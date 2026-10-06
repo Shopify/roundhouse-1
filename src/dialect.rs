@@ -1700,6 +1700,11 @@ pub struct TestModule {
     pub name: ClassId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ClassId>,
+    /// Where the superclass is written, when it is not rooted: the
+    /// name resolves in the modules around the class
+    /// (`ingest::test::resolve_test_parents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span: Option<Span>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ClassId>,
     pub tests: Vec<Test>,

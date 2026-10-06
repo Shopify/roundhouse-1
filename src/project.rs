@@ -3921,7 +3921,7 @@ fn apply_test_helper_connection(files: &mut [(String, String)], app: &App) -> Re
 ///
 /// The CRuby tree's SQLite3 adapter (ruby_overlay
 /// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
-/// supply the statement-error classes and the adapter's transaction
+/// supply the adapter class, the statement-error classes and its transaction
 /// members, and only that tree's `Db` translates a driver error into
 /// them, so those are refused on every target but Ruby, Spinel
 /// included: by constant, and by member name for a call that names no
@@ -3970,8 +3970,8 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 );
             }
         }
-        // Named by its path: the check leaves it unresolved, which a test
-        // body's `rescue` or `assert_raises` does not report.
+        // Named by its path: the check refuses the name as unresolved;
+        // this says why it stays so on this tree too.
         if let crate::expr::ExprNode::Const { path } = &*expr.node {
             // `::ActiveRecord::…` ingests with a leading empty segment.
             if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveRecord", "InvalidForeignKey"])
@@ -3996,12 +3996,13 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 let cruby_sqlite3 = matches!(id.0.as_str(),
                     "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException"
-                    | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation");
+                    | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation"
+                    | "ActiveRecord::ConnectionAdapters::SQLite3Adapter");
                 if (cruby_sqlite3 || bundled && matches!(id.0.as_str(),
                     "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
                     | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
                     | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
-                    | "Struct" | "Mutex")
+                    | "Struct" | "Mutex" | "Fiber")
                     // Nokogiri does not supply HTML5 on JRuby. The
                     // other bundled values remain available there.
                     && (target != "jruby" || id.0.as_str() == "Rails::HTML5::SafeListSanitizer"))

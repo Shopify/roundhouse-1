@@ -1834,6 +1834,7 @@ end
     // before anything downstream enumerates models.
     crate::lower::rich_text::synthesize_record_model(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
+    super::test::resolve_test_parents(&mut app);
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.

@@ -526,6 +526,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         let methods: Vec<(&str, Ty)> = methods;
         register_stdlib_class(classes, exc, &[], &methods);
     }
+    // The class `ActiveRecord::Base.connection` answers on the CRuby
+    // tree (ruby_overlay active_record_sqlite3_adapter.rb), as a name;
+    // `project` refuses it on every other target.
+    register_stdlib_class(classes, "ActiveRecord::ConnectionAdapters::SQLite3Adapter", &[], &[]);
     // `ActiveModel::Type::Boolean.new.cast(v)`: nil for a blank value, else the boolean.
     register_stdlib_class(classes, "ActiveModel::Type::Boolean", &[], &[
         ("cast", Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }),
@@ -612,6 +616,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // Do not invent member or synchronization return types here.
     register_stdlib_class(classes, "Struct", &[], &[]);
     register_stdlib_class(classes, "Mutex", &[], &[]);
+    // A Ruby core class the Ruby-family runtimes themselves use
+    // (`Fiber[:db_handle]`, Spinel's scheduled server); `project`
+    // refuses it where a target supplies none. No surface is invented.
+    register_stdlib_class(classes, "Fiber", &[], &[]);
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
     // Registered so the analyzer does not report it as unknown. The
     // element type is not known from a scalar argument.
