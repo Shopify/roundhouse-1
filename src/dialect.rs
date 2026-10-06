@@ -636,6 +636,16 @@ impl Param {
         Self { name, default: None, keyword: false, rest: true, forwarding: false, from_keyword: false, from_kwrest: false }
     }
 
+    /// A nameless positional rest (`def m(a, *)`): Ruby's arity, with no
+    /// local bound. Empty is a nameless declaration, never a legal name.
+    pub fn nameless_rest() -> Self {
+        Self::rest(Symbol::from(""))
+    }
+
+    pub fn is_nameless_rest(&self) -> bool {
+        self.rest && !self.keyword && !self.forwarding && self.name.as_str().is_empty()
+    }
+
     pub fn forwarding() -> Self {
         let mut param = Self::positional(Symbol::from(""));
         param.forwarding = true;

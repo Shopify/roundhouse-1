@@ -1172,6 +1172,10 @@ pub fn target_files(
     for (_, method) in crate::analyze::forwarding::methods(app) {
         if target != BuildTarget::Blog && let Some(formal) = method.unsupported_formals {
             crate::emit::diagnostics::report_unsupported(method.name_span, target.as_str(), "parameter declaration", formal.description());
+        } else if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) && method.params.iter().any(crate::dialect::Param::is_nameless_rest) {
+            // Only the CRuby Ruby tree is shown to keep `*` (its emitter
+            // writes it as written); no other target carries the arity.
+            crate::emit::diagnostics::report_unsupported(method.name_span, target.as_str(), "anonymous positional rest declaration", "no target but Ruby keeps a nameless rest's arity");
         }
         if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
             let named_keyword_rest = method.params.iter().any(|p| {

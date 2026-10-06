@@ -57,16 +57,18 @@ pub(crate) fn parse(def: &ruby_prism::DefNode<'_>) -> Formals {
         .any(|p| p.as_required_parameter_node().is_none())
     {
         Some(UnsupportedFormal::Destructured)
-    } else if pn.rest().is_some_and(|p| {
-        p.as_rest_parameter_node()
-            .is_some_and(|p| p.name().is_none())
-    }) {
-        Some(UnsupportedFormal::AnonymousRest)
     } else if pn
         .keyword_rest()
         .is_some_and(|p| p.as_no_keywords_parameter_node().is_some())
     {
         Some(UnsupportedFormal::NoKeywords)
+    } else if pn.rest().is_some_and(|p| {
+        p.as_rest_parameter_node()
+            .is_some_and(|p| p.name().is_none())
+    }) {
+        // Last: a context may admit a nameless rest, which must not
+        // also clear a `**nil` beside it (`def m(*, **nil)`).
+        Some(UnsupportedFormal::AnonymousRest)
     } else {
         None
     };
