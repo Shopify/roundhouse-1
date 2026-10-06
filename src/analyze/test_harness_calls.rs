@@ -13,29 +13,38 @@ use crate::App;
 /// Minitest methods a harness supplies, called on the test itself.
 const HARNESS_METHODS: &[&str] = &["capture_io"];
 
-/// The `TestBase` instance methods a Ruby harness source defines.
+/// The instance methods a Ruby harness source defines on the top-level
+/// `TestBase` (not `M::TestBase`, not its singleton class).
 pub(crate) fn declared_methods(text: &str) -> Vec<String> {
-    struct Declared(Vec<String>, bool);
+    struct Declared(Vec<String>, Vec<String>);
+    impl Declared {
+        fn on_test_base(&self) -> bool {
+            self.1.join("::") == "TestBase"
+        }
+    }
     impl<'pr> ruby_prism::Visit<'pr> for Declared {
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            let outer = self.1;
-            self.1 = node.constant_path().location().as_slice() == b"TestBase";
+            self.1.push(String::from_utf8_lossy(node.constant_path().location().as_slice()).into_owned());
             ruby_prism::visit_class_node(self, node);
-            self.1 = outer;
+            self.1.pop();
         }
         fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            let outer = self.1;
-            self.1 = false;
+            self.1.push(String::from_utf8_lossy(node.constant_path().location().as_slice()).into_owned());
             ruby_prism::visit_module_node(self, node);
-            self.1 = outer;
+            self.1.pop();
+        }
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            self.1.push("<< self".to_string());
+            ruby_prism::visit_singleton_class_node(self, node);
+            self.1.pop();
         }
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
-            if self.1 && node.receiver().is_none() {
+            if self.on_test_base() && node.receiver().is_none() {
                 self.0.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
             }
         }
     }
-    let mut declared = Declared(Vec::new(), false);
+    let mut declared = Declared(Vec::new(), Vec::new());
     let parsed = ruby_prism::parse(text.as_bytes());
     if parsed.errors().next().is_none() {
         ruby_prism::Visit::visit(&mut declared, &parsed.node());
@@ -43,13 +52,16 @@ pub(crate) fn declared_methods(text: &str) -> Vec<String> {
     declared.0
 }
 
-/// The test class's own helpers and those of the test classes it
-/// inherits from, which a call reaches before the harness.
+/// The test class's own instance helpers and those of the test classes
+/// it inherits from, which a call reaches before the harness. A `def
+/// self.capture_io` is not one: the call is sent to the test instance.
 fn defines(app: &App, module: &TestModule, method: &str) -> bool {
     let mut current = Some(module);
     for _ in 0..32 {
         let Some(tm) = current else { break };
-        if tm.helpers.iter().any(|helper| helper.name.as_str() == method) {
+        if tm.helpers.iter().any(|helper| {
+            helper.name.as_str() == method && helper.receiver == crate::dialect::MethodReceiver::Instance
+        }) {
             return true;
         }
         current = tm.parent.as_ref()
@@ -95,4 +107,22 @@ pub(crate) fn harness_calls(app: &App) -> Vec<(Span, &'static str)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared_methods;
+
+    #[test]
+    fn declared_methods_are_the_top_level_test_base_instance_defs() {
+        assert_eq!(declared_methods("class TestBase\n  def capture_io; end\nend\n"), ["capture_io"]);
+        for text in [
+            "module M\n  class TestBase\n    def capture_io; end\n  end\nend\n",
+            "class TestBase\n  class << self\n    def capture_io; end\n  end\nend\n",
+            "class TestBase\n  def self.capture_io; end\nend\n",
+            "class Other\n  def capture_io; end\nend\n",
+        ] {
+            assert!(declared_methods(text).is_empty(), "{text}");
+        }
+    }
 }
