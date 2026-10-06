@@ -511,11 +511,14 @@ module Db
   # its `cause`, as Rails' is.
   #
   # Rails answers a closed database with ConnectionNotEstablished, which
-  # is not a StatementInvalid; no such class here, so that error passes
-  # through untranslated rather than as a class a `rescue
-  # StatementInvalid` would catch. NOT modeled: StatementTimeout for a
-  # `SQLite3::BusyException` (a StatementInvalid here, as its Rails
-  # parent is), and translation of any non-driver error.
+  # is not a StatementInvalid; that error passes through untranslated
+  # (the ruby-family `ConnectionNotEstablished` class is not raised
+  # here), so no `rescue StatementInvalid` catches it. `InvalidForeignKey`
+  # is mapped as Rails maps it, but no `Db` turns on `PRAGMA
+  # foreign_keys`, so SQLite never reports the violation. NOT modeled:
+  # StatementTimeout for a `SQLite3::BusyException` (a StatementInvalid
+  # here, as its Rails parent is), and translation of any non-driver
+  # error.
   def self.translate(e, sql)
     m = e.message
     return e if m.match?(/called on a closed database/i)

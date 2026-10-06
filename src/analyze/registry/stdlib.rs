@@ -451,10 +451,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::ValueTooLong", None),
         // The CRuby tree's `Db` translates a driver error into these
         // (runtime/spinel/db_cruby.rb `translate`); `project` refuses
-        // them on every other target, whose `Db` does not.
+        // them on every other target, whose `Db` does not. Not
+        // `InvalidForeignKey`: no `Db` turns on `PRAGMA foreign_keys`
+        // and the schema loader drops `add_foreign_key`, so nothing
+        // raises it and its name stays unresolved.
         ("ActiveRecord::StatementInvalid", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
         ("ActiveRecord::NotNullViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
-        ("ActiveRecord::InvalidForeignKey", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
         ("ActiveRecord::CheckViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
         // Raised by the CRuby tree's SQLite3 adapter (ruby_overlay
         // active_record_sqlite3_adapter.rb).

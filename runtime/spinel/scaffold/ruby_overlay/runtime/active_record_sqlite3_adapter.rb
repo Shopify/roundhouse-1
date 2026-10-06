@@ -34,7 +34,11 @@
 # ConnectionNotEstablished); a connection of its own per thread (every
 # thread's adapter runs on `Db`'s shared handle outside a lease); a
 # shared-cache mode, so an isolation level never reaches its PRAGMA;
-# `transaction` options (refused at emit).
+# `transaction` options (refused at emit); foreign keys (no `PRAGMA
+# foreign_keys`, no `add_foreign_key`), so `InvalidForeignKey` below is
+# never raised and the check leaves its name unresolved. JRuby's tree
+# carries this file too, but its `Db` has no `translate`, so `project`
+# still refuses the statement-error names there.
 module ActiveRecord
   # Rails: `StatementInvalid < AdapterError < ActiveRecordError`, built
   # with the statement and its binds; the message defaults to the error
