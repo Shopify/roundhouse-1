@@ -7971,6 +7971,12 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("optional_param", "class Probe\n  def m(a, b = 0, *)\n    [a, b]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("post_param", "class Probe\n  def m(a, *, z)\n    [a, z]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("method_missing_keywords", "class Probe\n  def method_missing(name, *, **kw)\n    [name, kw]\n  end\n\n  def go(h)\n    foo(**h)\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("method_missing_positional", "class Probe\n  def method_missing(name, a, *)\n    a[:y] = 1\n    [name, a]\n  end\n\n  def go(h)\n    foo(**h)\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("reify_public_send", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(:method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_send_strings", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &__send__(\"method\", \"m\"))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_public_method", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &send(:public_method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_computed_name", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &method(\"m\".to_sym))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_computed_reifier", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(nm, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
         ("delegate_string", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("delegate_missing_to", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("override_implicit_super", "class Probe\n  def m(*, **kw)\n    kw\n  end\nend\n\nclass Kid < Probe\n  def m(a, k: 1)\n    super\n  end\nend\n", "implicit super into an anonymous positional rest"),
@@ -7991,11 +7997,12 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
 }
 
 /// Keywords a call passes, however it reaches the method, land in the
-/// rest when only required positionals precede it, as in Ruby.
+/// rest when only required positionals precede it, as in Ruby. A
+/// method object of a method without a nameless rest stays admitted.
 #[test]
 fn keywords_into_an_admitted_nameless_rest_are_unread_on_cruby() {
-    let probe = "class Probe\n  def method_missing(name, *)\n    name\n  end\n\n  def respond_to_missing?(name, *)\n    true\n  end\n\n  def go(h)\n    [foo(**h), bar(1, k: 2), baz(**{}), respond_to?(:x, true)]\n  end\nend\n";
-    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal [:foo, :bar, :baz, true], Probe.new.go({ x: 2 })\n  end\nend\n";
+    let probe = "class Probe\n  def method_missing(name, *)\n    name\n  end\n\n  def respond_to_missing?(name, *)\n    true\n  end\n\n  def other(x)\n    x + 1\n  end\n\n  def go(h)\n    [foo(**h), bar(1, k: 2), baz(**{}), respond_to?(:x, true), [1].map(&public_send(:method, :other)), [2].map(&method(:other))]\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal [:foo, :bar, :baz, true, [2], [3]], Probe.new.go({ x: 2 })\n  end\nend\n";
     nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
 }
 

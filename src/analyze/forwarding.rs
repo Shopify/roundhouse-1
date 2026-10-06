@@ -128,17 +128,33 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
         };
         // A reified method reaches callers (`yield`, `&block`) no
         // selector names, and `yield` keeps no keyword splat to check.
+        // Reifying is also spelled through a dispatcher
+        // (`public_send(:method, :m)`), and a name computed at run
+        // time (`method("m".to_sym)`) may be any selector, so it is
+        // refused too.
+        const REIFY: [&str; 3] = ["method", "public_method", "instance_method"];
+        fn literal(a: &Expr) -> Option<&str> {
+            match &*a.node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str()),
+                ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.as_str()),
+                _ => None,
+            }
+        }
+        let may_name_selector = |a: Option<&Expr>| {
+            a.is_some_and(|a| literal(a).is_none_or(|n| selectors.iter().any(|s| s.as_str() == n)))
+        };
         let reified = match &*e.node {
             ExprNode::MethodRef { name, .. } => selectors.contains(name),
-            ExprNode::Send { method, args, .. } => {
-                matches!(method.as_str(), "method" | "public_method" | "instance_method")
-                    && args.iter().any(|a| match &*a.node {
-                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => selectors.contains(value),
-                        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
-                            selectors.iter().any(|s| s.as_str() == value)
-                        }
-                        _ => false,
-                    })
+            ExprNode::Send { method, args, .. } if REIFY.contains(&method.as_str()) => {
+                may_name_selector(args.first())
+            }
+            ExprNode::Send { method, args, .. }
+                if matches!(method.as_str(), "send" | "public_send" | "__send__") =>
+            {
+                args.first().is_some_and(|a| literal(a).is_none_or(|n| REIFY.contains(&n)))
+                    && args.get(1).is_some_and(|a| literal(a).is_some_and(|n| selectors.iter().any(|s| s.as_str() == n)))
+                    || args.first().and_then(literal).is_some_and(|n| REIFY.contains(&n))
+                        && may_name_selector(args.get(1))
             }
             _ => false,
         };
