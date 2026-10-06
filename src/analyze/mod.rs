@@ -28,6 +28,7 @@ mod enum_raw_input;
 mod presence_not_null;
 mod test_teardown;
 pub(crate) mod test_constants;
+pub(crate) mod test_harness_calls;
 pub mod test_helper_connection;
 mod database_identity;
 mod fixture_entries;

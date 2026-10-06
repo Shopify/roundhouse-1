@@ -7649,3 +7649,50 @@ fn a_harness_name_shadowed_by_an_app_namespace_is_refused() {
     assert!(errors.iter().any(|e| e.contains("constant not supported (all targets): ActiveSupport::Cache::MemoryStore")), "{errors:?}");
     app("assert ::ActiveSupport::Cache::MemoryStore.new").run_test("test/models/shop_order_test.rb").assert_passes();
 }
+
+const CAPTURE_IO_TEST: &str = "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  test \"captured\" do\n    before = $stdout\n    out, err = capture_io do\n      Widget.say\n    end\n    assert_equal \"hi\\n\", out\n    assert_equal \"warn\\n\", err\n    assert_raises(RuntimeError) { capture_io { raise \"boom\" } }\n    assert before.equal?($stdout)\n  end\nend\n";
+
+/// Minitest's `capture_io` swaps `$stdout`/`$stderr` for the block and
+/// answers what was written. The CRuby harness carries it; a target whose
+/// emitted harness does not declare it is refused at the call, before a
+/// test calling an undefined method is written.
+#[test]
+fn capture_io_runs_on_cruby_and_is_refused_where_the_harness_lacks_it() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/widget.rb", "class Widget\n  def self.say\n    $stdout.puts(\"hi\")\n    $stderr.puts(\"warn\")\n  end\nend\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", CAPTURE_IO_TEST)
+    };
+    app().run_test("test/models/widget_test.rb").assert_passes();
+    for target in [
+        BuildTarget::Spinel,
+        BuildTarget::Jruby,
+        BuildTarget::Typescript,
+        BuildTarget::Rust,
+        BuildTarget::Python,
+        BuildTarget::Go,
+    ] {
+        let (_, errors) = app().emit(target);
+        assert!(errors.iter().any(|e| e.contains("harness_method") && e.contains("capture_io")), "{target:?}: {errors:?}");
+    }
+}
+
+/// A test class's own `capture_io` is the method the call reaches, so
+/// the harness's absence on a target is not the reason to refuse it.
+#[test]
+fn a_test_class_defining_capture_io_is_not_refused_for_the_harness() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/widget.rb", "class Widget\nend\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  def capture_io\n    yield\n    \"own\"\n  end\n\n  test \"own\" do\n    assert_equal \"own\", capture_io { 1 }\n  end\nend\n")
+    };
+    app().run_test("test/models/widget_test.rb").assert_passes();
+    for target in [BuildTarget::Spinel, BuildTarget::Typescript, BuildTarget::Rust] {
+        let (_, errors) = app().emit(target);
+        assert!(!errors.iter().any(|e| e.contains("harness_method")), "{target:?}: {errors:?}");
+    }
+}
