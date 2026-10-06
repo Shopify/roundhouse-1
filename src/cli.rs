@@ -262,10 +262,22 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     }
     // Sends nothing checked, beside the error total: an error that goes
     // away by becoming one of these was reclassified, not fixed.
-    let unknown_sends = crate::analyze::unknown_receiver_sends(&app);
+    // A known receiver's unresolved send is already an error where
+    // `diagnose` covers the body; only the uncovered sites count here.
+    let diagnosed: std::collections::HashSet<_> =
+        diags.iter().map(|d| (d.span.file, d.span.start, d.span.end)).collect();
+    let unknown_sends: Vec<_> = crate::analyze::unknown_receiver_sends(&app)
+        .into_iter()
+        .filter(|s| !(s.known_receiver && diagnosed.contains(&(s.span.file, s.span.start, s.span.end))))
+        .collect();
     if list_unknown_sends {
         for send in &unknown_sends {
-            let what = if send.gradual { "a gradual (untyped)" } else { "an unknown" };
+            let message = if send.known_receiver {
+                format!("send `{}` resolves to no method on its known receiver and is unchecked", send.method.as_str())
+            } else {
+                let what = if send.gradual { "a gradual (untyped)" } else { "an unknown" };
+                format!("send `{}` on {what} receiver is unchecked", send.method.as_str())
+            };
             let d = crate::diagnostic::Diagnostic {
                 span: send.span,
                 kind: crate::diagnostic::DiagnosticKind::UnresolvedType {
@@ -273,16 +285,18 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                     name: Some(send.method.clone()),
                 },
                 severity: Severity::Info,
-                message: format!("send `{}` on {what} receiver is unchecked", send.method.as_str()),
+                message,
             };
             eprintln!("{}", d.render(&app.sources));
         }
     }
     let gradual = unknown_sends.iter().filter(|s| s.gradual).count();
+    let known = unknown_sends.iter().filter(|s| s.known_receiver).count();
     eprintln!(
-        "roundhouse-check: {} send(s) on unknown receivers, {} on gradual receivers (unchecked, not errors)",
-        unknown_sends.len() - gradual,
+        "roundhouse-check: {} send(s) on unknown receivers, {} on gradual receivers, {} unresolved on known receivers (unchecked, not errors)",
+        unknown_sends.len() - gradual - known,
         gradual,
+        known,
     );
     eprintln!(
         "roundhouse-check: {} — {} parse error(s), {} error(s), {} warning(s), {} gap-attributed note(s), {} survey gap(s)",

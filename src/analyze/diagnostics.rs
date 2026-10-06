@@ -196,10 +196,15 @@ pub struct UnknownReceiverSend {
     /// The receiver is the gradual escape (`T.unsafe`, RBS `untyped`)
     /// rather than an unresolved type.
     pub gradual: bool,
+    /// The receiver's type is known, but the send resolved to nothing on
+    /// it: what `diagnose` reports as `send_dispatch_failed` in a model
+    /// or controller body, and nothing reports elsewhere.
+    pub known_receiver: bool,
 }
 
 /// Every send, in every emitted body, whose explicit receiver is
-/// unknown or gradual and which carries no diagnostic of its own.
+/// unknown or gradual, or known without the send resolving, and which
+/// carries no diagnostic of its own.
 ///
 /// Nothing checks such a send: no method table is consulted, so a
 /// misspelled or unimplemented method passes. `diagnose` reports the
@@ -211,8 +216,12 @@ pub fn unknown_receiver_sends(app: &App) -> Vec<UnknownReceiverSend> {
     fn visit(expr: &Expr, out: &mut Vec<UnknownReceiverSend>) {
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {
             let gradual = matches!(r.ty, Some(Ty::Untyped));
-            if (gradual || is_unknown_ty(r.ty.as_ref())) && expr.diagnostic.is_none() && !expr.span.is_synthetic() {
-                out.push(UnknownReceiverSend { span: expr.span, method: method.clone(), gradual });
+            let known_receiver = !gradual && !is_unknown_ty(r.ty.as_ref()) && is_unknown_ty(expr.ty.as_ref());
+            if (gradual || known_receiver || is_unknown_ty(r.ty.as_ref()))
+                && expr.diagnostic.is_none()
+                && !expr.span.is_synthetic()
+            {
+                out.push(UnknownReceiverSend { span: expr.span, method: method.clone(), gradual, known_receiver });
             }
         }
         expr.node.for_each_child(&mut |child| visit(child, out));
