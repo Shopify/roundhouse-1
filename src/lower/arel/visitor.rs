@@ -30,14 +30,14 @@ pub enum SqlDialect {
 }
 
 impl SqlDialect {
-    fn ident(self, name: &str) -> String {
+    pub(crate) fn ident(self, name: &str) -> String {
         match self {
             Self::Sqlite => crate::naming::sql_ident(name),
             Self::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
         }
     }
 
-    fn placeholder(self, index: usize) -> String {
+    pub(crate) fn placeholder(self, index: usize) -> String {
         match self {
             Self::Sqlite => "?".into(),
             Self::Postgres => format!("${index}"),
@@ -135,25 +135,26 @@ pub struct SqliteVisitor;
 
 pub struct PostgresVisitor;
 
-impl ArelVisitor for PostgresVisitor {
+impl ArelVisitor for SqlDialect {
     fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
         match op {
-            ArelOp::Select(s) => visit_select(s, schema, owner, SqlDialect::Postgres),
-            ArelOp::Insert(i) => visit_insert(i, schema, SqlDialect::Postgres),
-            ArelOp::Update(u) => visit_update(u, schema, SqlDialect::Postgres),
-            ArelOp::Delete(d) => visit_delete(d, schema, SqlDialect::Postgres),
+            ArelOp::Select(s) => visit_select(s, schema, owner, *self),
+            ArelOp::Insert(i) => visit_insert(i, schema, *self),
+            ArelOp::Update(u) => visit_update(u, schema, *self),
+            ArelOp::Delete(d) => visit_delete(d, schema, *self),
         }
+    }
+}
+
+impl ArelVisitor for PostgresVisitor {
+    fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
+        SqlDialect::Postgres.visit(op, schema, owner)
     }
 }
 
 impl ArelVisitor for SqliteVisitor {
     fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
-        match op {
-            ArelOp::Select(s) => visit_select(s, schema, owner, SqlDialect::Sqlite),
-            ArelOp::Insert(i) => visit_insert(i, schema, SqlDialect::Sqlite),
-            ArelOp::Update(u) => visit_update(u, schema, SqlDialect::Sqlite),
-            ArelOp::Delete(d) => visit_delete(d, schema, SqlDialect::Sqlite),
-        }
+        SqlDialect::Sqlite.visit(op, schema, owner)
     }
 }
 

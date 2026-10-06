@@ -5,7 +5,7 @@
 //! method's body is built by:
 //!
 //!   1. Constructing an `ArelOp` describing the operation.
-//!   2. Calling `SqliteVisitor::visit(op, schema, owner)` to get the
+//!   2. Calling the owning database dialect's visitor to get the
 //!      target-runtime `Expr` over the `Db` primitive surface.
 //!   3. Wrapping in a `MethodDef` with the appropriate name + signature.
 //!
@@ -41,7 +41,7 @@ use crate::expr::{Expr, ExprNode};
 use crate::ident::{ClassId, Symbol, TableRef, VarId};
 use crate::lower::arel::{
     ArelOp, ArelVisitor, Assignment, ColRef, ColumnSpec, Delete, Direction, Insert, LimitSpec,
-    Order, Predicate, Select, SqliteVisitor, Update, Value, ValueType,
+    Order, Predicate, Select, SqlDialect, Update, Value, ValueType,
 };
 use crate::schema::{Schema, Table};
 use crate::span::Span;
@@ -57,20 +57,21 @@ pub(super) fn push_adapter_methods(
     owner: &ClassId,
     table: &Table,
     schema: &Schema,
+    dialect: SqlDialect,
 ) {
-    methods.push(synth_adapter_find_by_id(owner, table, schema));
-    methods.push(synth_adapter_all(owner, table, schema));
-    methods.push(synth_adapter_last(owner, table, schema));
-    methods.push(synth_adapter_insert(owner, table, schema));
-    methods.push(synth_adapter_update(owner, table, schema));
-    methods.push(synth_adapter_delete(owner, table, schema));
-    methods.push(synth_adapter_count(owner, table, schema));
-    methods.push(synth_adapter_any(owner, table, schema));
-    methods.push(synth_adapter_exists_by_id(owner, table, schema));
-    methods.push(synth_adapter_truncate(owner, table, schema));
-    methods.push(synth_delete_all(owner, table));
-    methods.push(synth_adapter_reload(owner, table));
-    methods.push(synth_columns_sql(owner, table));
+    methods.push(synth_adapter_find_by_id(owner, table, schema, dialect));
+    methods.push(synth_adapter_all(owner, table, schema, dialect));
+    methods.push(synth_adapter_last(owner, table, schema, dialect));
+    methods.push(synth_adapter_insert(owner, table, schema, dialect));
+    methods.push(synth_adapter_update(owner, table, schema, dialect));
+    methods.push(synth_adapter_delete(owner, table, schema, dialect));
+    methods.push(synth_adapter_count(owner, table, schema, dialect));
+    methods.push(synth_adapter_any(owner, table, schema, dialect));
+    methods.push(synth_adapter_exists_by_id(owner, table, schema, dialect));
+    methods.push(synth_adapter_truncate(owner, table, schema, dialect));
+    methods.push(synth_delete_all(owner, table, dialect));
+    methods.push(synth_adapter_reload(owner, table, dialect));
+    methods.push(synth_columns_sql(owner, table, dialect));
     methods.push(synth_hydrate_all(owner));
 }
 
@@ -82,7 +83,7 @@ pub(super) fn push_adapter_methods(
 // insert / update / delete).
 // ---------------------------------------------------------------------------
 
-fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let id = Symbol::from("id");
     let key_ty = key_ty(table);
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
@@ -107,7 +108,7 @@ fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema) -> 
         name: Symbol::from("_adapter_find_by_id"),
         receiver: MethodReceiver::Class,
         params: vec![Param::positional(id.clone())],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![(id, key_ty)], nilable_owner)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -118,7 +119,7 @@ fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema) -> 
     }
 }
 
-fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
 
     let op = ArelOp::Select(Select {
@@ -140,7 +141,7 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema) -> MethodD
         name: Symbol::from("_adapter_all"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(owner_ty) })),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -157,7 +158,7 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema) -> MethodD
 /// full-table scan; goes through the same `Db.prepare`/`from_stmt` path
 /// as `_adapter_find_by_id`, so it works for every app (the raw
 /// `ActiveRecord.adapter` is not wired under the Level-3 architecture).
-fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
 
@@ -186,7 +187,7 @@ fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema) -> Method
         name: Symbol::from("_adapter_last"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], nilable_owner)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -204,7 +205,7 @@ fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema) -> Method
 /// `await` on the call result rather than the receiver. See the
 /// reload comment for the underlying emit issue with
 /// `self.class.<async_method>`.
-fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     use crate::expr::{LValue, Literal};
     use crate::schema::ColumnType;
 
@@ -240,7 +241,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     });
 
     let (body, ret_ty) = match supplied_key {
-        None => (SqliteVisitor.visit(&op, schema, owner), Ty::Int),
+        None => (dialect.visit(&op, schema, owner), Ty::Int),
         Some(k) => {
             let key_ivar = || ivar_ref(&k.name);
             let mut exprs = Vec::new();
@@ -285,7 +286,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
                     },
                 ));
             }
-            exprs.push(SqliteVisitor.visit(&op, schema, owner));
+            exprs.push(dialect.visit(&op, schema, owner));
             exprs.push(key_ivar());
             (Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), ty_of_column(&k.col_type))
         }
@@ -312,7 +313,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
 
 /// `def _adapter_update` — instance method; reads ivars + @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
-fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     // Same storage-ivar convention as `synth_adapter_insert`.
     let assignments: Vec<Assignment> = table
         .columns
@@ -341,7 +342,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
         name: Symbol::from("_adapter_update"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -354,7 +355,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
 
 /// `def _adapter_delete` — instance method; reads @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
-fn synth_adapter_delete(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_delete(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let op = ArelOp::Delete(Delete {
         table: TableRef(table.name.clone()),
         conditions: Some(eq_id_ivar(table)),
@@ -368,7 +369,7 @@ fn synth_adapter_delete(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
         name: Symbol::from("_adapter_delete"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -379,7 +380,7 @@ fn synth_adapter_delete(owner: &ClassId, table: &Table, schema: &Schema) -> Meth
     }
 }
 
-fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let op = ArelOp::Select(Select {
         single_record: false, // _adapter_count — a scalar
         table: TableRef(table.name.clone()),
@@ -399,7 +400,7 @@ fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema) -> Metho
         name: Symbol::from("_adapter_count"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], Ty::Int)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -417,7 +418,7 @@ fn synth_adapter_count(owner: &ClassId, table: &Table, schema: &Schema) -> Metho
 /// adapter-routing default, so strict targets go Db-direct like every
 /// other CRUD primitive (and targets with no adapter module at all,
 /// e.g. Elixir, never see the routing body).
-fn synth_delete_all(owner: &ClassId, table: &Table) -> MethodDef {
+fn synth_delete_all(owner: &ClassId, table: &Table, dialect: SqlDialect) -> MethodDef {
     use crate::expr::Literal;
 
     let exec = Expr::new(
@@ -432,7 +433,7 @@ fn synth_delete_all(owner: &ClassId, table: &Table) -> MethodDef {
                 Span::synthetic(),
                 ExprNode::Lit {
                     value: Literal::Str {
-                        value: format!("DELETE FROM {}", crate::naming::sql_ident(table.name.as_str())),
+                        value: format!("DELETE FROM {}", dialect.ident(table.name.as_str())),
                     },
                 },
             )],
@@ -469,7 +470,7 @@ fn synth_delete_all(owner: &ClassId, table: &Table) -> MethodDef {
     }
 }
 
-fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let op = ArelOp::Delete(Delete {
         table: TableRef(table.name.clone()),
         conditions: None,
@@ -483,7 +484,7 @@ fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema) -> Me
         name: Symbol::from("_adapter_truncate"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -517,7 +518,7 @@ fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema) -> Me
 /// reload needs to write into self. Generalizing the visitor with
 /// a "hydrate target = bare ivar / passed-in symbol" option is the
 /// right cleanup once a second use surfaces.
-fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
+fn synth_adapter_reload(owner: &ClassId, table: &Table, dialect: SqlDialect) -> MethodDef {
     use crate::expr::{ExprNode, LValue, Literal};
     use crate::span::Span;
 
@@ -529,7 +530,7 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
     let cols_csv: String = table
         .columns
         .iter()
-        .map(|c| crate::naming::sql_ident(c.name.as_str()))
+        .map(|c| dialect.ident(c.name.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -538,7 +539,7 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
     // inlined, so parameterize its `@id` predicate too, keeping it in
     // step with the visitor-emitted find/exists paths. Gate off ⇒
     // inline-escape, byte-identical to before.
-    let param = crate::lower::arel::visitor::param_binds_enabled();
+    let param = dialect == SqlDialect::Postgres || crate::lower::arel::visitor::param_binds_enabled();
     // The key column and its ivar, bound with the key's type — the same
     // column the visitor-emitted find/exists paths compare.
     let key = key_column_name(table);
@@ -553,10 +554,10 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
             arel_lit_str(format!(
                 "SELECT {} FROM {} WHERE {} = ",
                 cols_csv,
-                crate::naming::sql_ident(table.name.as_str()),
-                crate::naming::sql_ident(key.as_str())
+                dialect.ident(table.name.as_str()),
+                dialect.ident(key.as_str())
             )),
-            arel_lit_str("?".to_string()),
+            arel_lit_str(dialect.placeholder(1)),
             arel_lit_str(" LIMIT 1".to_string()),
         ]);
         // Db.bind_int(stmt, 1, @id) — or bind_text for a string key
@@ -571,8 +572,8 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table) -> MethodDef {
         let sql_prefix = arel_lit_str(format!(
             "SELECT {} FROM {} WHERE {} = ",
             cols_csv,
-            crate::naming::sql_ident(table.name.as_str()),
-            crate::naming::sql_ident(key.as_str())
+            dialect.ident(table.name.as_str()),
+            dialect.ident(key.as_str())
         ));
         let escape_id = Expr::new(
             Span::synthetic(),
@@ -691,7 +692,7 @@ fn rails_quoted(name: &str) -> String {
 /// before the FROM tables, and `<table>.*` names its outputs, while a
 /// bare `<table>.<col>` does not (campfire's `user.rooms.order(:created_at)`
 /// joins memberships, which has its own).
-fn synth_columns_sql(owner: &ClassId, table: &Table) -> MethodDef {
+fn synth_columns_sql(owner: &ClassId, table: &Table, dialect: SqlDialect) -> MethodDef {
     let cols_csv: String = table
         .columns
         .iter()
@@ -700,7 +701,7 @@ fn synth_columns_sql(owner: &ClassId, table: &Table) -> MethodDef {
                 "{t}.{q} AS {alias}",
                 t = rails_quoted(table.name.as_str()),
                 q = rails_quoted(c.name.as_str()),
-                alias = crate::naming::sql_ident(c.name.as_str())
+                alias = dialect.ident(c.name.as_str())
             )
         })
         .collect::<Vec<_>>()

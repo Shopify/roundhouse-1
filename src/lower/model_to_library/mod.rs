@@ -211,10 +211,25 @@ pub(crate) fn lower_models_inner(
     unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
     materialization: Materialization<'_>,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
+    lower_models_inner_for_dialect(models, schema, extra_class_infos, params_specs,
+        unfolded, materialization, crate::lower::arel::SqlDialect::Sqlite)
+}
+
+/// Database-aware model lowering. Existing target entry points retain SQLite
+/// until their runtime adapter supports the requested database.
+pub(crate) fn lower_models_inner_for_dialect(
+    models: &[Model],
+    schema: &Schema,
+    extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    materialization: Materialization<'_>,
+    dialect: crate::lower::arel::SqlDialect,
+) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
     for model in models {
-        let methods = build_methods(model, models, schema, params_specs);
+        let methods = build_methods_for_dialect(model, models, schema, params_specs, dialect);
         let table = schema.tables.get(&model.table.0);
         // Register actual production definitions, even for unselected
         // models and when source overrides hide framework ownership.
@@ -233,7 +248,7 @@ pub(crate) fn lower_models_inner(
                             if matches!(method.as_str(), "attr_accessor" | "attr_reader" | "attr_writer")),
                     _ => true,
                 });
-                let mut methods = build_methods(&definitions, models, schema, params_specs);
+                let mut methods = build_methods_for_dialect(&definitions, models, schema, params_specs, dialect);
                 // Preserve original source inputs for late derivations
                 // (e.g. raw helpers) without treating them as framework
                 // claims. Both kinds traverse the canonical Arel/typer.
@@ -253,6 +268,11 @@ pub(crate) fn lower_models_inner(
     // so model bodies that call into them — `Sqlite.prepare/step?/...` in
     // the lowerer-emitted `_adapter_*` primitives — type cleanly.
     crate::lower::view_to_library::insert_framework_stubs(&mut classes);
+    if dialect == crate::lower::arel::SqlDialect::Postgres {
+        classes.get_mut(&ClassId(Symbol::from("Db"))).expect("Db primitive registry")
+            .class_methods.insert(Symbol::from("insert_returning_int"),
+                fn_sig(vec![(Symbol::from("sql"), Ty::Str)], Ty::Int));
+    }
     // Register synthesized Row classes so dispatch on `Article.from_row(r)`
     // / `ArticleRow.from_raw(h)` resolves through the body-typer.
     // Stream unselected rows: their registry metadata is needed, but
@@ -347,7 +367,7 @@ pub(crate) fn lower_models_inner(
             let unfold = method.receiver == crate::dialect::MethodReceiver::Class
                 && unfolded.contains(&(model.name.clone(), method.name.clone()));
             if !unfold {
-                crate::lower::arel::rewrite_arel_in_expr(&mut method.body, schema, &classes);
+                crate::lower::arel::rewrite_arel_in_expr_for_dialect(&mut method.body, schema, &classes, &[], dialect);
             }
             type_method_body(method, &classes, table, Some(model));
         }
@@ -938,6 +958,17 @@ pub(crate) fn build_methods(
     schema: &Schema,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
 ) -> Vec<MethodDef> {
+    build_methods_for_dialect(model, models, schema, params_specs,
+        crate::lower::arel::SqlDialect::Sqlite)
+}
+
+fn build_methods_for_dialect(
+    model: &Model,
+    models: &[Model],
+    schema: &Schema,
+    params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
+    dialect: crate::lower::arel::SqlDialect,
+) -> Vec<MethodDef> {
     // No-op outside an emit diagnostics scope, so the many direct
     // test callers of the lowering entries are unaffected.
     report_unclaimed_unknowns(model);
@@ -967,7 +998,7 @@ pub(crate) fn build_methods(
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See
         // project_level_3_adapter_emit.md.
-        push_adapter_methods(&mut methods, &model.name, table, schema);
+        push_adapter_methods(&mut methods, &model.name, table, schema, dialect);
         // `from_params(p: <Resource>Params)` — typed factory matching the
         // (resource, fields) tuple a controller's `permit(...)` declared.
         // Skipped silently when the model isn't permitted by any

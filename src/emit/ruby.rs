@@ -218,13 +218,18 @@ pub(crate) fn materialize_models(
         )
         .0,
     );
-    let lcs = crate::lower::model_to_library::lower_models_inner(
+    let lcs = crate::lower::model_to_library::lower_models_inner_for_dialect(
         &app.models,
         &app.schema,
         Vec::new(),
         &params_specs,
         &assoc_scopes,
         materialization,
+        if app.databases.iter().any(|db| db.primary && db.adapter == crate::database::DatabaseAdapter::Postgresql) {
+            crate::lower::arel::SqlDialect::Postgres
+        } else {
+            crate::lower::arel::SqlDialect::Sqlite
+        },
     ).0;
     (lcs, params_specs)
 }
