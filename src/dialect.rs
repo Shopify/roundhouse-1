@@ -1718,12 +1718,10 @@ pub struct TestModule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<ClassId>,
     pub tests: Vec<Test>,
-    /// Body of `setup do ... end` or `def setup; ...; end`, if
-    /// present. The lowerer inlines this at the start of each test
-    /// method so the body-typer's Seq walk picks up ivar
-    /// assignments (`@article = articles(:one)`) before the test's
-    /// body runs. Mirror of the controller filter-inlining pattern.
-    /// `None` when the test class has no setup hook.
+    /// Bodies of `setup do ... end` callbacks in declaration order.
+    /// An authored `def setup` is a method in `helpers`, kept distinct so
+    /// its super/return has the right method context. CRuby runs callbacks
+    /// before setup; the inline test backends prepend both to each test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<Expr>,
     /// Classes declared inside the test class body — e.g. the
@@ -1735,7 +1733,7 @@ pub struct TestModule {
     /// app/models/ and doesn't redefine classes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inner_classes: Vec<LibraryClass>,
-    /// Non-test, non-setup instance methods on the test class —
+    /// Non-test instance methods on the test class (including `setup`) —
     /// helper methods like `setup_adapter_with_stub_row(id)` that
     /// the test methods invoke. Captured here so the lowerer can
     /// emit them as ordinary instance methods on the lowered test

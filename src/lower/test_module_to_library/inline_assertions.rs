@@ -51,6 +51,13 @@ use crate::expr::{Expr, ExprNode, LValue, Literal, RescueClause};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 
+/// CRuby has the real test library. Other backends keep inline assertions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertionMode {
+    Inline,
+    Minitest,
+}
+
 /// Top-level entry. Walk `body` bottom-up, rewriting recognized
 /// assertion Sends to inline raise statements. Unrecognized Sends
 /// pass through unchanged, and so does a recognized name the test
@@ -66,13 +73,19 @@ pub fn inline_assertions(body: &Expr, own: &dyn Fn(&str) -> bool) -> Expr {
 /// nested Seq flattened as a rewrite's result) so the test lowerer
 /// can skip a follow-up typing pass.
 pub fn inline_assertions_in_place(body: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
-    walk_inline(body, own)
+    inline_assertions_with_mode(body, own, AssertionMode::Inline)
+}
+
+/// Twin taking the target's assertion mode: under `Minitest` the calls
+/// Minitest itself defines stay calls (`minitest_call`).
+pub fn inline_assertions_with_mode(body: &mut Expr, own: &dyn Fn(&str) -> bool, mode: AssertionMode) -> bool {
+    walk_inline(body, own, mode)
 }
 
 // A multi-assignment's value is a child like an assignment's
 // (`for_each_child_mut`), so `out, err = capture_io do … assert … end`
 // keeps each assertion in its own position inside the block.
-fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
+fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool, mode: AssertionMode) -> bool {
     if matches!(&*e.node, ExprNode::Seq { .. }) {
         let exprs = match &mut *e.node {
             ExprNode::Seq { exprs } => std::mem::take(exprs),
@@ -81,7 +94,7 @@ fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
         let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
         let mut changed = false;
         for mut child in exprs {
-            if walk_inline(&mut child, own) {
+            if walk_inline(&mut child, own, mode) {
                 changed = true;
             }
             let node = std::mem::replace(&mut *child.node, ExprNode::SelfRef);
@@ -103,12 +116,12 @@ fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
     // The right of an assignment (`v = …`, `a, b = …`) answers
     // `assert_difference`'s block value; only its targets remain to walk.
     if let ExprNode::Assign { value, .. } | ExprNode::MultiAssign { value, .. } = &mut *e.node {
-        if lower_value_in_place(value, own) {
+        if lower_value_in_place(value, own, mode) {
             match &mut *e.node {
-                ExprNode::Assign { target, .. } => walk_lvalue(target, own),
+                ExprNode::Assign { target, .. } => walk_lvalue(target, own, mode),
                 ExprNode::MultiAssign { targets, .. } => {
                     for target in targets {
-                        walk_lvalue(target, own);
+                        walk_lvalue(target, own, mode);
                     }
                 }
                 _ => unreachable!(),
@@ -118,11 +131,16 @@ fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
     }
     let mut changed = false;
     e.node.for_each_child_mut(&mut |c| {
-        if walk_inline(c, own) {
+        if walk_inline(c, own, mode) {
             changed = true;
         }
     });
-    if let Some(replacement) = rewrite_send(e, own) {
+    // Preserve the call, its arguments and its block. Counting an inlined
+    // raise cannot reproduce nested assertions, argument failures, or returns.
+    if mode == AssertionMode::Minitest && minitest_call(e) {
+        return changed;
+    }
+    if let Some(replacement) = rewrite_send(e, own, mode) {
         *e = replacement;
         return true;
     }
@@ -135,7 +153,7 @@ fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
 /// splices into the surrounding statements, where an assignment would
 /// bind only the first of them. False (and `e` untouched) for any other
 /// value, which the caller walks as usual.
-fn lower_value_in_place(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
+fn lower_value_in_place(e: &mut Expr, own: &dyn Fn(&str) -> bool, mode: AssertionMode) -> bool {
     let ExprNode::Send { recv, method, args, block, .. } = &*e.node else {
         return false;
     };
@@ -145,13 +163,13 @@ fn lower_value_in_place(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
     }
     let mut args: Vec<Expr> = args.clone();
     for arg in &mut args {
-        walk_inline(arg, own);
+        walk_inline(arg, own, mode);
     }
     let mut block = block.clone();
     if let Some(b) = block.as_mut() {
-        walk_inline(b, own);
+        walk_inline(b, own, mode);
     }
-    match lower_difference_value(e.span, method.as_str(), &args, block.as_ref()) {
+    match lower_difference_value(e.span, method.as_str(), &args, block.as_ref(), mode) {
         Some(lowered) => {
             *e = lowered;
             true
@@ -169,14 +187,14 @@ pub(crate) fn for_each_rewritten_child<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Ex
     e.node.for_each_child(f);
 }
 
-fn walk_lvalue(target: &mut LValue, own: &dyn Fn(&str) -> bool) {
+fn walk_lvalue(target: &mut LValue, own: &dyn Fn(&str) -> bool, mode: AssertionMode) {
     match target {
         LValue::Attr { recv, .. } => {
-            walk_inline(recv, own);
+            walk_inline(recv, own, mode);
         }
         LValue::Index { recv, index } => {
-            walk_inline(recv, own);
-            walk_inline(index, own);
+            walk_inline(recv, own, mode);
+            walk_inline(index, own, mode);
         }
         _ => {}
     }
@@ -209,7 +227,7 @@ pub(crate) fn spliced_block<'a>(e: &'a Expr, own: &dyn Fn(&str) -> bool) -> Opti
     let ExprNode::Send { method, block, .. } = &*e.node else {
         return None;
     };
-    if !SPLICING.contains(&method.as_str()) || rewrite_send(e, own).is_none() {
+    if !SPLICING.contains(&method.as_str()) || rewrite_send(e, own, AssertionMode::Inline).is_none() {
         return None;
     }
     match block.as_ref().map(|b| &*b.node) {
@@ -218,10 +236,28 @@ pub(crate) fn spliced_block<'a>(e: &'a Expr, own: &dyn Fn(&str) -> bool) -> Opti
     }
 }
 
+fn minitest_call(e: &Expr) -> bool {
+    let ExprNode::Send { method, args, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "assert_raises" | "assert_raise" => {
+            // The app-specific match: extension is not Minitest's contract.
+            !args.iter().any(|arg| matches!(&*arg.node, ExprNode::Hash { kwargs: true, .. }))
+        }
+        "assert" | "refute" | "assert_not" | "assert_equal" | "refute_equal"
+        | "assert_not_equal" | "assert_nil" | "refute_nil" | "assert_not_nil"
+        | "assert_empty" | "refute_empty" | "assert_not_empty" | "assert_includes"
+        | "refute_includes" | "assert_not_includes" | "assert_kind_of"
+        | "assert_instance_of" | "assert_same" | "refute_same" | "assert_not_same"
+        | "assert_match" | "refute_match" | "assert_no_match" | "assert_operator"
+        | "refute_operator" | "assert_predicate" | "refute_predicate" | "assert_throws" => true,
+        _ => false,
+    }
+}
+
 /// Rewrite a bare-receiver `assert_*`/`refute_*` Send into an inline
 /// raise expression. Returns None for non-assertion Sends so the
 /// caller passes them through unchanged.
-fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
+fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool, mode: AssertionMode) -> Option<Expr> {
     let ExprNode::Send { recv, method, args, block, .. } = &*e.node else {
         return None;
     };
@@ -244,7 +280,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
             let expected = args[0].clone();
             let actual = materialised_for_array_literal(&expected, args[1].clone());
             let msg = format!("assert_equal failed");
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, expected, "!=", vec![actual]),
                 msg,
@@ -260,7 +296,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
             let a = args[0].clone();
             let b = args[2].clone();
             let op = op.as_str().to_string();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, a, &op, vec![b])),
                 "assert_operator failed".to_string(),
@@ -270,7 +306,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
             // Inverted assert_equal — raise *if* the values are equal.
             let a = args[0].clone();
             let b = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, a, "==", vec![b]),
                 "refute_equal failed".to_string(),
@@ -293,15 +329,15 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         // test, not something to preserve.
         "assert" if !args.is_empty() => {
             let cond = args[0].clone();
-            Some(raise_if(span, not_expr(span, cond), "assertion failed".to_string()))
+            Some(raise_if(mode, span, not_expr(span, cond), "assertion failed".to_string()))
         }
         "assert_not" | "refute" if !args.is_empty() => {
             let cond = args[0].clone();
-            Some(raise_if(span, cond, "refute failed".to_string()))
+            Some(raise_if(mode, span, cond, "refute failed".to_string()))
         }
         "assert_nil" if !args.is_empty() => {
             let val = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, val, "nil?", vec![])),
                 "assert_nil failed".to_string(),
@@ -309,7 +345,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         }
         "assert_not_nil" | "refute_nil" if !args.is_empty() => {
             let val = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, val, "nil?", vec![]),
                 "refute_nil failed".to_string(),
@@ -317,7 +353,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         }
         "assert_empty" if !args.is_empty() => {
             let coll = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, coll, "empty?", vec![])),
                 "assert_empty failed".to_string(),
@@ -325,7 +361,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         }
         "assert_not_empty" | "refute_empty" if !args.is_empty() => {
             let coll = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, coll, "empty?", vec![]),
                 "refute_empty failed".to_string(),
@@ -334,7 +370,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "assert_includes" if args.len() >= 2 => {
             let coll = args[0].clone();
             let item = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, coll, "include?", vec![item])),
                 "assert_includes failed".to_string(),
@@ -343,7 +379,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "refute_includes" | "assert_not_includes" if args.len() >= 2 => {
             let coll = args[0].clone();
             let item = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, coll, "include?", vec![item]),
                 "refute_includes failed".to_string(),
@@ -353,7 +389,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
             // `assert_kind_of Klass, x` — order matches Minitest (class first).
             let klass = args[0].clone();
             let val = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, val, "is_a?", vec![klass])),
                 "assert_kind_of failed".to_string(),
@@ -371,7 +407,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "assert_same" if args.len() >= 2 => {
             let expected = args[0].clone();
             let actual = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, expected, "equal?", vec![actual])),
                 "assert_same failed".to_string(),
@@ -380,7 +416,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "assert_not_same" | "refute_same" if args.len() >= 2 => {
             let expected = args[0].clone();
             let actual = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, expected, "equal?", vec![actual]),
                 "assert_not_same failed".to_string(),
@@ -389,7 +425,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         "assert_instance_of" if args.len() >= 2 => {
             let klass = args[0].clone();
             let val = args[1].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, val, "instance_of?", vec![klass])),
                 "assert_instance_of failed".to_string(),
@@ -416,9 +452,9 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
             let val = args[1].clone();
             let found = send_method(span, val, "include?", vec![needle]);
             Some(if method.as_str() == "assert_match" {
-                raise_if(span, not_expr(span, found), "assert_match failed".to_string())
+                raise_if(mode, span, not_expr(span, found), "assert_match failed".to_string())
             } else {
-                raise_if(span, found, "assert_no_match failed".to_string())
+                raise_if(mode, span, found, "assert_no_match failed".to_string())
             })
         }
         "assert_predicate" if args.len() >= 2 => {
@@ -429,7 +465,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
                 _ => return None,
             };
             let obj = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 not_expr(span, send_method(span, obj, &sym, vec![])),
                 "assert_predicate failed".to_string(),
@@ -442,7 +478,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
                 _ => return None,
             };
             let obj = args[0].clone();
-            Some(raise_if(
+            Some(raise_if(mode, 
                 span,
                 send_method(span, obj, &sym, vec![]),
                 "refute_predicate failed".to_string(),
@@ -453,13 +489,13 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         // assertion, one fewer letter — recognized here rather than in
         // a second lowering, so the two cannot diverge.
         "assert_raises" | "assert_raise" if !args.is_empty() => {
-            lower_assert_raises(span, args, block.as_ref())
+            lower_assert_raises(span, args, block.as_ref(), mode)
         }
         "assert_throws" if !args.is_empty() => {
-            lower_assert_throws(span, &args[0], block.as_ref())
+            lower_assert_throws(span, &args[0], block.as_ref(), mode)
         }
         "assert_difference" | "assert_no_difference" => {
-            lower_difference(span, method.as_str(), args, block.as_ref())
+            lower_difference(span, method.as_str(), args, block.as_ref(), mode)
         }
         _ => None,
     }
@@ -480,7 +516,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
 /// assert_match(/foo/, err.message)`. The expected-class arg(s)
 /// become the `rescue` classes. Non-block call bails — leaves the
 /// Send in place for the typer to surface.
-fn lower_assert_raises(span: Span, args: &[Expr], block: Option<&Expr>) -> Option<Expr> {
+fn lower_assert_raises(span: Span, args: &[Expr], block: Option<&Expr>, mode: AssertionMode) -> Option<Expr> {
     let block_body = match block.map(|b| &*b.node) {
         Some(ExprNode::Lambda { body, .. }) => body.clone(),
         _ => return None,
@@ -530,7 +566,7 @@ fn lower_assert_raises(span: Span, args: &[Expr], block: Option<&Expr>) -> Optio
             implicit: false,
         },
     );
-    let check = raise_if(
+    let check = raise_if(mode, 
         span,
         send_method(
             span,
@@ -554,7 +590,7 @@ fn lower_assert_raises(span: Span, args: &[Expr], block: Option<&Expr>) -> Optio
             ExprNode::Lit { value: Literal::Regex { .. } } => send_method(span, m.clone(), "match?", vec![message()]),
             _ => return None,
         };
-        Some(raise_if(span, send_method(span, hit, "!", vec![]), "assert_raises failed".to_string()))
+        Some(raise_if(mode, span, send_method(span, hit, "!", vec![]), "assert_raises failed".to_string()))
     });
     // Final expr in the Seq is the caught exception — gives the
     // surrounding `err = assert_raises(...) { ... }` its value.
@@ -610,7 +646,7 @@ fn lower_assert_raises(span: Span, args: &[Expr], block: Option<&Expr>) -> Optio
 /// campfire's Opengraph fetch tests assert that a resolved IP — never
 /// the hostname — is what gets connected to, and they prove it by
 /// making the mocked `TCPSocket.open` throw.
-fn lower_assert_throws(span: Span, tag: &Expr, block: Option<&Expr>) -> Option<Expr> {
+fn lower_assert_throws(span: Span, tag: &Expr, block: Option<&Expr>, mode: AssertionMode) -> Option<Expr> {
     let block_body = match block.map(|b| &*b.node) {
         Some(ExprNode::Lambda { body, .. }) => body.clone(),
         _ => return None,
@@ -663,7 +699,7 @@ fn lower_assert_throws(span: Span, tag: &Expr, block: Option<&Expr>) -> Option<E
             value: catch_call,
         },
     );
-    let check = raise_if(
+    let check = raise_if(mode, 
         span,
         not_expr(span, Expr::new(span, ExprNode::Var { id: VarId(0), name: thrown.clone() })),
         "assert_throws failed".to_string(),
@@ -702,8 +738,9 @@ fn lower_difference(
     method: &str,
     args: &[Expr],
     block: Option<&Expr>,
+    mode: AssertionMode,
 ) -> Option<Expr> {
-    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block)?;
+    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block, mode)?;
     // Inline block body — flatten if it's already a Seq so the
     // outer Seq stays single-level.
     let mut stmts: Vec<Expr> = vec![before_assign];
@@ -729,8 +766,9 @@ fn lower_difference_value(
     method: &str,
     args: &[Expr],
     block: Option<&Expr>,
+    mode: AssertionMode,
 ) -> Option<Expr> {
-    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block)?;
+    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block, mode)?;
     let value_name = Symbol::from("__diff_value");
     let block_value = match &*block_body.node {
         ExprNode::Seq { .. } => Expr::new(
@@ -768,6 +806,7 @@ fn difference_parts(
     method: &str,
     args: &[Expr],
     block: Option<&Expr>,
+    mode: AssertionMode,
 ) -> Option<(Expr, Expr, Expr, Expr)> {
     if args.is_empty() {
         return None;
@@ -823,7 +862,7 @@ fn difference_parts(
         vec![Expr::new(span, ExprNode::Lit { value: Literal::Int { value: delta } })],
     );
     let msg = format!("{} didn't change by {}", expr_str, delta);
-    let check = raise_if(span, mismatch, msg);
+    let check = raise_if(mode, span, mismatch, msg);
     Some((before_assign, block_body, after_assign, check))
 }
 
@@ -870,13 +909,23 @@ fn parse_const_dot_method(s: &str, span: Span) -> Option<Expr> {
 /// Ruby emitter recognizes — single-statement then-branch with empty
 /// else collapses to `then if cond`. So we put the Raise in the
 /// then-branch and the inverted condition in `cond`.
-fn raise_if(span: Span, cond: Expr, msg: String) -> Expr {
-    let raise = Expr::new(
-        span,
-        ExprNode::Raise {
-            value: Expr::new(span, ExprNode::Lit { value: Literal::Str { value: msg } }),
-        },
-    );
+///
+/// Under `Minitest` the raised value is `flunk("msg")`: Minitest's own
+/// failure, which raises `Minitest::Assertion` before `raise` is reached,
+/// as a failing Rails assertion does, so the runner reports a failure,
+/// not an error. The `Raise` node stays, so the branch still diverges.
+fn raise_if(mode: AssertionMode, span: Span, cond: Expr, msg: String) -> Expr {
+    let mut value = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: msg } });
+    if mode == AssertionMode::Minitest {
+        value = Expr::new(span, ExprNode::Send {
+            recv: None,
+            method: Symbol::from("flunk"),
+            args: vec![value],
+            block: None,
+            parenthesized: true,
+        });
+    }
+    let raise = Expr::new(span, ExprNode::Raise { value });
     Expr::new(
         span,
         ExprNode::If {

@@ -7759,18 +7759,21 @@ fn assertions_inside_a_destructured_block_run_where_they_are_written() {
 /// A failing assertion inside that block fails the test and stops what
 /// follows it, inside the block and after it — the effect count is the
 /// native run's. A raw Minitest call would instead raise NoMethodError
-/// before any assertion is checked.
+/// before any assertion is checked. The CRuby tree runs Minitest's own
+/// assertions, so the failure reads as Minitest's; the Rails assertion
+/// it lowers (`assert_difference`) still fails, not errors, through
+/// `flunk`.
 #[test]
 fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
     let cases = [
-        ("false", "assertion failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      assert false\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("mismatch", "assert_equal failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("ensure", "assertion failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("own_fail", "assert_equal failed", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("plain_fail", "assert_equal failed", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
-        ("branch_fail", "assert_equal failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("class_method", "assert_equal failed", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
-        ("diff_bind_fail", "assert_equal failed", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
+        ("false", "Expected false to be truthy.", 0, "  test \"t\" do\n    out, err = capture_io do\n      assert false\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("mismatch", "Expected: 1\n  Actual: 2", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("ensure", "Expected false to be truthy.", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("own_fail", "Expected: \"QUIET\"\n  Actual: \"quiet\"", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("plain_fail", "Expected: 1\n  Actual: 2", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
+        ("branch_fail", "Expected: 1\n  Actual: 2", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("class_method", "Expected: 1\n  Actual: 2", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
+        ("diff_bind_fail", "Expected: 0\n  Actual: 5", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
         ("diff_delta_fail", "Widget.hits didn't change by 2", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      [5, 6]\n    end\n    Widget.hit\n  end\n"),
     ];
     for (name, failure, hits, members) in cases {

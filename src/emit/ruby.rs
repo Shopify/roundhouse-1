@@ -810,6 +810,13 @@ fn jbuilder_view_output_path(view_name: &str) -> PathBuf {
 /// which would have CRuby double-run every test if combined with the
 /// shim).
 pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
+    emit_with_assertions(app, crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline)
+}
+
+pub fn emit_with_assertions(
+    app: &App,
+    assertion_mode: crate::lower::test_module_to_library::inline_assertions::AssertionMode,
+) -> Vec<EmittedFile> {
     let mut files = Vec::new();
     files.extend(emit_lowered_schema_pair(app));
     // routes.rb gets a require-relative header prepended (see
@@ -1025,12 +1032,13 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
             .map(|lc| (lc.name.clone(), crate::lower::class_info_from_library_class(lc)))
             .chain(model_registry)
             .collect();
-        let mut test_lowered = crate::lower::lower_test_modules_with_inner(
+        let mut test_lowered = crate::lower::test_module_to_library::lower_test_modules_with_assertions(
             &app.test_modules,
             &app.fixtures,
             &app.models,
             fixture_extras,
             &crate::lower::routes::helper_id_segments(app),
+            assertion_mode,
         );
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,
@@ -1269,7 +1277,10 @@ pub fn emit_spinel(app: &App) -> Vec<EmittedFile> {
             // files; a driver there would report on it once per require.
             let is_bare_base = test_parents.contains(class_name)
                 && lowered.test_class.methods.iter().all(|m| !m.name.as_str().starts_with("test_"));
-            if !is_bare_base {
+            let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
+            if !is_bare_base && minitest {
+                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &reset_lines));
+            } else if !is_bare_base {
                 emitted.content.push_str(&render_autorun_shim(&lc_for_emit, &reset_lines));
             }
             let rbs_path = emitted.path.clone();
@@ -1371,6 +1382,18 @@ fn rbs_only_from_funcs(
 /// against the test); `teardown` runs outside it so it fires whether
 /// or not the body raised, and a raise from teardown itself still
 /// aborts the file rather than being swallowed.
+fn render_minitest_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
+    let methods: Vec<String> = lc.methods.iter()
+        .filter(|m| matches!(m.receiver, MethodReceiver::Instance) && m.name.as_str().starts_with("test_"))
+        .map(|m| format!("{:?}", m.name.as_str())).collect();
+    let mut s = format!("\nRoundhouseTestRunner.run({}, [{}]) do\n", lc.name.0, methods.join(", "));
+    for line in reset_lines {
+        writeln!(s, "  {line}").unwrap();
+    }
+    s.push_str("end\n");
+    s
+}
+
 fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
     let class_name = lc.name.0.as_str();
     let test_methods: Vec<&str> = lc
