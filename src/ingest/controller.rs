@@ -204,6 +204,12 @@ pub(super) fn ingest_controller_with_nesting(
                         let mut blank = leading_blank;
                         let items = methods
                             .into_iter()
+                            .map(|mut method| {
+                                // A controller class side does not admit
+                                // `*`; keep the slot out, as before.
+                                method.params.retain(|p| !p.is_nameless_rest());
+                                method
+                            })
                             .map(|method| ControllerBodyItem::ClassMethod {
                                 configuration_slot: None,
                                 configuration_role: None,

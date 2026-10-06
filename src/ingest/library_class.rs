@@ -1045,30 +1045,40 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// written, so the emitted `def` keeps Ruby's arity with no binding.
 /// A module's methods are copied into whatever includes it, and a
 /// class-side `def self.m(*)` into other carriers, which are not shown
-/// to keep it, so those stay refused. So does a body that passes the
-/// rest on, by a bare `*` (ingested as a splat of nil, which would pass
-/// nothing) or an implicit `super` (which passes it implicitly).
+/// to keep it, so those stay refused. So does a method that passes the
+/// rest on (`source_passes_rest_on`): ingest keeps no slot for it.
+/// Lowerings that copy the parameters into a generated method (job and
+/// mailer wrappers) refuse it themselves.
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
             && m.receiver == MethodReceiver::Instance
             && m.params.iter().any(Param::is_nameless_rest)
-            && !passes_rest_on(&m.body)
         {
             m.unsupported_formals = None;
         }
     }
 }
 
-fn passes_rest_on(e: &Expr) -> bool {
-    let here = match &*e.node {
-        ExprNode::Splat { value } => matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) && value.span.is_synthetic(),
-        ExprNode::Super { args: None } => true,
-        _ => false,
-    };
-    let mut found = here;
-    e.node.for_each_child(&mut |c| found |= passes_rest_on(c));
-    found
+/// A bare `*` (`f(*)`, `[*]`) or an implicit `super` anywhere in the
+/// written def, parameters included. Read off the source, not the IR:
+/// IR ingests a bare `*` as a splat of nil, and drops some positions
+/// outright (a block parameter's default).
+fn source_passes_rest_on(def: &ruby_prism::DefNode<'_>) -> bool {
+    struct Uses(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Uses {
+        fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+            self.0 |= node.expression().is_none();
+            ruby_prism::visit_splat_node(self, node);
+        }
+        fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            self.0 = true;
+            ruby_prism::visit_forwarding_super_node(self, node);
+        }
+    }
+    let mut uses = Uses(false);
+    ruby_prism::Visit::visit(&mut uses, &def.as_node());
+    uses.0
 }
 
 /// Same as `library_class_from_node` but for module-as-namespace
@@ -2160,7 +2170,7 @@ pub(super) fn ingest_library_method(
                     if let Ok(s) = std::str::from_utf8(loc.as_slice()) {
                         params.push(Param::rest(Symbol::from(s)));
                     }
-                } else {
+                } else if !source_passes_rest_on(def) {
                     // `*`: the slot is kept for arity, but stays
                     // refused (`unsupported_formals`) unless the
                     // context admits it (`admit_nameless_rest`).
