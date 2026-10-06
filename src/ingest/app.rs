@@ -464,7 +464,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             match classify_class_file(&source, &model_bases) {
                 Some(ClassKind::Model) | None => {
                     if let Some(maybe_model) =
-                        unwrap_or_record(ingest_model_with_enum_constants(
+                        survey::unwrap_or_drop_file(ingest_model_with_enum_constants(
                             &source, &path_str, &app.schema, &table_prefixes, &enum_constants,
                             &model_bases,
                         ))?
@@ -479,7 +479,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             let outer = model.name.clone();
                             app.models.push(model);
                             if let Some(classes) =
-                                unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                                survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                             {
                                 let nested = nested_under(&outer, classes);
                                 let (concern_items, concern_enum_decls) =
@@ -502,7 +502,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     // just PORO classes. The singular path uses
                     // find_first_class and would drop a module.
                     if let Some(classes) =
-                        unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                        survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                     {
                         app.library_classes.extend(classes);
                         // Concern modules (app/models/concerns/…) also
@@ -653,7 +653,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 Ok(classes) => app.library_classes.extend(classes),
                 Err(err) => {
                     if survey::is_active() {
-                        survey::record(&err);
+                        survey::record_dropped_file(&err);
                     }
                 }
             }
@@ -743,7 +743,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     }
                     Err(err) => {
                         if survey::is_active() {
-                            survey::record(&err);
+                            survey::record_dropped_file(&err);
                         }
                     }
                 }
@@ -1172,7 +1172,7 @@ end
             let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
             let path_str = entry.display().to_string();
             if let Some(maybe_controller) =
-                unwrap_or_record(ingest_controller_with_nesting(&source, &path_str))?
+                survey::unwrap_or_drop_file(ingest_controller_with_nesting(&source, &path_str))?
             {
                 if let Some((controller, nesting)) = maybe_controller {
                     controller_nesting.insert(controller.name.clone(), nesting);
@@ -1200,7 +1200,7 @@ end
                     // controller's body is its own class, registered
                     // from this file by the library ingest.
                     if let Some(classes) =
-                        unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                        survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                     {
                         app.library_classes.extend(nested_under(&outer, classes));
                     }
@@ -1213,7 +1213,7 @@ end
                     // resolve into it, and capture its `included do`
                     // filter declarations for every includer's chain.
                     if let Some(classes) =
-                        unwrap_or_record(ingest_library_classes(&source, &path_str))?
+                        survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                     {
                         app.library_classes.extend(classes);
                         app.concern_filters
@@ -1857,6 +1857,7 @@ end
     // pass may append source-backed FileIds beyond the indexed snapshot.
     let late_sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&[], &late_sources);
+    app.dropped_files = survey::dropped_files();
     Ok(app)
 }
 
@@ -6349,7 +6350,7 @@ fn ingest_test_helper_modules<V: Vfs + ?Sized>(
     for entry in read_rb_files(vfs, &helpers_dir)? {
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
         let Some(classes) =
-            unwrap_or_record(ingest_library_classes(&source, &entry.display().to_string()))?
+            survey::unwrap_or_drop_file(ingest_library_classes(&source, &entry.display().to_string()))?
         else {
             continue;
         };

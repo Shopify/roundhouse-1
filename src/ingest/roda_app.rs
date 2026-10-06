@@ -139,7 +139,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
     if vfs.is_dir(&models_dir) {
         for entry in read_rb_files(vfs, &models_dir)? {
             let source = vfs.read(&entry)?;
-            if let Some(maybe_model) = unwrap_or_record(ingest_sequel_model(
+            if let Some(maybe_model) = survey::unwrap_or_drop_file(ingest_sequel_model(
                 &source,
                 &entry.display().to_string(),
                 &app.schema,
@@ -244,6 +244,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
 
     app.sources = super::sources::drain();
     app.root = dir.display().to_string().trim_end_matches('/').to_string();
+    app.dropped_files = survey::dropped_files();
     Ok(app)
 }
 

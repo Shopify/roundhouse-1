@@ -445,6 +445,13 @@ pub struct App {
     /// The analyzer resolves the sources itself when this is absent.
     #[serde(skip)]
     pub const_resolver: crate::analyze::PreparedConstResolver,
+    /// Source files whose class ingest failed under survey mode, with
+    /// the gap that failed each, in record order: the classes, modules
+    /// and constants that ingest would have registered from the file
+    /// are not in the IR. Gap attribution names the gap behind a
+    /// reference to one of them. Empty outside survey mode.
+    #[serde(skip)]
+    pub dropped_files: Vec<crate::ingest::survey::DroppedFile>,
     /// Ingested source apps cannot enter the standalone IR-only analyzer mode
     /// if a caller drops their source table. Persisted across serialization.
     #[serde(default)]
@@ -776,6 +783,7 @@ impl App {
             controller_resolutions: HashMap::new(),
             sources: Vec::new(),
             const_resolver: Default::default(),
+            dropped_files: Vec::new(),
             source_index_required: false,
             root: String::new(),
             app_roots: Vec::new(),

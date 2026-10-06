@@ -382,6 +382,30 @@ impl ConstResolver {
             })
     }
 
+    /// The full declaration name a written constant resolves to, and
+    /// whether that declaration is a value rather than a namespace.
+    pub(crate) fn resolved_name(&self, span: Span, path: &[Symbol]) -> Option<(&ClassId, bool)> {
+        match self.reference(span, path)?? {
+            ResolvedConstant::Namespace { class, .. } => Some((class, false)),
+            ResolvedConstant::Value { name, .. } => Some((name, true)),
+        }
+    }
+
+    /// Full names of the classes and modules that `file` opens with
+    /// `class` or `module`.
+    pub(crate) fn class_definitions(&self, file: FileId) -> impl Iterator<Item = &str> {
+        self.file(file)
+            .into_iter()
+            .flat_map(|file| file.class_definitions.iter().map(AsRef::as_ref))
+    }
+
+    /// Full names of the constants that `file` assigns.
+    pub(crate) fn constant_definitions(&self, file: FileId) -> impl Iterator<Item = &str> {
+        self.file(file)
+            .into_iter()
+            .flat_map(|file| file.constant_classes.values().map(|name| name.0.as_str()))
+    }
+
     pub(crate) fn is_runtime_class(&self, span: Span, path: &[Symbol], name: &str) -> bool {
         matches!(self.reference(span, path),
             Some(Some(ResolvedConstant::Namespace { class, runtime: true }))

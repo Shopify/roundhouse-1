@@ -38,16 +38,24 @@
 //! `UndefinedFilterTarget`) are eligible; `Parse` (a real syntax
 //! error), `Unsupported` (already a tool statement), and
 //! `GradualUntyped` (author-signed) never move.
+//!
+//! A `constant` refusal keeps its error severity — the reference cannot
+//! compile — but when it names a definition that a failed per-file
+//! class ingest left out of the IR ([`App::dropped_files`]), it gains
+//! the definition's file and the gap that failed it.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::expr::Expr;
-use crate::ident::ClassId;
-use crate::ingest::{survey, IngestError};
+use crate::ident::{ClassId, Symbol};
+use crate::ingest::survey::{self, DroppedFile};
+use crate::ingest::IngestError;
 use crate::span::FileId;
 use crate::ty::Ty;
+
+use super::body::ConstResolver;
 
 mod gem_ancestry;
 mod generated_methods;
@@ -94,7 +102,8 @@ pub fn attribute_analysis_gaps(diags: &mut [Diagnostic], app: &App, gaps: &mut V
     }
 }
 
-/// Downgrade diagnostics attributable to `gaps` (see module docs).
+/// Downgrade diagnostics attributable to `gaps`, and name the gap behind
+/// each `constant` refusal of a dropped definition (see module docs).
 /// No-op when `gaps` is empty — strict-mode callers can pass through
 /// unconditionally.
 pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[IngestError]) {
@@ -102,7 +111,18 @@ pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[Ingest
         return;
     }
     let ctx = AttributionCtx::build(app, gaps);
+    let resolver = (!app.dropped_files.is_empty() && diags.iter().any(is_constant_refusal))
+        .then(|| app.const_resolver.for_sources(&app.sources));
+    let dropped = resolver.as_deref().map(|resolver| DroppedDefinitions::build(app, resolver));
     for d in diags {
+        if is_constant_refusal(d) {
+            if let Some(cause) = dropped.as_ref().and_then(|dropped| dropped.cause_for(d)) {
+                if !d.message.contains(&cause) {
+                    d.message.push_str(&cause);
+                }
+            }
+            continue;
+        }
         if !eligible(&d.kind) {
             continue;
         }
@@ -113,6 +133,90 @@ pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[Ingest
                 cause
             ));
         }
+    }
+}
+
+fn is_constant_refusal(d: &Diagnostic) -> bool {
+    matches!(&d.kind,
+        DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "constant")
+}
+
+/// The definitions that failed per-file class ingests left out of the IR,
+/// by full name, so a `constant` refusal can name the gap behind it.
+struct DroppedDefinitions<'a> {
+    resolver: &'a ConstResolver,
+    /// Full class, module or constant name → the dropped file defining
+    /// it. A name that several dropped files define takes the first in
+    /// source order.
+    by_name: HashMap<&'a str, DroppedDefinition<'a>>,
+    /// Names of the models, controllers and library classes in the IR.
+    ingested: HashSet<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct DroppedDefinition<'a> {
+    /// App-root relative.
+    path: &'a str,
+    drop: &'a DroppedFile,
+    /// The IR holds none of the file's classes or modules, so its
+    /// top-level constants went with them.
+    whole_file: bool,
+}
+
+impl<'a> DroppedDefinitions<'a> {
+    fn build(app: &'a App, resolver: &'a ConstResolver) -> Self {
+        let ingested: HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str())
+            .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+            .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+            .collect();
+        let mut drops: HashMap<&str, &DroppedFile> = HashMap::new();
+        for drop in &app.dropped_files {
+            drops.entry(drop.file.as_str()).or_insert(drop);
+        }
+        let mut by_name = HashMap::new();
+        for (i, source) in app.sources.iter().enumerate() {
+            let Some(drop) = drops.get(source.path.as_str()).copied() else { continue };
+            let file = FileId(i as u32 + 1);
+            let path = source.path.strip_prefix(&app.root)
+                .map_or(source.path.as_str(), |rel| rel.trim_start_matches('/'));
+            let whole_file = !resolver.class_definitions(file).any(|name| ingested.contains(name));
+            let dropped = DroppedDefinition { path, drop, whole_file };
+            for name in resolver.class_definitions(file).chain(resolver.constant_definitions(file)) {
+                by_name.entry(name).or_insert(dropped);
+            }
+        }
+        DroppedDefinitions { resolver, by_name, ingested }
+    }
+
+    /// For a `constant` refusal that resolves to a definition a dropped
+    /// file holds and the IR lacks — the class itself, or a value's
+    /// lexical owner — the text naming that file and its gap.
+    fn cause_for(&self, d: &Diagnostic) -> Option<String> {
+        let DiagnosticKind::Unsupported { detail, .. } = &d.kind else { return None };
+        // Other constant refusals carry a sentence, not the written path.
+        let path: Vec<Symbol> = detail.split("::").map(Symbol::from).collect();
+        if path.iter().any(|segment| {
+            segment.as_str().is_empty()
+                || !segment.as_str().chars().all(|c| c.is_alphanumeric() || c == '_')
+        }) {
+            return None;
+        }
+        let (name, value) = self.resolver.resolved_name(d.span, &path)?;
+        let name = name.0.as_str();
+        let dropped = self.by_name.get(name)?;
+        // A definition the IR holds was compiled — from another file, or
+        // by an ingest that kept the outer class — so the refusal has
+        // another cause.
+        let compiled = match (value, name.rsplit_once("::")) {
+            (false, _) => self.ingested.contains(name),
+            (true, Some((owner, _))) => self.ingested.contains(owner),
+            (true, None) => !dropped.whole_file,
+        };
+        (!compiled).then(|| format!(
+            " — dropped by ingest gap: {name} is defined in {} but was not compiled: {}",
+            dropped.path,
+            survey::bucket_message(&dropped.drop.message),
+        ))
     }
 }
 

@@ -26,7 +26,24 @@ use std::cell::RefCell;
 use super::{IngestError, IngestResult};
 
 thread_local! {
-    static SURVEY_STATE: RefCell<Option<Vec<IngestError>>> = const { RefCell::new(None) };
+    static SURVEY_STATE: RefCell<Option<Survey>> = const { RefCell::new(None) };
+}
+
+/// The per-thread collector: every recorded gap, and the subset of
+/// them that failed a per-file class ingest.
+#[derive(Default)]
+struct Survey {
+    gaps: Vec<IngestError>,
+    dropped: Vec<DroppedFile>,
+}
+
+/// A per-file class ingest that failed in survey mode: the classes,
+/// modules and constants it would have registered from `file` are not
+/// in the IR. `message` is the recorded gap that failed it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DroppedFile {
+    pub file: String,
+    pub message: String,
 }
 
 /// Activate survey mode for the current thread. Subsequent
@@ -34,7 +51,7 @@ thread_local! {
 /// return a placeholder Expr instead of aborting. Calling again
 /// resets the collector.
 pub fn activate() {
-    SURVEY_STATE.with(|s| *s.borrow_mut() = Some(Vec::new()));
+    SURVEY_STATE.with(|s| *s.borrow_mut() = Some(Survey::default()));
 }
 
 /// True when survey mode is active on the calling thread.
@@ -45,10 +62,16 @@ pub fn is_active() -> bool {
 /// Probe with the same strict/survey parsing semantics, without publishing
 /// duplicate errors. Preserve all entries recorded before the probe.
 pub(super) fn without_recording<T>(f: impl FnOnce() -> T) -> T {
-    let length = SURVEY_STATE.with(|s| s.borrow().as_ref().map(Vec::len));
+    let lengths = SURVEY_STATE
+        .with(|s| s.borrow().as_ref().map(|survey| (survey.gaps.len(), survey.dropped.len())));
     let result = f();
-    if let Some(length) = length {
-        SURVEY_STATE.with(|s| s.borrow_mut().as_mut().unwrap().truncate(length));
+    if let Some((gaps, dropped)) = lengths {
+        SURVEY_STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            let survey = state.as_mut().unwrap();
+            survey.gaps.truncate(gaps);
+            survey.dropped.truncate(dropped);
+        });
     }
     result
 }
@@ -69,14 +92,30 @@ pub(super) fn continue_or_fail(err: IngestError) -> IngestResult<()> {
 /// survey mode isn't active (so callers can record unconditionally).
 pub fn record(err: &IngestError) {
     SURVEY_STATE.with(|s| {
-        if let Some(buf) = s.borrow_mut().as_mut() {
+        if let Some(survey) = s.borrow_mut().as_mut() {
             // IngestError doesn't implement Clone (std::io::Error has
             // no clone), but every variant we care about does — flatten
             // to a string-shaped Unsupported so the collector entries
             // are uniform and Clone-able by downstream printers.
-            buf.push(IngestError::Unsupported {
+            survey.gaps.push(IngestError::Unsupported {
                 file: err_file(err).to_string(),
                 message: err_message(err).to_string(),
+            });
+        }
+    });
+}
+
+/// [`record`] a gap that failed a per-file class ingest, and note
+/// it as the cause that left the file's definitions out of the IR. A
+/// gap the ingester absorbs (a `nil` placeholder, a skipped item) is a
+/// plain [`record`]. No-op if survey mode isn't active.
+pub(super) fn record_dropped_file(err: &IngestError) {
+    record(err);
+    SURVEY_STATE.with(|s| {
+        if let Some(survey) = s.borrow_mut().as_mut() {
+            survey.dropped.push(DroppedFile {
+                file: err_file(err).to_string(),
+                message: err_message(err),
             });
         }
     });
@@ -87,15 +126,21 @@ pub fn recorded() -> Vec<String> {
     SURVEY_STATE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|errors| errors.iter().map(|err| err.to_string()).collect())
+            .map(|survey| survey.gaps.iter().map(|err| err.to_string()).collect())
             .unwrap_or_default()
     })
+}
+
+/// Files whose class ingest failed so far, in record order, without
+/// draining survey mode. Empty when survey mode is off.
+pub(super) fn dropped_files() -> Vec<DroppedFile> {
+    SURVEY_STATE.with(|s| s.borrow().as_ref().map(|survey| survey.dropped.clone()).unwrap_or_default())
 }
 
 /// Drain the collector and deactivate survey mode. Returns every
 /// error captured during the active window in record order.
 pub fn drain() -> Vec<IngestError> {
-    SURVEY_STATE.with(|s| s.borrow_mut().take().unwrap_or_default())
+    SURVEY_STATE.with(|s| s.borrow_mut().take().map(|survey| survey.gaps).unwrap_or_default())
 }
 
 fn err_file(err: &IngestError) -> &str {
@@ -125,6 +170,19 @@ pub fn unwrap_or_record<T>(result: super::IngestResult<T>) -> super::IngestResul
         Ok(v) => Ok(Some(v)),
         Err(err) if is_active() => {
             record(&err);
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// [`unwrap_or_record`] for a per-file class ingest: a failure skips
+/// the file's classes, so it records as [`record_dropped_file`].
+pub(super) fn unwrap_or_drop_file<T>(result: super::IngestResult<T>) -> super::IngestResult<Option<T>> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(err) if is_active() => {
+            record_dropped_file(&err);
             Ok(None)
         }
         Err(err) => Err(err),
@@ -215,8 +273,12 @@ pub fn render_report(errors: &[IngestError]) -> String {
 }
 
 pub fn bucket_key(err: &IngestError) -> String {
-    let msg = err_message(err);
-    let trimmed = msg.split('(').next().unwrap_or(&msg);
+    bucket_message(&err_message(err))
+}
+
+/// [`bucket_key`] of a recorded gap message.
+pub fn bucket_message(msg: &str) -> String {
+    let trimmed = msg.split('(').next().unwrap_or(msg);
     // Strip trailing whitespace introduced by the split + truncate to
     // a reasonable display width.
     // By CHARACTERS, not bytes: a byte slice through a multi-byte
