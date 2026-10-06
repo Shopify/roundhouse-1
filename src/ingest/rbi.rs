@@ -154,6 +154,13 @@ fn declared_name(scope: Option<&str>, path: &Node<'_>) -> String {
     if cbase { written } else { qualify(scope, &written) }
 }
 
+/// Whether `gem` is named after `class`'s top-level namespace, ignoring
+/// case, `_` and `-` (`country_db` and `CountryDb`).
+fn gem_names_namespace(gem: &str, class: &str) -> bool {
+    let fold = |s: &str| s.chars().filter(|c| !matches!(c, '_' | '-')).collect::<String>().to_ascii_lowercase();
+    class.split("::").next().is_some_and(|top| fold(gem) == fold(top))
+}
+
 impl Reader<'_> {
     fn class_entry(&mut self, name: &str, is_module: bool) -> &mut GemClass {
         let gem = self.gem;
@@ -161,10 +168,18 @@ impl Reader<'_> {
         if entry.gem.is_empty() {
             entry.gem = gem.to_string();
             entry.is_module = is_module;
-        } else if !crate::project::ruby_tree_loads_gem(&entry.gem) && crate::project::ruby_tree_loads_gem(gem) {
-            // Two gems declare it (ci-queue reopens minitest's
-            // `Minitest::Result`); either one loaded defines it.
-            entry.gem = gem.to_string();
+        } else {
+            // Two gems declare it. Either one loaded defines it (ci-queue
+            // reopens minitest's `Minitest::Result`); otherwise the gem
+            // named after its namespace does (hedwig reopens redis's
+            // `Redis::CommandError`).
+            let loaded = crate::project::ruby_tree_loads_gem;
+            let (held, offered) = (loaded(&entry.gem), loaded(gem));
+            if (offered && !held)
+                || (offered == held && !gem_names_namespace(&entry.gem, name) && gem_names_namespace(gem, name))
+            {
+                entry.gem = gem.to_string();
+            }
         }
         entry
     }
