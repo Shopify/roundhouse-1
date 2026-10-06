@@ -4007,6 +4007,35 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
             return;
         }
+        // Only the Ruby-family trees ship the Duration value class
+        // (`runtime/spinel/active_support_duration.rb` and the CRuby
+        // overlay twin) that `30.minutes` grounds to and a declared
+        // `#: ActiveSupport::Duration` names.
+        if !matches!(target, "jruby" | "spinel") {
+            let names_duration = |ty: &crate::ty::Ty| {
+                let found = std::cell::Cell::new(false);
+                ty.map_class_ids(&|id| {
+                    found.set(found.get() || id.0.as_str() == "ActiveSupport::Duration");
+                    id.clone()
+                });
+                found.get()
+            };
+            let duration = match &*expr.node {
+                crate::expr::ExprNode::Const { path } => {
+                    path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport", "Duration"])
+                }
+                crate::expr::ExprNode::Cast { target_ty, .. } => names_duration(target_ty),
+                _ => false,
+            };
+            if duration && !app.library_classes.iter().any(|class| class.name.0.as_str() == "ActiveSupport::Duration") {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "duration",
+                    format!("ActiveSupport::Duration is the Ruby-family runtime's value class; the {target} runtime ships none"),
+                );
+            }
+        }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 let cruby_sqlite3 = matches!(id.0.as_str(),
