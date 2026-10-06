@@ -65,6 +65,26 @@ module ActiveSupport
   class LogSubscriber < Subscriber
     LEVEL_CHECKS = [:debug, :info, :error].freeze
 
+    # `mattr_accessor :colorize_logging, default: true`: one value shared by
+    # every subclass and instance.
+    @@colorize_logging = true
+
+    def self.colorize_logging
+      @@colorize_logging
+    end
+
+    def self.colorize_logging=(value)
+      @@colorize_logging = value
+    end
+
+    def colorize_logging
+      @@colorize_logging
+    end
+
+    def colorize_logging=(value)
+      @@colorize_logging = value
+    end
+
     class << self
       attr_writer :logger
 

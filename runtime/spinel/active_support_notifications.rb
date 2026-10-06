@@ -119,8 +119,32 @@ module ActiveSupport
       end
     end
 
+    # Bound to one notifier for its lifetime, as in ActiveSupport: a caller
+    # that keeps an instrumenter keeps publishing to that notifier even after
+    # `Notifications.notifier` is replaced.
+    class Instrumenter
+      attr_reader :id
+
+      def initialize(notifier)
+        @notifier = notifier
+        @id = SecureRandom.hex(10)
+      end
+
+      def instrument(name, payload = {}, &block)
+        @notifier.instrument(name, payload, &block)
+      end
+    end
+
     class << self
       attr_accessor :notifier
+
+      # One instrumenter per notifier per thread (ActiveSupport keeps this
+      # registry in IsolatedExecutionState, thread-scoped by default).
+      def instrumenter
+        registry = Thread.current.thread_variable_get(:roundhouse_notifications_registry) ||
+          Thread.current.thread_variable_set(:roundhouse_notifications_registry, {})
+        registry[notifier] ||= Instrumenter.new(notifier)
+      end
 
       def subscribe(pattern = nil, callback = nil, &block)
         notifier.subscribe(pattern, callback, &block)

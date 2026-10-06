@@ -2608,6 +2608,13 @@ module DatabaseConfiguration
   end
 end
 "#)));
+    // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
+    // test-file requires are not carried, so load it when a test names it.
+    let log_subscriber_test_helper = files.iter().any(|(path, content)| {
+        path.starts_with("test/") && path != "test/test_helper.rb"
+            && content.lines().any(|line| !line.trim_start().starts_with('#')
+                && line.contains("LogSubscriber::TestHelper"))
+    });
     for (path, content) in files.iter_mut() {
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter");
@@ -2632,6 +2639,9 @@ end
             let end = content[start..].find(last)
                 .ok_or("PostgreSQL bootstrap: missing test adapter setup anchor")? + start + last.len();
             content.replace_range(start..end, "require_relative \"../runtime/active_record_postgresql_adapter\"\nrequire_relative \"../runtime/database_configuration\"\nDatabaseConfiguration.configure!");
+            if log_subscriber_test_helper {
+                content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
+            }
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")

@@ -216,10 +216,20 @@ module Db
       end
     end
     if defined?(ActiveSupport::Notifications::Event)
-      ActiveSupport::Notifications.instrument("sql.active_record", sql: sql, name: "SQL", binds: binds.dup) { operation.call }
+      active_record_instrumenter.instrument("sql.active_record", sql: sql, name: "SQL", binds: binds.dup) { operation.call }
     else
       operation.call
     end
+  end
+
+  # Active Record's AbstractAdapter#instrumenter: cached per thread at the
+  # first instrumented statement, so it keeps the notifier current at that
+  # moment (LogSubscriber::TestHelper's swapped notifier does not receive
+  # SQL events from a thread that already ran SQL).
+  def self.active_record_instrumenter
+    Thread.current.thread_variable_get(:roundhouse_active_record_instrumenter) ||
+      Thread.current.thread_variable_set(:roundhouse_active_record_instrumenter,
+        ActiveSupport::Notifications.instrumenter)
   end
 
   def self.unique_violation?(message)

@@ -23,6 +23,17 @@ fn log_subscriber_runtime_preserves_lifecycle_and_log_levels() {
 }
 
 #[test]
+fn log_subscriber_test_helper_keeps_boot_subscribers_on_the_bound_instrumenter() {
+    let result = std::process::Command::new("ruby")
+        .args(["tests/log_subscriber_test_helper_runtime.rb", "emitted"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    assert!(result.status.success(), "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn postgres_driver_preserves_values_database_identity_and_leases() {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
@@ -205,6 +216,8 @@ fn emitted_model_crud_executes_on_postgresql() {
     let runtime_path = serde_json::to_string(&project.0.join("runtime/db.rb")).unwrap();
     let support_path = serde_json::to_string(&project.0.join("runtime/active_support_ext.rb")).unwrap();
     let schema_path = serde_json::to_string(&project.0.join("config/schema.rb")).unwrap();
+    let test_helper_path = serde_json::to_string(
+        &project.0.join("runtime/active_support_log_subscriber_test_helper.rb")).unwrap();
     // Execute the packaged driver, schema, shared framework and model. The
     // authored Core bootstrap is a separate integration still being repaired.
     let script = format!(r##"
@@ -298,6 +311,42 @@ class PostgreSQLRuntimeTest
       PostgreSQLContractSubscriber.detach_from(:active_record)
       logger.close
     end
+    # Core's shape: the subscriber attaches at boot, this thread's
+    # instrumenter is already bound by earlier SQL, then each test swaps in
+    # TestHelper's notifier and MockLogger.
+    require {test_helper_path}
+    log_test = Class.new do
+      include ActiveSupport::LogSubscriber::TestHelper
+      def set_logger(logger)
+        PostgreSQLContractSubscriber.logger = logger
+      end
+      def logged_errors
+        @logger.logged(:error)
+      end
+    end
+    PostgreSQLContractSubscriber.attach_to(:active_record)
+    begin
+      failing = log_test.new
+      failing.setup
+      begin
+        assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM nonexistent_table') }}
+        assert_equal 1, failing.logged_errors.size
+        assert_match(/SQL: SELECT \* FROM nonexistent_table; PG::UndefinedTable/, failing.logged_errors.first)
+      ensure
+        failing.teardown
+      end
+      working = log_test.new
+      working.setup
+      begin
+        ActiveRecord::Base.connection.execute('SELECT 1')
+        assert_equal 0, working.logged_errors.size
+      ensure
+        working.teardown
+      end
+      assert_nil PostgreSQLContractSubscriber.instance_variable_get(:@logger)
+    ensure
+      PostgreSQLContractSubscriber.detach_from(:active_record)
+    end
     first = Entry.create!(Title: "l'été \\ hi", enabled: true)
     second = Entry.create!(Title: "false", enabled: false)
     assert_equal 1, first.id
@@ -376,6 +425,27 @@ fn postgres_project_packages_matching_driver_schema_and_gem() {
         let error = target_files(&app, &fixture, target).unwrap_err();
         assert!(error.contains("postgresql") && error.contains("not substituted"), "{error}");
     }
+}
+
+#[test]
+fn postgres_test_bootstrap_loads_log_subscriber_test_helper_when_a_test_names_it() {
+    use roundhouse::project::{target_files, BuildTarget};
+    const REQUIRE: &str = "require_relative \"../runtime/active_support_log_subscriber_test_helper\"";
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let helper = |app: &roundhouse::app::App| {
+        let files = target_files(app, &fixture, BuildTarget::Ruby).unwrap();
+        assert!(files.iter().any(|(p, _)| p == "runtime/active_support_log_subscriber_test_helper.rb"));
+        files.into_iter().find(|(p, _)| p == "test/test_helper.rb").unwrap().1
+    };
+    let mut app = postgres_model_app();
+    assert!(!helper(&app).contains(REQUIRE));
+    app.test_modules.push(roundhouse::ingest::test::ingest_test_file(
+        b"class EntryLogTest < ActiveSupport::TestCase\n  include ActiveSupport::LogSubscriber::TestHelper\n  test \"quiet\" do\n    assert_equal 0, @logger.logged(:error).size\n  end\nend\n",
+        "test/models/entry_log_test.rb",
+    ).expect("ingest test").expect("test module"));
+    let source = helper(&app);
+    let configured = source.find("DatabaseConfiguration.configure!").expect("configured");
+    assert!(source.find(REQUIRE).expect("helper required") > configured, "{source}");
 }
 
 #[test]
