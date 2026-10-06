@@ -1286,6 +1286,9 @@ pub fn target_files(
     } else {
         files
     };
+    if target != BuildTarget::Blog {
+        report_unsupported_harness_reads(app, target, &files);
+    }
 
     // Blog is the verbatim Rails source — it ships `db/seeds.rb` and is
     // seeded by Rails, so it needs no SQL seed. Every transpile target
@@ -3833,6 +3836,30 @@ fn apply_test_helper_connection(files: &mut [(String, String)], app: &App) -> Re
 /// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
 /// checked only when the transaction first runs a statement, which the
 /// runtime's eager BEGIN does not reproduce.
+/// A test body's read of a name only the Ruby-family test harness
+/// declares (`ActiveSupport::Cache::MemoryStore`) is supported where the
+/// finished tree's own `test/test_helper.rb` declares it, and refused on
+/// every other target, before a test naming it is emitted.
+fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(String, String)]) {
+    let reads = crate::analyze::test_constants::harness_reads(app);
+    if reads.is_empty() {
+        return;
+    }
+    let declared = files.iter().find(|(path, _)| path == "test/test_helper.rb")
+        .map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .unwrap_or_default();
+    for (span, name) in reads {
+        if !declared.contains(&name) {
+            emit::diagnostics::report_unsupported(
+                span,
+                target.as_str(),
+                "harness_constant",
+                format!("{name} is declared by the Ruby-family test harness, which {} does not emit", target.as_str()),
+            );
+        }
+    }
+}
+
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;
