@@ -25,6 +25,7 @@
 
 mod alba;
 mod enum_raw_input;
+mod database_identity;
 mod body;
 mod class_configuration;
 mod data;

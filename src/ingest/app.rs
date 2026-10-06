@@ -263,7 +263,34 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
 
     let schema_path = dir.join("db/schema.rb");
     let structure_path = dir.join("db/structure.sql");
-    if vfs.exists(&schema_path) {
+    // A declared manifest decides the primary schema by configuration
+    // (format and path), never by which file exists; a manifest that
+    // names none, or names one that is absent, leaves the schema empty
+    // beside its refusal rather than falling back.
+    if let Some((manifest, config_span)) = database_configurations_manifest(vfs, dir)? {
+        match super::database_manifest::load(vfs, dir, &manifest, config_span, &mut app) {
+            Some((path, crate::database::SchemaFormat::Ruby)) => {
+                if let Some(source) = read_or_ledger(vfs, &path)? {
+                    if let Some(schema) =
+                        unwrap_or_record(ingest_schema(&source, &path.display().to_string()))?
+                    {
+                        app.schema = schema;
+                    }
+                }
+            }
+            Some((path, crate::database::SchemaFormat::Sql)) => {
+                if let Some(source) = read_or_ledger(vfs, &path)? {
+                    if let Some(schema) = unwrap_or_record(ingest_structure_sql(
+                        &source,
+                        &path.display().to_string(),
+                    ))? {
+                        app.schema = schema;
+                    }
+                }
+            }
+            None => {}
+        }
+    } else if vfs.exists(&schema_path) {
         if let Some(source) = read_or_ledger(vfs, &schema_path)? {
             if let Some(schema) =
                 unwrap_or_record(ingest_schema(&source, &schema_path.display().to_string()))?
@@ -1771,6 +1798,9 @@ end
     // and reuses the prepared resolver rather than rebuilding it.
     super::concern_accessors::validate(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
 
+    // Model-to-database ownership reads every model, concern splice and
+    // library module, so it runs once they all exist.
+    super::database_ownership::resolve(&mut app);
     collect_binary_assets(vfs, dir, &mut app);
     // Generated re-ingest labels never register real sources. No later
     // pass may append source-backed FileIds beyond the indexed snapshot.
@@ -4330,18 +4360,21 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
     Ok(files)
 }
 
-/// Additional test roots from the app's `roundhouse.yml`.
-fn additional_test_paths<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<PathBuf>> {
-    #[derive(Default, serde::Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct RoundhouseConfig {
-        test_paths: Vec<PathBuf>,
-    }
+/// The app's `roundhouse.yml`: extra test roots, and the database
+/// configuration manifest (`ingest::database_manifest`).
+#[derive(Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RoundhouseConfig {
+    test_paths: Vec<PathBuf>,
+    database_configurations: Option<PathBuf>,
+}
 
+/// `roundhouse.yml`, parsed, with its text; `None` when the app has none.
+fn roundhouse_config<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Option<(RoundhouseConfig, String)>> {
     let config_path = dir.join("roundhouse.yml");
     let text = match vfs.read_to_string(&config_path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(IngestError::Io(std::io::Error::new(
                 error.kind(),
@@ -4355,6 +4388,52 @@ fn additional_test_paths<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<V
             message: error.to_string(),
         }
     })?;
+    Ok(config.map(|config| (config, text)))
+}
+
+/// The manifest `roundhouse.yml` names under `database_configurations:`,
+/// app-relative, with the span of that key (the file is registered as a
+/// source so a refusal about the manifest itself has a place to stand).
+fn database_configurations_manifest<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+) -> IngestResult<Option<(PathBuf, crate::span::Span)>> {
+    let Some((config, text)) = roundhouse_config(vfs, dir)? else { return Ok(None) };
+    let Some(path) = config.database_configurations else { return Ok(None) };
+    let config_path = dir.join("roundhouse.yml");
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(segment) => normalized.push(segment),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(IngestError::Parse {
+                    file: config_path.display().to_string(),
+                    message: format!(
+                        "database_configurations must be an app-relative file without '..': {path:?}"
+                    ),
+                });
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() || path_has_symlink_component(vfs, dir, &dir.join(&normalized)) {
+        return Err(IngestError::Parse {
+            file: config_path.display().to_string(),
+            message: format!(
+                "database_configurations must be an app-relative file without symbolic links: {path:?}"
+            ),
+        });
+    }
+    let file = super::sources::register(&config_path.display().to_string(), &text);
+    let start = text.find("database_configurations").unwrap_or(0) as u32;
+    let span = crate::span::Span { file, start, end: start + "database_configurations".len() as u32 };
+    Ok(Some((normalized, span)))
+}
+
+/// Additional test roots from the app's `roundhouse.yml`.
+fn additional_test_paths<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<PathBuf>> {
+    let config_path = dir.join("roundhouse.yml");
+    let config = roundhouse_config(vfs, dir)?.map(|(config, _)| config);
 
     let mut paths = Vec::new();
     for path in config.into_iter().flat_map(|config| config.test_paths) {
