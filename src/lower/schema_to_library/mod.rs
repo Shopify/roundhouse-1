@@ -34,9 +34,9 @@ use crate::ty::Ty;
 /// DDL statements. Empty when `schema.tables` is empty — apps
 /// without persisted models don't need a Schema artifact.
 pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction> {
-    if schema.tables.is_empty() {
-        return Vec::new();
-    }
+    // No tables still means a `Schema` whose statement list is empty:
+    // every harness loads `Schema.statements` unconditionally, so an app
+    // without a database (a library and its tests) must still define it.
     let module_path = vec![Symbol::from("Schema")];
     let stmts = crate::emit::shared::schema_sql::render_schema_statements(schema);
     let elements: Vec<Expr> = stmts.into_iter().map(lit_str).collect();
