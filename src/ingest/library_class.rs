@@ -1049,11 +1049,26 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// rest on (`source_passes_rest_on`): ingest keeps no slot for it.
 /// Lowerings that copy the parameters into a generated method (job and
 /// mailer wrappers) refuse it themselves.
+///
+/// Only required positionals may precede the `*`, and nothing but a
+/// block may follow it. A call's keywords are lowered as a trailing
+/// positional hash, which such a method takes into the rest, where no
+/// body can read it, exactly as Ruby does for a method that accepts no
+/// keywords. That holds however the call reaches the method
+/// (`method_missing`, a reified method, a block), so no call site has
+/// to be found. A keyword, optional or post parameter would bind that
+/// hash instead, so those stay refused.
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
             && m.receiver == MethodReceiver::Instance
-            && m.params.iter().any(Param::is_nameless_rest)
+            && m.params.split_last().is_some_and(|(last, front)| {
+                last.is_nameless_rest()
+                    && front.iter().all(|p| {
+                        !p.keyword && !p.rest && !p.forwarding && p.default.is_none()
+                            && !p.from_keyword && !p.from_kwrest
+                    })
+            })
         {
             m.unsupported_formals = None;
         }

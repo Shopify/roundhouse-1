@@ -7901,9 +7901,9 @@ fn a_nested_destructuring_target_is_refused_by_name() {
     assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
 }
 
-const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(a, *, k: 1, &blk)\n    [a, k, blk ? blk.call : nil]\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def post(a, *, z)\n    [a, z]\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(a, *rest)\n    [rest.size] + super(a)\n  end\nend\n";
+const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(a, *, &blk)\n    [a, blk ? blk.call : nil]\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(a, *rest)\n    [rest.size] + super(a)\n  end\nend\n";
 
-const NAMELESS_REST_TEST: &str = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"arity\" do\n    p = Probe.new\n    assert_equal [1, 1, nil], p.m(1, 2, 3)\n    assert_equal [1, 5, 9], p.m(1, 2, k: 5) { 9 }\n    assert_equal \"wrong number of arguments (given 0, expected 1+)\", assert_raises(ArgumentError) { p.m }.message\n    assert_equal 44, p.acquire(:a, b: 1) { 44 }\n    assert_equal [1, 4], p.post(1, 2, 3, 4)\n    assert_raises(ArgumentError) { p.post(1) }\n    assert_equal 7, p.first_of([7, 8])\n    assert_equal [2, 1, 1, nil], Child.new.m(1, 2, 3)\n  end\nend\n";
+const NAMELESS_REST_TEST: &str = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"arity\" do\n    p = Probe.new\n    assert_equal [1, nil], p.m(1, 2, 3)\n    assert_equal [1, 9], p.m(1, 2, k: 5) { 9 }\n    assert_equal \"wrong number of arguments (given 0, expected 1+)\", assert_raises(ArgumentError) { p.m }.message\n    assert_equal 44, p.acquire(:a, b: 1) { 44 }\n    assert_equal 7, p.first_of([7, 8])\n    assert_equal [2, 1, nil], Child.new.m(1, 2, 3)\n  end\nend\n";
 
 fn nameless_rest_app(probe: &str, test: &str) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -7966,6 +7966,12 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("method_object_value", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    f = method(:m)\n    f.call(h)\n  end\nend\n", "method object of an anonymous positional rest"),
         ("delegate", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("block_default_passes_on", "class Probe\n  def m(*)\n    [1].map { |x = [*]| x }\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("keyword_param", "class Probe\n  def m(a, *, k: 1)\n    [a, k]\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("optional_param", "class Probe\n  def m(a, b = 0, *)\n    [a, b]\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("post_param", "class Probe\n  def m(a, *, z)\n    [a, z]\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("method_missing_keywords", "class Probe\n  def method_missing(name, *, **kw)\n    [name, kw]\n  end\n\n  def go(h)\n    foo(**h)\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("delegate_string", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("delegate_missing_to", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("override_implicit_super", "class Probe\n  def m(*, **kw)\n    kw\n  end\nend\n\nclass Kid < Probe\n  def m(a, k: 1)\n    super\n  end\nend\n", "implicit super into an anonymous positional rest"),
         ("default_passes_on", "class Probe\n  def m(*, k: [*])\n    k\n  end\nend\n", "anonymous positional rest is not retained"),
         ("keyword_splat_into", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    m(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
@@ -7978,6 +7984,18 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
     let helper = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  def helper(a, *)\n    a\n  end\n\n  test \"t\" do\n    assert_equal 1, helper(1, 2)\n  end\nend\n";
     let (_, errors) = nameless_rest_app("class Probe\nend\n", helper).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("anonymous positional rest is not retained")), "helper: {errors:?}");
+    let inner = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  class Wrapper\n    delegate :m, to: :probe\n\n    def probe\n      Probe.new\n    end\n  end\n\n  test \"t\" do\n    assert_equal 1, Wrapper.new.m(1, 2)\n  end\nend\n";
+    let (_, errors) = nameless_rest_app("class Probe\n  def m(a, *)\n    a\n  end\nend\n", inner).emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("delegate to an anonymous positional rest")), "test class delegate: {errors:?}");
+}
+
+/// Keywords a call passes, however it reaches the method, land in the
+/// rest when only required positionals precede it, as in Ruby.
+#[test]
+fn keywords_into_an_admitted_nameless_rest_are_unread_on_cruby() {
+    let probe = "class Probe\n  def method_missing(name, *)\n    name\n  end\n\n  def respond_to_missing?(name, *)\n    true\n  end\n\n  def go(h)\n    [foo(**h), bar(1, k: 2), baz(**{}), respond_to?(:x, true)]\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal [:foo, :bar, :baz, true], Probe.new.go({ x: 2 })\n  end\nend\n";
+    nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
 }
 
 /// An override with no keyword parameters passes its positionals to the
@@ -7996,8 +8014,8 @@ fn an_implicit_super_without_keywords_into_a_nameless_rest_runs_on_cruby() {
 fn a_nameless_rest_in_a_job_or_mailer_wrapper_is_refused_by_name() {
     use roundhouse::project::BuildTarget;
     let (_, errors) = emit_and_run::real_blog()
-        .write("app/jobs/probe_job.rb", "class ProbeJob < ApplicationJob\n  def perform(a, *, z)\n    [a, z]\n  end\nend\n")
-        .write("app/mailers/probe_mailer.rb", "class ProbeMailer < ApplicationMailer\n  def hello(to, *, z)\n    mail(to: to, subject: z)\n  end\nend\n")
+        .write("app/jobs/probe_job.rb", "class ProbeJob < ApplicationJob\n  def perform(a, *)\n    a\n  end\nend\n")
+        .write("app/mailers/probe_mailer.rb", "class ProbeMailer < ApplicationMailer\n  def hello(to, *)\n    mail(to: to, subject: \"hi\")\n  end\nend\n")
         .emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("anonymous positional rest job wrapper")), "{errors:?}");
     assert!(errors.iter().any(|e| e.contains("anonymous positional rest mailer wrapper")), "{errors:?}");
