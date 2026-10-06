@@ -188,6 +188,11 @@ pub fn ingest_fixture_file(source: &[u8], path: &Path, root: &Path) -> IngestRes
             }
             continue;
         }
+        // `DEFAULTS:` exists to be anchored and merged into the real rows;
+        // Rails deletes it before inserting (`FixtureSet#read_fixture_files`).
+        if label == "DEFAULTS" {
+            continue;
+        }
         let fields = match fields {
             serde_yaml_ng::Value::Mapping(m) => m,
             serde_yaml_ng::Value::Null => serde_yaml_ng::Mapping::new(),

@@ -696,3 +696,28 @@ fn presence_on_not_null_booleans_and_defaulted_columns_is_refused() {
     assert!(!refused.iter().any(|d| d.contains("Shop.name")), "{refused:?}");
     assert_eq!(refused.len(), 2, "{refused:?}");
 }
+
+/// Review r1: `keeper: ~` on an optional belongs_to is Rails' "no
+/// reference" (the foreign key stays unset, as the loader leaves it), not
+/// a dropped entry; and `DEFAULTS:` is merged into rows, never a row.
+#[test]
+fn nil_references_and_defaults_rows_are_not_fixture_drops() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `owners` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\nCREATE TABLE `pets` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `keeper_id` bigint DEFAULT NULL,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/owner.rb", "class Owner < ApplicationRecord\nend\n"),
+        ("app/models/pet.rb", "class Pet < ApplicationRecord\n  belongs_to :keeper, class_name: \"Owner\", optional: true\nend\n"),
+        ("test/fixtures/owners.yml", "ann: {}\n"),
+        ("test/fixtures/pets.yml", "DEFAULTS: &defaults\n  name: Anon\n\nrex:\n  <<: *defaults\n  keeper: ~\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    let pets = app.fixtures.iter().find(|f| f.name.as_str() == "pets").expect("pets");
+    assert_eq!(pets.records.keys().map(|k| k.as_str()).collect::<Vec<_>>(), ["rex"]);
+    Analyzer::new(&app).analyze(&mut app);
+    let named: Vec<String> = diagnose(&app).into_iter().map(|d| d.to_string()).filter(|d| d.contains("fixture_entry")).collect();
+    assert!(named.is_empty(), "{named:?}");
+}
