@@ -721,3 +721,73 @@ fn nil_references_and_defaults_rows_are_not_fixture_drops() {
     let named: Vec<String> = diagnose(&app).into_iter().map(|d| d.to_string()).filter(|d| d.contains("fixture_entry")).collect();
     assert!(named.is_empty(), "{named:?}");
 }
+
+/// Review r1 (#5): mysqldump writes views inside version-conditional
+/// comments (`/*!50001 … */`), which MySQL executes. Read as comments
+/// they vanished; they must reach the same view ledger as Postgres'.
+#[test]
+fn a_mysql_view_in_an_executable_comment_is_ledgered() {
+    let sql = "CREATE TABLE `shops` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n/*!50001 DROP VIEW IF EXISTS `shop_view`*/;\n/*!50001 CREATE ALGORITHM=UNDEFINED */\n/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */\n/*!50001 VIEW `shop_view` AS select `shops`.`id` AS `id` from `shops` */;\n";
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode");
+    let gaps: Vec<String> = survey::drain().iter().map(|g| format!("{g}")).collect();
+    assert!(schema.tables.contains_key(&Symbol::from("shops")));
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].contains("view not modeled") && gaps[0].contains("shop_view"), "{gaps:?}");
+}
+
+/// Review r1 (#6): MySQL declares foreign keys inside `CREATE TABLE`;
+/// Postgres' `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` already lands
+/// in `foreign_keys`, so the inline form must too (or be ledgered).
+#[test]
+fn an_inline_mysql_foreign_key_is_read() {
+    let sql = "CREATE TABLE `shops` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n);\nCREATE TABLE `returns` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `shop_id` bigint NOT NULL,\n  `a` bigint,\n  `b` bigint,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `fk_rails_1` FOREIGN KEY (`shop_id`) REFERENCES `shops` (`id`) ON DELETE CASCADE,\n  CONSTRAINT `fk_pair` FOREIGN KEY (`a`, `b`) REFERENCES `shops` (`id`, `id`)\n);\n";
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode");
+    let gaps: Vec<String> = survey::drain().iter().map(|g| format!("{g}")).collect();
+    let fks = &schema.tables[&Symbol::from("returns")].foreign_keys;
+    assert_eq!(fks.len(), 1, "{fks:?}");
+    assert_eq!(fks[0].from_column.as_str(), "shop_id");
+    assert_eq!(fks[0].to_table.0.as_str(), "shops");
+    assert_eq!(fks[0].on_delete, roundhouse::schema::ReferentialAction::Cascade);
+    assert!(gaps.iter().any(|g| g.contains("foreign key dropped: composite key (returns(a, b)")), "{gaps:?}");
+}
+
+/// Review r1 (#7): `PARTITION OF` in a table or column COMMENT is text,
+/// not the Postgres partition-child form; the table is still a table.
+#[test]
+fn partition_words_inside_a_comment_literal_do_not_drop_the_table() {
+    let sql = "CREATE TABLE `shards` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB COMMENT='each row is a partition of the keyspace';\nALTER TABLE `shards` COMMENT='we never attach partition here';\n";
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode");
+    let _ = survey::drain();
+    assert!(schema.tables.contains_key(&Symbol::from("shards")), "{:?}", schema.tables.keys().collect::<Vec<_>>());
+}
+
+/// Review r1 (#8): MySQL's `unsigned`/`signed`/`zerofill` follow the type
+/// as their own words; a type name merely ending in those letters (a
+/// Postgres enum `status_assigned`) is not stripped.
+#[test]
+fn numeric_attributes_strip_only_as_whole_words() {
+    let sql = "CREATE TYPE public.status_assigned AS ENUM ('a', 'b');\nCREATE TABLE public.tasks (\n    id bigint NOT NULL,\n    state public.status_assigned,\n    hits int unsigned zerofill\n);\n";
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("ingest");
+    let tasks = &schema.tables[&Symbol::from("tasks")];
+    assert!(matches!(col(tasks, "state").col_type, ColumnType::String { .. }));
+    assert_eq!(col(tasks, "hits").col_type, ColumnType::Integer);
+}
+
+/// Review r1 (#10): a UNIQUE key is a constraint the emitted database
+/// must enforce. A key column's sort order does not change uniqueness,
+/// so `DESC` keys are read; a prefix-length unique key constrains only
+/// the prefix and is ledgered, never dropped silently.
+#[test]
+fn unique_keys_are_read_or_ledgered() {
+    let sql = "CREATE TABLE `codes` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `code` varchar(255) NOT NULL,\n  `slug` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `index_codes_on_code` (`code` DESC),\n  UNIQUE KEY `index_codes_on_slug` (`slug`(32))\n);\n";
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode");
+    let gaps: Vec<String> = survey::drain().iter().map(|g| format!("{g}")).collect();
+    let indexes = &schema.tables[&Symbol::from("codes")].indexes;
+    assert_eq!(indexes.len(), 1, "{indexes:?}");
+    assert!(indexes[0].unique && indexes[0].columns == [Symbol::from("code")]);
+    assert!(gaps.iter().any(|g| g.contains("unique key dropped") && g.contains("index_codes_on_slug")), "{gaps:?}");
+}
