@@ -1,11 +1,13 @@
 //! A NOT NULL column's in-memory slot is the column's type, not `T | nil`
 //! (`ty_of_column_slot`), and the constructor fills an absent or nil input
-//! with the type's zero (`attrs[:shop_id] || 0`). For a numeric column
-//! that zero is *present*, so `validates :shop_id, presence: true` can never
-//! fail on `new(shop_id: nil)`, where Rails reports "can't be blank" before
-//! the database is reached. Strings and booleans zero to a blank value and
-//! still fail the check, so they are not refused. Refuse the numeric case
-//! until an unsaved record can hold nil in a NOT NULL slot.
+//! with the schema default or the type's zero (`attrs[:shop_id] || 0`).
+//! Rails holds nil there until save, so `validates :col, presence: true`
+//! on `new(col: nil)` reports "can't be blank" where the emitted program
+//! sees a present value. The one slot that still answers as Rails does is
+//! a string with no default: its zero is the blank `""`. Every other NOT
+//! NULL slot is refused (a boolean's `false` is blank to Rails as well,
+//! which the generic presence check does not model), until an unsaved
+//! record can hold nil there.
 
 use crate::diagnostic::Diagnostic;
 use crate::dialect::ValidationRule;
@@ -25,11 +27,18 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             if matches!(ty_of_column_slot(col), Ty::Union { .. }) || col.primary_key {
                 continue;
             }
-            if matches!(ty_of_column(&col.col_type), Ty::Int | Ty::Float) {
-                out.push(Diagnostic::unsupported(span, None, "presence_on_not_null_numeric",
-                    format!("{}.{} is NOT NULL, so an unsaved record holds 0 where Rails holds nil; `validates :{}, presence: true` cannot fail as Rails' does",
-                        model.name.0, col.name, col.name)));
+            let ty = ty_of_column(&col.col_type);
+            if ty == Ty::Str && col.default.is_none() {
+                continue;
             }
+            let held = match &col.default {
+                Some(default) => format!("its default {default:?}"),
+                None if ty == Ty::Bool => "false (blank to Rails' presence, present to the emitted nil-or-empty check)".to_string(),
+                None => "the type's zero".to_string(),
+            };
+            out.push(Diagnostic::unsupported(span, None, "presence_on_not_null_column",
+                format!("{}.{} is NOT NULL, so an unsaved record given nil holds {held} where Rails holds nil; `validates :{}, presence: true` cannot fail as Rails' does",
+                    model.name.0, col.name, col.name)));
         }
     }
     out

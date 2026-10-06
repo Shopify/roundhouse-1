@@ -627,7 +627,7 @@ fn presence_on_a_not_null_numeric_column_is_refused() {
     let refused: Vec<String> = diagnose(&app)
         .into_iter()
         .map(|d| d.to_string())
-        .filter(|d| d.contains("presence_on_not_null_numeric"))
+        .filter(|d| d.contains("presence_on_not_null_column"))
         .collect();
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(refused[0].starts_with("error") && refused[0].contains("Shop.shop_id"), "{refused:?}");
@@ -665,4 +665,34 @@ fn fixture_entries_the_loader_cannot_place_are_named() {
     assert!(named.iter().all(|d| d.starts_with("error")), "{named:?}");
     assert!(named.iter().any(|d| d.contains("`pets`.rex.shop")), "{named:?}");
     assert!(named.iter().any(|d| d.contains("`ghosts`") && d.contains("not a model")), "{named:?}");
+}
+
+/// Review r1 cases: a NOT NULL boolean holds `false` (blank to Rails, not
+/// to the generic presence check) and a NOT NULL column with a default
+/// holds the default. The string with no default holds the blank `""` and
+/// still answers as Rails. (An STI subclass's own `validates` is not
+/// ingested at all today, which is a separate, inherited gap.)
+#[test]
+fn presence_on_not_null_booleans_and_defaulted_columns_is_refused() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `shops` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `type` varchar(255) DEFAULT NULL,\n  `enabled` tinyint(1) NOT NULL,\n  `kind` varchar(20) NOT NULL DEFAULT 'simple',\n  `name` varchar(255) NOT NULL,\n  `qty` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/shop.rb", "class Shop < ApplicationRecord\n  validates :enabled, presence: true\n  validates :kind, presence: true\n  validates :name, presence: true\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    Analyzer::new(&app).analyze(&mut app);
+    let refused: Vec<String> = diagnose(&app)
+        .into_iter()
+        .map(|d| d.to_string())
+        .filter(|d| d.contains("presence_on_not_null_column"))
+        .collect();
+    for col in ["Shop.enabled", "Shop.kind"] {
+        assert!(refused.iter().any(|d| d.contains(col)), "{col} not refused: {refused:?}");
+    }
+    assert!(!refused.iter().any(|d| d.contains("Shop.name")), "{refused:?}");
+    assert_eq!(refused.len(), 2, "{refused:?}");
 }
