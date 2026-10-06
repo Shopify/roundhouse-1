@@ -31,24 +31,19 @@ use crate::ty::Ty;
 
 /// Build the `Schema` module as a single LibraryFunction:
 /// `Schema.statements() -> Array<String>` returning the rendered
-/// DDL statements. Empty when `schema.tables` is empty — apps
-/// without persisted models don't need a Schema artifact.
+/// DDL statements; an empty list when `schema.tables` is empty.
 pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction> {
-    if schema.tables.is_empty() {
-        return Vec::new();
-    }
+    // No tables still means a `Schema` whose statement list is empty:
+    // every harness loads `Schema.statements` unconditionally, so an app
+    // without a database (a library and its tests) must still define it.
     schema_functions(crate::emit::shared::schema_sql::render_schema_statements(schema))
 }
 
 /// Render the selected database's schema and preserve unsupported-DDL errors.
-/// Empty, like `lower_schema_to_library_functions`, when there are no tables.
 pub fn lower_schema_to_library_functions_for(
     schema: &Schema,
     dialect: crate::emit::shared::schema_sql::Dialect,
 ) -> Result<Vec<LibraryFunction>, String> {
-    if schema.tables.is_empty() {
-        return Ok(Vec::new());
-    }
     crate::emit::shared::schema_sql::render_schema_statements_for(schema, dialect)
         .map(schema_functions)
 }

@@ -6670,3 +6670,29 @@ end
         .run_test("test/models/grandfathered_shop_test.rb")
         .assert_passes();
 }
+
+/// An app with no tables at all, the shape of a Core gem's unit test:
+/// a library class and a test of it. The harness loads
+/// `Schema.statements` unconditionally, and an empty schema emitted no
+/// `Schema` module, so the test died with NameError before running.
+#[test]
+fn an_app_without_a_schema_runs_its_library_tests() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("lib/sql_fragments.rb", "module SqlFragments\n  class Sqlite3\n    class << self\n      def random\n        \"RANDOM()\"\n      end\n\n      def excluded(column)\n        \"excluded.#{column}\"\n      end\n    end\n  end\nend\n")
+        .write("test/lib/sql_fragments_test.rb", r#"require "test_helper"
+
+class SqlFragmentsTest < ActiveSupport::TestCase
+  test "random" do
+    assert_equal "RANDOM()", SqlFragments::Sqlite3.random
+  end
+
+  test "excluded" do
+    assert_equal "excluded.name", SqlFragments::Sqlite3.excluded("name")
+  end
+end
+"#)
+        .run_test("test/models/sql_fragments_test.rb")
+        .assert_passes();
+}
+
