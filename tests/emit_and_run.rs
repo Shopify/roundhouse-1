@@ -6792,6 +6792,49 @@ fn a_teardown_over_a_base_teardown_is_refused() {
     assert!(errors.iter().any(|e| e.contains("teardown") && e.contains("ChildTest") && e.contains("GemCompat::TestCase")), "{errors:?}");
 }
 
+/// Delta 2 r3: a child's teardown blocks are callbacks in Rails, so the
+/// base's `def teardown` still runs as the method; here the blocks become
+/// a `teardown` that overrides it. Refused by name.
+#[test]
+fn teardown_blocks_over_a_base_def_teardown_are_refused() {
+    let (_, errors) = emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class TestCase < ActiveSupport::TestCase\n    def teardown\n      raise \"base def ran\"\n    end\n  end\nend\n")
+        .write("test/child_test.rb", "require \"test_helper\"\n\nclass ChildTest < GemCompat::TestCase\n  teardown do\n    @x = 1\n  end\n\n  test \"x\" do\n    assert true\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("teardown") && e.contains("ChildTest") && e.contains("GemCompat::TestCase")), "{errors:?}");
+}
+
+/// Delta 2 r3: base teardown blocks run after every `def teardown` in
+/// Rails, so code a child runs after its `super` would run after them
+/// here but before them there. Refused by name.
+#[test]
+fn a_child_teardown_with_code_after_super_over_base_blocks_is_refused() {
+    let (_, errors) = emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class TestCase < ActiveSupport::TestCase\n    teardown do\n      @order = \"base\"\n    end\n  end\nend\n")
+        .write("test/child_test.rb", "require \"test_helper\"\n\nclass ChildTest < GemCompat::TestCase\n  def teardown\n    super\n    @order = \"child\"\n  end\n\n  test \"x\" do\n    assert true\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("teardown") && e.contains("ChildTest") && e.contains("GemCompat::TestCase")), "{errors:?}");
+}
+
+/// Delta 2 r4: a helper class that is not a test case may define
+/// `teardown` for its own reasons; only test-case reopens are refused.
+#[test]
+fn a_helper_class_teardown_that_is_not_a_test_case_is_not_refused() {
+    let tree = [
+        ("app/.keep", ""),
+        ("test/test_helper.rb", "require \"active_support\"\n\nclass FakeServer\n  def teardown\n    nil\n  end\nend\n"),
+        ("test/models/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    assert!(roundhouse::ingest::ingest_app_from_tree(tree).is_ok());
+}
+
 /// Review r2: the helper's reopen of `ActiveSupport::TestCase` keeps only
 /// its `setup`; a `teardown` there (every test's cleanup) was dropped
 /// without a word. Refused by name.
