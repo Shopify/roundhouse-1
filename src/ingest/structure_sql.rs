@@ -1,6 +1,7 @@
-//! `db/structure.sql` — parse a `pg_dump`-shaped Postgres DDL dump into
-//! the same target-neutral `Schema` that [`super::schema::ingest_schema`]
-//! produces from `db/schema.rb`.
+//! `db/structure.sql` — parse a `pg_dump`-shaped Postgres DDL dump, or
+//! the MySQL dump Rails' MySQL adapters write (`SHOW CREATE TABLE`
+//! output), into the same target-neutral `Schema` that
+//! [`super::schema::ingest_schema`] produces from `db/schema.rb`.
 //!
 //! Rails apps with `config.active_record.schema_format = :sql` never
 //! write `schema.rb`; `rails db:schema:dump` writes `db/structure.sql`
@@ -220,7 +221,17 @@ fn handle_create_table(
     if let Some(r2) = strip_prefix_ci(rest, "IF NOT EXISTS") {
         rest = r2.trim_start();
     }
-    let Some((table_name, consumed)) = read_ident(rest, 0) else { return };
+    // A table whose name or column list this walk cannot read is a
+    // ledgered gap: returning quietly would leave its model with no
+    // columns and no diagnostic.
+    let unreadable = |gaps: &mut Vec<IngestError>| {
+        let head: String = stmt.chars().take(60).collect();
+        gaps.push(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("table not modeled: CREATE TABLE not read ({})", head.trim()),
+        });
+    };
+    let Some((table_name, consumed)) = read_ident(rest, 0) else { return unreadable(gaps) };
     // Rails' own bookkeeping tables — schema.rb never lists them
     // either.
     if table_name.eq_ignore_ascii_case("schema_migrations")
@@ -230,14 +241,24 @@ fn handle_create_table(
     }
 
     let after_name = &rest[consumed..];
-    let Some(open) = find_first_open_paren(after_name, 0) else { return };
-    let Some(close) = matching_close_paren(after_name, open) else { return };
+    let open = after_name.len() - after_name.trim_start().len();
+    if !after_name[open..].starts_with('(') {
+        return unreadable(gaps);
+    }
+    let Some(close) = matching_close_paren(after_name, open) else { return unreadable(gaps) };
     let body = &after_name[open + 1..close];
 
     let mut columns: Vec<Column> = Vec::new();
+    let mut keys: Vec<Index> = Vec::new();
     for seg in top_level_split(body, b',') {
         let seg = seg.trim();
         if seg.is_empty() {
+            continue;
+        }
+        if let Some(unique) = mysql_key_entry(seg) {
+            if let Some(index) = mysql_inline_index(seg, unique) {
+                keys.push(index);
+            }
             continue;
         }
         if is_table_level_constraint(seg) {
@@ -254,13 +275,17 @@ fn handle_create_table(
     // Everything after the closing paren (`PARTITION BY …`, `INHERITS
     // (…)`, `WITH (…)` storage params) is intentionally never
     // inspected — none of it changes the column list, and schema.rb
-    // has no equivalent to round-trip it into anyway.
+    // has no equivalent to round-trip it into anyway. (MySQL's table
+    // options — `ENGINE`, `DEFAULT CHARSET`, `COLLATE`, `ROW_FORMAT` —
+    // sit there too.) A key over a column the walk dropped cannot
+    // apply, the same retain-filter `handle_create_index` uses.
+    keys.retain(|k| k.columns.iter().all(|c| columns.iter().any(|col| col.name == *c)));
     schema.tables.insert(
         Symbol::from(table_name.clone()),
         Table {
             name: Symbol::from(table_name),
             columns,
-            indexes: Vec::new(),
+            indexes: keys,
             foreign_keys: Vec::new(),
             virtual_module: None,
         },
@@ -272,6 +297,56 @@ fn handle_create_table(
 fn is_table_level_constraint(seg: &str) -> bool {
     const KW: &[&str] = &["CONSTRAINT", "PRIMARY KEY", "UNIQUE", "CHECK", "EXCLUDE", "FOREIGN KEY"];
     KW.iter().any(|k| starts_with_ci(seg, k))
+}
+
+/// A MySQL index entry inside `CREATE TABLE (...)`: `KEY \`name\`
+/// (cols)`, `UNIQUE KEY \`name\` (cols)`, or a `FULLTEXT`/`SPATIAL` key.
+/// `Some(unique)` when `seg` is one. The dumper always backtick-quotes
+/// the index name, and requiring it keeps a Postgres column that is
+/// merely *named* `key` or `index` (unquoted there) a column.
+fn mysql_key_entry(seg: &str) -> Option<bool> {
+    let words: Vec<&str> = seg.split_whitespace().take(3).collect();
+    let quoted = |i: usize| words.get(i).is_some_and(|w| w.starts_with('`'));
+    let key = |w: &str| w.eq_ignore_ascii_case("KEY") || w.eq_ignore_ascii_case("INDEX");
+    match words.as_slice() {
+        [w, ..] if key(w) && quoted(1) => Some(false),
+        [u, w, ..] if u.eq_ignore_ascii_case("UNIQUE") && key(w) && quoted(2) => Some(true),
+        [f, w, ..]
+            if (f.eq_ignore_ascii_case("FULLTEXT") || f.eq_ignore_ascii_case("SPATIAL"))
+                && key(w)
+                && quoted(2) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+/// The `Index` a [`mysql_key_entry`] declares. A `FULLTEXT`/`SPATIAL`
+/// key, or one with a prefix-length column (`\`name\`(191)`), has no
+/// `Index` shape and is skipped, as `handle_create_index` skips an
+/// expression index.
+fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
+    let first = seg.split_whitespace().next().unwrap_or("");
+    if first.eq_ignore_ascii_case("FULLTEXT") || first.eq_ignore_ascii_case("SPATIAL") {
+        return None;
+    }
+    let name_at = seg.find('`')?;
+    let (name, consumed) = read_ident(seg, name_at)?;
+    let open = find_first_open_paren(seg, consumed)?;
+    let close = matching_close_paren(seg, open)?;
+    let mut columns = Vec::new();
+    for entry in top_level_split(&seg[open + 1..close], b',') {
+        let e = entry.trim();
+        match read_ident(e, 0) {
+            Some((col, used)) if e[used..].trim().is_empty() => columns.push(Symbol::from(col)),
+            _ => return None,
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(Index { name: Symbol::from(name), columns, unique, predicate: None })
 }
 
 /// `[CONSTRAINT name] PRIMARY KEY (cols)` inside the column-list parens
@@ -287,7 +362,9 @@ fn handle_inline_table_constraint(
     file: &str,
 ) {
     let words = top_level_words(seg);
-    let Some(pos) = word_seq_pos_after(&words, 0, &["PRIMARY", "KEY"]) else { return };
+    // From the first word: a bare `PRIMARY KEY (…)` (MySQL's only
+    // spelling) starts the entry at byte 0.
+    let Some(pos) = word_seq_pos(&words, &["PRIMARY", "KEY"]) else { return };
     let Some(open) = find_first_open_paren(seg, pos) else { return };
     let Some(close) = matching_close_paren(seg, open) else { return };
     let cols: Vec<String> = top_level_split(&seg[open + 1..close], b',')
@@ -335,6 +412,24 @@ fn parse_column_def(
         return Ok(None);
     }
 
+    // `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` (both dialects):
+    // the database computes the value and rejects writes to it, so an
+    // ordinary column would be a wrong model. Postgres' identity form
+    // (`GENERATED … AS IDENTITY`) is an ordinary writable key.
+    let words = top_level_words(modifiers);
+    let generated_as = words
+        .windows(3)
+        .find(|w| w[0].1 == "GENERATED" && w[1].1 == "ALWAYS" && w[2].1 == "AS")
+        .map(|w| w[2].0 + "AS".len());
+    if let Some(after_as) = generated_as {
+        if modifiers[after_as..].trim_start().starts_with('(') {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("column dropped: {table}.{col_name} is a generated column (computed by the database)"),
+            });
+        }
+    }
+
     let (nullable, default) = parse_modifiers(modifiers);
     let col_type = resolve_column_type(type_phrase, enum_types)
         .ok_or_else(|| unsupported_col(file, table, &col_name, type_phrase))?;
@@ -372,6 +467,14 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
     if let Some(dot) = base.rfind('.') {
         base = base[dot + 1..].to_string();
     }
+    // MySQL's numeric attributes follow the type name. `unsigned` is a
+    // range constraint `ColumnType` has no notion of — dropped here as
+    // schema.rb ingest drops `unsigned: true`.
+    while let Some(stripped) =
+        ["unsigned", "signed", "zerofill"].iter().find_map(|w| base.strip_suffix(w).map(str::trim_end))
+    {
+        base = stripped.to_string();
+    }
     if is_array {
         // `text[]`, `bigint[]`, … — no array notion on `ColumnType`;
         // ledgered by the caller rather than silently scalarized.
@@ -384,18 +487,23 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
         "bigint" | "int8" | "bigserial" | "serial8" => ColumnType::BigInt,
         "serial" | "serial4" => ColumnType::Integer,
         "boolean" | "bool" => ColumnType::Boolean,
+        // Rails' MySQL adapters read `tinyint(1)` as a boolean
+        // (`emulate_booleans`, on by default) and any other tinyint as
+        // an integer.
+        "tinyint" if num1 == Some(1) => ColumnType::Boolean,
+        "tinyint" | "mediumint" => ColumnType::Integer,
         "character varying" | "varchar" | "character" | "char" | "bpchar" => {
             ColumnType::String { limit: limit() }
         }
-        "text" | "citext" => ColumnType::Text,
+        "text" | "citext" | "tinytext" | "mediumtext" | "longtext" => ColumnType::Text,
         "date" => ColumnType::Date,
-        "timestamp without time zone" | "timestamp with time zone" | "timestamptz" | "timestamp" => {
+        "timestamp without time zone" | "timestamp with time zone" | "timestamptz" | "timestamp" | "datetime" => {
             ColumnType::DateTime
         }
         "time without time zone" | "time with time zone" | "timetz" | "time" => ColumnType::Time,
         "numeric" | "decimal" => ColumnType::Decimal { precision: None, scale: None },
-        "double precision" | "real" | "float4" | "float8" | "float" => ColumnType::Float,
-        "bytea" => ColumnType::Binary,
+        "double precision" | "real" | "float4" | "float8" | "float" | "double" => ColumnType::Float,
+        "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => ColumnType::Binary,
         "json" | "jsonb" => ColumnType::Json,
         "uuid" => ColumnType::Uuid,
         "inet" | "cidr" | "macaddr" | "macaddr8" => ColumnType::String { limit: None },
@@ -839,14 +947,14 @@ fn skip_quoted_or_comment(bytes: &[u8], i: usize) -> Option<usize> {
                 j += 1;
             }
         }
-        Some(b'"') => {
+        Some(&q @ (b'"' | b'`')) => {
             let mut j = i + 1;
             loop {
                 if j >= bytes.len() {
                     return Some(bytes.len());
                 }
-                if bytes[j] == b'"' {
-                    if bytes.get(j + 1) == Some(&b'"') {
+                if bytes[j] == q {
+                    if bytes.get(j + 1) == Some(&q) {
                         j += 2;
                         continue;
                     }
@@ -996,16 +1104,19 @@ fn read_ident(s: &str, start: usize) -> Option<(String, usize)> {
         if i >= bytes.len() {
             break;
         }
-        if bytes[i] == b'"' {
+        if bytes[i] == b'"' || bytes[i] == b'`' {
+            // `"…"` (Postgres) or `` `…` `` (MySQL), the quote doubled to
+            // escape itself.
+            let quote = bytes[i];
             let mut j = i + 1;
             let mut seg = String::new();
             loop {
                 if j >= bytes.len() {
                     break;
                 }
-                if bytes[j] == b'"' {
-                    if bytes.get(j + 1) == Some(&b'"') {
-                        seg.push('"');
+                if bytes[j] == quote {
+                    if bytes.get(j + 1) == Some(&quote) {
+                        seg.push(quote as char);
                         j += 2;
                         continue;
                     }
@@ -1107,6 +1218,11 @@ fn top_level_words(s: &str) -> Vec<(usize, String)> {
 /// `after_byte`, of the consecutive word sequence `seq` (already
 /// uppercased in the search — [`top_level_words`] uppercases every
 /// word it returns).
+/// Like [`word_seq_pos_after`], but a match may start at the first word.
+fn word_seq_pos(words: &[(usize, String)], seq: &[&str]) -> Option<usize> {
+    words.windows(seq.len()).find(|w| w.iter().zip(seq).all(|((_, a), b)| a == b)).map(|w| w[0].0)
+}
+
 fn word_seq_pos_after(words: &[(usize, String)], after_byte: usize, seq: &[&str]) -> Option<usize> {
     if seq.is_empty() {
         return None;
@@ -1131,10 +1247,16 @@ fn word_seq_pos_after(words: &[(usize, String)], after_byte: usize, seq: &[&str]
 /// of those keywords, or the end of the string when the column has no
 /// modifiers at all.
 fn find_modifier_start(rest: &str) -> usize {
-    const STOP: [&str; 6] = ["DEFAULT", "NOT", "NULL", "GENERATED", "COLLATE", "PRIMARY"];
-    for (pos, word) in top_level_words(rest) {
-        if STOP.contains(&word.as_str()) {
-            return pos;
+    // MySQL adds `CHARACTER SET x`, `AUTO_INCREMENT` and `COMMENT '…'`.
+    // `CHARACTER` alone is not a stop: Postgres spells a type
+    // `character varying`.
+    const STOP: [&str; 8] = ["DEFAULT", "NOT", "NULL", "GENERATED", "COLLATE", "PRIMARY", "AUTO_INCREMENT", "COMMENT"];
+    let words = top_level_words(rest);
+    for (idx, (pos, word)) in words.iter().enumerate() {
+        if STOP.contains(&word.as_str())
+            || (word == "CHARACTER" && words.get(idx + 1).is_some_and(|(_, w)| w == "SET"))
+        {
+            return *pos;
         }
     }
     rest.len()
