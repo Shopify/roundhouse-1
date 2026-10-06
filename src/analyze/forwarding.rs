@@ -85,7 +85,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             walk(app, &contracts, owner, method, default, &mut out);
         }
     }
-    out.extend(keyword_splats_into_nameless_rest(app));
+    out.extend(keyword_splats_into_nameless_rest_with_index(app, &contracts));
     for (span, policy) in keyword_calls_with_index(app, &contracts) {
         if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
             out.push(keyword_refusal(span, policy));
@@ -96,16 +96,43 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 
 /// The ordinary `**value` lowering passes the hash positionally, which a
 /// rest destination takes as one more positional. Refuse it where the
-/// selector can name an admitted nameless rest, by selector alone: the
-/// method itself, `new` for `initialize`, and the dynamic dispatchers.
+/// selector can name an admitted nameless rest: the method itself, `new`
+/// for `initialize`, and the dynamic dispatchers. A call whose source
+/// destination resolves exactly (`destination`: a constant naming its
+/// class, a verified hierarchy, every self-dispatch override) to methods
+/// without one is admitted; anything less stays refused by selector.
 /// Reifying such a method (`method(:m)`) is refused outright.
 /// An implicit `super` in an override of such a selector with keyword
 /// parameters (kept or flattened) passes the override's lowered
 /// keywords as positionals, so it is refused too.
 pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
+    keyword_splats_into_nameless_rest_with_index(app, &SourceContractIndex::new(app))
+}
+
+fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceContractIndex<'_>) -> Vec<Diagnostic> {
     const DISPATCH: [&str; 8] =
         ["send", "public_send", "__send__", "call", "[]", "===", "curry", "instance_exec"];
-    fn visit(selectors: &HashSet<&Symbol>, enclosing: Option<&MethodDef>, e: &Expr, out: &mut Vec<Diagnostic>) {
+    /// The call's destination, and every override a self-send may reach,
+    /// are source methods none of which takes a nameless rest.
+    fn proven_without_rest(
+        app: &App,
+        contracts: &SourceContractIndex<'_>,
+        context: Option<(&ClassId, &MethodDef)>,
+        e: &Expr,
+    ) -> bool {
+        let rest = |m: &MethodDef| m.params.iter().any(crate::dialect::Param::is_nameless_rest);
+        destination(app, contracts, context, e).is_some_and(|(m, _)| !rest(m))
+            && virtual_destinations(contracts, context, e).is_ok_and(|v| v.iter().all(|(m, _)| !rest(m)))
+    }
+    fn visit(
+        app: &App,
+        contracts: &SourceContractIndex<'_>,
+        selectors: &HashSet<&Symbol>,
+        context: Option<(&ClassId, &MethodDef)>,
+        e: &Expr,
+        out: &mut Vec<Diagnostic>,
+    ) {
+        let enclosing = context.map(|(_, m)| m);
         if matches!(&*e.node, ExprNode::Super { args: None })
             && enclosing.is_some_and(|m| selectors.contains(&m.name) && m.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest))
         {
@@ -164,7 +191,10 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
                 "the callers a reified method reaches are not shown to pass as written",
             ));
         }
-        if reaches && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) {
+        if reaches
+            && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. }))
+            && !proven_without_rest(app, contracts, context, e)
+        {
             out.push(Diagnostic::unsupported(
                 e.span,
                 None,
@@ -172,7 +202,7 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
                 "the keyword splat lowering would pass the hash as a positional",
             ));
         }
-        e.node.for_each_child(&mut |c| visit(selectors, enclosing, c, out));
+        e.node.for_each_child(&mut |c| visit(app, contracts, selectors, context, c, out));
     }
     let selectors: HashSet<&Symbol> = methods(app)
         .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
@@ -182,13 +212,13 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
     if selectors.is_empty() {
         return out;
     }
-    for (_, method) in methods(app) {
-        visit(&selectors, Some(method), &method.body, &mut out);
+    for (owner, method) in methods(app) {
+        visit(app, contracts, &selectors, Some((owner, method)), &method.body, &mut out);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            visit(&selectors, Some(method), default, &mut out);
+            visit(app, contracts, &selectors, Some((owner, method)), default, &mut out);
         }
     }
-    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(&selectors, None, e, &mut out));
+    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(app, contracts, &selectors, None, e, &mut out));
     // `delegate` writes a zero-arg forwarder, or none (a string name, a
     // test class); the library-class pass leaves such a declaration in
     // `unknown_calls`, and a controller's stays a body item, so refuse

@@ -1013,3 +1013,33 @@ fn a_keyword_splat_into_a_nameless_rest_is_refused_before_lowering() {
         );
     }
 }
+
+/// Another class's `initialize(*)` does not make every `new(**h)` reach
+/// a rest: a constant naming a source class whose effective destination,
+/// and every override a self-send reaches, takes none is admitted. An
+/// unproven receiver, a rest destination, or a rest override is not.
+#[test]
+fn a_keyword_splat_whose_exact_destination_has_no_nameless_rest_is_admitted() {
+    const REST: &str = "class Loose; def initialize(*); end; end; ";
+    let refused = |source: &str| {
+        let app = analyzed(source);
+        diagnose(&app)
+            .into_iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("keyword splat into an anonymous positional rest"))
+    };
+    for source in [
+        "class Point; def initialize(x:, y: 0); @x = x; end; end; class Maker; def go(h); Point.new(**h); end; end",
+        "class Base; def initialize(x:); @x = x; end; end; class Point < Base; end; class Maker; def go(h); Point.new(**h); end; end",
+        "class Base; def m(a: 1); a; end; def go(h); m(**h); end; end",
+    ] {
+        assert!(!refused(&format!("{REST}{source}")), "{source}");
+    }
+    for source in [
+        "class Maker; def go(h); Loose.new(**h); end; end",
+        "class Maker; def go(k, h); k.new(**h); end; end",
+        "class Base; def m(a: 1); a; end; def go(h); m(**h); end; end; class Kid < Base; def m(*); 7; end; end",
+        "class Point < Loose; end; class Maker; def go(h); Point.new(**h); end; end",
+    ] {
+        assert!(refused(&format!("{REST}{source}")), "{source}");
+    }
+}
