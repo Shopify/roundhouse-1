@@ -1,4 +1,6 @@
-//! Non-nil assertion names need an app implementation or a shared nil-check lowerer.
+//! type_toolkit's `x.not_nil!` answers the receiver with nil removed.
+//! Analysis types it so; which trees can run it is `project`'s refusal
+//! (see `tests/not_nil_type_toolkit.rs`, which runs the emitted call).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,22 +40,29 @@ fn failures(controller_body: &str) -> Vec<String> {
 }
 
 #[test]
-fn unimplemented_not_nil_is_refused() {
+fn not_nil_rules_nil_out_of_the_receiver() {
+    // `name.upcase` on a `String?` would fail dispatch; with nil ruled
+    // out of `User?` the chain types clean.
     let f = failures("  def show\n    name = User.find_by(name: \"a\").not_nil!.name\n    name.upcase\n  end");
-    assert!(f.iter().any(|d| d.contains("not_nil!")), "{f:?}");
+    assert!(f.is_empty(), "{f:?}");
 }
 
 #[test]
 fn not_nil_still_checks_the_stripped_type() {
     let f = failures("  def show\n    User.find_by(name: \"a\").not_nil!.frobnicate\n  end");
-    assert!(f.iter().any(|d| d.contains("not_nil!")), "{f:?}");
+    assert!(
+        f.iter().any(|d| d.contains("frobnicate") && d.contains("ClassId(Symbol(\"User\"))")),
+        "{f:?}"
+    );
 }
 
 /// A receiver whose non-nil arm is itself un-inferred (`Var`) stays
 /// gradual, the way union dispatch treats a `Var` arm, rather than
-/// reporting `not_nil!` on `untyped?` (9 such on core).
+/// reporting `not_nil!` on `untyped?`; the unresolved name is still
+/// the error it was.
 #[test]
 fn unknown_receivers_do_not_certify_a_non_nil_assertion() {
     let f = failures("  def show\n    x = UnknownThing.lookup(1) || nil\n    x.not_nil!.anything\n  end");
-    assert!(f.iter().any(|m| m.contains("not_nil")), "{f:?}");
+    assert!(f.iter().any(|m| m.contains("UnknownThing")), "{f:?}");
+    assert!(!f.iter().any(|m| m.contains("not_nil")), "{f:?}");
 }

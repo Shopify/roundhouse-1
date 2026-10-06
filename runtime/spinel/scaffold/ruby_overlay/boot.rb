@@ -89,6 +89,8 @@ require_relative "runtime/rails_application_routes"
 require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_time_parsing"
 require_relative "runtime/active_support_core_ext"
+# type_toolkit's `not_nil!` (Kernel / NilClass reopen, CRuby overlay only).
+require_relative "runtime/type_toolkit"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other

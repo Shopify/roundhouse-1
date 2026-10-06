@@ -1418,6 +1418,26 @@ impl<'a> BodyTyper<'a> {
                         return t;
                     }
                 }
+                // type_toolkit's `x.not_nil!` (Core's `T.must`): Kernel's
+                // answers the receiver, NilClass's raises
+                // `TypeToolkit::UnexpectedNilError`, so the value is the
+                // receiver with nil removed. The CRuby overlay carries the
+                // gem's definition (`ruby_overlay/runtime/type_toolkit.rb`);
+                // `project` refuses it where no tree does. The assertion
+                // ingest synthesizes for `#: as !nil` keeps its own refusal.
+                if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
+                    && method.as_str() == "not_nil!" && args.is_empty() && block.is_none()
+                    && expr.diagnostic.is_none()
+                {
+                    if let Some(ty) = recv_ty.as_ref().filter(|_| recv.is_some()) {
+                        // An un-inferred arm stays gradual, as union
+                        // dispatch treats it, rather than a second error.
+                        return match ty.clone().strip_nil() {
+                            Ty::Var { .. } => Ty::Untyped,
+                            other => other,
+                        };
+                    }
+                }
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
                     let gap = match recv_ty.as_ref() {

@@ -3960,6 +3960,22 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 );
             }
         }
+        // type_toolkit's `not_nil!` is a Kernel/NilClass reopen only the
+        // CRuby overlay carries (`ruby_overlay/runtime/type_toolkit.rb`).
+        // The assertion ingest synthesizes for `#: as !nil` already
+        // carries its own refusal.
+        if let crate::expr::ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*expr.node {
+            if method.as_str() == "not_nil!" && args.is_empty() && expr.diagnostic.is_none()
+                && !matches!(target, "ruby" | "jruby")
+            {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "not_nil!",
+                    format!("`not_nil!` is type_toolkit's Kernel/NilClass extension, which only the CRuby tree carries, not {target}"),
+                );
+            }
+        }
         if target == "ruby" {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
             return;
