@@ -606,3 +606,29 @@ fn a_postgres_column_named_key_is_still_a_column() {
     assert_eq!(col(settings, "key").col_type, ColumnType::String { limit: Some(255) });
     assert_eq!(col(settings, "index").col_type, ColumnType::Integer);
 }
+
+/// A NOT NULL integer's unsaved slot holds 0, never nil, so presence on it
+/// could not fail the way Rails' does (`new(shop_id: nil).valid?` is
+/// false there). That is refused by name rather than emitted wrong; the
+/// string column, whose zero is blank, and the nullable integer are not.
+#[test]
+fn presence_on_a_not_null_numeric_column_is_refused() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `shops` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `shop_id` bigint NOT NULL,\n  `owner_id` bigint DEFAULT NULL,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/shop.rb", "class Shop < ApplicationRecord\n  validates :shop_id, presence: true\n  validates :owner_id, presence: true\n  validates :name, presence: true\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    Analyzer::new(&app).analyze(&mut app);
+    let refused: Vec<String> = diagnose(&app)
+        .into_iter()
+        .map(|d| d.to_string())
+        .filter(|d| d.contains("presence_on_not_null_numeric"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].starts_with("error") && refused[0].contains("Shop.shop_id"), "{refused:?}");
+}
