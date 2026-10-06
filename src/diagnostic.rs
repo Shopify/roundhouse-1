@@ -71,6 +71,7 @@ impl Diagnostic {
             DiagnosticKind::LowerResidue { .. } => "lower_residue",
             DiagnosticKind::UndefinedFilterTarget { .. } => "undefined_filter_target",
             DiagnosticKind::GraphqlNullableField { .. } => "graphql_nullable_field",
+            DiagnosticKind::InitializerUnsupported { .. } => "initializer_unsupported",
         }
     }
 
@@ -133,6 +134,28 @@ impl Diagnostic {
     pub fn parse(span: Span, message: impl Into<String>) -> Self {
         let message = message.into();
         let kind = DiagnosticKind::Parse { message: message.clone() };
+        Diagnostic {
+            span,
+            severity: Self::default_severity(&kind),
+            kind,
+            message,
+        }
+    }
+
+    /// Construct an `InitializerUnsupported` diagnostic: a statement in
+    /// a `config/initializers/` file that Rails runs at boot and no
+    /// ingest reader applies to the emitted app. `span` is the
+    /// statement; severity is the kind default (`Error`).
+    pub fn initializer_unsupported(
+        span: Span,
+        construct: impl Into<Symbol>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let kind = DiagnosticKind::InitializerUnsupported {
+            construct: construct.into(),
+            detail: detail.into(),
+        };
+        let message = Self::stub_text(&kind);
         Diagnostic {
             span,
             severity: Self::default_severity(&kind),
@@ -211,6 +234,10 @@ impl Diagnostic {
             DiagnosticKind::GraphqlNullableField { field, .. } => format!(
                 "`field :{}` is declared `null: false` but can resolve to nil; when it does, the response carries an error and nulls its parent",
                 field.as_str()
+            ),
+            DiagnosticKind::InitializerUnsupported { construct, detail } => format!(
+                "initializer statement `{}` does not run in the emitted app: {detail}",
+                construct.as_str()
             ),
         }
     }
@@ -502,4 +529,12 @@ pub enum DiagnosticKind {
     /// at the `field` call; `value_ty` is what it resolves to. Warning:
     /// the analyzer can see a nil that the data never holds.
     GraphqlNullableField { field: Symbol, value_ty: Ty },
+    /// A statement in a `config/initializers/` file (the app's or an
+    /// in-repo engine's) that Rails runs at boot and that no ingest
+    /// reader consumed, so the emitted app does not run it
+    /// (`analyze::initializer_coverage`). `construct` is a short
+    /// groupable name (`ActiveSupport.on_load`, `require`), `detail` the
+    /// statement's first line. Default severity `Error`: boot behavior
+    /// the emitted program silently lacks is not a faithful compile.
+    InitializerUnsupported { construct: Symbol, detail: String },
 }

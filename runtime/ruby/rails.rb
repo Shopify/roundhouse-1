@@ -517,6 +517,19 @@ module Rails
     def default_per_page
       25
     end
+
+    # `config.filter_parameters`: the keys Rails redacts, `[]` until the
+    # app adds some (railties 8.1.4 application/configuration.rb:36).
+    # Ingest lifts the app's writes, in boot order, onto the reopen; the
+    # emitted boot.rb copies them into `ActiveSupport.filter_parameters`
+    # after initialization, as the `active_support.set_filter_parameters`
+    # initializer does (activesupport railtie.rb:82-87). Rails keeps the
+    # application's own `filter_parameters` private; this one is the
+    # config reader `Rails.application.config.filter_parameters` lowers
+    # to, so it is public.
+    def filter_parameters
+      []
+    end
   end
 end
 

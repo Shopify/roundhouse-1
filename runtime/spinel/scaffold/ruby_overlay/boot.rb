@@ -265,3 +265,12 @@ ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(tz_name, tz_name)
 # between them count on this line having run before any dispatch.
 require_relative "app/models"
 require_relative "app/views"
+# `config.filter_parameters` reaches its consumers after initialization,
+# as activesupport 8.1.4's `active_support.set_filter_parameters`
+# initializer does it (railtie.rb:82-87, a `config.after_initialize`
+# hook, which Rails runs after eager loading): append the app's list to
+# `ActiveSupport.filter_parameters` and rebuild the event reporter's
+# payload filter from it. `Rails.application.filter_parameters` is the
+# app's list, lifted at ingest onto the reopen (framework default `[]`).
+ActiveSupport.filter_parameters += Rails.application.filter_parameters
+ActiveSupport.event_reporter.reload_payload_filter

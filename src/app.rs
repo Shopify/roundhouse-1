@@ -320,6 +320,19 @@ pub struct App {
     /// kept mixin supplies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_filters: Vec<InitializerFilter>,
+    /// Every `config/initializers/**/*.rb` Rails runs at boot, in its
+    /// load order: each in-repo engine's files (engines in the order
+    /// their classes are defined), then the application's, each
+    /// railtie's files sorted by full path
+    /// (`ingest::initializers::initializer_files`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initializer_files: Vec<String>,
+    /// Top-level initializer statements no ingest reader consumed, in
+    /// [`Self::initializer_files`] order. Each is code Rails runs at
+    /// boot and the emitted app does not, reported as an
+    /// `initializer_unsupported` error by `analyze::initializer_coverage`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initializer_gaps: Vec<InitializerGap>,
     /// SQL functions an initializer registers on every SQLite
     /// connection (`raw_connection.create_function("regexp", 2) do …`,
     /// `create_aggregate("stddev", 1) do step … finalize … end`).
@@ -601,6 +614,20 @@ pub struct InitializerFilter {
     pub only: Vec<Symbol>,
 }
 
+/// One initializer statement (a whole top-level statement, or one
+/// statement of a container a reader partly consumed) that nothing in
+/// ingest applies to the emitted app.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InitializerGap {
+    /// The statement's source range.
+    pub span: crate::span::Span,
+    /// Short, stable, groupable name: `ActiveSupport.on_load`,
+    /// `require`, `Rails.application.config.filter_parameters+=`, `if`.
+    pub construct: String,
+    /// The statement's first line, trimmed and capped.
+    pub detail: String,
+}
+
 /// `prepend` inserts AHEAD of the target in the lookup chain, `include`
 /// behind it. The distinction is the whole point of campfire's
 /// `RoomStreamsAreAuthorized`, whose `subscribed` calls `super` — as an
@@ -762,6 +789,8 @@ impl App {
             time_formats: BTreeMap::new(),
             module_mixins: Vec::new(),
             initializer_filters: Vec::new(),
+            initializer_files: Vec::new(),
+            initializer_gaps: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),
