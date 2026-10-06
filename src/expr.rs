@@ -38,6 +38,22 @@ pub const RESOLVED_DATA_FACTORY: u64 = 1 << 3;
 /// by the CRuby tree alone: every other target refuses it at emit.
 pub const GEM_CONSTANT_REF: u64 = 1 << 8;
 
+/// A source `T.bind(self, T)` / `#: self as T`: a `Cast` of `self` whose
+/// target is the type `self` has for the rest of the enclosing body. As a
+/// statement it only informs the typer; its value is `self`.
+pub const SELF_BINDING: u64 = 1 << 9;
+
+/// A [`SELF_BINDING`] to a class object (`T.bind(self, T.class_of(X))`,
+/// `#: self as singleton(X)`): `self` is then the class side of its type,
+/// which `Ty` alone does not tell apart from an instance.
+pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 10;
+
+/// Whether `expr` is a [`SELF_BINDING`] cast.
+pub fn is_self_binding(expr: &Expr) -> bool {
+    expr.decisions & SELF_BINDING != 0
+        && matches!(&*expr.node, ExprNode::Cast { value, .. } if matches!(&*value.node, ExprNode::SelfRef))
+}
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
