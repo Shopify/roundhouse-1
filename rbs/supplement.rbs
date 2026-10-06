@@ -1,0 +1,59 @@
+# Names Ruby 4.0.7 defines that rbs 3.10.0 does not declare. Hand-written
+# and reviewed; `scripts/vendor-rbs` does not touch this file. Each entry
+# cites the probe on the pinned interpreter that shows it, run with that
+# interpreter's own gem directory only:
+#
+#   GEM_HOME=$GEM_PATH=<ruby>/lib/ruby/gems/4.0.0 <ruby>/bin/ruby -e '...'
+#
+# Names only, as in phase 1 of docs: no method surface is declared here.
+
+# ruby -e 'require "socket"; p [Socket::ResolutionError, Socket::ResolutionError.superclass]'
+#   => [Socket::ResolutionError, SocketError]
+class Socket
+  class ResolutionError < SocketError
+  end
+end
+
+# ruby -e 'require "date"; p [Date::Error, Date::Error.superclass]'
+#   => [Date::Error, ArgumentError]
+# ruby -e 'require "date"; p [Date::Infinity, Date::Infinity.superclass]'
+#   => [Date::Infinity, Numeric]
+class Date
+  class Error < ArgumentError
+  end
+
+  class Infinity < Numeric
+  end
+end
+
+# ruby -e 'p [ObjectSpace::WeakMap, ObjectSpace::WeakMap.superclass, ObjectSpace::WeakMap.ancestors]'
+#   => [ObjectSpace::WeakMap, Object, [ObjectSpace::WeakMap, Enumerable, Object, Kernel, BasicObject]]
+module ObjectSpace
+  class WeakMap[K, V]
+  end
+end
+
+# ruby -e 'require "digest"; p [Digest::SHA2, Digest::SHA2.superclass]'
+#   => [Digest::SHA2, Digest::Class]
+class Digest::SHA2 < Digest::Class
+end
+
+# ruby -e 'require "bundler"; p [Bundler, Bundler.class]'
+#   => [Bundler, Module]
+module Bundler
+end
+
+# ruby -e 'require "json"; p [JSON::VERSION, JSON::Coder, JSON::Coder.superclass]'
+#   => ["2.18.0", JSON::Coder, Object]
+class JSON::Coder
+end
+
+# ruby -e 'require "psych"; p [Psych::VERSION, Psych::Coder, Psych::Coder.superclass]'
+#   => ["5.3.1", Psych::Coder, Object]
+class Psych::Coder
+end
+
+# Not here: Resolv::DNS::Resource::IN::CAA. The constant names a generated
+# class (`p Resolv::DNS::Resource::IN::CAA` prints
+# `Resolv::DNS::Resource::Type257_Class1`), so a class declaration under
+# that name would not be the class's identity.

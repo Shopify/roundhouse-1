@@ -1,0 +1,224 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Vendor the rbs signatures that ship with the Ruby the emitted CRuby tree
+# runs on (docs: rbs/README.md, written by this script).
+#
+#   /nix/store/...-ruby-4.0.7/bin/ruby scripts/vendor-rbs
+#
+# The rbs gem is resolved from the interpreter running this script: the
+# one copy in its own gem directory (`Gem.default_dir`), never a user or
+# bundle install of another version. Writes, replacing what was there:
+#
+#   rbs/core/**/*.rbs           core/ of that gem
+#   rbs/stdlib/<lib>/**/*.rbs   stdlib/<lib>/0/ of that gem
+#   rbs/requires.tsv            constant -> feature rows, each probed on
+#                               this interpreter (see `requires`)
+#   rbs/README.md               version, source path, probe rules
+#
+# Whole-line comments are stripped and blank runs collapsed: the documents
+# are indexed for names and types, and the comments are most of the bytes.
+# `rbs/supplement.rbs` is hand-written and reviewed; this script leaves it.
+
+require "fileutils"
+require "open3"
+require "rbconfig"
+
+CLEAN_ENV = {
+  "GEM_HOME" => Gem.default_dir, "GEM_PATH" => Gem.default_dir,
+  "RUBYOPT" => nil, "RUBYLIB" => nil, "BUNDLE_GEMFILE" => nil, "BUNDLER_SETUP" => nil,
+}.freeze
+
+# Parse with the interpreter's own rbs, not a newer one on the user's path.
+unless ENV["ROUNDHOUSE_VENDOR_RBS_CLEAN"]
+  exec(CLEAN_ENV.merge("ROUNDHOUSE_VENDOR_RBS_CLEAN" => "1"), RbConfig.ruby, __FILE__, *ARGV)
+end
+
+ROOT = File.expand_path("..", __dir__)
+OUT = File.join(ROOT, "rbs")
+
+gems = Dir[File.join(Gem.default_dir, "gems", "rbs-*")]
+abort "expected one rbs gem in #{Gem.default_dir}/gems, found #{gems.inspect}" unless gems.size == 1
+SOURCE = gems.first
+VERSION = File.basename(SOURCE).delete_prefix("rbs-")
+gem "rbs", "= #{VERSION}"
+require "rbs"
+abort "loaded rbs #{RBS::VERSION}, expected #{VERSION}" unless RBS::VERSION == VERSION
+
+def strip(text)
+  lines = text.lines.map(&:rstrip).reject { |line| line.lstrip.start_with?("#") }
+  lines.chunk_while { |a, b| a.empty? && b.empty? }.map(&:first).drop_while(&:empty?)
+       .reverse.drop_while(&:empty?).reverse.map { |line| "#{line}\n" }.join
+end
+
+FileUtils.rm_rf(File.join(OUT, "core"))
+FileUtils.rm_rf(File.join(OUT, "stdlib"))
+
+copied = []
+Dir.glob("core/**/*.rbs", base: SOURCE).sort.each do |rel|
+  copied << [nil, rel, File.join(OUT, rel)]
+end
+Dir.glob("stdlib/*/0/**/*.rbs", base: SOURCE).sort.each do |rel|
+  _, lib, _, *rest = rel.split("/")
+  copied << [lib, rel, File.join(OUT, "stdlib", lib, *rest)]
+end
+copied.each do |_, rel, dest|
+  FileUtils.mkdir_p(File.dirname(dest))
+  File.write(dest, strip(File.read(File.join(SOURCE, rel))))
+end
+
+# Every class, module, alias and constant each document declares, by full name.
+def declared(path)
+  _, _, decls = RBS::Parser.parse_signature(RBS::Buffer.new(name: path, content: File.read(path)))
+  names = []
+  walk = lambda do |decl, outer|
+    full = lambda do |type_name|
+      written = type_name.to_s
+      written.start_with?("::") ? written.delete_prefix("::") : [outer, written].compact.join("::")
+    end
+    case decl
+    when RBS::AST::Declarations::Class, RBS::AST::Declarations::Module
+      name = full.(decl.name)
+      names << name
+      decl.members.each { |member| walk.(member, name) }
+    when RBS::AST::Declarations::ClassAlias, RBS::AST::Declarations::ModuleAlias
+      names << full.(decl.new_name)
+    when RBS::AST::Declarations::Constant
+      names << full.(decl.name)
+    end
+  end
+  decls.each { |decl| walk.(decl, nil) }
+  names
+end
+
+core_names = copied.select { |lib, _, _| lib.nil? }.flat_map { |_, _, dest| declared(dest) }.uniq
+lib_names = copied.reject { |lib, _, _| lib.nil? }.group_by(&:first)
+                  .transform_values { |files| files.flat_map { |_, _, dest| declared(dest) }.uniq }
+
+def probe(script)
+  out, err, status = Open3.capture3(CLEAN_ENV, RbConfig.ruby, "-e", script)
+  [status.success?, out, err]
+end
+
+# `defined?` per name, in a fresh interpreter after `require feature`
+# (none: the names a plain `ruby` already has, rubygems included).
+def defined_after(feature, names)
+  list = names.map { |name| "::#{name}" }
+  script = +""
+  script << "require #{feature.inspect}\n" if feature
+  script << "#{list.inspect}.each { |n| puts(n.delete_prefix('::')) if (eval(\"defined?(\#{n})\") rescue nil) }\n"
+  ok, out, err = probe(script)
+  abort "probe failed for #{feature.inspect}: #{err}" unless ok
+  out.lines.map(&:chomp).to_set
+end
+
+# Feature names that differ from the library directory.
+FEATURE = {
+  "bigdecimal-math" => "bigdecimal/math", "cgi-escape" => "cgi/escape", "io-console" => "io/console",
+  "net-http" => "net/http", "net-protocol" => "net/protocol", "net-smtp" => "net/smtp",
+  "observable" => "observer",
+}.freeze
+
+# The test framework the CRuby harness carries itself
+# (`project.rs::CRUBY_TEST_GEMS`); its RBI, not RBS, types it.
+NOT_REQUIRED = %w[minitest].freeze
+
+rows = []
+skipped = []
+candidates = {}
+lib_names.each do |lib, names|
+  next skipped << [lib, "harness gem"] if NOT_REQUIRED.include?(lib)
+  feature = FEATURE.fetch(lib, lib)
+  ok, _, err = probe("require #{feature.inspect}")
+  next skipped << [lib, "require #{feature.inspect} fails: #{err.lines.first&.strip}"] unless ok
+  # The gem `require` activates for the feature, if any: a default gem is
+  # always on the load path, a bundled gem only when a Gemfile names it.
+  _, out, = probe(<<~RUBY)
+    before = Gem.loaded_specs.keys
+    require #{feature.inspect}
+    spec = (Gem.loaded_specs.keys - before).map { Gem.loaded_specs[_1] }
+      .find { _1.contains_requirable_file?(#{feature.inspect}) }
+    puts(spec ? (spec.default_gem? ? "default" : "bundled:\#{spec.name}") : "stdlib")
+  RUBY
+  kind = out.strip
+  candidates[lib] = [feature, kind, names.select { |name| name.count(":") <= 2 }]
+end
+
+plain = defined_after(nil, candidates.values.flat_map { _3 }.uniq)
+# `dependencies:` of each library's manifest, transitively.
+DEPENDS = lib_names.keys.to_h do |lib|
+  manifest = File.join(SOURCE, "stdlib", lib, "0", "manifest.yaml")
+  direct = File.exist?(manifest) ? File.read(manifest).scan(/^\s*- name: (\S+)/).flatten : []
+  [lib, direct]
+end
+def depends_on?(lib, other, seen = [])
+  return false if seen.include?(lib)
+  DEPENDS.fetch(lib, []).any? { |dep| dep == other || depends_on?(dep, other, seen + [lib]) }
+end
+
+claims = Hash.new { |h, k| h[k] = [] }
+candidates.each do |lib, (feature, kind, names)|
+  after = defined_after(feature, names)
+  names.each do |name|
+    next if plain.include?(name) || !after.include?(name) || core_names.include?(name)
+    claims[name] << [lib, feature, kind]
+  end
+end
+
+# Several libraries can define one name: open-uri reopens `URI`, and every
+# net library opens `Net`. The library the others depend on owns it. A
+# member (`Net::SMTP`) is listed only when its root's row does not load it.
+claims.each_value do |libs|
+  libs.reject! { |lib, _, _| libs.any? { |other, _, _| other != lib && depends_on?(lib, other) } }
+end
+row = ->(name, (lib, feature, kind)) { [name, feature, lib, kind] }
+claims.keys.reject { |name| name.include?("::") }.each do |root|
+  libs = claims[root]
+  next skipped << [root, "claimed by #{libs.map(&:first).join(", ")}"] unless libs.size == 1
+  rows << row.(root, libs.first)
+end
+claimed_by_root = rows.to_h { |root, feature, _, _| [root, feature] }
+covered = Hash.new { |h, feature| h[feature] = defined_after(feature, claims.keys) }
+claims.keys.select { |name| name.include?("::") }.sort.each do |name|
+  root = name.split("::").first
+  next if claimed_by_root[root] && covered[claimed_by_root[root]].include?(name)
+  next skipped << [name, "claimed by #{claims[name].map(&:first).join(", ")}"] if claims[name].size != 1
+  rows << row.(name, claims[name].first)
+end
+rows.sort!
+
+File.open(File.join(OUT, "requires.tsv"), "w") do |io|
+  io.puts "# Generated by scripts/vendor-rbs from rbs #{VERSION} on #{RUBY_DESCRIPTION}."
+  io.puts "# constant\tfeature\tlibrary\tkind (stdlib: loads with no Gemfile entry; bundled:<gem>: a bundled gem, which a Gemfile must name under bundler)"
+  io.puts "# A row means: `defined?(constant)` is nil in a plain `ruby` and non-nil after `require feature`."
+  rows.each { |row| io.puts row.join("\t") }
+end
+
+core_count = copied.count { |lib, _, _| lib.nil? }
+File.write(File.join(OUT, "README.md"), <<~MD)
+  # Vendored Ruby signatures
+
+  Generated by `scripts/vendor-rbs`; do not edit `core/`, `stdlib/` or
+  `requires.tsv` by hand. Rerun the script with the pinned interpreter.
+
+  - rbs **#{VERSION}**, the copy bundled with #{RUBY_DESCRIPTION}
+  - Source: `#{SOURCE}`
+  - Interpreter: `#{RbConfig.ruby}`
+  - #{core_count} files from `core/`, #{copied.size - core_count} from `stdlib/<lib>/0/`
+    (#{lib_names.size} libraries); #{copied.size} in all.
+  - Whole-line comments are stripped and runs of blank lines collapsed.
+
+  `requires.tsv` lists, for each stdlib constant that needs a `require`, the
+  feature that defines it. Each row is a probe on that interpreter, with its
+  own gem directory only: `defined?(X)` is nil in a plain `ruby` and non-nil
+  after `require "feature"`. Core constants need no row. A root several
+  libraries define (`Net`) is listed through its members (`Net::SMTP`).
+
+  Not listed:
+  #{skipped.map { |what, why| "- `#{what}`: #{why}" }.join("\n")}
+
+  `supplement.rbs` is hand-written: names this Ruby defines that rbs #{VERSION}
+  lacks, each with the probe that shows it.
+MD
+
+puts "#{copied.size} files (#{core_count} core), #{rows.size} require rows, #{skipped.size} skipped"

@@ -1,0 +1,142 @@
+class Rational < Numeric
+  def %: (Integer) -> Rational
+       | (Float) -> Float
+       | (Rational) -> Rational
+       | (Numeric) -> Numeric
+
+  def *: (Integer) -> Rational
+       | (Rational) -> Rational
+       | [T < Numeric](T) -> T
+
+  def **: (Complex) -> Complex
+        | (Numeric) -> Numeric
+
+  def +: (Float) -> Float
+       | (Complex) -> Complex
+       | (Numeric) -> Rational
+
+  def +@: () -> Rational
+
+  def -: (Float) -> Float
+       | (Complex) -> Complex
+       | (Numeric) -> Rational
+
+  def -@: () -> Rational
+
+  def /: (Float) -> Float
+       | (Complex) -> Complex
+       | (Numeric) -> Rational
+
+  def <=>: (Integer | Rational) -> Integer
+         | (untyped) -> Integer?
+
+  def ==: (untyped) -> bool
+
+  def abs: () -> Rational
+
+  def abs2: () -> Rational
+
+  def angle: () -> (Integer | Float)
+
+  alias arg angle
+
+  def ceil: () -> Integer
+          | (Integer digits) -> (Integer | Rational)
+
+  def coerce: (Numeric) -> [ Numeric, Numeric ]
+
+  def conj: () -> Rational
+
+  def conjugate: () -> Rational
+
+  def denominator: () -> Integer
+
+  def div: (Numeric) -> Integer
+
+  def divmod: (Integer | Float | Rational) -> [ Integer, Rational ]
+            | (Numeric) -> [ Numeric, Numeric ]
+
+  def dup: () -> self
+
+  def eql?: (untyped) -> bool
+
+  def fdiv: (Numeric) -> Float
+
+  def finite?: () -> bool
+
+  def floor: () -> Integer
+           | (Integer digits) -> (Integer | Rational)
+
+  def hash: () -> Integer
+
+  def i: () -> Complex
+
+  def imag: () -> Integer
+
+  def imaginary: () -> Integer
+
+  def infinite?: () -> Integer?
+
+  def inspect: () -> String
+
+  def integer?: () -> bool
+
+  alias magnitude abs
+
+  def modulo: (Float) -> Float
+            | (Numeric) -> Rational
+
+  def negative?: () -> bool
+
+  def nonzero?: () -> self?
+
+  def numerator: () -> Integer
+
+  alias phase angle
+
+  def polar: () -> [ Rational, Integer | Float ]
+
+  def positive?: () -> bool
+
+  def quo: (Float) -> Float
+         | (Complex) -> Complex
+         | (Numeric) -> Rational
+
+  def rationalize: (?Numeric eps) -> Rational
+
+  def real: () -> Rational
+
+  def real?: () -> true
+
+  def rect: () -> [ Rational, Numeric ]
+
+  alias rectangular rect
+
+  def remainder: (Float) -> Float
+               | (Numeric) -> Rational
+
+  def round: (?half: :up | :down | :even) -> Integer
+           | (Integer digits, ?half: :up | :down | :even) -> (Integer | Rational)
+
+  def step: (?Numeric limit, ?Numeric step) { (Rational) -> void } -> self
+          | (?Numeric limit, ?Numeric step) -> Enumerator[Rational, self]
+          | (?by: Numeric, ?to: Numeric) { (Rational) -> void } -> self
+          | (?by: Numeric, ?to: Numeric) -> Enumerator[Rational, self]
+
+  def to_c: () -> Complex
+
+  def to_f: () -> Float
+
+  def to_i: () -> Integer
+
+  alias to_int to_i
+
+  def to_r: () -> Rational
+
+  def to_s: () -> String
+
+  def truncate: () -> Integer
+              | (Integer ndigits) -> (Integer | Rational)
+
+  def zero?: () -> bool
+end
