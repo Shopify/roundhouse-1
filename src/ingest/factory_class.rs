@@ -214,5 +214,6 @@ fn factory_class(
         constants: Vec::new(),
         unknown_calls: body.unknown_calls,
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: body.visibility_overrides,
     })
 }

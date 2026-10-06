@@ -1576,6 +1576,9 @@ pub(super) struct FactoryClassBody {
     pub(super) includes: Vec<ClassId>,
     pub(super) methods: Vec<MethodDef>,
     pub(super) unknown_calls: Vec<Expr>,
+    /// `private :to_h` / `private :member` in the block: visibility of a
+    /// method the block does not define (the factory's or an ancestor's).
+    pub(super) visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
 }
 
 /// Walk a factory block as the class body Ruby evaluates it as. The
@@ -1589,7 +1592,7 @@ pub(super) fn factory_class_body(
     owner: &ClassId,
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
-    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers } =
+    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers, visibility_overrides } =
         walk_decl_body(body, owner, file, false)?;
     if !constants.is_empty() || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
@@ -1600,7 +1603,7 @@ pub(super) fn factory_class_body(
         });
     }
     admit_nameless_rest(&mut methods);
-    Ok(FactoryClassBody { includes, methods, unknown_calls })
+    Ok(FactoryClassBody { includes, methods, unknown_calls, visibility_overrides })
 }
 
 fn walk_decl_body<'pr>(
