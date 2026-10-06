@@ -559,6 +559,21 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "StringIO", &[], &[
         ("string", Ty::Str), ("<<", string_io),
     ]);
+    // `Process` — Ruby core, and on both Ruby lanes: CRuby's own, and
+    // Spinel's codegen, which lowers `Process.clock_gettime(id, unit)`
+    // and the four POSIX clock ids below to the C clock. `pid` and
+    // `clock_gettime` are typed by the send dispatcher (the unit
+    // argument picks Float or Integer), so no method is declared here;
+    // what this adds is the module itself and its clock ids, which are
+    // Integers in Ruby. Only the ids Spinel emits are listed, so any
+    // other `Process::` constant stays an unresolved name. `project`
+    // refuses the module value on every target whose runtime does not
+    // supply it.
+    let process = classes.entry(ClassId(Symbol::from("Process"))).or_default();
+    process.is_module = true;
+    for clock in ["CLOCK_MONOTONIC", "CLOCK_REALTIME", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID"] {
+        process.constants.entry(Symbol::from(clock)).or_insert(Ty::Int);
+    }
     // JSON dispatch is already intrinsic in BodyTyper and the emitters;
     // a source-backed reference must also recognize its exact namespace.
     register_stdlib_class(classes, "JSON", &[], &[]);

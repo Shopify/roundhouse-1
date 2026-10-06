@@ -142,7 +142,8 @@ pub struct Ctx {
 pub struct ClassInfo {
     /// Kind of the indexed source declaration; never inferred from its name.
     pub is_module: bool,
-    /// Constant values declared by external gem RBI/RBS files.
+    /// Constant values declared by external gem RBI/RBS files, or by
+    /// a modeled stdlib module (`registry::stdlib`, e.g. `Process`).
     pub constants: HashMap<Symbol, Ty>,
     /// If this class maps to a database table, which one.
     pub table: Option<crate::ident::TableRef>,
@@ -590,10 +591,10 @@ impl<'a> BodyTyper<'a> {
                     let id = written_class_id(path);
                     if let Some((name, owner)) = path.split_last() {
                         if !owner.is_empty() {
+                            // Only external declarations carry `constants`:
+                            // gem RBI/RBS and the modeled stdlib (`Process`).
                             if let Some(info) = self.classes().get(&written_class_id(owner)) {
-                                if info.gem_boundary {
-                                    if let Some(ty) = info.constants.get(name) { return ty.clone(); }
-                                }
+                                if let Some(ty) = info.constants.get(name) { return ty.clone(); }
                             }
                         }
                     }
