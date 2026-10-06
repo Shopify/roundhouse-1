@@ -5,7 +5,6 @@
 //! wherever the harness does not define it. `project` refuses each call
 //! on a target whose emitted harness does not declare the method.
 
-use crate::dialect::TestModule;
 use crate::expr::{Expr, ExprNode};
 use crate::span::Span;
 use crate::App;
@@ -52,24 +51,6 @@ pub(crate) fn declared_methods(text: &str) -> Vec<String> {
     declared.0
 }
 
-/// The test class's own instance helpers and those of the test classes
-/// it inherits from, which a call reaches before the harness. A `def
-/// self.capture_io` is not one: the call is sent to the test instance.
-fn defines(app: &App, module: &TestModule, method: &str) -> bool {
-    let mut current = Some(module);
-    for _ in 0..32 {
-        let Some(tm) = current else { break };
-        if tm.helpers.iter().any(|helper| {
-            helper.name.as_str() == method && helper.receiver == crate::dialect::MethodReceiver::Instance
-        }) {
-            return true;
-        }
-        current = tm.parent.as_ref()
-            .and_then(|parent| app.test_modules.iter().find(|other| other.name == *parent && other.name != tm.name));
-    }
-    false
-}
-
 fn collect(expr: &Expr, wanted: &[&'static str], out: &mut Vec<(Span, &'static str)>) {
     if let ExprNode::Send { recv, method, .. } = &*expr.node {
         let on_self = recv.as_ref().is_none_or(|recv| matches!(*recv.node, ExprNode::SelfRef));
@@ -86,7 +67,7 @@ pub(crate) fn harness_calls(app: &App) -> Vec<(Span, &'static str)> {
     let mut out = Vec::new();
     for module in &app.test_modules {
         let wanted: Vec<&'static str> = HARNESS_METHODS.iter().copied()
-            .filter(|method| !defines(app, module, method))
+            .filter(|method| !module.defines_instance_method(&app.test_modules, method))
             .collect();
         if wanted.is_empty() {
             continue;

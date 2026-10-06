@@ -7714,3 +7714,79 @@ fn a_test_class_defining_capture_io_is_not_refused_for_the_harness() {
         assert!(!errors.iter().any(|e| e.contains("harness_method")), "{target:?}: {errors:?}");
     }
 }
+
+/// One test file whose teardown prints how many times the block's
+/// effect (`Widget.hit`) ran, so a failing run shows where it stopped.
+fn destructured_block_app(name: &str, members: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write(
+            "app/models/widget.rb",
+            "class Widget\n  HITS = []\n\n  def self.flag\n    false\n  end\n\n  def self.hit\n    HITS << 1\n  end\n\n  def self.hits\n    HITS.size\n  end\n\n  def self.reset\n    HITS.clear\n  end\nend\n",
+        )
+        .write("test/test_helper.rb", "require \"active_support\"\n")
+        .write(
+            "test/models/widget_test.rb",
+            &format!(
+                "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  setup do\n    Widget.reset\n  end\n\n  teardown do\n    puts \"F3 {name} HITS=#{{Widget.hits}}\"\n  end\n\n{members}\nend\n"
+            ),
+        )
+}
+
+/// Assertions inside the block on the right of `a, b = call do … end`
+/// are lowered where they are written: in a branch, in an `ensure`,
+/// around the output a `capture_io` collects, and through a splat. A
+/// test class's own `assert_includes` is the one called, not Minitest's.
+/// Each case's outcome is the native Minitest run's (f3/native.log).
+#[test]
+fn assertions_inside_a_destructured_block_run_where_they_are_written() {
+    let cases = [
+        ("pass", "  test \"t\" do\n    out, err = capture_io do\n      $stdout.puts \"a\"\n      assert true\n      $stderr.puts \"b\"\n      assert_equal 2, 1 + 1\n      Widget.hit\n      $stdout.puts \"c\"\n    end\n    assert_equal \"a\\nc\\n\", out\n    assert_equal \"b\\n\", err\n    assert_equal 1, Widget.hits\n  end\n"),
+        ("nested", "  test \"t\" do\n    out, err = capture_io do\n      if Widget.flag\n        assert_equal 1, 2\n      else\n        Widget.hit\n      end\n      begin\n        $stdout.puts \"body\"\n      ensure\n        assert_equal 1, Widget.hits\n        Widget.hit\n      end\n    end\n    assert_equal \"body\\n\", out\n    assert_equal \"\", err\n    assert_equal 2, Widget.hits\n  end\n"),
+        ("own", "  def assert_includes(collection, item)\n    Widget.hit\n    assert collection.downcase.include?(item.downcase)\n  end\n\n  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      $stdout.puts \"HELLO\"\n      assert_includes \"HELLO\", \"hello\"\n      assert_shouted \"LOUD\"\n    end\n    assert_includes out, \"hello\"\n    assert_equal 2, Widget.hits\n  end\n"),
+        ("plain", "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal x, x\n      Widget.hit\n      x * 10\n    end\n    assert_equal [10, 20], [first, second]\n    assert_equal 2, Widget.hits\n  end\n"),
+        ("splat", "  test \"t\" do\n    out, *rest = capture_io do\n      $stderr.puts \"e\"\n      assert_equal 1, 1\n      Widget.hit\n    end\n    assert_equal \"\", out\n    assert_equal [\"e\\n\"], rest\n    assert_equal 1, Widget.hits\n  end\n"),
+    ];
+    for (name, members) in cases {
+        let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
+        run.assert_passes();
+        assert!(run.stdout.contains(&format!("F3 {name} HITS=")), "{name}: {}", run.stdout);
+    }
+}
+
+/// A failing assertion inside that block fails the test and stops what
+/// follows it, inside the block and after it — the effect count is the
+/// native run's. A raw Minitest call would instead raise NoMethodError
+/// before any assertion is checked.
+#[test]
+fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
+    let cases = [
+        ("false", "assertion failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      assert false\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("mismatch", "assert_equal failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("ensure", "assertion failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("own_fail", "assert_equal failed", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("plain_fail", "assert_equal failed", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
+    ];
+    for (name, failure, hits, members) in cases {
+        let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
+        assert!(run.errors.is_empty(), "{name}: {:?}", run.errors);
+        assert!(!run.success, "{name}: the failing assertion passed\n{}", run.stdout);
+        assert!(run.stdout.contains(&format!("FAIL WidgetTest#test_t: {failure}")), "{name}: {}", run.stdout);
+        assert!(run.stdout.contains(&format!("F3 {name} HITS={hits}\n")), "{name}: {}", run.stdout);
+    }
+}
+
+/// A nested destructuring target is refused by name at ingest rather
+/// than lowered with its block's assertions dropped.
+#[test]
+fn a_nested_destructuring_target_is_refused_by_name() {
+    let tree = [
+        ("app/.keep", ""),
+        ("test/test_helper.rb", "require \"active_support\"\n"),
+        ("test/models/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    (out, err), extra = capture_io do\n      assert_equal 1, 2\n    end\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
+    assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
+}
