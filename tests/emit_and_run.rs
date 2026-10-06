@@ -6622,3 +6622,51 @@ raise "nested members changed" unless ContainerNarrowingProbe.nested_members == 
 "#)
         .assert_passes();
 }
+
+/// A model-only app whose schema is a MySQL `structure.sql` dump, the
+/// shape of a Shopify Core component. Two things had to hold for it to
+/// run: the dump's tables reach the schema (`tinyint(1)` a boolean, its
+/// `DEFAULT '0'` false), and an app without controllers boots instead of
+/// `config/routes.rb` requiring an `application_controller` it never had.
+/// Presence is on a NOT NULL *string*, whose unsaved slot is the blank
+/// `""`; on a NOT NULL integer it is refused (`tests/structure_sql.rs`).
+#[test]
+fn a_model_only_app_on_a_mysql_structure_dump_runs() {
+    emit_and_run::empty_app()
+        .write("db/structure.sql", r#"CREATE TABLE `grandfathered_shops` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `shop_id` bigint NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '0',
+  `name` varchar(255) NOT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `index_grandfathered_shops_on_shop_id` (`shop_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+"#)
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/grandfathered_shop.rb", "class GrandfatheredShop < ApplicationRecord\n  validates :name, presence: true\nend\n")
+        .write("test/fixtures/grandfathered_shops.yml", "enabled:\n  shop_id: 7\n  name: a\n  enabled: true\n\ndisabled:\n  shop_id: 8\n  name: b\n  enabled: false\n")
+        .write("test/models/grandfathered_shop_test.rb", r#"require "test_helper"
+
+class GrandfatheredShopTest < ActiveSupport::TestCase
+  test "enabled defaults to false" do
+    refute GrandfatheredShop.new(shop_id: 1).enabled
+  end
+
+  test "requires name" do
+    record = GrandfatheredShop.new(shop_id: 1, name: nil)
+    refute_predicate record, :valid?
+    assert_includes record.errors[:name], "can't be blank"
+  end
+
+  test "can query by shop_id and enabled status" do
+    record = grandfathered_shops(:enabled)
+    assert GrandfatheredShop.exists?(shop_id: record.shop_id, enabled: true)
+    refute GrandfatheredShop.exists?(shop_id: record.shop_id, enabled: false)
+  end
+end
+"#)
+        .run_test("test/models/grandfathered_shop_test.rb")
+        .assert_passes();
+}
