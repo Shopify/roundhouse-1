@@ -26,6 +26,7 @@
 mod alba;
 mod enum_raw_input;
 mod presence_not_null;
+mod fixture_entries;
 mod body;
 mod class_configuration;
 mod data;

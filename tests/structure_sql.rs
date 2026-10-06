@@ -632,3 +632,37 @@ fn presence_on_a_not_null_numeric_column_is_refused() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(refused[0].starts_with("error") && refused[0].contains("Shop.shop_id"), "{refused:?}");
 }
+
+/// A fixture entry the loader cannot place used to vanish from the test
+/// data with `check` clean: Core's `shop: snowdevil` on a model whose
+/// `accelerated_belongs_to :shop` is not lowered and with no `shops`
+/// fixture. Rails loads it (or raises on an unknown column), so each
+/// unplaceable entry is named; a column and a resolvable belongs_to
+/// label are not.
+#[test]
+fn fixture_entries_the_loader_cannot_place_are_named() {
+    use roundhouse::analyze::{diagnose, Analyzer};
+    let tree = [
+        ("db/structure.sql", "CREATE TABLE `owners` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\nCREATE TABLE `pets` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `owner_id` bigint NOT NULL,\n  `name` varchar(255) NOT NULL,\n  `shop_id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/owner.rb", "class Owner < ApplicationRecord\nend\n"),
+        ("app/models/pet.rb", "class Pet < ApplicationRecord\n  belongs_to :owner\nend\n"),
+        ("test/fixtures/owners.yml", "ann: {}\n"),
+        ("test/fixtures/pets.yml", "rex:\n  owner: ann\n  name: Rex\n  shop: snowdevil\n"),
+        ("test/fixtures/ghosts.yml", "boo:\n  name: Boo\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    Analyzer::new(&app).analyze(&mut app);
+    let named: Vec<String> = diagnose(&app)
+        .into_iter()
+        .map(|d| d.to_string())
+        .filter(|d| d.contains("fixture_entry"))
+        .collect();
+    assert_eq!(named.len(), 2, "{named:?}");
+    assert!(named.iter().all(|d| d.starts_with("error")), "{named:?}");
+    assert!(named.iter().any(|d| d.contains("`pets`.rex.shop")), "{named:?}");
+    assert!(named.iter().any(|d| d.contains("`ghosts`") && d.contains("not a model")), "{named:?}");
+}

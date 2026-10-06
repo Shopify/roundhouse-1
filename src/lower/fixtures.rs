@@ -376,3 +376,26 @@ fn enum_stored_value(
         _ => None,
     }
 }
+
+/// Every fixture entry `lower_fixtures` would load as nothing: a set with
+/// no model to load it, or a field that names neither a column nor a
+/// belongs_to whose target label exists. Rails loads each (or raises on an
+/// unknown column), so a dropped entry is different data, not a no-op.
+pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    for fixture in &app.fixtures {
+        let class = fixture.class_id();
+        let Some(model) = app.models.iter().find(|m| m.name == class) else {
+            out.push(format!("fixture set `{}` loads {}, which is not a model of this app", fixture.path, class.0));
+            continue;
+        };
+        for (label, fields) in &fixture.records {
+            for (key, value) in fields {
+                if resolve_field(key, value, Some(model), app).is_empty() {
+                    out.push(format!("fixture `{}`.{label}.{key} names neither a {} column nor a belongs_to with that fixture label", fixture.path, class.0));
+                }
+            }
+        }
+    }
+    out
+}
