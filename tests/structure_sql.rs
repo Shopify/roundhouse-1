@@ -466,3 +466,143 @@ fn other_meta_commands_and_literals_are_left_alone() {
     let notes = &schema.tables[&Symbol::from("notes")];
     assert_eq!(col(notes, "body").default.as_deref(), Some("first line\n\\restrict kept"));
 }
+
+/// A MySQL `structure.sql` in the shape Rails' MySQL adapter dumps
+/// (`SHOW CREATE TABLE` output plus the `schema_migrations` insert):
+/// backtick identifiers, inline `PRIMARY KEY` / `KEY` / `UNIQUE KEY`
+/// entries, per-column `CHARACTER SET`/`COLLATE`/`COMMENT`, and table
+/// options after the closing paren.
+const MYSQL_STRUCTURE_SQL: &str = r#"CREATE TABLE `ar_internal_metadata` (
+  `key` varchar(255) COLLATE utf8mb4_general_ci NOT NULL,
+  `value` varchar(255) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  PRIMARY KEY (`key`)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `gadgets` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `owner_id` bigint NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '0',
+  `visible` tinyint(1) DEFAULT '1',
+  `rank` tinyint DEFAULT NULL,
+  `level` tinyint(4) DEFAULT NULL,
+  `position` int NOT NULL DEFAULT '0',
+  `small` smallint DEFAULT NULL,
+  `handle` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+  `title` varchar(100) COLLATE utf8mb4_general_ci NOT NULL COMMENT 'Shown, (sometimes); to people',
+  `kind` varchar(32) COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'simple',
+  `body` text CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  `notes` mediumtext CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+  `price` decimal(7,2) unsigned NOT NULL,
+  `ratio` float DEFAULT NULL,
+  `settings` json DEFAULT NULL,
+  `blob_data` mediumblob,
+  `starts_on` date DEFAULT NULL,
+  `seen_at` datetime DEFAULT NULL,
+  `created_at` datetime(6) NOT NULL,
+  `updated_at` datetime(6) NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `index_gadgets_on_owner_id_and_handle` (`owner_id`,`handle`),
+  KEY `index_gadgets_on_owner_id` (`owner_id`),
+  KEY `index_gadgets_on_updated_at` (`updated_at`)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC;
+
+CREATE TABLE `schema_migrations` (
+  `version` varchar(255) COLLATE utf8mb4_general_ci NOT NULL,
+  PRIMARY KEY (`version`)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+INSERT INTO `schema_migrations` (version) VALUES
+('20240101000000'),
+('20240102000000');
+
+"#;
+
+#[test]
+fn a_mysql_dump_ingests_tables_columns_keys_and_defaults() {
+    let schema = ingest_structure_sql(MYSQL_STRUCTURE_SQL.as_bytes(), "db/structure.sql")
+        .expect("a MySQL dump in Rails' shape ingests without gaps");
+
+    assert!(!schema.tables.contains_key(&Symbol::from("schema_migrations")));
+    assert!(!schema.tables.contains_key(&Symbol::from("ar_internal_metadata")));
+    let gadgets = schema.tables.get(&Symbol::from("gadgets")).unwrap_or_else(|| {
+        panic!("no gadgets table; have {:?}", schema.tables.keys().collect::<Vec<_>>())
+    });
+    assert_eq!(gadgets.columns.len(), 21, "{:?}", gadgets.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>());
+
+    assert!(col(gadgets, "id").primary_key);
+    assert_eq!(col(gadgets, "id").col_type, ColumnType::BigInt);
+    assert!(!col(gadgets, "owner_id").primary_key);
+    // Rails' MySQL adapter reads `tinyint(1)` as a boolean
+    // (`emulate_booleans`), and every other tinyint as an integer.
+    assert_eq!(col(gadgets, "enabled").col_type, ColumnType::Boolean);
+    assert!(!col(gadgets, "enabled").nullable);
+    assert_eq!(col(gadgets, "enabled").default.as_deref(), Some("0"));
+    assert_eq!(col(gadgets, "visible").col_type, ColumnType::Boolean);
+    assert_eq!(col(gadgets, "visible").default.as_deref(), Some("1"));
+    assert_eq!(col(gadgets, "rank").col_type, ColumnType::Integer);
+    assert_eq!(col(gadgets, "level").col_type, ColumnType::Integer);
+    assert_eq!(col(gadgets, "position").col_type, ColumnType::Integer);
+    assert_eq!(col(gadgets, "position").default.as_deref(), Some("0"));
+    assert_eq!(col(gadgets, "small").col_type, ColumnType::Integer);
+    assert_eq!(col(gadgets, "handle").col_type, ColumnType::String { limit: Some(255) });
+    assert!(!col(gadgets, "handle").nullable);
+    assert_eq!(col(gadgets, "title").col_type, ColumnType::String { limit: Some(100) });
+    assert!(!col(gadgets, "title").nullable);
+    assert_eq!(col(gadgets, "kind").default.as_deref(), Some("simple"));
+    assert_eq!(col(gadgets, "body").col_type, ColumnType::Text);
+    assert!(col(gadgets, "body").nullable);
+    assert_eq!(col(gadgets, "notes").col_type, ColumnType::Text);
+    assert!(!col(gadgets, "notes").nullable);
+    assert_eq!(col(gadgets, "price").col_type, ColumnType::Decimal { precision: None, scale: None });
+    assert_eq!(col(gadgets, "ratio").col_type, ColumnType::Float);
+    assert_eq!(col(gadgets, "settings").col_type, ColumnType::Json);
+    assert_eq!(col(gadgets, "blob_data").col_type, ColumnType::Binary);
+    assert_eq!(col(gadgets, "starts_on").col_type, ColumnType::Date);
+    assert_eq!(col(gadgets, "seen_at").col_type, ColumnType::DateTime);
+    assert_eq!(col(gadgets, "created_at").col_type, ColumnType::DateTime);
+    assert!(!col(gadgets, "created_at").nullable);
+
+    let unique = gadgets.indexes.iter().find(|i| i.name.as_str() == "index_gadgets_on_owner_id_and_handle").expect("unique key");
+    assert!(unique.unique);
+    assert_eq!(unique.columns.iter().map(|c| c.as_str()).collect::<Vec<_>>(), ["owner_id", "handle"]);
+    let plain = gadgets.indexes.iter().find(|i| i.name.as_str() == "index_gadgets_on_owner_id").expect("plain key");
+    assert!(!plain.unique);
+    assert_eq!(gadgets.indexes.len(), 3);
+}
+
+/// A MySQL column type with no `ColumnType` mapping is a ledgered
+/// drop, and a table the walk cannot read is never a silent no-op.
+#[test]
+fn mysql_gaps_are_ledgered_not_silent() {
+    let sql = "CREATE TABLE `gadgets` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `status` enum('a','b') NOT NULL,\n  `point` point NOT NULL,\n  `total` int GENERATED ALWAYS AS ((`id` * 2)) STORED,\n  PRIMARY KEY (`id`),\n  KEY `index_gadgets_on_status_prefix` (`status`(8)),\n  FULLTEXT KEY `index_gadgets_on_status_text` (`status`)\n) DEFAULT CHARSET=utf8mb4;\n";
+    survey::activate();
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("survey mode");
+    let gaps: Vec<String> = survey::drain().iter().map(|g| format!("{g}")).collect();
+    let gadgets = &schema.tables[&Symbol::from("gadgets")];
+    assert!(gadgets.columns.iter().all(|c| c.name.as_str() != "status"), "enum column dropped");
+    assert!(gaps.iter().any(|m| m.contains("column dropped: gadgets.status") && m.contains("enum")), "{gaps:?}");
+    assert!(gaps.iter().any(|m| m.contains("column dropped: gadgets.point")), "{gaps:?}");
+    // A generated column is computed by the database: writing it is an
+    // error there, so it cannot be modeled as an ordinary column.
+    assert!(gadgets.columns.iter().all(|c| c.name.as_str() != "total"), "generated column dropped");
+    assert!(gaps.iter().any(|m| m.contains("gadgets.total") && m.contains("generated")), "{gaps:?}");
+    // A prefix-length key and a FULLTEXT key have no `Index` shape.
+    assert!(gadgets.indexes.is_empty(), "{:?}", gadgets.indexes);
+
+    let unreadable = "CREATE TABLE `broken` `extra` (\n  `id` bigint\n);\n";
+    survey::activate();
+    let _ = ingest_structure_sql(unreadable.as_bytes(), "db/structure.sql").expect("survey mode");
+    let gaps: Vec<String> = survey::drain().iter().map(|g| format!("{g}")).collect();
+    assert!(!gaps.is_empty(), "an unreadable CREATE TABLE is ledgered");
+}
+
+/// Postgres keeps reading an unquoted column whose name is a MySQL
+/// key keyword: only a backtick-named `KEY`/`INDEX` entry is an index.
+#[test]
+fn a_postgres_column_named_key_is_still_a_column() {
+    let sql = "CREATE TABLE public.settings (\n    id bigint NOT NULL,\n    key character varying(255) NOT NULL,\n    index integer\n);\n";
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("ingest");
+    let settings = &schema.tables[&Symbol::from("settings")];
+    assert_eq!(col(settings, "key").col_type, ColumnType::String { limit: Some(255) });
+    assert_eq!(col(settings, "index").col_type, ColumnType::Integer);
+}
