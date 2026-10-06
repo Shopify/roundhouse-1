@@ -515,6 +515,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // The `sqlite3` gem's statement error, the cause of a
         // StatementInvalid on that tree.
         ("SQLite3::SQLException", None),
+        // The `sqlite3` gem's constraint error, raised by its driver on that tree.
+        ("SQLite3::ConstraintException", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
         ("ActionController::ParameterMissing", Some(("param", Ty::Str))),

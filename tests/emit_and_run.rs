@@ -7520,3 +7520,85 @@ fn a_test_naming_fiber_runs_on_cruby_and_is_refused_without_a_runtime() {
         assert!(errors.iter().any(|e| e.contains("Fiber is not available")), "{target:?}: {errors:?}");
     }
 }
+
+/// A helper base that subclasses its outer namesake (`class TestCase <
+/// TestCase` inside `module Compat`) reads the superclass before the
+/// inner class exists, so it subclasses the top-level one. Taking the
+/// class for its own parent emitted a file that required itself and
+/// raised NameError at load.
+#[test]
+fn a_test_base_subclassing_its_outer_namesake_keeps_it() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nclass TestCase < ActiveSupport::TestCase\n  def top_helper\n    1\n  end\nend\n\nmodule Compat\n  class TestCase < TestCase\n    def compat_helper\n      2\n    end\n  end\nend\n")
+        .write("test/models/widget_test.rb", "require \"test_helper\"\n\nmodule Compat\n  class WidgetTest < TestCase\n    test \"k\" do\n      assert_equal 1, top_helper\n      assert_equal 2, compat_helper\n    end\n  end\nend\n")
+        .run_test("test/models/compat_widget_test.rb")
+        .assert_passes();
+}
+
+/// A test class's inner class is hoisted to file scope under its own
+/// name. Where an app class of that name is found first from the test's
+/// module (`Shop::Late`), or is reopened by the hoist (`Report`), the
+/// bare read does not reach it: refused at the name.
+#[test]
+fn an_inner_class_hoisted_over_an_app_class_is_refused() {
+    use roundhouse::project::BuildTarget;
+    for (model_path, model, test, name) in [
+        ("app/models/report.rb", "class Report\n  def self.kind\n    \"app\"\n  end\nend\n",
+         "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  class Report < StandardError\n  end\n\n  test \"x\" do\n    assert_raises(Report) { raise Report, \"x\" }\n  end\nend\n", "Report"),
+        ("app/models/shop/late.rb", "module Shop\n  class Late\n    def self.kind\n      \"app\"\n    end\n  end\nend\n",
+         "require \"test_helper\"\n\nmodule Shop\n  class WidgetTest < ActiveSupport::TestCase\n    class Late < StandardError\n    end\n\n    test \"x\" do\n      assert_raises(Late) { raise Late, \"x\" }\n    end\n  end\nend\n", "Late"),
+    ] {
+        let (_, errors) = emit_and_run::empty_app()
+            .write(model_path, model)
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", test)
+            .emit(BuildTarget::Ruby);
+        assert!(errors.iter().any(|e| e.contains(&format!("constant not supported (all targets): {name}"))), "{name}: {errors:?}");
+    }
+}
+
+/// The inner class of a test class this one inherits from is hoisted
+/// in the parent's file, which this file loads.
+#[test]
+fn an_inner_class_of_an_inherited_test_class_runs() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("test/test_helper.rb", "require \"active_support\"\n")
+        .write("test/models/base_test.rb", "require \"test_helper\"\n\nclass BaseTest < ActiveSupport::TestCase\n  class Oops < StandardError; end\nend\n")
+        .write("test/models/widget_test.rb", "require \"test_helper\"\n\nclass WidgetTest < BaseTest\n  test \"inherited inner class\" do\n    error = assert_raises(Oops) { raise Oops, \"x\" }\n    assert_equal \"x\", error.message\n  end\nend\n")
+        .run_test("test/models/widget_test.rb")
+        .assert_passes();
+}
+
+/// The emitted harness declares stand-ins for some Rails namespaces
+/// (`ActiveSupport::Notifications`), which a test reads by that path.
+/// Its own top-level classes are not Rails names, and a path under a
+/// stand-in it does not declare is not one either: both refused.
+#[test]
+fn harness_internals_and_undeclared_framework_paths_are_refused() {
+    let test = "test/models/widget_test.rb";
+    for (statements, name) in [
+        ("assert Dom", "Dom"),
+        ("assert SchemaSetup", "SchemaSetup"),
+        ("assert ActiveSupport::Notifications::Nope", "ActiveSupport::Notifications::Nope"),
+    ] {
+        let errors = test_constant_errors(test, &in_a_test(statements));
+        assert!(errors.iter().any(|(at, message)| at == name && message.contains("constant not supported")), "{name}: {errors:?}");
+    }
+}
+
+/// The `sqlite3` gem's constraint error is a class only the CRuby tree
+/// carries: refused by name everywhere else.
+#[test]
+fn a_test_naming_the_sqlite3_constraint_exception_is_refused_off_cruby() {
+    use roundhouse::project::BuildTarget;
+    for target in [BuildTarget::Spinel, BuildTarget::Jruby, BuildTarget::Typescript] {
+        let (_, errors) = emit_and_run::empty_app()
+            .write("app/.keep", "")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/constraint_test.rb", "require \"test_helper\"\n\nclass ConstraintTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert_kind_of Class, SQLite3::ConstraintException\n  end\nend\n")
+            .emit(target);
+        assert!(errors.iter().any(|e| e.contains("SQLite3::ConstraintException")), "{target:?}: {errors:?}");
+    }
+}
