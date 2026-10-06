@@ -1,6 +1,17 @@
 //! Real PostgreSQL driver contracts. Requires an explicit disposable-server
 //! admin URL; the Ruby test creates and drops only its own named databases.
 #[test]
+fn notification_runtime_delivers_events_synchronously_and_cleans_up() {
+    let result = std::process::Command::new("ruby")
+        .args(["tests/notifications_runtime.rb", "emitted"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    assert!(result.status.success(), "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn postgres_driver_preserves_values_database_identity_and_leases() {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
@@ -212,6 +223,42 @@ class PostgreSQLRuntimeTest
     error = assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM no_such_table') }}
     assert_equal 'SELECT * FROM no_such_table', error.sql
     assert_equal [], error.binds
+    events = []
+    seen_during_block = false
+    listener = ActiveSupport::Notifications.subscribe("sql.active_record") {{ |event| events << event }}
+    begin
+      ActiveSupport::Notifications.subscribed(lambda {{ |name, start, finish, id, payload|
+        seen_during_block = true
+        assert_equal "sql.active_record", name
+        assert finish >= start
+        refute_empty id
+        assert_equal 'SELECT 7 AS notified', payload[:sql]
+      }}, "sql.active_record") do
+        assert_equal [{{ "notified" => 7 }}], ActiveRecord::Base.connection.execute('SELECT 7 AS notified').to_a
+        assert seen_during_block, "SQL callbacks must run before the query returns"
+      end
+      assert_equal 1, events.length
+      assert_equal 'SELECT 7 AS notified', events.last.payload[:sql]
+      assert_operator events.last.duration, :>=, 0
+      failed = assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM missing_notified_table') }}
+      assert_equal 2, events.length
+      assert_same failed, events.last.payload[:exception_object]
+      assert_equal [failed.class.name, failed.message], events.last.payload[:exception]
+      assert_equal failed.sql, events.last.payload[:sql]
+      handle = Db.prepare('SELECT $1::integer / $2::integer')
+      Db.bind_int(handle, 1, 5)
+      Db.bind_int(handle, 2, 0)
+      bound_error = assert_raises(ActiveRecord::StatementInvalid) {{ Db.step?(handle) }}
+      Db.finalize(handle)
+      assert_equal [5, 0], bound_error.binds
+      assert_same bound_error, events.last.payload[:exception_object]
+      assert_equal [5, 0], events.last.payload[:binds]
+    ensure
+      ActiveSupport::Notifications.unsubscribe(listener)
+    end
+    count_after_unsubscribe = events.length
+    ActiveRecord::Base.connection.execute('SELECT 8')
+    assert_equal count_after_unsubscribe, events.length
     first = Entry.create!(Title: "l'été \\ hi", enabled: true)
     second = Entry.create!(Title: "false", enabled: false)
     assert_equal 1, first.id

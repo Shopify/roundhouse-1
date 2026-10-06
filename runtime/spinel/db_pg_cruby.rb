@@ -162,11 +162,9 @@ module Db
     record_query(sql)
     context[:cache]&.clear
     conn = current_dbh
-    result = conn.exec(sql)
+    result = instrument_sql(sql) { conn.exec(sql) }
     conn.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     nil
-  rescue PG::Error => error
-    raise translate(error, sql)
   ensure
     result&.clear
   end
@@ -177,12 +175,10 @@ module Db
     record_query(sql)
     context[:cache]&.clear
     conn = current_dbh
-    result = conn.exec(sql)
+    result = instrument_sql(sql) { conn.exec(sql) }
     raise "INSERT RETURNING must produce one key" unless result.ntuples == 1 && result.nfields == 1
     conn.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     Integer(result.getvalue(0, 0))
-  rescue PG::Error => error
-    raise translate(error, sql)
   ensure
     result&.clear
   end
@@ -195,7 +191,7 @@ module Db
     current_dbh.instance_variable_get(:@rh_pg_changes)
   end
 
-  def self.translate(error, sql)
+  def self.translate(error, sql, binds = [])
     return error unless defined?(ActiveRecord::StatementInvalid)
     state = error.result&.error_field(PG::Result::PG_DIAG_SQLSTATE)
     class_name = {
@@ -205,7 +201,25 @@ module Db
       "55P03" => :LockWaitTimeout, "57014" => :QueryCanceled
     }.fetch(state, :StatementInvalid)
     klass = ActiveRecord.const_defined?(class_name) ? ActiveRecord.const_get(class_name) : ActiveRecord::StatementInvalid
-    klass.new("#{error.class}: #{error.message}", sql: sql, binds: [])
+    klass.new("#{error.class}: #{error.message}", sql: sql, binds: binds.dup)
+  end
+
+  # Instrument the actual execution, after binding and before returning to the
+  # caller. Translate driver errors inside the event so subscribers receive the
+  # same ActiveRecord exception that the caller rescues.
+  def self.instrument_sql(sql, binds = [])
+    operation = proc do
+      begin
+        yield
+      rescue PG::Error => error
+        raise translate(error, sql, binds)
+      end
+    end
+    if defined?(ActiveSupport::Notifications::Event)
+      ActiveSupport::Notifications.instrument("sql.active_record", sql: sql, name: "SQL", binds: binds.dup) { operation.call }
+    else
+      operation.call
+    end
   end
 
   def self.unique_violation?(message)
@@ -242,23 +256,25 @@ module Db
       return
     end
     record_query(sql)
-    if binds.empty?
-      result = conn.exec(sql)
-    else
-      cache = conn.instance_variable_get(:@rh_pg_cache)
-      name = cache.delete(sql)
-      unless name
-        if cache.size >= STMT_CACHE_CAP
-          _, oldest = cache.shift
-          conn.exec("DEALLOCATE #{oldest}").clear
+    result = instrument_sql(sql, binds) do
+      if binds.empty?
+        conn.exec(sql)
+      else
+        cache = conn.instance_variable_get(:@rh_pg_cache)
+        name = cache.delete(sql)
+        unless name
+          if cache.size >= STMT_CACHE_CAP
+            _, oldest = cache.shift
+            conn.exec("DEALLOCATE #{oldest}").clear
+          end
+          serial = conn.instance_variable_get(:@rh_pg_serial).to_i + 1
+          conn.instance_variable_set(:@rh_pg_serial, serial)
+          name = "rh_#{serial}"
+          conn.prepare(name, sql).clear
         end
-        serial = conn.instance_variable_get(:@rh_pg_serial).to_i + 1
-        conn.instance_variable_set(:@rh_pg_serial, serial)
-        name = "rh_#{serial}"
-        conn.prepare(name, sql).clear
+        cache[sql] = name
+        conn.exec_prepared(name, binds)
       end
-      cache[sql] = name
-      result = conn.exec_prepared(name, binds)
     end
     handle[:result] = result
     handle[:names] = result.fields
@@ -273,8 +289,6 @@ module Db
     else
       context[:cache]&.clear
     end
-  rescue PG::Error => error
-    raise translate(error, sql)
   end
 
   def self.step?(handle)

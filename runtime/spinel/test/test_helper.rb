@@ -883,6 +883,8 @@ end
 # arguments; the payload carries `:sql` and `:name` ("SQL", since the
 # runtime does not name its queries). Called after the block rather than
 # during it, which no test can tell: they collect, then inspect.
+# Legacy query capture for backends without synchronous event delivery.
+unless defined?(ActiveSupport::Notifications::Event)
 module ActiveSupport
   module Notifications
     def self.subscribed(callback, name, &block)
@@ -893,6 +895,7 @@ module ActiveSupport
       result
     end
   end
+end
 end
 
 module ActiveRecord
