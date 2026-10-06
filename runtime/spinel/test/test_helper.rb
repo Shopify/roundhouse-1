@@ -110,7 +110,10 @@ require_relative "../runtime/active_storage_processor"
 # first, and any `Db.with_connection` on another thread leased a
 # different, empty one ("no such table" from the web-push pool's
 # invalidation thread, the first thing in the suite to take a lease of
-# its own).
+# its own). A test helper that asks for `:memory:` itself gets exactly
+# that, as Rails gives it: `project` points the line below at `Db`'s
+# memory mode (a database per thread), and refuses any other
+# `establish_connection` rather than run it here.
 #
 # And not SQLite's shared-cache memory URI (`file::memory:?cache=shared`),
 # which this ran on until 2026-09-17. Shared cache trades the file

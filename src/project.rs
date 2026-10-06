@@ -1149,6 +1149,7 @@ pub fn target_files(
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
     report_unsupported_bundled_constants(app, target);
+    report_test_helper_connection(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
     // Full forwarding currently has a native Ruby contract only. A
@@ -2577,6 +2578,9 @@ fn ruby_family_runtime_files(
     // gets the block exactly once; this is the ruby family's turn, and
     // the ruby family is the one that can run the lines.
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
+    if matches!(flavor, RubyFlavor::CRuby) {
+        apply_test_helper_connection(&mut files, app)?;
+    }
     if primary_postgresql(app) {
         apply_postgres_bootstrap(&mut files, app)?;
     } else {
@@ -3861,6 +3865,56 @@ fn report_keyword_params(app: &App, target: &str) {
     }
 }
 
+/// The test helper's own in-memory connection
+/// (`analyze::test_helper_connection::honored_database`) is opened only
+/// by the CRuby tree's `Db`, which has the memory mode (a connection per
+/// thread, each its own database, with the sqlite3 adapter's pragmas).
+/// Every other target would run the tests on its harness's file
+/// database instead, so the call is refused there.
+fn report_test_helper_connection(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
+        return;
+    }
+    if crate::analyze::test_helper_connection::honored_database(app).is_none() {
+        return;
+    }
+    for connection in &app.test_helper_connections {
+        emit::diagnostics::report_unsupported(
+            connection.call.span,
+            target.as_str(),
+            "test_helper_connection",
+            format!(
+                "the test helper's in-memory `establish_connection` is opened only by the CRuby \
+                 tree's `Db`; the {} tree would run its tests on another database",
+                target.as_str()
+            ),
+        );
+    }
+}
+
+/// Point the CRuby harness at the test helper's own database instead of
+/// its per-test-file one, when the helper makes a connection the
+/// harness can open as written. The harness line must be there to
+/// replace: a template that no longer names it is an error, not a
+/// silent run on the file database.
+fn apply_test_helper_connection(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+    const HARNESS: &str = "Db.configure(_test_db_path)";
+    let Some(database) = crate::analyze::test_helper_connection::honored_database(app) else {
+        return Ok(());
+    };
+    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
+        return Ok(());
+    };
+    if helper.matches(HARNESS).count() != 1 {
+        return Err(format!("apply_test_helper_connection: expected one `{HARNESS}` in test/test_helper.rb"));
+    }
+    *helper = helper.replace(
+        HARNESS,
+        &format!("# The test helper's own `establish_connection`.\nDb.configure({database:?})"),
+    );
+    Ok(())
+}
+
 /// These class objects are supplied by Ruby/Spinel's bundled libraries,
 /// not by the transpiled runtimes. Recognizing them during inference
 /// must not turn a missing target implementation into a clean emit.
@@ -3874,7 +3928,11 @@ fn report_keyword_params(app: &App, target: &str) {
 /// constant.
 ///
 /// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
-/// too: no `Db` enforces a foreign key, so nothing raises it.
+/// too: the harness's file database enforces no foreign key and the
+/// schema loader drops `add_foreign_key`, so nothing raises it there.
+/// The test helper's in-memory connection does enforce one (and
+/// `translate` maps it), but the name stays refused rather than
+/// supported on one setup only.
 ///
 /// `transaction` with options is refused on every target, Ruby too: the
 /// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
@@ -3923,9 +3981,9 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     expr.span,
                     target,
                     "invalid_foreign_key",
-                    "`ActiveRecord::InvalidForeignKey` is never raised: no `Db` turns on SQLite's \
-                     `PRAGMA foreign_keys` and the schema loader does not carry `add_foreign_key`, \
-                     so a foreign-key violation is not reported"
+                    "`ActiveRecord::InvalidForeignKey` is not supported: the harness's file database \
+                     does not turn on SQLite's `PRAGMA foreign_keys` and the schema loader does not \
+                     carry `add_foreign_key`, so a foreign-key violation is not reported there"
                         .to_string(),
                 );
             }

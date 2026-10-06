@@ -25,6 +25,16 @@ use crate::ty::Ty;
 
 /// The top-level IR: a Rails application as data. This is the serializable
 /// deliverable — the thing ingesters produce and emitters consume.
+/// One `establish_connection` call in the test helper.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HelperConnection {
+    pub call: Expr,
+    /// A statement of the file itself, which the helper runs once and
+    /// unconditionally as it loads: not under a condition, in a class
+    /// body or `begin`, or in a method.
+    pub top_level: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct App {
     pub schema_version: u32,
@@ -122,12 +132,12 @@ pub struct App {
     /// the runtime's generated `ContentHelper.app_allowed_attributes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_helper_allowed_attributes: Vec<String>,
-    /// Each top-level `establish_connection` call in `test/test_helper.rb`,
-    /// as written. The emitted harness opens its own SQLite database, so
-    /// none of them is carried; `analyze::test_helper_connection` names
-    /// every one.
+    /// Each `establish_connection` call in `test/test_helper.rb`, as
+    /// written. `analyze::test_helper_connection` decides whether the
+    /// emitted harness can open the database it names
+    /// (`honored_database`) and refuses every other.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub test_helper_connections: Vec<Expr>,
+    pub test_helper_connections: Vec<HelperConnection>,
     /// Call-site-unified parameter types, written by the analyzer's
     /// fixpoint (`unify_params_from_call_sites`) as its last act and
     /// read by lowerings that build method signatures — the controller

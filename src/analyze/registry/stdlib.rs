@@ -502,9 +502,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // The CRuby tree's `Db` translates a driver error into these
         // (runtime/spinel/db_cruby.rb `translate`); `project` refuses
         // them on every other target, whose `Db` does not. Not
-        // `InvalidForeignKey`: no `Db` turns on `PRAGMA foreign_keys`
-        // and the schema loader drops `add_foreign_key`, so nothing
-        // raises it and its name stays unresolved.
+        // `InvalidForeignKey`: the harness's file database leaves
+        // `PRAGMA foreign_keys` off and the schema loader drops
+        // `add_foreign_key`, so nothing raises it there; its name stays
+        // unresolved and `project` refuses it.
         ("ActiveRecord::StatementInvalid", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
         ("ActiveRecord::NotNullViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
         ("ActiveRecord::CheckViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
