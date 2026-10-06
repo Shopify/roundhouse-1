@@ -7802,9 +7802,10 @@ fn a_test_class_assertion_calling_super_is_refused_by_name() {
 /// `assert_raises`, `assert_throws`) would, once spliced, leave whatever
 /// encloses the assertion instead: a false pass, other effects, or a
 /// syntax error, where natively it leaves only the block. A `return`
-/// in a block the lowering wraps (`assert_raises`, `assert_throws`, an
-/// assigned `assert_difference`) would leave only the wrapper where a
-/// target emits it as a function (TypeScript), or be a void value; it
+/// in a block the lowering wraps (`assert_raises`, `assert_throws`, or
+/// an `assert_difference` that is not itself a statement: assigned, a
+/// branch, an argument, an element) would leave only the wrapper where
+/// a target emits it as a function (TypeScript), or be a void value; it
 /// is refused too, also where CRuby would run it. Each is refused by
 /// name, on every target, in a helper as in a test. Outcomes natively:
 /// f3a/native.log.

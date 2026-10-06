@@ -12,7 +12,10 @@
 //! the jumps inside it, and those are kept, except where that block is
 //! itself a spliced assertion's: it is checked as its own.
 //!
-//! `return` leaves the test natively. Spliced bare into the test's
+//! In a test or helper, `return` leaves that method natively (in a
+//! `setup do` block it raises LocalJumpError natively instead; the
+//! setup copy into each test does not model that, a separate gap).
+//! Spliced bare into the test's
 //! statements (an `assert_difference` that is itself a statement, in a
 //! sequence or as a whole body) it still does. But `assert_raises` and
 //! `assert_throws` lower to a `begin`/`catch` around the block, an
