@@ -6712,3 +6712,42 @@ fn a_test_case_base_defined_in_the_helper_is_loaded_by_its_subclasses() {
         .run_test("test/models/fragments_test.rb")
         .assert_passes();
 }
+
+/// `teardown do … end` in a test class fell to the drop for unrecognized
+/// class-body statements: check stayed clean and the cleanup never ran
+/// (1,871 Core test files declare one). ActiveSupport runs the class's
+/// `def teardown` first, then the blocks newest first, after every test;
+/// the order asserted here is what ActiveSupport 8.1.4 produces natively.
+#[test]
+fn teardown_blocks_run_after_each_test_in_rails_order() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("test/models/teardown_order_test.rb", r#"require "test_helper"
+
+class TeardownOrderTest < ActiveSupport::TestCase
+  LOG = []
+
+  teardown do
+    LOG << "one"
+  end
+
+  def teardown
+    LOG << "def"
+  end
+
+  teardown do
+    LOG << "two"
+  end
+
+  test "a first" do
+    LOG << "a"
+  end
+
+  test "b second" do
+    assert_equal ["a", "def", "two", "one"], LOG
+  end
+end
+"#)
+        .run_test("test/models/teardown_order_test.rb")
+        .assert_passes();
+}
