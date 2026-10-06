@@ -24,6 +24,9 @@
 //! Each of those comes when a fixture forces it.
 
 mod alba;
+mod cycles;
+mod fixpoint_debug;
+mod recursion;
 mod enum_raw_input;
 mod presence_not_null;
 mod test_teardown;
@@ -146,6 +149,25 @@ pub struct Analyzer {
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
     data_factories: HashMap<crate::span::Span, Ty>,
+    /// `(class, is_class_method, name)` of methods that reach themselves
+    /// through implicit-self calls. Their harvested returns are widened
+    /// at the recursion point (see `recursion`), which is what lets the
+    /// fixpoint settle on recursive data shapes.
+    recursive_methods: std::collections::HashSet<(ClassId, bool, Symbol)>,
+    /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
+    /// settle; see [`Self::fixpoint_rounds`].
+    fixpoint_rounds: FixpointRounds,
+}
+
+/// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
+/// before its signature stopped moving — `None` when it hit the cap
+/// still moving. `absorb` is `Some(0)` when view unification moved no
+/// production signature and the absorb loop never ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixpointRounds {
+    pub production: Option<usize>,
+    pub tests: Option<usize>,
+    pub absorb: Option<usize>,
 }
 
 /// Snapshot of the data the fixpoint refines: per-class instance/class
@@ -957,6 +979,8 @@ impl Analyzer {
             source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
             data_factories,
+            recursive_methods: Self::find_recursive_methods(app),
+            fixpoint_rounds: FixpointRounds::default(),
         }
     }
 
@@ -986,6 +1010,11 @@ impl Analyzer {
     /// site contributed. Read-only companion to [`Self::class_registry`]
     /// for consumers assembling full candidate signatures (the gap
     /// footers' pre-filled RBS).
+    /// Rounds the last [`Self::analyze`]'s fixpoint loops took.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
+    }
+
     pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
     }
@@ -1101,6 +1130,7 @@ impl Analyzer {
         // `get_from_cache` block → its return → the destructuring, which
         // settles on round 9.
         let mut prev_sig = self.capture_inference_sig();
+        let mut cycles = cycles::CycleWidening::default();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
                 self.harvest_returns_to_registry(app, false)
@@ -1108,7 +1138,12 @@ impl Analyzer {
             crate::timings::phase(format_args!("round {round}: unify params"), || {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
+            self.widen_cycles(&prev_sig, &mut cycles);
+            if fixpoint_debug::enabled() {
+                fixpoint_debug::report(&format!("production round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+            }
             if self.inference_matches(&prev_sig) {
+                self.fixpoint_rounds.production = Some(round + 1);
                 break;
             }
             prev_sig = self.capture_inference_sig();
@@ -1145,6 +1180,7 @@ impl Analyzer {
         // harvested helper surface rather than leftover untyped.
         let production_sig = prev_sig.clone();
         let mut production_view_params = None;
+        let mut cycles = cycles::CycleWidening::default();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(
                 if round == 0 {
@@ -1185,13 +1221,22 @@ impl Analyzer {
                     }
                 },
             );
+            self.widen_cycles(&prev_sig, &mut cycles);
+            if fixpoint_debug::enabled() {
+                fixpoint_debug::report(&format!("test round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+            }
             if self.inference_matches(&prev_sig) {
+                self.fixpoint_rounds.tests = Some(round + 1);
                 break;
             }
             prev_sig = self.capture_inference_sig();
         }
+        if fixpoint_debug::enabled() {
+            fixpoint_debug::report("absorb entry vs production", &production_sig, &self.capture_inference_sig());
+        }
         if !self.inference_matches(&production_sig) {
             let mut absorb_sig = self.capture_inference_sig();
+            let mut cycles = cycles::CycleWidening::default();
             for round in 0..FIXPOINT_CAP {
                 crate::timings::phase(
                     if round == 0 {
@@ -1217,12 +1262,18 @@ impl Analyzer {
                     snapshot.clone_from(&self.inferred_params);
                 }
                 self.overlay_test_params(app);
+                self.widen_cycles(&absorb_sig, &mut cycles);
+                if fixpoint_debug::enabled() {
+                    fixpoint_debug::report(&format!("absorb round {round} (widened {})", cycles.widened_count()), &absorb_sig, &self.capture_inference_sig());
+                }
                 if self.inference_matches(&absorb_sig) {
+                    self.fixpoint_rounds.absorb = Some(round + 1);
                     break;
                 }
                 absorb_sig = self.capture_inference_sig();
             }
         } else {
+            self.fixpoint_rounds.absorb = Some(0);
             // View unify did not move production signatures, but helper
             // *bodies* still need a pass against view-inferred params
             // (`highlight_searched_content`'s `content` is only called
@@ -3856,6 +3907,7 @@ impl Analyzer {
             model.scopes().map(|s| s.name.clone()).collect();
         for method in model.methods() {
             let ret = self.method_return_ty(class_id, method);
+            let ret = self.widen_recursive_return(class_id, method, ret);
             let target = match method.receiver {
                 crate::dialect::MethodReceiver::Instance => {
                     &mut self.classes.entry(class_id.clone()).or_default().instance_methods
@@ -3924,6 +3976,7 @@ impl Analyzer {
             let class_id = &lc.name;
             for method in &lc.methods {
                 let ret = self.method_return_ty(class_id, method);
+                let ret = self.widen_recursive_return(class_id, method, ret);
                 let target = match method.receiver {
                     crate::dialect::MethodReceiver::Instance => {
                         &mut self.classes.entry(class_id.clone()).or_default().instance_methods
@@ -3945,6 +3998,7 @@ impl Analyzer {
             for module in &app.test_modules {
                 for method in &module.helpers {
                     let ret = self.method_return_ty(&module.name, method);
+                    let ret = self.widen_recursive_return(&module.name, method, ret);
                     let class = self.classes.entry(module.name.clone()).or_default();
                     let table = match method.receiver {
                         crate::dialect::MethodReceiver::Instance => &mut class.instance_methods,
@@ -3968,6 +4022,7 @@ impl Analyzer {
             // rather than "no known method".
             for method in controller.class_methods() {
                 let ret = self.method_return_ty(class_id, method);
+                let ret = self.widen_recursive_return(class_id, method, ret);
                 let target = &mut self.classes.entry(class_id.clone()).or_default().class_methods;
                 Self::register_method_return(target, &method.name, ret.as_ref());
             }
@@ -4477,6 +4532,49 @@ impl Analyzer {
             })
     }
 
+    fn find_recursive_methods(app: &App) -> std::collections::HashSet<(ClassId, bool, Symbol)> {
+        let mut out = std::collections::HashSet::new();
+        let mut add = |id: &ClassId, found: std::collections::HashSet<(bool, Symbol)>| {
+            out.extend(found.into_iter().map(|(c, n)| (id.clone(), c, n)));
+        };
+        for model in &app.models {
+            add(&model.name, recursion::recursive_methods(model.methods()));
+        }
+        for lc in &app.library_classes {
+            add(&lc.name, recursion::recursive_methods(&lc.methods));
+        }
+        for module in &app.test_modules {
+            add(&module.name, recursion::recursive_methods(&module.helpers));
+        }
+        for controller in &app.controllers {
+            add(&controller.name, recursion::recursive_methods(controller.class_methods()));
+        }
+        out
+    }
+
+    /// A recursive method's harvested return, widened against the one
+    /// the registry holds from last round (see `recursion`).
+    fn widen_recursive_return(
+        &self,
+        class_id: &ClassId,
+        method: &crate::dialect::MethodDef,
+        ret: Option<Ty>,
+    ) -> Option<Ty> {
+        let is_class = method.receiver == crate::dialect::MethodReceiver::Class;
+        let ret = ret?;
+        if !self.recursive_methods.contains(&(class_id.clone(), is_class, method.name.clone())) {
+            return Some(ret);
+        }
+        let cls = self.classes.get(class_id);
+        let old = cls.and_then(|c| {
+            if is_class { c.class_methods.get(&method.name) } else { c.instance_methods.get(&method.name) }
+        });
+        Some(match old {
+            Some(old) => recursion::widen_recursive_return(old, ret),
+            None => ret,
+        })
+    }
+
     fn register_method_return(
         table: &mut HashMap<Symbol, Ty>,
         method: &Symbol,
@@ -4623,16 +4721,27 @@ impl Analyzer {
     fn apply_param_sites(
         &mut self,
         sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)>,
-        params_by_method: &HashMap<(ClassId, Symbol), ParamShape>,
+        params_by_method: &HashMap<(ClassId, Symbol), Vec<ParamShape>>,
         defined: &BTreeSet<(ClassId, Symbol)>,
     ) {
         for (class_id, method, arg_tys, kw_tys) in sites {
             let class_id = self.inherited_param_owner(defined, class_id, &method);
-            let arg_tys = Self::place_keyword_args(
+            let arg_tys = match Self::site_shape(
                 params_by_method.get(&(class_id.clone(), method.clone())),
-                arg_tys,
-                kw_tys,
-            );
+                &arg_tys,
+                &kw_tys,
+            ) {
+                SitePlacement::Shape(shape) => Self::place_keyword_args(shape, arg_tys, kw_tys),
+                // The positionals before the group are still evidence;
+                // the group itself binds nowhere we can name.
+                SitePlacement::Unknown => {
+                    let mut arg_tys = arg_tys;
+                    if kw_tys.group {
+                        arg_tys.pop();
+                    }
+                    arg_tys
+                }
+            };
             let arity = arg_tys.len();
             let entry = self
                 .inferred_params
@@ -4856,24 +4965,22 @@ impl Analyzer {
     ///
     /// Keyed the way `inferred_params` is, by (class, method) with no
     /// receiver distinction, so a class method and an instance method
-    /// of the same name collide. When their shapes differ the entry is
-    /// POISONED rather than picked: placing keywords from the wrong
-    /// `def` is worse than leaving the hash where it sits, which is the
-    /// behaviour that stood before this table existed.
-    fn param_shapes(app: &App) -> HashMap<(ClassId, Symbol), ParamShape> {
-        let mut out: HashMap<(ClassId, Symbol), Option<ParamShape>> = HashMap::new();
+    /// of the same name collide — and so do a concern's `module
+    /// ClassMethods` def and the module's own `class << self` def,
+    /// which ingest flattens to the same Class-receiver name. Every
+    /// distinct shape is kept; [`Self::site_shape`] picks one per call
+    /// only when the call's keys say which `def` it reaches.
+    fn param_shapes(app: &App) -> HashMap<(ClassId, Symbol), Vec<ParamShape>> {
+        let mut out: HashMap<(ClassId, Symbol), Vec<ParamShape>> = HashMap::new();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
             let shape = ParamShape {
                 slots: m.params.iter().map(|p| (p.name.clone(), p.ty_kind())).collect(),
                 keywords_by_kind: false,
             };
-            out.entry((class.clone(), m.name.clone()))
-                .and_modify(|slot| {
-                    if slot.as_ref() != Some(&shape) {
-                        *slot = None;
-                    }
-                })
-                .or_insert(Some(shape));
+            let shapes = out.entry((class.clone(), m.name.clone())).or_default();
+            if !shapes.contains(&shape) {
+                shapes.push(shape);
+            }
         };
         for model in &app.models {
             for m in model.methods() {
@@ -4909,16 +5016,78 @@ impl Analyzer {
                 // Controller lowering keeps every keyword a keyword, so a
                 // key binds by kind here, never to a same-named positional.
                 let shape = ParamShape { slots: shape, keywords_by_kind: true };
-                out.entry((controller.name.clone(), a.name.clone()))
-                    .and_modify(|slot| {
-                        if slot.as_ref() != Some(&shape) {
-                            *slot = None;
-                        }
-                    })
-                    .or_insert(Some(shape));
+                let shapes = out.entry((controller.name.clone(), a.name.clone())).or_default();
+                if !shapes.contains(&shape) {
+                    shapes.push(shape);
+                }
             }
         }
-        out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
+        out
+    }
+
+    /// The `def` shape a call's arguments are placed by, among the
+    /// shapes sharing its `(class, method)` key.
+    ///
+    /// A single shape is the method's. With several, the candidates are
+    /// the defs that can accept the call at all: as many positionals as
+    /// it passes, and a parameter for every key (or a `**rest`). A key
+    /// or an arity only one `def` accepts says which method Ruby
+    /// dispatches to: `ImageAttachment.build_target(shop, filename:,
+    /// mime_type:, bucket:)` reaches the module's own `class << self`
+    /// def, not the three-keyword `ClassMethods` one its includers get;
+    /// `RolloutTreatmentRecord.to_entity(self, draft_id_lookup: …)`
+    /// passes a positional the keyword-only instance `to_entity` has no
+    /// slot for. The call is placed when every candidate places it
+    /// identically.
+    ///
+    /// When the candidates disagree, or none accepts the call, which
+    /// slot a keyword binds to is unknown, and so is whether the keyword
+    /// group is a positional Hash at all: [`SitePlacement::Unknown`].
+    /// Leaving the hash in the slot it occupies — what this did when a
+    /// collision discarded both shapes — is not a neutral default. When
+    /// the call sits in a body reading the same slots, like
+    /// `ClassMethods#build_target(shop, filename:, mime_type:)`
+    /// forwarding `filename: filename` to the singleton of the same
+    /// name, the slot receives a Hash of its own previous type, and
+    /// every fixpoint round nests it once more: `Str | Hash[Sym, Str |
+    /// Hash[Sym, …]]`, without end.
+    fn site_shape<'s>(
+        shapes: Option<&'s Vec<ParamShape>>,
+        arg_tys: &[Ty],
+        kw: &SiteKeywords,
+    ) -> SitePlacement<'s> {
+        let Some(shapes) = shapes else { return SitePlacement::Shape(None) };
+        if let [only] = shapes.as_slice() {
+            return SitePlacement::Shape(Some(only));
+        }
+        let accepts = |shape: &ParamShape| {
+            let has = |f: &dyn Fn(&ParamKind) -> bool| shape.slots.iter().any(|(_, k)| f(k));
+            let takes_keywords = has(&|k| matches!(k, ParamKind::Keyword { .. } | ParamKind::KeywordRest));
+            let positionals = arg_tys.len() - usize::from(kw.group && takes_keywords);
+            let capacity = shape
+                .slots
+                .iter()
+                .filter(|(_, k)| matches!(k, ParamKind::Required | ParamKind::Optional))
+                .count();
+            let fits = positionals <= capacity || has(&|k| matches!(k, ParamKind::Rest));
+            let keyword_rest = has(&|k| matches!(k, ParamKind::KeywordRest));
+            fits && (!kw.group
+                || !takes_keywords
+                || keyword_rest
+                || kw.keys.iter().all(|(key, _)| {
+                    shape.slots.iter().any(|(n, kind)| {
+                        n == key && (!shape.keywords_by_kind || matches!(kind, ParamKind::Keyword { .. }))
+                    })
+                }))
+        };
+        let mut candidates = shapes.iter().filter(|s| accepts(s));
+        let Some(first) = candidates.next() else { return SitePlacement::Unknown };
+        let placed = Self::place_keyword_args(Some(first), arg_tys.to_vec(), kw.clone());
+        if candidates.all(|other| Self::place_keyword_args(Some(other), arg_tys.to_vec(), kw.clone()) == placed) {
+            SitePlacement::Shape(Some(first))
+        } else {
+            SitePlacement::Unknown
+        }
     }
 
     /// Place a call's trailing keyword arguments on the parameter slots
@@ -6435,6 +6604,16 @@ struct SiteKeywords {
     /// Its `key: value` pairs, by name; empty when any key is not a
     /// literal symbol (a `**splat` included).
     keys: Vec<(Symbol, Ty)>,
+}
+
+/// How a call's arguments map onto the slots of the `def` it reaches;
+/// see `Analyzer::site_shape`.
+enum SitePlacement<'s> {
+    /// By this shape (`None`: no `def` shape is known; positional as is).
+    Shape(Option<&'s ParamShape>),
+    /// Several same-keyed `def`s would bind the keyword group
+    /// differently; it is evidence for none of them.
+    Unknown,
 }
 
 /// A method's declared parameter slots, in declaration order, as
