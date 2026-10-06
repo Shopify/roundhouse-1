@@ -10,6 +10,8 @@ module Rails
   def self.logger: () -> Rails::Logger
   def self.log_line: (String line) -> void
   def self.application: () -> Application
+  def self.error: () -> ActiveSupport::ErrorReporter
+  def self.event: () -> ActiveSupport::EventReporter
 
   class AppPath
     @base: String
@@ -70,7 +72,8 @@ module Rails
     def active_storage_excluded_content_types: () -> Array[String]
     def vips_block_untrusted: () -> bool
     def vips_blocked_operations: () -> Array[String]
-    def default_per_page: () -> Integer
+    def pagination_default_per_page: () -> Integer
+    def filter_parameters: () -> Array[untyped]
   end
 end
 

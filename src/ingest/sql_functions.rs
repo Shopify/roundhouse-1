@@ -49,6 +49,8 @@ pub fn extract_sql_functions(source: &[u8], file: &str) -> Vec<SqlFunction> {
             if matches!(name, "create_function" | "create_aggregate") {
                 if let Some(f) = read_call(node, name == "create_aggregate", self.file) {
                     self.out.push(f);
+                    let loc = node.location();
+                    super::initializers::consume(self.file, loc.start_offset(), loc.end_offset());
                     return;
                 }
             }

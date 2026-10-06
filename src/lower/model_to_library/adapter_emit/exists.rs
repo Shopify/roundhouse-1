@@ -5,7 +5,7 @@ use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Param};
 use crate::effect::EffectSet;
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::lower::arel::{
-    ArelOp, ArelVisitor, ColumnSpec, LimitSpec, Predicate, Select, SqliteVisitor,
+    ArelOp, ArelVisitor, ColumnSpec, LimitSpec, Predicate, Select, SqlDialect,
 };
 use crate::schema::{Schema, Table};
 use crate::ty::Ty;
@@ -20,6 +20,7 @@ fn synth_exists_probe(
     owner: &ClassId,
     table: &Table,
     schema: &Schema,
+    dialect: SqlDialect,
     name: &str,
     conditions: Option<Predicate>,
     params: Vec<Param>,
@@ -43,7 +44,7 @@ fn synth_exists_probe(
         name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params,
-        body: SqliteVisitor.visit(&op, schema, owner),
+        body: dialect.visit(&op, schema, owner),
         signature: Some(fn_sig(param_tys, Ty::Bool)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -56,17 +57,18 @@ fn synth_exists_probe(
 
 /// Unscoped emptiness without COUNT(*) — `Base.any?` / `none?` on
 /// Level-3 models. Same Exists emit as `_adapter_exists_by_id?`, no WHERE.
-pub(super) fn synth_adapter_any(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
-    synth_exists_probe(owner, table, schema, "_adapter_any?", None, vec![], vec![])
+pub(super) fn synth_adapter_any(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    synth_exists_probe(owner, table, schema, dialect, "_adapter_any?", None, vec![], vec![])
 }
 
-pub(super) fn synth_adapter_exists_by_id(owner: &ClassId, table: &Table, schema: &Schema) -> MethodDef {
+pub(super) fn synth_adapter_exists_by_id(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let id = Symbol::from("id");
     let key = key_ty(table);
     synth_exists_probe(
         owner,
         table,
         schema,
+        dialect,
         "_adapter_exists_by_id?",
         Some(eq_id_param(table, &id)),
         vec![Param::positional(id.clone())],

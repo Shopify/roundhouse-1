@@ -116,7 +116,7 @@ expect("/by_paginate_kwargs", "page=2&per=2", "page=2 per=2 total=5 pages=3 next
 fn without_configure_a_page_is_25_rows() {
     let script = format!(
         r#"{PRELUDE}
-raise "default per page is #{{Rails.application.default_per_page}}" unless Rails.application.default_per_page == 25
+raise "default per page is #{{Rails.application.pagination_default_per_page}}" unless Rails.application.pagination_default_per_page == 25
 expect("/unordered", "", "page=1 per=25 titles=e,d,c,b,a")
 expect("/reports", "page=2", "page=2 per=25 total=5 pages=1 next=nil prev=nil first=false last=false out=true titles=")
 "#
@@ -125,14 +125,19 @@ expect("/reports", "page=2", "page=2 per=25 total=5 pages=1 next=nil prev=nil fi
 }
 
 /// Only the `Kaminari.configure` block's own parameter sets the page
-/// size: a `config.default_per_page =` in another config block of
-/// the same initializer belongs to that block's receiver.
+/// size: an app config key of the same name, `default_per_page`, set
+/// in another config block of the same initializer belongs to the app's
+/// config, not Kaminari. (`Rails.application.configure` binds its
+/// parameter to the APPLICATION, so the key is written through
+/// `app.config`; `|config| config.default_per_page = 50` raises
+/// NoMethodError in Rails 8.1.4.)
 #[test]
 fn only_the_configure_block_sets_the_page_size() {
-    let initializer = "Kaminari.configure { |k| k.default_per_page = 2 }\n\nRails.application.configure do |config|\n  config.default_per_page = 50\nend\n";
+    let initializer = "Kaminari.configure { |k| k.default_per_page = 2 }\n\nRails.application.configure do |app|\n  app.config.default_per_page = 50\nend\n";
     let script = format!(
         r#"{PRELUDE}
-raise "default per page is #{{Rails.application.default_per_page}}" unless Rails.application.default_per_page == 2
+raise "default per page is #{{Rails.application.pagination_default_per_page}}" unless Rails.application.pagination_default_per_page == 2
+raise "app key is #{{Rails.application.default_per_page}}" unless Rails.application.default_per_page == 50
 expect("/reports", "page=2", "page=2 per=2 total=5 pages=3 next=3 prev=1 first=false last=false out=false titles=c,d")
 "#
     );

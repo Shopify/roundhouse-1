@@ -79,14 +79,66 @@ fn for_scope_is_not_a_block_scope() {
 #[test]
 fn registry_signatures_do_not_supply_missing_runtime() {
     for (body, name) in [
-        ("Rails.event.notify(\"probe\")", "event"),
-        ("Rails.error.set_context(probe: true)", "error"),
         ("ActiveRecord::Base.connected_to(role: :reading) { 7 }", "connected_to"),
         ("Benchmark.realtime { 1 }", "Benchmark"),
         ("\"2020-01-02\".to_date", "to_date"),
         ("\"1.5\".to_d", "to_d"),
         ("{}.to_sentence", "to_sentence"),
     ] { refuses(body, name); }
+}
+
+/// The probe app, written to a fresh directory.
+fn probe_app(body: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("rh_admission_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+    for (path, text) in [
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n".to_string()),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".to_string()),
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"probes\" do |t|\n    t.string \"title\"\n  end\nend\n".to_string()),
+        ("app/models/probe.rb", format!("class Probe < ApplicationRecord\n  validates :title, presence: true\n  def probe\n    {body}\n  end\nend\n")),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    root
+}
+
+fn run(root: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_roundhouse"));
+    command.args(args).arg(root);
+    if args[0] != "check" { command.arg("-o").arg(root.join(format!("emitted-{}", args[1]))); }
+    let output = command.output().unwrap();
+    (output.status.success(), format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr)))
+}
+
+/// `Rails.event` / `Rails.error` answer the ported EventReporter and
+/// ErrorReporter, which only the Ruby-family trees carry
+/// (runtime/ruby/active_support_reporters.rb). Target-independent
+/// `check` accepts them: a clean `check` does not imply availability on
+/// every target (docs/guide/transpile.md). The ruby tree carries the
+/// file and emits; a target without it refuses the read by name. That
+/// the ruby tree's reporters run as activesupport's do is
+/// tests/reporters_runtime.rs; that analysis resolves them is
+/// tests/rails_reporters_and_process_clock.rs.
+#[test]
+fn ruby_family_reporters_are_refused_where_the_runtime_lacks_them() {
+    for (body, shown) in [
+        ("Rails.event.notify(\"probe\")", "`Rails.event` answers ActiveSupport::EventReporter"),
+        ("Rails.error.set_context(probe: true)", "`Rails.error` answers ActiveSupport::ErrorReporter"),
+    ] {
+        let root = probe_app(body);
+        let (ok, text) = run(&root, &["check"]);
+        assert!(ok, "check refused {body}: {text}");
+        let (ok, text) = run(&root, &["--target", "ruby"]);
+        assert!(ok, "ruby refused {body}: {text}");
+        assert!(root.join("emitted-ruby/runtime/active_support_reporters.rb").is_file(), "ruby tree lacks the reporters for {body}");
+        for target in ["typescript", "rust"] {
+            let (ok, text) = run(&root, &["--target", target]);
+            assert!(!ok, "{target} accepted {body}: {text}");
+            assert!(text.contains("runtime_constant") && text.contains(shown), "{target} lost named refusal {shown}: {text}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

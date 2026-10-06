@@ -77,6 +77,11 @@ fn harness_namespaces() -> &'static HashSet<String> {
     })
 }
 
+/// Whether the Ruby-family test harness declares `name`.
+pub(crate) fn is_harness_namespace(name: &str) -> bool {
+    harness_namespaces().contains(name)
+}
+
 struct Scope<'a> {
     /// Inner classes of the test class and the test classes it inherits from.
     hoisted: Vec<&'a str>,

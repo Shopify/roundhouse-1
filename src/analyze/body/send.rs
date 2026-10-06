@@ -2825,6 +2825,10 @@ pub(super) fn universal_method(method: &Symbol) -> Option<Ty> {
         // Kernel#block_given? — bare call inside any method body
         // (`yield x if block_given?` in the runtime's create/create!).
         "block_given?" => Some(Ty::Bool),
+        // Kernel#caller_locations — the frames above the caller
+        // (`Thread::Backtrace::Location`s, untyped here like
+        // Exception#backtrace_locations).
+        "caller_locations" => Some(Ty::Array { elem: Box::new(Ty::Untyped) }),
         // `class` is receiver-aware and handled in `dispatch` itself
         // (preserves `Ty::Class { id }` so chained `obj.class.foo`
         // resolves against `id`'s registry entry).

@@ -3847,6 +3847,7 @@ class ConcernEnumInheritanceTest < ActiveSupport::TestCase
   end
 
   test "a child Concern keeps its own asymmetric enum mapping" do
+    assert_nil SpecialArticle.new.state
     article = SpecialArticle.create!(title: "Override", body: "Long enough body", state: :shipped)
     reloaded = SpecialArticle.find(article.id)
     assert_equal "shipped", reloaded.state
@@ -7758,18 +7759,21 @@ fn assertions_inside_a_destructured_block_run_where_they_are_written() {
 /// A failing assertion inside that block fails the test and stops what
 /// follows it, inside the block and after it — the effect count is the
 /// native run's. A raw Minitest call would instead raise NoMethodError
-/// before any assertion is checked.
+/// before any assertion is checked. The CRuby tree runs Minitest's own
+/// assertions, so the failure reads as Minitest's; the Rails assertion
+/// it lowers (`assert_difference`) still fails, not errors, through
+/// `flunk`.
 #[test]
 fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
     let cases = [
-        ("false", "assertion failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      assert false\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("mismatch", "assert_equal failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("ensure", "assertion failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("own_fail", "assert_equal failed", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("plain_fail", "assert_equal failed", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
-        ("branch_fail", "assert_equal failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
-        ("class_method", "assert_equal failed", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
-        ("diff_bind_fail", "assert_equal failed", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
+        ("false", "Expected false to be truthy.", 0, "  test \"t\" do\n    out, err = capture_io do\n      assert false\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("mismatch", "Expected: 1\n  Actual: 2", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      assert_equal 1, 2\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("ensure", "Expected false to be truthy.", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("own_fail", "Expected: \"QUIET\"\n  Actual: \"quiet\"", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("plain_fail", "Expected: 1\n  Actual: 2", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
+        ("branch_fail", "Expected: 1\n  Actual: 2", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("class_method", "Expected: 1\n  Actual: 2", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
+        ("diff_bind_fail", "Expected: 0\n  Actual: 5", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
         ("diff_delta_fail", "Widget.hits didn't change by 2", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      [5, 6]\n    end\n    Widget.hit\n  end\n"),
     ];
     for (name, failure, hits, members) in cases {
@@ -7851,10 +7855,12 @@ fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
             );
         }
     }
-    // The lowerer reaches an assertion inside a `while` too (its walk
-    // descends into every child), splicing the block into the loop body,
-    // where `next` would go on to the loop's next iteration; the scan
-    // descends where the lowerer does, so that jump is refused as well.
+    // The scan follows exactly the assertions the lowerer reaches. Main's
+    // in-place inliner (`walk_inline`) descends into a `while` body too,
+    // so an assertion there is spliced and the jump in its block, which
+    // would then continue the loop instead of leaving the block, is
+    // refused. (On the old map_expr inliner a `while` body was not
+    // reached, and this case was pinned as not refused.)
     let (_, errors) = destructured_block_app("while_raises_next", "  test \"t\" do\n    i = 0\n    while i < 1\n      i += 1\n      assert_raises(ArgumentError) do\n        next if Widget.flag\n        raise ArgumentError\n      end\n    end\n  end\n").emit(BuildTarget::Ruby);
     assert!(
         errors.iter().any(|e| e.contains("assertion_block_jump") && e.contains("`next`") && e.contains("assert_raises")),

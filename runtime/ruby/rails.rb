@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "active_support_reporters"
+
 # Minimal, statically-resolvable `Rails` global for the roundhouse
 # runtime — `Rails.env` / `Rails.cache` / `Rails.logger` plus an (empty)
 # `Rails.application` config stand-in.
@@ -126,6 +128,16 @@ module Rails
 
   def self.application
     Application.new
+  end
+
+  # `Rails.error` / `Rails.event` — ActiveSupport's process-wide
+  # reporters, as railties answers them (active_support_reporters.rb).
+  def self.error
+    ActiveSupport.error_reporter
+  end
+
+  def self.event
+    ActiveSupport.event_reporter
   end
 
   # `Rails.env.production?` etc. — a plain object answering the known
@@ -501,9 +513,23 @@ module Rails
     # Default page size for `Relation#page`. Ingest lifts a literal
     # `config.default_per_page = N` from a `Kaminari.configure` block
     # (one input spelling) onto this reopen; 25 when the app configures
-    # none.
-    def default_per_page
+    # none. Named apart from `default_per_page`, which an app may define
+    # as its own config key on the same reopen.
+    def pagination_default_per_page
       25
+    end
+
+    # `config.filter_parameters`: the keys Rails redacts, `[]` until the
+    # app adds some (railties 8.1.4 application/configuration.rb:36).
+    # Ingest lifts the app's writes, in boot order, onto the reopen; the
+    # emitted boot.rb copies them into `ActiveSupport.filter_parameters`
+    # after initialization, as the `active_support.set_filter_parameters`
+    # initializer does (activesupport railtie.rb:82-87). Rails keeps the
+    # application's own `filter_parameters` private; this one is the
+    # config reader `Rails.application.config.filter_parameters` lowers
+    # to, so it is public.
+    def filter_parameters
+      []
     end
   end
 end

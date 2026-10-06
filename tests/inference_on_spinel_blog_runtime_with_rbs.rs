@@ -601,6 +601,10 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // Soft ratchet under canonical class-ID lookup (Fixes #435), then
     // dependency RBS + cross-stem ivar merge + Relation/Base overlays.
     // Fails only when the residual rises. Not a substitute for Bar B.
+    // `StatementInvalid#initialize` (errors.rb; the parent constructor
+    // its subclasses call, tests/runtime_errors_strict_constructors.rs)
+    // cost the old branch one site, `super.arg[0]`. Under main's
+    // canonical class-ID lookup it adds none: measured 0 with it.
     const CEILING: usize = 0;
 
     assert!(

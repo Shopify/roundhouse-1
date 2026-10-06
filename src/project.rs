@@ -1208,6 +1208,9 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    if primary_postgresql(app) && !matches!(target, BuildTarget::Ruby | BuildTarget::Blog) {
+        return Err(format!("postgresql database: no emitted runtime adapter for target {} (not substituted)", target.as_str()));
+    }
     let without_health;
     let app = match without_rails_health_controller(app, target) {
         Some(trimmed) => {
@@ -1370,6 +1373,7 @@ pub fn target_files(
     };
     if target != BuildTarget::Blog {
         report_unsupported_harness_reads(app, target, &files);
+        report_unsupported_runtime_reads(app, target, &files);
         report_unsupported_harness_calls(app, target, &files);
     }
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
@@ -2270,12 +2274,30 @@ fn jruby_runtime_files(
     ruby_family_runtime_files(app, fixture, RubyFlavor::JRuby)
 }
 
+fn primary_postgresql(app: &App) -> bool {
+    app.databases.iter().any(|db| db.primary && db.adapter == crate::database::DatabaseAdapter::Postgresql)
+}
+
 fn ruby_family_runtime_files(
     app: &App,
     fixture: &Path,
     flavor: RubyFlavor,
 ) -> Result<Vec<(String, String)>, String> {
-    let (mut files, test_stems) = spinel_files(app, fixture)?;
+    if primary_postgresql(app) && flavor != RubyFlavor::CRuby {
+        return Err("postgresql database: only the CRuby runtime has a pg driver (not substituted)".into());
+    }
+    let assertion_mode = match flavor {
+        RubyFlavor::CRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest,
+        RubyFlavor::JRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline,
+    };
+    let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
+    if matches!(flavor, RubyFlavor::CRuby) {
+        files.push(("test/minitest_runner.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/test/minitest_runner.rb")?));
+        if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
+            helper.push_str("\nrequire_relative \"minitest_runner\"\n");
+        }
+    }
 
     files.retain(|(p, _)| p != "runtime/db.rb");
     // The spinel SQL-functions file is FFI; CRuby writes its own below
@@ -2450,10 +2472,15 @@ fn ruby_family_runtime_files(
     const TIME_PARSING_REQUIRE: &str = "require_relative \"active_support_time_parsing\"\n";
     match flavor {
         RubyFlavor::CRuby => {
-            let sql_functions = cruby_sql_functions_file(app);
+            let postgres = primary_postgresql(app);
+            let sql_functions = if postgres { None } else { cruby_sql_functions_file(app) };
             for (path, content) in files.iter_mut() {
                 if path == "runtime/db_cruby.rb" {
                     *path = "runtime/db.rb".to_string();
+                    if postgres {
+                        *content = crate::runtime_files::read_to_string("runtime/spinel/db_pg_cruby.rb")
+                            .map_err(|e| format!("read PostgreSQL driver: {e}"))?;
+                    }
                     content.insert_str(0, TIME_PARSING_REQUIRE);
                     if sql_functions.is_some() {
                         content.insert_str(0, "require_relative \"sql_functions\"\n");
@@ -2462,6 +2489,21 @@ fn ruby_family_runtime_files(
             }
             if let Some(src) = sql_functions {
                 files.push(("runtime/sql_functions.rb".to_string(), src));
+            }
+            if postgres {
+                let gemfile = files.iter_mut().find(|(path, _)| path == "Gemfile")
+                    .ok_or("PostgreSQL project: missing Gemfile")?;
+                if !gemfile.1.contains("gem \"sqlite3\"") {
+                    return Err("PostgreSQL project: expected SQLite backend declaration to replace".into());
+                }
+                gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
+                // The scaffold lock pins the sqlite3 backend. It is not a valid
+                // dependency resolution for a pg project; let Bundler resolve it.
+                files.retain(|(path, _)| path != "Gemfile.lock");
+                files.retain(|(path, _)| path != "config/schema.rb" && path != "sig/config/schema.rbs");
+                files.extend(sort_files(emit::ruby::emit_lowered_schema_pair_for(
+                    app, emit::shared::schema_sql::Dialect::Postgres,
+                ).map_err(|error| format!("PostgreSQL schema: {error}"))?));
             }
         }
         RubyFlavor::JRuby => {
@@ -2641,7 +2683,127 @@ fn ruby_family_runtime_files(
         apply_test_helper_connection(&mut files, app)?;
         apply_test_harness_methods(&mut files, app)?;
     }
+    if primary_postgresql(app) {
+        apply_postgres_bootstrap(&mut files, app)?;
+        apply_extension_gem_wiring(&mut files, app)?;
+    } else {
+        files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
+    }
     Ok(files)
+}
+
+/// Configure the selected PostgreSQL backend at both ordinary Ruby entry
+/// points. Endpoints are explicit runtime inputs, never manifest credentials.
+fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
+    let database = app.databases.iter().find(|db| db.primary)
+        .ok_or("PostgreSQL bootstrap: missing primary database identity")?;
+    let search_path = database.schema_search_path.as_ref()
+        .map(|value| serde_json::to_string(value).expect("schema search path string"))
+        .unwrap_or_else(|| "nil".into());
+    files.retain(|(p, _)| p != "runtime/sqlite_adapter.rb" && p != "runtime/active_record_sqlite3_adapter.rb");
+    let adapter = crate::runtime_files::read_to_string("runtime/spinel/postgres_adapter.rb")
+        .map_err(|e| format!("read PostgreSQL adapter: {e}"))?;
+    files.push(("runtime/postgres_adapter.rb".into(), adapter));
+    // semian 0.28.3's core and its ActiveRecord PostgreSQL adapter, ported
+    // onto this tree's adapter. Loaded only by the app's own
+    // `require "semian/activerecord_postgresql_adapter"`, which must
+    // compile to `require_relative` of the second file before
+    // `DatabaseConfiguration.configure!`.
+    for stem in ["semian", "semian_activerecord_postgresql_adapter"] {
+        let source = crate::runtime_files::read_to_string(&format!("runtime/spinel/{stem}.rb"))
+            .map_err(|e| format!("read {stem} runtime: {e}"))?;
+        files.push((format!("runtime/{stem}.rb"), source));
+    }
+    files.push(("runtime/database_configuration.rb".into(), format!(r#"# Runtime connection configuration; the schema manifest contains no credentials.
+module DatabaseConfiguration
+  def self.configure!
+    url = ENV.fetch("ROUNDHOUSE_DATABASE_URL")
+    raise ArgumentError, "ROUNDHOUSE_DATABASE_URL must name the PostgreSQL database" if url.empty?
+    Db.configure(url, search_path: {search_path})
+    ActiveRecord.adapter = PostgresAdapter
+    Schema.statements.each {{ |sql| Db.exec(sql) }}
+  end
+end
+"#)));
+    // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
+    // test-file requires are not carried, so load it when a test names it.
+    let log_subscriber_test_helper = files.iter().any(|(path, content)| {
+        path.starts_with("test/") && path != "test/test_helper.rb"
+            && content.lines().any(|line| !line.trim_start().starts_with('#')
+                && line.contains("LogSubscriber::TestHelper"))
+    });
+    for (path, content) in files.iter_mut() {
+        if path == "boot.rb" {
+            *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
+                .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
+            content.push_str("\nrequire_relative \"runtime/database_configuration\"\n");
+        }
+        if path == "test/test_helper.rb" {
+            *content = content.replace("../runtime/sqlite_adapter", "../runtime/postgres_adapter");
+            let start = content.find("def _test_db_path\n")
+                .ok_or("PostgreSQL bootstrap: missing test database setup anchor")?;
+            let last = "ActiveRecord.adapter = SqliteAdapter";
+            let end = content[start..].find(last)
+                .ok_or("PostgreSQL bootstrap: missing test adapter setup anchor")? + start + last.len();
+            content.replace_range(start..end, "require_relative \"../runtime/active_record_postgresql_adapter\"\nrequire_relative \"../runtime/database_configuration\"\nDatabaseConfiguration.configure!");
+            if log_subscriber_test_helper {
+                content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
+            }
+        }
+        if path == "main.rb" {
+            let start = content.find("    db_path = ENV[\"BLOG_DB\"]")
+                .ok_or("PostgreSQL bootstrap: missing server database setup anchor")?;
+            let last = "    Schema.statements.each { |sql| SqliteAdapter.execute_ddl(sql) }";
+            let end = content[start..].find(last)
+                .ok_or("PostgreSQL bootstrap: missing server schema setup anchor")? + start + last.len();
+            content.replace_range(start..end, "    DatabaseConfiguration.configure!");
+        }
+    }
+    Ok(())
+}
+
+/// Gems the PostgreSQL CRuby tree carries on disk but never loads: a
+/// runtime port stands in for the gem's Ruby and requires one native
+/// extension of the gem itself. Each row is the gem and the version the
+/// port was compared against. Not in `GEM_REQUIRES`, and not
+/// `Bundler.require`d: the gem's own entry file would redefine the port's
+/// constants and hook the native Active Record adapter through `on_load`.
+/// So the Gemfile line is `require: false`, written only when the app's
+/// own Gemfile declares the gem.
+const CRUBY_EXTENSION_GEMS: [(&str, &str); 1] = [
+    // runtime/spinel/semian*.rb ports semian's circuit breaker, bulkhead,
+    // registry, errors and Active Record PostgreSQL adapter. The bulkhead
+    // requires "semian/semian", the gem's SysV semaphore extension.
+    ("semian", "0.28.3"),
+];
+
+fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+    let Some(lock) = &app.gem_lock else { return Ok(()) };
+    let declared: Vec<_> = CRUBY_EXTENSION_GEMS
+        .iter()
+        .filter(|(gem, _)| lock.dependencies.iter().any(|dep| dep == gem))
+        .collect();
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let gemfile = files
+        .iter_mut()
+        .find(|(path, _)| path == "Gemfile")
+        .ok_or("PostgreSQL project: missing Gemfile")?;
+    for (gem, version) in declared {
+        if gemfile.1.contains(&format!("gem {gem:?}")) {
+            continue;
+        }
+        if !gemfile.1.ends_with('\n') {
+            gemfile.1.push('\n');
+        }
+        gemfile.1.push_str(&format!(
+            "\n# The runtime port requires this gem's native extension, never the\n\
+             # gem itself (project.rs::CRUBY_EXTENSION_GEMS).\n\
+             gem {gem:?}, {version:?}, require: false\n"
+        ));
+    }
+    Ok(())
 }
 
 /// The JRuby tree's Gemfile: the committed scaffold Gemfile is MRI-only
@@ -3948,6 +4110,48 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, expr));
 }
 
+/// A read of a name only the Ruby-family runtime declares
+/// (`ActiveSupport::Notifications`, `Rails.event`'s EventReporter) is
+/// supported where the finished tree carries a runtime file declaring
+/// it, and refused on every other target. A test body's read of a name
+/// the test harness also declares is supported by the finished tree's
+/// `test/test_helper.rb` too, and is refused as a harness name.
+fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(String, String)]) {
+    let reads = crate::analyze::runtime_reads::ruby_family_runtime_reads(app);
+    if reads.is_empty() {
+        return;
+    }
+    let runtime: std::collections::HashSet<String> = files.iter()
+        .filter(|(p, _)| p.starts_with("runtime/") && p.ends_with(".rb"))
+        .flat_map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .collect();
+    let harness = files.iter().find(|(p, _)| p == "test/test_helper.rb")
+        .map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .unwrap_or_default();
+    let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
+    for read in reads {
+        let harness_name = read.in_test && crate::analyze::test_constants::is_harness_namespace(&read.name);
+        if runtime.contains(&read.name) || harness_name && harness.contains(&read.name) {
+            continue;
+        }
+        let file = names.get(&read.name).copied().unwrap_or("the Ruby-family runtime");
+        let (construct, detail) = if harness_name {
+            ("harness_constant", format!(
+                "{} is declared by the Ruby-family test harness and runtime ({file}), which {} does not emit",
+                read.name, target.as_str()))
+        } else if read.shown == read.name {
+            ("runtime_constant", format!(
+                "{} is declared by the Ruby-family runtime ({file}), which {} does not emit",
+                read.name, target.as_str()))
+        } else {
+            ("runtime_constant", format!(
+                "`{}` answers {}, declared by the Ruby-family runtime ({file}), which {} does not emit",
+                read.shown, read.name, target.as_str()))
+        };
+        emit::diagnostics::report_unsupported(read.span, target.as_str(), construct, detail);
+    }
+}
+
 /// Add Minitest's `capture_io` to the CRuby harness when a test body
 /// calls it. Only CRuby is run here; the Spinel tree cannot swap the
 /// output globals, and the JRuby tree is unverified, so both are left
@@ -4303,6 +4507,15 @@ fn spinel_files_with_source_markers(
 }
 
 fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    spinel_files_with_assertions(app, fixture,
+        crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline)
+}
+
+fn spinel_files_with_assertions(
+    app: &App,
+    fixture: &Path,
+    assertion_mode: crate::lower::test_module_to_library::inline_assertions::AssertionMode,
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let mut files: Vec<(String, String)> = Vec::new();
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold", "", &mut files)?;
@@ -4312,6 +4525,9 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "sig/test/",
         &mut files,
     )?;
+    // CRuby adds this harness explicitly; the directory walk also serves
+    // Spinel and JRuby, whose test bootstrap must remain Minitest-free.
+    files.retain(|(path, _)| path != "test/minitest_runner.rb");
 
     crate::runtime_files::walk_flat("runtime/spinel", &["rb"], "runtime/", &mut files)?;
 
@@ -4583,7 +4799,11 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // (`java_import`, `Java::`) that the CRuby and Spinel toolchains (and
     // the spinel-subset compliance gate) must never see. It is injected
     // only by `jruby_runtime_files`, so keep it out of the shared base.
-    files.retain(|(p, _)| p != "runtime/db_jruby.rb");
+    // Likewise, the pg-gem driver is selected only for PostgreSQL CRuby
+    // projects, never included by the generic runtime directory walk, and
+    // so is the semian port that wraps that driver's adapter.
+    files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
+        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance
@@ -4624,6 +4844,8 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // shares this tree and must keep Base for CRuby/JRuby Bar A/B.
     for stem in [
         "rails",
+        // `Rails.error` / `Rails.event`, which rails.rb requires.
+        "active_support_reporters",
         "active_record",
         "action_view",
         "action_controller",
@@ -4761,7 +4983,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         }
     }
 
-    let app_files = emit::ruby::emit_spinel(app);
+    let app_files = emit::ruby::emit_with_assertions(app, assertion_mode);
     let test_stems = app_test_stems(&app_files);
     files.extend(sort_files(app_files));
 

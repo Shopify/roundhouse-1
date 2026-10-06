@@ -1,15 +1,10 @@
 //! Per-backend visitors that turn an `ArelOp` into emitted `Expr`.
 //!
-//! Phase 1 ships `SqliteVisitor` — the only backend that has a Db
-//! primitive shim today (CRuby `sqlite3-ruby` + spinel-FFI
-//! `libsqlite3`). Future backends (postgres, libsql variants) will
-//! add sibling visitor structs; the IR shape doesn't change.
-//!
-//! The Expr shapes the visitor emits match what today's
-//! `lower::model_to_library::adapter_emit` synthesizes per shape —
-//! that's the migration target for Phase 1 step 5 (refactor
-//! adapter_emit to build Arel + call this visitor instead of
-//! synthesizing inline).
+//! `SqliteVisitor` preserves the existing SQLite path. `PostgresVisitor`
+//! shares query composition, hydration and typed bind calls, and selects
+//! PostgreSQL identifiers, placeholders, booleans, RETURNING and truncation.
+//! Production model lowering still uses SQLite until PostgreSQL project
+//! assembly and model ownership have emitted execution coverage.
 
 use crate::dialect::AccessorKind;
 use crate::effect::EffectSet;
@@ -25,6 +20,39 @@ use super::ir::{
 };
 
 const DB_MOD: &str = "Db";
+
+/// SQL choices are made from database identity in shared lowering, never by
+/// rewriting completed SQL in a driver. SQLite remains the legacy default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqlDialect {
+    Sqlite,
+    Postgres,
+}
+
+impl SqlDialect {
+    pub(crate) fn ident(self, name: &str) -> String {
+        match self {
+            Self::Sqlite => crate::naming::sql_ident(name),
+            Self::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        }
+    }
+
+    pub(crate) fn placeholder(self, index: usize) -> String {
+        match self {
+            Self::Sqlite => "?".into(),
+            Self::Postgres => format!("${index}"),
+        }
+    }
+
+    fn boolean(self, value: bool) -> &'static str {
+        match (self, value) {
+            (Self::Sqlite, true) => "1",
+            (Self::Sqlite, false) => "0",
+            (Self::Postgres, true) => "TRUE",
+            (Self::Postgres, false) => "FALSE",
+        }
+    }
+}
 
 /// Prototype gate for placeholder-bind emit (roundhouse#12, the
 /// "planned follow-on" the Db shims name). When
@@ -105,14 +133,28 @@ pub trait ArelVisitor {
 /// produces.
 pub struct SqliteVisitor;
 
-impl ArelVisitor for SqliteVisitor {
+pub struct PostgresVisitor;
+
+impl ArelVisitor for SqlDialect {
     fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
         match op {
-            ArelOp::Select(s) => visit_select(s, schema, owner),
-            ArelOp::Insert(i) => visit_insert(i, schema),
-            ArelOp::Update(u) => visit_update(u, schema),
-            ArelOp::Delete(d) => visit_delete(d, schema),
+            ArelOp::Select(s) => visit_select(s, schema, owner, *self),
+            ArelOp::Insert(i) => visit_insert(i, schema, *self),
+            ArelOp::Update(u) => visit_update(u, schema, *self),
+            ArelOp::Delete(d) => visit_delete(d, schema, *self),
         }
+    }
+}
+
+impl ArelVisitor for PostgresVisitor {
+    fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
+        SqlDialect::Postgres.visit(op, schema, owner)
+    }
+}
+
+impl ArelVisitor for SqliteVisitor {
+    fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
+        SqlDialect::Sqlite.visit(op, schema, owner)
     }
 }
 
@@ -120,24 +162,24 @@ impl ArelVisitor for SqliteVisitor {
 // Select — four result shapes, dispatched by ColumnSpec + LimitSpec
 // ---------------------------------------------------------------------------
 
-fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId) -> Expr {
+fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId, dialect: SqlDialect) -> Expr {
     let table = lookup_table(schema, &sel.table.0);
     // Read the placeholder-bind gate once per Select. All four prepare
     // paths honor it; a false value reproduces the inline-escape emit
     // byte-for-byte.
-    let param = param_binds_enabled();
+    let param = dialect == SqlDialect::Postgres || param_binds_enabled();
     match &sel.columns {
-        ColumnSpec::Count => emit_count(sel, table, param),
-        ColumnSpec::Exists => emit_exists(sel, table, param),
+        ColumnSpec::Count => emit_count(sel, table, param, dialect),
+        ColumnSpec::Exists => emit_exists(sel, table, param, dialect),
         // Cardinality comes from the BUILDER (`single_record`), never
         // from `LIMIT 1` — `find_by(x)` and `.limit(1)` render the same
         // SQL and mean different things. See `Select::single_record`.
         ColumnSpec::All if sel.single_record => {
-            emit_single_hydrate(sel, table, owner, param)
+            emit_single_hydrate(sel, table, owner, param, dialect)
         }
-        ColumnSpec::All => emit_multi_hydrate(sel, table, owner, schema, param),
-        ColumnSpec::Pluck(col) => emit_pluck(sel, table, col, param),
-        ColumnSpec::GroupCount(col) => emit_group_count(sel, table, col, param),
+        ColumnSpec::All => emit_multi_hydrate(sel, table, owner, schema, param, dialect),
+        ColumnSpec::Pluck(col) => emit_pluck(sel, table, col, param, dialect),
+        ColumnSpec::GroupCount(col) => emit_group_count(sel, table, col, param, dialect),
         ColumnSpec::Named(_) => {
             // Reserved — no Phase 1 builder produces Named yet (it's for
             // find_by(<col>)). Degrade instead of crashing: report the
@@ -166,13 +208,13 @@ fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId) -> Expr {
 
 /// `SELECT <cols> FROM <table> [WHERE …] LIMIT 1` →
 /// nilable single-instance hydrate.
-fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool) -> Expr {
+fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds);
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
     let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
     let result_init = assign_var(&result, nil_lit());
 
@@ -209,14 +251,13 @@ fn emit_multi_hydrate(
     table: &Table,
     owner: &ClassId,
     schema: &Schema,
-    param: bool,
-) -> Expr {
+    param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from(DB_MOD));
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds);
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
     let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
     // Empty Array literal carries an explicit `Array<Owner>` type
     // annotation so strict-target emit (Crystal `[] of Owner`)
@@ -277,7 +318,7 @@ fn emit_multi_hydrate(
     stmts.push(while_loop);
     stmts.push(finalize);
     for directive in &sel.preloads {
-        push_preload_stmts(&mut stmts, directive, schema, owner, &results);
+        push_preload_stmts(&mut stmts, directive, schema, owner, &results, dialect);
     }
     stmts.push(var_ref(&results));
     seq(stmts)
@@ -296,8 +337,7 @@ fn push_preload_stmts(
     directive: &PreloadDirective,
     schema: &Schema,
     parent_owner: &ClassId,
-    parent_results: &Symbol,
-) {
+    parent_results: &Symbol, dialect: SqlDialect) {
     let _ = parent_owner;
     let db = ClassId(Symbol::from(DB_MOD));
     let target_table = lookup_table(schema, &directive.target_table.0);
@@ -325,18 +365,18 @@ fn push_preload_stmts(
     let mut close = ")".to_string();
     if planned {
         close.push_str(" ORDER BY ");
-        close.push_str(&crate::naming::sql_ident(directive.foreign_key.as_str()));
+        close.push_str(&dialect.ident(directive.foreign_key.as_str()));
         if let Some(pk) = target_table.columns.iter().find(|c| c.primary_key) {
             close.push_str(", ");
-            close.push_str(&crate::naming::sql_ident(pk.name.as_str()));
+            close.push_str(&dialect.ident(pk.name.as_str()));
         }
     }
     let sql = concat_chain(vec![
         lit_str(format!(
             "SELECT {} FROM {} WHERE {} IN (",
-            select_cols_csv(target_table),
-            crate::naming::sql_ident(target_table.name.as_str()),
-            crate::naming::sql_ident(directive.foreign_key.as_str()),
+            select_cols_csv(target_table, dialect),
+            dialect.ident(target_table.name.as_str()),
+            dialect.ident(directive.foreign_key.as_str()),
         )),
         db_call(&db, "escape_int_list", vec![var_ref(&ids)]),
         lit_str(close),
@@ -557,7 +597,7 @@ fn push_planned_distribute(
 /// which is where the nullable `_opt` rule lives. Reusing it is the
 /// point: a second copy of that rule would be a second description of
 /// the same column.
-fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool) -> Expr {
+fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from(DB_MOD));
@@ -579,7 +619,7 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool)
     let elem_ty = crate::lower::model_to_library::ty_of_column_slot(column);
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds);
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
     let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
 
     // The element type is carried explicitly for the same reason the
@@ -650,8 +690,7 @@ fn emit_group_count(
     sel: &Select,
     table: &Table,
     col: &super::ir::ColRef,
-    param: bool,
-) -> Expr {
+    param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from(DB_MOD));
@@ -677,7 +716,7 @@ fn emit_group_count(
     };
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds);
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
     let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
 
     let results_init = assign_var(
@@ -726,17 +765,17 @@ fn emit_group_count(
 }
 
 /// `SELECT COUNT(*) FROM <table> [WHERE …]` → integer scalar.
-fn emit_count(sel: &Select, table: &Table, param: bool) -> Expr {
+fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
 
     let mut segments: Vec<Expr> = vec![lit_str(format!(
         "SELECT COUNT(*) FROM {}",
-        crate::naming::sql_ident(table.name.as_str())
+        dialect.ident(table.name.as_str())
     ))];
     let mut binds = Vec::new();
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect);
 
     let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![concat_chain(segments)]));
     let step = db_call(&db, "step?", vec![var_ref(&stmt)]);
@@ -755,15 +794,15 @@ fn emit_count(sel: &Select, table: &Table, param: bool) -> Expr {
 }
 
 /// `SELECT 1 FROM <table> WHERE … LIMIT 1` → bool from `step?`.
-fn emit_exists(sel: &Select, table: &Table, param: bool) -> Expr {
+fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> Expr {
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
 
     let mut segments: Vec<Expr> =
-        vec![lit_str(format!("SELECT 1 FROM {}", crate::naming::sql_ident(table.name.as_str())))];
+        vec![lit_str(format!("SELECT 1 FROM {}", dialect.ident(table.name.as_str())))];
     let mut binds = Vec::new();
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect);
     if let Some(super::ir::LimitSpec(n)) = sel.limit {
         segments.push(lit_str(format!(" LIMIT {}", n)));
     }
@@ -785,29 +824,51 @@ fn emit_exists(sel: &Select, table: &Table, param: bool) -> Expr {
 // Insert / Update / Delete — exec-shaped, no hydration
 // ---------------------------------------------------------------------------
 
-fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
-    let _ = lookup_table(schema, &ins.table.0); // validates table exists; not consumed beyond that
+fn visit_insert(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Expr {
+    let table = lookup_table(schema, &ins.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
 
     let cols_csv = ins
         .assignments
         .iter()
-        .map(|a| crate::naming::sql_ident(a.column.as_str()))
+        .map(|a| dialect.ident(a.column.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
 
     let mut segments: Vec<Expr> = vec![lit_str(format!(
         "INSERT INTO {} ({}) VALUES (",
-        crate::naming::sql_ident(ins.table.0.as_str()),
+        dialect.ident(ins.table.0.as_str()),
         cols_csv
     ))];
     for (idx, a) in ins.assignments.iter().enumerate() {
         if idx > 0 {
             segments.push(lit_str(", ".to_string()));
         }
-        segments.push(escape_value(&db, &a.value));
+        segments.push(escape_value(&db, &a.value, dialect));
     }
     segments.push(lit_str(")".to_string()));
+
+    if dialect == SqlDialect::Postgres {
+        if ins.assignments.is_empty() {
+            segments = vec![lit_str(format!("INSERT INTO {} DEFAULT VALUES", dialect.ident(ins.table.0.as_str())))];
+        }
+        if ins.returns_rowid {
+            let keys: Vec<_> = table.columns.iter().filter(|c| c.primary_key).collect();
+            if keys.len() != 1 || !matches!(keys[0].col_type, ColumnType::Integer | ColumnType::BigInt) {
+                let detail = "PostgreSQL generated insert identity requires one integer primary key";
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    Span::synthetic(), None, "postgresql_insert_identity", detail,
+                ));
+                let mut stub = nil_lit();
+                stub.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                    target: None, construct: Symbol::from("postgresql_insert_identity"), detail: detail.into(),
+                });
+                return stub;
+            }
+            segments.push(lit_str(format!(" RETURNING {}", dialect.ident(keys[0].name.as_str()))));
+            return db_call(&db, "insert_returning_int", vec![concat_chain(segments)]);
+        }
+    }
 
     let exec_call = db_call(&db, "exec", vec![concat_chain(segments)]);
     if !ins.returns_rowid {
@@ -817,34 +878,40 @@ fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
     seq(vec![exec_call, last_id])
 }
 
-fn visit_update(upd: &Update, schema: &Schema) -> Expr {
+fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
     let table = lookup_table(schema, &upd.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
 
-    let mut segments: Vec<Expr> = vec![lit_str(format!("UPDATE {} SET ", crate::naming::sql_ident(upd.table.0.as_str())))];
+    let mut segments: Vec<Expr> = vec![lit_str(format!("UPDATE {} SET ", dialect.ident(upd.table.0.as_str())))];
     for (idx, a) in upd.assignments.iter().enumerate() {
         let prefix = if idx == 0 {
-            format!("{} = ", crate::naming::sql_ident(a.column.as_str()))
+            format!("{} = ", dialect.ident(a.column.as_str()))
         } else {
-            format!(", {} = ", crate::naming::sql_ident(a.column.as_str()))
+            format!(", {} = ", dialect.ident(a.column.as_str()))
         };
         segments.push(lit_str(prefix));
-        segments.push(escape_value(&db, &a.value));
+        segments.push(escape_value(&db, &a.value, dialect));
     }
     // Writes go through `Db.exec` (`sqlite3_exec`), which never touches
     // the prepared-statement cache — so the WHERE stays inline-escaped
     // regardless of the placeholder-bind gate.
-    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new());
+    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect);
     db_call(&db, "exec", vec![concat_chain(segments)])
 }
 
-fn visit_delete(del: &Delete, schema: &Schema) -> Expr {
+fn visit_delete(del: &Delete, schema: &Schema, dialect: SqlDialect) -> Expr {
     let table = lookup_table(schema, &del.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
 
-    let mut segments: Vec<Expr> = vec![lit_str(format!("DELETE FROM {}", crate::naming::sql_ident(del.table.0.as_str())))];
+    if dialect == SqlDialect::Postgres && del.conditions.is_none() {
+        return db_call(&db, "exec", vec![lit_str(format!(
+            "TRUNCATE TABLE {} RESTART IDENTITY", dialect.ident(del.table.0.as_str()),
+        ))]);
+    }
+
+    let mut segments: Vec<Expr> = vec![lit_str(format!("DELETE FROM {}", dialect.ident(del.table.0.as_str())))];
     // Exec path — inline WHERE (see visit_update note); not cached.
-    push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new());
+    push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new(), dialect);
     let delete_call = db_call(&db, "exec", vec![concat_chain(segments)]);
 
     // Truncate (Delete with no WHERE) — also reset the
@@ -860,14 +927,14 @@ fn visit_delete(del: &Delete, schema: &Schema) -> Expr {
     // postgres / other backends would skip this branch in their own
     // visitor.
     let has_primary_key = table.columns.iter().any(|c| c.primary_key);
-    if del.conditions.is_none() && has_primary_key {
+    if dialect == SqlDialect::Sqlite && del.conditions.is_none() && has_primary_key {
         let reset = db_call(
             &db,
             "exec",
             // Here the physical name is a VALUE, not an identifier.
             vec![concat_chain(vec![
                 lit_str("DELETE FROM sqlite_sequence WHERE name = ".to_string()),
-                escape_value(&db, &Value::LiteralStr(del.table.0.as_str().to_string())),
+                escape_value(&db, &Value::LiteralStr(del.table.0.as_str().to_string()), dialect),
             ])],
         );
         return seq(vec![delete_call, reset]);
@@ -881,35 +948,35 @@ fn visit_delete(del: &Delete, schema: &Schema) -> Expr {
 
 /// Build the SELECT prefix `"SELECT <cols> FROM <table>[...]"` plus
 /// any WHERE / LIMIT segments, returning the concat chain.
-fn compose_sql_select(sel: &Select, table: &Table, param: bool, binds: &mut Vec<Bind>) -> Expr {
+fn compose_sql_select(sel: &Select, table: &Table, param: bool, binds: &mut Vec<Bind>, dialect: SqlDialect) -> Expr {
     let cols_csv = match &sel.columns {
-        ColumnSpec::All => select_cols_csv(table),
+        ColumnSpec::All => select_cols_csv(table, dialect),
         ColumnSpec::Named(refs) => refs
             .iter()
-            .map(|r| crate::naming::sql_ident(r.column.as_str()))
+            .map(|r| dialect.ident(r.column.as_str()))
             .collect::<Vec<_>>()
             .join(", "),
         ColumnSpec::Count => "COUNT(*)".to_string(),
         ColumnSpec::Exists => "1".to_string(),
-        ColumnSpec::Pluck(col) => crate::naming::sql_ident(col.column.as_str()),
+        ColumnSpec::Pluck(col) => dialect.ident(col.column.as_str()),
         // The grouped column is projected BESIDE the aggregate, in that
         // order — the hydrate reads key at index 0, count at index 1.
-        ColumnSpec::GroupCount(col) => format!("{}, COUNT(*)", crate::naming::sql_ident(col.column.as_str())),
+        ColumnSpec::GroupCount(col) => format!("{}, COUNT(*)", dialect.ident(col.column.as_str())),
     };
     let mut segments: Vec<Expr> = vec![lit_str(format!(
         "SELECT {} FROM {}",
         cols_csv,
-        crate::naming::sql_ident(table.name.as_str())
+        dialect.ident(table.name.as_str())
     ))];
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, binds);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, binds, dialect);
     // GROUP BY sits between WHERE and ORDER BY. Read off the
     // projection rather than a `Select` field: the grouped column is
     // the projection here (see `ColumnSpec::GroupCount`), so one place
     // names it and the SELECT list and the GROUP BY cannot disagree.
     if let ColumnSpec::GroupCount(col) = &sel.columns {
-        segments.push(lit_str(format!(" GROUP BY {}", crate::naming::sql_ident(col.column.as_str()))));
+        segments.push(lit_str(format!(" GROUP BY {}", dialect.ident(col.column.as_str()))));
     }
-    push_order_segment(&mut segments, &sel.orders, table);
+    push_order_segment(&mut segments, &sel.orders, table, dialect);
     if let Some(super::ir::LimitSpec(n)) = sel.limit {
         segments.push(lit_str(format!(" LIMIT {}", n)));
     }
@@ -920,7 +987,7 @@ fn compose_sql_select(sel: &Select, table: &Table, param: bool, binds: &mut Vec<
 /// when at least one order is present. Empty orders → no segment.
 /// Quote known physical columns. Other existing order spellings (such
 /// as `articles.title`) are SQL terms, not single physical identifiers.
-fn push_order_segment(segments: &mut Vec<Expr>, orders: &[super::ir::Order], table: &Table) {
+fn push_order_segment(segments: &mut Vec<Expr>, orders: &[super::ir::Order], table: &Table, dialect: SqlDialect) {
     if orders.is_empty() {
         return;
     }
@@ -932,7 +999,7 @@ fn push_order_segment(segments: &mut Vec<Expr>, orders: &[super::ir::Order], tab
                 super::ir::Direction::Desc => "DESC",
             };
             let column = if table.columns.iter().any(|c| c.name == o.column.column) {
-                crate::naming::sql_ident(o.column.column.as_str())
+                dialect.ident(o.column.column.as_str())
             } else {
                 o.column.column.as_str().to_string()
             };
@@ -951,42 +1018,40 @@ fn push_where_segments(
     preds: Option<&Predicate>,
     _table: &Table,
     param: bool,
-    binds: &mut Vec<Bind>,
-) {
+    binds: &mut Vec<Bind>, dialect: SqlDialect) {
     let Some(pred) = preds else {
         return;
     };
     segments.push(lit_str(" WHERE ".to_string()));
-    push_predicate_segments(segments, pred, param, binds);
+    push_predicate_segments(segments, pred, param, binds, dialect);
 }
 
 fn push_predicate_segments(
     segments: &mut Vec<Expr>,
     pred: &Predicate,
     param: bool,
-    binds: &mut Vec<Bind>,
-) {
+    binds: &mut Vec<Bind>, dialect: SqlDialect) {
     match pred {
         // SQL equality never matches NULL (`col = NULL` is three-valued
         // unknown, i.e. no rows); a literal-nil condition is the IS NULL
         // form, as Rails renders it.
         Predicate::Eq(col, Value::LiteralNull) => {
-            segments.push(lit_str(format!("{} IS NULL", crate::naming::sql_ident(col.column.as_str()))));
+            segments.push(lit_str(format!("{} IS NULL", dialect.ident(col.column.as_str()))));
         }
         Predicate::Eq(col, val) => {
-            segments.push(lit_str(format!("{} = ", crate::naming::sql_ident(col.column.as_str()))));
-            push_value_segment(segments, val, param, binds);
+            segments.push(lit_str(format!("{} = ", dialect.ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds, dialect);
         }
         Predicate::And(l, r) => {
-            push_predicate_segments(segments, l, param, binds);
+            push_predicate_segments(segments, l, param, binds, dialect);
             segments.push(lit_str(" AND ".to_string()));
-            push_predicate_segments(segments, r, param, binds);
+            push_predicate_segments(segments, r, param, binds, dialect);
         }
         Predicate::Or(l, r) => {
             segments.push(lit_str("(".to_string()));
-            push_predicate_segments(segments, l, param, binds);
+            push_predicate_segments(segments, l, param, binds, dialect);
             segments.push(lit_str(" OR ".to_string()));
-            push_predicate_segments(segments, r, param, binds);
+            push_predicate_segments(segments, r, param, binds, dialect);
             segments.push(lit_str(")".to_string()));
         }
     }
@@ -997,27 +1062,27 @@ fn push_predicate_segments(
 /// Runtime value becomes `Db.escape_<ty>(<expr>)` inline when `param`
 /// is off, or a `?` placeholder + a recorded `Bind` when on — so the
 /// composed SQL keys the prepared-statement cache by shape, not value.
-fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds: &mut Vec<Bind>) {
+fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds: &mut Vec<Bind>, dialect: SqlDialect) {
     let db = ClassId(Symbol::from(DB_MOD));
     match val {
         Value::LiteralInt(n) => segments.push(lit_str(n.to_string())),
         Value::LiteralStr(s) => segments.push(lit_str(format!("'{}'", s.replace('\'', "''")))),
-        Value::LiteralBool(b) => segments.push(lit_str(if *b { "1".into() } else { "0".into() })),
+        Value::LiteralBool(b) => segments.push(lit_str(dialect.boolean(*b).to_string())),
         Value::LiteralNull => segments.push(lit_str("NULL".into())),
         // A nullable value can't ride the placeholder path — there is
         // no `bind_null` — so it always renders inline.
         Value::Runtime { expr, ty } if param && !ty.is_nullable() => {
-            segments.push(lit_str("?".to_string()));
+            segments.push(lit_str(dialect.placeholder(binds.len() + 1)));
             binds.push(Bind { expr: expr.clone(), ty: *ty });
         }
-        Value::Runtime { .. } => segments.push(escape_value(&db, val)),
+        Value::Runtime { .. } => segments.push(escape_value(&db, val, dialect)),
     }
 }
 
 /// `Db.escape_<ty>(<expr>)` for a Runtime value; literals stringify
 /// inline. Callers that already split literal vs runtime can call
 /// `push_value_segment` instead.
-fn escape_value(db: &ClassId, val: &Value) -> Expr {
+fn escape_value(db: &ClassId, val: &Value, dialect: SqlDialect) -> Expr {
     match val {
         Value::Runtime { expr, ty } => {
             let method = match ty {
@@ -1036,7 +1101,7 @@ fn escape_value(db: &ClassId, val: &Value) -> Expr {
         }
         Value::LiteralInt(n) => lit_str(n.to_string()),
         Value::LiteralStr(s) => lit_str(format!("'{}'", s.replace('\'', "''"))),
-        Value::LiteralBool(b) => lit_str(if *b { "1".into() } else { "0".into() }),
+        Value::LiteralBool(b) => lit_str(dialect.boolean(*b).to_string()),
         Value::LiteralNull => lit_str("NULL".into()),
     }
 }
@@ -1066,11 +1131,11 @@ fn model_from_stmt(owner: &ClassId, stmt: &Symbol) -> Expr {
     )
 }
 
-fn select_cols_csv(table: &Table) -> String {
+fn select_cols_csv(table: &Table, dialect: SqlDialect) -> String {
     table
         .columns
         .iter()
-        .map(|c| crate::naming::sql_ident(c.name.as_str()))
+        .map(|c| dialect.ident(c.name.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1275,6 +1340,22 @@ mod tests {
     }
 
     #[test]
+    fn postgres_generated_identity_refuses_missing_or_composite_keys() {
+        let (mut schema, owner) = fixture_schema();
+        let op = ArelOp::Insert(Insert {
+            table: TableRef(Symbol::from("articles")), assignments: vec![], returns_rowid: true,
+        });
+        schema.tables.get_mut(&Symbol::from("articles")).unwrap().columns[0].primary_key = false;
+        let no_key = PostgresVisitor.visit(&op, &schema, &owner);
+        assert!(matches!(no_key.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
+        let columns = &mut schema.tables.get_mut(&Symbol::from("articles")).unwrap().columns;
+        columns[0].primary_key = true;
+        columns[1].primary_key = true;
+        let composite = PostgresVisitor.visit(&op, &schema, &owner);
+        assert!(matches!(composite.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { .. })));
+    }
+
+    #[test]
     fn ordering_preserves_existing_qualified_terms() {
         let (schema, _) = fixture_schema();
         let table = schema.tables.get(&Symbol::from("articles")).unwrap();
@@ -1285,7 +1366,7 @@ mod tests {
                 column: Symbol::from("articles.title"),
             },
             direction: super::super::ir::Direction::Desc,
-        }], table);
+        }], table, SqlDialect::Sqlite);
         assert!(matches!(segments[0].node.as_ref(),
             ExprNode::Lit { value: Literal::Str { value } }
                 if value == " ORDER BY articles.title DESC"));
@@ -1698,7 +1779,7 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_single_hydrate(&sel, table, &owner, true);
+        let body = emit_single_hydrate(&sel, table, &owner, true, SqlDialect::Sqlite);
 
         // SQL keys on the static shape — placeholder, no inline escape call.
         let sql = prepare_sql(&body);
@@ -1736,7 +1817,7 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_single_hydrate(&sel, table, &owner, false);
+        let body = emit_single_hydrate(&sel, table, &owner, false, SqlDialect::Sqlite);
 
         let sql = prepare_sql(&body);
         assert!(!sql.contains('?'), "no placeholder when gate off; got:\n{sql}");
@@ -1766,7 +1847,7 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_count(&sel, table, true);
+        let body = emit_count(&sel, table, true, SqlDialect::Sqlite);
         let sql = prepare_sql(&body);
         assert!(sql.contains("COUNT(*)") && sql.contains("WHERE id = ?"), "got:\n{sql}");
         assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_int"), "expected bind_int");
@@ -1791,7 +1872,7 @@ mod tests {
             preloads: vec![],
         };
         let table = &schema.tables[&Symbol::from("articles")];
-        let body = emit_exists(&sel, table, true);
+        let body = emit_exists(&sel, table, true, SqlDialect::Sqlite);
         assert!(prepare_sql(&body).contains("WHERE title = ?"));
         assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_text"), "expected bind_text");
     }

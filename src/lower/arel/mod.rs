@@ -23,7 +23,7 @@ pub use ir::{
     ArelOp, Assignment, ColRef, ColumnSpec, Delete, Direction, Insert, Join, JoinKind, LimitSpec,
     Order, Predicate, PreloadDirective, Select, Update, Value, ValueType,
 };
-pub use visitor::{ArelVisitor, SqliteVisitor};
+pub use visitor::{ArelVisitor, PostgresVisitor, SqlDialect, SqliteVisitor};
 
 use std::collections::HashMap;
 
@@ -62,6 +62,21 @@ pub fn rewrite_arel_in_expr_with_assocs(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
 ) -> bool {
+    rewrite_arel_in_expr_for_dialect(expr, schema, registry, assocs, SqlDialect::Sqlite)
+}
+
+/// Carry the owning database's SQL dialect through the entire query walk,
+/// including value arguments on unmaterialized relation chains.
+///
+/// Returns whether any node was rewritten, as
+/// `rewrite_arel_in_expr_with_assocs` does.
+pub fn rewrite_arel_in_expr_for_dialect(
+    expr: &mut Expr,
+    schema: &Schema,
+    registry: &HashMap<ClassId, ClassInfo>,
+    assocs: &[crate::lower::model_associations::AssociationEdge],
+    dialect: SqlDialect,
+) -> bool {
     // Names (ivars/locals) the body later refines with relation-chain
     // methods (`@moderations.where(...)` after `@moderations =
     // Moderation.all...`). Materializing the assigned chain here would
@@ -69,7 +84,7 @@ pub fn rewrite_arel_in_expr_with_assocs(
     // runtime Relation path.
     let mut refined = std::collections::HashSet::new();
     collect_relation_refined_names(expr, &mut refined);
-    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined);
+    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, dialect);
     // Both call sites hand us a METHOD BODY, and a body that is a
     // single statement is not a `Seq` — so the hoist post-pass inside
     // `rewrite_arel_inner`, which walks a Seq's statement list, had no
@@ -192,6 +207,7 @@ fn rewrite_arel_inner(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &std::collections::HashSet<crate::ident::Symbol>,
+    dialect: SqlDialect,
 ) -> bool {
     if let ExprNode::Assign { target, .. } = expr.node.as_ref() {
         let name = match target {
@@ -207,7 +223,7 @@ fn rewrite_arel_inner(
         if let Some((op, owner)) =
             build::try_build_arel_with_assocs(expr, schema, registry, assocs)
         {
-            let mut replacement = SqliteVisitor.visit(&op, schema, &owner);
+            let mut replacement = dialect.visit(&op, schema, &owner);
             // The expansion replaces the recognized chain wholesale;
             // its provenance is the chain call site. Subtrees the
             // builder lifted out of the chain (predicate values, …)
@@ -241,15 +257,15 @@ fn rewrite_arel_inner(
         let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else {
             unreachable!("matched Send with recv above");
         };
-        let mut changed = rewrite_arel_spine_args(recv, schema, registry, assocs, refined);
+        let mut changed = rewrite_arel_spine_args(recv, schema, registry, assocs, refined, dialect);
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, dialect);
         }
         return changed;
     }
     let mut changed = false;
     walk_subexprs_mut(expr, &mut |e| {
-        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined)
+        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, dialect)
     });
     // Post-pass: when an Arel rewrite landed a multi-stmt hydrate Seq
     // in a *value* position — directly as an Assign value
@@ -281,17 +297,18 @@ fn rewrite_arel_spine_args(
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &std::collections::HashSet<crate::ident::Symbol>,
+    dialect: SqlDialect,
 ) -> bool {
     let mut changed = false;
     if let ExprNode::Send { recv, args, block, .. } = &mut *expr.node {
         if let Some(r) = recv {
-            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined);
+            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, dialect);
         }
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, dialect);
         }
         if let Some(b) = block {
-            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined);
+            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, dialect);
         }
     }
     changed

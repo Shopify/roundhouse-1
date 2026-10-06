@@ -36,8 +36,20 @@ pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction
     // No tables still means a `Schema` whose statement list is empty:
     // every harness loads `Schema.statements` unconditionally, so an app
     // without a database (a library and its tests) must still define it.
+    schema_functions(crate::emit::shared::schema_sql::render_schema_statements(schema))
+}
+
+/// Render the selected database's schema and preserve unsupported-DDL errors.
+pub fn lower_schema_to_library_functions_for(
+    schema: &Schema,
+    dialect: crate::emit::shared::schema_sql::Dialect,
+) -> Result<Vec<LibraryFunction>, String> {
+    crate::emit::shared::schema_sql::render_schema_statements_for(schema, dialect)
+        .map(schema_functions)
+}
+
+fn schema_functions(stmts: Vec<String>) -> Vec<LibraryFunction> {
     let module_path = vec![Symbol::from("Schema")];
-    let stmts = crate::emit::shared::schema_sql::render_schema_statements(schema);
     let elements: Vec<Expr> = stmts.into_iter().map(lit_str).collect();
     let body = with_ty(
         Expr::new(

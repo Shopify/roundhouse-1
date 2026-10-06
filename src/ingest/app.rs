@@ -119,33 +119,60 @@ pub fn ingest_inflections<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::naming
             _ => {}
         }
     }
-    fn walk(e: &Expr, out: &mut crate::naming::AppInflections) {
+    // Every argument a String/Symbol literal or an Array of them — the
+    // declarations whose every word `strings` carries.
+    fn all_literal(e: &Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(all_literal),
+            _ => false,
+        }
+    }
+    fn walk(e: &Expr, file: &str, out: &mut crate::naming::AppInflections) {
         if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node {
             let on_inflect = matches!(&*recv.node, ExprNode::Var { name, .. } if name.as_str() == "inflect");
             if on_inflect {
                 let mut words = Vec::new();
                 args.iter().for_each(|a| strings(a, &mut words));
-                match method.as_str() {
+                let literal = args.iter().all(all_literal);
+                let applied = match method.as_str() {
                     "irregular" if words.len() == 2 => {
                         out.irregular.push((words[0].clone(), words[1].clone()));
+                        literal && args.len() == 2
                     }
-                    "uncountable" => out.uncountable.extend(words),
-                    "acronym" => out.acronym.extend(words),
+                    "uncountable" => {
+                        out.uncountable.extend(words);
+                        literal
+                    }
+                    "acronym" => {
+                        out.acronym.extend(words);
+                        literal
+                    }
                     // The string form carries; a regex rule cannot.
                     "singular" if words.len() == 2 && args.len() == 2 => {
                         out.singular.push((words[0].clone(), words[1].clone()));
+                        true
                     }
                     "plural" if words.len() == 2 && args.len() == 2 => {
                         out.plural.push((words[0].clone(), words[1].clone()));
+                        true
                     }
-                    "plural" | "singular" => out.regex_rules += 1,
-                    _ => {}
+                    "plural" | "singular" => {
+                        out.regex_rules += 1;
+                        false
+                    }
+                    _ => false,
+                };
+                // What is applied is consumed; a regex rule (or a
+                // declaration with a non-literal word) stays a gap.
+                if applied {
+                    super::initializers::consume(file, e.span.start as usize, e.span.end as usize);
                 }
             }
         }
-        e.node.for_each_child(&mut |c| walk(c, out));
+        e.node.for_each_child(&mut |c| walk(c, file, out));
     }
-    walk(&program, &mut out);
+    walk(&program, &file, &mut out);
     if out.regex_rules > 0 {
         survey::record(&IngestError::Unsupported {
             file: file.clone(),
@@ -178,7 +205,7 @@ fn keep_initializer_defined(
     app: &mut App,
     dir: &Path,
     sources: &[crate::span::SourceFile],
-    candidates: Vec<LibraryClass>,
+    candidates: Vec<InitializerDefined>,
 ) {
     const FRAMEWORK_ROOTS: &[&str] = &[
         "Rails", "ActiveRecord", "ActiveSupport", "ActiveModel", "ActiveJob",
@@ -206,7 +233,7 @@ fn keep_initializer_defined(
                 })
         })
     };
-    for lc in candidates {
+    for InitializerDefined { file, ranges, lc } in candidates {
         let name = lc.name.0.as_str().to_string();
         if name.contains("::")
             || FRAMEWORK_ROOTS.contains(&name.as_str())
@@ -218,7 +245,39 @@ fn keep_initializer_defined(
         {
             continue;
         }
+        for (start, end) in ranges {
+            super::initializers::consume(&file, start, end);
+        }
         app.library_classes.push(lc);
+    }
+}
+
+/// A library class an initializer defines, with what keeping it applies
+/// of its file: its declaration(s) and, for the file's first class, the
+/// file-level constants `ingest_library_classes` hoists into it.
+struct InitializerDefined {
+    file: String,
+    ranges: Vec<(usize, usize)>,
+    lc: LibraryClass,
+}
+
+impl InitializerDefined {
+    fn new(
+        file: &str,
+        decls: &[(String, usize, usize)],
+        constants: &[(usize, usize)],
+        first: bool,
+        lc: LibraryClass,
+    ) -> Self {
+        let mut ranges: Vec<(usize, usize)> = decls
+            .iter()
+            .filter(|(name, _, _)| name == lc.name.0.as_str())
+            .map(|&(_, start, end)| (start, end))
+            .collect();
+        if first {
+            ranges.extend_from_slice(constants);
+        }
+        InitializerDefined { file: file.to_string(), ranges, lc }
     }
 }
 
@@ -230,6 +289,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         return super::roda_app::ingest_roda_app_with_vfs(vfs, dir);
     }
     super::sources::reset();
+    super::initializers::reset();
     let _source_root = super::sources::set_root(dir);
     let gem_sources = gem_source_dirs(vfs, dir)?;
     let mut path_gems = path_gem_dirs(vfs, dir);
@@ -238,6 +298,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     path_gems.dedup();
     let source_vfs = PathGemVfs { inner: vfs, root: dir, dirs: &path_gems };
     let vfs = &source_vfs;
+    // Every initializer Rails runs at boot, in its load order: each
+    // in-repo engine's, then the app's (see `initializers`).
+    let boot_initializers: Vec<std::path::PathBuf> = {
+        let engines = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
+        super::initializers::initializer_files(vfs, dir, &engines)
+    };
     let additional_test_paths = additional_test_paths(vfs, dir)?;
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
     let mut app = App::new();
@@ -583,6 +649,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     };
     let nested_app_roots: Vec<PathBuf> = roots.iter().skip(1).map(|root| dir.join(root)).collect();
     let mut support_seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Support files ingested whole: every top-level statement a class or
+    // module definition the IR now carries, so the emitted app loads
+    // all of this file (`require_of_loaded_support`).
+    let mut loaded_support: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
         let sub = sub.as_str();
         let support_dir = dir.join(sub);
@@ -622,6 +692,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     &model_bases,
                 ) {
                     Ok(Some(model)) => {
+                        if declarations_only(&source) {
+                            loaded_support.insert(entry.clone());
+                        }
                         let outer = model.name.clone();
                         app.models.push(model);
                         // Classes nested in the model's body are classes
@@ -650,7 +723,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 }
             }
             match ingest_library_classes(&source, &path_str) {
-                Ok(classes) => app.library_classes.extend(classes),
+                Ok(classes) => {
+                    if !classes.is_empty() && declarations_only(&source) {
+                        loaded_support.insert(entry.clone());
+                    }
+                    app.library_classes.extend(classes)
+                }
                 Err(err) => {
                     if survey::is_active() {
                         survey::record_dropped_file(&err);
@@ -825,8 +903,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         // on the Application reopen, overriding the framework default in
         // runtime/ruby/rails.rb. Apps that declare no session_store keep
         // that default. Every other initializer stays un-ingested.
-        if let Ok(init) = vfs.read(&dir.join("config/initializers/session_store.rb")) {
-            if let Some(key) = extract_session_cookie_key(&init) {
+        let session_store_path = dir.join("config/initializers/session_store.rb");
+        if let Ok(init) = vfs.read(&session_store_path) {
+            if let Some(key) =
+                extract_session_cookie_key(&init, &session_store_path.display().to_string())
+            {
                 if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
                     "def session_cookie_key\n  {key:?}\nend\n"
                 )) {
@@ -865,7 +946,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             if vfs.is_dir(&init_dir) {
                 for entry in read_rb_files(vfs, &init_dir)? {
                     if let Ok(bytes) = vfs.read(&entry) {
-                        excluded.extend(extract_variable_content_type_exclusions(&bytes));
+                        excluded.extend(extract_variable_content_type_exclusions(
+                            &bytes,
+                            &entry.display().to_string(),
+                        ));
                     }
                 }
             }
@@ -902,7 +986,8 @@ end
             if vfs.is_dir(&init_dir) {
                 for entry in read_rb_files(vfs, &init_dir)? {
                     if let Ok(bytes) = vfs.read(&entry) {
-                        let (u, mut b) = extract_vips_loader_policy(&bytes);
+                        let (u, mut b) =
+                            extract_vips_loader_policy(&bytes, &entry.display().to_string());
                         untrusted = untrusted || u;
                         blocked.append(&mut b);
                     }
@@ -930,8 +1015,10 @@ end
         }
         // Default page size for `Relation#page`. A `Kaminari.configure`
         // block's literal `default_per_page = N` is one input spelling;
-        // synthesized as `default_per_page` on the reopen, over the
-        // runtime default of 25 in runtime/ruby/rails.rb.
+        // synthesized as `pagination_default_per_page` on the reopen, over
+        // the runtime default of 25 in runtime/ruby/rails.rb. Not
+        // `default_per_page`: the reopen also answers the app's own config
+        // keys, and an app may set `config.default_per_page` for itself.
         {
             let init_dir = dir.join("config/initializers");
             let mut per_page: Option<u64> = None;
@@ -945,9 +1032,121 @@ end
             }
             if let Some(n) = per_page {
                 if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
-                    "def default_per_page\n  {n}\nend\n"
+                    "def pagination_default_per_page\n  {n}\nend\n"
                 )) {
                     methods.append(&mut synth);
+                }
+            }
+        }
+        // `config.filter_parameters` — the keys Rails redacts. railties
+        // 8.1.4 starts it at `[]` (application/configuration.rb:36) and
+        // the app adds to it from application.rb and any initializer
+        // (Rails' generator writes `Rails.application.config
+        // .filter_parameters += [...]` in filter_parameter_logging.rb),
+        // so the list is every write in boot order: the Application
+        // class body (required before any initializer runs), then each
+        // engine's initializers and the app's, as Rails loads them. A
+        // `=` starts the list over, as it does in Rails.
+        //
+        // NOT MODELED: an initializer that reads the list before a later
+        // write (`ParameterFilter.new(config.filter_parameters)` mid-boot)
+        // sees the final list here, not the partial one.
+        //
+        // Synthesized as `filter_parameters` on the reopen, over the
+        // framework default `[]` in runtime/ruby/rails.rb; that name is
+        // also what `lower::config_reader` resolves a
+        // `Rails.application.config.filter_parameters` read to. Rails
+        // applies the list once, after initialization
+        // (activesupport railtie.rb:82-87, `active_support
+        // .set_filter_parameters`); the emitted boot.rb does the same.
+        //
+        // Consumers of the list in Rails 8.1.4, against this runtime:
+        // - `ActiveSupport.filter_parameters` -> the event reporter's
+        //   payload filter (event_reporter.rb:548-553): WIRED, boot.rb
+        //   copies the list in and reloads the filter.
+        // - `ActiveRecord::Base.filter_attributes` (activerecord
+        //   railtie.rb:328-332) -> `#inspect` / `attribute_for_inspect`
+        //   masking (core.rb:369): NOT IN THE RUNTIME. Emitted models
+        //   inherit Object#inspect, which prints every ivar unmasked.
+        // - `request.filtered_parameters` / the "Parameters:" log line
+        //   (action_dispatch http/filter_parameters.rb,
+        //   action_controller log_subscriber) and `filter_redirect`: NOT
+        //   IN THE RUNTIME, which logs no request parameters.
+        // - Action Cable's `filter_parameters` (actioncable engine.rb:56,
+        //   channel/base.rb:312-319 action signature logging): NOT IN
+        //   THE RUNTIME, which logs no channel actions.
+        // - Encryption's auto-filtered attributes (activerecord
+        //   encryption/auto_filtered_parameters.rb:56): not modeled
+        //   (`encrypts` is not ingested).
+        // Each write becomes one statement of the method, in boot order,
+        // on a local list that starts at `[]`: the authored operand
+        // verbatim (`list = FilterParameterLogging.for_config`, `list +=
+        // [:passw]`), compiled and analyzed as app code like any other
+        // method on the reopen, so a constant it names resolves or is
+        // diagnosed like any app code. The writes are consumed once the
+        // method ingests; one that cannot run there is refused with a
+        // reason and stays an `initializer_unsupported` gap
+        // (`extract_filter_parameters`).
+        {
+            let mut files: Vec<(String, Vec<u8>)> = vec![(file.clone(), source.clone())];
+            for entry in &boot_initializers {
+                if let Ok(bytes) = vfs.read(entry) {
+                    files.push((entry.display().to_string(), bytes));
+                }
+            }
+            // Sources before ingesting their operands, so the spans are
+            // real (registration is idempotent).
+            for (path, bytes) in &files {
+                super::sources::register(path, &String::from_utf8_lossy(bytes));
+            }
+            let mut statements: Vec<String> = Vec::new();
+            let mut operands: Vec<crate::expr::Expr> = Vec::new();
+            let mut sites: Vec<(String, usize, usize)> = Vec::new();
+            for (path, bytes) in &files {
+                for write in extract_filter_parameters(bytes, path) {
+                    match write {
+                        Ok(w) => {
+                            statements.push(w.statement);
+                            operands.extend(w.operands);
+                            sites.push((path.clone(), w.start, w.end));
+                        }
+                        Err((start, end, reason)) => {
+                            super::initializers::refuse(path, start, end, reason);
+                        }
+                    }
+                }
+            }
+            if !statements.is_empty() {
+                let mut body = String::from("def filter_parameters\n  list = []\n");
+                for statement in &statements {
+                    for line in statement.lines() {
+                        body.push_str("  ");
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                }
+                body.push_str("  list\nend\n");
+                let filled = crate::runtime_src::parse_methods(&body).and_then(|mut synth| {
+                    fill_filter_parameters(&mut synth, operands)?;
+                    Ok(synth)
+                });
+                match filled {
+                    Ok(mut synth) => {
+                        methods.append(&mut synth);
+                        for (path, start, end) in &sites {
+                            super::initializers::consume(path, *start, *end);
+                        }
+                    }
+                    Err(err) => {
+                        for (path, start, end) in &sites {
+                            super::initializers::refuse(
+                                path,
+                                *start,
+                                *end,
+                                format!("filter_parameters does not ingest as app code: {err}"),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -973,8 +1172,14 @@ end
                 }
             }
             let mut assignments: Vec<(Vec<String>, String)> = Vec::new();
+            // Where each assignment sits, index-aligned with
+            // `assignments`: a reader lifted from one consumes it.
+            let mut assignment_sites: Vec<(String, usize, usize)> = Vec::new();
             for (path, bytes) in sources {
-                assignments.extend(extract_config_assignments(&bytes, &path));
+                for a in extract_config_assignments(&bytes, &path) {
+                    assignments.push((a.path, a.value));
+                    assignment_sites.push((path.clone(), a.start, a.end));
+                }
             }
             // ONCE PER PROCESS. An initializer runs at boot, so the
             // value an assignment writes is built one time and every
@@ -999,8 +1204,17 @@ end
             // single-element-Array holder is the shape every stub slot
             // in the runtime already uses, typed by its push on spinel.
             let mut slots: Vec<(String, String)> = Vec::new();
-            for (segments, value) in &assignments {
+            for ((segments, value), (site_file, site_start, site_end)) in
+                assignments.iter().zip(&assignment_sites)
+            {
                 let name = segments.join("_");
+                // A framework key is NOT consumed here: it is railtie
+                // configuration this lift does not model, and only the
+                // keys `INERT_FRAMEWORK_CONFIG_KEYS` vouches for count as
+                // applied (`extract_config_assignments` consumes those).
+                // A key that already has a reader — the second
+                // assignment of one name, or one synthesized above — is
+                // not applied either: the first reader answers.
                 if FRAMEWORK_CONFIG_KEYS.contains(&name.as_str())
                     || methods.iter().any(|m| m.name.as_str() == name)
                 {
@@ -1014,6 +1228,7 @@ end
                 )) {
                     methods.append(&mut synth);
                     slots.push((name, slot));
+                    super::initializers::consume(site_file, *site_start, *site_end);
                 }
             }
             if !slots.is_empty() {
@@ -1097,7 +1312,7 @@ end
     // Top-level constants an initializer defines that are not mixins —
     // kept or dropped after every app file is read (see
     // `keep_initializer_defined`).
-    let mut initializer_defined: Vec<LibraryClass> = Vec::new();
+    let mut initializer_defined: Vec<InitializerDefined> = Vec::new();
 
     // `Time::DATE_FORMATS[:name] = ->(t) { … }` in an initializer —
     // read independently of config/application.rb above, since an app
@@ -1111,7 +1326,7 @@ end
             for entry in read_rb_files(vfs, &init_dir)? {
                 let Ok(bytes) = vfs.read(&entry) else { continue };
                 let path_str = entry.display().to_string();
-                for (name, source) in extract_time_formats(&bytes, &path_str) {
+                for (name, source, (site_start, site_end)) in extract_time_formats(&bytes, &path_str) {
                     let format = match source {
                         TimeFormatSource::Strftime(format) => {
                             crate::app::TimeFormat::Strftime { format }
@@ -1128,6 +1343,7 @@ end
                     };
                     app.time_formats
                         .insert(crate::ident::Symbol::from(name.as_str()), format);
+                    super::initializers::consume(&path_str, site_start, site_end);
                 }
                 // Same directory, same read: `X.prepend Y` / `X.include
                 // Y`. Recorded whether or not either constant is in the
@@ -1142,12 +1358,18 @@ end
                 // was dropped with the guard. Only the mixed-in names
                 // are kept here; the rest wait in `initializer_defined`
                 // for the referenced-by-app test below.
+                let decls = super::initializers::declaration_ranges(&bytes);
+                let file_constants = super::initializers::top_level_constant_ranges(&bytes);
                 if let Ok(classes) = ingest_library_classes(&bytes, &path_str) {
-                    for lc in classes {
-                        if mixins.iter().any(|m| m.module.as_str() == lc.name.0.as_str()) {
-                            app.library_classes.push(lc);
+                    for (i, lc) in classes.into_iter().enumerate() {
+                        let defined = InitializerDefined::new(&path_str, &decls, &file_constants, i == 0, lc);
+                        if mixins.iter().any(|m| m.module.as_str() == defined.lc.name.0.as_str()) {
+                            for &(start, end) in &defined.ranges {
+                                super::initializers::consume(&path_str, start, end);
+                            }
+                            app.library_classes.push(defined.lc);
                         } else {
-                            initializer_defined.push(lc);
+                            initializer_defined.push(defined);
                         }
                     }
                 }
@@ -1529,6 +1751,28 @@ end
         }
     }
 
+    // Every initializer Rails runs at boot — each in-repo engine's, then
+    // the app's, in load order — is a source: registered here, before
+    // the snapshot, so its statements have spans (the app's are mostly
+    // registered already by the readers above; registration is
+    // idempotent). Engine initializers are indexed with the rest because
+    // Rails loads them. `initializers::survey`, after the last reader,
+    // reports what nothing applied.
+    {
+        let load_path: Vec<PathBuf> = std::iter::once(dir.join("lib"))
+            .chain(path_gems.iter().map(|gem| gem.join("lib")))
+            .collect();
+        for entry in &boot_initializers {
+            let Ok(bytes) = vfs.read(entry) else { continue };
+            let path = entry.display().to_string();
+            super::sources::register(&path, &String::from_utf8_lossy(&bytes));
+            for (start, end) in require_of_loaded_support(&bytes, &load_path, &loaded_support, vfs) {
+                super::initializers::consume(&path, start, end);
+            }
+            app.initializer_files.push(path);
+        }
+    }
+
     // Every app source is registered by here. Rubydex resolves a
     // SNAPSHOT on another thread while the passes below run, and those
     // passes read the same snapshot. It is not the real `drain`: the
@@ -1853,6 +2097,10 @@ end
     // library module, so it runs once they all exist.
     super::database_ownership::resolve(&mut app);
     collect_binary_assets(vfs, dir, &mut app);
+    // After every initializer reader (the last, the Action Text
+    // allowed-attributes read, runs above): what none of them consumed
+    // is a gap.
+    super::initializers::survey(&mut app);
     // Generated re-ingest labels never register real sources. No later
     // pass may append source-backed FileIds beyond the indexed snapshot.
     let late_sources = super::sources::drain();
@@ -4854,9 +5102,28 @@ fn engine_app_roots<V: Vfs + ?Sized>(
     }
 }
 
+/// `class X < Rails::Engine` / `class X < ::Rails::Engine`.
+pub(super) fn is_rails_engine_class(class: &ruby_prism::ClassNode<'_>) -> bool {
+    class.superclass()
+        .and_then(|parent| parent.as_constant_path_node())
+        .is_some_and(|parent| {
+            parent.name().is_some_and(|name| super::util::constant_id_str(&name) == "Engine")
+                && parent.parent().is_some_and(|namespace| {
+                    if let Some(name) = namespace.as_constant_read_node() {
+                        super::util::constant_id_str(&name.name()) == "Rails"
+                    } else {
+                        namespace.as_constant_path_node().is_some_and(|name| {
+                            name.parent().is_none()
+                                && name.name().is_some_and(|id| super::util::constant_id_str(&id) == "Rails")
+                        })
+                    }
+                })
+        })
+}
+
 /// Whether any Ruby file under `lib_dir` subclasses `Rails::Engine`
 /// (`class Engine < ::Rails::Engine`).
-fn declares_rails_engine<V: Vfs + ?Sized>(vfs: &V, lib_dir: &Path) -> bool {
+pub(super) fn declares_rails_engine<V: Vfs + ?Sized>(vfs: &V, lib_dir: &Path) -> bool {
     if !vfs.is_dir(lib_dir) {
         return false;
     }
@@ -4869,21 +5136,7 @@ fn declares_rails_engine<V: Vfs + ?Sized>(vfs: &V, lib_dir: &Path) -> bool {
             if self.found {
                 return;
             }
-            self.found = class.superclass()
-                .and_then(|parent| parent.as_constant_path_node())
-                .is_some_and(|parent| {
-                    parent.name().is_some_and(|name| super::util::constant_id_str(&name) == "Engine")
-                        && parent.parent().is_some_and(|namespace| {
-                            if let Some(name) = namespace.as_constant_read_node() {
-                                super::util::constant_id_str(&name.name()) == "Rails"
-                            } else {
-                                namespace.as_constant_path_node().is_some_and(|name| {
-                                    name.parent().is_none()
-                                        && name.name().is_some_and(|id| super::util::constant_id_str(&id) == "Rails")
-                                })
-                            }
-                        })
-                });
+            self.found = is_rails_engine_class(class);
             if !self.found {
                 ruby_prism::visit_class_node(self, class);
             }
@@ -5354,6 +5607,9 @@ fn lib_dir_is_explicitly_required<V: Vfs + ?Sized>(vfs: &V, dir: &Path, subdir: 
             let loc = stmt.location();
             let text = &src[loc.start_offset()..loc.end_offset()];
             if text.contains("require") && text.contains(subdir) {
+                // The statement is the load: the directory it requires
+                // is walked as app source (the ignore is lifted).
+                super::initializers::consume_node(&file, &stmt);
                 return true;
             }
         }
@@ -5440,6 +5696,8 @@ fn extract_autoload_lib_ignores(source: &[u8]) -> Vec<String> {
 /// configures machinery that does not exist here.
 const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
     "time_zone",
+    // Applied by its own reader (`extract_filter_parameters`), not lifted.
+    "filter_parameters",
     "session_store",
     "load_defaults",
     "eager_load",
@@ -5491,7 +5749,10 @@ const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
 /// `"%Y%m%d%H%M%S"` here), so it is deliberately not folded in:
 /// Date's format registry is not modeled, and sharing Time's table would
 /// render a full timestamp where Rails renders eight digits.
-fn extract_time_formats(source: &[u8], file: &str) -> Vec<(String, TimeFormatSource)> {
+fn extract_time_formats(
+    source: &[u8],
+    file: &str,
+) -> Vec<(String, TimeFormatSource, (usize, usize))> {
     let result = super::prism::parse(source, file);
     let root = result.node();
     let src = String::from_utf8_lossy(source).into_owned();
@@ -5524,6 +5785,7 @@ fn extract_time_formats(source: &[u8], file: &str) -> Vec<(String, TimeFormatSou
         };
         let Some(key) = key.as_symbol_node() else { continue };
         let name = String::from_utf8_lossy(key.unescaped()).into_owned();
+        let site = (stmt.location().start_offset(), stmt.location().end_offset());
 
         // A String format is a strftime string; a lambda is inlined.
         // Rails picks between them at run time with `respond_to?(:call)`.
@@ -5533,6 +5795,7 @@ fn extract_time_formats(source: &[u8], file: &str) -> Vec<(String, TimeFormatSou
                 TimeFormatSource::Strftime(
                     String::from_utf8_lossy(string.unescaped()).into_owned(),
                 ),
+                site,
             ));
             continue;
         }
@@ -5555,6 +5818,7 @@ fn extract_time_formats(source: &[u8], file: &str) -> Vec<(String, TimeFormatSou
                 param: super::util::constant_id_str(&param.name()).to_string(),
                 body: src[body_loc.start_offset()..body_loc.end_offset()].to_string(),
             },
+            site,
         ));
     }
     out
@@ -5613,6 +5877,9 @@ fn extract_module_mixins(source: &[u8], file: &str) -> Vec<crate::app::ModuleMix
         let [arg] = args.as_slice() else { continue };
         let Some(module) = constant_text(arg, &src) else { continue };
 
+        // Recorded is applied: `lower::module_mixins` emits it or
+        // reports the constant it cannot resolve.
+        super::initializers::consume_node(file, &stmt);
         out.push(ModuleMixin { target: Symbol::from(target), module: Symbol::from(module), kind });
     }
     out
@@ -5741,17 +6008,25 @@ fn content_helper_attribute_additions<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app:
             let Ok(value) = super::expr::ingest_expr(arg, &file) else { continue };
             let mut ops = Vec::new();
             operands(&value, &mut ops);
+            let mut all_applied = true;
             for op in ops {
                 if is_base(op) {
                     continue;
                 }
                 match resolve(op) {
                     Some(list) => add(list, &mut out),
-                    None => survey::record(&IngestError::Unsupported {
-                        file: file.clone(),
-                        message: "ActionText::ContentHelper.allowed_attributes addition is not a literal list or a constant holding one; the attributes it adds are not allowed by the emitted sanitizer".to_string(),
-                    }),
+                    None => {
+                        all_applied = false;
+                        survey::record(&IngestError::Unsupported {
+                            file: file.clone(),
+                            message: "ActionText::ContentHelper.allowed_attributes addition is not a literal list or a constant holding one; the attributes it adds are not allowed by the emitted sanitizer".to_string(),
+                        })
+                    }
                 }
+            }
+            // Applied only when every addition resolved.
+            if all_applied {
+                super::initializers::consume_node(&file, &stmt);
             }
         }
     }
@@ -5872,6 +6147,7 @@ fn extract_initializer_filters(source: &[u8], file: &str) -> Vec<crate::app::Ini
                 continue;
             }
         }
+        super::initializers::consume_node(file, &stmt);
         out.push(InitializerFilter { target: Symbol::from(target), method: Symbol::from(method), only });
     }
     out
@@ -5896,63 +6172,59 @@ enum TimeFormatSource {
     Lambda { param: String, body: String },
 }
 
-/// Each assignment as its PATH SEGMENTS plus the value's source text —
+/// One app config assignment: its PATH SEGMENTS, the value's source
+/// text, and the assignment statement's byte range (consumed by the
+/// caller when a reader is lifted from it).
+///
 /// `config.x.vapid.private_key = …` is `(["x", "vapid", "private_key"],
 /// "ENV.fetch(…)")`. The path rather than the joined reader name because
 /// the caller synthesizes a reader for an intermediate node too
 /// (`config.x.vapid` read as a whole is an OrderedOptions in Rails), and
 /// `x_vapid_private_key` cannot be split back into its segments — the
 /// leaf has an underscore of its own.
-fn extract_config_assignments(source: &[u8], file: &str) -> Vec<(Vec<String>, String)> {
-    fn walk(stmts: Vec<ruby_prism::Node<'_>>, src: &str, out: &mut Vec<(Vec<String>, String)>) {
-        for stmt in stmts {
-            // Config lines sit at the top level of an initializer and
-            // inside the Application class body; descend through both
-            // rather than the whole expression tree, which is where
-            // every other config reader in this file draws the line.
-            if let Some(class) = stmt.as_class_node() {
-                walk(class.body().map(super::util::flatten_statements).unwrap_or_default(), src, out);
-                continue;
-            }
-            if let Some(module) = stmt.as_module_node() {
-                walk(module.body().map(super::util::flatten_statements).unwrap_or_default(), src, out);
-                continue;
-            }
-            // The third home, and the one Rails' own generator writes:
-            // `Rails.application.configure do … end`. Descending into the
-            // block keeps the same discipline as the two above — named
-            // containers only, not the whole expression tree.
-            if let Some(call) = stmt.as_call_node() {
-                if super::util::constant_id_str(&call.name()) == "configure" {
-                    if let Some(body) = call
-                        .block()
-                        .and_then(|b| b.as_block_node())
-                        .and_then(|b| b.body())
-                    {
-                        walk(super::util::flatten_statements(body), src, out);
-                        continue;
-                    }
-                }
-            }
-            let Some(call) = stmt.as_call_node() else { continue };
-            // `x.y = v` parses as a call named `y=`.
-            let name = super::util::constant_id_str(&call.name()).to_string();
-            let Some(base) = name.strip_suffix('=') else { continue };
-            let Some(prefix) = config_receiver_path(&call.receiver()) else {
-                continue;
-            };
-            let Some(args) = call.arguments() else { continue };
-            let Some(value) = args.arguments().iter().next() else { continue };
-            let loc = value.location();
-            let mut path = prefix;
-            path.push(base.to_string());
-            out.push((
-                path,
-                src[loc.start_offset()..loc.end_offset()].to_string(),
-            ));
-        }
-    }
+struct ConfigAssignment {
+    path: Vec<String>,
+    value: String,
+    start: usize,
+    end: usize,
+}
 
+/// Framework config an initializer may write that is deliberately INERT
+/// for the emitted runtime: setting it changes nothing the emitted app
+/// does, so the write counts as applied (consumed) for initializer
+/// coverage. Matched as a dotted prefix of the written path
+/// (`assets.version` covers `config.assets.version = …`), whether the
+/// write is `=`, `+=`/`||=` or `<<`.
+///
+/// Everything else in Rails' config surface — `FRAMEWORK_CONFIG_KEYS`
+/// above and every framework namespace — is real behavior not wired yet
+/// and stays a reported gap. `filter_parameters` is not inert: it is
+/// applied (`extract_filter_parameters`, the Application reopen).
+const INERT_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
+    // The emitted app requires every file at boot; there is no
+    // autoloader whose eager-load mode this selects.
+    ("eager_load", "no autoloader: every file is loaded at boot"),
+    // Selects code reloading, which the emitted app does not have.
+    ("cache_classes", "no code reloading in the emitted app"),
+    // Names the asset digest generation; the emitted app serves
+    // undigested `/assets/<name>` paths (runtime/ruby/action_view/
+    // view_helpers.rb, `image_path`).
+    ("assets.version", "no asset digests in the emitted app"),
+    // The file list `rails assets:precompile` builds; the emitted app
+    // runs no precompile step and serves undigested assets.
+    ("assets.precompile", "no asset precompile step in the emitted app"),
+];
+
+/// Whether a written config path (`["assets", "version"]`) is one
+/// [`INERT_FRAMEWORK_CONFIG_KEYS`] vouches for.
+fn inert_framework_config(path: &[String]) -> bool {
+    let dotted = path.join(".");
+    INERT_FRAMEWORK_CONFIG_KEYS.iter().any(|(key, _)| {
+        dotted == *key || dotted.strip_prefix(key).is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment> {
     let result = super::prism::parse(source, file);
     let root = result.node();
     let src = String::from_utf8_lossy(source).into_owned();
@@ -5961,8 +6233,429 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<(Vec<String>, St
         .as_program_node()
         .map(|p| p.statements().body().iter().collect::<Vec<_>>())
         .unwrap_or_default();
-    walk(stmts, &src, &mut out);
+    walk_config_statements(stmts, None, &mut |stmt, app_param| {
+        // An inert framework write is applied by being inert:
+        // `config.assets.version = …`, `config.assets.precompile +=
+        // …`, `config.assets.precompile << …`.
+        let written: Option<Vec<String>> = if let Some(call) = stmt.as_call_node() {
+            let name = super::util::constant_id_str(&call.name()).to_string();
+            let receiver = call.receiver();
+            let prefix = receiver.as_ref().and_then(|r| config_path_in(r, 0, app_param));
+            match (name.as_str(), prefix) {
+                ("<<", prefix) => prefix,
+                (n, Some(mut prefix)) if n.ends_with('=') && !n.ends_with("==") => {
+                    prefix.push(n.trim_end_matches('=').to_string());
+                    Some(prefix)
+                }
+                _ => None,
+            }
+        } else if let Some(w) = stmt.as_call_operator_write_node() {
+            w.receiver().and_then(|r| config_path_in(&r, 0, app_param)).map(|mut prefix| {
+                prefix.push(super::util::constant_id_str(&w.read_name()).to_string());
+                prefix
+            })
+        } else if let Some(w) = stmt.as_call_or_write_node() {
+            w.receiver().and_then(|r| config_path_in(&r, 0, app_param)).map(|mut prefix| {
+                prefix.push(super::util::constant_id_str(&w.read_name()).to_string());
+                prefix
+            })
+        } else {
+            None
+        };
+        if written.as_deref().is_some_and(inert_framework_config) {
+            super::initializers::consume_node(file, stmt);
+            return;
+        }
+        let Some(call) = stmt.as_call_node() else { return };
+        // `x.y = v` parses as a call named `y=`.
+        let name = super::util::constant_id_str(&call.name()).to_string();
+        let Some(base) = name.strip_suffix('=') else { return };
+        if base.is_empty() || base.ends_with(['=', '!', '<', '>']) {
+            return;
+        }
+        // `Rails.application.configure do |config| config.key = v end`:
+        // the parameter is the APPLICATION, not its config (railties
+        // 8.1.4 railtie.rb:254, `configure` is `instance_eval(&block)`,
+        // which yields the receiver), so this line is
+        // `Rails.application.key = v`. That is not a config assignment
+        // and Rails has no such writer on the application; say so
+        // instead of lifting a key Rails never sets.
+        if let (Some(param), Some(recv)) = (app_param, call.receiver()) {
+            if recv.as_local_variable_read_node().is_some_and(|l| {
+                super::util::constant_id_str(&l.name()) == param
+            }) {
+                super::initializers::refuse(
+                    file,
+                    stmt.location().start_offset(),
+                    stmt.location().end_offset(),
+                    format!(
+                        "`{param}` is Rails.application here, not its config: this calls `Rails.application.{name}`"
+                    ),
+                );
+                return;
+            }
+        }
+        let Some(prefix) = config_receiver_path(&call.receiver(), app_param) else {
+            return;
+        };
+        let Some(args) = call.arguments() else { return };
+        let Some(value) = args.arguments().iter().next() else { return };
+        let loc = value.location();
+        let mut path = prefix;
+        path.push(base.to_string());
+        out.push(ConfigAssignment {
+            path,
+            value: src[loc.start_offset()..loc.end_offset()].to_string(),
+            start: stmt.location().start_offset(),
+            end: stmt.location().end_offset(),
+        });
+    });
     out
+}
+
+/// The statements Rails runs as application configuration, in source
+/// order: the top level of the file, the bodies of classes and modules
+/// (the Application class body), and the block of a `configure` call.
+/// Named containers only, not the whole expression tree, which is where
+/// every config reader in this file draws the line.
+///
+/// `f` gets each statement with the name the innermost enclosing
+/// `<x>.application.configure do |p|` binds to the APPLICATION: railties
+/// 8.1.4 `Railtie#configure` is `instance_eval(&block)` (railtie.rb:254),
+/// so its block parameter is the receiver itself, and `p.config` is the
+/// config. Any other `configure` (`Kaminari.configure do |config|`)
+/// binds nothing.
+fn walk_config_statements<'pr>(
+    stmts: Vec<ruby_prism::Node<'pr>>,
+    app_param: Option<&str>,
+    f: &mut dyn FnMut(&ruby_prism::Node<'pr>, Option<&str>),
+) {
+    for stmt in stmts {
+        if let Some(class) = stmt.as_class_node() {
+            walk_config_statements(
+                class.body().map(super::util::flatten_statements).unwrap_or_default(),
+                app_param,
+                f,
+            );
+            continue;
+        }
+        if let Some(module) = stmt.as_module_node() {
+            walk_config_statements(
+                module.body().map(super::util::flatten_statements).unwrap_or_default(),
+                app_param,
+                f,
+            );
+            continue;
+        }
+        // The third home, and the one Rails' own generator writes:
+        // `Rails.application.configure do … end`.
+        if let Some(call) = stmt.as_call_node() {
+            if super::util::constant_id_str(&call.name()) == "configure" {
+                if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                    if let Some(body) = block.body() {
+                        let on_application = call.receiver().is_some_and(|r| {
+                            r.as_call_node().is_some_and(|c| {
+                                super::util::constant_id_str(&c.name()) == "application"
+                                    && c.arguments().is_none()
+                            })
+                        });
+                        let param = on_application.then(|| first_block_param(&block)).flatten();
+                        walk_config_statements(
+                            super::util::flatten_statements(body),
+                            param.as_deref(),
+                            f,
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        f(&stmt, app_param);
+    }
+}
+
+/// The first required parameter of a block (`config` in `do |config|`).
+fn first_block_param(block: &ruby_prism::BlockNode<'_>) -> Option<String> {
+    let params = block.parameters()?;
+    let params = params.as_block_parameters_node()?.parameters()?;
+    let first = params.requireds().iter().next()?;
+    let param = first.as_required_parameter_node()?;
+    Some(super::util::constant_id_str(&param.name()).to_string())
+}
+
+/// Whether every top-level statement of `source` is a class or module
+/// definition: a file the IR carries whole once ingest registered its
+/// classes, with nothing else for loading it to run.
+fn declarations_only(source: &[u8]) -> bool {
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return false };
+    result.errors().next().is_none()
+        && program
+            .statements()
+            .body()
+            .iter()
+            .all(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
+}
+
+/// The top-level `require "name"` statements of an initializer that load
+/// a support file the emitted app already loads at boot: `name` resolves
+/// on the load path Rails gives the app (`lib/`, and each path gem's
+/// `lib/`) to a file in `loaded` ([`declarations_only`], every class
+/// registered). The emitted app requires every support class with the
+/// models (the `app/models` aggregator, before boot.rb applies the
+/// config readers), so the require is applied; what it would add is
+/// already there. A require of anything else stays a gap.
+fn require_of_loaded_support<V: Vfs + ?Sized>(
+    source: &[u8],
+    load_path: &[PathBuf],
+    loaded: &std::collections::HashSet<PathBuf>,
+    vfs: &V,
+) -> Vec<(usize, usize)> {
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if call.receiver().is_some() || super::util::constant_id_str(&call.name()) != "require" {
+            continue;
+        }
+        let Some(args) = call.arguments() else { continue };
+        let args: Vec<_> = args.arguments().iter().collect();
+        let [arg] = args.as_slice() else { continue };
+        let Some(name) = arg.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+        else {
+            continue;
+        };
+        let file = if name.ends_with(".rb") { name.clone() } else { format!("{name}.rb") };
+        let target = load_path.iter().map(|lib| lib.join(&file)).find(|p| vfs.exists(p));
+        if target.is_some_and(|t| loaded.contains(&t)) {
+            out.push((stmt.location().start_offset(), stmt.location().end_offset()));
+        }
+    }
+    out
+}
+
+/// One write to `config.filter_parameters`, as a statement on the list
+/// being built (`list += [:passw]`, `list = FilterParameterLogging
+/// .for_config`). `statement` holds a `nil` placeholder for each operand;
+/// `operands` are the authored operands ingested from the initializer
+/// itself, real spans and all, so they are analyzed (and diagnosed) as
+/// that file's app code where they land: the Application reopen.
+struct FilterParametersWrite {
+    statement: String,
+    operands: Vec<crate::expr::Expr>,
+    start: usize,
+    end: usize,
+}
+
+/// `config.filter_parameters` writes (railties 8.1.4
+/// `Rails::Application::Configuration#filter_parameters`, initially
+/// `[]`, configuration.rb:36): `config.filter_parameters = V`, `op= V`
+/// (`+=`, `-=`, `|=`), `<< x`, `.push(...)`, `.append(...)` and
+/// `.concat(...)`, in every place [`walk_config_statements`] reads
+/// config from, including `param.config.filter_parameters` inside
+/// `Rails.application.configure do |param|`. The operand is any
+/// expression: Rails evaluates app code there, and so does the emitted
+/// app, from the synthesized `filter_parameters`.
+///
+/// `Err` is a write recognized and refused, with the statement range and
+/// the reason, for what cannot run there as written:
+/// - `Rails.application.filter_parameters` / `param.filter_parameters`
+///   as the receiver: the application's PRIVATE method (railties 8.1.4
+///   application.rb:634-650), so the write raises NoMethodError in
+///   Rails (checked natively);
+/// - an operand that reads a local variable of the initializer (or the
+///   configure block's parameter): it does not exist in the method the
+///   operand moves into.
+fn extract_filter_parameters(
+    source: &[u8],
+    file: &str,
+) -> Vec<Result<FilterParametersWrite, (usize, usize, String)>> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let src = String::from_utf8_lossy(source).into_owned();
+    let stmts = root
+        .as_program_node()
+        .map(|p| p.statements().body().iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    walk_config_statements(stmts, None, &mut |stmt, app_param| {
+        let (start, end) = (stmt.location().start_offset(), stmt.location().end_offset());
+        let text = |n: &ruby_prism::Node<'_>| {
+            let loc = n.location();
+            src[loc.start_offset()..loc.end_offset()].to_string()
+        };
+        let anchored_config = |n: &ruby_prism::Node<'_>| {
+            config_path_in(n, 0, app_param).is_some_and(|path| path.is_empty())
+        };
+        // `Rails.application`, `<X>.application`, or the configure
+        // block's parameter.
+        let is_application = |n: &ruby_prism::Node<'_>| {
+            app_param.is_some_and(|p| {
+                n.as_local_variable_read_node()
+                    .is_some_and(|l| super::util::constant_id_str(&l.name()) == p)
+            }) || n.as_call_node().is_some_and(|c| {
+                super::util::constant_id_str(&c.name()) == "application"
+                    && c.arguments().is_none()
+                    && c.receiver().is_some()
+            })
+        };
+        // railties 8.1.4 application.rb:634-650: the application's own
+        // `filter_parameters` is private, so any explicit-receiver call
+        // to it raises.
+        let private_reader = |owner: &str| {
+            format!(
+                "`{owner}.filter_parameters` is private on the application: NoMethodError in Rails 8.1.4"
+            )
+        };
+        // The write, as a statement on `list`, unless an operand reads a
+        // local the method it moves into does not have.
+        let write = |statement: String, operands: &[ruby_prism::Node<'_>]| {
+            if let Some(local) = operands.iter().find_map(outer_local_read) {
+                return Err((
+                    start,
+                    end,
+                    format!("filter_parameters operand reads `{local}`, a local of the initializer"),
+                ));
+            }
+            let mut ingested = Vec::new();
+            for operand in operands {
+                match super::expr::ingest_expr(operand, file) {
+                    Ok(expr) => ingested.push(expr),
+                    Err(err) => {
+                        return Err((start, end, format!("filter_parameters operand does not ingest: {err}")));
+                    }
+                }
+            }
+            Ok(FilterParametersWrite { statement, operands: ingested, start, end })
+        };
+        if let Some(w) = stmt.as_call_operator_write_node() {
+            if super::util::constant_id_str(&w.read_name()) != "filter_parameters" {
+                return;
+            }
+            let Some(recv) = w.receiver() else { return };
+            if is_application(&recv) {
+                out.push(Err((start, end, private_reader(&text(&recv)))));
+                return;
+            }
+            if !anchored_config(&recv) {
+                return;
+            }
+            let op = super::util::constant_id_str(&w.binary_operator()).to_string();
+            out.push(write(format!("list {op}= nil"), &[w.value()]));
+            return;
+        }
+        let Some(call) = stmt.as_call_node() else { return };
+        let name = super::util::constant_id_str(&call.name()).to_string();
+        let Some(recv) = call.receiver() else { return };
+        let args: Vec<ruby_prism::Node<'_>> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if name == "filter_parameters=" {
+            if is_application(&recv) {
+                out.push(Err((start, end, private_reader(&text(&recv)))));
+                return;
+            }
+            if !anchored_config(&recv) || args.len() != 1 {
+                return;
+            }
+            out.push(write("list = nil".to_string(), &args));
+            return;
+        }
+        if !matches!(name.as_str(), "<<" | "push" | "append" | "concat") || call.block().is_some() {
+            return;
+        }
+        // The receiver is the list itself: `<config>.filter_parameters` or
+        // `<application>.filter_parameters`.
+        let Some(list) = recv.as_call_node() else { return };
+        if super::util::constant_id_str(&list.name()) != "filter_parameters"
+            || list.arguments().is_some()
+            || list.block().is_some()
+        {
+            return;
+        }
+        let Some(owner) = list.receiver() else { return };
+        if is_application(&owner) {
+            out.push(Err((start, end, private_reader(&text(&owner)))));
+            return;
+        }
+        if !anchored_config(&owner) {
+            return;
+        }
+        if args.is_empty() {
+            return;
+        }
+        let placeholders = vec!["nil"; args.len()].join(", ");
+        let statement = if name == "<<" {
+            format!("list << {placeholders}")
+        } else {
+            format!("list.{name}({placeholders})")
+        };
+        out.push(write(statement, &args));
+    });
+    out
+}
+
+/// Put the ingested operands into the synthesized `filter_parameters`
+/// skeleton (`list = []`, one statement per write with a `nil` per
+/// operand, `list`), in order.
+fn fill_filter_parameters(
+    methods: &mut [crate::dialect::MethodDef],
+    operands: Vec<crate::expr::Expr>,
+) -> Result<(), String> {
+    use crate::expr::ExprNode;
+    let [method] = methods else { return Err("not one method".into()) };
+    let ExprNode::Seq { exprs } = &mut *method.body.node else {
+        return Err("body is not a statement sequence".into());
+    };
+    let mut operands = operands.into_iter();
+    let count = exprs.len();
+    for stmt in exprs.iter_mut().take(count.saturating_sub(1)).skip(1) {
+        let slots: Vec<&mut crate::expr::Expr> = match &mut *stmt.node {
+            ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => vec![value],
+            ExprNode::Send { args, .. } => args.iter_mut().collect(),
+            _ => return Err("unexpected statement".into()),
+        };
+        for slot in slots {
+            *slot = operands.next().ok_or("too few operands")?;
+        }
+    }
+    match operands.next() {
+        None => Ok(()),
+        Some(_) => Err("too many operands".into()),
+    }
+}
+
+/// The first local variable `node` reads from OUTSIDE itself: a read
+/// whose scope depth reaches past every block and lambda opened inside
+/// `node` (a lambda's own parameters are depth 0 within it; the
+/// initializer's locals are one further out).
+fn outer_local_read(node: &ruby_prism::Node<'_>) -> Option<String> {
+    struct Outer {
+        nesting: u32,
+        found: Option<String>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Outer {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            if node.depth() >= self.nesting && self.found.is_none() {
+                self.found = Some(super::util::constant_id_str(&node.name()).to_string());
+            }
+        }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.nesting += 1;
+            ruby_prism::visit_block_node(self, node);
+            self.nesting -= 1;
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.nesting += 1;
+            ruby_prism::visit_lambda_node(self, node);
+            self.nesting -= 1;
+        }
+    }
+    let mut visitor = Outer { nesting: 0, found: None };
+    ruby_prism::Visit::visit(&mut visitor, node);
+    visitor.found
 }
 
 /// The receiver chain of a config assignment, as the segments BETWEEN
@@ -5982,8 +6675,11 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<(Vec<String>, St
 /// reads back the same way, as a plain method on `Rails::Application`.
 /// `config_reader` flattens the read side identically, so the two halves
 /// meet at the same name.
-fn config_receiver_path(recv: &Option<ruby_prism::Node<'_>>) -> Option<Vec<String>> {
-    let path = config_path_of(recv.as_ref()?, 0)?;
+fn config_receiver_path(
+    recv: &Option<ruby_prism::Node<'_>>,
+    app_param: Option<&str>,
+) -> Option<Vec<String>> {
+    let path = config_path_in(recv.as_ref()?, 0, app_param)?;
     // Only `config.<key>` and the `x` namespace. A deeper chain that is
     // NOT `x` is a framework subsection (`config.action_mailer.
     // delivery_method`, `config.active_record.*`), and lifting those
@@ -6002,19 +6698,34 @@ fn config_receiver_path(recv: &Option<ruby_prism::Node<'_>>) -> Option<Vec<Strin
 /// is a fresh owned node, so the walk borrows down the stack rather than
 /// reassigning a cursor. Depth-bounded; Rails' `x` namespace is
 /// arbitrarily deep in principle, two levels in practice.
-fn config_path_of(node: &ruby_prism::Node<'_>, depth: usize) -> Option<Vec<String>> {
+///
+/// Inside `<x>.application.configure do |app_param|`, `app_param.config`
+/// is the config too (see [`walk_config_statements`]).
+fn config_path_in(
+    node: &ruby_prism::Node<'_>,
+    depth: usize,
+    app_param: Option<&str>,
+) -> Option<Vec<String>> {
     if depth > 8 {
         return None;
     }
     let call = node.as_call_node()?;
     let name = super::util::constant_id_str(&call.name()).to_string();
     if name == "config" {
-        // Anchored: bare `config`, or `<recv>.application.config`.
+        // Anchored: bare `config`, `<recv>.application.config`, or the
+        // configure block's parameter's `.config`.
         let anchored = match call.receiver() {
             None => true,
-            Some(inner) => inner
-                .as_call_node()
-                .is_some_and(|c| super::util::constant_id_str(&c.name()) == "application"),
+            Some(inner) => {
+                inner
+                    .as_call_node()
+                    .is_some_and(|c| super::util::constant_id_str(&c.name()) == "application")
+                    || app_param.is_some_and(|p| {
+                        inner
+                            .as_local_variable_read_node()
+                            .is_some_and(|l| super::util::constant_id_str(&l.name()) == p)
+                    })
+            }
         };
         return anchored.then(Vec::new);
     }
@@ -6024,7 +6735,7 @@ fn config_path_of(node: &ruby_prism::Node<'_>, depth: usize) -> Option<Vec<Strin
         return None;
     }
     let inner = call.receiver()?;
-    let mut segments = config_path_of(&inner, depth + 1)?;
+    let mut segments = config_path_in(&inner, depth + 1, app_param)?;
     segments.push(name);
     Some(segments)
 }
@@ -6060,29 +6771,65 @@ fn extract_app_namespace(source: &[u8]) -> Option<String> {
     None
 }
 
-fn extract_session_cookie_key(source: &[u8]) -> Option<String> {
-    let source = String::from_utf8_lossy(source);
-    let mut seen_session_store = false;
+fn extract_session_cookie_key(bytes: &[u8], file: &str) -> Option<String> {
+    let source = String::from_utf8_lossy(bytes);
+    let mut seen_session_store: Option<usize> = None;
+    let mut found = None;
     for line in source.lines() {
         let t = line.trim_start();
         if t.starts_with('#') {
             continue;
         }
-        if !seen_session_store {
+        if seen_session_store.is_none() {
             if t.contains("config.session_store") {
-                seen_session_store = true;
+                seen_session_store = Some(line_offset(&source, t));
                 // `key:` may share the line with the declaration.
                 if let Some(key) = quoted_after_key_label(t) {
-                    return Some(key);
+                    found = Some(key);
+                    break;
                 }
             }
             continue;
         }
         if let Some(key) = quoted_after_key_label(t) {
-            return Some(key);
+            found = Some(key);
+            break;
         }
     }
-    None
+    // Consumed only when the key is ALL the declaration says:
+    // `session_store :cookie_store, key: "…"`. Any other option
+    // (`expire_after:`, `same_site:`, `domain:`) is session behavior the
+    // runtime does not apply, so the statement stays a reported gap.
+    if let (Some(key), Some(offset)) = (&found, seen_session_store) {
+        super::initializers::consume_statement_at(bytes, file, offset, |stmt, _| {
+            let Some(call) = stmt.as_call_node() else { return false };
+            if super::util::constant_id_str(&call.name()) != "session_store" {
+                return false;
+            }
+            let Some(args) = call.arguments() else { return false };
+            let args: Vec<_> = args.arguments().iter().collect();
+            let [store, options] = args.as_slice() else { return false };
+            if super::util::symbol_value(store).as_deref() != Some("cookie_store") {
+                return false;
+            }
+            let Some(hash) = options.as_keyword_hash_node() else { return false };
+            let pairs: Vec<_> = hash.elements().iter().collect();
+            let [pair] = pairs.as_slice() else { return false };
+            pair.as_assoc_node().is_some_and(|pair| {
+                super::util::symbol_value(&pair.key()).as_deref() == Some("key")
+                    && pair
+                        .value()
+                        .as_string_node()
+                        .is_some_and(|v| String::from_utf8_lossy(v.unescaped()) == key.as_str())
+            })
+        });
+    }
+    found
+}
+
+/// Byte offset of `part` (a slice borrowed from `whole`) within `whole`.
+fn line_offset(whole: &str, part: &str) -> usize {
+    (part.as_ptr() as usize).saturating_sub(whole.as_ptr() as usize)
 }
 
 /// The quoted value of a `key:` label in `text`, if it has one. Anchored
@@ -6115,8 +6862,8 @@ fn quoted_after_key_label(text: &str) -> Option<String> {
 /// (campfire breaks after the `-=`), so the scan continues to the
 /// closing bracket. Only the subtractive form: an app REPLACING the
 /// list (`= %w[…]`) is not read, and keeps Rails' default.
-fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<String> {
-    let source = String::from_utf8_lossy(source);
+fn extract_variable_content_type_exclusions(bytes: &[u8], file: &str) -> Vec<String> {
+    let source = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     let mut lines = source.lines();
     while let Some(line) = lines.next() {
@@ -6125,6 +6872,7 @@ fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<String> {
             continue;
         }
         let Some(idx) = t.find("active_storage.variable_content_types") else { continue };
+        let offset = line_offset(&source, t) + idx;
         let rest = t[idx + "active_storage.variable_content_types".len()..].trim_start();
         let Some(rest) = rest.strip_prefix("-=") else { continue };
         let mut text = rest.to_string();
@@ -6137,6 +6885,10 @@ fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<String> {
         let body = &text[open + 3..];
         let Some(close) = body.find(']') else { continue };
         out.extend(body[..close].split_whitespace().map(|s| s.to_string()));
+        super::initializers::consume_statement_at(bytes, file, offset, |stmt, src| {
+            let loc = stmt.location();
+            src[loc.start_offset()..loc.end_offset()].contains("variable_content_types")
+        });
     }
     out
 }
@@ -6147,8 +6899,17 @@ fn extract_variable_content_type_exclusions(source: &[u8]) -> Vec<String> {
 /// only the `true` arms are policy (`false` is libvips' default).
 /// Parens are optional (`Vips.block_untrusted true`); a `#` comment
 /// does not count. Named blocks accept double or single quotes.
-fn extract_vips_loader_policy(source: &[u8]) -> (bool, Vec<String>) {
-    let source = String::from_utf8_lossy(source);
+fn extract_vips_loader_policy(bytes: &[u8], file: &str) -> (bool, Vec<String>) {
+    let source = String::from_utf8_lossy(bytes);
+    // The applied calls (the `true` arms) are consumed: each is the
+    // innermost statement at its line, a `Vips.block*` call.
+    let consume_at = |offset: usize| {
+        super::initializers::consume_statement_at(bytes, file, offset, |stmt, _| {
+            stmt.as_call_node().is_some_and(|c| {
+                matches!(super::util::constant_id_str(&c.name()), "block_untrusted" | "block")
+            })
+        })
+    };
     let mut untrusted = false;
     let mut blocked = Vec::new();
     for line in source.lines() {
@@ -6160,6 +6921,7 @@ fn extract_vips_loader_policy(source: &[u8]) -> (bool, Vec<String>) {
             let arg = rest.trim().trim_start_matches('(').trim_end_matches(')').trim();
             if arg.starts_with("true") {
                 untrusted = true;
+                consume_at(line_offset(&source, t));
             }
             continue;
         }
@@ -6172,6 +6934,7 @@ fn extract_vips_loader_policy(source: &[u8]) -> (bool, Vec<String>) {
             let state = parts.next().unwrap_or("").trim();
             if !name.is_empty() && state == "true" {
                 blocked.push(name.to_string());
+                consume_at(line_offset(&source, t));
             }
         }
     }
@@ -6250,6 +7013,10 @@ fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
                         &src[loc.start_offset()..loc.end_offset()]
                     ),
                 });
+            } else {
+                // Only this assignment: the rest of the configure block
+                // (`max_per_page`, `window`, …) is not applied.
+                super::initializers::consume_node(file, &inner);
             }
             found = literal;
         }
@@ -6662,10 +7429,18 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
                     continue;
                 }
                 let Some(args) = call.arguments() else { continue };
+                let mut every_constant = true;
                 for arg in args.arguments().iter() {
                     if let Some(name) = constant_text(&arg, &src) {
                         modules.push(name.trim_start_matches("::").to_string());
+                    } else {
+                        every_constant = false;
                     }
+                }
+                // The routes ingest reads the extension's block methods
+                // as DSL scopes, which is what the prepend is for.
+                if every_constant {
+                    super::initializers::consume_node(&file, &stmt);
                 }
             }
         }

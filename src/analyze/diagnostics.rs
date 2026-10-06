@@ -52,6 +52,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(super::test_teardown::diagnose(app));
     out.extend(super::test_helper_connection::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
+    // Initializer statements Rails runs at boot that no ingest reader
+    // applies, in initializer load order.
+    out.extend(super::initializer_coverage::diagnose(app));
     out.extend(super::test_constants::diagnose(app));
     out.extend(super::test_harness_calls::diagnose(app));
     out.extend(super::test_assertion_jumps::diagnose(app));
@@ -350,6 +353,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             DiagnosticKind::UndefinedFilterTarget { .. } => Diagnostic::stub_text(kind),
             // Produced by `graphql::diagnose` as a returned list.
             DiagnosticKind::GraphqlNullableField { .. } => Diagnostic::stub_text(kind),
+            // Produced by `initializer_coverage::diagnose` as a returned list.
+            DiagnosticKind::InitializerUnsupported { .. } => Diagnostic::stub_text(kind),
         };
         out.push(Diagnostic {
             span: expr.span,

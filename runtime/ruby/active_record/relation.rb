@@ -483,7 +483,7 @@ module ActiveRecord
     # `page(n)`: page `n` at the app's default page size. A nil, blank,
     # non-numeric or non-positive `n` is page 1 (`to_i`).
     def page(num = nil)
-      per_page = Rails.application.default_per_page
+      per_page = Rails.application.pagination_default_per_page
       n = num.to_s.to_i
       n = 1 if n < 1
       limit(per_page)
@@ -1865,8 +1865,20 @@ module ActiveRecord
     # (as Rails does for hash conditions) so a condition survives `merge`
     # into a JOINed query where the bare name would be ambiguous —
     # `hidden_stories.user_id`, not `user_id`, after `joins(:hidings)`.
+    # Hash predicates name columns, not SQL expressions. Quote each component
+    # so PostgreSQL preserves case and reserved words; keep already quoted names.
+    def quote_column_path(path)
+      path.split(".").map do |part|
+        if part.start_with?('"') && part.end_with?('"')
+          part
+        else
+          '"' + part.gsub('"', '""') + '"'
+        end
+      end.join(".")
+    end
+
     def column_predicate(col, val)
-      qcol = col.include?(".") ? col : "#{@table}.#{col}"
+      qcol = col.include?(".") ? quote_column_path(col) : "#{@table}.#{quote_column_path(col)}"
       if val.is_a?(Relation)
         # A relation value is Rails' subquery form —
         # `where(story_id: Tagging.where(...).select(:story_id))` →

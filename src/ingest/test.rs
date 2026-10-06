@@ -134,6 +134,14 @@ fn ingest_test_class(
                 continue;
             }
             if let Some(body) = ingest_setup_declaration(&stmt, file)? {
+                // A method's super/return belongs to setup, not to whichever
+                // test happens to run next. Keep it distinct from callbacks.
+                if let Some(def) = stmt.as_def_node() {
+                    let method = ingest_library_method(&def, &name, file)?;
+                    helpers.retain(|m| m.name.as_str() != "setup");
+                    helpers.push(method);
+                    continue;
+                }
                 // Multiple setup hooks compose in source order — append
                 // by wrapping in a Seq. Rare in practice; first wins
                 // when stored as Option, so accumulate.
@@ -164,7 +172,7 @@ fn ingest_test_class(
                 inner_classes.push(lc);
                 continue;
             }
-            // Non-test, non-setup `def` — instance helper method
+            // Other non-test `def` — instance helper method
             // (e.g. `setup_adapter_with_stub_row(id)`). Capture as
             // an ordinary method on the test class so test bodies
             // can `self.<helper>(...)` it. Definitions of `def

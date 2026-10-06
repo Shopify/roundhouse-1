@@ -50,6 +50,7 @@ pub mod sequel_model;
 pub mod sorbet_sig;
 pub mod sources;
 pub mod type_ascription;
+pub mod initializers;
 pub mod sql_functions;
 pub mod structure_sql;
 pub mod survey;
