@@ -153,6 +153,20 @@ pub struct Analyzer {
     /// at the recursion point (see `recursion`), which is what lets the
     /// fixpoint settle on recursive data shapes.
     recursive_methods: std::collections::HashSet<(ClassId, bool, Symbol)>,
+    /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
+    /// settle; see [`Self::fixpoint_rounds`].
+    fixpoint_rounds: FixpointRounds,
+}
+
+/// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
+/// before its signature stopped moving — `None` when it hit the cap
+/// still moving. `absorb` is `Some(0)` when view unification moved no
+/// production signature and the absorb loop never ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixpointRounds {
+    pub production: Option<usize>,
+    pub tests: Option<usize>,
+    pub absorb: Option<usize>,
 }
 
 /// Snapshot of the data the fixpoint refines: per-class instance/class
@@ -965,6 +979,7 @@ impl Analyzer {
             typed_constants: IdentityHashMap::default(),
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
+            fixpoint_rounds: FixpointRounds::default(),
         }
     }
 
@@ -994,6 +1009,11 @@ impl Analyzer {
     /// site contributed. Read-only companion to [`Self::class_registry`]
     /// for consumers assembling full candidate signatures (the gap
     /// footers' pre-filled RBS).
+    /// Rounds the last [`Self::analyze`]'s fixpoint loops took.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
+    }
+
     pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
     }
@@ -1120,6 +1140,7 @@ impl Analyzer {
                 fixpoint_debug::report(&format!("production round {round}"), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
+                self.fixpoint_rounds.production = Some(round + 1);
                 break;
             }
             prev_sig = self.capture_inference_sig();
@@ -1200,6 +1221,7 @@ impl Analyzer {
                 fixpoint_debug::report(&format!("test round {round}"), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
+                self.fixpoint_rounds.tests = Some(round + 1);
                 break;
             }
             prev_sig = self.capture_inference_sig();
@@ -1238,11 +1260,13 @@ impl Analyzer {
                     fixpoint_debug::report(&format!("absorb round {round}"), &absorb_sig, &self.capture_inference_sig());
                 }
                 if self.inference_matches(&absorb_sig) {
+                    self.fixpoint_rounds.absorb = Some(round + 1);
                     break;
                 }
                 absorb_sig = self.capture_inference_sig();
             }
         } else {
+            self.fixpoint_rounds.absorb = Some(0);
             // View unify did not move production signatures, but helper
             // *bodies* still need a pass against view-inferred params
             // (`highlight_searched_content`'s `content` is only called
