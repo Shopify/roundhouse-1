@@ -48,6 +48,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(super::enum_raw_input::diagnose(app));
     out.extend(super::presence_not_null::diagnose(app));
     out.extend(super::fixture_entries::diagnose(app));
+    out.extend(super::test_teardown::diagnose(app));
     out.extend(super::database_identity::diagnose(app));
     // Rubydex's unresolved constants emit refusal stubs. Collect those
     // annotations from support methods/defaults/constants as well, so
