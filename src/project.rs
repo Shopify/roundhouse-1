@@ -5183,6 +5183,7 @@ const GEM_REQUIRES: &[&str] = &[
     "web-push",
     "statsd-instrument",
     "drb",
+    "ostruct",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5477,7 +5478,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 18] = [
+    const RUNTIME_GEMS: [(Marker, &str); 19] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -5573,6 +5574,11 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // runtime dependencies are none: no Rails in its load closure.
         (Marker::Constant("DRb"), "drb"),
         (Marker::Constant("DRbObject"), "drb"),
+        // OpenStruct, a bundled gem since Ruby 4.0 (Core runs 4.0 and
+        // locks ostruct 0.6.3). Core's test support builds GraphQL
+        // mock payloads from it. It defines OpenStruct and patches no
+        // other library, so requiring it at boot changes nothing else.
+        (Marker::Constant("OpenStruct"), "ostruct"),
     ];
     &RUNTIME_GEMS
 }
