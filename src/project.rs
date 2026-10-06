@@ -3810,7 +3810,8 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         // Named by its path: the check leaves it unresolved, which a test
         // body's `rescue` or `assert_raises` does not report.
         if let crate::expr::ExprNode::Const { path } = &*expr.node {
-            if path.iter().map(|s| s.as_str()).eq(["ActiveRecord", "InvalidForeignKey"])
+            // `::ActiveRecord::…` ingests with a leading empty segment.
+            if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveRecord", "InvalidForeignKey"])
                 && !app.library_classes.iter().any(|class| class.name.0.as_str() == "ActiveRecord::InvalidForeignKey")
             {
                 emit::diagnostics::report_unsupported(

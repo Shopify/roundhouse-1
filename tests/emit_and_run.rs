@@ -7090,10 +7090,13 @@ fn the_sqlite3_statement_errors_are_refused_off_cruby() {
 /// rescue of it is refused rather than left as a clause that never runs.
 #[test]
 fn a_rescue_of_invalid_foreign_key_is_refused() {
-    let (_, errors) = adapter_app()
-        .write("test/foreign_key_test.rb", "require \"test_helper\"\n\nclass ForeignKeyTest < ActiveSupport::TestCase\n  test \"x\" do\n    begin\n      ActiveRecord::Base.connection.execute(\"SELECT 1\")\n    rescue ActiveRecord::InvalidForeignKey\n      flunk\n    end\n    assert true\n  end\nend\n")
-        .emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(errors.iter().any(|e| e.contains("`ActiveRecord::InvalidForeignKey` is never raised")), "{errors:?}");
+    for name in ["ActiveRecord::InvalidForeignKey", "::ActiveRecord::InvalidForeignKey"] {
+        let test = format!("require \"test_helper\"\n\nclass ForeignKeyTest < ActiveSupport::TestCase\n  test \"x\" do\n    begin\n      ActiveRecord::Base.connection.execute(\"SELECT 1\")\n    rescue {name}\n      flunk\n    end\n    assert true\n  end\nend\n");
+        let (_, errors) = adapter_app()
+            .write("test/foreign_key_test.rb", &test)
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(errors.iter().any(|e| e.contains("`ActiveRecord::InvalidForeignKey` is never raised")), "{name}: {errors:?}");
+    }
 }
 /// The test helper's own connection setup is not carried: the emitted
 /// harness opens one SQLite file database per test file. Each
