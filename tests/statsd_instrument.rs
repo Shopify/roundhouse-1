@@ -48,8 +48,9 @@ end
 "#;
 
 /// A gem nothing in any emitted tree loads. It also reopens the
-/// framework's `ActiveRecord`, as activemodel-serializers-xml does.
-const ZORK_RBI: &str = "# typed: true\nmodule Zork\n  class Widget\n    def label; end\n  end\nend\n\nmodule ActiveRecord\n  def self.zork_mode; end\n  module ZorkExtension\n    def zork; end\n  end\nend\n";
+/// framework's `ActiveRecord`, as activemodel-serializers-xml does, and
+/// the stdlib's `OpenSSL::PKey::RSA`, as json-jwt does.
+const ZORK_RBI: &str = "# typed: true\nmodule Zork\n  class Widget\n    def label; end\n  end\nend\n\nmodule ActiveRecord\n  def self.zork_mode; end\n  module ZorkExtension\n    def zork; end\n  end\nend\n\nclass OpenSSL::PKey::RSA\n  def to_zork; end\nend\n";
 
 fn statsd_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -155,4 +156,15 @@ fn a_framework_namespace_a_gem_reopens_is_not_the_gems() {
         errors.iter().any(|e| e.contains("ActiveRecord::ZorkExtension is declared by the zork gem")),
         "{errors:#?}"
     );
+}
+
+/// A stdlib class a gem's RBI patches (json-jwt's `OpenSSL::PKey::RSA`)
+/// is the stdlib's: loading the gem would not load it, so it is not
+/// refused as the gem's.
+#[test]
+fn a_stdlib_class_a_gem_reopens_is_not_the_gems() {
+    let (_, errors) = statsd_app()
+        .write("lib/keys.rb", "class Keys\n  def rsa\n    OpenSSL::PKey::RSA\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("is declared by the zork gem")), "{errors:#?}");
 }

@@ -39,6 +39,18 @@ const RUBY_CORE: &[&str] = &[
     "BigDecimal", "Pathname", "StringIO", "URI", "JSON", "Logger", "Singleton", "Forwardable",
 ];
 
+/// Ruby's standard-library namespaces that a gem's RBI reopens (json-jwt
+/// patches `OpenSSL::PKey::RSA`). The name is the stdlib's, not the
+/// gem's, and loading the gem would not make the stdlib part load, so
+/// none of them are registered: such a constant is unknown, like every
+/// other stdlib constant the analysis does not model.
+const RUBY_STDLIB: &[&str] = &[
+    "OpenSSL", "Net", "Digest", "Socket", "Zlib", "Psych", "YAML", "ERB", "CGI", "Base64",
+    "SecureRandom", "Open3", "Timeout", "Tempfile", "FileUtils", "DRb", "Benchmark", "Coverage",
+    "Etc", "Find", "Shellwords", "OptionParser", "IPAddr", "Resolv", "PP", "Ripper", "Monitor",
+    "WeakRef", "Gem", "Bundler", "Prism", "Errno",
+];
+
 /// Mixins that add no callable surface a caller could miss: sorbet's
 /// own `extend T::Sig`, and the ActiveSupport::Concern marker.
 fn is_marker(name: &str) -> bool {
@@ -51,13 +63,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
     }
     let declared = &app.gem_boundary.classes;
 
-    // Which declarations become classes: not core, not already known.
+    // Which declarations become classes: not core or stdlib, not already
+    // known.
     let fresh: HashSet<&ClassId> = declared
         .keys()
         .filter(|id| {
             let name = id.0.as_str();
             let top = name.split("::").next().unwrap_or(name);
-            !RUBY_CORE.contains(&top) && !classes.contains_key(*id)
+            !RUBY_CORE.contains(&top) && !RUBY_STDLIB.contains(&top) && !classes.contains_key(*id)
         })
         .collect();
 
