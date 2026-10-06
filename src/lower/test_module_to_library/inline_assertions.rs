@@ -30,6 +30,17 @@
 //!   - `assert_predicate o, :sym`       → `raise "…" if !o.sym` (sym from Symbol literal)
 //!   - `assert_difference("X.m"[, d]) { body }` → before/after capture
 //!   - `assert_no_difference("X.m") { body }`   → same, delta 0
+//!   (on the right of an assignment, `v = assert_difference(…) { … }`
+//!   and `a, b = …`, the lowering is one `begin … end` answering the
+//!   block's value, as ActiveSupport's does)
+//!
+//! A name the test class (or a test class it inherits from) defines as
+//! an instance method is not rewritten: the call reaches that method.
+//! Such an override calling `super` is refused in analysis
+//! (`analyze::test_harness_calls`), since no emitted test defines the
+//! assertion it would reach. Assertions are rewritten where they are
+//! written, including inside the block on the right of `out, err =
+//! capture_io do … end`.
 //!
 //! Assertions that depend on shared dispatch state (`assert_response`,
 //! `assert_select`, `assert_redirected_to`) stay as method calls;
@@ -87,17 +98,72 @@ fn walk_inline(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
         return changed;
     }
     let mut changed = false;
+    // The right of an assignment (`v = …`, `a, b = …`): an
+    // `assert_difference` there answers its block's value, so it is
+    // lowered to one expression and held out of the walk below, which
+    // still visits the targets.
+    let mut lowered_value: Option<Expr> = None;
+    if let ExprNode::Assign { value, .. } | ExprNode::MultiAssign { value, .. } = &mut *e.node {
+        if let Some(lowered) = difference_value(value, own) {
+            let span = value.span;
+            *value = Expr::new(span, ExprNode::SelfRef);
+            lowered_value = Some(lowered);
+            changed = true;
+        }
+    }
     e.node.for_each_child_mut(&mut |c| {
         if walk_inline(c, own) {
             changed = true;
         }
     });
+    if let Some(lowered) = lowered_value {
+        if let ExprNode::Assign { value, .. } | ExprNode::MultiAssign { value, .. } = &mut *e.node {
+            *value = lowered;
+        }
+    }
     if let Some(replacement) = rewrite_send(e, own) {
         *e = replacement;
         return true;
     }
     changed
 }
+
+/// The right of an assignment. `assert_difference` answers its block's
+/// value (ActiveSupport's contract), so here it is lowered to an
+/// expression ending on that value; in statement position its lowering
+/// splices into the surrounding statements, where an assignment would
+/// bind only the first of them. Its arguments and block are inlined
+/// first, as everywhere else.
+fn difference_value(value: &mut Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
+    let ExprNode::Send { recv, method, args, block, .. } = &mut *value.node else {
+        return None;
+    };
+    let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+    if !on_self || !matches!(method.as_str(), "assert_difference" | "assert_no_difference") || own(method.as_str()) {
+        return None;
+    }
+    for a in args.iter_mut() {
+        walk_inline(a, own);
+    }
+    if let Some(b) = block.as_mut() {
+        walk_inline(b, own);
+    }
+    lower_difference_value(value.span, method.as_str(), args, block.as_ref())
+}
+
+/// Every assertion `rewrite_send` lowers at its call site. Nothing that
+/// emits a test defines these as methods, so a test class's own
+/// override that calls `super` has nothing to reach
+/// (`analyze::test_harness_calls`).
+pub(crate) const LOWERED: &[&str] = &[
+    "assert_equal", "assert_operator", "refute_equal", "assert_not_equal", "assert",
+    "assert_not", "refute", "assert_nil", "assert_not_nil", "refute_nil", "assert_empty",
+    "assert_not_empty", "refute_empty", "assert_includes", "refute_includes",
+    "assert_not_includes", "assert_kind_of", "assert_same", "assert_not_same", "refute_same",
+    "assert_instance_of", "assert_match", "assert_no_match", "assert_predicate",
+    "refute_predicate", "assert_raises", "assert_raise", "assert_throws",
+    "assert_difference", "assert_no_difference",
+];
 
 /// Rewrite a bare-receiver `assert_*`/`refute_*` Send into an inline
 /// raise expression. Returns None for non-assertion Sends so the
@@ -116,7 +182,7 @@ fn rewrite_send(e: &Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr> {
         Some(r) if matches!(&*r.node, ExprNode::SelfRef) => {}
         _ => return None,
     }
-    if own(method.as_str()) {
+    if own(method.as_str()) || !LOWERED.contains(&method.as_str()) {
         return None;
     }
     let span = e.span;
@@ -584,6 +650,72 @@ fn lower_difference(
     args: &[Expr],
     block: Option<&Expr>,
 ) -> Option<Expr> {
+    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block)?;
+    // Inline block body — flatten if it's already a Seq so the
+    // outer Seq stays single-level.
+    let mut stmts: Vec<Expr> = vec![before_assign];
+    match &*block_body.node {
+        ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
+        _ => stmts.push(block_body.clone()),
+    }
+    stmts.push(after_assign);
+    stmts.push(check);
+    Some(Expr::new(span, ExprNode::Seq { exprs: stmts }))
+}
+
+/// `v = assert_difference("X.m") { body }` → one `begin … end` of
+///   __diff_before = X.m
+///   __diff_value = begin <block body> end
+///   __diff_after = X.m
+///   raise "…" if __diff_after - __diff_before != delta
+///   __diff_value
+/// wrapped like `lower_assert_raises`, so the assignment binds the
+/// block's value and every statement stays inside the right-hand side.
+fn lower_difference_value(
+    span: Span,
+    method: &str,
+    args: &[Expr],
+    block: Option<&Expr>,
+) -> Option<Expr> {
+    let (before_assign, block_body, after_assign, check) = difference_parts(span, method, args, block)?;
+    let value_name = Symbol::from("__diff_value");
+    let block_value = match &*block_body.node {
+        ExprNode::Seq { .. } => Expr::new(
+            span,
+            ExprNode::BeginRescue { body: block_body, rescues: vec![], else_branch: None, ensure: None, implicit: false },
+        ),
+        _ => block_body,
+    };
+    let capture = Expr::new(
+        span,
+        ExprNode::Assign { target: LValue::Var { id: VarId(0), name: value_name.clone() }, value: block_value },
+    );
+    let body = Expr::new(
+        span,
+        ExprNode::Seq {
+            exprs: vec![
+                before_assign,
+                capture,
+                after_assign,
+                check,
+                Expr::new(span, ExprNode::Var { id: VarId(0), name: value_name }),
+            ],
+        },
+    );
+    Some(Expr::new(
+        span,
+        ExprNode::BeginRescue { body, rescues: vec![], else_branch: None, ensure: None, implicit: false },
+    ))
+}
+
+/// The before-capture, block body, after-capture and mismatch check
+/// both forms of `assert_difference` are built from.
+fn difference_parts(
+    span: Span,
+    method: &str,
+    args: &[Expr],
+    block: Option<&Expr>,
+) -> Option<(Expr, Expr, Expr, Expr)> {
     if args.is_empty() {
         return None;
     }
@@ -639,17 +771,7 @@ fn lower_difference(
     );
     let msg = format!("{} didn't change by {}", expr_str, delta);
     let check = raise_if(span, mismatch, msg);
-
-    // Inline block body — flatten if it's already a Seq so the
-    // outer Seq stays single-level.
-    let mut stmts: Vec<Expr> = vec![before_assign];
-    match &*block_body.node {
-        ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
-        _ => stmts.push(block_body.clone()),
-    }
-    stmts.push(after_assign);
-    stmts.push(check);
-    Some(Expr::new(span, ExprNode::Seq { exprs: stmts }))
+    Some((before_assign, block_body, after_assign, check))
 }
 
 /// Parse a String literal of the form `"<Const>.<method>"` into an

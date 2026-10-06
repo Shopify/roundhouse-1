@@ -4,8 +4,15 @@
 //! checked clean and the emitted test failed with `NoMethodError`
 //! wherever the harness does not define it. `project` refuses each call
 //! on a target whose emitted harness does not declare the method.
+//!
+//! The assertions the inliner lowers are the other side of it: emitted
+//! tests carry them inline at each call, never as methods, so a test
+//! class's own override that calls `super` reaches nothing.
 
+use crate::diagnostic::Diagnostic;
+use crate::dialect::MethodReceiver;
 use crate::expr::{Expr, ExprNode};
+use crate::lower::test_module_to_library::inline_assertions::LOWERED;
 use crate::span::Span;
 use crate::App;
 
@@ -85,6 +92,39 @@ pub(crate) fn harness_calls(app: &App) -> Vec<(Span, &'static str)> {
         }
         for test in &module.tests {
             collect(&test.body, &wanted, &mut out);
+        }
+    }
+    out
+}
+
+fn supers(expr: &Expr, out: &mut Vec<Span>) {
+    if matches!(&*expr.node, ExprNode::Super { .. }) {
+        out.push(expr.span);
+    }
+    expr.node.for_each_child(&mut |child| supers(child, out));
+}
+
+/// Each `super` in a test class's own instance method named for an
+/// assertion the inliner lowers: natively it reaches Minitest's, which
+/// no emitted test defines.
+pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for module in &app.test_modules {
+        for method in &module.helpers {
+            let name = method.name.as_str();
+            if method.receiver != MethodReceiver::Instance || !LOWERED.contains(&name) {
+                continue;
+            }
+            let mut spans = Vec::new();
+            supers(&method.body, &mut spans);
+            out.extend(spans.into_iter().map(|span| {
+                Diagnostic::unsupported(
+                    span,
+                    None,
+                    "assertion_super",
+                    format!("`super` from {}#{name} reaches Minitest's {name}, which emitted tests inline at each call rather than define", module.name.0.as_str()),
+                )
+            }));
         }
     }
     out
