@@ -1365,6 +1365,7 @@ end
     .into_iter()
     .map(PathBuf::from)
     .collect();
+    let extra_test_paths = additional_test_paths.clone();
     test_roots.extend(additional_test_paths);
     test_roots.sort();
     test_roots.dedup();
@@ -1405,7 +1406,8 @@ end
                 app.test_helper_connections = calls;
             }
             if !app.test_helper_connections.is_empty() {
-                app.test_helper_connection_blockers = helper_connection_blockers(vfs, dir, &helper_rb, &source)?;
+                app.test_helper_connection_blockers =
+                    helper_connection_blockers(vfs, dir, &helper_rb, &source, &extra_test_paths)?;
             }
             if let Some(tms) =
                 unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
@@ -4340,13 +4342,15 @@ fn path_has_symlink_component<V: Vfs + ?Sized>(vfs: &V, root: &Path, path: &Path
 /// `App::test_helper_connection_blockers`: the helper's own (see
 /// `ingest::test::helper_connection_blockers`; a `require` is local when
 /// the app has the file under `test/` or `lib/`), then every other Ruby
-/// file under `app/`, `lib/`, `config/` and `test/` that makes an
-/// `establish_connection` of its own.
+/// file under `app/`, `lib/`, `config/`, `test/` and the extra test
+/// paths (`ingest::test::connection_blockers`), and every ERB template
+/// there that names a connecting call at all.
 fn helper_connection_blockers<V: Vfs + ?Sized>(
     vfs: &V,
     dir: &Path,
     helper_rb: &Path,
     helper: &[u8],
+    test_paths: &[PathBuf],
 ) -> IngestResult<Vec<String>> {
     let shown = |path: &Path| path.strip_prefix(dir).unwrap_or(path).display().to_string();
     let local = |feature: &str| {
@@ -4354,21 +4358,47 @@ fn helper_connection_blockers<V: Vfs + ?Sized>(
     };
     let mut blockers = super::test::helper_connection_blockers(helper, &shown(helper_rb), &local);
     let mut files = Vec::new();
-    for root in ["app", "lib", "config", "test"] {
+    let roots = ["app", "lib", "config", "test"].into_iter().map(PathBuf::from).chain(test_paths.iter().cloned());
+    for root in roots {
         let root = dir.join(root);
         if !path_has_symlink_component(vfs, dir, &root) && vfs.is_dir(&root) {
-            files.extend(read_test_rb_files(vfs, dir, &root)?);
+            collect_files(vfs, dir, &root, &mut files)?;
         }
     }
     files.sort();
     files.dedup();
     for file in files.iter().filter(|f| *f != helper_rb) {
-        let Some(source) = read_or_ledger(vfs, file)? else { continue };
-        if super::test::connection_calls(&source) > 0 {
-            blockers.push(format!("{}: another `establish_connection` the harness does not carry", shown(file)));
+        match file.extension().and_then(|e| e.to_str()) {
+            Some("rb") => {
+                let Some(source) = read_or_ledger(vfs, file)? else { continue };
+                blockers.extend(super::test::connection_blockers(&source, &shown(file)));
+            }
+            Some("erb") => {
+                let Some(source) = read_or_ledger(vfs, file)? else { continue };
+                let text = String::from_utf8_lossy(&source);
+                if ["establish_connection", "connects_to", "remove_connection"].iter().any(|m| text.contains(m)) {
+                    blockers.push(format!("{}: a template names a connecting call", shown(file)));
+                }
+            }
+            _ => {}
         }
     }
     Ok(blockers)
+}
+
+/// Every file under `dir`, recursively, skipping symlinked paths.
+fn collect_files<V: Vfs + ?Sized>(vfs: &V, app_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> IngestResult<()> {
+    for entry in vfs.read_dir(dir)? {
+        if path_has_symlink_component(vfs, app_root, &entry) {
+            continue;
+        }
+        if vfs.is_dir(&entry) {
+            collect_files(vfs, app_root, &entry, out)?;
+        } else {
+            out.push(entry);
+        }
+    }
+    Ok(())
 }
 
 fn read_test_rb_files<V: Vfs + ?Sized>(
