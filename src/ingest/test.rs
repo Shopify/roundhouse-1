@@ -224,6 +224,7 @@ fn ingest_test_class(
     // test's `teardown` after each test the same way, so the blocks
     // become that method.
     let teardown_blocks = !teardowns.is_empty();
+    let teardown_def = helpers.iter().any(|m| m.name.as_str() == "teardown");
     if teardown_blocks {
         let mut exprs: Vec<Expr> = Vec::new();
         let own = helpers.iter().position(|m| m.name.as_str() == "teardown");
@@ -282,6 +283,7 @@ fn ingest_test_class(
         inner_classes,
         helpers,
         teardown_blocks,
+        teardown_def,
         constants,
         includes,
     })
@@ -302,6 +304,15 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
         if class.superclass().is_some() {
             continue;
         }
+        let mut path = scope;
+        path.extend(class_name_path(&class).unwrap_or_default());
+        // Only the framework's test cases: a helper's own class may
+        // define `teardown` for its own reasons.
+        let framework = path.first().is_some_and(|ns| ns.starts_with("Active") || ns.starts_with("Action"));
+        let test_case = path.last().is_some_and(|n| n.ends_with("TestCase") || n.ends_with("IntegrationTest"));
+        if !(framework && test_case) {
+            continue;
+        }
         let Some(body) = class.body() else { continue };
         let declares = flatten_statements(body).iter().any(|stmt| {
             let call = stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "teardown");
@@ -309,8 +320,6 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
             call || def
         });
         if declares {
-            let mut path = scope;
-            path.extend(class_name_path(&class).unwrap_or_default());
             out.push(path.join("::"));
         }
     }

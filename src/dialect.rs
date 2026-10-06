@@ -1732,6 +1732,11 @@ pub struct TestModule {
     /// a `def teardown`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub teardown_blocks: bool,
+    /// The `teardown` helper includes the class's own `def teardown`.
+    /// Rails' method chain runs only defs; a blocks-only class has none
+    /// of its own, so the nearest base def still runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub teardown_def: bool,
     /// Class-body constant assignments — `TABLE = [...]`, `SCHEMA =
     /// {...}` declared at test-class scope. Lifted to file-scope
     /// `const NAME = <value>` declarations during emit so test methods
