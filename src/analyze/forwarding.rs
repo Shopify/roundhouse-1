@@ -175,10 +175,11 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
         }
     }
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(&selectors, None, e, &mut out));
-    // `delegate` writes a zero-arg forwarder; the library-class pass
-    // leaves such a declaration in `unknown_calls`, and a controller's
-    // stays a body item, so refuse it here by name.
-    let delegations = app.library_classes.iter().flat_map(|c| c.unknown_calls.iter()).chain(
+    // `delegate` writes a zero-arg forwarder, or none (a string name, a
+    // test class); the library-class pass leaves such a declaration in
+    // `unknown_calls`, and a controller's stays a body item, so refuse
+    // it here by name. `delegate_missing_to` names no method at all.
+    let delegations = classes(app).flat_map(|c| c.unknown_calls.iter()).chain(
         app.controllers.iter().flat_map(|c| c.body.iter()).filter_map(|item| match item {
             crate::dialect::ControllerBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
@@ -186,16 +187,21 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
     );
     for call in delegations {
         if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
-            && method.as_str() == "delegate"
-            && args.iter().any(|a| {
-                matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if selectors.contains(value))
-            })
+            && (method.as_str() == "delegate_missing_to"
+                || method.as_str() == "delegate"
+                    && args.iter().any(|a| match &*a.node {
+                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => selectors.contains(value),
+                        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
+                            selectors.iter().any(|s| s.as_str() == value)
+                        }
+                        _ => false,
+                    }))
         {
             out.push(Diagnostic::unsupported(
                 call.span,
                 None,
                 "delegate to an anonymous positional rest",
-                "the generated forwarder takes no arguments",
+                "no forwarder is written with the rest's arity",
             ));
         }
     }
