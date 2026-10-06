@@ -15,9 +15,14 @@
 //!
 //! Everything else is an error: another adapter or database, an option
 //! the check cannot read or the harness does not model, a call made
-//! under a condition or in a method, more than one call, and an app
-//! whose schema the harness would load into a database the helper
-//! leaves empty.
+//! under a condition or in a method, more than one call, an app whose
+//! schema the harness would load into a database the helper leaves
+//! empty, and anything else that could set or change the database the
+//! harness does not carry (`App::test_helper_connection_blockers`: the
+//! helper's own schema or statements, a local file it loads, an exit
+//! before its connection, another `establish_connection` in the app).
+//! That last guard is conservative: a statement in a `setup` the
+//! harness does carry is refused too.
 
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -73,6 +78,10 @@ fn refusal(app: &App) -> Option<String> {
     let Some(options) = options(&connection.call) else {
         return Some("its options are not a hash the check can read".to_string());
     };
+    // Ruby keeps a repeated key's last value.
+    if let Some((key, _)) = options.iter().enumerate().find(|(i, (k, _))| options[..*i].iter().any(|(j, _)| j == k)).map(|(_, o)| o) {
+        return Some(format!("option `{key}` is given twice"));
+    }
     if let Some((key, _)) = options.iter().find(|(k, _)| k != "adapter" && k != "database") {
         return Some(format!("option `{key}` is not modeled"));
     }
@@ -93,6 +102,12 @@ fn refusal(app: &App) -> Option<String> {
              leaves empty"
                 .to_string(),
         );
+    }
+    if !app.test_helper_connection_blockers.is_empty() {
+        return Some(format!(
+            "the harness does not carry what else could set or change its database ({})",
+            app.test_helper_connection_blockers.join("; ")
+        ));
     }
     None
 }

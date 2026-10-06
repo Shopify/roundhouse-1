@@ -7099,17 +7099,15 @@ fn a_rescue_of_invalid_foreign_key_is_refused() {
     }
 }
 /// The test helper's own `establish_connection`: the diagnostics the
-/// check gives it, from a helper and (optionally) a schema.
-fn helper_connection_diagnostics_with(helper: &str, schema: Option<&str>) -> Vec<roundhouse::diagnostic::Diagnostic> {
+/// check gives it, from a helper and other files of the app.
+fn helper_connection_diagnostics_in(helper: &str, files: &[(&str, &str)]) -> Vec<roundhouse::diagnostic::Diagnostic> {
     let mut tree = vec![
         ("app/.keep", "".to_string()),
         ("roundhouse.yml", "test_paths:\n  - test\n".to_string()),
         ("test/test_helper.rb", helper.to_string()),
         ("test/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n".to_string()),
     ];
-    if let Some(schema) = schema {
-        tree.push(("db/schema.rb", schema.to_string()));
-    }
+    tree.extend(files.iter().map(|(path, content)| (*path, content.to_string())));
     let tree = tree.into_iter().map(|(p, c)| (std::path::PathBuf::from(p), c.into_bytes())).collect();
     let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
     let lower = roundhouse::session::analyze_and_lower(&mut app);
@@ -7117,7 +7115,7 @@ fn helper_connection_diagnostics_with(helper: &str, schema: Option<&str>) -> Vec
 }
 
 fn helper_connection_diagnostics(helper: &str) -> Vec<roundhouse::diagnostic::Diagnostic> {
-    helper_connection_diagnostics_with(helper, None)
+    helper_connection_diagnostics_in(helper, &[])
 }
 
 const MEMORY_HELPER: &str = "require \"active_record\"\n\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n";
@@ -7161,15 +7159,84 @@ fn a_helper_connection_the_harness_cannot_open_is_refused() {
     );
     assert!(diags[0].message.contains("option `timeout` is not modeled"), "{}", diags[0].message);
     // The helper's database starts empty; the harness's schema load would fill it.
-    let diags = helper_connection_diagnostics_with(
+    let diags = helper_connection_diagnostics_in(
         MEMORY_HELPER,
-        Some("ActiveRecord::Schema.define do\n  create_table \"things\" do |t|\n    t.string \"name\"\n  end\nend\n"),
+        &[("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table \"things\" do |t|\n    t.string \"name\"\n  end\nend\n")],
     );
     assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error && d.message.contains("schema")), "{diags:?}");
 }
 
+/// Whatever else could set or change the database the honored
+/// connection names, and the harness does not carry, refuses it: the
+/// helper's own schema and statements, a local file it loads, an exit
+/// before its connection, a repeated option, another
+/// `establish_connection` anywhere in the app.
+#[test]
+fn a_helper_memory_connection_is_refused_beside_what_the_harness_does_not_carry() {
+    let postgres = "ActiveRecord::Base.establish_connection(adapter: \"postgresql\", database: \"core_test\")\n";
+    let cases: Vec<(String, Vec<(&str, &str)>, &str)> = vec![
+        (
+            format!("{MEMORY_HELPER}ActiveRecord::Schema.define do\n  create_table :widgets do |t|\n    t.string :name\n  end\nend\n"),
+            vec![],
+            "`ActiveRecord::Schema.define` runs against the database",
+        ),
+        (format!("{MEMORY_HELPER}ActiveRecord::Base.connection.execute(\"CREATE TABLE t (id INTEGER)\")\n"), vec![], "runs against the database"),
+        (format!("{MEMORY_HELPER}require_relative \"support/db\"\n"), vec![("test/support/db.rb", postgres)], "loads a file"),
+        (format!("{MEMORY_HELPER}require \"support/db\"\n"), vec![("test/support/db.rb", "# nothing\n")], "loads a file"),
+        (format!("{MEMORY_HELPER}load \"x.rb\"\n"), vec![], "loads a file"),
+        (format!("return if ENV[\"SKIP\"]\n{MEMORY_HELPER}"), vec![], "can stop the helper before its connection"),
+        (format!("abort unless ENV[\"DB\"]\n{MEMORY_HELPER}"), vec![], "can stop the helper before its connection"),
+        (MEMORY_HELPER.to_string(), vec![("test/other_test.rb", postgres)], "test/other_test.rb: another `establish_connection`"),
+        (MEMORY_HELPER.to_string(), vec![("app/models/legacy.rb", "class Legacy < ActiveRecord::Base\n  establish_connection(adapter: \"mysql2\")\nend\n")], "app/models/legacy.rb: another"),
+        (
+            "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\", database: \"db/x.sqlite3\")\n".to_string(),
+            vec![],
+            "option `database` is given twice",
+        ),
+    ];
+    for (helper, files, why) in cases {
+        let diags = helper_connection_diagnostics_in(&helper, &files);
+        assert!(
+            diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error && d.message.contains(why)),
+            "{helper} {files:?}: expected an error naming {why:?}, got {diags:?}"
+        );
+    }
+}
+
+/// What a gem's helper usually carries beside its connection leaves it
+/// honored: settings, gems, a load path, a logger, a test-case base.
+#[test]
+fn a_helper_memory_connection_is_honored_beside_inert_statements() {
+    let helper = format!(
+        "ENV[\"RAILS_ENV\"] = \"test\"\n$LOAD_PATH.unshift(File.expand_path(\"../lib\", __dir__))\nrequire \"active_support\"\nrequire \"sqlite3\"\n{MEMORY_HELPER}ActiveRecord::Base.logger = nil\n\nmodule Compat\n  class TestCase < ActiveSupport::TestCase\n  end\nend\n"
+    );
+    assert_eq!(helper_connection_diagnostics(&helper), vec![]);
+}
+
+/// A thread started under a lease runs on a database of its own, as
+/// Rails gives every thread, not on the leasing thread's: `Thread.new`
+/// copies fiber storage, where the lease is bound.
+#[test]
+fn a_thread_started_under_a_memory_lease_has_its_own_database() {
+    let run = emit_and_run::empty_app().write("app/.keep", "").run_ruby(
+        r#"
+Db.configure(":memory:")
+Db.exec("CREATE TABLE leased_probe (id INTEGER)")
+query = "SELECT name FROM sqlite_master WHERE name = 'leased_probe'"
+seen = Db.with_connection do
+  [Db.current_dbh.execute(query), Thread.new { Db.current_dbh.execute(query) }.value]
+end
+raise "lease saw #{seen.inspect}" unless seen == [[["leased_probe"]], []]
+"#,
+    );
+    run.assert_passes();
+}
+
+
 /// The control test, byte-identical to the one run natively under
 /// Rails 5813559f with this helper (evidence oracle/memory_connection_test.rb).
+/// It runs on `empty_app`, not real-blog: real-blog has a schema, which
+/// a memory connection is refused beside.
 const MEMORY_CONNECTION_TEST: &str = r##"require "test_helper"
 
 class MemoryConnectionTest < ActiveSupport::TestCase
