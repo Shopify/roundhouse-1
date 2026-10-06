@@ -391,7 +391,11 @@ pub(crate) fn unloaded_fixture_entries(app: &App) -> Vec<String> {
         };
         for (label, fields) in &fixture.records {
             for (key, value) in fields {
-                if resolve_field(key, value, Some(model), app).is_empty() {
+                // `parent: ~` on a belongs_to: Rails skips a nil reference
+                // and leaves the foreign key unset, as the loader does.
+                let nil_reference = value.as_scalar() == Some("")
+                    && model.associations().any(|a| matches!(a, Association::BelongsTo { name, .. } if name == key));
+                if !nil_reference && resolve_field(key, value, Some(model), app).is_empty() {
                     out.push(format!("fixture `{}`.{label}.{key} names neither a {} column nor a belongs_to with that fixture label", fixture.path, class.0));
                 }
             }
