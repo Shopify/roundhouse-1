@@ -246,6 +246,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("unlink", Ty::Int), ("delete", Ty::Int), ("rename", Ty::Int),
         ("join", Ty::Str), ("basename", Ty::Str), ("dirname", Ty::Str),
         ("extname", Ty::Str), ("expand_path", Ty::Str), ("size", Ty::Int),
+        // CRuby's `File` / `FileTest` type and permission predicates.
+        ("socket?", Ty::Bool), ("symlink?", Ty::Bool), ("pipe?", Ty::Bool),
+        ("readable?", Ty::Bool), ("writable?", Ty::Bool), ("executable?", Ty::Bool),
+        ("zero?", Ty::Bool), ("empty?", Ty::Bool), ("absolute_path?", Ty::Bool),
+        ("absolute_path", Ty::Str), ("realpath", Ty::Str),
     ], &[]);
     register_stdlib_class(classes, "Dir", &[
         ("entries", str_arr()), ("glob", str_arr()), ("[]", str_arr()),
