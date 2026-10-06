@@ -6808,3 +6808,43 @@ fn a_teardown_on_the_reopened_test_case_is_refused() {
     let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
     assert!(err.to_string().contains("teardown"), "{err}");
 }
+
+/// Delta r2: `rails new` writes the helper's reopen nested (`module
+/// ActiveSupport; class TestCase`), and an app may reopen
+/// `ActionDispatch::IntegrationTest`; a teardown in either is refused too.
+#[test]
+fn a_teardown_on_a_nested_or_integration_reopen_is_refused() {
+    for helper in [
+        "require \"active_support\"\n\nmodule ActiveSupport\n  class TestCase\n    teardown do\n      raise \"global cleanup ran\"\n    end\n  end\nend\n",
+        "require \"active_support\"\n\nclass ActionDispatch::IntegrationTest\n  teardown do\n    raise \"global cleanup ran\"\n  end\nend\n",
+    ] {
+        let tree = [
+            ("app/.keep", ""),
+            ("test/test_helper.rb", helper),
+            ("test/models/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n"),
+        ]
+        .into_iter()
+        .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+        let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
+        assert!(err.to_string().contains("teardown"), "{err}");
+    }
+}
+
+/// Delta r2: these two run as Rails runs them, so they are not refused:
+/// a plain `def teardown` over a plain one is Ruby overriding (only the
+/// child's runs), and a child `def teardown` calling `super` reaches the
+/// base's teardown blocks.
+#[test]
+fn teardowns_that_reach_or_override_their_base_as_rails_does_run() {
+    for run in ["test/models/override_test.rb", "test/models/reach_test.rb"] {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class PlainCase < ActiveSupport::TestCase\n    PLAIN_LOG = []\n\n    def teardown\n      PLAIN_LOG << \"plain base\"\n    end\n  end\n\n  class BlockCase < ActiveSupport::TestCase\n    BLOCK_LOG = []\n\n    teardown do\n      BLOCK_LOG << \"block base\"\n    end\n  end\nend\n")
+        .write("test/override_test.rb", "require \"test_helper\"\n\nclass OverrideTest < GemCompat::PlainCase\n  def teardown\n    PLAIN_LOG << \"child\"\n  end\n\n  test \"a\" do\n    PLAIN_LOG.clear\n  end\n\n  test \"b\" do\n    assert_equal [\"child\"], PLAIN_LOG\n  end\nend\n")
+        .write("test/reach_test.rb", "require \"test_helper\"\n\nclass ReachTest < GemCompat::BlockCase\n  def teardown\n    BLOCK_LOG << \"child\"\n    super\n  end\n\n  test \"a\" do\n    BLOCK_LOG.clear\n  end\n\n  test \"b\" do\n    assert_equal [\"child\", \"block base\"], BLOCK_LOG\n  end\nend\n")
+        .run_test(run)
+        .assert_passes();
+    }
+}

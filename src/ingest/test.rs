@@ -223,7 +223,8 @@ fn ingest_test_class(
     // reverse of the order they were declared. The harness calls the
     // test's `teardown` after each test the same way, so the blocks
     // become that method.
-    if !teardowns.is_empty() {
+    let teardown_blocks = !teardowns.is_empty();
+    if teardown_blocks {
         let mut exprs: Vec<Expr> = Vec::new();
         let own = helpers.iter().position(|m| m.name.as_str() == "teardown");
         let name_span = match own.map(|i| helpers.remove(i)) {
@@ -280,9 +281,40 @@ fn ingest_test_class(
         setup,
         inner_classes,
         helpers,
+        teardown_blocks,
         constants,
         includes,
     })
+}
+
+/// Classes the test helper reopens (no superclass: `class
+/// ActiveSupport::TestCase`, `module ActiveSupport; class TestCase`,
+/// `class ActionDispatch::IntegrationTest`) that declare a teardown,
+/// block or `def`. Only a reopen's `setup` is carried into the tests
+/// (`ingest_test_case_setup`); a teardown there would run after none.
+pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let mut classes: Vec<ScopedClass<'_>> = Vec::new();
+    collect_top_level_classes(&root, &[], &mut classes);
+    let mut out = Vec::new();
+    for (scope, class) in classes {
+        if class.superclass().is_some() {
+            continue;
+        }
+        let Some(body) = class.body() else { continue };
+        let declares = flatten_statements(body).iter().any(|stmt| {
+            let call = stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && constant_id_str(&c.name()) == "teardown");
+            let def = stmt.as_def_node().is_some_and(|d| d.name().as_slice() == b"teardown");
+            call || def
+        });
+        if declares {
+            let mut path = scope;
+            path.extend(class_name_path(&class).unwrap_or_default());
+            out.push(path.join("::"));
+        }
+    }
+    out
 }
 
 /// The app-wide `setup do … end` an app's `test/test_helper.rb` puts on

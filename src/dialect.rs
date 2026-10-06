@@ -1727,6 +1727,11 @@ pub struct TestModule {
     /// class. Empty when the file has no helpers (the typical case).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub helpers: Vec<MethodDef>,
+    /// The `teardown` helper carries `teardown do … end` blocks (Rails
+    /// callbacks, which a subclass's teardown does not replace), not only
+    /// a `def teardown`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub teardown_blocks: bool,
     /// Class-body constant assignments — `TABLE = [...]`, `SCHEMA =
     /// {...}` declared at test-class scope. Lifted to file-scope
     /// `const NAME = <value>` declarations during emit so test methods
