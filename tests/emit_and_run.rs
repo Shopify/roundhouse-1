@@ -6893,3 +6893,127 @@ fn teardowns_that_reach_or_override_their_base_as_rails_does_run() {
         .assert_passes();
     }
 }
+
+/// `ActiveRecord::Base.connection` is Rails' `SQLite3Adapter`, with that
+/// adapter's transaction statements and its error translation: a driver
+/// error becomes `StatementInvalid` named "<driver class>: <message>"
+/// with the driver's exception as its cause. Expected values are Rails
+/// 5813559f's (evidence: oracle run of the same file on that bundle).
+const ADAPTER_TRANSACTION_TEST: &str = r#"require "test_helper"
+
+class AdapterTransactionTest < ActiveSupport::TestCase
+  setup do
+    @conn = ActiveRecord::Base.connection
+    @conn.execute("CREATE TABLE IF NOT EXISTS tx_rows (id INTEGER PRIMARY KEY, val TEXT)")
+    @conn.execute("DELETE FROM tx_rows")
+  end
+
+  test "the connection is the adapter, the same object on every call" do
+    assert_kind_of ActiveRecord::ConnectionAdapters::SQLite3Adapter, @conn
+    assert_same @conn, ActiveRecord::Base.connection
+  end
+
+  test "rollback discards and commit keeps" do
+    @conn.begin_db_transaction
+    @conn.execute("INSERT INTO tx_rows (val) VALUES ('a')")
+    @conn.exec_rollback_db_transaction
+    assert_equal 0, @conn.select_rows("SELECT COUNT(*) FROM tx_rows")[0][0]
+    @conn.begin_deferred_transaction
+    @conn.execute("INSERT INTO tx_rows (val) VALUES ('b')")
+    @conn.commit_db_transaction
+    assert_equal 1, @conn.select_rows("SELECT COUNT(*) FROM tx_rows")[0][0]
+  end
+
+  test "a statement error is StatementInvalid caused by the driver error" do
+    e = assert_raises(ActiveRecord::StatementInvalid) { @conn.exec_rollback_db_transaction }
+    assert_equal "SQLite3::SQLException: cannot rollback - no transaction is active", e.message
+    assert_kind_of SQLite3::SQLException, e.cause
+    assert_equal "ROLLBACK TRANSACTION", e.sql
+  end
+
+  test "a nested begin is refused by SQLite" do
+    @conn.begin_db_transaction
+    e = assert_raises(ActiveRecord::StatementInvalid) { @conn.begin_deferred_transaction }
+    assert_includes e.message, "cannot start a transaction within a transaction"
+    @conn.exec_rollback_db_transaction
+  end
+
+  test "an isolation level is refused as Rails refuses it on SQLite" do
+    assert_raises(ActiveRecord::TransactionIsolationError) { @conn.begin_isolated_db_transaction(:read_committed) }
+    e = assert_raises(StandardError) { @conn.begin_isolated_db_transaction(:read_uncommitted) }
+    assert_includes e.message, "shared-cache mode"
+  end
+
+  test "resetting an isolation level never set issues an invalid PRAGMA" do
+    assert_raises(ActiveRecord::StatementInvalid) { @conn.reset_isolation_level }
+  end
+end
+"#;
+
+/// A module prepended onto the adapter class reaches Rails' statement
+/// through `super` and sees the translated error, as Core's
+/// sqlite_test_compat does.
+const ADAPTER_PREPEND_TEST: &str = r#"require "test_helper"
+require "active_record/rollback_compat"
+
+class AdapterPrependTest < ActiveSupport::TestCase
+  setup do
+    unless ActiveRecord::ConnectionAdapters::SQLite3Adapter.ancestors.include?(ActiveRecord::RollbackCompat)
+      ActiveRecord::ConnectionAdapters::SQLite3Adapter.prepend(ActiveRecord::RollbackCompat)
+    end
+    @conn = ActiveRecord::Base.connection
+    @conn.execute("CREATE TABLE IF NOT EXISTS tx_rows (id INTEGER PRIMARY KEY, val TEXT)")
+    @conn.execute("DELETE FROM tx_rows")
+  end
+
+  test "the prepended rollback swallows only cannot rollback" do
+    assert_nothing_raised { @conn.exec_rollback_db_transaction }
+    @conn.begin_db_transaction
+    @conn.execute("INSERT INTO tx_rows (val) VALUES ('a')")
+    @conn.exec_rollback_db_transaction
+    assert_equal 0, @conn.select_rows("SELECT COUNT(*) FROM tx_rows")[0][0]
+  end
+end
+"#;
+
+const ROLLBACK_COMPAT_LIB: &str = r#"module ActiveRecord
+  module RollbackCompat
+    def exec_rollback_db_transaction
+      super
+    rescue ActiveRecord::StatementInvalid => e
+      Kernel.raise unless e.cause.is_a?(SQLite3::SQLException) && e.message.include?("cannot rollback")
+    end
+  end
+end
+"#;
+
+fn adapter_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n")
+        .write("lib/active_record/rollback_compat.rb", ROLLBACK_COMPAT_LIB)
+        .write("test/adapter_transaction_test.rb", ADAPTER_TRANSACTION_TEST)
+        .write("test/adapter_prepend_test.rb", ADAPTER_PREPEND_TEST)
+}
+
+#[test]
+fn the_sqlite3_adapter_runs_rails_transaction_statements() {
+    adapter_app().run_test("test/models/adapter_transaction_test.rb").assert_passes();
+}
+
+#[test]
+fn a_module_prepended_on_the_sqlite3_adapter_reaches_it_through_super() {
+    adapter_app().run_test("test/models/adapter_prepend_test.rb").assert_passes();
+}
+
+/// Only the CRuby tree carries the adapter and the `sqlite3` gem.
+#[test]
+fn the_sqlite3_statement_errors_are_refused_off_cruby() {
+    for target in [roundhouse::project::BuildTarget::Spinel, roundhouse::project::BuildTarget::Jruby] {
+        let (_, errors) = adapter_app().emit(target);
+        for name in ["ActiveRecord::StatementInvalid", "SQLite3::SQLException"] {
+            assert!(errors.iter().any(|e| e.contains(name)), "{target:?} {name}: {errors:?}");
+        }
+    }
+}

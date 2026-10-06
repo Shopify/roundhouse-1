@@ -3759,21 +3759,29 @@ fn report_keyword_params(app: &App, target: &str) {
 /// These class objects are supplied by Ruby/Spinel's bundled libraries,
 /// not by the transpiled runtimes. Recognizing them during inference
 /// must not turn a missing target implementation into a clean emit.
+///
+/// The CRuby tree's SQLite3 adapter (ruby_overlay
+/// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
+/// supply the statement-error classes, so those are refused on every
+/// target but Ruby, Spinel included.
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
-    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Roda) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
         return;
     }
-    fn visit(expr: &crate::expr::Expr, app: &App, target: &str) {
+    let bundled = !matches!(target, BuildTarget::Spinel | BuildTarget::Roda);
+    fn visit(expr: &crate::expr::Expr, app: &App, target: &str, bundled: bool) {
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
-                if matches!(id.0.as_str(),
+                let cruby_sqlite3 = matches!(id.0.as_str(),
+                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException");
+                if (cruby_sqlite3 || bundled && matches!(id.0.as_str(),
                     "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
                     | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
                     | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
                     | "Struct" | "Mutex")
                     // Nokogiri does not supply HTML5 on JRuby. The
                     // other bundled values remain available there.
-                    && (target != "jruby" || id.0.as_str() == "Rails::HTML5::SafeListSanitizer")
+                    && (target != "jruby" || id.0.as_str() == "Rails::HTML5::SafeListSanitizer"))
                     && !app.library_classes.iter().any(|class| class.name == *id)
                     && !app.models.iter().any(|model| model.name == *id)
                     && !app.controllers.iter().any(|controller| controller.name == *id)
@@ -3802,15 +3810,15 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             {
                 expr.node.for_each_child(&mut |child| {
                     if !std::ptr::eq(child, recv) {
-                        visit(child, app, target);
+                        visit(child, app, target, bundled);
                     }
                 });
                 return;
             }
         }
-        expr.node.for_each_child(&mut |child| visit(child, app, target));
+        expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
     }
-    let mut visit = |expr: &crate::expr::Expr| visit(expr, app, target.as_str());
+    let mut visit = |expr: &crate::expr::Expr| visit(expr, app, target.as_str(), bundled);
     crate::lower::for_each_hook_body_ref(app, &mut visit);
     // Like the Date gate, include roots outside the app-body survey.
     for controller in &app.controllers {

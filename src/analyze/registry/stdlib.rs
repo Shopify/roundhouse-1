@@ -449,6 +449,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
         ("ActiveRecord::ValueTooLong", None),
+        // The CRuby tree's SQLite3 adapter raises these (ruby_overlay
+        // active_record_sqlite3_adapter.rb); `project` refuses them on
+        // every other target.
+        ("ActiveRecord::StatementInvalid", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
+        ("ActiveRecord::TransactionIsolationError", None),
+        // The `sqlite3` gem's statement error, the cause of a
+        // StatementInvalid on that tree.
+        ("SQLite3::SQLException", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
         ("ActionController::ParameterMissing", Some(("param", Ty::Str))),

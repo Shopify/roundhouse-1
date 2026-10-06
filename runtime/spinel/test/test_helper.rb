@@ -1075,6 +1075,15 @@ class TestBase
     ActiveSupport.travel(0)
   end
 
+  # ActiveSupport's `assert_nothing_raised`: the block's value, and an
+  # exception out of it fails the test. ActiveSupport wraps a
+  # StandardError as Minitest's UnexpectedError (an error, not a
+  # failure); this harness reports both alike, under the exception's
+  # own message.
+  def assert_nothing_raised
+    yield
+  end
+
   # `assert_match` left as a method — nilable value handling differs
   # per target. spinel-target will need adjusting when toolchain-spinel
   # re-enables; for now this works under CRuby.
