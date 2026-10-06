@@ -5461,8 +5461,16 @@ fn gem_require_block(exclude: &[&str]) -> String {
 /// No other tree loads any gem, so a constant only a gem's RBI declares
 /// runs here or nowhere.
 pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
-    runtime_gems().iter().any(|(_, loaded)| *loaded == gem)
+    runtime_gems().iter().any(|(_, loaded)| *loaded == gem) || CRUBY_TEST_GEMS.contains(&gem)
 }
+
+/// The test framework the CRuby test process runs on: real Minitest
+/// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the
+/// reporters Core's test boot subclasses. Its constants are the gems',
+/// typed from their RBIs; the Spinel and JRuby test bootstraps stay
+/// Minitest-free and refuse them. Not ci-queue: it patches Minitest when
+/// it loads, so it is required only where the app requires it.
+const CRUBY_TEST_GEMS: [&str; 2] = ["minitest", "minitest-reporters"];
 
 fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // Kept in step with the guarded list in `runtime/gem_facades.rb`:
