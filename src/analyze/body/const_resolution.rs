@@ -25,31 +25,27 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::{FileId, SourceFile, Span};
 use crate::ty::Ty;
 
-// Rubydex's minimal built-ins stop at Object/Module/Class. These are
-// Ruby core classes already modeled by Roundhouse's primitive dispatch,
-// declared as RBS so the source graph resolves them by Ruby name.
-const CORE_RBS: &str = "\
-class Numeric < Object\nend\n\
-class Integer < Numeric\nend\n\
-class Float < Numeric\n  INFINITY: Float\n  NAN: Float\n  EPSILON: Float\n  MAX: Float\n  MIN: Float\nend\n\
-class String < Object\nend\n\
-class Array < Object\nend\n\
-class Hash < Object\nend\n\
-class Symbol < Object\nend\n\
-class Data < Object\nend\n\
-class TrueClass < Object\nend\n\
-class FalseClass < Object\nend\n\
-class NilClass < Object\nend\n\
-class Regexp < Object\nend\n\
-class Exception < Object\nend\n\
-class StandardError < Exception\nend\n";
+// Rubydex's minimal built-ins stop at Object/Module/Class. Ruby's own
+// signatures (`rbs/`, `crate::stdlib_rbs`) declare the rest of the core
+// and stdlib, so the source graph resolves them by Ruby name.
+const STDLIB_URI_PREFIX: &str = "roundhouse-stdlib:";
 
-const CORE_URI: &str = "roundhouse-core:rbs";
+/// The core classes Roundhouse's primitive dispatch modeled before the
+/// signatures were indexed, when a 14-class prelude declared them. Every
+/// target answers them, so they are not names only Ruby defines.
+const MODELED_CORE: &[&str] = &[
+    "Numeric", "Integer", "Float", "String", "Array", "Hash", "Symbol", "Data", "TrueClass",
+    "FalseClass", "NilClass", "Regexp", "Exception", "StandardError",
+];
+
 const RUNTIME_URI_PREFIX: &str = "roundhouse-runtime:";
 
 pub(super) enum ResolvedConstant {
-    Namespace { class: Arc<ClassId>, runtime: bool },
-    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>> },
+    /// `stdlib`: only Ruby's signatures declare it ([`is_stdlib_only`]).
+    /// `alias`: the name written resolved through an RBS class alias
+    /// (`Queue` for `Thread::Queue`); `class` is the alias's target.
+    Namespace { class: Arc<ClassId>, runtime: bool, stdlib: bool, alias: Option<Arc<ClassId>> },
+    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>>, stdlib: bool },
 }
 
 /// Rubydex answers for one source file.
@@ -71,6 +67,9 @@ pub(crate) struct ConstResolver {
     /// Indexed by `FileId - 1`. `None` marks a source that Rubydex did
     /// not index, such as an ERB template.
     files: Vec<Option<FileAnswers>>,
+    /// Full names of the classes and modules Ruby's signatures declare,
+    /// RBS class aliases included, as the graph resolved them.
+    stdlib_namespaces: HashSet<Box<str>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -228,9 +227,9 @@ fn index_documents(documents: &[Document<'_>]) -> Graph {
     graph
 }
 
-/// Roundhouse models the Ruby core: the RBS block above, the Ruby
-/// runtime, and the classes that Rubydex itself installs (`BasicObject`,
-/// `Kernel`, `Object`, `Module`, `Class`).
+/// Declarations Ruby itself supplies: Ruby's core and stdlib signatures,
+/// the Ruby runtime, and the classes that Rubydex itself installs
+/// (`BasicObject`, `Kernel`, `Object`, `Module`, `Class`).
 fn is_runtime_declaration(graph: &Graph, declaration: &Declaration) -> bool {
     declaration.definitions().iter().any(|id| {
         graph
@@ -239,9 +238,26 @@ fn is_runtime_declaration(graph: &Graph, declaration: &Declaration) -> bool {
             .and_then(|definition| graph.documents().get(definition.uri_id()))
             .is_some_and(|document| {
                 let uri = document.uri();
-                uri == CORE_URI || uri == BUILT_IN_URI || uri.starts_with(RUNTIME_URI_PREFIX)
+                uri.starts_with(STDLIB_URI_PREFIX) || uri == BUILT_IN_URI || uri.starts_with(RUNTIME_URI_PREFIX)
             })
     })
+}
+
+/// Whether every definition of the declaration is in Ruby's signatures:
+/// neither the Ruby runtime, nor Rubydex's built-ins, nor the app open
+/// it, and it is not one of the [`MODELED_CORE`] classes. A Ruby-family
+/// tree runs it on the interpreter that defines it; no other runtime
+/// does unless it models the name itself.
+fn is_stdlib_only(graph: &Graph, declaration: &Declaration) -> bool {
+    !MODELED_CORE.contains(&declaration.name())
+        && !declaration.definitions().is_empty()
+        && declaration.definitions().iter().all(|id| {
+            graph
+                .definitions()
+                .get(id)
+                .and_then(|definition| graph.documents().get(definition.uri_id()))
+                .is_some_and(|document| document.uri().starts_with(STDLIB_URI_PREFIX))
+        })
 }
 
 fn resolved_namespace(graph: &Graph, name: NameId) -> Option<&Declaration> {
@@ -305,8 +321,9 @@ impl ConstResolver {
         // its graph, including declarations in later files.
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
+        let stdlib_namespaces = stdlib_namespaces(&graph);
         drop(graph);
-        Self { files, source_fingerprint: source_fingerprint(sources) }
+        Self { files, stdlib_namespaces, source_fingerprint: source_fingerprint(sources) }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -382,6 +399,13 @@ impl ConstResolver {
             })
     }
 
+    /// Whether Ruby's signatures declare this class or module (a declared
+    /// `#: Range` or `#: URI::HTTPS`), by the graph written constants
+    /// resolve against.
+    pub(crate) fn has_stdlib_namespace(&self, name: &str) -> bool {
+        self.stdlib_namespaces.contains(name)
+    }
+
     /// The full declaration name a written constant resolves to, and
     /// whether that declaration is a value rather than a namespace.
     pub(crate) fn resolved_name(&self, span: Span, path: &[Symbol]) -> Option<(&ClassId, bool)> {
@@ -408,7 +432,7 @@ impl ConstResolver {
 
     pub(crate) fn is_runtime_class(&self, span: Span, path: &[Symbol], name: &str) -> bool {
         matches!(self.reference(span, path),
-            Some(Some(ResolvedConstant::Namespace { class, runtime: true }))
+            Some(Some(ResolvedConstant::Namespace { class, runtime: true, .. }))
                 if class.0.as_str() == name)
     }
 }
@@ -488,12 +512,21 @@ impl ConstResolverTask {
 /// Ruby core RBS, never from fabricated suffix aliases. App sources keep
 /// their paths as URIs so answers map back to their file IDs.
 fn index_sources(sources: &[SourceFile]) -> Graph {
-    let mut documents = vec![Document {
-        uri_prefix: CORE_URI,
-        path: "",
-        text: CORE_RBS,
-        language: LanguageId::Rbs,
-    }];
+    let mut documents: Vec<Document<'_>> = crate::stdlib_rbs::documents()
+        .map(|(path, text)| Document {
+            uri_prefix: STDLIB_URI_PREFIX,
+            path,
+            text,
+            language: LanguageId::Rbs,
+        })
+        .collect();
+    // Rubydex's RBS indexer declares no `class Queue = Thread::Queue`.
+    documents.push(Document {
+        uri_prefix: STDLIB_URI_PREFIX,
+        path: "rbs/aliases.rb",
+        text: crate::stdlib_rbs::alias_document(),
+        language: LanguageId::Ruby,
+    });
     documents.extend(
         crate::runtime_files::ruby_sources().map(|(path, text)| Document {
             uri_prefix: RUNTIME_URI_PREFIX,
@@ -514,6 +547,34 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
             }),
     );
     index_documents(&documents)
+}
+
+fn stdlib_namespaces(graph: &Graph) -> HashSet<Box<str>> {
+    let in_stdlib = |declaration: &Declaration| {
+        declaration.definitions().iter().any(|id| {
+            graph
+                .definitions()
+                .get(id)
+                .and_then(|definition| graph.documents().get(definition.uri_id()))
+                .is_some_and(|document| document.uri().starts_with(STDLIB_URI_PREFIX))
+        })
+    };
+    graph
+        .declarations()
+        .iter()
+        .filter(|(id, declaration)| {
+            in_stdlib(declaration)
+                && match declaration {
+                    Declaration::Namespace(_) => true,
+                    Declaration::ConstantAlias(_) => graph
+                        .resolve_alias(id)
+                        .and_then(|target| graph.declarations().get(&target))
+                        .is_some_and(|target| target.as_namespace().is_some()),
+                    _ => false,
+                }
+        })
+        .map(|(_, declaration)| declaration.name().into())
+        .collect()
 }
 
 /// Rubydex resolves names, ownership, and lexical scope. Keep only its
@@ -591,7 +652,7 @@ fn parenthesized_factory_receivers(text: &str) -> HashSet<u32> {
 fn answer_file(
     graph: &Graph,
     source: &SourceFile,
-    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool)>,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool, bool)>,
 ) -> FileAnswers {
     let mut answers = FileAnswers::default();
     let Some(document) = graph.documents().get(&UriId::from(source.path.as_str())) else {
@@ -633,16 +694,31 @@ fn answer_file(
             .name_id_to_declaration_id(*reference.name_id())
             .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
             .map(|(id, declaration)| {
+                // An RBS class alias is the class it names. The alias
+                // declaration is the signatures' own, so an app that
+                // assigns the name instead keeps its value.
+                let stdlib_alias = matches!(declaration, Declaration::ConstantAlias(_))
+                    && is_stdlib_only(graph, declaration);
+                let aliased = stdlib_alias
+                    .then(|| graph.resolve_alias(&id))
+                    .flatten()
+                    .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
+                    .filter(|(_, target)| target.as_namespace().is_some());
+                let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(declaration.name()))));
+                let (id, declaration) = aliased.unwrap_or((id, declaration));
                 if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
-                    let (class, runtime) = class_cache.entry(id).or_insert_with(|| {
+                    let (class, runtime, stdlib) = class_cache.entry(id).or_insert_with(|| {
                         (
                             Arc::new(ClassId(Symbol::from(declaration.name()))),
                             is_runtime_declaration(graph, declaration),
+                            is_stdlib_only(graph, declaration),
                         )
                     });
                     ResolvedConstant::Namespace {
                         class: Arc::clone(class),
                         runtime: *runtime,
+                        stdlib: *stdlib,
+                        alias,
                     }
                 } else {
                     // An app write to the same declaration must never
@@ -668,16 +744,21 @@ fn answer_file(
                             .definitions()
                             .get(id)
                             .and_then(|definition| graph.documents().get(definition.uri_id()))
-                            .is_some_and(|document| document.uri() == CORE_URI)
+                            .is_some_and(|document| document.uri().starts_with(STDLIB_URI_PREFIX))
                     });
+                    // Ruby's signatures type a value only they declare;
+                    // a runtime implementation's literal types its own.
+                    let stdlib = !builtin_float && is_stdlib_only(graph, declaration);
                     let runtime = if builtin_float {
                         Some(Arc::new(Ty::Float))
+                    } else if stdlib {
+                        crate::stdlib_rbs::value_type(name).cloned()
                     } else if !app_write && is_runtime_declaration(graph, declaration) {
                         runtime_value_types().get(declaration.name()).cloned()
                     } else {
                         None
                     };
-                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(name))), runtime }
+                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(name))), runtime, stdlib }
                 }
             });
         match answers.references.entry(offset.start()) {

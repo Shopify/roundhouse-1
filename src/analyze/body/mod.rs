@@ -593,7 +593,7 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 expr.diagnostic = None;
-                expr.decisions &= !crate::expr::GEM_CONSTANT_REF;
+                expr.decisions &= !(crate::expr::GEM_CONSTANT_REF | crate::expr::STDLIB_CONSTANT_REF);
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -638,11 +638,19 @@ impl<'a> BodyTyper<'a> {
                     .as_ref()
                     .filter(|_| !generated)
                     .and_then(|resolver| resolver.reference(expr_span, path));
-                let app_value = matches!(source_reference, Some(Some(ResolvedConstant::Value { .. })));
+                let app_value = matches!(source_reference, Some(Some(ResolvedConstant::Value { stdlib: false, .. })));
                 let ty = match source_reference {
-                    Some(Some(ResolvedConstant::Namespace { class, runtime })) => {
-                        let id = class.as_ref().clone();
+                    Some(Some(ResolvedConstant::Namespace { class, runtime, stdlib, alias })) => {
+                        // A modeled class keeps the name it is modeled
+                        // under (`Mutex`, not its target `Thread::Mutex`).
+                        let id = match alias {
+                            Some(alias) if self.classes().contains_key(alias.as_ref()) => alias.as_ref().clone(),
+                            _ => class.as_ref().clone(),
+                        };
                         if self.classes().contains_key(&id) || *runtime {
+                            if *stdlib && !self.classes().contains_key(&id) {
+                                expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
+                            }
                             expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
                             qualify_resolved_path(path, &id);
                             Ty::Class { id, args: vec![] }
@@ -650,7 +658,26 @@ impl<'a> BodyTyper<'a> {
                             unknown()
                         }
                     }
-                    Some(Some(ResolvedConstant::Value { declaration, name, runtime })) => {
+                    // A value only Ruby's signatures declare: a modeled
+                    // constant (`Process::CLOCK_MONOTONIC`) keeps its
+                    // model, and a class modeled with a constant table
+                    // answers for its own constants; otherwise the
+                    // declared type, gradual when the signature's type
+                    // does not map.
+                    Some(Some(ResolvedConstant::Value { stdlib: true, runtime, .. })) => {
+                        let closed = path.split_last().is_some_and(|(_, owner)| {
+                            !owner.is_empty() && self.classes().get(&written_class_id(owner))
+                                .is_some_and(|info| !info.constants.is_empty())
+                        });
+                        match exact_modeled_class(path) {
+                            Ty::Var { .. } if !closed => {
+                                expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
+                                runtime.as_ref().map_or(Ty::Untyped, |ty| (**ty).clone())
+                            }
+                            modeled => modeled,
+                        }
+                    }
+                    Some(Some(ResolvedConstant::Value { declaration, name, runtime, .. })) => {
     // Concern splices retain the resolved value owner as well as its type.
     qualify_resolved_path(path, name);
     let value = self.typed_constants.and_then(|values| values.get(declaration)).cloned()
@@ -2221,7 +2248,9 @@ impl<'a> BodyTyper<'a> {
                 if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
                     resolved.map_class_ids(&|id| {
                         if !self.classes.contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
-                            && !self.const_resolver.as_ref().is_some_and(|r| r.has_source_namespace(id.0.as_str())) {
+                            && !self.const_resolver.as_ref().is_some_and(|r| {
+                                r.has_source_namespace(id.0.as_str()) || r.has_stdlib_namespace(id.0.as_str())
+                            }) {
                             missing.borrow_mut().push(id.0.as_str().to_owned());
                         }
                         id.clone()

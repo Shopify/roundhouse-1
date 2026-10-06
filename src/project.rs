@@ -4086,10 +4086,13 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             return;
         }
         // CRuby's core and default-gem classes the analysis admits for the
-        // interpreters that define them natively.
+        // interpreters that define them natively: the modeled ones by
+        // name, and those only Ruby's signatures declare by the typer's
+        // mark.
         if target != "jruby" && let crate::expr::ExprNode::Const { path } = &*expr.node {
             let name = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::");
-            if crate::analyze::CRUBY_ONLY_STDLIB.iter().any(|(konst, ..)| *konst == name)
+            if (crate::analyze::CRUBY_ONLY_STDLIB.iter().any(|(konst, ..)| *konst == name)
+                || expr.decisions & crate::expr::STDLIB_CONSTANT_REF != 0)
                 && !app.library_classes.iter().any(|class| class.name.0.as_str() == name)
             {
                 emit::diagnostics::report_unsupported(
@@ -6232,6 +6235,14 @@ fn names_constant(src: &str, konst: &str) -> bool {
                 }
             }
         }
+        // MIXIN position — `include Singleton`, `extend Forwardable`:
+        // the stdlib modules a class mixes in stand bare, like a parent.
+        let trimmed = line.trim();
+        if let Some(rest) = ["include ", "extend ", "prepend "].iter().find_map(|kw| trimmed.strip_prefix(kw)) {
+            if rest.split(',').any(|module| module.trim() == konst) {
+                return true;
+            }
+        }
         let b = line.as_bytes();
         let mut i = 0;
         while let Some(off) = line[i..].find(konst) {
@@ -6294,11 +6305,21 @@ fn requires_feature(src: &str, require_line: &str) -> bool {
 /// `write_bundled_requires` in the value-passing shape `target_files`'
 /// match arms want.
 fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, String)> {
-    write_bundled_requires(&mut files);
+    write_bundled_require_lines(&mut files);
     // Only the Ruby family reaches here.
-    for (i, require_line) in require_gaps(&files, &CRUBY_STDLIB_REQUIRES) {
-        files[i].1.insert_str(0, &format!("{require_line}\n"));
+    let mut written = std::collections::HashSet::new();
+    for (i, require_line) in require_gaps(&files, &cruby_stdlib_requires()) {
+        // Several constants of one library (`Net::HTTP`, `Net::HTTPOK`)
+        // can name the same feature in one file.
+        if written.insert((i, require_line.clone())) {
+            files[i].1.insert_str(0, &format!("{require_line}\n"));
+        }
     }
+    let stdlib_gems: Vec<(&str, &str)> = crate::stdlib_rbs::requires()
+        .iter()
+        .filter_map(|row| row.bundled_gem.map(|gem| (row.feature, gem)))
+        .collect();
+    apply_bundled_gem_wiring(&mut files, &stdlib_gems);
     files
 }
 
@@ -6317,18 +6338,24 @@ const BUNDLED_GEMS: [&str; 3] = ["base64", "bigdecimal", "csv"];
 /// own requires, and that pass writes them back from `BUNDLED`, so the
 /// requires are final only there. Every file, not only app/: a test
 /// that names `CSV` runs under the same bundle.
-fn apply_bundled_gem_wiring(files: &mut [(String, String)]) {
+///
+/// `stdlib` adds `(feature, gem)` pairs beyond `BUNDLED_GEMS`: the
+/// bundled-gem rows of Ruby's signatures' require table
+/// (`stdlib_rbs::requires`), on the Ruby family.
+fn apply_bundled_gem_wiring(files: &mut [(String, String)], stdlib: &[(&str, &str)]) {
     let Some(gemfile_at) = files.iter().position(|(p, _)| p == "Gemfile") else {
         return;
     };
-    let missing: Vec<&str> = BUNDLED_GEMS
-        .into_iter()
-        .filter(|gem| !files[gemfile_at].1.contains(&format!("gem {gem:?}")))
-        .filter(|gem| {
-            let require_line = format!("require {gem:?}");
-            files.iter().any(|(p, c)| p.ends_with(".rb") && requires_feature(c, &require_line))
-        })
-        .collect();
+    let mut missing: Vec<&str> = Vec::new();
+    for (feature, gem) in BUNDLED_GEMS.into_iter().map(|gem| (gem, gem)).chain(stdlib.iter().copied()) {
+        let require_line = format!("require {feature:?}");
+        if !missing.contains(&gem)
+            && !files[gemfile_at].1.contains(&format!("gem {gem:?}"))
+            && files.iter().any(|(p, c)| p.ends_with(".rb") && requires_feature(c, &require_line))
+        {
+            missing.push(gem);
+        }
+    }
     if missing.is_empty() {
         return;
     }
@@ -6413,9 +6440,23 @@ fn bundled_require_gaps(files: &[(String, String)]) -> Vec<(usize, String)> {
 /// Default gems only the CRuby and JRuby trees load
 /// (`analyze::CRUBY_ONLY_STDLIB`; every other runtime refuses the
 /// constant). The rest of that table is interpreter core and needs no
-/// require.
-const CRUBY_STDLIB_REQUIRES: [(&str, &str); 3] =
-    [("FileUtils", "fileutils"), ("Timeout", "timeout"), ("YAML", "yaml")];
+/// require. `Bundler` is `rbs/supplement.rbs`'s, which the generated
+/// table below does not probe.
+const CRUBY_STDLIB_REQUIRES: [(&str, &str); 4] =
+    [("Bundler", "bundler"), ("FileUtils", "fileutils"), ("Timeout", "timeout"), ("YAML", "yaml")];
+
+/// `CRUBY_STDLIB_REQUIRES`, then every row of Ruby's signatures' table
+/// (`rbs/requires.tsv`, each probed on the pinned interpreter) that
+/// neither it nor `BUNDLED` already answers.
+fn cruby_stdlib_requires() -> Vec<(&'static str, &'static str)> {
+    let mut table = CRUBY_STDLIB_REQUIRES.to_vec();
+    for row in crate::stdlib_rbs::requires() {
+        if !table.iter().chain(BUNDLED.iter()).any(|(konst, _)| *konst == row.constant) {
+            table.push((row.constant, row.feature));
+        }
+    }
+    table
+}
 
 fn require_gaps(files: &[(String, String)], table: &[(&str, &str)]) -> Vec<(usize, String)> {
     let mut gaps = Vec::new();
@@ -6483,10 +6524,14 @@ pub fn missing_bundled_requires(files: &[(String, String)]) -> Vec<String> {
 /// Sorted by constant so a tree that needs two requires gets them in a
 /// stable order.
 fn write_bundled_requires(files: &mut [(String, String)]) {
+    write_bundled_require_lines(files);
+    apply_bundled_gem_wiring(files, &[]);
+}
+
+fn write_bundled_require_lines(files: &mut [(String, String)]) {
     for (i, require_line) in bundled_require_gaps(files) {
         files[i].1.insert_str(0, &format!("{require_line}\n"));
     }
-    apply_bundled_gem_wiring(files);
 }
 
 /// The emitted call every declared variant lowers to (`lower::attached

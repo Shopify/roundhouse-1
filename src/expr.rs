@@ -48,6 +48,11 @@ pub const SELF_BINDING: u64 = 1 << 9;
 /// which `Ty` alone does not tell apart from an instance.
 pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 10;
 
+/// The constant is declared only by Ruby's own signatures (`rbs/`): the
+/// CRuby and JRuby trees run it on the interpreter that defines it, and
+/// every other target refuses it at emit unless it models the name.
+pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
