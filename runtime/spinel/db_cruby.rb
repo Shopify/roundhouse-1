@@ -224,7 +224,10 @@ module Db
   # In memory mode the thread's own handle, whatever fiber storage says:
   # a `Thread.new` copies its parent's fiber storage, so a thread started
   # under a lease would otherwise run on the parent's database, where
-  # Rails gives it its own.
+  # Rails gives it its own. NOT modeled: the query cache
+  # (`Fiber[:rh_qcache]`) is copied the same way, so a thread started
+  # inside a cached block answers a repeated SELECT from the parent's
+  # cache, as on the file pool.
   def self.current_dbh
     return memory_dbh if @memory
     h = Fiber[:db_handle]

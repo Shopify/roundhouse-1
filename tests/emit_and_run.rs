@@ -7107,6 +7107,7 @@ fn helper_connection_diagnostics_in(helper: &str, files: &[(&str, &str)]) -> Vec
         ("test/test_helper.rb", helper.to_string()),
         ("test/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n".to_string()),
     ];
+    tree.retain(|(path, _)| !files.iter().any(|(file, _)| file == path));
     tree.extend(files.iter().map(|(path, content)| (*path, content.to_string())));
     let tree = tree.into_iter().map(|(p, c)| (std::path::PathBuf::from(p), c.into_bytes())).collect();
     let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
@@ -7178,7 +7179,7 @@ fn a_helper_memory_connection_is_refused_beside_what_the_harness_does_not_carry(
         (
             format!("{MEMORY_HELPER}ActiveRecord::Schema.define do\n  create_table :widgets do |t|\n    t.string :name\n  end\nend\n"),
             vec![],
-            "`ActiveRecord::Schema.define` runs against the database",
+            "`ActiveRecord::Schema.define do` runs against the database",
         ),
         (format!("{MEMORY_HELPER}ActiveRecord::Base.connection.execute(\"CREATE TABLE t (id INTEGER)\")\n"), vec![], "runs against the database"),
         (format!("{MEMORY_HELPER}require_relative \"support/db\"\n"), vec![("test/support/db.rb", postgres)], "loads a file"),
@@ -7186,21 +7187,54 @@ fn a_helper_memory_connection_is_refused_beside_what_the_harness_does_not_carry(
         (format!("{MEMORY_HELPER}load \"x.rb\"\n"), vec![], "loads a file"),
         (format!("return if ENV[\"SKIP\"]\n{MEMORY_HELPER}"), vec![], "can stop the helper before its connection"),
         (format!("abort unless ENV[\"DB\"]\n{MEMORY_HELPER}"), vec![], "can stop the helper before its connection"),
-        (MEMORY_HELPER.to_string(), vec![("test/other_test.rb", postgres)], "test/other_test.rb: another `establish_connection`"),
-        (MEMORY_HELPER.to_string(), vec![("app/models/legacy.rb", "class Legacy < ActiveRecord::Base\n  establish_connection(adapter: \"mysql2\")\nend\n")], "app/models/legacy.rb: another"),
+        (MEMORY_HELPER.to_string(), vec![("test/other_test.rb", postgres)], "test/other_test.rb: `ActiveRecord::Base.establish_connection"),
+        (MEMORY_HELPER.to_string(), vec![("app/models/legacy.rb", "class Legacy < ActiveRecord::Base\n  establish_connection(adapter: \"mysql2\")\nend\n")], "app/models/legacy.rb: `establish_connection"),
+        // Any load but a gem's `require "name"`.
+        (format!("{MEMORY_HELPER}Dir[File.join(__dir__, \"support/**/*.rb\")].sort.each {{ |f| require f }}\n"), vec![], "loads a file"),
+        (format!("{MEMORY_HELPER}require File.expand_path(\"support/schema\", __dir__)\n"), vec![], "loads a file"),
+        (format!("{MEMORY_HELPER}require \"./test/support/schema\"\n"), vec![], "loads a file"),
+        (format!("{MEMORY_HELPER}Kernel.load \"test/support/schema.rb\"\n"), vec![], "loads a file"),
+        (format!("Process.exit if ENV[\"SKIP\"]\n{MEMORY_HELPER}"), vec![], "can stop the helper before its connection"),
+        (format!("{MEMORY_HELPER}ActiveRecord::Base.public_send(:connects_to, database: {{ writing: :primary }})\n"), vec![], "connects by a dynamic call"),
+        // Another file's schema, connection or statement at load.
+        (
+            MEMORY_HELPER.to_string(),
+            vec![("test/widget_test.rb", "ActiveRecord::Schema.define do\n  create_table :widgets\nend\n\nclass WidgetTest < ActiveSupport::TestCase\nend\n")],
+            "test/widget_test.rb: `ActiveRecord::Schema.define",
+        ),
+        (
+            MEMORY_HELPER.to_string(),
+            vec![("test/widget_test.rb", "ActiveRecord::Base.connection.execute(\"CREATE TABLE widgets (id INTEGER)\")\n")],
+            "as the file loads",
+        ),
+        (
+            MEMORY_HELPER.to_string(),
+            vec![("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n  connects_to database: { writing: :primary }\nend\n")],
+            "app/models/application_record.rb: `connects_to",
+        ),
+        (MEMORY_HELPER.to_string(), vec![("app/models/legacy.rb", "class Legacy < ActiveRecord::Base\n  send(:establish_connection, :legacy)\nend\n")], "sets another connection"),
+        (MEMORY_HELPER.to_string(), vec![("app/views/a/b.html.erb", "<% ActiveRecord::Base.establish_connection(:x) %>\n")], "a template names a connecting call"),
+        (
+            MEMORY_HELPER.to_string(),
+            vec![("roundhouse.yml", "test_paths:\n  - test\n  - spec\n"), ("spec/other_test.rb", postgres)],
+            "spec/other_test.rb: `ActiveRecord::Base.establish_connection",
+        ),
         (
             "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\", database: \"db/x.sqlite3\")\n".to_string(),
             vec![],
             "option `database` is given twice",
         ),
     ];
-    for (helper, files, why) in cases {
-        let diags = helper_connection_diagnostics_in(&helper, &files);
-        assert!(
-            diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error && d.message.contains(why)),
-            "{helper} {files:?}: expected an error naming {why:?}, got {diags:?}"
-        );
-    }
+    let missed: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(helper, files, why)| {
+            let diags = helper_connection_diagnostics_in(&helper, &files);
+            let refused =
+                diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error && d.message.contains(why));
+            (!refused).then(|| format!("{helper} {files:?}: expected an error naming {why:?}, got {diags:?}"))
+        })
+        .collect();
+    assert!(missed.is_empty(), "{} not refused:\n{}", missed.len(), missed.join("\n"));
 }
 
 /// What a gem's helper usually carries beside its connection leaves it

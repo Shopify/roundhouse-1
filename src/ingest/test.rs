@@ -387,75 +387,132 @@ const DATABASE_CALLS: &[&str] = &[
     "migrate",
 ];
 
+/// Calls that set the connection a class runs on.
+const CONNECTING_CALLS: &[&str] = &["establish_connection", "connects_to", "remove_connection"];
+
 /// Receivers whose every call touches the database.
 const DATABASE_RECEIVERS: &[&str] =
     &["ActiveRecord::Schema", "ActiveRecord::Migration", "ActiveRecord::Migrator", "ActiveRecord::Tasks"];
 
-/// Calls that stop the file where they stand.
+/// Calls that stop the file where they stand, bare or on `Kernel` or
+/// `Process`.
 const EXITS: &[&str] = &["exit", "exit!", "abort", "raise", "fail", "throw"];
+
+/// Calls that load another file, bare or on `Kernel`.
+const LOADS: &[&str] = &["require", "require_relative", "load", "autoload"];
+
+/// Where a scanned file stands: the test helper itself, or any other
+/// file of the app.
+#[derive(Clone, Copy, PartialEq)]
+enum Scanned {
+    Helper,
+    Other,
+}
+
+struct Scan<'a> {
+    kind: Scanned,
+    local: &'a dyn Fn(&str) -> bool,
+    found: Vec<String>,
+    exits: bool,
+    /// Inside a method or block: code that runs when called, not as the
+    /// file loads.
+    deferred: usize,
+}
+
+impl Scan<'_> {
+    fn runs_at_load(&self) -> bool {
+        self.deferred == 0
+    }
+}
+
+impl<'pr> ruby_prism::Visit<'pr> for Scan<'_> {
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        self.deferred += 1;
+        ruby_prism::visit_def_node(self, node);
+        self.deferred -= 1;
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        // A helper's block (`Dir[...].each { |f| require f }`) runs as it
+        // loads; another file's is a test body or a callback.
+        let defer = self.kind == Scanned::Other;
+        self.deferred += defer as usize;
+        ruby_prism::visit_block_node(self, node);
+        self.deferred -= defer as usize;
+    }
+    fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        if self.deferred == 0 {
+            self.exits = true;
+        }
+        ruby_prism::visit_return_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let name = constant_id_str(&node.name()).to_string();
+        let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).to_string();
+        let receiver = node.receiver().map(|r| text(&r).trim_start_matches("::").to_string());
+        let bare_or_on = |modules: &[&str]| receiver.as_deref().is_none_or(|r| modules.contains(&r));
+        let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        // Its first line, which names it.
+        let call = text(&node.as_node()).lines().next().unwrap_or_default().trim_end().to_string();
+        // `send(:establish_connection, …)` and its kin.
+        let sent = matches!(name.as_str(), "send" | "public_send" | "__send__")
+            .then(|| args.first())
+            .flatten()
+            .and_then(|a| {
+                a.as_symbol_node()
+                    .map(|s| String::from_utf8_lossy(s.unescaped()).to_string())
+                    .or_else(|| a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string()))
+            });
+        let on_schema = receiver
+            .as_deref()
+            .is_some_and(|r| DATABASE_RECEIVERS.iter().any(|root| r == *root || r.starts_with(&format!("{root}::")) || r.starts_with(&format!("{root}["))));
+        match self.kind {
+            Scanned::Helper => {
+                if DATABASE_CALLS.contains(&name.as_str()) || on_schema {
+                    self.found.push(format!("`{call}` runs against the database"));
+                } else if sent.as_deref().is_some_and(|m| CONNECTING_CALLS.contains(&m)) {
+                    self.found.push(format!("`{call}` connects by a dynamic call"));
+                } else if LOADS.contains(&name.as_str()) && bare_or_on(&["Kernel"]) {
+                    // Only a gem's `require "name"` is known not to load a
+                    // file of the app's.
+                    let gem = name == "require"
+                        && args.len() == 1
+                        && args[0].as_string_node().is_some_and(|s| {
+                            let feature = String::from_utf8_lossy(s.unescaped()).to_string();
+                            !feature.starts_with(['.', '/', '~']) && !(self.local)(&feature)
+                        });
+                    if !gem {
+                        self.found.push(format!("`{call}` loads a file the harness does not carry"));
+                    }
+                } else if self.deferred == 0 && EXITS.contains(&name.as_str()) && bare_or_on(&["Kernel", "Process"]) {
+                    self.exits = true;
+                }
+            }
+            Scanned::Other => {
+                if CONNECTING_CALLS.contains(&name.as_str()) || sent.as_deref().is_some_and(|m| CONNECTING_CALLS.contains(&m)) {
+                    self.found.push(format!("`{call}` sets another connection"));
+                } else if on_schema {
+                    self.found.push(format!("`{call}` runs against the database"));
+                } else if self.runs_at_load() && DATABASE_CALLS.contains(&name.as_str()) {
+                    self.found.push(format!("`{call}` runs against the database as the file loads"));
+                }
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
 
 /// What in the test helper could set or change the database its tests
 /// run on, besides its `establish_connection` calls, that the emitted
 /// harness does not carry: a call that runs against the database or
-/// reconnects (anywhere in the file), a local file it loads
-/// (`require_relative`, `load`, or a `require` that `local` says names a
-/// file of the app's), and a top-level statement before its first
-/// connection that can stop the file first (`return`, `exit`, `raise`
-/// and the like), after which the connection is no longer certain.
+/// reconnects (anywhere in the file), any load of another file but a
+/// gem's `require "name"` (`local` says whether the app has the file),
+/// and a top-level statement before its first connection that can stop
+/// the file first (`return`, `exit`, `raise` and the like), after which
+/// the connection is no longer certain.
 pub fn helper_connection_blockers(source: &[u8], file: &str, local: &dyn Fn(&str) -> bool) -> Vec<String> {
-    struct Scan<'a> {
-        local: &'a dyn Fn(&str) -> bool,
-        found: Vec<String>,
-        exits: bool,
-        in_def: usize,
-    }
-    impl<'pr> ruby_prism::Visit<'pr> for Scan<'_> {
-        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
-            self.in_def += 1;
-            ruby_prism::visit_def_node(self, node);
-            self.in_def -= 1;
-        }
-        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
-            if self.in_def == 0 {
-                self.exits = true;
-            }
-            ruby_prism::visit_return_node(self, node);
-        }
-        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            let name = constant_id_str(&node.name()).to_string();
-            let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).to_string();
-            let receiver = node.receiver().map(|r| text(&r));
-            let first_string = || {
-                node.arguments().and_then(|args| {
-                    args.arguments().iter().next().and_then(|a| {
-                        a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string())
-                    })
-                })
-            };
-            if DATABASE_CALLS.contains(&name.as_str()) {
-                self.found.push(format!("`{}` runs against the database", text(&node.as_node())));
-            } else if let Some(recv) = receiver.as_deref().map(|r| r.trim_start_matches("::"))
-                && DATABASE_RECEIVERS.iter().any(|root| recv == *root || recv.starts_with(&format!("{root}::")))
-            {
-                self.found.push(format!("`{recv}.{name}` runs against the database"));
-            } else if receiver.is_none() {
-                match name.as_str() {
-                    "require_relative" | "load" => {
-                        self.found.push(format!("`{}` loads a file the harness does not carry", text(&node.as_node())))
-                    }
-                    "require" if first_string().is_some_and(|f| (self.local)(&f)) => {
-                        self.found.push(format!("`{}` loads a file the harness does not carry", text(&node.as_node())))
-                    }
-                    _ if self.in_def == 0 && EXITS.contains(&name.as_str()) => self.exits = true,
-                    _ => {}
-                }
-            }
-            ruby_prism::visit_call_node(self, node);
-        }
-    }
     let result = super::prism::parse_silent(source);
     let root = result.node();
-    let mut scan = Scan { local, found: Vec::new(), exits: false, in_def: 0 };
+    let mut scan = Scan { kind: Scanned::Helper, local, found: Vec::new(), exits: false, deferred: 0 };
     ruby_prism::Visit::visit(&mut scan, &root);
     let mut found: Vec<String> = scan.found.into_iter().map(|why| format!("{file}: {why}")).collect();
     // The exits that matter come before the first connection, at the
@@ -465,7 +522,7 @@ pub fn helper_connection_blockers(source: &[u8], file: &str, local: &dyn Fn(&str
             if count_connections(&stmt) > 0 {
                 break;
             }
-            let mut exits = Scan { local, found: Vec::new(), exits: false, in_def: 0 };
+            let mut exits = Scan { kind: Scanned::Helper, local, found: Vec::new(), exits: false, deferred: 0 };
             ruby_prism::Visit::visit(&mut exits, &stmt);
             if exits.exits {
                 found.push(format!(
@@ -479,11 +536,18 @@ pub fn helper_connection_blockers(source: &[u8], file: &str, local: &dyn Fn(&str
     found
 }
 
-/// How many `establish_connection` calls a Ruby source makes, anywhere
-/// in it.
-pub fn connection_calls(source: &[u8]) -> usize {
+/// What in another Ruby file of the app could set or change the
+/// database the helper's connection names: a connecting call
+/// (`establish_connection`, `connects_to`, `remove_connection`, also
+/// through `send`), a schema or migration call, or a statement on a
+/// connection that runs as the file loads (not in a method, a test body
+/// or another block).
+pub fn connection_blockers(source: &[u8], file: &str) -> Vec<String> {
     let result = super::prism::parse_silent(source);
-    count_connections(&result.node())
+    let local = |_: &str| false;
+    let mut scan = Scan { kind: Scanned::Other, local: &local, found: Vec::new(), exits: false, deferred: 0 };
+    ruby_prism::Visit::visit(&mut scan, &result.node());
+    scan.found.into_iter().map(|why| format!("{file}: {why}")).collect()
 }
 
 fn count_connections(node: &Node<'_>) -> usize {
