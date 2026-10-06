@@ -1418,24 +1418,18 @@ end
     // helper configuring Rails' own base, not a class of the app's.
     if vfs.exists(&helper_rb) {
         if let Some(source) = read_or_ledger(vfs, &helper_rb)? {
+            // A reopen's `setup` is spliced into every test; nothing
+            // carries its teardown, so refuse it rather than drop it.
+            for class in super::test::helper_reopen_teardowns(&source, &helper_rb.display().to_string()) {
+                unwrap_or_record::<()>(Err(IngestError::Unsupported {
+                    file: helper_rb.display().to_string(),
+                    message: format!("test teardown not modeled: `{class}`'s teardown in the test helper would run after no test"),
+                }))?;
+            }
             if let Some(tms) =
                 unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
             {
-                for mut tm in tms {
-                    if tm.parent.is_none() {
-                        // The reopen's `setup` is spliced into every test
-                        // (`ingest_test_case_setup`); nothing carries its
-                        // `teardown`, so refuse it rather than drop it.
-                        if tm.name.0.as_str().ends_with("TestCase")
-                            && tm.helpers.iter().any(|m| m.name.as_str() == "teardown")
-                        {
-                            unwrap_or_record::<()>(Err(IngestError::Unsupported {
-                                file: helper_rb.display().to_string(),
-                                message: format!("test teardown not modeled: `{}`'s teardown in the test helper would run after no test", tm.name.0),
-                            }))?;
-                        }
-                        continue;
-                    }
+                for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
                     splice_test_helpers(&mut tm, &shared_test_helpers);
                     app.test_modules.push(tm);
                 }
