@@ -7797,6 +7797,65 @@ fn a_test_class_assertion_calling_super_is_refused_by_name() {
     assert!(run.errors.iter().any(|e| e.contains("assertion_super") && e.contains("assert_includes")), "{:?}", run.errors);
 }
 
+/// A `next`, `break` or `redo` whose target is the block of an assertion
+/// the lowerer splices into the test (`assert_difference`,
+/// `assert_raises`, `assert_throws`) would, once spliced, leave whatever
+/// encloses the assertion instead: a false pass, other effects, or a
+/// syntax error, where natively it leaves only the block. So is a
+/// `return` in the tail of an `assert_difference` block whose value is
+/// assigned, which becomes a void value (conservatively also when only
+/// one branch returns, which Ruby would accept). Each is refused by
+/// name, on every target. Outcomes natively: f3a/native.log.
+#[test]
+fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
+    use roundhouse::project::BuildTarget;
+    let cases = [
+        ("diff_next_stmt", "next", "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      next\n    end\n    Widget.hit\n  end\n"),
+        ("diff_next_each", "next", "  test \"t\" do\n    [1].each do\n      assert_difference(\"Widget.hits\", 2) do\n        Widget.hit\n        next\n      end\n      Widget.hit\n    end\n  end\n"),
+        ("diff_break_cond", "break", "  test \"t\" do\n    [1, 2].each do |x|\n      assert_difference(\"Widget.hits\") do\n        Widget.hit\n        break if x == 1\n      end\n      Widget.hit\n    end\n  end\n"),
+        ("diff_next_value", "next", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      next 3 unless Widget.flag\n      4\n    end\n    assert_equal 3, v\n  end\n"),
+        ("diff_next_capio", "next", "  test \"t\" do\n    out, err = capture_io do\n      v = assert_difference(\"Widget.hits\", 2) do\n        Widget.hit\n        next 3\n      end\n      Widget.hit\n    end\n  end\n"),
+        ("diff_return_tail", "return", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return\n    end\n    Widget.hit\n  end\n"),
+        ("diff_return_cond_tail", "return", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n    end\n    Widget.hit\n  end\n"),
+        ("raises_next", "next", "  test \"t\" do\n    [1].each do\n      assert_raises(ArgumentError) do\n        Widget.hit\n        next\n      end\n      Widget.hit\n    end\n  end\n"),
+        ("throws_next", "next", "  test \"t\" do\n    assert_throws(:done) do\n      Widget.hit\n      next\n    end\n    Widget.hit\n  end\n"),
+        ("throws_break", "break", "  test \"t\" do\n    [1].each do\n      assert_throws(:done) do\n        Widget.hit\n        break\n      end\n      Widget.hit\n    end\n  end\n"),
+        ("nested_assert_next", "next", "  test \"t\" do\n    [1].each do\n      assert_difference(\"Widget.hits\", 2) do\n        assert_difference(\"Widget.hits\") do\n          Widget.hit\n          next\n        end\n        Widget.hit\n      end\n      Widget.hit\n    end\n  end\n"),
+    ];
+    for (name, jump, members) in cases {
+        for target in [BuildTarget::Ruby, BuildTarget::Spinel, BuildTarget::Typescript] {
+            let (_, errors) = destructured_block_app(name, members).emit(target);
+            assert!(
+                errors.iter().any(|e| e.contains("assertion_block_jump") && e.contains(&format!("`{jump}`"))),
+                "{name} {target:?}: {errors:?}"
+            );
+        }
+    }
+}
+
+/// A jump confined to a loop, block or lambda inside the spliced block,
+/// a statement-position `return` (which leaves the test either way), and
+/// a jump in a block the lowerer does not splice (a test class's own
+/// `assert_difference`, `capture_io`) run as natively, with its effect
+/// count.
+#[test]
+fn a_jump_that_stays_inside_an_assertion_block_runs_as_written() {
+    let cases = [
+        ("diff_return_stmt", 1, "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n    end\n    Widget.hit\n  end\n"),
+        ("diff_return_value", 1, "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n      4\n    end\n    Widget.hit\n  end\n"),
+        ("inner_each_next", 2, "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      [1, 2, 3].each do |x|\n        next if x == 2\n        Widget.hit\n      end\n    end\n    assert_equal 2, Widget.hits\n  end\n"),
+        ("inner_while_break", 1, "  test \"t\" do\n    v = assert_difference(\"Widget.hits\") do\n      while true\n        Widget.hit\n        break\n      end\n      5\n    end\n    assert_equal 5, v\n  end\n"),
+        ("inner_lambda", 1, "  test \"t\" do\n    assert_difference(\"Widget.hits\") do\n      f = -> { return 5 }\n      Widget.hit if f.call == 5\n    end\n  end\n"),
+        ("own_difference", 2, "  def assert_difference(_expression, _delta = 1)\n    Widget.hit\n    yield\n  end\n\n  test \"t\" do\n    assert_difference(\"Widget.hits\") do\n      next\n    end\n    Widget.hit\n    assert_equal 2, Widget.hits\n  end\n"),
+        ("capio_next", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      $stdout.puts \"x\"\n      next\n    end\n    assert_equal \"x\\n\", out\n    assert_equal 1, Widget.hits\n  end\n"),
+    ];
+    for (name, hits, members) in cases {
+        let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
+        run.assert_passes();
+        assert!(run.stdout.contains(&format!("F3 {name} HITS={hits}\n")), "{name}: {}", run.stdout);
+    }
+}
+
 /// A nested destructuring target is refused by name at ingest rather
 /// than lowered with its block's assertions dropped.
 #[test]
