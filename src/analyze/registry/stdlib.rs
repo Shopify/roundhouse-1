@@ -32,6 +32,56 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     );
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
 
+    // `Rails.event` / `Rails.error` — ActiveSupport's EventReporter and
+    // ErrorReporter, answered by runtime/ruby/active_support_reporters.rb
+    // (activesupport 8.1.4). Registered here because a runtime `.rbs`
+    // does not feed app analysis. A block-taking method answers its
+    // block's value, which this table cannot see: `Untyped`.
+    let class = |name: &str| Ty::Class { id: ClassId(Symbol::from(name)), args: vec![] };
+    let sym_hash = || Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) };
+    let untyped_arr = || Ty::Array { elem: Box::new(Ty::Untyped) };
+    let event_reporter = class("ActiveSupport::EventReporter");
+    let error_reporter = class("ActiveSupport::ErrorReporter");
+    register_stdlib_class(classes, "Rails", &[
+        ("event", event_reporter.clone()), ("error", error_reporter.clone()),
+    ], &[]);
+    register_stdlib_class(classes, "ActiveSupport", &[
+        ("event_reporter", event_reporter.clone()), ("error_reporter", error_reporter.clone()),
+        ("event_reporter=", event_reporter.clone()), ("error_reporter=", error_reporter.clone()),
+        ("filter_parameters", untyped_arr()), ("filter_parameters=", untyped_arr()),
+    ], &[]);
+    register_stdlib_class(classes, "ActiveSupport::EventReporter", &[
+        ("new", event_reporter.clone()),
+        ("context_store", Ty::Untyped), ("context_store=", Ty::Untyped),
+    ], &[
+        ("notify", Ty::Nil), ("debug", Ty::Nil),
+        ("tagged", Ty::Untyped), ("with_debug", Ty::Untyped),
+        ("set_context", sym_hash()), ("clear_context", sym_hash()), ("context", sym_hash()),
+        ("subscribe", untyped_arr()), ("unsubscribe", untyped_arr()),
+        ("subscribers", untyped_arr()), ("debug_mode?", Ty::Bool),
+        ("debug_mode=", Ty::Bool), ("raise_on_error=", Ty::Bool),
+        ("reload_payload_filter", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::ErrorReporter", &[
+        ("new", error_reporter.clone()),
+    ], &[
+        ("report", Ty::Nil), ("unexpected", Ty::Nil),
+        ("handle", Ty::Untyped), ("record", Ty::Untyped), ("disable", Ty::Untyped),
+        ("set_context", Ty::Untyped),
+        ("subscribe", untyped_arr()), ("unsubscribe", untyped_arr()),
+        ("add_middleware", untyped_arr()),
+        ("logger", Ty::Untyped), ("logger=", Ty::Untyped),
+        ("debug_mode", Ty::Bool), ("debug_mode=", Ty::Bool),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::ErrorReporter::UnexpectedError", &[], &[
+        ("message", Ty::Str), ("cause", Ty::Untyped), ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::ExecutionContext", &[
+        ("set", Ty::Untyped), ("[]=", Ty::Untyped), ("to_h", sym_hash()),
+        ("clear", Ty::Nil), ("push", Ty::Untyped), ("pop", Ty::Untyped), ("flush", Ty::Untyped),
+        ("nestable", Ty::Bool), ("nestable=", Ty::Bool),
+    ], &[]);
+
     // `ActionController::BrowserBlocker.blocked?(user_agent, floors)` —
     // the gate `ingest::allow_browser` synthesizes into a controller
     // body for `allow_browser`, answered by

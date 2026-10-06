@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "active_support_reporters"
+
 # Minimal, statically-resolvable `Rails` global for the roundhouse
 # runtime — `Rails.env` / `Rails.cache` / `Rails.logger` plus an (empty)
 # `Rails.application` config stand-in.
@@ -126,6 +128,16 @@ module Rails
 
   def self.application
     Application.new
+  end
+
+  # `Rails.error` / `Rails.event` — ActiveSupport's process-wide
+  # reporters, as railties answers them (active_support_reporters.rb).
+  def self.error
+    ActiveSupport.error_reporter
+  end
+
+  def self.event
+    ActiveSupport.event_reporter
   end
 
   # `Rails.env.production?` etc. — a plain object answering the known

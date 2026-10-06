@@ -891,6 +891,13 @@ pub fn parse_methods_with_rbs_in_ctx(
             for (param, p) in m.params.iter().zip(params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
             }
+            // `def subscribe(subscriber, &block)`: the captured block is
+            // the signature's block, which `m.params` does not carry.
+            if let Some(block_param) = &m.block_param {
+                if let Some(p) = params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
+                    ctx.local_bindings.insert(block_param.name.clone(), p.ty.clone());
+                }
+            }
         }
         if let Some(enclosing) = &m.enclosing_class {
             ctx.self_ty = Some(Ty::Class {

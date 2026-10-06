@@ -4359,6 +4359,8 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // shares this tree and must keep Base for CRuby/JRuby Bar A/B.
     for stem in [
         "rails",
+        // `Rails.error` / `Rails.event`, which rails.rb requires.
+        "active_support_reporters",
         "active_record",
         "action_view",
         "action_controller",

@@ -1,4 +1,8 @@
-//! Registry-only reporters and undefined application tracers are not executable support.
+//! Undefined application tracers and unported clocks are not executable
+//! support. `Rails.event` / `Rails.error` are: they resolve to the
+//! runtime's EventReporter / ErrorReporter
+//! (runtime/ruby/active_support_reporters.rb, compared against
+//! activesupport 8.1.4 by tests/reporters_runtime.rb).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,7 +33,7 @@ fn diagnostics_for(body: &str) -> Vec<String> {
 }
 
 #[test]
-fn unimplemented_reporters_and_tracers_are_refused() {
+fn unimplemented_tracers_are_refused_and_reporters_resolve() {
     let diags = diagnostics_for(
         r#"    Rails.event.notify("thing", message: "m")
     Rails.event.tagged(a: 1) { Rails.event.debug("d", message: "x") }
@@ -42,7 +46,10 @@ fn unimplemented_reporters_and_tracers_are_refused() {
     ShopifyTracer.in_span("x") { |s| 1 }
     [t + 1.0, ms + 1, fm + 1.0]"#,
     );
-    for name in ["event", "error", "ShopifyTracer", "Process"] {
+    for name in ["ShopifyTracer", "Process"] {
         assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
+    }
+    for gap in ["`event` on", "`error` on", "event lacks", "error lacks", "`notify`", "`report`", "`tagged`", "`handle`"] {
+        assert!(!diags.iter().any(|d| d.contains(gap)), "reporter refused ({gap}): {diags:?}");
     }
 }
