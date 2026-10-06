@@ -1050,33 +1050,20 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// Lowerings that copy the parameters into a generated method (job and
 /// mailer wrappers) refuse it themselves.
 ///
-/// Only required positionals may precede the `*`, and nothing but a
-/// block may follow it. A call's keywords are lowered as a trailing
-/// positional hash, which such a method takes into the rest, where no
-/// body can read it, exactly as Ruby does for a method that accepts no
-/// keywords. That holds however the call reaches the method
-/// (`method_missing`, a reified method, a block), so no call site has
-/// to be found. A keyword, optional or post parameter would bind that
-/// hash instead, so those stay refused.
-///
-/// A required positional can still be filled by a `**h` the call
-/// passes. That binds the right value, but it is the caller's hash
-/// object, where Ruby passes a copy. A named selector, a dispatcher
-/// and a reified method are refused at the call (analyze/forwarding.rs).
-/// `method_missing` is reached by no selector, so it is admitted only
-/// as `(name, *)` or `(*)`, with no positional left to fill.
+/// Nothing but a block may accompany the `*`. Every argument a call
+/// passes, its keywords lowered to a trailing positional hash included,
+/// then lands in the rest, where no body can read it, as Ruby does for
+/// a method that accepts no keywords. That holds however the call
+/// reaches the method (`method_missing`, a reified or dispatched method,
+/// a block), so no call site has to be found. Any other parameter could
+/// bind that hash (a required positional takes the caller's hash object
+/// where Ruby passes a copy), and the paths that reach a method unnamed
+/// are open-ended, so those stay refused.
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
             && m.receiver == MethodReceiver::Instance
-            && m.params.split_last().is_some_and(|(last, front)| {
-                last.is_nameless_rest()
-                    && front.iter().all(|p| {
-                        !p.keyword && !p.rest && !p.forwarding && p.default.is_none()
-                            && !p.from_keyword && !p.from_kwrest
-                    })
-                    && (m.name.as_str() != "method_missing" || front.len() <= 1)
-            })
+            && matches!(m.params.as_slice(), [only] if only.is_nameless_rest())
         {
             m.unsupported_formals = None;
         }

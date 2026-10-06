@@ -7901,9 +7901,9 @@ fn a_nested_destructuring_target_is_refused_by_name() {
     assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
 }
 
-const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(a, *, &blk)\n    [a, blk ? blk.call : nil]\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(a, *rest)\n    [rest.size] + super(a)\n  end\nend\n";
+const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(*, &blk)\n    blk ? blk.call : :none\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(*rest)\n    [rest.size, super(rest.first)]\n  end\nend\n";
 
-const NAMELESS_REST_TEST: &str = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"arity\" do\n    p = Probe.new\n    assert_equal [1, nil], p.m(1, 2, 3)\n    assert_equal [1, 9], p.m(1, 2, k: 5) { 9 }\n    assert_equal \"wrong number of arguments (given 0, expected 1+)\", assert_raises(ArgumentError) { p.m }.message\n    assert_equal 44, p.acquire(:a, b: 1) { 44 }\n    assert_equal 7, p.first_of([7, 8])\n    assert_equal [2, 1, nil], Child.new.m(1, 2, 3)\n  end\nend\n";
+const NAMELESS_REST_TEST: &str = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"arity\" do\n    p = Probe.new\n    assert_equal :none, p.m(1, 2, 3)\n    assert_equal :none, p.m\n    assert_equal 9, p.m(1, 2, k: 5) { 9 }\n    assert_equal 44, p.acquire(:a, b: 1) { 44 }\n    assert_equal 7, p.first_of([7, 8])\n    assert_equal [3, :none], Child.new.m(1, 2, 3)\n  end\nend\n";
 
 fn nameless_rest_app(probe: &str, test: &str) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -7912,7 +7912,7 @@ fn nameless_rest_app(probe: &str, test: &str) -> emit_and_run::Overlay {
         .write("test/models/probe_test.rb", test)
 }
 
-/// `def m(a, *)` takes any number of extra positionals and binds none.
+/// `def m(*)` takes any number of positionals and keywords and binds none.
 /// A library class's own instance method is emitted where it is
 /// written, so the CRuby tree keeps that arity.
 #[test]
@@ -7954,9 +7954,9 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("module", "module Mixin\n  def m(*)\n    :mixed\n  end\nend\n\nclass Probe\n  include Mixin\nend\n", "anonymous positional rest is not retained"),
         ("class_side", "class Probe\n  def self.m(*)\n    :klass\n  end\nend\n", "anonymous positional rest is not retained"),
         ("singleton", "class Probe\n  class << self\n    def m(*)\n      :klass\n    end\n  end\nend\n", "anonymous positional rest is not retained"),
-        ("reopened", "class Probe\n  def first\n    :first\n  end\nend\n\nclass Probe\n  def m(a, *)\n    [a, first]\n  end\nend\n", "nameless rest in a reopened class fragment"),
+        ("reopened", "class Probe\n  def first\n    :first\n  end\nend\n\nclass Probe\n  def m(*)\n    first\n  end\nend\n", "nameless rest in a reopened class fragment"),
         ("no_keywords", "class Probe\n  def m(*, **nil)\n    :ok\n  end\nend\n", "no-keywords constraint is not retained"),
-        ("forwarded_into", "class Probe\n  def m(a, *)\n    a\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
+        ("forwarded_into", "class Probe\n  def m(*)\n    :m\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
         ("keyword_splat_super", "class Probe\n  def m(*)\n    7\n  end\nend\n\nclass Kid < Probe\n  def m(**h)\n    super(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
         ("new_keyword_splat", "class Probe\n  def initialize(*, **kw)\n    @kw = kw\n  end\n\n  def self.make(h)\n    new(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
         ("send_keyword_splat", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    send(:m, **h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
@@ -7964,26 +7964,28 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("public_send_keyword_splat", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    public_send(:m, **h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
         ("method_object_yield", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h)\n    each(h, &method(:m))\n  end\nend\n", "method object of an anonymous positional rest"),
         ("method_object_value", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    f = method(:m)\n    f.call(h)\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("delegate", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("delegate", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("block_default_passes_on", "class Probe\n  def m(*)\n    [1].map { |x = [*]| x }\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("required_positional", "class Probe\n  def m(a, *)\n    a\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("method_missing_name", "class Probe\n  def method_missing(name, *)\n    name\n  end\nend\n", "anonymous positional rest is not retained"),
         ("keyword_param", "class Probe\n  def m(a, *, k: 1)\n    [a, k]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("optional_param", "class Probe\n  def m(a, b = 0, *)\n    [a, b]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("post_param", "class Probe\n  def m(a, *, z)\n    [a, z]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("method_missing_keywords", "class Probe\n  def method_missing(name, *, **kw)\n    [name, kw]\n  end\n\n  def go(h)\n    foo(**h)\n  end\nend\n", "anonymous positional rest is not retained"),
         ("method_missing_positional", "class Probe\n  def method_missing(name, a, *)\n    a[:y] = 1\n    [name, a]\n  end\n\n  def go(h)\n    foo(**h)\n  end\nend\n", "anonymous positional rest is not retained"),
-        ("reify_public_send", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(:method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_send_strings", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &__send__(\"method\", \"m\"))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_public_method", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &send(:public_method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_computed_name", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &method(\"m\".to_sym))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_computed_reifier", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(nm, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_public_instance_method", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &Probe.public_instance_method(:m).bind(self))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_a_reifier", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &Kernel.instance_method(:method).bind_call(self, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_a_dispatcher", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &method(:public_send).call(:method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_nested_dispatch", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &send(:send, :method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_splatted_dispatch", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &send(*[:method, :m]))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("reify_computed_selector", "class Probe\n  def m(a, *)\n    a[:y] = 1\n    a\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &public_send(:method, n2))\n  end\nend\n", "method object of an anonymous positional rest"),
-        ("delegate_string", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
-        ("delegate_missing_to", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("reify_public_send", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(:method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_send_strings", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &__send__(\"method\", \"m\"))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_public_method", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &send(:public_method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_computed_name", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &method(\"m\".to_sym))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_computed_reifier", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method)\n    each(h, &public_send(nm, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_public_instance_method", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &Probe.public_instance_method(:m).bind(self))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_a_reifier", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &Kernel.instance_method(:method).bind_call(self, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_a_dispatcher", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &method(:public_send).call(:method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_nested_dispatch", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &send(:send, :method, :m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_splatted_dispatch", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &send(*[:method, :m]))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("reify_computed_selector", "class Probe\n  def m(*)\n    :m\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h, nm = :method, n2 = :m)\n    each(h, &public_send(:method, n2))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("delegate_string", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("delegate_missing_to", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("override_implicit_super", "class Probe\n  def m(*, **kw)\n    kw\n  end\nend\n\nclass Kid < Probe\n  def m(a, k: 1)\n    super\n  end\nend\n", "implicit super into an anonymous positional rest"),
         ("default_passes_on", "class Probe\n  def m(*, k: [*])\n    k\n  end\nend\n", "anonymous positional rest is not retained"),
         ("keyword_splat_into", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    m(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
@@ -7997,17 +7999,17 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
     let (_, errors) = nameless_rest_app("class Probe\nend\n", helper).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("anonymous positional rest is not retained")), "helper: {errors:?}");
     let inner = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  class Wrapper\n    delegate :m, to: :probe\n\n    def probe\n      Probe.new\n    end\n  end\n\n  test \"t\" do\n    assert_equal 1, Wrapper.new.m(1, 2)\n  end\nend\n";
-    let (_, errors) = nameless_rest_app("class Probe\n  def m(a, *)\n    a\n  end\nend\n", inner).emit(BuildTarget::Ruby);
+    let (_, errors) = nameless_rest_app("class Probe\n  def m(*)\n    :m\n  end\nend\n", inner).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("delegate to an anonymous positional rest")), "test class delegate: {errors:?}");
 }
 
 /// Keywords a call passes, however it reaches the method, land in the
-/// rest when only required positionals precede it, as in Ruby. A
+/// rest when nothing but a block accompanies it, as in Ruby. A
 /// method object of a method without a nameless rest stays admitted.
 #[test]
 fn keywords_into_an_admitted_nameless_rest_are_unread_on_cruby() {
-    let probe = "class Probe\n  def method_missing(name, *)\n    name\n  end\n\n  def respond_to_missing?(name, *)\n    true\n  end\n\n  def other(x)\n    x + 1\n  end\n\n  def go(h)\n    [foo(**h), bar(1, k: 2), baz(**{}), respond_to?(:x, true), [1].map(&public_send(:method, :other)), [2].map(&method(:other))]\n  end\nend\n";
-    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal [:foo, :bar, :baz, true, [2], [3]], Probe.new.go({ x: 2 })\n  end\nend\n";
+    let probe = "class Probe\n  def method_missing(*)\n    :missing\n  end\n\n  def respond_to_missing?(*)\n    true\n  end\n\n  def other(x)\n    x + 1\n  end\n\n  def go(h)\n    [foo(**h), bar(1, k: 2), baz(**{}), respond_to?(:x, true), [1].map(&public_send(:method, :other)), [2].map(&method(:other))]\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal [:missing, :missing, :missing, true, [2], [3]], Probe.new.go({ x: 2 })\n  end\nend\n";
     nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
 }
 
@@ -8024,8 +8026,8 @@ fn a_method_missing_with_only_a_nameless_rest_runs_on_cruby() {
 /// admitted rest as written, so its implicit `super` stays admitted.
 #[test]
 fn an_implicit_super_without_keywords_into_a_nameless_rest_runs_on_cruby() {
-    let probe = "class Probe\n  def m(a, *)\n    a * 2\n  end\nend\n\nclass Named < Probe\n  def m(a, *rest)\n    super\n  end\nend\n";
-    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal 6, Named.new.m(3, 4, 5)\n  end\nend\n";
+    let probe = "class Probe\n  def m(*)\n    :base\n  end\nend\n\nclass Named < Probe\n  def m(a, *rest)\n    super\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal :base, Named.new.m(3, 4, 5)\n  end\nend\n";
     nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
 }
 
