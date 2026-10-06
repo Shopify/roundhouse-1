@@ -317,12 +317,27 @@ pub(super) fn resolve(app: &mut App) {
             Some((j, Own::Named { writing, reading, span })) => {
                 let declared_by = app.models[j].name.clone();
                 let class = declared_by.0.as_str();
-                if !have_manifest {
+                if !have_manifest && app.database_yml.is_some() {
+                    // Boot resolves `config/database.yml` and checks each
+                    // named role (`DatabaseConfiguration::OWNERSHIP`); the
+                    // runtime opens only the primary, so a writing role
+                    // other than Rails' `primary` cannot be it.
+                    if writing != "primary" {
+                        note(
+                            span,
+                            "connects_to",
+                            format!(
+                                "models under `{class}` write to database `{writing}`: the emitted runtime opens only the primary configuration (resolved from `config/database.yml` at boot), and a second database is not opened yet"
+                            ),
+                            name,
+                        );
+                    }
+                } else if !have_manifest {
                     note(
                         span,
                         "connects_to",
                         format!(
-                            "`connects_to` on `{class}` names databases, and `roundhouse.yml` declares no `database_configurations` manifest to resolve them"
+                            "`connects_to` on `{class}` names databases, and `roundhouse.yml` declares no `database_configurations` manifest (or `database_adapter` for boot-time `config/database.yml` resolution) to resolve them"
                         ),
                         name,
                     );

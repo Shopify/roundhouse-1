@@ -23,6 +23,7 @@ pub mod app;
 mod concern_accessors;
 pub mod database_manifest;
 mod database_ownership;
+pub mod database_yml;
 pub mod controller;
 pub mod expr;
 pub mod fixture;

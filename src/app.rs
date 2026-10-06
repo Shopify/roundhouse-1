@@ -58,6 +58,10 @@ pub struct App {
     /// reported as an error by `analyze::database_identity`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub database_refusals: Vec<crate::database::DatabaseRefusal>,
+    /// `config/database.yml`, compiled for boot-time resolution; `None`
+    /// when the app states no compiled-for adapter ([`crate::database::DatabaseYml`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_yml: Option<crate::database::DatabaseYml>,
     pub models: Vec<Model>,
     /// Non-model classes living under `app/models/` (e.g. specialized
     /// has_many proxies). Classified at ingest time by superclass:
@@ -674,6 +678,18 @@ pub struct ImportmapPin {
 }
 
 impl App {
+    /// The adapter the primary database is compiled for: the manifest's
+    /// primary, else `config/database.yml`'s declared compile target;
+    /// `None` keeps the single-database (sqlite3) selection.
+    pub fn primary_database_adapter(&self) -> Option<&crate::database::DatabaseAdapter> {
+        self.databases
+            .iter()
+            .find(|db| db.primary && !db.replica)
+            .or_else(|| self.databases.iter().find(|db| db.primary))
+            .map(|db| &db.adapter)
+            .or_else(|| self.database_yml.as_ref().map(|yml| &yml.adapter))
+    }
+
     /// Module → the one non-module class that includes it, directly or
     /// through another module; absent when none or several do. A
     /// concern's methods run on its includer, and with exactly one
@@ -765,6 +781,7 @@ impl App {
             databases: Vec::new(),
             model_databases: indexmap::IndexMap::new(),
             database_refusals: Vec::new(),
+            database_yml: None,
             binary_assets: Vec::new(),
             models: Vec::new(),
             library_classes: Vec::new(),

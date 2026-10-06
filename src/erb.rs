@@ -98,6 +98,10 @@ impl PendingText {
     }
 
     fn flush(&mut self, out: &mut String, map: &mut Vec<ErbSegment>) {
+        self.flush_with(out, map, ruby_string_literal)
+    }
+
+    fn flush_with(&mut self, out: &mut String, map: &mut Vec<ErbSegment>, literal: fn(&str) -> String) {
         if self.text.is_empty() {
             self.range = None;
             return;
@@ -105,7 +109,7 @@ impl PendingText {
         let (e_start, e_end) = self.range.take().expect("non-empty pending has a range");
         out.push_str("_buf = _buf + ");
         let c_start = out.len();
-        out.push_str(&ruby_string_literal(&self.text));
+        out.push_str(&literal(&self.text));
         map.push(ErbSegment {
             c_start: c_start as u32,
             c_end: out.len() as u32,
@@ -389,6 +393,146 @@ pub fn compile_erb_mapped(source: &str) -> (String, Vec<ErbSegment>) {
     pending.flush(&mut out, &mut map);
     out.push_str("_buf\n");
     (out, map)
+}
+
+/// A template construct Ruby's `ERB.new(content)` (no trim mode) rejects
+/// or that this compiler does not carry, at a template byte range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErbError {
+    pub start: usize,
+    pub end: usize,
+    /// Stable construct name (`erb_unterminated_tag`, `erb_trim_marker`, ...).
+    pub construct: &'static str,
+    pub message: String,
+}
+
+/// Compile a template the way Ruby's stdlib `ERB.new(content).result`
+/// reads it. This is Rails' `ActiveSupport::ConfigurationFile#render`
+/// (config/database.yml and every `config_for` file), which passes no trim
+/// mode, so unlike view templates (Erubi with Rails' trim rules):
+///
+/// * text is copied byte for byte, including the indentation and newline
+///   around a `<% %>` tag alone on its line;
+/// * `<%%` is a literal `<%` in text;
+/// * `<%= code %>` appends `(code).to_s`, `<% code %>` is code,
+///   `<%# ... %>` is nothing.
+///
+/// `<%-`, `-%>`, `<%==`, a block-taking `<%= x do %>` and a `# comment`
+/// closing an output tag do not compile under stdlib ERB without a trim
+/// mode (they are Ruby syntax errors there), and `%%>` inside a tag is not
+/// carried; each is an [`ErbError`] naming the construct.
+///
+/// The compiled Ruby builds `_buf` and ends with `_buf`, with the same
+/// segment table as [`compile_erb_mapped`]. Text becomes double-quoted
+/// literals with `#` escaped, so YAML text containing `#{` is data.
+pub fn compile_erb_stdlib_mapped(source: &str) -> Result<(String, Vec<ErbSegment>), ErbError> {
+    let mut out = String::from("_buf = \"\"\n");
+    let mut map: Vec<ErbSegment> = Vec::new();
+    let mut pending = PendingText::default();
+    let bytes = source.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(open) = find_at(bytes, cursor, b"<%") else {
+            pending.push(&source[cursor..], cursor, source.len());
+            break;
+        };
+        pending.push(&source[cursor..open], cursor, open);
+        let marker = bytes.get(open + 2).copied();
+        if marker == Some(b'%') {
+            pending.push("<%", open, open + 3);
+            cursor = open + 3;
+            continue;
+        }
+        let body_start = match marker {
+            Some(b'=') | Some(b'#') => open + 3,
+            _ => open + 2,
+        };
+        let Some(close) = find_at(bytes, body_start, b"%>") else {
+            return Err(ErbError {
+                start: open,
+                end: source.len(),
+                construct: "erb_unterminated_tag",
+                message: "an ERB tag `<%` is never closed by `%>`".into(),
+            });
+        };
+        let end = close + 2;
+        let err = |construct: &'static str, message: &str| {
+            Err(ErbError { start: open, end, construct, message: message.into() })
+        };
+        let body = &source[body_start..close];
+        if marker == Some(b'#') {
+            cursor = end;
+            continue;
+        }
+        if body.ends_with('%') {
+            return err("erb_escaped_close", "`%%>` (ERB's escaped `%>`) inside a tag is not supported");
+        }
+        if marker == Some(b'-') || body.ends_with('-') {
+            return err(
+                "erb_trim_marker",
+                "`<%-` / `-%>` are trim markers only under an ERB trim mode; Rails renders this file with `ERB.new(content)` (no trim mode), where they are Ruby syntax errors",
+            );
+        }
+        if marker == Some(b'=') && bytes.get(open + 3) == Some(&b'=') {
+            return err(
+                "erb_raw_output",
+                "`<%==` is Erubi's raw output; Rails renders this file with stdlib ERB, where it is a Ruby syntax error",
+            );
+        }
+        let code = body.trim();
+        let lead = body.len() - body.trim_start().len();
+        let e_start = body_start + lead;
+        let is_output = marker == Some(b'=');
+        if is_output && is_block_expr(code) {
+            return err(
+                "erb_block_output",
+                "`<%= ... do %>` passes a block to an output tag; stdlib ERB (Rails' renderer for this file) cannot compile it",
+            );
+        }
+        if is_output && strip_trailing_comment(code) != code {
+            return err(
+                "erb_output_comment",
+                "a `# comment` inside `<%= %>` comments out the rest of ERB's compiled line; Rails fails to compile it",
+            );
+        }
+        pending.flush_with(&mut out, &mut map, stdlib_text_literal);
+        if is_output {
+            out.push_str("_buf = _buf + (");
+        }
+        map.push(ErbSegment {
+            c_start: out.len() as u32,
+            c_end: (out.len() + code.len()) as u32,
+            e_start: e_start as u32,
+            e_end: (e_start + code.len()) as u32,
+        });
+        out.push_str(code);
+        out.push_str(if is_output { ").to_s\n" } else { "\n" });
+        cursor = end;
+    }
+    pending.flush_with(&mut out, &mut map, stdlib_text_literal);
+    out.push_str("_buf\n");
+    Ok((out, map))
+}
+
+/// Double-quoted Ruby literal whose every byte is data: `#` is escaped
+/// (no interpolation) along with quotes, backslashes and control bytes.
+fn stdlib_text_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '#' => out.push_str("\\#"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Does `code` end in a block opener (`do`, `do |p|`, `{`, `{ |p| `)?
@@ -895,5 +1039,27 @@ mod tests {
         let plain_idx = out.find("\nend\n").unwrap();
         let close_idx = out.find("end).to_s").unwrap();
         assert!(plain_idx < close_idx, "close order wrong:\n{out}");
+    }
+
+    #[test]
+    fn stdlib_mode_keeps_text_verbatim_and_names_rejected_forms() {
+        let (out, map) = compile_erb_stdlib_mapped("a: <%= x %>\n<% if y %>\n  b: \"#{c}\" <%% d\n<% end %>\n").unwrap();
+        assert_eq!(
+            out,
+            "_buf = \"\"\n_buf = _buf + \"a: \"\n_buf = _buf + (x).to_s\n_buf = _buf + \"\\n\"\nif y\n_buf = _buf + \"\\n  b: \\\"\\#{c}\\\" <% d\\n\"\nend\n_buf = _buf + \"\\n\"\n_buf\n"
+        );
+        // Code segments are byte-identical copies of the tag body.
+        let code: Vec<_> = map.iter().filter(|s| s.c_end - s.c_start == s.e_end - s.e_start && out.as_bytes()[s.c_start as usize] != b'"').collect();
+        assert_eq!(code.len(), 3);
+        for (src, construct) in [
+            ("<%- x %>", "erb_trim_marker"),
+            ("<% x -%>", "erb_trim_marker"),
+            ("<%== x %>", "erb_raw_output"),
+            ("<%= x.each do %><% end %>", "erb_block_output"),
+            ("<%= x # note %>", "erb_output_comment"),
+            ("a <% x", "erb_unterminated_tag"),
+        ] {
+            assert_eq!(compile_erb_stdlib_mapped(src).unwrap_err().construct, construct, "{src}");
+        }
     }
 }

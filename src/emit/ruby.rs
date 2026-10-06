@@ -225,7 +225,7 @@ pub(crate) fn materialize_models(
         &params_specs,
         &assoc_scopes,
         materialization,
-        if app.databases.iter().any(|db| db.primary && db.adapter == crate::database::DatabaseAdapter::Postgresql) {
+        if app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) {
             crate::lower::arel::SqlDialect::Postgres
         } else {
             crate::lower::arel::SqlDialect::Sqlite

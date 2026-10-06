@@ -1760,6 +1760,14 @@ end
         }
     }
 
+    // `config/database.yml` as app code, for boot-time resolution: a
+    // source, so before the snapshot (`ingest::database_yml`).
+    {
+        let declared = declared_database_adapter(vfs, dir)?;
+        let manifest = database_configurations_manifest(vfs, dir)?.map(|(_, span)| span);
+        super::database_yml::ingest_declared(vfs, dir, declared, manifest, &mut app)?;
+    }
+
     // Every initializer Rails runs at boot — each in-repo engine's, then
     // the app's, in load order — is a source: registered here, before
     // the snapshot, so its statements have spans (the app's are mostly
@@ -4741,6 +4749,21 @@ struct RoundhouseConfig {
     /// Installed gem sources the app carries as its own code: gem name
     /// to the app-relative directory holding the gem's tree.
     gem_sources: std::collections::BTreeMap<String, PathBuf>,
+    /// The adapter the program is compiled for when `config/database.yml`
+    /// is resolved at boot without a manifest (`ingest::database_yml`).
+    database_adapter: Option<String>,
+}
+
+/// `roundhouse.yml`'s `database_adapter:` with the span of its key.
+fn declared_database_adapter<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+) -> IngestResult<Option<(String, crate::span::Span)>> {
+    let Some((config, text)) = roundhouse_config(vfs, dir)? else { return Ok(None) };
+    let Some(adapter) = config.database_adapter else { return Ok(None) };
+    let file = super::sources::register(&dir.join("roundhouse.yml").display().to_string(), &text);
+    let start = text.find("database_adapter").unwrap_or(0) as u32;
+    Ok(Some((adapter, crate::span::Span { file, start, end: start + "database_adapter".len() as u32 })))
 }
 
 /// `roundhouse.yml`, parsed, with its text; `None` when the app has none.

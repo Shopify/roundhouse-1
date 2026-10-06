@@ -118,6 +118,36 @@ pub struct Database {
     pub migrations_paths: Vec<String>,
 }
 
+/// The app's authored `config/database.yml`, resolved at emitted boot the
+/// way Rails resolves it (`runtime/database_configurations.rb`): its ERB
+/// is compiled into the app as the `renderer` module's `render` method,
+/// so the code it calls is analyzed and emitted app code.
+///
+/// Present when the app states the adapter it is compiled for: by a
+/// `database_configurations` manifest's primary, or by `roundhouse.yml`
+/// `database_adapter:` alone. The adapter is a compile-time choice (SQL
+/// dialect, driver); boot refuses a configuration whose primary names
+/// another. Absent, the app keeps the single-database selection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseYml {
+    /// App-relative (`config/database.yml`).
+    pub path: String,
+    /// The adapter the program is compiled for.
+    pub adapter: DatabaseAdapter,
+    /// The module whose `render` returns the ERB result; `None` when the
+    /// file is absent (boot uses `DATABASE_URL` alone, as Rails does) or
+    /// its ERB did not compile (a refusal names the construct, and boot
+    /// refuses rather than resolve without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<ClassId>,
+    /// True when the file exists.
+    pub present: bool,
+    /// True when a manifest supplied `App::databases`: boot cross-checks
+    /// the resolved configurations against those recorded facts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manifest: bool,
+}
+
 /// The database a model runs on, read from source.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

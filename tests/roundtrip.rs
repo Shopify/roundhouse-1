@@ -137,6 +137,7 @@ fn tiny_blog_round_trips() {
         initializer_filters: Vec::new(),
         initializer_files: Vec::new(),
         initializer_gaps: Vec::new(),
+        database_yml: None,
         sql_functions: Vec::new(),
         rbs_includes: Default::default(),
         controllers: vec![posts_controller],

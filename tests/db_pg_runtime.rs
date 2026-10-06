@@ -134,13 +134,38 @@ end
         String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
 }
 
+/// tiny-blog with an authored config/database.yml (ERB included) that boot
+/// resolves; roundhouse.yml states the compiled-for adapter.
+const POSTGRES_DATABASE_YML: &str = "default: &default\n  adapter: postgresql\n  pool: <%= 1 + 2 %>\n  schema_search_path: <%= %w[runtime_test public].join(\",\") %>\n\ntest:\n  <<: *default\n  database: roundhouse_unused\n";
+
 fn postgres_model_app() -> roundhouse::app::App {
-    use roundhouse::database::{Database, DatabaseAdapter};
     use roundhouse::ident::Symbol;
     use roundhouse::schema::{Column, ColumnType, Schema, Table};
-    let mut app = roundhouse::ingest::ingest_app(
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog"),
-    ).expect("ingest fixture");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    struct Copy(std::path::PathBuf);
+    impl Drop for Copy {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let copy = Copy(std::env::temp_dir().join(format!(
+        "roundhouse-pg-app-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))));
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+    copy_tree(&fixture, &copy.0);
+    std::fs::write(copy.0.join("config/database.yml"), POSTGRES_DATABASE_YML).unwrap();
+    std::fs::write(copy.0.join("roundhouse.yml"), "database_adapter: postgresql\n").unwrap();
+    let mut app = roundhouse::ingest::ingest_app(&copy.0).expect("ingest fixture");
+    assert!(app.database_yml.as_ref().is_some_and(|yml| yml.renderer.is_some()), "{:?}", app.database_refusals);
     let mut schema = Schema::default();
     schema.tables.insert(Symbol::from("entries"), Table {
         name: Symbol::from("entries"),
@@ -160,12 +185,6 @@ fn postgres_model_app() -> roundhouse::app::App {
     app.models = vec![model];
     app.schema = schema;
     app.controllers.clear();
-    app.databases = vec![Database {
-        name: "primary".into(), adapter: DatabaseAdapter::Postgresql,
-        primary: true, replica: false, database_tasks: true, schema_source: None,
-        schema: None, schema_search_path: Some("runtime_test,public".into()),
-        pragmas: vec![], migrations_paths: vec![],
-    }];
     app
 }
 
@@ -181,7 +200,7 @@ fn model_sql_uses_owning_database_dialect() {
     assert!(pg.contains("RESTART IDENTITY"), "{pg}");
     assert!(!pg.contains("last_insert_rowid"), "{pg}");
     assert!(!pg.contains("sqlite_sequence"), "{pg}");
-    app.databases.clear();
+    app.database_yml = None;
     let files = roundhouse::emit::ruby::emit_lowered_models(&app);
     let sqlite = &files.iter().find(|f| f.path.to_str() == Some("app/models/entry.rb")).unwrap().content;
     assert!(sqlite.contains("last_insert_rowid"), "{sqlite}");
@@ -253,7 +272,10 @@ class PostgreSQLRuntimeTest
     assert_equal "PostgreSQL", ActiveRecord::Base.connection.adapter_name
     assert_equal "TRUE", ActiveRecord::Base.connection.quote(true)
     assert_equal "FALSE", ActiveRecord::Base.connection.quote(false)
-    assert_equal "runtime_test,public", scalar("SHOW search_path")
+    # database.yml schema_search_path, applied as Rails 8.1.4 does
+    # (schema_statements.rb:305 `SET search_path TO ...`; PostgreSQL
+    # shows the parsed list).
+    assert_equal "runtime_test, public", scalar("SHOW search_path")
     assert_equal DATABASE_NAMES[0], scalar("SELECT current_database()")
     assert_equal [{{ "number" => 1 }}], ActiveRecord::Base.connection.execute('SELECT 1 AS number').to_a
     error = assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM no_such_table') }}
@@ -414,6 +436,11 @@ fn postgres_project_packages_matching_driver_schema_and_gem() {
     assert!(!source("test/test_helper.rb").contains("Db.configure(_test_db_path)"));
     assert!(!source("main.rb").contains("SqliteAdapter.configure"));
     assert!(source("main.rb").contains("DatabaseConfiguration.configure!"));
+    // Boot resolves the authored config/database.yml through its compiled renderer.
+    assert!(source("app/models/database_yml.rb").contains("def self.render"));
+    assert!(source("runtime/database_configuration.rb").contains("    DatabaseYml\n"));
+    assert!(source("runtime/database_configurations.rb").contains("module DatabaseConfigurations"));
+    assert!(!source("runtime/database_configuration.rb").contains("Db.configure(url"));
     assert!(!files.iter().any(|(p, _)| p == "runtime/active_record_sqlite3_adapter.rb" || p == "runtime/sqlite_adapter.rb"));
     assert!(!source("Gemfile").contains("gem \"sqlite3\""));
     assert!(!files.iter().any(|(p, _)| p == "Gemfile.lock"));

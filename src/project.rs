@@ -2275,7 +2275,117 @@ fn jruby_runtime_files(
 }
 
 fn primary_postgresql(app: &App) -> bool {
-    app.databases.iter().any(|db| db.primary && db.adapter == crate::database::DatabaseAdapter::Postgresql)
+    app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+}
+
+/// Ruby literal for manifest data (`=>` keys, `#` escaped so nothing
+/// interpolates).
+fn ruby_data_literal(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "nil".into(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => serde_json::to_string(s).expect("string").replace('#', "\\#"),
+        serde_json::Value::Array(items) => {
+            format!("[{}]", items.iter().map(ruby_data_literal).collect::<Vec<_>>().join(", "))
+        }
+        serde_json::Value::Object(map) => format!(
+            "{{ {} }}",
+            map.iter()
+                .map(|(k, v)| format!("{} => {}", ruby_data_literal(&serde_json::Value::String(k.clone())), ruby_data_literal(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The generated `runtime/database_configuration.rb`: the compiled-for
+/// adapter, the manifest's recorded facts (when the app has one), each
+/// `connects_to` role, and the renderer, handed to
+/// `runtime/database_configurations.rb` at boot. No credentials: the
+/// endpoint comes from ROUNDHOUSE_DATABASE_URL at run time.
+fn database_configuration_source(app: &App, yml: &crate::database::DatabaseYml) -> String {
+    let manifest = if yml.manifest {
+        let facts: Vec<serde_json::Value> = app.databases.iter().map(|db| serde_json::json!({
+            "name": db.name,
+            "adapter": db.adapter.name(),
+            "primary": db.primary,
+            "replica": db.replica,
+            "database_tasks": db.database_tasks,
+            "schema_search_path": db.schema_search_path,
+            "pragmas": db.pragmas.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_, _>>(),
+            "migrations_paths": db.migrations_paths,
+        })).collect();
+        ruby_data_literal(&serde_json::Value::Array(facts))
+    } else {
+        "nil".into()
+    };
+    let mut ownership: Vec<serde_json::Value> = Vec::new();
+    for owner in app.model_databases.values() {
+        if let crate::database::ModelDatabase::Named { writing, reading, declared_by, .. } = owner {
+            let row = serde_json::json!([declared_by.0.as_str(), writing, reading]);
+            if !ownership.contains(&row) {
+                ownership.push(row);
+            }
+        }
+    }
+    let ownership = ruby_data_literal(&serde_json::Value::Array(ownership));
+    let renderer = match (&yml.renderer, yml.present) {
+        (Some(class), _) => class.0.as_str().to_string(),
+        (None, true) => format!(
+            "raise DatabaseConfigurations::Error.new(\"database_yml_erb\", {})",
+            ruby_data_literal(&serde_json::Value::String(format!(
+                "{} did not compile into the program (`roundhouse check` names the construct)",
+                yml.path
+            )))
+        ),
+        (None, false) => "nil".into(),
+    };
+    let path = ruby_data_literal(&serde_json::Value::String(yml.path.clone()));
+    let adapter = ruby_data_literal(&serde_json::Value::String(yml.adapter.name().to_string()));
+    format!(r#"# Boot-time database configuration, resolved from the app's own
+# config/database.yml by runtime/database_configurations.rb. Holds no
+# credentials: the endpoint is ROUNDHOUSE_DATABASE_URL, read at boot.
+require_relative "database_configurations"
+
+module DatabaseConfiguration
+  PATH = {path}
+  # The adapter the program is compiled for (SQL dialect, driver).
+  COMPILED_ADAPTER = {adapter}
+  # The facts a database_configurations manifest records; nil without one.
+  MANIFEST = {manifest}
+  # [class, writing, reading] for each `connects_to`.
+  OWNERSHIP = {ownership}
+
+  class << self
+    attr_reader :configurations, :primary
+  end
+
+  # The compiled template: `render` returns what Rails' ERB pass returns.
+  def self.renderer
+    {renderer}
+  end
+
+  # ActiveRecord::ConnectionHandling::DEFAULT_ENV: Rails.env, RAILS_ENV,
+  # RACK_ENV; Rails.env itself defaults to development, so that is the last.
+  def self.default_env
+    [Rails.env_name, ENV["RAILS_ENV"], ENV["RACK_ENV"]].find {{ |name| name && !name.strip.empty? }} || "development"
+  end
+
+  # Resolve without connecting: [configurations, primary HashConfig].
+  def self.resolve(env: default_env, environment: ENV)
+    DatabaseConfigurations.resolve(renderer: renderer, path: PATH, env: env, compiled_adapter: COMPILED_ADAPTER,
+      manifest: MANIFEST, ownership: OWNERSHIP, environment: environment)
+  end
+
+  def self.configure!
+    @configurations, @primary = resolve
+    Db.configure_database("primary", DatabaseConfigurations.connection_entry(@primary, ENV["ROUNDHOUSE_DATABASE_URL"]))
+    ActiveRecord.adapter = PostgresAdapter
+    Schema.statements.each {{ |sql| Db.exec(sql) }}
+  end
+end
+"#)
 }
 
 fn ruby_family_runtime_files(
@@ -2695,11 +2805,12 @@ fn ruby_family_runtime_files(
 /// Configure the selected PostgreSQL backend at both ordinary Ruby entry
 /// points. Endpoints are explicit runtime inputs, never manifest credentials.
 fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
-    let database = app.databases.iter().find(|db| db.primary)
-        .ok_or("PostgreSQL bootstrap: missing primary database identity")?;
-    let search_path = database.schema_search_path.as_ref()
-        .map(|value| serde_json::to_string(value).expect("schema search path string"))
-        .unwrap_or_else(|| "nil".into());
+    // Boot resolves the app's own config/database.yml (ingest::database_yml);
+    // a manifest, when present, is the cross-check, never the source.
+    let yml = app.database_yml.as_ref().ok_or(
+        "PostgreSQL bootstrap: the primary database is postgresql, and config/database.yml was not ingested for boot-time resolution (roundhouse.yml `database_adapter:` or a manifest)",
+    )?;
+    let configuration = database_configuration_source(app, yml);
     files.retain(|(p, _)| p != "runtime/sqlite_adapter.rb" && p != "runtime/active_record_sqlite3_adapter.rb");
     let adapter = crate::runtime_files::read_to_string("runtime/spinel/postgres_adapter.rb")
         .map_err(|e| format!("read PostgreSQL adapter: {e}"))?;
@@ -2714,17 +2825,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read {stem} runtime: {e}"))?;
         files.push((format!("runtime/{stem}.rb"), source));
     }
-    files.push(("runtime/database_configuration.rb".into(), format!(r#"# Runtime connection configuration; the schema manifest contains no credentials.
-module DatabaseConfiguration
-  def self.configure!
-    url = ENV.fetch("ROUNDHOUSE_DATABASE_URL")
-    raise ArgumentError, "ROUNDHOUSE_DATABASE_URL must name the PostgreSQL database" if url.empty?
-    Db.configure(url, search_path: {search_path})
-    ActiveRecord.adapter = PostgresAdapter
-    Schema.statements.each {{ |sql| Db.exec(sql) }}
-  end
-end
-"#)));
+    let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
+        .map_err(|e| format!("read database configuration resolver: {e}"))?;
+    files.push(("runtime/database_configurations.rb".into(), resolver));
+    files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
     let log_subscriber_test_helper = files.iter().any(|(path, content)| {
@@ -2745,7 +2849,8 @@ end
             let last = "ActiveRecord.adapter = SqliteAdapter";
             let end = content[start..].find(last)
                 .ok_or("PostgreSQL bootstrap: missing test adapter setup anchor")? + start + last.len();
-            content.replace_range(start..end, "require_relative \"../runtime/active_record_postgresql_adapter\"\nrequire_relative \"../runtime/database_configuration\"\nDatabaseConfiguration.configure!");
+            // Rails' generated test_helper.rb sets RAILS_ENV before boot.
+            content.replace_range(start..end, "require_relative \"../runtime/active_record_postgresql_adapter\"\nrequire_relative \"../runtime/database_configuration\"\nENV[\"RAILS_ENV\"] ||= \"test\"\nRails.env_name = ENV[\"RAILS_ENV\"] if Rails.env_name.nil? || Rails.env_name.empty?\nDatabaseConfiguration.configure!");
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
