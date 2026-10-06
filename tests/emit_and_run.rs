@@ -6776,3 +6776,35 @@ end
         .run_test("test/models/member_test.rb")
         .assert_passes();
 }
+
+/// Review r2: a test class's `teardown` replaces its base's, so a base
+/// teardown would silently stop running under a child that declares one;
+/// Rails runs both. Refused by name until the chain is modeled.
+#[test]
+fn a_teardown_over_a_base_teardown_is_refused() {
+    let refused = emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class TestCase < ActiveSupport::TestCase\n    teardown do\n      raise \"base cleanup ran\"\n    end\n  end\nend\n")
+        .write("test/child_test.rb", "require \"test_helper\"\n\nclass ChildTest < GemCompat::TestCase\n  teardown do\n    nil\n  end\n\n  test \"x\" do\n    assert true\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    let (_, errors) = refused;
+    assert!(errors.iter().any(|e| e.contains("teardown") && e.contains("ChildTest") && e.contains("GemCompat::TestCase")), "{errors:?}");
+}
+
+/// Review r2: the helper's reopen of `ActiveSupport::TestCase` keeps only
+/// its `setup`; a `teardown` there (every test's cleanup) was dropped
+/// without a word. Refused by name.
+#[test]
+fn a_teardown_on_the_reopened_test_case_is_refused() {
+    let tree = [
+        ("app/.keep", ""),
+        ("test/test_helper.rb", "require \"active_support\"\n\nclass ActiveSupport::TestCase\n  teardown do\n    raise \"global cleanup ran\"\n  end\nend\n"),
+        ("test/models/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
+    assert!(err.to_string().contains("teardown"), "{err}");
+}
