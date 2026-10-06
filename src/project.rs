@@ -2789,6 +2789,9 @@ fn ruby_family_runtime_files(
     // base's eagerly-rewritten one at dedupe) and strips routes.rb's eager
     // controller-require header.
     apply_controller_dispatch(&mut files, app, true);
+    // Lazy flavor of the models aggregator: autoload on reference unless
+    // the environment's `config.eager_load` says otherwise.
+    apply_models_autoload(&mut files, app);
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
@@ -3825,6 +3828,274 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
         files.push(("app/models.rb".to_string(), body));
     }
 }
+
+/// The constant an emitted `app/models/*.rb` file defines, when it
+/// defines exactly one, with the keyword that opened each segment
+/// (`module Podding` / `module Database` / `module Config` →
+/// `Podding::Database::Config`, all modules).
+///
+/// The emitter names each file after its class (`underscore` of the
+/// full name), so the constant is the prefix of the file's leading
+/// `module`/`class` chain whose underscored name is the file's own path
+/// (`anchor`, `models/podding/database/config`). It must also be the only
+/// thing the file defines above its body: every enclosing level holds
+/// just the next level's block. A second class beside it, a constant on
+/// an outer namespace, a top-level statement, or a file whose name
+/// matches no chain prefix all return `None`, because loading the file
+/// on reference to one constant would leave the rest undefined until
+/// then. Those files keep loading at boot.
+fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> {
+    let stem = anchor.strip_prefix("models/")?;
+    // Significant lines below the leading requires: (indent, text).
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if lines.is_empty()
+            && indent == 0
+            && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative "))
+        {
+            continue;
+        }
+        lines.push((indent, trimmed));
+    }
+    // The leading chain: headers at indent 0, 2, 4, … on consecutive lines.
+    let mut chain: Vec<(String, bool)> = Vec::new();
+    for (indent, text) in &lines {
+        let header = text
+            .strip_prefix("module ")
+            .map(|rest| (rest, true))
+            .or_else(|| text.strip_prefix("class ").map(|rest| (rest, false)));
+        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else { break };
+        let name = rest.split([' ', '<']).next().unwrap_or("");
+        // `class << self`, `class A::B` (says nothing about `A`), and a
+        // one-line `class X; end` are not a chain to follow.
+        if name.is_empty() || name.contains("::") || name.contains(';') || rest.contains(';')
+            || !name.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            break;
+        }
+        chain.push((name.to_string(), is_module));
+    }
+    let depth = (1..=chain.len()).find(|&n| {
+        let full = chain[..n].iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        crate::naming::underscore(&full) == stem
+    })?;
+    // Every level above the constant's body holds only the next block:
+    // at indent 2k, exactly that level's header and its `end`.
+    for level in 0..depth {
+        let at: Vec<&str> = lines.iter().filter(|(i, _)| *i == 2 * level).map(|(_, t)| *t).collect();
+        if at.len() != 2 || at[1] != "end" {
+            return None;
+        }
+    }
+    chain.truncate(depth);
+    Some(chain)
+}
+
+/// The CRuby/JRuby `app/models.rb`: Rails' autoloader, generated.
+///
+/// Rails loads an app file when its constant is first referenced, unless
+/// `config.eager_load` is true for the environment, in which case the
+/// `eager_load!` finisher loads every file at boot. Core sets it to
+/// `BootLib.test_eager_load?` in test.rb: lazy locally, eager on main
+/// and in full CI. The eager aggregator `apply_models_aggregator` writes
+/// required every carried file at boot, so a file Rails would never
+/// load — a load-time gap in a Podding file database.yml never touches
+/// — stopped boot.
+///
+/// Here every file whose single constant `autoload_primary` can name is
+/// registered with `Module#autoload` under its namespace, Zeitwerk's
+/// model: a namespace registers its children when it is defined
+/// (`Module#const_added`), an intermediate namespace no file defines is
+/// an implicit module, and a constant already defined at boot (a reopen
+/// of a runtime class) loads its file then. The environment's
+/// `config.eager_load` expression is emitted as app code and evaluated
+/// at boot; when true every file loads, in the same order as the eager
+/// aggregator, so every load-time error still surfaces. Nothing is
+/// dropped: a file is only loaded later, never omitted. The spinel tree
+/// keeps the eager aggregator (AOT resolves the whole require graph).
+fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    let mut models: Vec<(String, String)> = files
+        .iter()
+        .filter(|(p, _)| p.starts_with("app/models/") && p.ends_with(".rb"))
+        .map(|(p, c)| {
+            let anchor = p.strip_prefix("app/").unwrap_or(p).strip_suffix(".rb").unwrap_or(p).to_string();
+            (anchor, c.clone())
+        })
+        .collect();
+    models.sort();
+
+    // namespace ("Object" for the top level) -> child -> (file, written as module)
+    #[derive(Default)]
+    struct Child {
+        file: Option<String>,
+        all_module: bool,
+        seen: bool,
+    }
+    let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
+    let mut boot_files: Vec<&str> = Vec::new();
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    for (anchor, content) in &models {
+        let Some(chain) = autoload_primary(anchor, content) else {
+            boot_files.push(anchor);
+            continue;
+        };
+        let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        // Two files that both define the same constant cannot both be its
+        // autoload; the second loads at boot, as before.
+        if claimed.contains_key(&full) {
+            boot_files.push(anchor);
+            continue;
+        }
+        claimed.insert(full, anchor.clone());
+        let mut parent = String::from("Object");
+        let last = chain.len() - 1;
+        for (i, (segment, is_module)) in chain.iter().enumerate() {
+            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
+            if !child.seen {
+                child.all_module = true;
+                child.seen = true;
+            }
+            child.all_module &= *is_module;
+            if i == last {
+                child.file = Some(anchor.clone());
+            }
+            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
+        }
+    }
+
+    let mut body = String::from(
+        "# Loads the model/support classes under app/models/ the way Rails'\n\
+         # autoloader does. Generated from the emitted tree (see\n\
+         # apply_models_autoload). Each file still requires its own\n\
+         # LOAD-time deps (superclass, includes, class-body constants).\n\
+         # A file that defines one constant loads when that constant is\n\
+         # first referenced; the rest load at boot. When the environment's\n\
+         # `config.eager_load` is true every file loads at boot, as Rails'\n\
+         # `eager_load!` does.\n\
+         module RoundhouseAutoload\n\
+         \x20 ROOT = __dir__\n\
+         \x20 # namespace => [[constant, file (nil: implicit module), written as module], ...]\n\
+         \x20 NAMESPACES = {\n",
+    );
+    for (namespace, children) in &namespaces {
+        write!(body, "    {namespace:?} => [").unwrap();
+        for (i, (name, child)) in children.iter().enumerate() {
+            if i > 0 {
+                body.push_str(", ");
+            }
+            let file = child.file.as_ref().map_or("nil".to_string(), |f| format!("{f:?}"));
+            write!(body, "[:{name}, {file}, {}]", child.all_module).unwrap();
+        }
+        body.push_str("],\n");
+    }
+    body.push_str("  }.freeze\n");
+    let list = |names: &mut dyn Iterator<Item = &str>| -> String {
+        names.map(|n| format!("    {n:?},\n")).collect()
+    };
+    write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().copied())).unwrap();
+    write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut models.iter().map(|(a, _)| a.as_str()))).unwrap();
+    body.push_str(AUTOLOAD_RUNTIME);
+
+    // The environment's `config.eager_load`, as the app wrote it. Rails'
+    // default for an environment that leaves it nil is
+    // `!config.reloading_enabled?` (railties 8.1.4 bootstrap.rb:19-29),
+    // true unless the environment enables reloading.
+    body.push_str("  def self.eager_load?\n");
+    if app.eager_load.is_empty() {
+        body.push_str("    true\n  end\nend\n\n");
+    } else {
+        body.push_str("    case Rails.env.to_s\n");
+    }
+    for setting in &app.eager_load {
+        write!(body, "    when {:?}\n", setting.env).unwrap();
+        match &setting.value {
+            Ok(expr) => write!(body, "      {}\n", crate::emit::ruby::expr::emit_expr(expr)).unwrap(),
+            Err(reason) => write!(
+                body,
+                "      raise {:?}\n",
+                format!("roundhouse: config.eager_load not supported (all targets): {reason}")
+            )
+            .unwrap(),
+        }
+    }
+    if !app.eager_load.is_empty() {
+        body.push_str("    else\n      true\n    end\n  end\nend\n\n");
+    }
+    body.push_str(
+        "RoundhouseAutoload.register(Object)\n\
+         RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n\
+         RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n",
+    );
+
+    if let Some((_, content)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        *content = body;
+    } else {
+        files.push(("app/models.rb".to_string(), body));
+    }
+}
+
+/// The registration half of the generated `app/models.rb`
+/// ([`apply_models_autoload`]).
+const AUTOLOAD_RUNTIME: &str = r##"
+  MODULE_NAME = Module.instance_method(:name)
+
+  def self.path(file)
+    File.expand_path("#{file}.rb", ROOT)
+  end
+
+  # Register `mod`'s children: an autoload for each file, an implicit
+  # module for a namespace only other files open. A child already
+  # defined (a runtime class the app reopens) loads its file now, after
+  # its siblings are registered, since nothing will reference it into
+  # loading.
+  def self.register(mod)
+    key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
+    entries = NAMESPACES[key] or return
+    defined = []
+    entries.each do |name, file, written_module|
+      if mod.const_defined?(name, false)
+        defined << [name, file] unless mod.autoload?(name, false)
+      elsif file
+        mod.autoload(name, path(file))
+      elsif written_module
+        mod.const_set(name, Module.new)
+      end
+    end
+    defined.each do |name, file|
+      require path(file) if file
+      child = mod.const_get(name, false)
+      register(child) if child.is_a?(Module)
+    end
+  end
+
+  def self.eager_load!
+    ALL_FILES.each { |file| require path(file) }
+  end
+
+  # A namespace defined by its own file, or by `const_set` above,
+  # registers its children as it is defined.
+  module ConstAdded
+    def const_added(name)
+      super
+      owner = equal?(Object) ? nil : RoundhouseAutoload::MODULE_NAME.bind_call(self)
+      return if !equal?(Object) && owner.nil?
+      key = owner ? "#{owner}::#{name}" : name.to_s
+      return unless RoundhouseAutoload::NAMESPACES.key?(key)
+      return if autoload?(name, false)
+      child = const_get(name, false)
+      RoundhouseAutoload.register(child) if child.is_a?(Module)
+    end
+  end
+  Module.prepend(ConstAdded)
+"##;
 
 /// Replace the scaffold `main.rb`'s blog-hardcoded
 /// `instantiate_controller` (`:articles`/`:comments` only) with a
