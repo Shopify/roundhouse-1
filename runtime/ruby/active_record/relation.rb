@@ -483,7 +483,7 @@ module ActiveRecord
     # `page(n)`: page `n` at the app's default page size. A nil, blank,
     # non-numeric or non-positive `n` is page 1 (`to_i`).
     def page(num = nil)
-      per_page = Rails.application.default_per_page
+      per_page = Rails.application.pagination_default_per_page
       n = num.to_s.to_i
       n = 1 if n < 1
       limit(per_page)

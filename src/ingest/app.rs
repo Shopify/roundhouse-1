@@ -1007,8 +1007,10 @@ end
         }
         // Default page size for `Relation#page`. A `Kaminari.configure`
         // block's literal `default_per_page = N` is one input spelling;
-        // synthesized as `default_per_page` on the reopen, over the
-        // runtime default of 25 in runtime/ruby/rails.rb.
+        // synthesized as `pagination_default_per_page` on the reopen, over
+        // the runtime default of 25 in runtime/ruby/rails.rb. Not
+        // `default_per_page`: the reopen also answers the app's own config
+        // keys, and an app may set `config.default_per_page` for itself.
         {
             let init_dir = dir.join("config/initializers");
             let mut per_page: Option<u64> = None;
@@ -1022,7 +1024,7 @@ end
             }
             if let Some(n) = per_page {
                 if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
-                    "def default_per_page\n  {n}\nend\n"
+                    "def pagination_default_per_page\n  {n}\nend\n"
                 )) {
                     methods.append(&mut synth);
                 }

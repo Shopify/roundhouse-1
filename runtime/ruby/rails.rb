@@ -513,8 +513,9 @@ module Rails
     # Default page size for `Relation#page`. Ingest lifts a literal
     # `config.default_per_page = N` from a `Kaminari.configure` block
     # (one input spelling) onto this reopen; 25 when the app configures
-    # none.
-    def default_per_page
+    # none. Named apart from `default_per_page`, which an app may define
+    # as its own config key on the same reopen.
+    def pagination_default_per_page
       25
     end
 

@@ -72,7 +72,7 @@ module Rails
     def active_storage_excluded_content_types: () -> Array[String]
     def vips_block_untrusted: () -> bool
     def vips_blocked_operations: () -> Array[String]
-    def default_per_page: () -> Integer
+    def pagination_default_per_page: () -> Integer
     def filter_parameters: () -> Array[untyped]
   end
 end
