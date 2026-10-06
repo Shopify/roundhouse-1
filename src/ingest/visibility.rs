@@ -392,7 +392,18 @@ impl Visibility {
             None if call.receiver().is_none() => method.to_string(),
             None => format!("<expression>.{method}"),
         };
-        format!("definitions or visibility declarations inside a `{callee} do … end` block are not modeled")
+        // Without a def the block holds only declarations naming methods
+        // defined elsewhere (`included do private :helper end`).
+        let defines = call
+            .block()
+            .and_then(|block| block.as_block_node())
+            .and_then(|block| block.body())
+            .is_some_and(|body| flatten_statements(body).iter().any(|stmt| definition(stmt).is_some()));
+        if defines {
+            format!("definitions or visibility declarations inside a `{callee} do … end` block are not modeled")
+        } else {
+            format!("visibility declarations inside a `{callee} do … end` block are not modeled")
+        }
     }
 
     fn walk(

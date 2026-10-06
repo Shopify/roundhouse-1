@@ -325,13 +325,46 @@ fn accessor_contexts_fail_strict_ingest_and_are_not_carried_in_survey() {
     }
 }
 
-/// Forward/inherited/dynamic model markers are source errors before splicing,
-/// independently of accessor admission. Keep the canonical visibility boundary.
+/// A literal model marker over a concern-included accessor is Ruby's own
+/// override: the included block defines the accessor on the includer
+/// before the marker runs (CRuby: `private_method_defined?(:scratch=)`).
+/// It is carried verbatim after the accessor, so without the include Ruby
+/// raises the same NameError at load that the source does.
+#[test]
+fn literal_markers_over_concern_accessors_are_carried_overrides() {
+    use roundhouse::dialect::MethodVisibility;
+    for (marker, name, visibility) in [
+        ("private :scratch=", "scratch=", MethodVisibility::Private),
+        ("private \"scratch=\"", "scratch=", MethodVisibility::Private),
+        ("protected \"scratch\"", "scratch", MethodVisibility::Protected),
+    ] {
+        for include in ["include DraftState", ""] {
+            let model = format!("class Message < ApplicationRecord\n  {include}\n  {marker}\nend\n");
+            let app = ingest_app_from_tree(tree(&[
+                ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :messages do |t|\n    t.string :body\n  end\nend\n"),
+                ("app/models/concerns/draft_state.rb", "module DraftState\n  extend ActiveSupport::Concern\n  included { attr_accessor :scratch }\nend\n"),
+                ("app/models/message.rb", &model),
+            ])).unwrap();
+            let overrides = &app.models[0].visibility_overrides;
+            assert!(overrides.len() == 1 && overrides[0].name.as_str() == name
+                && overrides[0].visibility == visibility, "{model}: {overrides:?}");
+            let src = ruby::emit_lowered_models(&app).into_iter()
+                .find(|file| file.path.to_string_lossy().ends_with("message.rb")).unwrap().content;
+            let declared = src.find(&format!("  {} :{name}\n", marker.split(' ').next().unwrap()))
+                .unwrap_or_else(|| panic!("{model}: {src}"));
+            if !include.is_empty() {
+                assert!(src.find(&format!("def {name}")).is_some_and(|def| def < declared), "{src}");
+            }
+        }
+    }
+}
+
+/// Conditional, block-scoped and dynamic model markers are source errors
+/// before splicing, independently of accessor admission.
 #[test]
 fn source_visibility_refusals_precede_concern_accessor_admission() {
     use roundhouse::ingest::survey;
     for marker in [
-        "private :scratch=", "private \"scratch=\"", "protected \"scratch\"",
         "private :scratch if true", "with_options do\n    protected :scratch=\n  end",
         "private [:scratch].first",
     ] {
@@ -376,7 +409,10 @@ fn only_retained_module_candidates_defer_included_visibility() {
             ("app/models/concerns/draft_state.rb", &concern),
             ("app/models/message.rb", "class Message < ApplicationRecord\n  include DraftState\nend\n"),
         ])).unwrap_err().to_string();
-        assert!(error.contains("conditional or dynamic visibility"), "{body}: {error}");
+        // A def-less included block names the block; the `if` wrapper is
+        // conditional. Either way the declaration is refused.
+        assert!(error.contains("app/models/concerns/draft_state.rb")
+            && error.contains("visibility declarations"), "{body}: {error}");
     }
 }
 
