@@ -1058,6 +1058,13 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// (`method_missing`, a reified method, a block), so no call site has
 /// to be found. A keyword, optional or post parameter would bind that
 /// hash instead, so those stay refused.
+///
+/// A required positional can still be filled by a `**h` the call
+/// passes. That binds the right value, but it is the caller's hash
+/// object, where Ruby passes a copy. A named selector, a dispatcher
+/// and a reified method are refused at the call (analyze/forwarding.rs).
+/// `method_missing` is reached by no selector, so it is admitted only
+/// as `(name, *)`, with no positional left to fill.
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
@@ -1068,6 +1075,7 @@ fn admit_nameless_rest(methods: &mut [MethodDef]) {
                         !p.keyword && !p.rest && !p.forwarding && p.default.is_none()
                             && !p.from_keyword && !p.from_kwrest
                     })
+                    && (m.name.as_str() != "method_missing" || front.len() == 1)
             })
         {
             m.unsupported_formals = None;
