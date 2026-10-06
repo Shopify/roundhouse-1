@@ -1045,6 +1045,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         block_refine::propagate_one(&mut class);
         let fwd = class

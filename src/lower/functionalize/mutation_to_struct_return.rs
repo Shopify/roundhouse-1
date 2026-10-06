@@ -1283,6 +1283,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         crate::emit::elixir::emit_library_class(&class).expect("emit")
     }
@@ -1514,6 +1515,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         eprintln!("--- ctor ---\n{ex}\n------------");

@@ -62,9 +62,16 @@ analyzer cannot determine the protocol's result shape.
 
 Model and library/concern ingest preserve statically known `public`,
 `protected`, and `private` on local definitions, including singleton
-blocks and inline `private def` forms. Named changes must follow an
-unambiguous local definition; forward references, inherited-only names,
-dynamic names/conditional declarations, and visibility-sensitive
+blocks and inline `private def` forms. A named change applies to an
+unambiguous local definition. A name the class does not define when its
+body ends (an inherited method such as `new` under
+`private_class_method :new`, one a class-body macro generates, a model
+accessor, or a forward name) is a visibility override: the class keeps
+its own entry with that visibility, the last change wins, and a later
+`def` replaces it. Modules and class-method carriers still require the
+name to be defined there. Dynamic names, conditional declarations,
+declarations inside a block (`Data.define do`, `Struct.new do`,
+`included do`; the message names the block) and visibility-sensitive
 redefinitions remain unsupported. Concern class-method carriers have
 their own lexical scope, distinct from the concern's own singletons.
 `private_class_method`/`public_class_method` inside singleton blocks or
@@ -88,9 +95,17 @@ made public. CRuby emit-and-run tests prove wrapper calls, `send`,
 `public_send`, and `respond_to?(name, include_private)` for model, library,
 and concern methods. This is not a strict-target visibility/reflective
 dispatch compatibility claim, nor a Spinel runtime verification.
-Nonpublic model accessor macros that have not become local `MethodDef`s
-are still diagnosed rather than silently emitted as public. Existing
-model lowering's synthesized-name precedence is unchanged.
+The same emitter writes visibility overrides after the class's methods
+(`public :delete_entry`, `private_class_method :new`). Under a private
+`new`, a class-side bare `new(...)` stays as written rather than
+becoming `Owner.new(...)`, and is not copied into subclasses. Literal
+`send`/`public_send` grounding treats an override like a local
+definition and keeps the reflective call. Strict targets refuse each
+override as `inherited_visibility_override`; Spinel refuses only a
+private class-side `new`, whose receiverless call it does not compile.
+A nonpublic model `alias_method` is still diagnosed, because model
+lowering does not carry the alias. Existing model lowering's
+synthesized-name precedence is unchanged.
 
 Thin builder-yielding form wrappers retain owner-local `data:` computations
 through generated callable bridges when the expression is frame-independent

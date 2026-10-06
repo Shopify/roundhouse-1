@@ -287,6 +287,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         eprintln!("--- accumulation ---\n{ex}\n--------------------");
@@ -339,6 +340,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         assert!(ex.contains("acc = acc ++ [v]"), "`<<` → append rebind:\n{ex}");
@@ -395,6 +397,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         eprintln!("--- string builder ---\n{ex}\n----------------------");
@@ -448,6 +451,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         assert!(ex.contains("r = %{r | notice: v}"), "attr setter → struct update:\n{ex}");
@@ -505,6 +509,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         eprintln!("--- block reduce ---\n{ex}\n--------------------");
@@ -554,6 +559,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
         let ex = crate::emit::elixir::emit_library_class(&class).expect("emit");
         assert!(

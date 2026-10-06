@@ -133,6 +133,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         enums: indexmap::IndexMap::new(),
         enum_defaults: indexmap::IndexMap::new(),
         sti_subclass_names: Vec::new(),
+        visibility_overrides: Vec::new(),
     });
     let models_dir = dir.join("models");
     if vfs.is_dir(&models_dir) {
@@ -356,6 +357,7 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         });
     }
 

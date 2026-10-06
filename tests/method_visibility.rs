@@ -249,22 +249,17 @@ fn a_modifier_if_is_not_a_conditional_visibility_declaration() {
 }
 
 #[test]
-fn forward_inherited_dynamic_and_ambiguous_changes_stay_errors() {
+fn dynamic_and_ambiguous_changes_stay_errors() {
+    // A name without a local definition is an override instead
+    // (tests/inherited_visibility.rs).
     for body in [
-        "private :later\n def later; 1; end",
-        "private :inherited",
-        "private_class_method :later\n def self.later; 1; end",
-        "private_class_method :inherited",
         "def same; 1; end\n def same; 2; end\n private :same",
         "def same; 1; end\n private :same\n def same; 2; end",
         "private\n def same; 1; end\n public\n def same; 2; end",
-        "def self.only; 1; end\n private :only",
-        "def only; 1; end\n private_class_method :only",
         "def helper; 1; end\n private name",
         "def self.helper; 1; end\n private def self.other; 2; end",
         "def helper; 1; end\n private :helper if condition",
         "if condition\n def helper; 1; end\n end\n private :helper",
-        "def helper; 1; end\n class << self; private :helper; end",
     ] {
         let source = format!("class Thing < ApplicationRecord\n{body}\nend");
         assert!(
@@ -394,23 +389,20 @@ end"#;
 }
 
 #[test]
-fn nonpublic_model_accessors_are_not_silently_accepted_without_method_metadata() {
-    for body in [
-        "private\n attr_reader :value",
-        "attr_reader :value\n private :value",
-    ] {
-        let source = format!("class Thing < ApplicationRecord\n{body}\nend");
-        assert!(
-            ingest_model(
-                source.as_bytes(),
-                "thing.rb",
-                &Schema::default(),
-                &Default::default()
-            )
-            .is_err(),
-            "{source}"
-        );
-    }
+fn nonpublic_model_aliases_are_not_silently_accepted_without_method_metadata() {
+    // A nonpublic model accessor is an override of the accessor methods
+    // (tests/inherited_visibility.rs); an alias has nothing to carry it.
+    let source = "class Thing < ApplicationRecord\n private\n attr_reader :value\n alias_method :early, :value\nend";
+    assert!(
+        ingest_model(
+            source.as_bytes(),
+            "thing.rb",
+            &Schema::default(),
+            &Default::default()
+        )
+        .is_err(),
+        "{source}"
+    );
 }
 
 #[test]

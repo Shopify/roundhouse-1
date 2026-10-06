@@ -269,6 +269,7 @@ mod tests {
             enum_defaults: indexmap::IndexMap::new(),
             sti_subclass_names: Vec::new(),
             span: crate::span::Span::synthetic(),
+            visibility_overrides: Vec::new(),
         }
     }
 

@@ -1441,8 +1441,9 @@ pub fn all_scope_names(scopes: &ScopeRegistry) -> HashSet<Symbol> {
 /// surface must be visible to the ordinary relation-threading pass.
 /// Never erase reflection on arbitrary user methods: `send` can call a
 /// private helper where `public_send` and a direct receiver call cannot.
-/// Ingest refuses visibility changes on generated DSL methods without a
-/// local MethodDef; local overrides are vetoed by `app_method` below.
+/// A visibility change on a generated DSL method (`has_many :comments`
+/// then `private :comments`) is the class's own entry for it, so it
+/// vetoes the collapse exactly as a local override does (`app_method`).
 pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: &AssocRegistry) {
     expr.node
         .for_each_child_mut(&mut |child| ground_literal_model_dispatch(child, app, assocs));
@@ -1543,7 +1544,9 @@ pub fn ground_literal_model_dispatch(expr: &mut Expr, app: &crate::App, assocs: 
 }
 
 /// Whether app metadata proves that `id`'s lookup chain contains a
-/// user-defined method. This deliberately walks models, library classes,
+/// user-defined method, or a visibility override of one
+/// ([`crate::dialect::VisibilityOverride`]): either replaces the
+/// framework's public entry. This deliberately walks models, library classes,
 /// all reopenings, includes, parents and initializer-installed mixins.
 /// Unknown framework roots terminate the walk.
 pub(crate) fn app_method(
@@ -1566,6 +1569,7 @@ pub(crate) fn app_method(
             if model
                 .methods()
                 .any(|m| m.name == *name && m.receiver == side)
+                || model.visibility_overrides.iter().any(|o| o.name == *name && o.receiver == side)
             {
                 return true;
             }
@@ -1588,6 +1592,7 @@ pub(crate) fn app_method(
                 .methods
                 .iter()
                 .any(|m| m.name == *name && m.receiver == side)
+                || class.visibility_overrides.iter().any(|o| o.name == *name && o.receiver == side)
             {
                 return true;
             }

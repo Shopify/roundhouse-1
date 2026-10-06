@@ -1216,6 +1216,7 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     }
 }
 

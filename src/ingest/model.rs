@@ -185,6 +185,7 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
     let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
+    let mut visibility_overrides = visibility.overrides();
     if let Some(class_body) = class.body() {
         let mut prev_end: Option<usize> = None;
         // Constants the class body assigns, for `enum :x, CONST` and for
@@ -364,11 +365,14 @@ pub(super) fn ingest_model_with_enum_constants(
             // A multi-attribute `validates` expands to one item per
             // attribute; only the first carries the blank line that
             // separated the declaration from what came before it.
+            let mut unknown_seen = false;
             for (i, mut item) in items.into_iter().enumerate() {
                 if let ModelBodyItem::Method { method, .. } = &mut item {
                     visibility.apply(&statement, method);
-                } else if let ModelBodyItem::Unknown { .. } = &item {
-                    visibility.check_model_item(&statement, file)?;
+                } else if let ModelBodyItem::Unknown { .. } = &item
+                    && !std::mem::replace(&mut unknown_seen, true)
+                {
+                    visibility_overrides.extend(visibility.model_item_overrides(&statement, file)?);
                 }
                 item.set_leading_blank_line(leading_blank && i == 0);
                 body.push(item);
@@ -400,6 +404,7 @@ pub(super) fn ingest_model_with_enum_constants(
             start: class_loc.start_offset() as u32,
             end: class_loc.end_offset() as u32,
         },
+        visibility_overrides,
     }))
 }
 

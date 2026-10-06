@@ -100,6 +100,7 @@ pub fn ingest_sequel_model(
             start: class_loc.start_offset() as u32,
             end: class_loc.end_offset() as u32,
         },
+        visibility_overrides: Vec::new(),
     }))
 }
 

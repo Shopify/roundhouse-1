@@ -94,6 +94,11 @@ pub struct Model {
     /// `Rooms::Open` rows say `rooms_open`, not `room`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sti_subclass_names: Vec<ClassId>,
+    /// Named visibility for methods the body does not define as a local
+    /// `MethodDef`: inherited ones, schema/association readers, and
+    /// accessors the lowering synthesizes. See [`VisibilityOverride`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visibility_overrides: Vec<VisibilityOverride>,
 }
 
 impl Model {
@@ -673,6 +678,26 @@ pub enum MethodVisibility {
     Private,
 }
 
+/// A named visibility change (`private :name`, `public :name`,
+/// `private_class_method :new`) for a method this class has no local
+/// definition of when the body ends: an inherited method, one an
+/// unmodeled class-body call generates (`has_many`, `class_attribute`,
+/// an `alias_method` of an inherited method), or a model accessor the
+/// lowering synthesizes. Ruby gives the class its own method entry with
+/// this visibility that dispatches to the existing implementation; the
+/// last change to a name wins, and a later local definition replaces it.
+/// The Ruby-family emitters write the declaration after the class's
+/// methods. Other targets refuse it by name rather than drop the class.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisibilityOverride {
+    pub name: Symbol,
+    pub receiver: MethodReceiver,
+    pub visibility: MethodVisibility,
+    /// The visibility declaration in the source.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub span: Span,
+}
+
 /// Source formal shapes whose binding/arity contract is not retained yet.
 /// This belongs to the declaration, independent of body rewrites or typing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -890,6 +915,10 @@ pub struct LibraryClass {
     /// visibility deny-list at the ingest site.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown_calls: Vec<Expr>,
+    /// Named visibility for methods without a local `MethodDef` in
+    /// `methods`. See [`VisibilityOverride`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visibility_overrides: Vec<VisibilityOverride>,
 }
 
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to

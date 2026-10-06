@@ -809,6 +809,7 @@ fn module_funcs_to_library_class(
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     }
 }
 

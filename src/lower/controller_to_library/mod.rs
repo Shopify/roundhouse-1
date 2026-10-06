@@ -555,6 +555,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
             constants: collect_class_constants(controller),
             unknown_calls: collect_delegate_calls(controller),
             class_ivar_initializers: collect_class_ivar_initializers(controller),
+            visibility_overrides: Vec::new(),
         };
         let forwarders = crate::ingest::delegate::expand_delegates_in_class(&mut lc);
         lc.methods.extend(forwarders);
@@ -626,6 +627,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
         constants: collect_class_constants(controller),
         unknown_calls: collect_delegate_calls(controller),
         class_ivar_initializers: collect_class_ivar_initializers(controller),
+        visibility_overrides: Vec::new(),
     };
     let forwarders = crate::ingest::delegate::expand_delegates_in_class(&mut lc);
     lc.methods.extend(forwarders);

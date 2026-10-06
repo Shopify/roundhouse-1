@@ -193,6 +193,7 @@ pub fn jbuilder_signature_classes(views: &[View], app: &App) -> Vec<LibraryClass
                 constants: Vec::new(),
                 unknown_calls: Vec::new(),
                 class_ivar_initializers: Vec::new(),
+                visibility_overrides: Vec::new(),
             }
         })
         .collect()
@@ -265,6 +266,7 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     }
 }
 

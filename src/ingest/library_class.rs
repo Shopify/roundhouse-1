@@ -205,6 +205,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     })
 }
 
@@ -279,6 +280,15 @@ pub fn ingest_rails_application_singleton_methods(
                 message: "Rails application singleton class-variable initialization is not modeled".into(),
             });
         }
+        if let Some(changed) = body.visibility_overrides.first() {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "visibility change for `{}` in the Rails application singleton requires a method it defines",
+                    changed.name.as_str()
+                ),
+            });
+        }
         out.extend(body.methods);
     }
     Ok(out)
@@ -333,8 +343,14 @@ pub(super) fn library_class_and_struct_base(
         None => parent,
     };
 
-    let DeclBody { mut includes, mut methods, mut constants, mut unknown_calls, class_initializers } =
-        walk_decl_body(class.body(), &owner, file, false)?;
+    let DeclBody {
+        mut includes,
+        mut methods,
+        mut constants,
+        mut unknown_calls,
+        class_initializers,
+        visibility_overrides,
+    } = walk_decl_body(class.body(), &owner, file, false)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
     // :name, String` IS the constructor and the reader. Lower it into
@@ -407,6 +423,7 @@ pub(super) fn library_class_and_struct_base(
             constants,
             unknown_calls,
             class_ivar_initializers: class_initializers,
+            visibility_overrides,
         },
         base,
     ))
@@ -1138,6 +1155,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     }
 }
 
@@ -1212,7 +1230,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers } =
+    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, .. } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     Ok(LibraryClass {
         name: owner,
@@ -1225,6 +1243,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         constants,
         unknown_calls,
         class_ivar_initializers: class_initializers,
+        visibility_overrides: Vec::new(),
     })
 }
 
@@ -1247,6 +1266,7 @@ struct DeclBody {
     constants: Vec<(Symbol, Expr)>,
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
+    visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
 }
 
 impl DeclBody {
@@ -1256,6 +1276,7 @@ impl DeclBody {
         self.constants.extend(other.constants);
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
+        self.visibility_overrides.extend(other.visibility_overrides);
     }
 
     fn finalize_classvars(
@@ -1549,7 +1570,9 @@ fn walk_decl_body<'pr>(
     force_class_receiver: bool,
 ) -> IngestResult<DeclBody> {
     let visibility = Visibility::resolve(body.as_ref(), file, None)?;
-    walk_decl_body_with_visibility(body, owner, file, force_class_receiver, &visibility)
+    let mut out = walk_decl_body_with_visibility(body, owner, file, force_class_receiver, &visibility)?;
+    out.visibility_overrides = visibility.overrides();
+    Ok(out)
 }
 
 fn walk_decl_body_with_visibility<'pr>(

@@ -57,6 +57,7 @@ fn length_rule_fans_out_into_min_and_max_checks() {
             leading_blank_line: false,
             span: roundhouse::span::Span::synthetic(),
         }],
+        visibility_overrides: Vec::new(),
     };
     let lowered = lower_validations(&model);
     assert_eq!(lowered.len(), 1);
@@ -92,6 +93,7 @@ fn multiple_rules_on_one_attribute_stay_grouped() {
             leading_blank_line: false,
             span: roundhouse::span::Span::synthetic(),
         }],
+        visibility_overrides: Vec::new(),
     };
     let lowered = lower_validations(&model);
     assert_eq!(lowered.len(), 1);

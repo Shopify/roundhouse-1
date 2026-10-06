@@ -223,6 +223,7 @@ fn synthesize_module_lc(
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     }
 }
 
@@ -527,6 +528,7 @@ fn collect_imports_for_function(
         constants: Vec::new(),
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
     };
     collect_imports(&synthetic_lc, app, out_path)
 }

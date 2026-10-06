@@ -61,6 +61,7 @@ fn tiny_blog_round_trips() {
         enum_defaults: Default::default(),
         sti_subclass_names: Vec::new(),
         span: Span::synthetic(),
+        visibility_overrides: Vec::new(),
     };
 
     // Action body: `Post.all` — a Send to a class-level method.

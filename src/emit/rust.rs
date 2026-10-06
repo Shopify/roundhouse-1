@@ -1130,6 +1130,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     constants: Vec::new(),
                     unknown_calls: Vec::new(),
                     class_ivar_initializers: Vec::new(),
+                    visibility_overrides: Vec::new(),
                 });
                 let _ = stem;
             }

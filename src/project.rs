@@ -835,6 +835,60 @@ fn report_unsupported_keys(app: &App, target: BuildTarget) {
     }
 }
 
+/// A visibility change for a method the class does not define itself
+/// ([`crate::dialect::VisibilityOverride`]) is written back as the
+/// authored `private :name` / `private_class_method :new` by the
+/// Ruby-family emit, where Ruby's own method table carries it. The other
+/// targets have no per-class visibility entry over an inherited or
+/// generated method, so each override is an unsupported construct naming
+/// the class and the method. Spinel additionally refuses a private
+/// class-side `new`: only a receiverless `new(...)` reaches it, and
+/// Spinel does not compile that call (see [`crate::lower::class_body_new`]).
+fn report_inherited_visibility_overrides(app: &App, target: BuildTarget) {
+    use crate::dialect::{MethodReceiver, MethodVisibility, VisibilityOverride};
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return;
+    }
+    let classes = app
+        .models
+        .iter()
+        .map(|m| (m.name.0.as_str(), &m.visibility_overrides))
+        .chain(app.library_classes.iter().map(|lc| (lc.name.0.as_str(), &lc.visibility_overrides)));
+    let mut seen = std::collections::HashSet::new();
+    for (class, overrides) in classes {
+        for VisibilityOverride { name, receiver, visibility, span } in overrides.iter() {
+            let class_side = *receiver == MethodReceiver::Class;
+            if target == BuildTarget::Spinel
+                && !(class_side && name.as_str() == "new" && *visibility != MethodVisibility::Public)
+            {
+                continue;
+            }
+            if !seen.insert((class, name.as_str(), class_side)) {
+                continue;
+            }
+            let method = if class_side { format!("{class}.{name}") } else { format!("{class}#{name}") };
+            let detail = if target == BuildTarget::Spinel {
+                format!("{method} is private, so only a receiverless `new(...)` reaches it, which this target does not compile")
+            } else {
+                format!(
+                    "{method} is made {} over a method {class} does not define; this target has no per-class visibility entry for it",
+                    match visibility {
+                        MethodVisibility::Public => "public",
+                        MethodVisibility::Protected => "protected",
+                        MethodVisibility::Private => "private",
+                    }
+                )
+            };
+            emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                *span,
+                Some(crate::ident::Symbol::from(target.as_str())),
+                "inherited_visibility_override",
+                detail,
+            ));
+        }
+    }
+}
+
 /// True when the app schema or emitted roots mention a date-only value.
 /// Shared by the unsupported-target gate and Spinel's conditional Date
 /// runtime load (matz/spinel#7334: defining `Date#strftime` currently
@@ -1145,6 +1199,7 @@ pub fn target_files(
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
+    report_inherited_visibility_overrides(app, target);
     report_unsupported_bundled_constants(app, target);
     report_test_helper_connection(app, target);
     report_sqlite_index_predicates(app, target);
@@ -8355,6 +8410,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         };
 
         // The app declares one: the arm names it.
@@ -8527,6 +8583,7 @@ mod tests {
             constants: Vec::new(),
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
+            visibility_overrides: Vec::new(),
         });
         let mut files = vec![("boot.rb".to_string(), "# boot\n".to_string())];
         apply_module_mixins(&mut files, &modapp, MixinForm::Reopen);

@@ -66,6 +66,12 @@
 //! turns up with a large class-side method and many subclasses, this is
 //! the pass that will say so.
 //!
+//! A PRIVATE `new` (`private_class_method :new`, the factory-method
+//! idiom) is the exception. Ruby refuses `Owner.new` there, so the bare
+//! call is the only working spelling and is left as written, and Ruby's
+//! own dispatch on `self` already builds the subclass, so nothing is
+//! copied either. See [`private_constructors`].
+//!
 //! Only `new`. `create` / `create!` are the same shape on a MODEL class
 //! body, but they are also association-scope constructors that
 //! `lower::scope_chain` already claims at implicit self
@@ -81,7 +87,9 @@ use crate::ident::Symbol;
 
 pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let subclassed = subclassed_names(app);
+    let private = private_constructors(app);
+    let mut subclassed = subclassed_names(app);
+    subclassed.retain(|name| !private.contains(name));
 
     // Copies FIRST, while every method body still holds its bare `new`:
     // the rewrite below is what binds a receiver, and a copy taken after
@@ -90,6 +98,9 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
 
     for model in &mut app.models {
         let owner = model.name.0.as_str().to_string();
+        if private.contains(&owner) {
+            continue;
+        }
         for item in &mut model.body {
             match item {
                 // A model's constants arrive as replayed class-body
@@ -125,6 +136,9 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
         } else {
             lc.name.0.as_str().to_string()
         };
+        if private.contains(&owner) {
+            continue;
+        }
         for (_, value) in &mut lc.constants {
             rewrite(value, &owner);
         }
@@ -135,6 +149,57 @@ pub fn apply_class_body_new_lowering(app: &mut App) -> Vec<Diagnostic> {
         }
     }
     diags
+}
+
+/// Classes whose class-side `new` is private or protected: the nearest
+/// `private_class_method :new` / `public_class_method :new` along the
+/// superclass chain in this tree decides. A superclass is looked up from
+/// the subclass's namespace outward, the way Ruby resolves it.
+pub(crate) fn private_constructors(app: &App) -> std::collections::HashSet<String> {
+    use crate::dialect::{MethodVisibility, VisibilityOverride};
+    use std::collections::HashMap;
+
+    let mut classes: HashMap<&str, (Option<&str>, &[VisibilityOverride])> = HashMap::new();
+    for m in &app.models {
+        classes.insert(m.name.0.as_str(), (m.parent.as_ref().map(|p| p.0.as_str()), &m.visibility_overrides));
+    }
+    for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
+        classes.insert(lc.name.0.as_str(), (lc.parent.as_ref().map(|p| p.0.as_str()), &lc.visibility_overrides));
+    }
+    let resolve = |child: &str, parent: &str| -> Option<String> {
+        let parent = parent.trim_start_matches("::");
+        let mut scope: Vec<&str> = child.split("::").collect();
+        scope.pop();
+        loop {
+            let candidate =
+                if scope.is_empty() { parent.to_string() } else { format!("{}::{parent}", scope.join("::")) };
+            if classes.contains_key(candidate.as_str()) {
+                return Some(candidate);
+            }
+            scope.pop()?;
+        }
+    };
+    let mut out = std::collections::HashSet::new();
+    for &name in classes.keys() {
+        let mut current = name.to_string();
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(current.clone()) {
+            let (parent, overrides) = classes[current.as_str()];
+            if let Some(o) = overrides
+                .iter()
+                .rev()
+                .find(|o| o.receiver == MethodReceiver::Class && o.name.as_str() == "new")
+            {
+                if o.visibility != MethodVisibility::Public {
+                    out.insert(name.to_string());
+                }
+                break;
+            }
+            let Some(next) = parent.and_then(|p| resolve(&current, p)) else { break };
+            current = next;
+        }
+    }
+    out
 }
 
 /// Copy an inherited class-side method that constructs into each
