@@ -4211,7 +4211,9 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // (`java_import`, `Java::`) that the CRuby and Spinel toolchains (and
     // the spinel-subset compliance gate) must never see. It is injected
     // only by `jruby_runtime_files`, so keep it out of the shared base.
-    files.retain(|(p, _)| p != "runtime/db_jruby.rb");
+    // Likewise, the pg-gem driver is selected only for PostgreSQL CRuby
+    // projects, never included by the generic runtime directory walk.
+    files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance

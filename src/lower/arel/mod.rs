@@ -23,7 +23,7 @@ pub use ir::{
     ArelOp, Assignment, ColRef, ColumnSpec, Delete, Direction, Insert, Join, JoinKind, LimitSpec,
     Order, Predicate, PreloadDirective, Select, Update, Value, ValueType,
 };
-pub use visitor::{ArelVisitor, SqliteVisitor};
+pub use visitor::{ArelVisitor, PostgresVisitor, SqlDialect, SqliteVisitor};
 
 use std::collections::HashMap;
 
