@@ -231,7 +231,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     }
     super::sources::reset();
     let _source_root = super::sources::set_root(dir);
-    let path_gems = path_gem_dirs(vfs, dir);
+    let gem_sources = gem_source_dirs(vfs, dir)?;
+    let mut path_gems = path_gem_dirs(vfs, dir);
+    path_gems.extend(gem_sources.iter().map(|(_, gem)| gem.clone()));
+    path_gems.sort();
+    path_gems.dedup();
     let source_vfs = PathGemVfs { inner: vfs, root: dir, dirs: &path_gems };
     let vfs = &source_vfs;
     let additional_test_paths = additional_test_paths(vfs, dir)?;
@@ -254,7 +258,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let lock_path = dir.join("Gemfile.lock");
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
-            app.gem_lock = Some(crate::gems::Lockfile::parse(&text));
+            let mut lock = crate::gems::Lockfile::parse(&text);
+            // A gem whose source the app carries is in the repository
+            // now, as a `PATH` gem is.
+            lock.in_repo.extend(gem_sources.iter().map(|(name, _)| name.clone()));
+            app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
                 app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock);
             }
@@ -4464,13 +4472,16 @@ fn read_test_rb_files<V: Vfs + ?Sized>(
     Ok(files)
 }
 
-/// The app's `roundhouse.yml`: extra test roots, and the database
-/// configuration manifest (`ingest::database_manifest`).
+/// The app's `roundhouse.yml`: extra test roots, carried gem sources,
+/// and the database configuration manifest (`ingest::database_manifest`).
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RoundhouseConfig {
     test_paths: Vec<PathBuf>,
     database_configurations: Option<PathBuf>,
+    /// Installed gem sources the app carries as its own code: gem name
+    /// to the app-relative directory holding the gem's tree.
+    gem_sources: std::collections::BTreeMap<String, PathBuf>,
 }
 
 /// `roundhouse.yml`, parsed, with its text; `None` when the app has none.
@@ -4569,6 +4580,42 @@ fn additional_test_paths<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<V
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// The gems `roundhouse.yml` names under `gem_sources:`, with their
+/// app-relative directories. Such a gem's installed tree was copied into
+/// the app, because it depends on Rails and so is compiled rather than
+/// loaded natively (an app's vendored `verdict-19.34.0/`). It is read
+/// the way a `PATH` gem is: its `lib/` is a support root, and its RBI is
+/// not the gem boundary, since its own source is.
+fn gem_source_dirs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Vec<(String, PathBuf)>> {
+    let config_path = dir.join("roundhouse.yml");
+    let Some((config, _)) = roundhouse_config(vfs, dir)? else { return Ok(Vec::new()) };
+    let refuse = |name: &str, path: &Path| IngestError::Parse {
+        file: config_path.display().to_string(),
+        message: format!(
+            "gem_sources entry {name:?} must name an app-relative directory without '..' or symbolic links: {path:?}"
+        ),
+    };
+    let mut out = Vec::new();
+    for (name, path) in config.gem_sources {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(segment) => normalized.push(segment),
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(refuse(&name, &path));
+                }
+            }
+        }
+        let full = dir.join(&normalized);
+        if normalized.as_os_str().is_empty() || path_has_symlink_component(vfs, dir, &full) || !vfs.is_dir(&full) {
+            return Err(refuse(&name, &path));
+        }
+        out.push((name, full));
+    }
+    Ok(out)
 }
 
 /// The classes from `classes` that are NESTED under `outer` — the ones
