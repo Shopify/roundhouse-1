@@ -85,6 +85,11 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
                     "the generated mailer wrapper cannot preserve a full forwarding packet"));
                 continue;
             }
+            if m.params.iter().any(crate::dialect::Param::is_nameless_rest) {
+                diags.push(Diagnostic::unsupported(m.name_span, None, "anonymous positional rest mailer wrapper",
+                    "the generated mailer wrapper has no name to forward a nameless rest by"));
+                continue;
+            }
             if m.params.iter().any(|p| p.keyword) {
                 diags.push(residue(m, "keyword parameters do not forward positionally"));
                 continue;

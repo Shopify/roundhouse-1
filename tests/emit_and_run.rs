@@ -7959,6 +7959,16 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("no_keywords", "class Probe\n  def m(*, **nil)\n    :ok\n  end\nend\n", "no-keywords constraint is not retained"),
         ("forwarded_into", "class Probe\n  def m(a, *)\n    a\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
         ("keyword_splat_super", "class Probe\n  def m(*)\n    7\n  end\nend\n\nclass Kid < Probe\n  def m(**h)\n    super(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("new_keyword_splat", "class Probe\n  def initialize(*, **kw)\n    @kw = kw\n  end\n\n  def self.make(h)\n    new(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("send_keyword_splat", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    send(:m, **h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("call_keyword_splat", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    method(:m).call(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("public_send_keyword_splat", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    public_send(:m, **h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("method_object_yield", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def each(h)\n    yield(**h)\n  end\n\n  def go(h)\n    each(h, &method(:m))\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("method_object_value", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    f = method(:m)\n    f.call(h)\n  end\nend\n", "method object of an anonymous positional rest"),
+        ("delegate", "class Probe\n  def m(a, *)\n    a\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("block_default_passes_on", "class Probe\n  def m(*)\n    [1].map { |x = [*]| x }\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("override_implicit_super", "class Probe\n  def m(*, **kw)\n    kw\n  end\nend\n\nclass Kid < Probe\n  def m(a, k: 1)\n    super\n  end\nend\n", "implicit super into an anonymous positional rest"),
+        ("default_passes_on", "class Probe\n  def m(*, k: [*])\n    k\n  end\nend\n", "anonymous positional rest is not retained"),
         ("keyword_splat_into", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    m(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
     ];
     let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert Probe\n  end\nend\n";
@@ -7969,4 +7979,54 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
     let helper = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  def helper(a, *)\n    a\n  end\n\n  test \"t\" do\n    assert_equal 1, helper(1, 2)\n  end\nend\n";
     let (_, errors) = nameless_rest_app("class Probe\nend\n", helper).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("anonymous positional rest is not retained")), "helper: {errors:?}");
+}
+
+/// An override with no keyword parameters passes its positionals to the
+/// admitted rest as written, so its implicit `super` stays admitted.
+#[test]
+fn an_implicit_super_without_keywords_into_a_nameless_rest_runs_on_cruby() {
+    let probe = "class Probe\n  def m(a, *)\n    a * 2\n  end\nend\n\nclass Named < Probe\n  def m(a, *rest)\n    super\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal 6, Named.new.m(3, 4, 5)\n  end\nend\n";
+    nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
+}
+
+/// A job's `perform` and a mailer action are copied into generated
+/// class-side wrappers that forward each parameter by name; a nameless
+/// rest has none, so the wrapper is refused rather than written broken.
+#[test]
+fn a_nameless_rest_in_a_job_or_mailer_wrapper_is_refused_by_name() {
+    use roundhouse::project::BuildTarget;
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/jobs/probe_job.rb", "class ProbeJob < ApplicationJob\n  def perform(a, *, z)\n    [a, z]\n  end\nend\n")
+        .write("app/mailers/probe_mailer.rb", "class ProbeMailer < ApplicationMailer\n  def hello(to, *, z)\n    mail(to: to, subject: z)\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("anonymous positional rest job wrapper")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("anonymous positional rest mailer wrapper")), "{errors:?}");
+}
+
+/// A controller's `delegate` writes a zero-arg forwarder, so naming an
+/// admitted nameless rest is refused by name.
+#[test]
+fn a_controller_delegate_to_a_nameless_rest_is_refused_by_name() {
+    use roundhouse::project::BuildTarget;
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/models/probe.rb", "class Probe\n  def tagx(a, *)\n    a\n  end\nend\n")
+        .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", "class ArticlesController < ApplicationController\n  delegate :tagx, to: :probe\n\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("delegate to an anonymous positional rest")), "{errors:?}");
+}
+
+/// A controller class side does not admit `*`: its slot stays out of
+/// the parameters, as before, on every target (the declaration's own
+/// refusal there is a separate, ledgered gap).
+#[test]
+fn a_controller_class_side_nameless_rest_is_not_written() {
+    use roundhouse::project::BuildTarget;
+    for target in [BuildTarget::Ruby, BuildTarget::Jruby, BuildTarget::Spinel] {
+        let (out, _) = emit_and_run::real_blog()
+            .edit("app/controllers/articles_controller.rb", "class ArticlesController < ApplicationController\n", "class ArticlesController < ApplicationController\n  def self.tagx(a, *)\n    a\n  end\n\n")
+            .emit(target);
+        let text = std::fs::read_to_string(out.join("app/controllers/articles_controller.rb")).unwrap_or_default();
+        assert!(text.contains("def self.tagx(a)") && !text.contains("tagx(a, *)"), "{target:?}: {text}");
+    }
 }

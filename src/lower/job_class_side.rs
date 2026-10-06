@@ -109,6 +109,11 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                 "the generated job wrapper cannot preserve a full forwarding packet"));
             continue;
         }
+        if perform.params.iter().any(crate::dialect::Param::is_nameless_rest) {
+            diags.push(Diagnostic::unsupported(perform.name_span, None, "anonymous positional rest job wrapper",
+                "the generated job wrapper has no name to forward a nameless rest by"));
+            continue;
+        }
         if perform.params.iter().any(|p| p.keyword) {
             diags.push(residue(&perform, "keyword parameters do not forward positionally"));
             continue;

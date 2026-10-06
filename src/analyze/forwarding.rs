@@ -96,17 +96,61 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 
 /// The ordinary `**value` lowering passes the hash positionally, which a
 /// rest destination takes as one more positional. Refuse it where the
-/// selector can name an admitted nameless rest, by selector alone.
+/// selector can name an admitted nameless rest, by selector alone: the
+/// method itself, `new` for `initialize`, and the dynamic dispatchers.
+/// Reifying such a method (`method(:m)`) is refused outright.
+/// An implicit `super` in an override of such a selector with keyword
+/// parameters (kept or flattened) passes the override's lowered
+/// keywords as positionals, so it is refused too.
 pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
-    fn visit(selectors: &HashSet<&Symbol>, enclosing: Option<&Symbol>, e: &Expr, out: &mut Vec<Diagnostic>) {
-        let (selector, args) = match &*e.node {
-            ExprNode::Send { method, args, .. } => (Some(method), args.as_slice()),
-            ExprNode::Super { args: Some(args) } => (enclosing, args.as_slice()),
-            _ => (None, [].as_slice()),
-        };
-        if selector.is_some_and(|s| selectors.contains(s))
-            && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. }))
+    const DISPATCH: [&str; 8] =
+        ["send", "public_send", "__send__", "call", "[]", "===", "curry", "instance_exec"];
+    fn visit(selectors: &HashSet<&Symbol>, enclosing: Option<&MethodDef>, e: &Expr, out: &mut Vec<Diagnostic>) {
+        if matches!(&*e.node, ExprNode::Super { args: None })
+            && enclosing.is_some_and(|m| selectors.contains(&m.name) && m.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest))
         {
+            out.push(Diagnostic::unsupported(
+                e.span,
+                None,
+                "implicit super into an anonymous positional rest",
+                "the override's lowered parameters are not shown to pass as written",
+            ));
+        }
+        let named = |s: &Symbol| {
+            selectors.contains(s)
+                || DISPATCH.contains(&s.as_str())
+                || (s.as_str() == "new" && selectors.iter().any(|s| s.as_str() == "initialize"))
+        };
+        let (reaches, args) = match &*e.node {
+            ExprNode::Send { method, args, .. } => (named(method), args.as_slice()),
+            ExprNode::Super { args: Some(args) } => (enclosing.is_some_and(|m| named(&m.name)), args.as_slice()),
+            _ => (false, [].as_slice()),
+        };
+        // A reified method reaches callers (`yield`, `&block`) no
+        // selector names, and `yield` keeps no keyword splat to check.
+        let reified = match &*e.node {
+            ExprNode::MethodRef { name, .. } => selectors.contains(name),
+            ExprNode::Send { method, args, .. } => {
+                matches!(method.as_str(), "method" | "public_method" | "instance_method")
+                    && args.iter().any(|a| match &*a.node {
+                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => selectors.contains(value),
+                        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
+                            selectors.iter().any(|s| s.as_str() == value)
+                        }
+                        _ => false,
+                    })
+            }
+            _ => false,
+        };
+        if reified {
+            out.push(Diagnostic::unsupported(
+                e.span,
+                None,
+                "method object of an anonymous positional rest",
+                "the callers a reified method reaches are not shown to pass as written",
+            ));
+        }
+        if reaches && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) {
             out.push(Diagnostic::unsupported(
                 e.span,
                 None,
@@ -125,12 +169,36 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
         return out;
     }
     for (_, method) in methods(app) {
-        visit(&selectors, Some(&method.name), &method.body, &mut out);
+        visit(&selectors, Some(method), &method.body, &mut out);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            visit(&selectors, Some(&method.name), default, &mut out);
+            visit(&selectors, Some(method), default, &mut out);
         }
     }
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(&selectors, None, e, &mut out));
+    // `delegate` writes a zero-arg forwarder; the library-class pass
+    // leaves such a declaration in `unknown_calls`, and a controller's
+    // stays a body item, so refuse it here by name.
+    let delegations = app.library_classes.iter().flat_map(|c| c.unknown_calls.iter()).chain(
+        app.controllers.iter().flat_map(|c| c.body.iter()).filter_map(|item| match item {
+            crate::dialect::ControllerBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        }),
+    );
+    for call in delegations {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
+            && method.as_str() == "delegate"
+            && args.iter().any(|a| {
+                matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if selectors.contains(value))
+            })
+        {
+            out.push(Diagnostic::unsupported(
+                call.span,
+                None,
+                "delegate to an anonymous positional rest",
+                "the generated forwarder takes no arguments",
+            ));
+        }
+    }
     out
 }
 

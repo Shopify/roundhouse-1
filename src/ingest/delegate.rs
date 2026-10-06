@@ -61,9 +61,18 @@ struct Delegation {
 /// declarations on its own classes — so what reaches here is the
 /// general shape only.
 pub fn lower_delegates(app: &mut crate::App) {
+    // A zero-arg forwarder for an admitted `def m(a, *)` is the arity
+    // error the module header declines; leave those declarations visible.
+    let nameless_rest: std::collections::HashSet<String> = app
+        .library_classes
+        .iter()
+        .flat_map(|c| c.methods.iter())
+        .filter(|m| m.unsupported_formals.is_none() && m.params.iter().any(crate::dialect::Param::is_nameless_rest))
+        .map(|m| m.name.as_str().to_string())
+        .collect();
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
-        let methods = expand_delegates_in_class(lc);
+        let methods = expand_delegates_declining(lc, &nameless_rest);
         if !methods.is_empty() {
             generated.push((i, methods));
         }
@@ -108,7 +117,13 @@ fn record_synthesis_failure(delegates: &[Delegation], diags: &[crate::diagnostic
 /// whole app; a single-class caller can just extend its own `methods`
 /// with the result).
 pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef> {
-    let delegates = take_delegate_decls(lc);
+    expand_delegates_declining(lc, &std::collections::HashSet::new())
+}
+
+/// `expand_delegates_in_class`, leaving any delegation that names one
+/// of `decline` in `unknown_calls`.
+fn expand_delegates_declining(lc: &mut LibraryClass, decline: &std::collections::HashSet<String>) -> Vec<MethodDef> {
+    let delegates = take_delegate_decls(lc, decline);
     if delegates.is_empty() {
         return Vec::new();
     }
@@ -139,7 +154,7 @@ pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef>
 
 /// Consume the declarations this pass can reproduce EXACTLY, leaving
 /// every other shape in `unknown_calls` rather than half-expanded.
-fn take_delegate_decls(lc: &mut LibraryClass) -> Vec<Delegation> {
+fn take_delegate_decls(lc: &mut LibraryClass, decline: &std::collections::HashSet<String>) -> Vec<Delegation> {
     let called_with_args = names_called_with_arguments(lc);
     let mut out = Vec::new();
     lc.unknown_calls.retain(|call| {
@@ -196,6 +211,9 @@ fn take_delegate_decls(lc: &mut LibraryClass) -> Vec<Delegation> {
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
         if names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str())) {
+            return true;
+        }
+        if names.iter().any(|n| decline.contains(n.as_str())) {
             return true;
         }
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
@@ -351,7 +369,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior, :behavior=, to: :deprecator\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc);
+        let delegates = take_delegate_decls(&mut lc, &Default::default());
         assert_eq!(delegates.len(), 2);
         assert!(lc.unknown_calls.is_empty(), "the declaration should be consumed");
 
@@ -374,7 +392,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior=, to: :deprecator, prefix: true\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc);
+        let delegates = take_delegate_decls(&mut lc, &Default::default());
         assert_eq!(delegates.len(), 1);
         assert_eq!(delegates[0].name, "deprecator_behavior=", "prefix composes ahead of the delegated name, trailing `=` intact");
 
@@ -391,7 +409,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior=, to: :deprecator, allow_nil: true\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc);
+        let delegates = take_delegate_decls(&mut lc, &Default::default());
         assert_eq!(delegates.len(), 1);
         assert!(delegates[0].allow_nil);
 
@@ -421,7 +439,7 @@ mod tests {
         let mut lc = library_class(
             "class Store\n  attr_accessor :backing\n\n  delegate :[]=, to: :backing\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc);
+        let delegates = take_delegate_decls(&mut lc, &Default::default());
         assert_eq!(delegates.len(), 1);
         let methods = synthesized_methods(&lc, &delegates);
         let setter = methods
@@ -481,7 +499,7 @@ mod tests {
             mutates_self: false,
         });
 
-        let delegates = take_delegate_decls(&mut lc);
+        let delegates = take_delegate_decls(&mut lc, &Default::default());
         assert_eq!(
             delegates.len(),
             1,
