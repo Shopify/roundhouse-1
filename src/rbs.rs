@@ -1298,6 +1298,89 @@ pub fn print_sidecar(
     Some(out)
 }
 
+/// The names one RBS document declares, for constant resolution:
+/// classes and modules, class/module aliases, and value constants
+/// with their declared types. Methods are not read here.
+#[derive(Debug, Default)]
+pub(crate) struct DeclaredNames {
+    /// Full names of the classes and modules the document opens.
+    pub namespaces: Vec<String>,
+    pub aliases: Vec<NamespaceAlias>,
+    /// `(full name, type)`. `Err` when the type has no `Ty` reading
+    /// (an interface, a singleton `self`): the constant still exists.
+    pub constants: Vec<(String, Result<Ty, String>)>,
+}
+
+/// `class Queue = Thread::Queue`, as written, with the lexical scopes
+/// around it: each `(is_module, name as written)`, outermost first.
+#[derive(Debug)]
+pub(crate) struct NamespaceAlias {
+    pub nesting: Vec<(bool, String)>,
+    pub new_name: String,
+    pub old_name: String,
+    /// The full name the alias declares.
+    pub full_name: String,
+}
+
+pub(crate) fn declared_names(source: &str) -> Result<DeclaredNames, String> {
+    fn full(type_name: &ruby_rbs::node::TypeNameNode<'_>, scope: Option<&str>) -> String {
+        let written = declared_name(type_name);
+        if type_name.namespace().absolute() { written } else { namespace_join(scope, &written) }
+    }
+    fn written(type_name: &ruby_rbs::node::TypeNameNode<'_>) -> String {
+        let name = declared_name(type_name);
+        if type_name.namespace().absolute() { format!("::{name}") } else { name }
+    }
+    fn walk<'a>(
+        members: Vec<Node<'a>>,
+        scope: Option<&str>,
+        nesting: &mut Vec<(bool, String)>,
+        outer: &AliasTable,
+        out: &mut DeclaredNames,
+    ) {
+        let aliases = resolve_aliases(&members, scope, outer);
+        for member in members {
+            let (is_module, name, body) = match member {
+                Node::Class(class) => (false, class.name(), class.members().iter().collect::<Vec<_>>()),
+                Node::Module(module) => (true, module.name(), module.members().iter().collect()),
+                Node::ClassAlias(alias) => {
+                    out.aliases.push(NamespaceAlias {
+                        nesting: nesting.clone(),
+                        new_name: written(&alias.new_name()),
+                        old_name: written(&alias.old_name()),
+                        full_name: full(&alias.new_name(), scope),
+                    });
+                    continue;
+                }
+                Node::ModuleAlias(alias) => {
+                    out.aliases.push(NamespaceAlias {
+                        nesting: nesting.clone(),
+                        new_name: written(&alias.new_name()),
+                        old_name: written(&alias.old_name()),
+                        full_name: full(&alias.new_name(), scope),
+                    });
+                    continue;
+                }
+                Node::Constant(constant) => {
+                    let ctx = TyCtx { scope, self_is_instance: true, aliases: &aliases };
+                    out.constants.push((full(&constant.name(), scope), ty_from_node(&constant.type_(), ctx)));
+                    continue;
+                }
+                _ => continue,
+            };
+            let full_name = full(&name, scope);
+            out.namespaces.push(full_name.clone());
+            nesting.push((is_module, written(&name)));
+            walk(body, Some(&full_name), nesting, &aliases, out);
+            nesting.pop();
+        }
+    }
+    let signature = parse(source)?;
+    let mut out = DeclaredNames::default();
+    walk(signature.declarations().iter().collect(), None, &mut Vec::new(), &AliasTable::new(), &mut out);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

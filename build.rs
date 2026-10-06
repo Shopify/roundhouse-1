@@ -13,6 +13,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     embed_runtime_files();
+    embed_rbs_files();
     println!("cargo:rerun-if-env-changed=ROUNDHOUSE_COMMIT");
     let commit = std::env::var("ROUNDHOUSE_COMMIT")
         .ok()
@@ -112,6 +113,23 @@ fn embed_runtime_files() {
     });
     std::fs::write(dest.join("runtime_const_sources.rs"), runtime_table(ruby))
         .expect("write runtime_const_sources.rs");
+}
+
+/// The Ruby core and stdlib signatures vendored under `rbs/`
+/// (`scripts/vendor-rbs`), as `$OUT_DIR/rbs_files.rs`, read by
+/// `src/stdlib_rbs.rs`. Every target embeds them, wasm included: the
+/// constant resolver indexes them, and the browser analyzer must answer
+/// as the CLI does. About 0.5 MB once comments are stripped.
+fn embed_rbs_files() {
+    let dir = manifest_root().join("rbs");
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    collect(&dir, "rbs", &mut entries);
+    entries.retain(|(path, _)| path.ends_with(".rbs") || path.ends_with(".tsv"));
+    entries.sort();
+    let dest = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(dest.join("rbs_files.rs"), runtime_table(entries.iter()))
+        .expect("write rbs_files.rs");
 }
 
 fn runtime_table<'a>(entries: impl Iterator<Item = &'a (String, PathBuf)>) -> String {

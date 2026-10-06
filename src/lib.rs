@@ -68,6 +68,8 @@ pub mod stack;
 pub mod rbs;
 pub mod runtime_loader;
 pub mod runtime_src;
+/// Ruby core and stdlib signatures (`rbs/`), for constant names and types.
+pub(crate) mod stdlib_rbs;
 pub mod session;
 pub mod timings;
 pub mod treeshake;
