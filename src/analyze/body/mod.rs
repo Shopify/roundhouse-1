@@ -236,6 +236,10 @@ pub struct ClassInfo {
     /// but an APP class that inherits from it also inherits whatever the
     /// gem's macros generate, which no declaration lists.
     pub gem_boundary: bool,
+    /// The gem whose RBI declared it, when `gem_boundary`. An RBI is a
+    /// type, not a runtime: a constant it declares runs only on a tree
+    /// that loads that gem (`crate::project::ruby_tree_loads_gem`).
+    pub gem: Option<String>,
     /// The surface cannot be enumerated (`method_missing`, an unresolved
     /// mixin, an ancestor the RBI could not name): a lookup that misses
     /// is unknown, not wrong.
@@ -308,6 +312,20 @@ impl<'a> BodyTyper<'a> {
     /// stays private to this module; `send.rs` reaches it here.
     pub(super) fn classes(&self) -> &'a HashMap<ClassId, ClassInfo> {
         self.classes
+    }
+
+    /// The gem whose RBI is the only declaration of the constant `path`
+    /// names: the class or module itself, else a value its owner assigns.
+    fn declaring_gem(&self, path: &[Symbol]) -> Option<String> {
+        if let Some(gem) = self.classes().get(&written_class_id(path)).and_then(|info| info.gem.clone()) {
+            return Some(gem);
+        }
+        let (name, owner) = path.split_last()?;
+        if owner.is_empty() {
+            return None;
+        }
+        let info = self.classes().get(&written_class_id(owner))?;
+        info.constants.contains_key(name).then(|| info.gem.clone()).flatten()
     }
 
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
@@ -570,6 +588,7 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 expr.diagnostic = None;
+                expr.decisions &= !crate::expr::GEM_CONSTANT_REF;
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -614,6 +633,7 @@ impl<'a> BodyTyper<'a> {
                     .as_ref()
                     .filter(|_| !generated)
                     .and_then(|resolver| resolver.reference(expr_span, path));
+                let app_value = matches!(source_reference, Some(Some(ResolvedConstant::Value { .. })));
                 let ty = match source_reference {
                     Some(Some(ResolvedConstant::Namespace { class, runtime })) => {
                         let id = class.as_ref().clone();
@@ -681,6 +701,24 @@ impl<'a> BodyTyper<'a> {
                         construct: Symbol::from("constant"),
                         detail: written_class_id(path).0.as_str().to_string(),
                     });
+                }
+                // A gem's RBI types the constant; only a tree that loads
+                // the gem can run it.
+                if expr.diagnostic.is_none() && !app_value {
+                    if let Some(gem) = self.declaring_gem(path) {
+                        if crate::project::ruby_tree_loads_gem(&gem) {
+                            expr.decisions |= crate::expr::GEM_CONSTANT_REF;
+                        } else {
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("constant"),
+                                detail: format!(
+                                    "{} is declared by the {gem} gem, which no emitted tree loads",
+                                    written_class_id(path).0
+                                ),
+                            });
+                        }
+                    }
                 }
                 ty
             }

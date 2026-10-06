@@ -83,6 +83,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
     };
     let prune = |ty: &Ty, scope: &str| -> Ty { prune_ty(ty, &|id| resolve(id, scope)) };
 
+    // A namespace the catalog already nests a class in (`ActiveRecord`,
+    // which activemodel-serializers-xml reopens) exists without the gem;
+    // only a name the gem alone introduces is the gem's to load.
+    let framework_namespaces: HashSet<&str> = classes
+        .iter()
+        .filter(|(_, info)| !info.app_declared && !info.gem_boundary)
+        .flat_map(|(id, _)| id.0.as_str().match_indices("::").map(|(i, _)| &id.0.as_str()[..i]))
+        .collect();
+
     // First pass: build every ClassInfo with resolved types and the
     // instance-method surface of each declared mixin.
     let mut built: HashMap<ClassId, ClassInfo> = HashMap::new();
@@ -90,7 +99,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
     for id in &fresh {
         let gem = &declared[*id];
         let scope = id.0.as_str();
-        let mut info = ClassInfo { gem_boundary: true, ..ClassInfo::default() };
+        let owner = (!framework_namespaces.contains(scope)).then(|| gem.gem.clone());
+        let mut info = ClassInfo { gem_boundary: true, gem: owner, ..ClassInfo::default() };
         for (name, ty) in &gem.instance_methods {
             info.instance_methods.insert(name.clone(), prune(ty, scope));
         }

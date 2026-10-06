@@ -1294,6 +1294,9 @@ pub fn target_files(
         report_unsupported_harness_reads(app, target, &files);
         report_unsupported_harness_calls(app, target, &files);
     }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
+        report_unloaded_gem_constants(app, target);
+    }
 
     // Blog is the verbatim Rails source — it ships `db/seeds.rb` and is
     // seeded by Rails, so it needs no SQL seed. Every transpile target
@@ -3843,6 +3846,30 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
     }
 }
 
+/// A constant only a gem's RBI declares (`StatsD`) runs on the CRuby
+/// tree, which loads the gem, and is refused on every other target,
+/// which loads none. The analyzer marks each such read
+/// (`GEM_CONSTANT_REF`) and has already refused the ones whose gem no
+/// tree loads.
+fn report_unloaded_gem_constants(app: &App, target: BuildTarget) {
+    fn visit(app: &App, target: BuildTarget, expr: &crate::expr::Expr) {
+        if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
+            if let crate::expr::ExprNode::Const { path } = &*expr.node {
+                let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                let gem = app.gem_boundary.gem_of(&name).unwrap_or("its");
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target.as_str(),
+                    "gem_constant",
+                    format!("{name} is declared by the {gem} gem, which the {} tree does not load", target.as_str()),
+                );
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(app, target, child));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, expr));
+}
+
 /// Add Minitest's `capture_io` to the CRuby harness when a test body
 /// calls it. Only CRuby is run here; the Spinel tree cannot swap the
 /// output globals, and the JRuby tree is unverified, so both are left
@@ -5110,6 +5137,7 @@ const GEM_REQUIRES: &[&str] = &[
     "rails-html-sanitizer",
     "net/http/persistent",
     "web-push",
+    "statsd-instrument",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5383,12 +5411,20 @@ fn gem_require_block(exclude: &[&str]) -> String {
     out
 }
 
-fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
+/// Whether the CRuby tree loads `gem` (a lockfile spec name): its
+/// Gemfile declares it on demand and runtime/gem_facades.rb requires it.
+/// No other tree loads any gem, so a constant only a gem's RBI declares
+/// runs here or nowhere.
+pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
+    runtime_gems().iter().any(|(_, loaded)| *loaded == gem)
+}
+
+fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // Kept in step with the guarded list in `runtime/gem_facades.rb`:
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 15] = [
+    const RUNTIME_GEMS: [(Marker, &str); 16] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -5474,10 +5510,17 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
         // installed, which the app's own Gemfile (image_processing →
         // ruby-vips) already asked of the machine.
         (Marker::AnyText(&[VARIATION_MARKER]), "ruby-vips"),
+        // Shopify Core reports query and CI timings through the real
+        // client (`StatsD::Instrument::Client.from_env`); the analyzer
+        // types it from the gem's Tapioca RBI, which loads nothing.
+        (Marker::Constant("StatsD"), "statsd-instrument"),
     ];
+    &RUNTIME_GEMS
+}
 
+fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
     let mut needed: Vec<&str> = Vec::new();
-    for (marker, gem) in RUNTIME_GEMS {
+    for &(ref marker, gem) in runtime_gems() {
         // `app/` only. The runtime tree names several of these itself (the
         // façade lists all nine), and a scan that saw those would declare
         // every gem for every app — the same self-fulfilling wiring the

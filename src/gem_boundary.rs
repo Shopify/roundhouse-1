@@ -38,6 +38,17 @@ impl GemBoundary {
         self.classes.is_empty()
     }
 
+    /// The gem whose RBI declares the constant `path`: the class or
+    /// module itself, else the value constant its owner's body assigns.
+    pub fn gem_of(&self, path: &str) -> Option<&str> {
+        if let Some(class) = self.classes.get(&ClassId(Symbol::from(path))) {
+            return Some(class.gem.as_str());
+        }
+        let (owner, name) = path.rsplit_once("::")?;
+        let class = self.classes.get(&ClassId(Symbol::from(owner)))?;
+        class.constants.iter().any(|c| c.as_str() == name).then_some(class.gem.as_str())
+    }
+
     /// Whether `gem`'s RBI accounts for the constant `path`: it defines
     /// it, defines something inside it, or `path` sits inside something
     /// it defines. `None` when its RBI was not read: nothing is known

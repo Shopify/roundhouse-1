@@ -34,6 +34,10 @@ pub const GENERATED_CONST_REF: u64 = 1 << 4;
 /// An admitted library-class Data factory with its exact declaration identity.
 pub const RESOLVED_DATA_FACTORY: u64 = 1 << 3;
 
+/// The constant is declared only by a gem's RBI, and that gem is loaded
+/// by the CRuby tree alone: every other target refuses it at emit.
+pub const GEM_CONSTANT_REF: u64 = 1 << 8;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
