@@ -7679,6 +7679,24 @@ fn capture_io_runs_on_cruby_and_is_refused_where_the_harness_lacks_it() {
     }
 }
 
+/// A `def self.capture_io` on the test class is not what an instance
+/// call reaches, so the call still needs the harness's.
+#[test]
+fn a_test_class_capture_io_class_method_does_not_stand_in_for_the_harness() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/widget.rb", "class Widget\nend\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  def self.capture_io\n    yield\n  end\n\n  test \"t\" do\n    out, _err = capture_io { $stdout.puts \"x\" }\n    assert_equal \"x\\n\", out\n  end\nend\n")
+    };
+    app().run_test("test/models/widget_test.rb").assert_passes();
+    for target in [BuildTarget::Spinel, BuildTarget::Rust, BuildTarget::Typescript] {
+        let (_, errors) = app().emit(target);
+        assert!(errors.iter().any(|e| e.contains("harness_method") && e.contains("capture_io")), "{target:?}: {errors:?}");
+    }
+}
+
 /// A test class's own `capture_io` is the method the call reaches, so
 /// the harness's absence on a target is not the reason to refuse it.
 #[test]
