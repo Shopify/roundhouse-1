@@ -4,7 +4,7 @@
 //! Rails holds nil there until save, so `validates :col, presence: true`
 //! on `new(col: nil)` reports "can't be blank" where the emitted program
 //! sees a present value. The one slot that still answers as Rails does is
-//! a string with no default: its zero is the blank `""`. Every other NOT
+//! a string with no default or an empty one: it holds the blank `""`. Every other NOT
 //! NULL slot is refused (a boolean's `false` is blank to Rails as well,
 //! which the generic presence check does not model), until an unsaved
 //! record can hold nil there.
@@ -28,7 +28,10 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 continue;
             }
             let ty = ty_of_column(&col.col_type);
-            if ty == Ty::Str && col.default.is_none() {
+            // A blank default (`DEFAULT ''`, Devise's `default: "", null:
+            // false`) is held as `""`, as blank to the emitted check as to
+            // Rails'.
+            if ty == Ty::Str && col.default.as_deref().is_none_or(str::is_empty) {
                 continue;
             }
             let held = match &col.default {

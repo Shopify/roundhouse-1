@@ -6751,3 +6751,28 @@ end
         .run_test("test/models/teardown_order_test.rb")
         .assert_passes();
 }
+
+/// Review r2: a NOT NULL string whose default is blank (Devise's
+/// `email default: "", null: false`) holds `""` when given nil, which is
+/// blank to both sides, so presence answers as Rails' does and is not
+/// refused. Real ActiveRecord 8.1.4 answers these four the same way.
+#[test]
+fn presence_on_a_not_null_string_with_a_blank_default_runs() {
+    emit_and_run::empty_app()
+        .write("db/structure.sql", "CREATE TABLE `members` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;\n")
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/models/member.rb", "class Member < ApplicationRecord\n  validates :email, presence: true\nend\n")
+        .write("test/models/member_test.rb", r#"require "test_helper"
+
+class MemberTest < ActiveSupport::TestCase
+  test "blank and missing emails are invalid" do
+    refute Member.new.valid?
+    refute Member.new(email: nil).valid?
+    refute Member.new(email: "").valid?
+    assert Member.new(email: "a@b.c").valid?
+  end
+end
+"#)
+        .run_test("test/models/member_test.rb")
+        .assert_passes();
+}

@@ -31,8 +31,7 @@ use crate::ty::Ty;
 
 /// Build the `Schema` module as a single LibraryFunction:
 /// `Schema.statements() -> Array<String>` returning the rendered
-/// DDL statements. Empty when `schema.tables` is empty — apps
-/// without persisted models don't need a Schema artifact.
+/// DDL statements; an empty list when `schema.tables` is empty.
 pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction> {
     // No tables still means a `Schema` whose statement list is empty:
     // every harness loads `Schema.statements` unconditionally, so an app
