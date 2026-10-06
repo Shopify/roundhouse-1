@@ -54,6 +54,7 @@ pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
     let mut seen_heads: HashSet<String> = HashSet::new();
 
     for raw in top_level_split(&text, b';') {
+        let raw = unwrap_mysql_executable_comments(&raw);
         let stmt = strip_leading_comment_banner(&raw);
         if stmt.is_empty() {
             continue;
@@ -96,11 +97,13 @@ fn dispatch_statement(
     // information. `ALTER INDEX … ATTACH PARTITION …` (a partitioned
     // index's own child-index attachment) has no table to retract —
     // skipped, same as before.
-    if starts_with_ci(stmt, "ALTER TABLE") && stmt.to_ascii_uppercase().contains("ATTACH PARTITION") {
+    // Words, not substrings: `COMMENT='… attach partition …'` is text.
+    let attach = word_seq_pos(&top_level_words(stmt), &["ATTACH", "PARTITION"]).is_some();
+    if starts_with_ci(stmt, "ALTER TABLE") && attach {
         handle_attach_partition(stmt, schema);
         return;
     }
-    if stmt.to_ascii_uppercase().contains("ATTACH PARTITION") {
+    if attach {
         return;
     }
 
@@ -113,6 +116,10 @@ fn dispatch_statement(
         || starts_with_ci(stmt, "CREATE OR REPLACE VIEW")
     {
         handle_create_view(stmt, file, gaps);
+        return;
+    }
+    if let Some(name) = mysql_view_name(stmt) {
+        push_view_gap(&name, file, gaps);
         return;
     }
     if starts_with_ci(stmt, "CREATE TYPE") {
@@ -212,7 +219,7 @@ fn handle_create_table(
     // …` — DOES have its own column list here, so it's ingested like
     // any other table and then retracted by `handle_attach_partition`
     // once the ATTACH statement names it.)
-    if stmt.to_ascii_uppercase().contains("PARTITION OF") {
+    if word_seq_pos(&top_level_words(stmt), &["PARTITION", "OF"]).is_some() {
         return;
     }
 
@@ -250,15 +257,25 @@ fn handle_create_table(
 
     let mut columns: Vec<Column> = Vec::new();
     let mut keys: Vec<Index> = Vec::new();
+    let mut inline_fks: Vec<String> = Vec::new();
     for seg in top_level_split(body, b',') {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;
         }
         if let Some(unique) = mysql_key_entry(seg) {
-            if let Some(index) = mysql_inline_index(seg, unique) {
-                keys.push(index);
+            match mysql_inline_index(seg, unique) {
+                Some(index) => keys.push(index),
+                // A unique key is a constraint the emitted database must
+                // enforce; one this walk cannot shape is ledgered. A plain
+                // key only speeds reads, so skipping it changes nothing.
+                None if unique => gaps.push(unique_key_gap(file, &table_name, seg)),
+                None => {}
             }
+            continue;
+        }
+        if is_table_level_constraint(seg) && word_seq_pos(&top_level_words(seg), &["FOREIGN", "KEY"]).is_some() {
+            inline_fks.push(seg.to_string());
             continue;
         }
         if is_table_level_constraint(seg) {
@@ -279,17 +296,42 @@ fn handle_create_table(
     // options — `ENGINE`, `DEFAULT CHARSET`, `COLLATE`, `ROW_FORMAT` —
     // sit there too.) A key over a column the walk dropped cannot
     // apply, the same retain-filter `handle_create_index` uses.
-    keys.retain(|k| k.columns.iter().all(|c| columns.iter().any(|col| col.name == *c)));
+    keys.retain(|k| {
+        let kept = k.columns.iter().all(|c| columns.iter().any(|col| col.name == *c));
+        if !kept && k.unique {
+            gaps.push(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("unique key dropped: {table_name}.{} covers a dropped column", k.name),
+            });
+        }
+        kept
+    });
+    let table_sym = Symbol::from(table_name.clone());
     schema.tables.insert(
-        Symbol::from(table_name.clone()),
+        table_sym.clone(),
         Table {
-            name: Symbol::from(table_name),
+            name: Symbol::from(table_name.clone()),
             columns,
             indexes: keys,
             foreign_keys: Vec::new(),
             virtual_module: None,
         },
     );
+    // MySQL declares foreign keys in the table body; read them as the
+    // `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` Postgres writes.
+    for seg in &inline_fks {
+        let words = top_level_words(seg);
+        if let Some(pos) = word_seq_pos(&words, &["FOREIGN", "KEY"]) {
+            handle_add_foreign_key(seg, &words, pos, &table_name, table_sym.clone(), schema, gaps, file);
+        }
+    }
+}
+
+fn unique_key_gap(file: &str, table: &str, seg: &str) -> IngestError {
+    IngestError::Unsupported {
+        file: file.into(),
+        message: format!("unique key dropped: {table} `{}` has no index shape (prefix length or expression)", seg.trim()),
+    }
 }
 
 /// A comma-separated entry inside `CREATE TABLE (...)` that is a
@@ -324,8 +366,7 @@ fn mysql_key_entry(seg: &str) -> Option<bool> {
 
 /// The `Index` a [`mysql_key_entry`] declares. A `FULLTEXT`/`SPATIAL`
 /// key, or one with a prefix-length column (`\`name\`(191)`), has no
-/// `Index` shape and is skipped, as `handle_create_index` skips an
-/// expression index.
+/// `Index` shape: `None`, which the caller ledgers for a unique key.
 fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
     let first = seg.split_whitespace().next().unwrap_or("");
     if first.eq_ignore_ascii_case("FULLTEXT") || first.eq_ignore_ascii_case("SPATIAL") {
@@ -338,8 +379,10 @@ fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
     let mut columns = Vec::new();
     for entry in top_level_split(&seg[open + 1..close], b',') {
         let e = entry.trim();
+        // A key column's sort order changes no lookup or uniqueness.
+        let order = |t: &str| t.is_empty() || t.eq_ignore_ascii_case("ASC") || t.eq_ignore_ascii_case("DESC");
         match read_ident(e, 0) {
-            Some((col, used)) if e[used..].trim().is_empty() => columns.push(Symbol::from(col)),
+            Some((col, used)) if order(e[used..].trim()) => columns.push(Symbol::from(col)),
             _ => return None,
         }
     }
@@ -351,9 +394,10 @@ fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
 
 /// `[CONSTRAINT name] PRIMARY KEY (cols)` inside the column-list parens
 /// sets the primary-key flag on the matching column(s); every other
-/// table-level constraint form (`UNIQUE`, `CHECK`, `EXCLUDE`, an
-/// inline `FOREIGN KEY`) is recognized and skipped — it costs the DDL
-/// nothing schema.rb would have captured either.
+/// table-level constraint form (`UNIQUE`, `CHECK`, `EXCLUDE`) is
+/// recognized and skipped — it costs the DDL nothing schema.rb would
+/// have captured either. (An inline `FOREIGN KEY` never reaches here:
+/// `handle_create_table` reads it once the table exists.)
 fn handle_inline_table_constraint(
     seg: &str,
     table_name: &str,
@@ -470,8 +514,9 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
     // MySQL's numeric attributes follow the type name. `unsigned` is a
     // range constraint `ColumnType` has no notion of — dropped here as
     // schema.rb ingest drops `unsigned: true`.
-    while let Some(stripped) =
-        ["unsigned", "signed", "zerofill"].iter().find_map(|w| base.strip_suffix(w).map(str::trim_end))
+    while let Some(stripped) = ["unsigned", "signed", "zerofill"]
+        .iter()
+        .find_map(|w| base.strip_suffix(w).filter(|b| b.ends_with(' ')).map(str::trim_end))
     {
         base = stripped.to_string();
     }
@@ -526,10 +571,70 @@ fn handle_create_view(stmt: &str, file: &str, gaps: &mut Vec<IngestError>) {
         .or_else(|| strip_prefix_ci(stmt, "CREATE VIEW"));
     let Some(rest) = rest else { return };
     let Some((name, _)) = read_ident(rest.trim_start(), 0) else { return };
+    push_view_gap(&name, file, gaps);
+}
+
+fn push_view_gap(name: &str, file: &str, gaps: &mut Vec<IngestError>) {
     gaps.push(IngestError::Unsupported {
         file: file.into(),
         message: format!("view not modeled: a model backed by this view has no columns ({name})"),
     });
+}
+
+/// mysqldump's view form: `CREATE [ALGORITHM=…] [DEFINER=…] [SQL
+/// SECURITY …] VIEW name AS …` (after [`unwrap_mysql_executable_comments`]
+/// has joined the comment pieces it writes it in). The view's name.
+fn mysql_view_name(stmt: &str) -> Option<String> {
+    let rest = strip_prefix_ci(stmt, "CREATE")?;
+    let mut words = rest.split_whitespace();
+    loop {
+        let w = words.next()?;
+        let upper = w.to_ascii_uppercase();
+        if upper == "VIEW" {
+            return read_ident(words.next()?, 0).map(|(name, _)| name);
+        }
+        let qualifier = upper.starts_with("ALGORITHM=")
+            || upper.starts_with("DEFINER=")
+            || matches!(upper.as_str(), "SQL" | "SECURITY" | "DEFINER" | "INVOKER");
+        if !qualifier {
+            return None;
+        }
+    }
+}
+
+/// MySQL executes the body of a version-conditional comment
+/// (`/*!50001 CREATE VIEW … */`), and mysqldump writes views, triggers
+/// and session settings that way. Replace each such comment with its
+/// body so the statement reads as MySQL runs it; ordinary comments and
+/// quoted text are left alone.
+fn unwrap_mysql_executable_comments(raw: &str) -> std::borrow::Cow<'_, str> {
+    if !raw.contains("/*!") {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*!") {
+            if let Some(end) = raw[i + 3..].find("*/").map(|e| i + 3 + e) {
+                let body = raw[i + 3..end].trim_start_matches(|c: char| c.is_ascii_digit());
+                out.push_str(&raw[copied..i]);
+                out.push(' ');
+                out.push_str(body);
+                out.push(' ');
+                i = end + 2;
+                copied = i;
+                continue;
+            }
+        }
+        match skip_quoted_or_comment(bytes, i) {
+            Some(next) => i = next,
+            None => i += 1,
+        }
+    }
+    out.push_str(&raw[copied..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// `CREATE TYPE name AS ENUM (…)` registers the (schema-stripped,
