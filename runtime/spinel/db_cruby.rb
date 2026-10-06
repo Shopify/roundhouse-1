@@ -112,8 +112,10 @@ module Db
   # in-memory database answers `memory`), NORMAL sync, its mmap, journal
   # and cache sizes — and no busy timeout, which Rails sets only for a
   # `timeout:` option. NOT modeled: the pool's size limit and reaping (a
-  # thread's handle lives until `close`), and a fork (a child keeps the
-  # parent's handles, as nothing re-opens a memory database).
+  # thread's handle lives until `close`), and a fork: the sqlite3 gem
+  # closes the handles a child inherits and nothing reopens them, so the
+  # child's next statement raises where Rails would reconnect to a new
+  # empty database.
   MEMORY_PRAGMAS = [
     "PRAGMA foreign_keys = ON",
     "PRAGMA journal_mode = WAL",
@@ -218,10 +220,15 @@ module Db
   # pool's first free handle for single-thread test/dev modes.
   # `Fiber[:k]` is fiber-storage — under Puma's thread-per-request it is
   # effectively thread-local (each worker thread's root fiber).
+  #
+  # In memory mode the thread's own handle, whatever fiber storage says:
+  # a `Thread.new` copies its parent's fiber storage, so a thread started
+  # under a lease would otherwise run on the parent's database, where
+  # Rails gives it its own.
   def self.current_dbh
+    return memory_dbh if @memory
     h = Fiber[:db_handle]
     return h if !h.nil?
-    return memory_dbh if @memory
     # Only the UNLEASED path pays the fork check — boot, tests, and
     # single-threaded dev. Under a lease the line above has already
     # returned, so the per-query cost of all this is zero.
@@ -247,6 +254,8 @@ module Db
   end
 
   def self.with_connection
+    # Memory mode: the thread's own handle, bound only so `in_lease?`
+    # answers as it does under a lease (`current_dbh` does not read it).
     if @memory
       outer = Fiber[:db_handle]
       Fiber[:db_handle] = memory_dbh

@@ -138,6 +138,14 @@ pub struct App {
     /// (`honored_database`) and refuses every other.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_helper_connections: Vec<HelperConnection>,
+    /// What else in the app could set or change the database the tests
+    /// run on, which the harness does not carry: in the helper, a
+    /// statement that runs against the database, a local file it loads,
+    /// or an exit before its connection; elsewhere, another
+    /// `establish_connection`. Each names its file. A helper connection
+    /// the harness could otherwise open is refused while any is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_helper_connection_blockers: Vec<String>,
     /// Call-site-unified parameter types, written by the analyzer's
     /// fixpoint (`unify_params_from_call_sites`) as its last act and
     /// read by lowerings that build method signatures — the controller
@@ -740,6 +748,7 @@ impl App {
             gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
             test_helper_connections: Vec::new(),
+            test_helper_connection_blockers: Vec::new(),
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),
             view_visible_controller_methods: BTreeSet::new(),

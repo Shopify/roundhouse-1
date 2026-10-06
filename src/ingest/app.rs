@@ -1431,6 +1431,9 @@ end
             {
                 app.test_helper_connections = calls;
             }
+            if !app.test_helper_connections.is_empty() {
+                app.test_helper_connection_blockers = helper_connection_blockers(vfs, dir, &helper_rb, &source)?;
+            }
             if let Some(tms) =
                 unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
             {
@@ -4364,6 +4367,40 @@ fn path_has_symlink_component<V: Vfs + ?Sized>(vfs: &V, root: &Path, path: &Path
 }
 
 /// Collect Ruby test files without following symbolic links.
+/// `App::test_helper_connection_blockers`: the helper's own (see
+/// `ingest::test::helper_connection_blockers`; a `require` is local when
+/// the app has the file under `test/` or `lib/`), then every other Ruby
+/// file under `app/`, `lib/`, `config/` and `test/` that makes an
+/// `establish_connection` of its own.
+fn helper_connection_blockers<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    helper_rb: &Path,
+    helper: &[u8],
+) -> IngestResult<Vec<String>> {
+    let shown = |path: &Path| path.strip_prefix(dir).unwrap_or(path).display().to_string();
+    let local = |feature: &str| {
+        ["test", "lib"].iter().any(|root| vfs.exists(&dir.join(root).join(format!("{feature}.rb"))))
+    };
+    let mut blockers = super::test::helper_connection_blockers(helper, &shown(helper_rb), &local);
+    let mut files = Vec::new();
+    for root in ["app", "lib", "config", "test"] {
+        let root = dir.join(root);
+        if !path_has_symlink_component(vfs, dir, &root) && vfs.is_dir(&root) {
+            files.extend(read_test_rb_files(vfs, dir, &root)?);
+        }
+    }
+    files.sort();
+    files.dedup();
+    for file in files.iter().filter(|f| *f != helper_rb) {
+        let Some(source) = read_or_ledger(vfs, file)? else { continue };
+        if super::test::connection_calls(&source) > 0 {
+            blockers.push(format!("{}: another `establish_connection` the harness does not carry", shown(file)));
+        }
+    }
+    Ok(blockers)
+}
+
 fn read_test_rb_files<V: Vfs + ?Sized>(
     vfs: &V,
     app_root: &Path,

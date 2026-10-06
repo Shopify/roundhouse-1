@@ -369,6 +369,138 @@ pub fn helper_connections(source: &[u8], file: &str) -> IngestResult<Vec<crate::
     calls.found.into_iter().collect()
 }
 
+/// Methods whose call runs against the database or changes the
+/// connection: the helper's own schema load (`ActiveRecord::Schema
+/// .define`, `load_schema`), a statement on its connection, a
+/// connection of another kind. Any of these the harness does not carry.
+const DATABASE_CALLS: &[&str] = &[
+    "connection",
+    "lease_connection",
+    "with_connection",
+    "connection_pool",
+    "connects_to",
+    "remove_connection",
+    "load_schema",
+    "load_schema!",
+    "maintain_test_schema!",
+    "purge",
+    "migrate",
+];
+
+/// Receivers whose every call touches the database.
+const DATABASE_RECEIVERS: &[&str] =
+    &["ActiveRecord::Schema", "ActiveRecord::Migration", "ActiveRecord::Migrator", "ActiveRecord::Tasks"];
+
+/// Calls that stop the file where they stand.
+const EXITS: &[&str] = &["exit", "exit!", "abort", "raise", "fail", "throw"];
+
+/// What in the test helper could set or change the database its tests
+/// run on, besides its `establish_connection` calls, that the emitted
+/// harness does not carry: a call that runs against the database or
+/// reconnects (anywhere in the file), a local file it loads
+/// (`require_relative`, `load`, or a `require` that `local` says names a
+/// file of the app's), and a top-level statement before its first
+/// connection that can stop the file first (`return`, `exit`, `raise`
+/// and the like), after which the connection is no longer certain.
+pub fn helper_connection_blockers(source: &[u8], file: &str, local: &dyn Fn(&str) -> bool) -> Vec<String> {
+    struct Scan<'a> {
+        local: &'a dyn Fn(&str) -> bool,
+        found: Vec<String>,
+        exits: bool,
+        in_def: usize,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Scan<'_> {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.in_def += 1;
+            ruby_prism::visit_def_node(self, node);
+            self.in_def -= 1;
+        }
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            if self.in_def == 0 {
+                self.exits = true;
+            }
+            ruby_prism::visit_return_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = constant_id_str(&node.name()).to_string();
+            let text = |n: &Node<'_>| String::from_utf8_lossy(n.location().as_slice()).to_string();
+            let receiver = node.receiver().map(|r| text(&r));
+            let first_string = || {
+                node.arguments().and_then(|args| {
+                    args.arguments().iter().next().and_then(|a| {
+                        a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).to_string())
+                    })
+                })
+            };
+            if DATABASE_CALLS.contains(&name.as_str()) {
+                self.found.push(format!("`{}` runs against the database", text(&node.as_node())));
+            } else if let Some(recv) = receiver.as_deref().map(|r| r.trim_start_matches("::"))
+                && DATABASE_RECEIVERS.iter().any(|root| recv == *root || recv.starts_with(&format!("{root}::")))
+            {
+                self.found.push(format!("`{recv}.{name}` runs against the database"));
+            } else if receiver.is_none() {
+                match name.as_str() {
+                    "require_relative" | "load" => {
+                        self.found.push(format!("`{}` loads a file the harness does not carry", text(&node.as_node())))
+                    }
+                    "require" if first_string().is_some_and(|f| (self.local)(&f)) => {
+                        self.found.push(format!("`{}` loads a file the harness does not carry", text(&node.as_node())))
+                    }
+                    _ if self.in_def == 0 && EXITS.contains(&name.as_str()) => self.exits = true,
+                    _ => {}
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = super::prism::parse_silent(source);
+    let root = result.node();
+    let mut scan = Scan { local, found: Vec::new(), exits: false, in_def: 0 };
+    ruby_prism::Visit::visit(&mut scan, &root);
+    let mut found: Vec<String> = scan.found.into_iter().map(|why| format!("{file}: {why}")).collect();
+    // The exits that matter come before the first connection, at the
+    // top level.
+    if let Some(program) = root.as_program_node() {
+        for stmt in program.statements().body().iter() {
+            if count_connections(&stmt) > 0 {
+                break;
+            }
+            let mut exits = Scan { local, found: Vec::new(), exits: false, in_def: 0 };
+            ruby_prism::Visit::visit(&mut exits, &stmt);
+            if exits.exits {
+                found.push(format!(
+                    "{file}: `{}` can stop the helper before its connection",
+                    String::from_utf8_lossy(stmt.location().as_slice())
+                ));
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// How many `establish_connection` calls a Ruby source makes, anywhere
+/// in it.
+pub fn connection_calls(source: &[u8]) -> usize {
+    let result = super::prism::parse_silent(source);
+    count_connections(&result.node())
+}
+
+fn count_connections(node: &Node<'_>) -> usize {
+    struct Count(usize);
+    impl<'pr> ruby_prism::Visit<'pr> for Count {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if constant_id_str(&node.name()) == "establish_connection" {
+                self.0 += 1;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut count = Count(0);
+    ruby_prism::Visit::visit(&mut count, node);
+    count.0
+}
+
 /// The app-wide `setup do … end` an app's `test/test_helper.rb` puts on
 /// `ActiveSupport::TestCase` (reopened there, or nested as `module
 /// ActiveSupport; class TestCase`). Rails runs it before every test
