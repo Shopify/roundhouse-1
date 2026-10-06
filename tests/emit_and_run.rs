@@ -7095,59 +7095,57 @@ fn a_rescue_of_invalid_foreign_key_is_refused() {
         let (_, errors) = adapter_app()
             .write("test/foreign_key_test.rb", &test)
             .emit(roundhouse::project::BuildTarget::Ruby);
-        assert!(errors.iter().any(|e| e.contains("`ActiveRecord::InvalidForeignKey` is never raised")), "{name}: {errors:?}");
+        assert!(errors.iter().any(|e| e.contains("`ActiveRecord::InvalidForeignKey` is not supported")), "{name}: {errors:?}");
     }
 }
-/// The test helper's own connection setup is not carried: the emitted
-/// harness opens one SQLite file database per test file. Each
-/// `establish_connection` the helper makes is named, so a run is never
-/// read as having used the helper's database.
-fn helper_connection_diagnostics(helper: &str) -> Vec<roundhouse::diagnostic::Diagnostic> {
-    let tree = [
+/// The test helper's own `establish_connection`: the diagnostics the
+/// check gives it, from a helper and (optionally) a schema.
+fn helper_connection_diagnostics_with(helper: &str, schema: Option<&str>) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    let mut tree = vec![
         ("app/.keep", "".to_string()),
         ("roundhouse.yml", "test_paths:\n  - test\n".to_string()),
         ("test/test_helper.rb", helper.to_string()),
         ("test/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n".to_string()),
-    ]
-    .into_iter()
-    .map(|(p, c)| (std::path::PathBuf::from(p), c.into_bytes()))
-    .collect();
+    ];
+    if let Some(schema) = schema {
+        tree.push(("db/schema.rb", schema.to_string()));
+    }
+    let tree = tree.into_iter().map(|(p, c)| (std::path::PathBuf::from(p), c.into_bytes())).collect();
     let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
     let lower = roundhouse::session::analyze_and_lower(&mut app);
     roundhouse::analyze::diagnose(&app).into_iter().chain(lower).filter(|d| d.message.contains("establish_connection")).collect()
 }
 
+fn helper_connection_diagnostics(helper: &str) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    helper_connection_diagnostics_with(helper, None)
+}
+
+const MEMORY_HELPER: &str = "require \"active_record\"\n\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n";
+
+/// The one connection the harness opens as written.
 #[test]
-fn a_helper_sqlite3_memory_connection_is_named_as_not_carried() {
-    let diags = helper_connection_diagnostics(
-        "require \"active_record\"\n\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n",
+fn a_helper_sqlite3_memory_connection_is_opened_as_written() {
+    assert_eq!(helper_connection_diagnostics(MEMORY_HELPER), vec![]);
+    assert_eq!(
+        helper_connection_diagnostics("ActiveRecord::Base.establish_connection(adapter: :sqlite3, database: \":memory:\")\n"),
+        vec![]
     );
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].severity, roundhouse::diagnostic::Severity::Warning, "{diags:?}");
-    assert!(diags[0].message.contains(":memory:") && diags[0].message.contains("tmp/test/"), "{}", diags[0].message);
 }
 
+/// Any connection the harness cannot open as written is an error, never
+/// a run on the harness's file database in its place.
 #[test]
-fn a_helper_connection_to_another_adapter_is_refused() {
-    for helper in [
-        "ActiveRecord::Base.establish_connection(adapter: \"mysql2\", database: \"core_test\")\n",
-        "ActiveRecord::Base.establish_connection(:test)\n",
-        "ActiveRecord::Base.establish_connection(adapter: ENV[\"DB\"], database: \":memory:\")\n",
-    ] {
-        let diags = helper_connection_diagnostics(helper);
-        assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{helper}: {diags:?}");
-    }
-}
-
-/// A connection the helper makes under a condition, in a class body, in
-/// a `begin` or inside a method it calls is named like a top-level one;
-/// a non-literal option beside a literal sqlite3 adapter does not make
-/// the adapter unreadable.
-#[test]
-fn a_helper_connection_anywhere_in_the_helper_is_named() {
-    use roundhouse::diagnostic::Severity;
+fn a_helper_connection_the_harness_cannot_open_is_refused() {
     let call = "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")";
     for helper in [
+        "ActiveRecord::Base.establish_connection(adapter: \"mysql2\", database: \"core_test\")\n".to_string(),
+        "ActiveRecord::Base.establish_connection(:test)\n".to_string(),
+        "ActiveRecord::Base.establish_connection(adapter: ENV[\"DB\"], database: \":memory:\")\n".to_string(),
+        "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \"db/test.sqlite3\")\n".to_string(),
+        "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\", timeout: 5000)\n".to_string(),
+        "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\")\n".to_string(),
+        "ApplicationRecord.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n".to_string(),
+        format!("{call}\n{call}\n"),
         format!("if ENV[\"CI\"]\n  {call}\nend\n"),
         format!("unless defined?(Foo)\n  {call}\nend\n"),
         format!("class ActiveSupport::TestCase\n  {call}\nend\n"),
@@ -7155,15 +7153,90 @@ fn a_helper_connection_anywhere_in_the_helper_is_named() {
         format!("def connect\n  {call}\nend\nconnect\n"),
     ] {
         let diags = helper_connection_diagnostics(&helper);
-        assert_eq!(diags.len(), 1, "{helper}: {diags:?}");
-        assert_eq!(diags[0].severity, Severity::Warning, "{helper}: {diags:?}");
+        assert!(!diags.is_empty(), "{helper}: {diags:?}");
+        assert!(diags.iter().all(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{helper}: {diags:?}");
     }
     let diags = helper_connection_diagnostics(
         "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\", timeout: 5000)\n",
     );
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].severity, Severity::Warning, "{diags:?}");
-    assert!(diags[0].message.contains("timeout: 5000"), "{}", diags[0].message);
+    assert!(diags[0].message.contains("option `timeout` is not modeled"), "{}", diags[0].message);
+    // The helper's database starts empty; the harness's schema load would fill it.
+    let diags = helper_connection_diagnostics_with(
+        MEMORY_HELPER,
+        Some("ActiveRecord::Schema.define do\n  create_table \"things\" do |t|\n    t.string \"name\"\n  end\nend\n"),
+    );
+    assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error && d.message.contains("schema")), "{diags:?}");
+}
+
+/// The control test, byte-identical to the one run natively under
+/// Rails 5813559f with this helper (evidence oracle/memory_connection_test.rb).
+const MEMORY_CONNECTION_TEST: &str = r##"require "test_helper"
+
+class MemoryConnectionTest < ActiveSupport::TestCase
+  test "the connection is an in-memory database" do
+    assert_equal [[0, "main", ""]], ActiveRecord::Base.connection.select_rows("PRAGMA database_list")
+  end
+
+  test "the connection runs with the sqlite3 adapter's default pragmas" do
+    conn = ActiveRecord::Base.connection
+    assert_equal [[1]], conn.select_rows("PRAGMA foreign_keys")
+    assert_equal [["memory"]], conn.select_rows("PRAGMA journal_mode")
+    assert_equal [[1]], conn.select_rows("PRAGMA synchronous")
+    assert_equal [[2000]], conn.select_rows("PRAGMA cache_size")
+  end
+
+  test "a foreign key is enforced" do
+    conn = ActiveRecord::Base.connection
+    conn.execute("CREATE TABLE IF NOT EXISTS memory_parents (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS memory_children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES memory_parents(id))")
+    error = assert_raises(ActiveRecord::StatementInvalid) do
+      conn.execute("INSERT INTO memory_children (parent_id) VALUES (42)")
+    end
+    assert_equal "ActiveRecord::InvalidForeignKey", error.class.name
+    assert_includes error.message, "FOREIGN KEY constraint failed"
+  end
+
+  test "a table is the thread's own: seen in its fibers, not on another thread" do
+    conn = ActiveRecord::Base.connection
+    conn.execute("CREATE TABLE IF NOT EXISTS memory_probe (id INTEGER)")
+    query = "SELECT name FROM sqlite_master WHERE name = 'memory_probe'"
+    assert_equal [["memory_probe"]], conn.select_rows(query)
+    assert_equal [["memory_probe"]], Fiber.new { ActiveRecord::Base.connection.select_rows(query) }.resume
+    assert_equal [], Thread.new { ActiveRecord::Base.connection.select_rows(query) }.value
+  end
+end
+"##;
+
+fn memory_app(helper: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", helper)
+        .write("test/memory_connection_test.rb", MEMORY_CONNECTION_TEST)
+}
+
+#[test]
+fn a_helper_memory_connection_runs_the_tests_on_rails_in_memory_database() {
+    memory_app(MEMORY_HELPER).run_test("test/models/memory_connection_test.rb").assert_passes();
+}
+
+/// The control discriminates: on the harness's own file database the
+/// same test fails.
+#[test]
+fn the_memory_connection_control_fails_on_the_harness_file_database() {
+    let run = memory_app("require \"active_record\"\n").run_test("test/models/memory_connection_test.rb");
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert!(!run.success, "the control passed on the file database:\n{}\n{}", run.stdout, run.stderr);
+}
+
+/// Only the CRuby tree's `Db` opens it.
+#[test]
+fn a_helper_memory_connection_is_refused_off_cruby() {
+    use roundhouse::project::BuildTarget;
+    for target in [BuildTarget::Spinel, BuildTarget::Jruby, BuildTarget::Typescript] {
+        let (_, errors) = memory_app(MEMORY_HELPER).emit(target);
+        assert!(errors.iter().any(|e| e.contains("in-memory `establish_connection`")), "{target:?}: {errors:?}");
+    }
 }
 
 /// A call to the adapter's transaction members names no constant, so

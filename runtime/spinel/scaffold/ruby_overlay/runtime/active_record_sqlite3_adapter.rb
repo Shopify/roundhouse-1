@@ -31,12 +31,15 @@
 # NOT modeled (ledgered): the Active Record error hierarchy above
 # StatementInvalid (ActiveRecordError, AdapterError,
 # WrappedDatabaseException, QueryAborted, StatementTimeout,
-# ConnectionNotEstablished); a connection of its own per thread (every
-# thread's adapter runs on `Db`'s shared handle outside a lease); a
+# ConnectionNotEstablished); a connection of its own per thread on the
+# file database (every thread's adapter runs on `Db`'s shared handle
+# outside a lease; memory mode gives each thread its own); a
 # shared-cache mode, so an isolation level never reaches its PRAGMA;
-# `transaction` options (refused at emit); foreign keys (no `PRAGMA
-# foreign_keys`, no `add_foreign_key`), so `InvalidForeignKey` below is
-# never raised and the check leaves its name unresolved. JRuby's tree
+# `transaction` options (refused at emit); foreign keys on the
+# harness's file database (no `PRAGMA foreign_keys`, no
+# `add_foreign_key`), so the check leaves `InvalidForeignKey` below
+# unresolved and `project` refuses its name (only the test helper's
+# in-memory connection, `Db` memory mode, raises it). JRuby's tree
 # carries this file too, but its `Db` has no `translate`, so `project`
 # still refuses the statement-error names there.
 module ActiveRecord

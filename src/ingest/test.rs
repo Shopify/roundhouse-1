@@ -331,22 +331,41 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
 /// at the top level, under a condition, in a class body or `begin`, or
 /// in a method the helper calls. Any of them can name the database the
 /// helper's tests run on, so none is left out.
-pub fn helper_connections(source: &[u8], file: &str) -> IngestResult<Vec<Expr>> {
+pub fn helper_connections(source: &[u8], file: &str) -> IngestResult<Vec<crate::app::HelperConnection>> {
     struct Calls<'f> {
         file: &'f str,
-        found: Vec<IngestResult<Expr>>,
+        top_level: Vec<(usize, usize)>,
+        found: Vec<IngestResult<crate::app::HelperConnection>>,
     }
     impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if constant_id_str(&node.name()) == "establish_connection" {
-                self.found.push(ingest_expr(&node.as_node(), self.file));
+                let at = node.location();
+                let top_level = self.top_level.contains(&(at.start_offset(), at.end_offset()));
+                self.found.push(
+                    ingest_expr(&node.as_node(), self.file)
+                        .map(|call| crate::app::HelperConnection { call, top_level }),
+                );
             }
             ruby_prism::visit_call_node(self, node);
         }
     }
     let result = super::prism::parse(source, file);
-    let mut calls = Calls { file, found: Vec::new() };
-    ruby_prism::Visit::visit(&mut calls, &result.node());
+    let root = result.node();
+    let top_level = root
+        .as_program_node()
+        .map(|program| {
+            program
+                .statements()
+                .body()
+                .iter()
+                .filter(|stmt| stmt.as_call_node().is_some())
+                .map(|stmt| (stmt.location().start_offset(), stmt.location().end_offset()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut calls = Calls { file, top_level, found: Vec::new() };
+    ruby_prism::Visit::visit(&mut calls, &root);
     calls.found.into_iter().collect()
 }
 

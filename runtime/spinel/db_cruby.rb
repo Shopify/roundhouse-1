@@ -44,6 +44,8 @@ require "sqlite3"
 
 module Db
   @pool    = nil
+  # Thread => handle, in memory mode only (see MEMORY MODE).
+  @memory  = nil
   # WHAT PROCESS THIS POOL BELONGS TO, and what it would take to build
   # another one. Both exist for `fork`: see `adopt_after_fork`.
   @owner_pid = nil
@@ -83,13 +85,54 @@ module Db
   # Pool size defaults to the Puma thread count (RAILS_MAX_THREADS) so
   # every concurrently-serving thread can hold its own handle without
   # contending. Override explicitly for tests.
+  #
+  # `":memory:"` is not a pool: see MEMORY MODE below.
   def self.configure(path, pool_size: ENV.fetch("RAILS_MAX_THREADS", "3").to_i)
     @path      = path
     @pool_size = pool_size
     @mutex     = Mutex.new
     @cv        = ConditionVariable.new
-    @pool      = open_pool
+    @memory    = path == ":memory:" ? {} : nil
+    @pool      = @memory ? nil : open_pool
     @owner_pid = Process.pid
+  end
+
+  # MEMORY MODE: a test helper's own `establish_connection(adapter:
+  # "sqlite3", database: ":memory:")` (project.rs
+  # `apply_test_helper_connection`). Rails' sqlite3 adapter opens such a
+  # connection per thread, on the thread's first statement, and every
+  # one is its own empty database: a table one thread creates is not
+  # there on another, and a fiber uses its thread's. So each thread gets
+  # one handle here, opened when first asked for and kept until `close`;
+  # a lease (`with_connection`) on the thread is that same handle, as a
+  # Rails `with_connection` reuses the thread's connection.
+  #
+  # The handle carries the adapter's DEFAULT_PRAGMAS (activerecord
+  # 5813559f sqlite3_adapter.rb) — foreign keys on, WAL asked for (an
+  # in-memory database answers `memory`), NORMAL sync, its mmap, journal
+  # and cache sizes — and no busy timeout, which Rails sets only for a
+  # `timeout:` option. NOT modeled: the pool's size limit and reaping (a
+  # thread's handle lives until `close`), and a fork (a child keeps the
+  # parent's handles, as nothing re-opens a memory database).
+  MEMORY_PRAGMAS = [
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = NORMAL",
+    "PRAGMA mmap_size = 134217728",
+    "PRAGMA journal_size_limit = 67108864",
+    "PRAGMA cache_size = 2000",
+  ].freeze
+
+  def self.memory_dbh
+    @mutex.synchronize do
+      @memory[Thread.current] ||= begin
+        db = SQLite3::Database.new(":memory:")
+        db.results_as_hash = false
+        MEMORY_PRAGMAS.each { |pragma| db.execute(pragma) }
+        SqlFunctions.install(db) if defined?(SqlFunctions)
+        db
+      end
+    end
   end
 
   # The pool construction, in one place because two callers need it: the
@@ -178,6 +221,7 @@ module Db
   def self.current_dbh
     h = Fiber[:db_handle]
     return h if !h.nil?
+    return memory_dbh if @memory
     # Only the UNLEASED path pays the fork check — boot, tests, and
     # single-threaded dev. Under a lease the line above has already
     # returned, so the per-query cost of all this is zero.
@@ -203,6 +247,15 @@ module Db
   end
 
   def self.with_connection
+    if @memory
+      outer = Fiber[:db_handle]
+      Fiber[:db_handle] = memory_dbh
+      begin
+        return yield
+      ensure
+        Fiber[:db_handle] = outer
+      end
+    end
     h = nil
     adopt_after_fork
     @mutex.synchronize do
@@ -238,6 +291,15 @@ module Db
   end
 
   def self.close
+    if @memory
+      @memory.each_value do |conn|
+        cache = conn.instance_variable_get(:@rh_stmt_cache)
+        cache.each_value { |st| st.close } if cache
+        conn.close
+      end
+      @memory = {}
+      return
+    end
     return if @pool.nil?
     i = 0
     while i < @pool.free.length
@@ -514,8 +576,9 @@ module Db
   # is not a StatementInvalid; that error passes through untranslated
   # (the ruby-family `ConnectionNotEstablished` class is not raised
   # here), so no `rescue StatementInvalid` catches it. `InvalidForeignKey`
-  # is mapped as Rails maps it, but no `Db` turns on `PRAGMA
-  # foreign_keys`, so SQLite never reports the violation. NOT modeled:
+  # is mapped as Rails maps it; only memory mode turns on `PRAGMA
+  # foreign_keys`, so on the file database SQLite never reports the
+  # violation. NOT modeled:
   # StatementTimeout for a `SQLite3::BusyException` (a StatementInvalid
   # here, as its Rails parent is), and translation of any non-driver
   # error.
