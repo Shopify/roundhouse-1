@@ -76,6 +76,8 @@ PROJECT_BUILDERS = {
     "jruby_runtime_files": "interpreted",
     "ruby_family_runtime_files": "interpreted",
     "spinel_files": "ruby-family",
+    # db81a6d6 moved the spinel_files body here (CRuby assertion modes).
+    "spinel_files_with_assertions": "ruby-family",
     "spin_shape": "ruby-family",
 }
 
