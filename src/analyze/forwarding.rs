@@ -128,11 +128,12 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
         };
         // A reified method reaches callers (`yield`, `&block`) no
         // selector names, and `yield` keeps no keyword splat to check.
-        // Reifying is also spelled through a dispatcher
-        // (`public_send(:method, :m)`), and a name computed at run
-        // time (`method("m".to_sym)`) may be any selector, so it is
-        // refused too.
-        const REIFY: [&str; 3] = ["method", "public_method", "instance_method"];
+        // A reifier or a dispatcher can itself be reified or dispatched
+        // (`public_send(:method, :m)`, `instance_method(:send)`), and a
+        // name computed at run time, or splatted, may be any of these,
+        // so each is taken to reach the rest.
+        const REIFY: [&str; 4] = ["method", "public_method", "instance_method", "public_instance_method"];
+        const SEND: [&str; 3] = ["send", "public_send", "__send__"];
         fn literal(a: &Expr) -> Option<&str> {
             match &*a.node {
                 ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str()),
@@ -140,21 +141,18 @@ pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
                 _ => None,
             }
         }
-        let may_name_selector = |a: Option<&Expr>| {
-            a.is_some_and(|a| literal(a).is_none_or(|n| selectors.iter().any(|s| s.as_str() == n)))
-        };
+        let meta = |n: &str| REIFY.contains(&n) || SEND.contains(&n);
+        let reaching = |n: &str| meta(n) || selectors.iter().any(|s| s.as_str() == n);
+        let may_reach = |a: &Expr| literal(a).is_none_or(reaching);
         let reified = match &*e.node {
-            ExprNode::MethodRef { name, .. } => selectors.contains(name),
+            ExprNode::MethodRef { name, .. } => reaching(name.as_str()),
             ExprNode::Send { method, args, .. } if REIFY.contains(&method.as_str()) => {
-                may_name_selector(args.first())
+                args.first().is_some_and(may_reach)
             }
-            ExprNode::Send { method, args, .. }
-                if matches!(method.as_str(), "send" | "public_send" | "__send__") =>
-            {
-                args.first().is_some_and(|a| literal(a).is_none_or(|n| REIFY.contains(&n)))
-                    && args.get(1).is_some_and(|a| literal(a).is_some_and(|n| selectors.iter().any(|s| s.as_str() == n)))
-                    || args.first().and_then(literal).is_some_and(|n| REIFY.contains(&n))
-                        && may_name_selector(args.get(1))
+            ExprNode::Send { method, args, .. } if SEND.contains(&method.as_str()) => {
+                args.first().is_some_and(|a| literal(a).is_none_or(meta))
+                    && (args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. }))
+                        || args.iter().skip(1).any(may_reach))
             }
             _ => false,
         };
