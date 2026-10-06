@@ -1,6 +1,7 @@
 # PostgreSQL hooks over the same row/query facade as SQLite.
 require_relative "sql_adapter_queries"
 require_relative "active_support_notifications"
+require_relative "active_support_log_subscriber"
 
 module PostgresAdapter
   extend SqlAdapterQueries

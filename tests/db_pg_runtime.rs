@@ -12,6 +12,17 @@ fn notification_runtime_delivers_events_synchronously_and_cleans_up() {
 }
 
 #[test]
+fn log_subscriber_runtime_preserves_lifecycle_and_log_levels() {
+    let result = std::process::Command::new("ruby")
+        .args(["tests/log_subscriber_runtime.rb", "emitted"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    assert!(result.status.success(), "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn postgres_driver_preserves_values_database_identity_and_leases() {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
@@ -197,6 +208,8 @@ fn emitted_model_crud_executes_on_postgresql() {
     // Execute the packaged driver, schema, shared framework and model. The
     // authored Core bootstrap is a separate integration still being repaired.
     let script = format!(r##"
+require "logger"
+require "stringio"
 require {runtime_path}
 require {support_path}
 require {schema_path}
@@ -207,6 +220,16 @@ bootstrap_connection.exec("CREATE SCHEMA runtime_test").clear
 bootstrap_connection.finish
 require {helper_path}
 Db.close
+class PostgreSQLContractSubscriber < ActiveSupport::LogSubscriber
+  subscribe_log_level :sql, :error
+  def logger
+    self.class.logger
+  end
+  def sql(event)
+    exception = event.payload[:exception_object]
+    error("SQL: #{{event.payload[:sql]}}; #{{exception.message}}") if exception.is_a?(ActiveRecord::StatementInvalid)
+  end
+end
 class PostgreSQLRuntimeTest
   def test_emitted_model_crud
     require {main_path}
@@ -259,6 +282,22 @@ class PostgreSQLRuntimeTest
     count_after_unsubscribe = events.length
     ActiveRecord::Base.connection.execute('SELECT 8')
     assert_equal count_after_unsubscribe, events.length
+    log_output = StringIO.new
+    logger = ::Logger.new(log_output)
+    logger.formatter = lambda {{ |severity, time, progname, message| "#{{message.inspect}}\n" }}
+    PostgreSQLContractSubscriber.logger = logger
+    PostgreSQLContractSubscriber.attach_to(:active_record)
+    begin
+      ActiveRecord::Base.connection.execute('SELECT 1')
+      assert_equal '', log_output.string
+      assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM missing_logged_table') }}
+      assert_equal 1, log_output.string.lines.length
+      assert_includes log_output.string, 'SQL: SELECT * FROM missing_logged_table'
+      assert_includes log_output.string, 'PG::UndefinedTable'
+    ensure
+      PostgreSQLContractSubscriber.detach_from(:active_record)
+      logger.close
+    end
     first = Entry.create!(Title: "l'été \\ hi", enabled: true)
     second = Entry.create!(Title: "false", enabled: false)
     assert_equal 1, first.id
