@@ -1438,13 +1438,15 @@ impl<'a> BodyTyper<'a> {
                 }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
-                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx));
+                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
+                    || send::is_module_query_on_module_value(method, recv_ty.as_ref());
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
                     let class_object = class_object_receiver;
                     if send::is_module_protocol(method) && !class_object
-                        && !self.owns_operator(recv_ty.as_ref(), method, false) {
+                        && !self.owns_operator(recv_ty.as_ref(), method, false)
+                        && !send::is_query_any_receiver_may_answer(method, recv_ty.as_ref()) {
                         expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                             target: None,
                             construct: Symbol::from("Module protocol"),

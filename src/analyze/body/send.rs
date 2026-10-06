@@ -2924,6 +2924,30 @@ pub(super) fn is_module_protocol(method: &Symbol) -> bool {
         | "private_instance_methods" | "remove_method" | "undef_method")
 }
 
+/// `include?` is Module's ancestry query and also Array's, String's,
+/// Hash's, Set's and Range's membership test. On a receiver whose type
+/// is unknown or gradual, the Module reading is a guess: the send is an
+/// ordinary unknown (or gradual) one, not a missing class object.
+pub(super) fn is_query_any_receiver_may_answer(method: &Symbol, recv_ty: Option<&Ty>) -> bool {
+    fn unproven(ty: &Ty) -> bool {
+        match ty {
+            Ty::Var { .. } | Ty::Untyped => true,
+            Ty::Union { variants } => variants.iter().any(unproven),
+            _ => false,
+        }
+    }
+    method.as_str() == "include?" && recv_ty.is_some_and(unproven)
+}
+
+/// A value typed `Class` or `Module` is a class object whatever its
+/// identity, which is all a pure query (`klass.include?(Mod)`) needs.
+/// Methods that change the class (`define_method`) still need to know
+/// which class.
+pub(super) fn is_module_query_on_module_value(method: &Symbol, recv_ty: Option<&Ty>) -> bool {
+    method.as_str() == "include?"
+        && matches!(recv_ty, Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "Class" | "Module"))
+}
+
 pub(super) fn object_protocol_method(
     recv_ty: Option<&Ty>,
     method: &Symbol,
