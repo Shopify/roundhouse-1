@@ -306,11 +306,12 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
         }
         let mut path = scope;
         path.extend(class_name_path(&class).unwrap_or_default());
-        // Only the framework's test cases: a helper's own class may
-        // define `teardown` for its own reasons.
-        let framework = path.first().is_some_and(|ns| ns.starts_with("Active") || ns.starts_with("Action"));
-        let test_case = path.last().is_some_and(|n| n.ends_with("TestCase") || n.ends_with("IntegrationTest"));
-        if !(framework && test_case) {
+        // Only the framework's test cases (every one is a `Minitest::Test`):
+        // a helper's own class may define `teardown` for its own reasons.
+        let rails = path.first().is_some_and(|ns| ns.starts_with("Active") || ns.starts_with("Action"))
+            && path.last().is_some_and(|n| n.ends_with("TestCase") || n.ends_with("IntegrationTest"));
+        let minitest = path.first().is_some_and(|ns| ns == "Minitest");
+        if !(rails || minitest) {
             continue;
         }
         let Some(body) = class.body() else { continue };
