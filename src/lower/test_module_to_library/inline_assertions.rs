@@ -151,6 +151,16 @@ fn difference_value(value: &mut Expr, own: &dyn Fn(&str) -> bool) -> Option<Expr
     lower_difference_value(value.span, method.as_str(), args, block.as_ref())
 }
 
+/// The children `walk_inline` descends into: the expressions whose
+/// assertions are rewritten. It visits every direct child
+/// (`ExprNode::for_each_child_mut`, an assigned `assert_difference`'s
+/// arguments and block included), so this is the read-side twin,
+/// `ExprNode::for_each_child`. Kept beside `walk_inline`; narrow both
+/// together.
+pub(crate) fn for_each_rewritten_child<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+    e.node.for_each_child(f);
+}
+
 /// Every assertion `rewrite_send` lowers at its call site. Nothing that
 /// emits a test defines these as methods, so a test class's own
 /// override that calls `super` has nothing to reach
