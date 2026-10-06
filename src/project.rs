@@ -3873,6 +3873,9 @@ fn report_keyword_params(app: &App, target: &str) {
 /// included: by constant, and by member name for a call that names no
 /// constant.
 ///
+/// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
+/// too: no `Db` enforces a foreign key, so nothing raises it.
+///
 /// `transaction` with options is refused on every target, Ruby too: the
 /// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
 /// checked only when the transaction first runs a statement, which the
@@ -3906,6 +3909,23 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     target,
                     "sqlite3_adapter_member",
                     format!("`{}` is a member of the CRuby tree's SQLite3 adapter, which {target} does not carry", method.as_str()),
+                );
+            }
+        }
+        // Named by its path: the check leaves it unresolved, which a test
+        // body's `rescue` or `assert_raises` does not report.
+        if let crate::expr::ExprNode::Const { path } = &*expr.node {
+            if path.iter().map(|s| s.as_str()).eq(["ActiveRecord", "InvalidForeignKey"])
+                && !app.library_classes.iter().any(|class| class.name.0.as_str() == "ActiveRecord::InvalidForeignKey")
+            {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "invalid_foreign_key",
+                    "`ActiveRecord::InvalidForeignKey` is never raised: no `Db` turns on SQLite's \
+                     `PRAGMA foreign_keys` and the schema loader does not carry `add_foreign_key`, \
+                     so a foreign-key violation is not reported"
+                        .to_string(),
                 );
             }
         }
