@@ -601,7 +601,12 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // Soft ratchet under canonical class-ID lookup (Fixes #435), then
     // dependency RBS + cross-stem ivar merge + Relation/Base overlays.
     // Fails only when the residual rises. Not a substitute for Bar B.
-    const CEILING: usize = 0;
+    // 0 -> 1, +1, MEASURED on the old branch (errors.rb):
+    // `StatementInvalid#initialize/super.arg[0]`, the `super(message)`
+    // read the `RecordNotFound` and `ValueTooLong` bodies already pay.
+    // What it buys: the parent constructor its subclasses call exists on
+    // Kotlin, Swift and C# (tests/runtime_errors_strict_constructors.rs).
+    const CEILING: usize = 1;
 
     assert!(
         all_untyped.len() <= CEILING,

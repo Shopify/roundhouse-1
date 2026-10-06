@@ -807,7 +807,14 @@ fn every_runtime_method_body_concretely_typed() {
     // of one is a site. What it bought: Core's 22886 `Rails.event.notify`
     // and 3341 `Rails.error.report` calls (plus handle / unexpected /
     // set_context / tagged) resolve instead of failing dispatch.
-    const CEILING: usize = 471;
+    //
+    // 471 -> 472, ONE MEASURED on the old branch (active_record/errors.rb
+    // 5 -> 6): `StatementInvalid#initialize`'s `super(message)` into
+    // StandardError, the site `RecordNotFound#initialize` already pays.
+    // What it bought: `ValueTooLong` and `RecordNotUnique` hand their
+    // message to a parent constructor that exists on Kotlin, Swift and
+    // C# (tests/runtime_errors_strict_constructors.rs).
+    const CEILING: usize = 472;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

@@ -7,6 +7,7 @@ module ActiveRecord
   # Raised for a statement the database refused; the parent of the
   # statement errors below, as in Rails.
   class StatementInvalid < StandardError
+    def initialize: (?String message) -> void
   end
 
   # Raised when a value exceeds its column's declared limit.
