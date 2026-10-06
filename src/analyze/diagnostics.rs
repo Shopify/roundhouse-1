@@ -189,6 +189,41 @@ fn is_unknown_ty(ty: Option<&Ty>) -> bool {
     }
 }
 
+/// A send whose explicit receiver the analysis could not type.
+pub struct UnknownReceiverSend {
+    pub span: crate::span::Span,
+    pub method: Symbol,
+    /// The receiver is the gradual escape (`T.unsafe`, RBS `untyped`)
+    /// rather than an unresolved type.
+    pub gradual: bool,
+}
+
+/// Every send, in every emitted body, whose explicit receiver is
+/// unknown or gradual and which carries no diagnostic of its own.
+///
+/// Nothing checks such a send: no method table is consulted, so a
+/// misspelled or unimplemented method passes. `diagnose` reports the
+/// unresolved receiver only in model and controller bodies, and not at
+/// all for a gradual one, so in a library class the send is silent. A
+/// drop in errors that only moves sends here is a reclassification, not
+/// progress; `check` prints the count beside the error total.
+pub fn unknown_receiver_sends(app: &App) -> Vec<UnknownReceiverSend> {
+    fn visit(expr: &Expr, out: &mut Vec<UnknownReceiverSend>) {
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {
+            let gradual = matches!(r.ty, Some(Ty::Untyped));
+            if (gradual || is_unknown_ty(r.ty.as_ref())) && expr.diagnostic.is_none() && !expr.span.is_synthetic() {
+                out.push(UnknownReceiverSend { span: expr.span, method: method.clone(), gradual });
+            }
+        }
+        expr.node.for_each_child(&mut |child| visit(child, out));
+    }
+    let mut out = Vec::new();
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, &mut out));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|s| seen.insert((s.span.file, s.span.start, s.span.end, s.method.clone())));
+    out
+}
+
 /// Short label for what shape of expression resolved to `Untyped`.
 /// Used for the `GradualUntyped` diagnostic message so a single
 /// kind can name the syntactic position without each callsite

@@ -99,21 +99,26 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let mut fixture: Option<String> = None;
+    let mut list_unknown_sends = false;
 
     for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: roundhouse check [--continue|--strict] [APP]\n\n\
+                    "Usage: roundhouse check [--continue|--strict] [--unknown-sends] [APP]\n\n\
                      Analyze the Rails app at APP (default {default_app}) and print the\n\
                      diagnostics; exit 1 on parse or type errors.\n\n\
                      Options:\n\
                        --continue   Record unsupported constructs as a punch list and keep\n\
                                     going (also ROUNDHOUSE_INGEST_SURVEY=1).\n\
-                       --strict     Abort at the first unsupported construct (default)."
+                       --strict     Abort at the first unsupported construct (default).\n\
+                       --unknown-sends\n\
+                                    List each send on an unknown or gradual receiver (always\n\
+                                    counted in the summary; never an error)."
                 );
                 return ExitCode::SUCCESS;
             }
+            "--unknown-sends" => list_unknown_sends = true,
             "--continue" => continue_on_error = true,
             "--strict" => continue_on_error = false,
             other if other.starts_with("--") => {
@@ -255,6 +260,30 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     if let Some(coverage) = crate::analyze::graphql::coverage(&app) {
         eprintln!("roundhouse-check: {}", coverage.summary());
     }
+    // Sends nothing checked, beside the error total: an error that goes
+    // away by becoming one of these was reclassified, not fixed.
+    let unknown_sends = crate::analyze::unknown_receiver_sends(&app);
+    if list_unknown_sends {
+        for send in &unknown_sends {
+            let what = if send.gradual { "a gradual (untyped)" } else { "an unknown" };
+            let d = crate::diagnostic::Diagnostic {
+                span: send.span,
+                kind: crate::diagnostic::DiagnosticKind::UnresolvedType {
+                    expr_kind: crate::ident::Symbol::from("unknown receiver"),
+                    name: Some(send.method.clone()),
+                },
+                severity: Severity::Info,
+                message: format!("send `{}` on {what} receiver is unchecked", send.method.as_str()),
+            };
+            eprintln!("{}", d.render(&app.sources));
+        }
+    }
+    let gradual = unknown_sends.iter().filter(|s| s.gradual).count();
+    eprintln!(
+        "roundhouse-check: {} send(s) on unknown receivers, {} on gradual receivers (unchecked, not errors)",
+        unknown_sends.len() - gradual,
+        gradual,
+    );
     eprintln!(
         "roundhouse-check: {} — {} parse error(s), {} error(s), {} warning(s), {} gap-attributed note(s), {} survey gap(s)",
         fixture,
