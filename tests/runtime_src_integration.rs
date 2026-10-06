@@ -799,7 +799,10 @@ fn every_runtime_method_body_concretely_typed() {
     // `Relation[T]` is the longer-term fix. Merged main's 299; measure
     // after the security helpers before changing this number.
     //
-    // 299 -> 471, +172 MEASURED on the old branch (active_support_reporters.rb,
+    // 299 -> 469 MEASURED with the two additions below: main's residual
+    // was 296 under its 299 ceiling, +172 and +1.
+    //
+    // +172 (active_support_reporters.rb,
     // new): `Rails.event` / `Rails.error`, ported from activesupport 8.1.4.
     // Event payloads, tags and contexts, the subscribers and context
     // middlewares, and every `Thread.current[]` slot behind them are
@@ -808,13 +811,13 @@ fn every_runtime_method_body_concretely_typed() {
     // and 3341 `Rails.error.report` calls (plus handle / unexpected /
     // set_context / tagged) resolve instead of failing dispatch.
     //
-    // 471 -> 472, ONE MEASURED on the old branch (active_record/errors.rb
-    // 5 -> 6): `StatementInvalid#initialize`'s `super(message)` into
+    // +1 (active_record/errors.rb 5 -> 6):
+    // `StatementInvalid#initialize`'s `super(message)` into
     // StandardError, the site `RecordNotFound#initialize` already pays.
     // What it bought: `ValueTooLong` and `RecordNotUnique` hand their
     // message to a parent constructor that exists on Kotlin, Swift and
     // C# (tests/runtime_errors_strict_constructors.rs).
-    const CEILING: usize = 472;
+    const CEILING: usize = 469;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
