@@ -1,5 +1,6 @@
 # CRuby-only: `ActiveRecord::Base.connection` as Rails' SQLite3 adapter
-# class, with its transaction statements.
+# class, with its transaction statements, and the statement errors this
+# tree's `Db` raises.
 #
 # Rails hands back `ConnectionAdapters::SQLite3Adapter` from
 # `Base.connection`, and code that adjusts the adapter (Core's
@@ -12,24 +13,33 @@
 # connection_adapters/sqlite3/database_statements.rb at 5813559f):
 # BEGIN DEFERRED/IMMEDIATE TRANSACTION, COMMIT/ROLLBACK TRANSACTION, the
 # isolation checks of `internal_begin_transaction`, and the
-# `read_uncommitted` PRAGMA of `reset_isolation_level`. A driver error
-# from these statements surfaces as `StatementInvalid` with the driver's
-# exception as its `cause`, which is what Rails' `translate_exception`
-# answers for anything it does not map to a narrower class.
+# `read_uncommitted` PRAGMA of `reset_isolation_level`.
 #
-# CRuby only, deliberately: `SQLite3::SQLException` (the cause) is the
-# `sqlite3` gem's class, which this tree's `Db` is built on. The check
-# refuses these constants on every other target.
+# WHERE EACH PART LIVES. The class names and their parents are portable
+# and live in the shared `runtime/ruby/active_record/errors.rb`
+# (`StatementInvalid`, with `RecordNotUnique` and `ValueTooLong` under
+# it). Turning a driver error into one of them is the driver's
+# boundary: the "<driver class>: <message>" text and the `cause` are
+# the driver's, so it is `Db.translate` in `runtime/spinel/db_cruby.rb`,
+# under every statement `Db` runs. Only this tree has that half, so the
+# Rails statement API (`sql`, `binds`), the subclasses only it raises,
+# and the adapter class are here, and `project` refuses their constants
+# and the adapter's members on every other target. The per-thread
+# connection needs Thread, which is why it is not in the shared
+# `connection.rb` either.
 #
-# NOT modeled (ledgered): `execute` and the rest of the facade do not
-# translate driver errors; the translated subclasses (NotNullViolation,
-# InvalidForeignKey, CheckViolation, StatementTimeout) are not separate
-# classes; `RecordNotUnique` and this `StatementInvalid` hang off
-# StandardError, not Rails' `ActiveRecordError` hierarchy; there is no
-# shared-cache mode, so an isolation level never reaches its PRAGMA.
+# NOT modeled (ledgered): the Active Record error hierarchy above
+# StatementInvalid (ActiveRecordError, AdapterError,
+# WrappedDatabaseException, QueryAborted, StatementTimeout,
+# ConnectionNotEstablished); a connection of its own per thread (every
+# thread's adapter runs on `Db`'s shared handle outside a lease); a
+# shared-cache mode, so an isolation level never reaches its PRAGMA;
+# `transaction` options (refused at emit).
 module ActiveRecord
-  # Rails: `StatementInvalid < AdapterError < ActiveRecordError`.
-  class StatementInvalid < StandardError
+  # Rails: `StatementInvalid < AdapterError < ActiveRecordError`, built
+  # with the statement and its binds; the message defaults to the error
+  # being handled.
+  class StatementInvalid
     attr_reader :sql, :binds
 
     def initialize(message = nil, sql: nil, binds: nil)
@@ -37,6 +47,28 @@ module ActiveRecord
       @sql = sql
       @binds = binds
     end
+  end
+
+  # Rails defines no constructor of their own on these.
+  class RecordNotUnique
+    def initialize(message = nil, sql: nil, binds: nil)
+      super
+    end
+  end
+
+  class ValueTooLong
+    def initialize(message = nil, sql: nil, binds: nil)
+      super
+    end
+  end
+
+  class NotNullViolation < StatementInvalid
+  end
+
+  class InvalidForeignKey < StatementInvalid
+  end
+
+  class CheckViolation < StatementInvalid
   end
 
   # Rails: `TransactionIsolationError < ActiveRecordError`.
@@ -58,15 +90,17 @@ module ActiveRecord
       end
 
       def commit_db_transaction
-        transaction_statement("COMMIT TRANSACTION")
+        Db.exec("COMMIT TRANSACTION")
+        nil
       end
 
       def exec_rollback_db_transaction
-        transaction_statement("ROLLBACK TRANSACTION")
+        Db.exec("ROLLBACK TRANSACTION")
+        nil
       end
 
       def reset_isolation_level
-        transaction_statement("PRAGMA read_uncommitted=#{@previous_read_uncommitted}")
+        Db.exec("PRAGMA read_uncommitted=#{@previous_read_uncommitted}")
         @previous_read_uncommitted = nil
       end
 
@@ -80,29 +114,20 @@ module ActiveRecord
           raise TransactionIsolationError, "SQLite3 only supports the `read_uncommitted` transaction isolation level" if isolation != :read_uncommitted
           raise StandardError, "You need to enable the shared-cache mode in SQLite mode before attempting to change the transaction isolation level"
         end
-        transaction_statement("BEGIN #{mode} TRANSACTION")
-      end
-
-      # Rails' `translate_exception`: a RuntimeError or an Active Record
-      # error passes through, anything else becomes StatementInvalid
-      # named "<driver class>: <message>". Raised inside the rescue, so
-      # the driver's exception is its `cause`.
-      def transaction_statement(sql)
-        Db.exec(sql)
+        Db.exec("BEGIN #{mode} TRANSACTION")
         nil
-      rescue RuntimeError, RecordNotUnique, StatementInvalid
-        raise
-      rescue => e
-        raise StatementInvalid.new("#{e.class.name}: #{e.message}", sql: sql)
       end
     end
   end
 
   class Base
-    # Rails' connection is one adapter per thread, the same object on
-    # every call; `@previous_read_uncommitted` lives on it.
+    # Rails' connection is one adapter per thread (ActiveSupport's
+    # isolation level is the thread by default), the same object on
+    # every call and in every fiber of the thread;
+    # `@previous_read_uncommitted` lives on it.
     def self.connection
-      Thread.current[:rh_sqlite3_adapter] ||= ConnectionAdapters::SQLite3Adapter.new
+      Thread.current.thread_variable_get(:rh_sqlite3_adapter) ||
+        Thread.current.thread_variable_set(:rh_sqlite3_adapter, ConnectionAdapters::SQLite3Adapter.new)
     end
   end
 end

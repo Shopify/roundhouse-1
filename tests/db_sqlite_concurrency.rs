@@ -26,7 +26,17 @@ fn run(name: &str, body: &str) {
         r#"
 require {pool:?}
 require {shim:?}
-module ActiveRecord; class RecordNotUnique < StandardError; end; end
+# The statement errors `Db.translate` raises, with Rails' hierarchy and
+# constructor (the CRuby overlay's active_record_sqlite3_adapter.rb).
+module ActiveRecord
+  class StatementInvalid < StandardError
+    def initialize(message = nil, sql: nil, binds: nil) = super(message)
+  end
+  class RecordNotUnique < StatementInvalid; end
+  class NotNullViolation < StatementInvalid; end
+  class InvalidForeignKey < StatementInvalid; end
+  class CheckViolation < StatementInvalid; end
+end
 def check(what, ok)
   raise "FAILED: #{{what}}" unless ok
 end
@@ -229,8 +239,9 @@ Db.with_connection do
       begin
         Db.exec("INSERT INTO t VALUES (2)")
         outcome = :wrote
-      rescue SQLite3::BusyException
-        outcome = :busy
+      rescue ActiveRecord::StatementInvalid => e
+        # Translated as Rails does; the driver's BusyException is the cause.
+        outcome = :busy if e.cause.is_a?(SQLite3::BusyException)
       end
     end
   end

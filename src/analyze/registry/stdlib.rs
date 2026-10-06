@@ -449,10 +449,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
         ("ActiveRecord::ValueTooLong", None),
-        // The CRuby tree's SQLite3 adapter raises these (ruby_overlay
-        // active_record_sqlite3_adapter.rb); `project` refuses them on
-        // every other target.
+        // The CRuby tree's `Db` translates a driver error into these
+        // (runtime/spinel/db_cruby.rb `translate`); `project` refuses
+        // them on every other target, whose `Db` does not.
         ("ActiveRecord::StatementInvalid", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
+        ("ActiveRecord::NotNullViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
+        ("ActiveRecord::InvalidForeignKey", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
+        ("ActiveRecord::CheckViolation", Some(("sql", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }))),
+        // Raised by the CRuby tree's SQLite3 adapter (ruby_overlay
+        // active_record_sqlite3_adapter.rb).
         ("ActiveRecord::TransactionIsolationError", None),
         // The `sqlite3` gem's statement error, the cause of a
         // StatementInvalid on that tree.

@@ -3762,18 +3762,57 @@ fn report_keyword_params(app: &App, target: &str) {
 ///
 /// The CRuby tree's SQLite3 adapter (ruby_overlay
 /// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
-/// supply the statement-error classes, so those are refused on every
-/// target but Ruby, Spinel included.
+/// supply the statement-error classes and the adapter's transaction
+/// members, and only that tree's `Db` translates a driver error into
+/// them, so those are refused on every target but Ruby, Spinel
+/// included: by constant, and by member name for a call that names no
+/// constant.
+///
+/// `transaction` with options is refused on every target, Ruby too: the
+/// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
+/// checked only when the transaction first runs a statement, which the
+/// runtime's eager BEGIN does not reproduce.
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
-    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
+    if matches!(target, BuildTarget::Blog) {
         return;
     }
     let bundled = !matches!(target, BuildTarget::Spinel | BuildTarget::Roda);
     fn visit(expr: &crate::expr::Expr, app: &App, target: &str, bundled: bool) {
+        if let crate::expr::ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node {
+            let ar_class = matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. })
+                if matches!(id.0.as_str(), "ActiveRecord::Base" | "ApplicationRecord")
+                    || app.models.iter().any(|model| model.name == *id));
+            if method.as_str() == "transaction" && !args.is_empty() && ar_class {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "transaction_options",
+                    "`transaction` with options is not modeled: the runtime's transaction takes none, \
+                     and begins before Rails would check an isolation level"
+                        .to_string(),
+                );
+            }
+            if target != "ruby" && matches!(method.as_str(),
+                "begin_db_transaction" | "begin_deferred_transaction" | "begin_isolated_db_transaction"
+                | "commit_db_transaction" | "exec_rollback_db_transaction" | "reset_isolation_level")
+            {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "sqlite3_adapter_member",
+                    format!("`{}` is a member of the CRuby tree's SQLite3 adapter, which {target} does not carry", method.as_str()),
+                );
+            }
+        }
+        if target == "ruby" {
+            expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
+            return;
+        }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 let cruby_sqlite3 = matches!(id.0.as_str(),
-                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException");
+                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException"
+                    | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation");
                 if (cruby_sqlite3 || bundled && matches!(id.0.as_str(),
                     "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
                     | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
