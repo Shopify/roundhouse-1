@@ -6696,3 +6696,19 @@ end
         .assert_passes();
 }
 
+/// A Core gem keeps its tests at `test/` root over a base its helper
+/// defines (`class SqliteTestCompat::TestCase < ActiveSupport::TestCase`
+/// in test/test_helper.rb). With `test_paths: [test]` the helper was
+/// read a second time as a test file, and the emitted subclass never
+/// loaded its base: NameError on `SqliteTestCompat` before any test ran.
+#[test]
+fn a_test_case_base_defined_in_the_helper_is_loaded_by_its_subclasses() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("lib/fragments.rb", "module Fragments\n  def self.random\n    \"RANDOM()\"\n  end\nend\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class TestCase < ActiveSupport::TestCase\n  end\nend\n")
+        .write("test/fragments_test.rb", "require \"test_helper\"\n\nclass FragmentsTest < GemCompat::TestCase\n  test \"random\" do\n    assert_equal \"RANDOM()\", Fragments.random\n  end\nend\n")
+        .run_test("test/models/fragments_test.rb")
+        .assert_passes();
+}
