@@ -1295,6 +1295,7 @@ pub fn target_files(
     };
     if target != BuildTarget::Blog {
         report_unsupported_harness_reads(app, target, &files);
+        report_unsupported_runtime_reads(app, target, &files);
         report_unsupported_harness_calls(app, target, &files);
     }
 
@@ -3945,6 +3946,48 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
                 format!("{name} is declared by the Ruby-family test harness, which {} does not emit", target.as_str()),
             );
         }
+    }
+}
+
+/// A read of a name only the Ruby-family runtime declares
+/// (`ActiveSupport::Notifications`, `Rails.event`'s EventReporter) is
+/// supported where the finished tree carries a runtime file declaring
+/// it, and refused on every other target. A test body's read of a name
+/// the test harness also declares is supported by the finished tree's
+/// `test/test_helper.rb` too, and is refused as a harness name.
+fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(String, String)]) {
+    let reads = crate::analyze::runtime_reads::ruby_family_runtime_reads(app);
+    if reads.is_empty() {
+        return;
+    }
+    let runtime: std::collections::HashSet<String> = files.iter()
+        .filter(|(p, _)| p.starts_with("runtime/") && p.ends_with(".rb"))
+        .flat_map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .collect();
+    let harness = files.iter().find(|(p, _)| p == "test/test_helper.rb")
+        .map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
+        .unwrap_or_default();
+    let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
+    for read in reads {
+        let harness_name = read.in_test && crate::analyze::test_constants::is_harness_namespace(&read.name);
+        if runtime.contains(&read.name) || harness_name && harness.contains(&read.name) {
+            continue;
+        }
+        let file = names.get(&read.name).copied().unwrap_or("the Ruby-family runtime");
+        let (construct, detail) = if harness_name {
+            ("harness_constant", format!(
+                "{} is declared by the Ruby-family test harness and runtime ({file}), which {} does not emit",
+                read.name, target.as_str()))
+        } else if read.shown == read.name {
+            ("runtime_constant", format!(
+                "{} is declared by the Ruby-family runtime ({file}), which {} does not emit",
+                read.name, target.as_str()))
+        } else {
+            ("runtime_constant", format!(
+                "`{}` answers {}, declared by the Ruby-family runtime ({file}), which {} does not emit",
+                read.shown, read.name, target.as_str()))
+        };
+        emit::diagnostics::report_unsupported(read.span, target.as_str(), construct, detail);
     }
 }
 
