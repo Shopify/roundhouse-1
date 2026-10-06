@@ -125,6 +125,13 @@ pub fn ingest_library_classes(
             first.constants = file_constants;
         }
     }
+    // `X = Struct.new(...) do … end` / `X = Data.define(...) do … end`,
+    // which the body walks above skip: classes of their own. After the
+    // hoist, which must not move a file's constants into a block that
+    // Ruby evaluates as another class's body. Before the `Class.new`
+    // parent resolution below, so `Sub = Class.new(Point)` finds a
+    // factory class `Point` this file declares.
+    out.extend(super::factory_class::factory_classes(&root, file)?);
     // A file holding nothing but such constants still declares them.
     // Without a class to host the rest, other file-level constants
     // were dropped before this too.
@@ -223,7 +230,7 @@ fn file_level_constants(
     };
     for stmt in prog.statements().body().iter() {
         let Some(cw) = stmt.as_constant_write_node() else { continue };
-        if is_sorbet_type_alias(&cw.value()) {
+        if is_sorbet_type_alias(&cw.value()) || super::factory_class::is_factory_class_write(&stmt) {
             continue;
         }
         out.push((
@@ -1563,6 +1570,39 @@ fn reject_conditional_accessor(node: &ruby_prism::Node<'_>, file: &str) -> Inges
     Ok(())
 }
 
+/// What a `Struct.new(...) do … end` / `Data.define(...) do … end`
+/// block contributes to the class it builds (`ingest::factory_class`).
+pub(super) struct FactoryClassBody {
+    pub(super) includes: Vec<ClassId>,
+    pub(super) methods: Vec<MethodDef>,
+    pub(super) unknown_calls: Vec<Expr>,
+}
+
+/// Walk a factory block as the class body Ruby evaluates it as. The
+/// visibility pass starts afresh on the block, as Ruby's does: markers
+/// inside it apply to its methods, and none from the enclosing body
+/// reach in. Constants and class variables in the block are lexically
+/// the ENCLOSING scope's (`class_eval` with a block keeps the caller's
+/// cref), which a class body cannot express, so those are refused.
+pub(super) fn factory_class_body(
+    body: Option<ruby_prism::Node<'_>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<FactoryClassBody> {
+    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers } =
+        walk_decl_body(body, owner, file, false)?;
+    if !constants.is_empty() || !class_initializers.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "constant or class variable assigned inside a Struct.new/Data.define body block \
+                      (it belongs to the enclosing scope) is not modeled"
+                .into(),
+        });
+    }
+    admit_nameless_rest(&mut methods);
+    Ok(FactoryClassBody { includes, methods, unknown_calls })
+}
+
 fn walk_decl_body<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
@@ -1686,6 +1726,21 @@ fn walk_decl_body_with_visibility<'pr>(
         // Class-level constant `NAME = <expr>` (e.g. `STORIES_PER_PAGE = 25`).
         if let Some(cw) = stmt.as_constant_write_node() {
             if is_sorbet_type_alias(&cw.value()) {
+                continue;
+            }
+            // `NAME = Struct.new(...) do … end` is a class, which
+            // `factory_class::factory_classes` builds from the same
+            // statement. Not in a singleton or class-method carrier:
+            // that constant belongs to a scope no class is emitted for.
+            if super::factory_class::is_factory_class_write(stmt) {
+                if force_class_receiver {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "Struct.new/Data.define body block in a singleton or class-method \
+                                  carrier is not modeled"
+                            .into(),
+                    });
+                }
                 continue;
             }
             let name = Symbol::from(constant_id_str(&cw.name()));
@@ -1857,6 +1912,31 @@ fn walk_decl_body_with_visibility<'pr>(
                     if let Some(block) = call.block().and_then(|blk| blk.as_block_node()) {
                         out.extend(walk_decl_body_with_visibility(block.body(), owner, file, true, visibility)?);
                         continue;
+                    }
+                }
+                // `included do def x … end end` — ActiveSupport::Concern
+                // class_evals the block on each includer, so its `def x`
+                // is an instance method and its `def self.y` a class
+                // method of the includer, with the visibility the
+                // block's own markers give (`Visibility` walks the block
+                // as a fresh body). Kept as the concern's: instance
+                // methods reach includers through `include`, class
+                // methods through the concern class-method splice, as
+                // `class_methods do` ones do. The difference from Ruby
+                // is ancestry alone: the includer's own same-named
+                // method wins here even when written before `include`.
+                //
+                // Only the definitions: the block's DSL calls are the
+                // concern collectors' (`ingest_concern_model_items`,
+                // filters), and its `attr_*` the accessor collector's.
+                // The call itself is still captured below.
+                if !force_class_receiver {
+                    if let Some(block) = visibility::included_block_with_defs(&call) {
+                        let inner = walk_decl_body_with_visibility(block.body(), owner, file, false, visibility)?;
+                        out.methods.extend(inner.methods.into_iter().filter(|m| !m.name_span.is_synthetic()));
+                        // A constant written in the block is the
+                        // concern's: the block keeps its lexical scope.
+                        out.constants.extend(inner.constants);
                     }
                 }
                 match kw {
@@ -2953,6 +3033,18 @@ pub fn ingest_concern_class_method_spans(
                 {
                     if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
                         defs_in(block.body(), file, &mut spans);
+                    }
+                }
+                // `included do def self.x … end end` is class_eval'd on
+                // the includer: `x` is ITS class method, which
+                // `walk_decl_body` keeps on the concern for this splice.
+                if let Some(body) = visibility::included_block_with_defs(&call).and_then(|b| b.body()) {
+                    for inner in flatten_statements(body) {
+                        if let Some(def) = visibility::definition(&inner) {
+                            if def.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+                                spans.push(super::util::def_name_span(&def, file));
+                            }
+                        }
                     }
                 }
             }

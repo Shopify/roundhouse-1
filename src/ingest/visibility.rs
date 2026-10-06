@@ -41,6 +41,24 @@ pub(super) fn marker(call: &CallNode<'_>) -> bool {
 
 /// `private def helper … end` defines a method, not a default for later
 /// definitions. Leave all other forms alone for the resolution/error gate.
+/// `included do … end` (no arguments) whose body defines a method
+/// directly: a body Ruby class_evals on each includer, which this pass
+/// and `walk_decl_body` read as one. A block without a `def` keeps the
+/// concern collectors' handling (accessors, DSL calls, `private :name`).
+pub(super) fn included_block_with_defs<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<ruby_prism::BlockNode<'pr>> {
+    if call.receiver().is_some()
+        || call.arguments().is_some()
+        || super::util::constant_id_str(&call.name()) != "included"
+    {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    super::util::flatten_statements(block.body()?)
+        .iter()
+        .any(|stmt| definition(stmt).is_some())
+        .then_some(block)
+}
+
 pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'pr>> {
     if let Some(call) = node.as_call_node() {
         if marker(&call) && call.receiver().is_none() && call.block().is_none() {
@@ -552,6 +570,15 @@ impl Visibility {
                 continue;
             }
             let Some(call) = node.as_call_node() else {
+                // `X = Struct.new(...) do … end` / `X = Data.define(...)
+                // do … end`: Ruby class_evals the block on the class the
+                // factory returns, so its defs and markers are that
+                // class's, resolved by its own pass
+                // (`factory_class`), and the default here carries on
+                // past it unchanged.
+                if super::factory_class::is_factory_class_write(node) {
+                    continue;
+                }
                 // A `def` is handled above. Anything else — an `if` that
                 // wraps a definition, a modifier that does not — still
                 // has to be rejected when it hides a marker or a `def`.
@@ -600,6 +627,16 @@ impl Visibility {
                     file,
                     "module_function on a nested singleton level or class-method carrier is not modeled",
                 ));
+            }
+            // `included do def … end` is class_eval'd on each includer: a
+            // body of its own that starts public, where `def self.x` is
+            // the includer's class side. Its methods are kept on the
+            // concern (`walk_decl_body`), looked up by their offsets.
+            if !class_side && let Some(block) = included_block_with_defs(&call) {
+                let mut block_body = Self::default();
+                block_body.walk(block.body(), false, file, None)?;
+                self.values.extend(block_body.values);
+                continue;
             }
             // Only collector-owned candidates have a replacement refusal gate:
             // their unclaimed block context is diagnosed per includer. Do not

@@ -992,6 +992,18 @@ fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel) {
         return Ok(());
     }
+    // A `Struct.new`/`Data.define` body block is emitted around the
+    // runtime's own factory, which only the Ruby family has.
+    if let Some(class) = app.library_classes.iter().find(|class| {
+        matches!(class.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
+    }) {
+        return Err(format!(
+            "{}: {} is built by a Struct.new/Data.define body block, which this target has no \
+             representation for; use Ruby or Spinel",
+            target.as_str(),
+            class.name.0.as_str()
+        ));
+    }
     fn visit(expr: &crate::expr::Expr, target: &str, found: &mut bool) {
         if expr.decisions & crate::expr::RESOLVED_DATA_FACTORY != 0 {
             *found = true;

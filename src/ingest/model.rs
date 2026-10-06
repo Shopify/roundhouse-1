@@ -208,6 +208,14 @@ pub(super) fn ingest_model_with_enum_constants(
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
+            // `X = Struct.new(...) do … end` is the class `Model::X`,
+            // which the library ingest of this file builds
+            // (`factory_class`). As a body item its block's defs would
+            // be lost.
+            if super::factory_class::is_factory_class_write(stmt) {
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             // `self.primary_key = "key"` is recognized into
             // `Model::primary_key` instead of being kept as a body item:
             // the lowering synthesizes a reader from it, and re-emitting

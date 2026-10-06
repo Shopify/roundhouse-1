@@ -129,11 +129,13 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         contracts: &SourceContractIndex<'_>,
         selectors: &HashSet<&Symbol>,
         context: Option<(&ClassId, &MethodDef)>,
+        runtime_super: bool,
         e: &Expr,
         out: &mut Vec<Diagnostic>,
     ) {
         let enclosing = context.map(|(_, m)| m);
         if matches!(&*e.node, ExprNode::Super { args: None })
+            && !runtime_super
             && enclosing.is_some_and(|m| selectors.contains(&m.name) && m.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest))
         {
             out.push(Diagnostic::unsupported(
@@ -202,23 +204,47 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
                 "the keyword splat lowering would pass the hash as a positional",
             ));
         }
-        e.node.for_each_child(&mut |c| visit(app, contracts, selectors, context, c, out));
+        e.node.for_each_child(&mut |c| visit(app, contracts, selectors, context, runtime_super, c, out));
     }
-    let selectors: HashSet<&Symbol> = methods(app)
+    let rests: Vec<(&ClassId, &Symbol)> = methods(app)
         .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
-        .map(|(_, m)| &m.name)
+        .map(|(owner, m)| (owner, &m.name))
         .collect();
+    let selectors: HashSet<&Symbol> = rests.iter().map(|(_, name)| *name).collect();
     let mut out = Vec::new();
     if selectors.is_empty() {
         return out;
     }
+    // A `Struct.new`/`Data.define` body class that includes nothing has
+    // the runtime factory class as its next ancestor, so an implicit
+    // `super` there reaches the runtime's method (`Data#initialize`
+    // takes the members as keywords), not an app nameless rest -- unless
+    // the app itself reopens one of those runtime ancestors with one.
+    const FACTORY_ANCESTORS: [&str; 5] = ["Struct", "Data", "Object", "Kernel", "BasicObject"];
+    let runtime_super_owners: HashSet<&ClassId> = app
+        .library_classes
+        .iter()
+        .filter(|c| {
+            matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
+                && c.includes.is_empty()
+        })
+        .map(|c| &c.name)
+        .collect();
+    let runtime_super = |owner: &ClassId, m: &MethodDef| {
+        runtime_super_owners.contains(owner)
+            && m.receiver == MethodReceiver::Instance
+            && !rests
+                .iter()
+                .any(|(o, n)| **n == m.name && FACTORY_ANCESTORS.contains(&o.0.as_str()))
+    };
     for (owner, method) in methods(app) {
-        visit(app, contracts, &selectors, Some((owner, method)), &method.body, &mut out);
+        let runtime = runtime_super(owner, method);
+        visit(app, contracts, &selectors, Some((owner, method)), runtime, &method.body, &mut out);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            visit(app, contracts, &selectors, Some((owner, method)), default, &mut out);
+            visit(app, contracts, &selectors, Some((owner, method)), runtime, default, &mut out);
         }
     }
-    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(app, contracts, &selectors, None, e, &mut out));
+    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(app, contracts, &selectors, None, false, e, &mut out));
     // `delegate` writes a zero-arg forwarder, or none (a string name, a
     // test class); the library-class pass leaves such a declaration in
     // `unknown_calls`, and a controller's stays a body item, so refuse

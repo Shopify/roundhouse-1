@@ -1724,6 +1724,17 @@ impl Analyzer {
                 Ty::Class { id: constant.clone(), args: vec![] },
             );
         }
+        // `X = Struct.new(...) do … end` is a constant to Rubydex and a
+        // library class here (`ingest::factory_class`): its value is
+        // that class.
+        for class in &app.library_classes {
+            if matches!(class.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. })) {
+                resolved.insert(
+                    rubydex::model::ids::declaration_id_from_lookup_name(class.name.0.as_str()),
+                    Ty::Class { id: class.name.clone(), args: vec![] },
+                );
+            }
+        }
         (map, resolved)
     }
 

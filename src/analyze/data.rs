@@ -17,6 +17,7 @@ pub(super) fn register(
     classes: &mut HashMap<ClassId, ClassInfo>,
 ) -> HashMap<Span, Ty> {
     let mut factories = HashMap::new();
+    register_factory_classes(app, resolver, classes);
     // Source overrides can replace `.define`; only the built-in factory is modeled here.
     if resolver.has_source_namespace("Data") {
         return factories;
@@ -80,6 +81,55 @@ pub(super) fn register(
         }
     }
     factories
+}
+
+/// The members a `Struct.new` / `Data.define` factory with a body block
+/// generates (`LibraryClassOrigin::FactoryClass`). The class itself is
+/// a library class, registered with the block's own methods; this adds
+/// what the factory defines around them: `new`, a reader per member,
+/// and for Struct a writer per member. A method the block defines
+/// itself keeps its own entry. Member values are untyped, as for the
+/// blockless form.
+fn register_factory_classes(
+    app: &App,
+    resolver: &ConstResolver,
+    classes: &mut HashMap<ClassId, ClassInfo>,
+) {
+    for class in &app.library_classes {
+        let Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }) = &class.origin else {
+            continue;
+        };
+        let ExprNode::Send { recv: Some(recv), method, args, .. } = &*factory.node else {
+            continue;
+        };
+        let ExprNode::Const { path } = &*recv.node else { continue };
+        let generator = if method.as_str() == "new" { "Struct" } else { "Data" };
+        // An app's own `Struct`/`Data` is not the factory modeled here.
+        if resolver.has_source_namespace(generator)
+            || !resolver.is_runtime_class(recv.span, path, generator)
+        {
+            continue;
+        }
+        let Some(info) = classes.get_mut(&class.name) else { continue };
+        info.parent = Some(ClassId(Symbol::from(generator)));
+        info.class_methods
+            .entry(Symbol::from("new"))
+            .or_insert_with(|| Ty::Class { id: class.name.clone(), args: vec![] });
+        for arg in args {
+            let ExprNode::Lit { value: Literal::Sym { value: member } } = &*arg.node else {
+                continue;
+            };
+            if !reader_name(member.as_str()) {
+                continue;
+            }
+            info.instance_methods.entry(member.clone()).or_insert(Ty::Untyped);
+            if generator == "Struct" {
+                info.instance_methods
+                    .entry(Symbol::from(format!("{}=", member.as_str())))
+                    .or_insert(Ty::Untyped);
+            }
+        }
+    }
 }
 
 fn reader_name(member: &str) -> bool {

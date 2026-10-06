@@ -26,6 +26,7 @@ mod database_ownership;
 pub mod database_yml;
 pub mod controller;
 pub mod expr;
+mod factory_class;
 pub mod fixture;
 pub(crate) mod forwarding;
 pub mod generated_helpers;

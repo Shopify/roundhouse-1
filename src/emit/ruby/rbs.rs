@@ -53,6 +53,13 @@ fn render_class(lc: &LibraryClass) -> String {
         let last = segments[depth - 1];
         let pad = "  ".repeat(depth - 1);
         match lc.parent.as_ref() {
+            // RBS declares `Struct[Elem]`; a factory-built struct's
+            // members are not typed here.
+            Some(p) if p.0.as_str() == "Struct"
+                && matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. })) =>
+            {
+                writeln!(s, "{pad}class {last} < Struct[untyped]").unwrap()
+            }
             Some(p) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
             None => writeln!(s, "{pad}class {last}").unwrap(),
         }

@@ -6002,6 +6002,19 @@ fn emit_library_class_decl_inner(
     out_path: PathBuf,
     synthesized_siblings: &[(String, String)],
 ) -> EmittedFile {
+    // A factory class's member readers/writers are the factory's own;
+    // ingest synthesized them for analysis only.
+    let without_generated;
+    let lc = match lc.origin.as_ref().and_then(|o| o.factory_generated_methods()) {
+        Some(generated) => {
+            let mut copy = lc.clone();
+            copy.methods
+                .retain(|m| !(m.name_span.is_synthetic() && generated.contains(&m.name)));
+            without_generated = copy;
+            &without_generated
+        }
+        None => lc,
+    };
     let name = lc.name.0.as_str();
     let out_dir = out_path
         .parent()
@@ -6280,9 +6293,14 @@ fn emit_library_class_decl_inner(
             }
             let last = segments[depth - 1];
             let pad = "  ".repeat(depth - 1);
-            match lc.parent.as_ref() {
-                Some(p) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
-                None => writeln!(s, "{pad}class {last}").unwrap(),
+            match (&lc.origin, lc.parent.as_ref()) {
+                // `X = Struct.new(:a) do … end`: the factory builds the
+                // class and evaluates the body below as its body.
+                (Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }), _) => {
+                    writeln!(s, "{pad}{last} = {} do", super::emit_expr(factory)).unwrap()
+                }
+                (_, Some(p)) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
+                (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
             }
         }
     };
@@ -6725,9 +6743,14 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
 /// the MODEL `Account` — whose file then referenced a constant nothing
 /// had loaded. Both sides ask this now.
 fn owns_a_file(name: &str, app: &App) -> bool {
-    app.library_classes
-        .iter()
-        .any(|c| c.name.0.as_str() == name && !c.is_module)
+    // A factory class's body is a block, not a `class` header a nested
+    // class can be spliced after; those keep their own file and reopen
+    // it with its superclass (`class X < Struct`), which Ruby accepts.
+    app.library_classes.iter().any(|c| {
+        c.name.0.as_str() == name
+            && !c.is_module
+            && !matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
+    })
 }
 
 fn is_app_class(name: &str, app: &App) -> bool {

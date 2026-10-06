@@ -974,6 +974,44 @@ pub enum LibraryClassOrigin {
         owner: Symbol,
         members: Vec<Symbol>,
     },
+    /// A constant whose value is a class factory with a body block:
+    /// `X = Struct.new(:a, keyword_init: true) do … end` or
+    /// `X = Data.define(:a) do … end` (`ingest::factory_class`). Ruby
+    /// evaluates the block as the body of the class the factory
+    /// returns, so its defs and visibility markers belong to `X`.
+    ///
+    /// `factory` is the call without its block, as written. The Ruby
+    /// family emits `X = <factory> do … end` around the class body, so
+    /// the members, constructor, readers and value equality remain the
+    /// runtime's. `methods` holds only the block's own definitions.
+    FactoryClass {
+        factory: crate::expr::Expr,
+    },
+}
+
+impl LibraryClassOrigin {
+    /// The member methods a `FactoryClass` factory generates: a reader
+    /// per symbol member, plus a writer each for `Struct`. Ingest adds
+    /// these to the class as synthesized methods (unless the block
+    /// defines one) so every pass sees the class's real surface; the
+    /// Ruby family leaves them to the factory.
+    pub fn factory_generated_methods(&self) -> Option<Vec<Symbol>> {
+        let Self::FactoryClass { factory } = self else { return None };
+        let crate::expr::ExprNode::Send { method, args, .. } = &*factory.node else {
+            return None;
+        };
+        let writers = method.as_str() == "new";
+        let mut out = Vec::new();
+        for arg in args {
+            if let crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
+                out.push(value.clone());
+                if writers {
+                    out.push(Symbol::from(format!("{}=", value.as_str())));
+                }
+            }
+        }
+        Some(out)
+    }
 }
 
 /// A graphql-ruby object type (a class descending from
