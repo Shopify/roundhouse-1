@@ -5182,6 +5182,7 @@ const GEM_REQUIRES: &[&str] = &[
     "net/http/persistent",
     "web-push",
     "statsd-instrument",
+    "drb",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5468,7 +5469,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 16] = [
+    const RUNTIME_GEMS: [(Marker, &str); 18] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -5558,6 +5559,12 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // client (`StatsD::Instrument::Client.from_env`); the analyzer
         // types it from the gem's Tapioca RBI, which loads nothing.
         (Marker::Constant("StatsD"), "statsd-instrument"),
+        // dRuby, a bundled gem since Ruby 3.4 (so a Bundler tree must
+        // declare it). Core's test parallelization reaches it at boot
+        // (`DRbObject.new_with_uri`, `rescue DRb::DRbConnError`). Its
+        // runtime dependencies are none: no Rails in its load closure.
+        (Marker::Constant("DRb"), "drb"),
+        (Marker::Constant("DRbObject"), "drb"),
     ];
     &RUNTIME_GEMS
 }

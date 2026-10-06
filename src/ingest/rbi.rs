@@ -60,7 +60,9 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 /// Rails' own components, the stdlib gems and the tooling gems are
 /// skipped: the first two are already the analyzer's catalog (a second,
 /// partial, description of them would only disagree), and the last never
-/// enters the analysis at all.
+/// enters the analysis at all. A gem an emitted tree loads natively
+/// (`crate::project::ruby_tree_loads_gem`) is read whatever its fate:
+/// the analyzer has no model of it, and its constants run as the gem's.
 pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) -> GemBoundary {
     let mut boundary = GemBoundary::default();
     let Some(root) = rbi_dir(vfs, dir) else { return boundary };
@@ -74,7 +76,8 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
         let Some((name, version)) = stem.split_once('@') else { continue };
-        if lock.is_in_repo(name) || !matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled) {
+        let read = matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled) || crate::project::ruby_tree_loads_gem(name);
+        if lock.is_in_repo(name) || !read {
             continue;
         }
         let Some(locked) = lock.version_of(name) else { continue };
@@ -158,6 +161,10 @@ impl Reader<'_> {
         if entry.gem.is_empty() {
             entry.gem = gem.to_string();
             entry.is_module = is_module;
+        } else if !crate::project::ruby_tree_loads_gem(&entry.gem) && crate::project::ruby_tree_loads_gem(gem) {
+            // Two gems declare it (ci-queue reopens minitest's
+            // `Minitest::Result`); either one loaded defines it.
+            entry.gem = gem.to_string();
         }
         entry
     }
@@ -212,6 +219,21 @@ impl Reader<'_> {
                     self.walk(&body.body().iter().collect::<Vec<_>>(), scope, true, aliases);
                 }
                 continue;
+            }
+            if let Some(write) = statement.as_constant_write_node() {
+                // `DRbObject = DRb::DRbObject`: another name for a class
+                // this gem declared, with its surface.
+                let alias = qualify(scope, constant_id_str(&write.name()));
+                let written = constant_path_name(&write.value());
+                let target = [qualify(scope, &written), written]
+                    .into_iter()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| ClassId(Symbol::new(&name)))
+                    .find(|id| self.out.classes.contains_key(id));
+                if let Some(target) = target {
+                    let class = self.out.classes[&target].clone();
+                    self.out.classes.entry(ClassId(Symbol::new(&alias))).or_insert(class);
+                }
             }
             let Some(scope) = scope else {
                 // Top-level: only a `sig` carries over to the next
