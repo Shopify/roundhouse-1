@@ -4,15 +4,19 @@ module ActiveRecord
     def initialize: (?String message) -> void
   end
 
+  # Raised for a statement the database refused; the parent of the
+  # statement errors below, as in Rails.
+  class StatementInvalid < StandardError
+  end
+
   # Raised when a value exceeds its column's declared limit.
-  class ValueTooLong < StandardError
+  class ValueTooLong < StatementInvalid
     def initialize: (?String message) -> void
   end
 
-  # Raised when an INSERT/UPDATE trips a unique index. Defined so a
-  # `rescue ActiveRecord::RecordNotUnique` clause resolves; see the .rb
-  # for why the adapters do not raise it yet.
-  class RecordNotUnique < StandardError
+  # Raised when an INSERT/UPDATE trips a unique index; each `Db` raises
+  # it (see the .rb).
+  class RecordNotUnique < StatementInvalid
     def initialize: (?String message) -> void
   end
 

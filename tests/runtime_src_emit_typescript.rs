@@ -83,8 +83,9 @@ for (const [count, expected] of [
     assert!(run.status.success(), "{emitted}\n{}", String::from_utf8_lossy(&run.stderr));
 }
 
-/// Phase 1 second target: errors.rb has four classes (RecordNotFound,
-/// ValueTooLong, RecordNotUnique, RecordInvalid), one with a synth attr_reader
+/// Phase 1 second target: errors.rb has five classes (RecordNotFound,
+/// StatementInvalid, and under it ValueTooLong and RecordNotUnique, as in
+/// Rails; RecordInvalid), one with a synth attr_reader
 /// (`record`) and an `initialize` that calls `super(...)`. Validates parent extends
 /// (StandardError → Error), constructor synthesis, attr_reader-as-
 /// field detection, and `@ivar` → `this.x` in the constructor body.
@@ -98,7 +99,17 @@ fn errors_rb_transpiles_to_typescript_classes() {
     let classes = parse_library_with_rbs(&ruby, &rbs, "runtime/ruby/active_record/errors.rb")
         .expect("parse_library_with_rbs");
 
-    assert_eq!(classes.len(), 4, "expected 4 classes; got {}", classes.len());
+    assert_eq!(classes.len(), 5, "expected 5 classes; got {}", classes.len());
+
+    let invalid_statement = classes
+        .iter()
+        .find(|c| c.name.0.as_str() == "ActiveRecord::StatementInvalid")
+        .expect("ActiveRecord::StatementInvalid");
+    let si_ts = emit_library_class(invalid_statement).expect("emit StatementInvalid");
+    assert!(
+        si_ts.contains("export class StatementInvalid extends Error"),
+        "StatementInvalid: {si_ts}"
+    );
 
     let not_found = classes
         .iter()
@@ -116,7 +127,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::ValueTooLong");
     let tl_ts = emit_library_class(too_long).expect("emit ValueTooLong");
     assert!(
-        tl_ts.contains("export class ValueTooLong extends Error"),
+        tl_ts.contains("export class ValueTooLong extends StatementInvalid"),
         "ValueTooLong: {tl_ts}"
     );
 
@@ -126,7 +137,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::RecordNotUnique");
     let nu_ts = emit_library_class(not_unique).expect("emit RecordNotUnique");
     assert!(
-        nu_ts.contains("export class RecordNotUnique extends Error"),
+        nu_ts.contains("export class RecordNotUnique extends StatementInvalid"),
         "RecordNotUnique: {nu_ts}"
     );
 

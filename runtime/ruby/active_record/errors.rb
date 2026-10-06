@@ -8,12 +8,20 @@ module ActiveRecord
     end
   end
 
+  # Rails' error for a statement the database refused. Rails hangs it
+  # off AdapterError < ActiveRecordError; with no ActiveRecordError
+  # here, StandardError is the parent. Only the CRuby tree's `Db`
+  # translates its driver's errors into it (`db_cruby.rb`), and that
+  # tree's overlay adds the statement (`sql`, `binds`); `project`
+  # refuses the constant on every other target.
+  class StatementInvalid < StandardError
+  end
+
   # Rails raises this when a value exceeds its column's declared limit;
   # apps also construct it directly to reject over-long input before it
-  # reaches the DB (lobsters' Keystore.validate_input_key). Rails hangs
-  # it off StatementInvalid — with no statement-error hierarchy here,
-  # StandardError is the honest parent.
-  class ValueTooLong < StandardError
+  # reaches the DB (lobsters' Keystore.validate_input_key). A
+  # StatementInvalid, as in Rails.
+  class ValueTooLong < StatementInvalid
     def initialize(message = "ActiveRecord::ValueTooLong")
       super(message)
     end
@@ -24,9 +32,8 @@ module ActiveRecord
   # campfire's first-run screen does exactly that (two people opening a
   # brand-new install at once; the loser is sent to the root path).
   #
-  # Rails hangs it off WrappedDatabaseException < StatementInvalid; with
-  # no statement-error hierarchy here, StandardError is the honest
-  # parent, matching `ValueTooLong` above.
+  # Rails hangs it off WrappedDatabaseException < StatementInvalid; here
+  # it is a StatementInvalid directly.
   #
   # RAISED BY EACH `Db`, not from here: the emitted per-model
   # `_adapter_insert` hands its SQL straight to the per-target `Db.exec`
@@ -37,7 +44,7 @@ module ActiveRecord
   # same string appears in the cruby gem's ConstraintException, in the
   # JDBC SQLException and in `sqlite3_errmsg`. The strict targets carry
   # their own `Db` and owe their own mapping.
-  class RecordNotUnique < StandardError
+  class RecordNotUnique < StatementInvalid
     def initialize(message = "ActiveRecord::RecordNotUnique")
       super(message)
     end

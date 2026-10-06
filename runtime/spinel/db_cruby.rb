@@ -301,9 +301,8 @@ module Db
 
   def self.run_exec(conn, sql)
     conn.execute(sql)
-  rescue StandardError => e
-    raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
-    raise
+  rescue SQLite3::Exception => e
+    raise translate(e, sql)
   end
 
   # ── The write permit ──
@@ -504,6 +503,38 @@ module Db
     end
   end
 
+  # Rails' sqlite3 `translate_exception` (activerecord 5813559f,
+  # connection_adapters/sqlite3_adapter.rb): a driver error becomes the
+  # Active Record class its SQLite message names, else StatementInvalid,
+  # each named "<driver class>: <message>" and carrying the statement.
+  # Raised from inside the driver's rescue, so the driver's exception is
+  # its `cause`, as Rails' is.
+  #
+  # Rails answers a closed database with ConnectionNotEstablished, which
+  # is not a StatementInvalid; no such class here, so that error passes
+  # through untranslated rather than as a class a `rescue
+  # StatementInvalid` would catch. NOT modeled: StatementTimeout for a
+  # `SQLite3::BusyException` (a StatementInvalid here, as its Rails
+  # parent is), and translation of any non-driver error.
+  def self.translate(e, sql)
+    m = e.message
+    return e if m.match?(/called on a closed database/i)
+    message = "#{e.class.name}: #{m}"
+    klass =
+      if m.match?(/(column(s)? .* (is|are) not unique|UNIQUE constraint failed: .*)/i)
+        ActiveRecord::RecordNotUnique
+      elsif m.match?(/(.* may not be NULL|NOT NULL constraint failed: .*)/i)
+        ActiveRecord::NotNullViolation
+      elsif m.match?(/FOREIGN KEY constraint failed/i)
+        ActiveRecord::InvalidForeignKey
+      elsif m.match?(/CHECK constraint failed: .*/i)
+        ActiveRecord::CheckViolation
+      else
+        ActiveRecord::StatementInvalid
+      end
+    klass.new(message, sql: sql, binds: [])
+  end
+
   # A UNIQUE-index violation is `ActiveRecord::RecordNotUnique`, not
   # whatever this driver raises. Rails' contract is what apps write
   # against — campfire's sign-up rescues it to turn a lost race into a
@@ -591,7 +622,11 @@ module Db
     stmt   = cache[sql]
     cached = true
     if stmt.nil?
-      stmt = conn.prepare(sql)
+      begin
+        stmt = conn.prepare(sql)
+      rescue SQLite3::Exception => e
+        raise translate(e, sql)
+      end
       if cache.size >= STMT_CACHE_CAP
         # Evict least-recently-used (Ruby Hash is insertion-ordered and
         # hits below re-insert, so the earliest key is the LRU). Skip
@@ -624,7 +659,7 @@ module Db
     unless qcache.nil? || parameterized
       capture = { rows: [], names: stmt.columns, eof: false, sql: sql }
     end
-    handle = { stmt: stmt, row: nil, cached: cached, capture: capture, open: open }
+    handle = { stmt: stmt, row: nil, cached: cached, capture: capture, open: open, sql: sql }
     open[handle] = true
     handle
   end
@@ -650,7 +685,11 @@ module Db
       entry[:row] = row
       return !row.nil?
     end
-    row = entry[:stmt].step
+    row = begin
+      entry[:stmt].step
+    rescue SQLite3::Exception => e
+      raise translate(e, entry[:sql])
+    end
     entry[:row] = row
     if (c = entry[:capture])
       if row.nil?

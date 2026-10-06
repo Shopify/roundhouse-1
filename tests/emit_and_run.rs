@@ -6987,6 +6987,64 @@ const ROLLBACK_COMPAT_LIB: &str = r#"module ActiveRecord
 end
 "#;
 
+/// Rails' sqlite3 `translate_exception` under every statement: a raw-SQL
+/// error is a StatementInvalid with the driver's error as its cause, a
+/// constraint violation the subclass its message names. The same file
+/// passes on Rails 5813559f (the native oracle, evidence/oracle).
+const ADAPTER_ERRORS_TEST: &str = r##"require "test_helper"
+
+class AdapterErrorsTest < ActiveSupport::TestCase
+  setup do
+    @conn = ActiveRecord::Base.connection
+    @conn.execute("CREATE TABLE IF NOT EXISTS err_rows (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE)")
+    @conn.execute("DELETE FROM err_rows")
+  end
+
+  test "an execute error is StatementInvalid caused by the driver error" do
+    e = assert_raises(ActiveRecord::StatementInvalid) { @conn.execute("SELECT * FROM no_such_rows") }
+    assert_equal "SQLite3::SQLException: no such table: no_such_rows:\nSELECT * FROM no_such_rows", e.message
+    assert_kind_of SQLite3::SQLException, e.cause
+    assert_equal "SELECT * FROM no_such_rows", e.sql
+    assert_equal [], e.binds
+  end
+
+  test "select_rows raises the same" do
+    e = assert_raises(ActiveRecord::StatementInvalid) { @conn.select_rows("SELECT nope FROM err_rows") }
+    assert_equal "SQLite3::SQLException: no such column: nope:\nSELECT nope FROM err_rows\n       ^", e.message
+  end
+
+  test "a unique violation is RecordNotUnique, a StatementInvalid" do
+    @conn.execute("INSERT INTO err_rows (code) VALUES ('a')")
+    e = assert_raises(ActiveRecord::RecordNotUnique) { @conn.execute("INSERT INTO err_rows (code) VALUES ('a')") }
+    assert_kind_of ActiveRecord::StatementInvalid, e
+    assert_equal "SQLite3::ConstraintException: UNIQUE constraint failed: err_rows.code", e.message
+    assert_kind_of SQLite3::ConstraintException, e.cause
+  end
+
+  test "a not null violation is NotNullViolation, a StatementInvalid" do
+    e = assert_raises(ActiveRecord::NotNullViolation) { @conn.execute("INSERT INTO err_rows (code) VALUES (NULL)") }
+    assert_kind_of ActiveRecord::StatementInvalid, e
+    assert_equal "SQLite3::ConstraintException: NOT NULL constraint failed: err_rows.code", e.message
+  end
+
+  test "a rescue of StatementInvalid catches each of them" do
+    caught = []
+    ["SELECT * FROM no_such_rows", "INSERT INTO err_rows (code) VALUES (NULL)"].each do |sql|
+      begin
+        @conn.execute(sql)
+      rescue ActiveRecord::StatementInvalid => e
+        caught << e.class.name
+      end
+    end
+    assert_equal ["ActiveRecord::StatementInvalid", "ActiveRecord::NotNullViolation"], caught
+  end
+
+  test "a fiber on the same thread shares the connection" do
+    assert_same @conn, Fiber.new { ActiveRecord::Base.connection }.resume
+  end
+end
+"##;
+
 fn adapter_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
         .write("app/.keep", "")
@@ -6995,6 +7053,7 @@ fn adapter_app() -> emit_and_run::Overlay {
         .write("lib/active_record/rollback_compat.rb", ROLLBACK_COMPAT_LIB)
         .write("test/adapter_transaction_test.rb", ADAPTER_TRANSACTION_TEST)
         .write("test/adapter_prepend_test.rb", ADAPTER_PREPEND_TEST)
+        .write("test/adapter_errors_test.rb", ADAPTER_ERRORS_TEST)
 }
 
 #[test]
@@ -7007,12 +7066,18 @@ fn a_module_prepended_on_the_sqlite3_adapter_reaches_it_through_super() {
     adapter_app().run_test("test/models/adapter_prepend_test.rb").assert_passes();
 }
 
+#[test]
+fn a_driver_error_under_any_statement_is_rails_statement_invalid() {
+    adapter_app().run_test("test/models/adapter_errors_test.rb").assert_passes();
+}
+
 /// Only the CRuby tree carries the adapter and the `sqlite3` gem.
 #[test]
 fn the_sqlite3_statement_errors_are_refused_off_cruby() {
     for target in [roundhouse::project::BuildTarget::Spinel, roundhouse::project::BuildTarget::Jruby] {
         let (_, errors) = adapter_app().emit(target);
-        for name in ["ActiveRecord::StatementInvalid", "SQLite3::SQLException"] {
+        for name in ["ActiveRecord::StatementInvalid", "ActiveRecord::TransactionIsolationError", "SQLite3::SQLException",
+                     "ActiveRecord::NotNullViolation"] {
             assert!(errors.iter().any(|e| e.contains(name)), "{target:?} {name}: {errors:?}");
         }
     }
@@ -7056,5 +7121,46 @@ fn a_helper_connection_to_another_adapter_is_refused() {
     ] {
         let diags = helper_connection_diagnostics(helper);
         assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{helper}: {diags:?}");
+    }
+}
+
+/// A call to the adapter's transaction members names no constant, so
+/// it is refused by member name, in a library and in a test body alike,
+/// on every target that does not carry the adapter.
+#[test]
+fn the_sqlite3_adapter_members_are_refused_off_cruby_without_a_constant() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/.keep", "")
+            .write("roundhouse.yml", "test_paths:\n  - test\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("lib/raw_transaction.rb", "class RawTransaction\n  def self.run\n    ActiveRecord::Base.connection.begin_db_transaction\n    ActiveRecord::Base.connection.exec_rollback_db_transaction\n  end\nend\n")
+            .write("test/raw_transaction_test.rb", "require \"test_helper\"\n\nclass RawTransactionTest < ActiveSupport::TestCase\n  test \"x\" do\n    ActiveRecord::Base.connection.reset_isolation_level\n    assert true\n  end\nend\n")
+    };
+    for target in [BuildTarget::Spinel, BuildTarget::Jruby, BuildTarget::Typescript, BuildTarget::Rust] {
+        let (_, errors) = app().emit(target);
+        for member in ["begin_db_transaction", "exec_rollback_db_transaction", "reset_isolation_level"] {
+            assert!(errors.iter().any(|e| e.contains(member)), "{target:?} {member}: {errors:?}");
+        }
+    }
+    let (_, errors) = app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// `transaction(isolation: …)`: Rails checks the level when the
+/// transaction first runs a statement; the runtime's transaction takes
+/// no options and begins at once, so it is refused, Ruby included.
+#[test]
+fn a_transaction_with_options_is_refused() {
+    use roundhouse::project::BuildTarget;
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel, BuildTarget::Typescript] {
+        let (_, errors) = emit_and_run::empty_app()
+            .write("app/.keep", "")
+            .write("roundhouse.yml", "test_paths:\n  - test\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/isolated_test.rb", "require \"test_helper\"\n\nclass IsolatedTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert_equal 1, ActiveRecord::Base.transaction(isolation: :read_committed) { 1 }\n  end\nend\n")
+            .emit(target);
+        assert!(errors.iter().any(|e| e.contains("`transaction` with options")), "{target:?}: {errors:?}");
     }
 }

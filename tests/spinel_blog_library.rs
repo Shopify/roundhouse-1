@@ -38,22 +38,28 @@ fn errors_rb_ingests_and_emits_via_library_path() {
     // nesting and prepends the path to each class's syntactic name.
     assert_eq!(
         classes.len(),
-        4,
-        "expected RecordNotFound + ValueTooLong + RecordNotUnique + RecordInvalid; got {} ({:?})",
+        5,
+        "expected RecordNotFound + StatementInvalid + ValueTooLong + RecordNotUnique + RecordInvalid; got {} ({:?})",
         classes.len(),
         classes.iter().map(|c| c.name.0.as_str().to_string()).collect::<Vec<_>>(),
     );
     let names: Vec<&str> = classes.iter().map(|c| c.name.0.as_str()).collect();
     assert!(names.contains(&"ActiveRecord::RecordNotFound"), "names: {names:?}");
+    assert!(names.contains(&"ActiveRecord::StatementInvalid"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::ValueTooLong"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::RecordNotUnique"), "names: {names:?}");
     assert!(names.contains(&"ActiveRecord::RecordInvalid"), "names: {names:?}");
 
-    // Both inherit from StandardError. is_module = false.
+    // The statement errors inherit from StatementInvalid, as in Rails;
+    // the rest from StandardError. is_module = false.
     for lc in &classes {
         assert!(!lc.is_module, "{} should be a class, not module", lc.name.0.as_str());
         let parent = lc.parent.as_ref().map(|p| p.0.as_str()).unwrap_or("(none)");
-        assert_eq!(parent, "StandardError", "{}: parent {parent}", lc.name.0.as_str());
+        let expected = match lc.name.0.as_str() {
+            "ActiveRecord::ValueTooLong" | "ActiveRecord::RecordNotUnique" => "StatementInvalid",
+            _ => "StandardError",
+        };
+        assert_eq!(parent, expected, "{}: parent {parent}", lc.name.0.as_str());
     }
 
     // RecordInvalid is the rich one. attr_reader :record lowers to
@@ -82,7 +88,7 @@ fn errors_rb_ingests_and_emits_via_library_path() {
         .iter()
         .filter(|f| f.path.extension().and_then(|e| e.to_str()) == Some("rb"))
         .count();
-    assert_eq!(rb_count, 4, "one .rb file per LibraryClass");
+    assert_eq!(rb_count, 5, "one .rb file per LibraryClass");
 
     let invalid_file = files
         .iter()
