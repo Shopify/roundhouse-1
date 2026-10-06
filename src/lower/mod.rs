@@ -1626,7 +1626,9 @@ mod body_root_tests {
         let hooks = ["11", "12", "13", "14", "15", "16", "17", "18",
             "26", "27", "24", "25", "28", "29", "@@counter",
             "30", "31", "32", "33", "19", "20", "21", "22", "23", "34"];
-        let extras = ["35", "40", "36", "37", "41", "39", "38", "43", "42", "@@nested"];
+        // An authored `def setup` is a helper method (db81a6d6), so its
+        // body (40) is reached among the helpers in source order.
+        let extras = ["35", "36", "37", "41", "39", "38", "40", "43", "42", "@@nested"];
         let mut seen = Vec::new();
         for_each_hook_body_ref(&app, &mut |root| trace(root, &mut seen));
         assert_eq!(seen, hooks);
