@@ -15,6 +15,12 @@
 //!   forwards to the module's own `class << self` `build_target`, which
 //!   takes one more keyword. The colliding shapes left the kwargs Hash in
 //!   the `filename` slot, and that slot then held a Hash of itself.
+//! - `PaymentGateway#without_killswitched_wallets` is Core's wallet
+//!   killswitch filter. Its return reaches its own `new:` argument
+//!   through `supported_wallet_brands` and `disabled_wallet_brands=`,
+//!   and a site that is `Untyped` one round is no evidence, so the param,
+//!   the return and three callers cycled with period 4. The slots are
+//!   widened to the join of the cycle.
 //! - `Gateway#limit?` is an instance method and a class method with
 //!   different keywords (`CollectionSource#over_..._limit?`), and
 //!   `Gateway#to_entity` is a keyword-only instance method plus a
@@ -34,6 +40,10 @@ const SOURCES: &[(&str, &str)] = &[
         r#"ActiveRecord::Schema[7.1].define(version: 1) do
   create_table "photos", force: :cascade do |t|
     t.string "name"
+  end
+  create_table "payment_gateways", force: :cascade do |t|
+    t.string "name"
+    t.text "disabled_wallet_brands"
   end
 end
 "#,
@@ -117,6 +127,76 @@ end
 end
 "#,
     ),
+    (
+        "app/models/payment_gateway.rb",
+        r#"class PaymentGateway < ApplicationRecord
+  def without_killswitched_wallets(supported_wallet_brands)
+    supported_wallet_brands -= [:facebook_pay]
+
+    return supported_wallet_brands if Verdict::Flag.enabled?(handle: "bypass")
+
+    supported_wallet_brands.reject do |supported_wallet_brand|
+      Verdict::Flag.enabled?(handle: "wallet_killswitch_#{supported_wallet_brand}")
+    end
+  end
+
+  def without_changes_to_killswitched_wallets(current:, new:)
+    killswitched_but_previously_present = current.difference(without_killswitched_wallets(current))
+    killswitched_but_previously_present
+      .union(without_killswitched_wallets(new))
+      .uniq
+  end
+end
+"#,
+    ),
+    (
+        "app/models/direct_payment_gateway.rb",
+        r#"class DirectPaymentGateway < PaymentGateway
+  def self.supported_wallets_by_provider(name)
+    Providers.lookup(name)
+  end
+
+  def supported_wallet_brands
+    wallets = self.class.supported_wallets_by_provider(name)
+    wallets.delete(:amazon_pay) unless name
+    without_killswitched_wallets(wallets)
+  end
+
+  def wallet_enabled?(brand)
+    enabled_wallet_brands.include?(brand)
+  end
+
+  def disabled_wallet_brands
+    brands = self[:disabled_wallet_brands]
+    brands += [:apple_pay] if name
+    brands.uniq
+  end
+
+  def enabled_wallet_brands
+    @enabled_wallet_brands ||= (supported_wallet_brands - disabled_wallet_brands).freeze
+  end
+
+  def enabled_wallet_brands=(brands)
+    @enabled_wallet_brands = nil
+    self.disabled_wallet_brands = (supported_wallet_brands - brands.map(&:to_sym))
+  end
+
+  def disabled_wallet_brands=(brands)
+    @enabled_wallet_brands = nil
+    supported_wallets = self.class.supported_wallets_by_provider(name)
+    disabled = (brands.map(&:to_sym) & supported_wallets)
+    self[:disabled_wallet_brands] = without_changes_to_killswitched_wallets(
+      current: self[:disabled_wallet_brands],
+      new: disabled,
+    )
+  end
+
+  def apple_pay?
+    wallet_enabled?(:apple_pay)
+  end
+end
+"#,
+    ),
 ];
 
 struct Analyzed {
@@ -177,8 +257,10 @@ fn contains_hash(ty: &Ty) -> bool {
 #[test]
 fn every_fixpoint_loop_settles_well_under_the_cap() {
     let (_, rounds) = analyzed();
+    // The wallet cycle has period 4: it shows itself on the fifth
+    // round, and its dependents settle in the next few.
     for (name, n) in [("production", rounds.production), ("tests", rounds.tests), ("absorb", rounds.absorb)] {
-        assert!(n.is_some_and(|n| n <= 6), "{name} loop did not settle: {rounds:?}");
+        assert!(n.is_some_and(|n| n <= 8), "{name} loop did not settle: {rounds:?}");
     }
 }
 
@@ -232,4 +314,22 @@ fn instance_and_class_defs_of_one_name_never_feed_a_slot_its_own_hash() {
             assert!(!p.iter().any(contains_hash), "Gateway#{method}: {p:?}");
         }
     }
+}
+
+#[test]
+fn a_return_that_feeds_its_own_argument_settles_on_the_join_of_its_cycle() {
+    let a = analyzed_full();
+    assert!(a.rounds.production.is_some_and(|n| n <= 8), "{:?}", a.rounds);
+    let [param] = params(&a.app, "PaymentGateway", "without_killswitched_wallets") else {
+        panic!("one param")
+    };
+    // The settled type admits every state of the cycle: the precise
+    // `Array[Sym]` and the `Untyped` from the unresolved provider list.
+    let syms = Ty::Array { elem: Box::new(Ty::Sym) };
+    let admits = |want: &Ty| match param {
+        Ty::Untyped => true,
+        Ty::Union { variants } => variants.contains(want) || variants.contains(&Ty::Untyped),
+        t => t == want,
+    };
+    assert!(admits(&syms) && admits(&Ty::Untyped), "{param:?}");
 }

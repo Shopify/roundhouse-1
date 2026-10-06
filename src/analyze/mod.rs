@@ -24,6 +24,7 @@
 //! Each of those comes when a fixture forces it.
 
 mod alba;
+mod cycles;
 mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
@@ -1129,6 +1130,7 @@ impl Analyzer {
         // `get_from_cache` block → its return → the destructuring, which
         // settles on round 9.
         let mut prev_sig = self.capture_inference_sig();
+        let mut cycles = cycles::CycleWidening::default();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
                 self.harvest_returns_to_registry(app, false)
@@ -1136,8 +1138,9 @@ impl Analyzer {
             crate::timings::phase(format_args!("round {round}: unify params"), || {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
+            self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("production round {round}"), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("production round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.production = Some(round + 1);
@@ -1177,6 +1180,7 @@ impl Analyzer {
         // harvested helper surface rather than leftover untyped.
         let production_sig = prev_sig.clone();
         let mut production_view_params = None;
+        let mut cycles = cycles::CycleWidening::default();
         for round in 0..FIXPOINT_CAP {
             crate::timings::phase(
                 if round == 0 {
@@ -1217,8 +1221,9 @@ impl Analyzer {
                     }
                 },
             );
+            self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("test round {round}"), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("test round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.tests = Some(round + 1);
@@ -1231,6 +1236,7 @@ impl Analyzer {
         }
         if !self.inference_matches(&production_sig) {
             let mut absorb_sig = self.capture_inference_sig();
+            let mut cycles = cycles::CycleWidening::default();
             for round in 0..FIXPOINT_CAP {
                 crate::timings::phase(
                     if round == 0 {
@@ -1256,8 +1262,9 @@ impl Analyzer {
                     snapshot.clone_from(&self.inferred_params);
                 }
                 self.overlay_test_params(app);
+                self.widen_cycles(&absorb_sig, &mut cycles);
                 if fixpoint_debug::enabled() {
-                    fixpoint_debug::report(&format!("absorb round {round}"), &absorb_sig, &self.capture_inference_sig());
+                    fixpoint_debug::report(&format!("absorb round {round} (widened {})", cycles.widened_count()), &absorb_sig, &self.capture_inference_sig());
                 }
                 if self.inference_matches(&absorb_sig) {
                     self.fixpoint_rounds.absorb = Some(round + 1);
