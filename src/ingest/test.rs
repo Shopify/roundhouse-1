@@ -968,7 +968,9 @@ pub(super) fn resolve_test_parents(app: &mut crate::App) {
     for tm in &mut app.test_modules {
         let (Some(span), Some(parent)) = (tm.parent_span, &tm.parent) else { continue };
         let path: Vec<Symbol> = parent.0.as_str().split("::").map(Symbol::from).collect();
-        if let Some(id) = resolver.namespace(span, &path).filter(|id| defined.contains(*id)) {
+        // The superclass is read before the class exists, so a name that
+        // resolves to the class itself names an outer one in Ruby.
+        if let Some(id) = resolver.namespace(span, &path).filter(|id| defined.contains(*id) && **id != tm.name) {
             tm.parent = Some(id.clone());
         }
     }

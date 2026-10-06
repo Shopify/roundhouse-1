@@ -3890,7 +3890,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 let cruby_sqlite3 = matches!(id.0.as_str(),
-                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException"
+                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException" | "SQLite3::ConstraintException"
                     | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation"
                     | "ActiveRecord::ConnectionAdapters::SQLite3Adapter");
                 if (cruby_sqlite3 || bundled && matches!(id.0.as_str(),
