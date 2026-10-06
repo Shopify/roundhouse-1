@@ -2630,18 +2630,8 @@ end
     });
     for (path, content) in files.iter_mut() {
         if path == "boot.rb" {
-            *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter");
-            // `Base.connection` as Rails' PostgreSQL adapter class: in place
-            // of the SQLite3 adapter's require where the tree has one, else
-            // after the shared Active Record runtime, before the schema.
-            if content.contains("runtime/active_record_sqlite3_adapter") {
-                *content = content.replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
-            } else {
-                let schema = "require_relative \"config/schema\"\n";
-                let at = content.find(schema)
-                    .ok_or("PostgreSQL bootstrap: missing boot schema require anchor")?;
-                content.insert_str(at, "require_relative \"runtime/active_record_postgresql_adapter\"\n");
-            }
+            *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
+                .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
             content.push_str("\nrequire_relative \"runtime/database_configuration\"\n");
         }
         if path == "test/test_helper.rb" {

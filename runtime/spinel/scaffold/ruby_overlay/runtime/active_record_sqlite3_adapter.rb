@@ -42,46 +42,9 @@
 # in-memory connection, `Db` memory mode, raises it). JRuby's tree
 # carries this file too, but its `Db` has no `translate`, so `project`
 # still refuses the statement-error names there.
+require_relative "active_record_statement_errors"
+
 module ActiveRecord
-  # Rails: `StatementInvalid < AdapterError < ActiveRecordError`, built
-  # with the statement and its binds; the message defaults to the error
-  # being handled.
-  class StatementInvalid
-    attr_reader :sql, :binds
-
-    def initialize(message = nil, sql: nil, binds: nil)
-      super(message || $!&.message)
-      @sql = sql
-      @binds = binds
-    end
-  end
-
-  # Rails defines no constructor of their own on these.
-  class RecordNotUnique
-    def initialize(message = nil, sql: nil, binds: nil)
-      super
-    end
-  end
-
-  class ValueTooLong
-    def initialize(message = nil, sql: nil, binds: nil)
-      super
-    end
-  end
-
-  class NotNullViolation < StatementInvalid
-  end
-
-  class InvalidForeignKey < StatementInvalid
-  end
-
-  class CheckViolation < StatementInvalid
-  end
-
-  # Rails: `TransactionIsolationError < ActiveRecordError`.
-  class TransactionIsolationError < StandardError
-  end
-
   module ConnectionAdapters
     class SQLite3Adapter < Connection
       def begin_deferred_transaction(isolation = nil)
