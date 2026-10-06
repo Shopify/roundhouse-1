@@ -798,6 +798,13 @@ fn every_runtime_method_body_concretely_typed() {
     // still dominated by polymorphic SQL / helper-opt hashes;
     // `Relation[T]` is the longer-term fix. Merged main's 299; measure
     // after the security helpers before changing this number.
+    //
+    // +1 MEASURED, within this ceiling (296 -> 297; active_record/errors.rb
+    // 5 -> 6): `StatementInvalid#initialize`'s `super(message)` into
+    // StandardError, the site `RecordNotFound#initialize` already pays.
+    // What it bought: `ValueTooLong` and `RecordNotUnique` hand their
+    // message to a parent constructor that exists on Kotlin, Swift and
+    // C# (tests/runtime_errors_strict_constructors.rs).
     const CEILING: usize = 299;
     assert!(
         total_gradual <= CEILING,

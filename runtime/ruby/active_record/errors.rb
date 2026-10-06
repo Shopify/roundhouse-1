@@ -13,8 +13,13 @@ module ActiveRecord
   # here, StandardError is the parent. Only the CRuby tree's `Db`
   # translates its driver's errors into it (`db_cruby.rb`), and that
   # tree's overlay adds the statement (`sql`, `binds`); `project`
-  # refuses the constant on every other target.
+  # refuses the constant on every other target. The constructor is the
+  # one its subclasses hand their message to, spelled out for the
+  # targets whose parent constructor must exist (Kotlin, Swift, C#).
   class StatementInvalid < StandardError
+    def initialize(message = "ActiveRecord::StatementInvalid")
+      super(message)
+    end
   end
 
   # Rails raises this when a value exceeds its column's declared limit;
