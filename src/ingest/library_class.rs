@@ -97,14 +97,115 @@ pub fn ingest_library_classes(
     // carries the lexical scope it was written in. The corpus has no
     // cross-file reader; a new one surfaces as a NameError naming the
     // constant, not as a silent wrong answer.
+    // `Err = Class.new(StandardError)` inside a declaration is a class
+    // declaration, so it becomes the `class Err < StandardError; end`
+    // it stands for, right after its owner. See `class_new_declaration`.
+    let mut i = 0;
+    let mut synthesized = HashSet::new();
+    while i < out.len() {
+        let declared = take_class_new_declarations(&mut out[i]);
+        synthesized.extend(declared.iter().map(|class| class.name.clone()));
+        let at = i + 1;
+        i += 1 + declared.len();
+        out.splice(at..at, declared);
+    }
+    // At file level the constant is Object's, not the first class's.
+    let mut file_constants = file_level_constants(&root, file)?;
+    let mut top_level = Vec::new();
+    file_constants.retain(|(name, value)| match class_new_declaration(&[], name, value) {
+        Some(class) => {
+            top_level.push(class);
+            false
+        }
+        None => true,
+    });
     if let Some(first) = out.first_mut() {
-        let mut file_constants = file_level_constants(&root, file)?;
         if !file_constants.is_empty() {
             file_constants.extend(std::mem::take(&mut first.constants));
             first.constants = file_constants;
         }
     }
-    Ok(out)
+    // A file holding nothing but such constants still declares them.
+    // Without a class to host the rest, other file-level constants
+    // were dropped before this too.
+    synthesized.extend(top_level.iter().map(|class| class.name.clone()));
+    top_level.append(&mut out);
+    // `Sub = Class.new(Err)` inside `module Foo` names `Foo::Err` when
+    // this file declares it: Ruby's lexical lookup, innermost scope
+    // first. Written in full, the emitted file can require the class
+    // it subclasses. A name this file does not declare stays as written.
+    let declared: HashSet<ClassId> = top_level.iter().map(|class| class.name.clone()).collect();
+    for class in top_level.iter_mut().filter(|class| synthesized.contains(&class.name)) {
+        let Some(parent) = &class.parent else { continue };
+        let name = class.name.0.as_str();
+        let mut scope: Vec<&str> = name.split("::").collect();
+        scope.pop();
+        while !scope.is_empty() {
+            let candidate = ClassId(Symbol::from(format!("{}::{}", scope.join("::"), parent.0.as_str())));
+            if declared.contains(&candidate) {
+                class.parent = Some(candidate);
+                break;
+            }
+            scope.pop();
+        }
+    }
+    Ok(top_level)
+}
+
+/// Moves each `NAME = Class.new(Parent)` out of `owner`'s constants and
+/// returns the classes they declare, in source order.
+fn take_class_new_declarations(owner: &mut LibraryClass) -> Vec<LibraryClass> {
+    let scope: Vec<&str> = owner.name.0.as_str().split("::").collect();
+    let mut declared = Vec::new();
+    owner.constants.retain(|(name, value)| match class_new_declaration(&scope, name, value) {
+        Some(class) => {
+            declared.push(class);
+            false
+        }
+        None => true,
+    });
+    declared
+}
+
+/// `NAME = Class.new(Parent)` with no block and a constant parent is a
+/// class declaration in all but spelling: Ruby names the new class when
+/// it is assigned, and it answers exactly what `class NAME < Parent;
+/// end` does. That is the shape exception hierarchies are written in
+/// (`Error = Class.new(StandardError)`). The parent stays as written,
+/// to resolve lexically like any `class X < Parent`.
+///
+/// A block body, a parent that is not a constant path, or a missing
+/// parent (`Class.new`) is not this shape and stays a constant, which
+/// analysis reports.
+fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<LibraryClass> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
+        return None;
+    };
+    let is_class = matches!(&*recv.node, ExprNode::Const { path }
+        if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["Class"]));
+    if !is_class || method.as_str() != "new" {
+        return None;
+    }
+    let [parent] = args.as_slice() else { return None };
+    let ExprNode::Const { path } = &*parent.node else { return None };
+    let parent: Vec<&str> = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect();
+    if parent.is_empty() {
+        return None;
+    }
+    let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
+    full.push(name.as_str());
+    Some(LibraryClass {
+        name: ClassId(Symbol::from(full.join("::"))),
+        is_module: false,
+        parent: Some(ClassId(Symbol::from(parent.join("::")))),
+        includes: Vec::new(),
+        methods: Vec::new(),
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    })
 }
 
 /// `NAME = <expr>` statements at the top level of a file, in source

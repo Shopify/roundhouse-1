@@ -628,9 +628,20 @@ impl<'a> BodyTyper<'a> {
                     Some(Some(ResolvedConstant::Value { declaration, name, runtime })) => {
     // Concern splices retain the resolved value owner as well as its type.
     qualify_resolved_path(path, name);
-    self.typed_constants.and_then(|values| values.get(declaration)).cloned()
-        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()))
-        .unwrap_or_else(unknown)
+    let value = self.typed_constants.and_then(|values| values.get(declaration)).cloned()
+        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
+    match value {
+        Some(ty) => ty,
+        // `Err = Class.new(StandardError)` is a constant to the source
+        // index and a class to ingest (`library_class::
+        // class_new_declaration`), which leaves no constant value
+        // behind: the exact declared name is that class.
+        None if self.classes().contains_key(name.as_ref()) => {
+            expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
+            Ty::Class { id: name.as_ref().clone(), args: vec![] }
+        }
+        None => unknown(),
+    }
 }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
