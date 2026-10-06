@@ -201,6 +201,29 @@ fn negate_pred(p: NarrowPred) -> NarrowPred {
     }
 }
 
+/// `case x when C` — Ruby evaluates `C === x`, which for a class is
+/// `x.is_a?(C)`, so the arm's body sees `x` narrowed exactly as under
+/// `if x.is_a?(C)`. Only a constant that names a class narrows: a core
+/// class (`Hash`, `Array`, `String`, …) or one `is_class` confirms. A
+/// value constant (`when SLUG_FORMAT`, a Regexp) calls its own `===`
+/// and says nothing about the scrutinee's class.
+pub(super) fn case_when_class(
+    scrutinee: &Expr,
+    pattern: &Expr,
+    is_reader: &dyn Fn(&Symbol) -> Option<Ty>,
+    is_class: &dyn Fn(&Expr) -> bool,
+) -> Option<NarrowPred> {
+    let key = var_key(scrutinee, is_reader)?;
+    let ExprNode::Const { path } = &*pattern.node else { return None };
+    let ty = const_to_ty(pattern)?;
+    let core = path.len() == 1 || (path.len() == 2 && path[0].as_str().is_empty());
+    let names_class = match ty {
+        Ty::Class { .. } => is_class(pattern),
+        _ => core,
+    };
+    names_class.then_some(NarrowPred::IsA(key, ty))
+}
+
 fn var_key(e: &Expr, is_reader: &dyn Fn(&Symbol) -> Option<Ty>) -> Option<VarKey> {
     match &*e.node {
         ExprNode::Var { name, .. } => Some(VarKey::Local(name.clone())),

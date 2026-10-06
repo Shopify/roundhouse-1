@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::{DeclarationId, declaration_id_from_lookup_name};
 
-use crate::expr::{Expr, ExprNode, HashRest, LValue, Literal, MatchPattern};
+use crate::expr::{Expr, ExprNode, HashRest, LValue, Literal, MatchPattern, Pattern};
 use crate::ident::{ClassId, Symbol, TyVar};
 use crate::ty::{Row, Ty};
 
@@ -1568,10 +1568,36 @@ impl<'a> BodyTyper<'a> {
 
             ExprNode::Case { scrutinee, arms } => {
                 self.analyze_expr(scrutinee, ctx);
+                // `when C` narrows the scrutinee to `C` in its arm, and
+                // every later arm runs only because the earlier
+                // patterns failed, so it sees those classes removed.
+                // Without it a structural recursion over `case value
+                // when Hash … when Array …` typed each arm against the
+                // whole union: `value.map { |v| … }` in the Array arm
+                // dispatched on the Hash variant, its block saw the
+                // keys, and the recursive call's observed argument
+                // alternated round to round — the param never settled.
+                let mut failed: Vec<narrowing::NarrowPred> = Vec::new();
                 let mut branch_tys = Vec::new();
                 for arm in arms.iter_mut() {
-                    if let Some(g) = &mut arm.guard { self.analyze_expr(g, ctx); }
-                    branch_tys.push(self.analyze_expr(&mut arm.body, ctx));
+                    let mut arm_ctx = failed
+                        .iter()
+                        .fold(ctx.clone(), |c, p| narrowing::apply_narrowing(&c, p, false));
+                    let pred = match &arm.pattern {
+                        Pattern::Expr { expr: pat } if arm.guard.is_none() => narrowing::case_when_class(
+                            scrutinee,
+                            pat,
+                            &|n| self.self_attribute_ty(n, ctx),
+                            &|e| self.is_class_object(e, ctx),
+                        ),
+                        _ => None,
+                    };
+                    if let Some(p) = &pred {
+                        arm_ctx = narrowing::apply_narrowing(&arm_ctx, p, true);
+                    }
+                    if let Some(g) = &mut arm.guard { self.analyze_expr(g, &arm_ctx); }
+                    branch_tys.push(self.analyze_expr(&mut arm.body, &arm_ctx));
+                    failed.extend(pred);
                 }
                 union_many(branch_tys)
             }
