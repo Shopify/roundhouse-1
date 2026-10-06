@@ -994,6 +994,11 @@ fn build_methods_for_dialect(
             permitted_fields.map(|fields| writable_permit_fields(model, table, fields));
         let permitted_fields = writable_fields.as_deref();
         push_schema_methods(&mut methods, model, models, table);
+        if dialect == crate::lower::arel::SqlDialect::Postgres {
+            if let Some(method) = methods.iter_mut().find(|method| method.name.as_str() == "_table_sql") {
+                method.body = crate::lower::typing::lit_str(dialect.ident(table.name.as_str()));
+            }
+        }
         // Per-model Level-3 adapter primitives (`_adapter_find_by_id`, etc.)
         // — typed methods that go directly from SQL composition to typed
         // model instances over the `Sqlite` primitive surface. See

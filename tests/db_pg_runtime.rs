@@ -71,7 +71,7 @@ fn shared_lowering_executes_postgresql_sql_in_emitted_ruby() {
         &schema, roundhouse::emit::shared::schema_sql::Dialect::Postgres,
     ).unwrap().into_iter().map(|sql| format!("Db.exec({})\n", serde_json::to_string(&sql).unwrap()))
         .collect::<String>();
-    let script = format!(r#"
+    let script = format!(r##"
 class PostgreSQLRuntimeTest
   {methods}
   def test_shared_lowered_sql
@@ -92,7 +92,7 @@ class PostgreSQLRuntimeTest
     assert_equal 1, pg_insert("restart")
   end
 end
-"#);
+"##);
     let result = std::process::Command::new("ruby")
         .args(["-r", "./tests/db_pg_runtime.rb", "-e", &script, "--", "--name", "test_shared_lowered_sql"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -178,24 +178,47 @@ fn emitted_model_crud_executes_on_postgresql() {
         std::fs::write(path, content).unwrap();
     }
     let model_path = serde_json::to_string(&project.0.join("app/models/entry.rb")).unwrap();
+    let main_path = serde_json::to_string(&project.0.join("main.rb")).unwrap();
+    let helper_path = serde_json::to_string(&project.0.join("test/test_helper.rb")).unwrap();
     let runtime_path = serde_json::to_string(&project.0.join("runtime/db.rb")).unwrap();
     let support_path = serde_json::to_string(&project.0.join("runtime/active_support_ext.rb")).unwrap();
     let schema_path = serde_json::to_string(&project.0.join("config/schema.rb")).unwrap();
     // Execute the packaged driver, schema, shared framework and model. The
     // authored Core bootstrap is a separate integration still being repaired.
-    let script = format!(r#"
+    let script = format!(r##"
 require {runtime_path}
 require {support_path}
 require {schema_path}
 require {model_path}
+ENV["ROUNDHOUSE_DATABASE_URL"] = DB_OPTIONS.merge(dbname: DATABASE_NAMES[0]).compact.map {{ |k,v| "#{{k}}=#{{v}}" }}.join(" ")
+bootstrap_connection = PG.connect(DB_OPTIONS.merge(dbname: DATABASE_NAMES[0]))
+bootstrap_connection.exec("CREATE SCHEMA runtime_test").clear
+bootstrap_connection.finish
+require {helper_path}
+Db.close
 class PostgreSQLRuntimeTest
   def test_emitted_model_crud
+    require {main_path}
+    Db.close
+    ActiveRecord.adapter = nil
+    Main.configure_default_adapter!
     Schema.statements.each {{ |sql| Db.exec(sql) }}
+    assert_equal "PostgreSQL", ActiveRecord::Base.connection.adapter_name
+    assert_equal "TRUE", ActiveRecord::Base.connection.quote(true)
+    assert_equal "FALSE", ActiveRecord::Base.connection.quote(false)
+    assert_equal "runtime_test,public", scalar("SHOW search_path")
+    assert_equal DATABASE_NAMES[0], scalar("SELECT current_database()")
+    assert_equal [{{ "number" => 1 }}], ActiveRecord::Base.connection.execute('SELECT 1 AS number').to_a
+    error = assert_raises(ActiveRecord::StatementInvalid) {{ ActiveRecord::Base.connection.execute('SELECT * FROM no_such_table') }}
+    assert_equal 'SELECT * FROM no_such_table', error.sql
+    assert_equal [], error.binds
     first = Entry.create!(Title: "l'été \\ hi", enabled: true)
     second = Entry.create!(Title: "false", enabled: false)
     assert_equal 1, first.id
     assert_equal 2, second.id
     assert_equal 2, Entry.count
+    assert_equal 1, Entry.named("l'été \\ hi")
+    assert_equal 0, Entry.named("absent")
     assert Entry.exists?(first.id)
     loaded = Entry.find(first.id)
     assert_equal "l'été \\ hi", loaded.Title
@@ -223,9 +246,16 @@ class PostgreSQLRuntimeTest
     assert_equal 3, Entry.create!(Title: "no reset", enabled: true).id
     Entry._adapter_truncate
     assert_equal 1, Entry.create!(Title: "reset", enabled: true).id
+    connection = ActiveRecord::Base.connection
+    connection.begin_isolated_db_transaction(:serializable)
+    assert_equal "serializable", scalar("SHOW transaction_isolation")
+    Entry.create!(Title: "discard isolated", enabled: true)
+    connection.exec_rollback_db_transaction
+    assert_equal 1, Entry.count
+    assert_raises(ActiveRecord::TransactionIsolationError) {{ connection.begin_isolated_db_transaction(:invalid) }}
   end
 end
-"#);
+"##);
     let result = std::process::Command::new("ruby")
         .args(["-r", "./tests/db_pg_runtime.rb", "-e", &script, "--", "--name", "test_emitted_model_crud"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -245,6 +275,11 @@ fn postgres_project_packages_matching_driver_schema_and_gem() {
     assert!(source("runtime/db.rb").contains("require \"pg\""));
     assert!(!source("runtime/db.rb").contains("require \"sqlite3\""));
     assert!(source("Gemfile").contains("gem \"pg\""));
+    assert!(source("test/test_helper.rb").contains("DatabaseConfiguration.configure!"));
+    assert!(!source("test/test_helper.rb").contains("Db.configure(_test_db_path)"));
+    assert!(!source("main.rb").contains("SqliteAdapter.configure"));
+    assert!(source("main.rb").contains("DatabaseConfiguration.configure!"));
+    assert!(!files.iter().any(|(p, _)| p == "runtime/active_record_sqlite3_adapter.rb" || p == "runtime/sqlite_adapter.rb"));
     assert!(!source("Gemfile").contains("gem \"sqlite3\""));
     assert!(!files.iter().any(|(p, _)| p == "Gemfile.lock"));
     assert!(source("config/schema.rb").contains("serial PRIMARY KEY"));

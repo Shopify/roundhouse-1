@@ -5,6 +5,8 @@ module ActiveRecord
   # per-model. `Relation[T]` is the later refinement. `preloaded` and
   # set-operator operands stay `untyped` for Spinel integer-seed arrays.
   class Relation
+    def quote_column_path: (String path) -> String
+
     # Model handle is `Base` (class object collapsed onto `Ty::Class{Base}`
     # in send.rs). Do not spell `Class` — that leaves `@model` as Ty::Var
     # and breaks Bar A. Spinel's emit rewrites this parameter to

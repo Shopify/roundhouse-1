@@ -38,6 +38,15 @@ class PostgreSQLRuntimeTest < Minitest::Test
     Db.finalize(statement)
   end
 
+  def test_connection_string_preserves_endpoint_and_database
+    Db.close
+    config = DB_OPTIONS.merge(dbname: DATABASE_NAMES[0]).compact.map { |k,v| "#{k}=#{v}" }.join(" ")
+    Db.configure(config, search_path: "runtime_test,public")
+    assert_equal DATABASE_NAMES[0], scalar("SELECT current_database()")
+    assert_equal ADMIN.port, scalar("SHOW port").to_i
+    assert_equal "runtime_test,public", scalar("SHOW search_path")
+  end
+
   def test_typed_values_null_escaping_and_real_returning
     assert_equal 1, Db.insert_returning_int("INSERT INTO items(label,enabled,amount,payload,day) VALUES (#{Db.escape_string("l'été \\ hi")},TRUE,12345678901234567890.1234567890,#{Db.escape_string("a\0\xff".b)},'2026-10-06') RETURNING id")
     statement = Db.prepare("SELECT label,enabled,amount,payload,day FROM items")

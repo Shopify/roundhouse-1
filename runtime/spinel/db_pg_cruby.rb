@@ -21,7 +21,15 @@ module Db
   def self.configure_database(name, config, pool_size: 3, search_path: nil)
     raise ArgumentError, "pool_size must be positive" unless pool_size.positive?
     raise ArgumentError, "database already configured: #{name}" if @databases.key?(name.to_s)
-    options = config.is_a?(Hash) ? config.dup : { dbname: config.to_s }
+    options = if config.is_a?(Hash)
+      config.dup
+    else
+      # Use libpq's parser for both connection strings and PostgreSQL URIs.
+      # Passing a whole connection string as a dbname loses its endpoint.
+      PG::Connection.conninfo_parse(config.to_s).each_with_object({}) do |option, out|
+        out[option[:keyword].to_sym] = option[:val] if option[:val]
+      end
+    end
     options = options.transform_keys(&:to_sym)
     options[:options] = options.fetch(:options, "")
     pool = Pool.new(options.freeze, pool_size, [], [], Mutex.new, ConditionVariable.new, Process.pid)
