@@ -73,6 +73,18 @@ pub fn lower_test_modules_with_inner(
     // `crate::lower::routes::helper_id_segments`.
     route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
 ) -> Vec<LoweredTestModule> {
+    lower_test_modules_with_assertions(test_modules, fixtures, models, extras, route_id_segments,
+        inline_assertions::AssertionMode::Inline)
+}
+
+pub fn lower_test_modules_with_assertions(
+    test_modules: &[TestModule],
+    fixtures: &[Fixture],
+    models: &[Model],
+    extras: Vec<(ClassId, ClassInfo)>,
+    route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    assertion_mode: inline_assertions::AssertionMode,
+) -> Vec<LoweredTestModule> {
     let mut classes: HashMap<ClassId, ClassInfo> = HashMap::new();
     for (id, info) in extras {
         classes.insert(id, info);
@@ -153,7 +165,7 @@ pub fn lower_test_modules_with_inner(
     let mut out: Vec<LoweredTestModule> = Vec::new();
     let mut all_lcs: Vec<LibraryClass> = test_modules
         .iter()
-        .map(|tm| build_library_class(tm, route_id_segments))
+        .map(|tm| build_library_class(tm, route_id_segments, assertion_mode))
         .map(|mut lc| {
             for m in &mut lc.methods {
                 m.body = crate::lower::rewrite_fixture_calls(&m.body, &fixture_names);
@@ -336,7 +348,7 @@ pub fn lower_test_modules_with_inner(
             // ExprNode::Raise as its native halt-with-message (Ruby
             // `raise`, Crystal `raise`, TS `throw`, …) — see the
             // issue's "Cross-target benefits" table.
-            rewritten |= inline_assertions::inline_assertions_in_place(&mut method.body);
+            rewritten |= inline_assertions::inline_assertions_with_mode(&mut method.body, assertion_mode);
             // Ground `blank?`/`present?`/`presence` by receiver type,
             // AFTER the assertion inlining that wraps them in a `raise
             // … if !(…)` and BEFORE the re-type that stamps the result.
@@ -628,14 +640,15 @@ pub fn lower_test_module_to_library_class(
     tm: &TestModule,
     route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
 ) -> LibraryClass {
-    build_library_class(tm, route_id_segments)
+    build_library_class(tm, route_id_segments, inline_assertions::AssertionMode::Inline)
 }
 
 fn build_library_class(
     tm: &TestModule,
     route_id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    assertion_mode: inline_assertions::AssertionMode,
 ) -> LibraryClass {
-    // Inline setup body at the start of every test method. The
+    // Inline backends put setup at the start of every test method. The
     // body-typer's Seq walk picks up `@article = articles(:one)` and
     // propagates the type to downstream reads. Self-describing IR —
     // the assignment is materialized at every call site, just like
@@ -649,19 +662,53 @@ fn build_library_class(
         .map(|h| h.name.clone())
         .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
         .collect();
+    let native_assertions = assertion_mode == inline_assertions::AssertionMode::Minitest;
+    let mut inline_setup = tm.setup.clone();
+    if !native_assertions {
+        if let Some(method) = tm.helpers.iter().find(|m| m.name.as_str() == "setup") {
+            let body = if contains_setup_jump(&method.body) {
+                let detail = "test_setup_control_flow: this target inlines setup; super/return requires a preserved setup method";
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    method.body.span, None, "test_setup_control_flow", detail));
+                Expr::new(method.body.span, ExprNode::Raise {
+                    value: Expr::new(method.body.span, ExprNode::Lit {
+                        value: crate::expr::Literal::Str { value: detail.into() },
+                    }),
+                })
+            } else {
+                method.body.clone()
+            };
+            inline_setup = Some(match inline_setup {
+                Some(callbacks) => prepend_setup(&callbacks, &body),
+                None => body,
+            });
+        }
+    }
     let mut methods: Vec<MethodDef> = tm
         .tests
         .iter()
         .map(|t| {
-            test_to_method_def(&tm.name, t, tm.setup.as_ref(), &helper_shadows, route_id_segments)
+            test_to_method_def(&tm.name, t, if native_assertions { None } else { inline_setup.as_ref() }, &helper_shadows, route_id_segments)
         })
         .collect();
-    // Helpers (non-test, non-setup `def` items in the test class
+    if native_assertions {
+        if let Some(callbacks) = &tm.setup {
+            let parent = Expr::new(callbacks.span, ExprNode::Super { args: Some(vec![]) });
+            let body = prepend_setup(&parent, callbacks);
+            let body = crate::lower::controller_to_library::rewrites::rewrite_route_helpers(
+                &body, &helper_shadows, route_id_segments);
+            methods.push(test_method_def(&tm.name, Symbol::from("__roundhouse_before_setup"), body));
+        }
+    }
+    // Helpers (non-test `def` items in the test class
     // body — e.g. `setup_adapter_with_stub_row`) lower as ordinary
     // instance methods on the test class so test bodies can dispatch
     // on them via `self.<helper>(...)`. Default-typed to nil return
     // when the ingest pipeline didn't attach a signature.
     for h in &tm.helpers {
+        if !native_assertions && h.name.as_str() == "setup" {
+            continue;
+        }
         let mut m = h.clone();
         // Same route-helper namespacing the test methods get in
         // `test_to_method_def`. A helper body reaches `session_url`
@@ -718,6 +765,15 @@ fn build_library_class(
     }
 }
 
+fn contains_setup_jump(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Super { .. } | ExprNode::Return { .. }) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found |= contains_setup_jump(child));
+    found
+}
+
 /// Convert one `test "<name>" do …; end` block into `def
 /// test_<snake_name>; <setup_body>; …; end`. The optional setup
 /// argument — when present — gets prepended to the test body so
@@ -747,6 +803,10 @@ fn test_to_method_def(
         shadows,
         route_id_segments,
     );
+    test_method_def(owner, method_name, body)
+}
+
+fn test_method_def(owner: &ClassId, method_name: Symbol, body: Expr) -> MethodDef {
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,

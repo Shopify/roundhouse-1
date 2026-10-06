@@ -2185,7 +2185,18 @@ fn ruby_family_runtime_files(
     fixture: &Path,
     flavor: RubyFlavor,
 ) -> Result<Vec<(String, String)>, String> {
-    let (mut files, test_stems) = spinel_files(app, fixture)?;
+    let assertion_mode = match flavor {
+        RubyFlavor::CRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest,
+        RubyFlavor::JRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline,
+    };
+    let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
+    if matches!(flavor, RubyFlavor::CRuby) {
+        files.push(("test/minitest_runner.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/test/minitest_runner.rb")?));
+        if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
+            helper.push_str("\nrequire_relative \"minitest_runner\"\n");
+        }
+    }
 
     files.retain(|(p, _)| p != "runtime/db.rb");
     // The spinel SQL-functions file is FFI; CRuby writes its own below
@@ -3931,6 +3942,15 @@ fn spinel_files_with_source_markers(
 }
 
 fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    spinel_files_with_assertions(app, fixture,
+        crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline)
+}
+
+fn spinel_files_with_assertions(
+    app: &App,
+    fixture: &Path,
+    assertion_mode: crate::lower::test_module_to_library::inline_assertions::AssertionMode,
+) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     let mut files: Vec<(String, String)> = Vec::new();
 
     crate::runtime_files::walk_into("runtime/spinel/scaffold", "", &mut files)?;
@@ -3940,6 +3960,9 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         "sig/test/",
         &mut files,
     )?;
+    // CRuby adds this harness explicitly; the directory walk also serves
+    // Spinel and JRuby, whose test bootstrap must remain Minitest-free.
+    files.retain(|(path, _)| path != "test/minitest_runner.rb");
 
     crate::runtime_files::walk_flat("runtime/spinel", &["rb"], "runtime/", &mut files)?;
 
@@ -4389,7 +4412,7 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
         }
     }
 
-    let app_files = emit::ruby::emit_spinel(app);
+    let app_files = emit::ruby::emit_with_assertions(app, assertion_mode);
     let test_stems = app_test_stems(&app_files);
     files.extend(sort_files(app_files));
 

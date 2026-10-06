@@ -40,6 +40,13 @@ use crate::expr::{Expr, ExprNode, LValue, Literal, RescueClause};
 use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 
+/// CRuby has the real test library. Other backends keep inline assertions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertionMode {
+    Inline,
+    Minitest,
+}
+
 /// Top-level entry. Walk `body` bottom-up, rewriting recognized
 /// assertion Sends to inline raise statements. Unrecognized Sends
 /// pass through unchanged.
@@ -53,10 +60,14 @@ pub fn inline_assertions(body: &Expr) -> Expr {
 /// nested Seq flattened as a rewrite's result) so the test lowerer
 /// can skip a follow-up typing pass.
 pub fn inline_assertions_in_place(body: &mut Expr) -> bool {
-    walk_inline(body)
+    inline_assertions_with_mode(body, AssertionMode::Inline)
 }
 
-fn walk_inline(e: &mut Expr) -> bool {
+pub fn inline_assertions_with_mode(body: &mut Expr, mode: AssertionMode) -> bool {
+    walk_inline(body, mode)
+}
+
+fn walk_inline(e: &mut Expr, mode: AssertionMode) -> bool {
     if matches!(&*e.node, ExprNode::Seq { .. }) {
         let exprs = match &mut *e.node {
             ExprNode::Seq { exprs } => std::mem::take(exprs),
@@ -65,7 +76,7 @@ fn walk_inline(e: &mut Expr) -> bool {
         let mut out: Vec<Expr> = Vec::with_capacity(exprs.len());
         let mut changed = false;
         for mut child in exprs {
-            if walk_inline(&mut child) {
+            if walk_inline(&mut child, mode) {
                 changed = true;
             }
             let node = std::mem::replace(&mut *child.node, ExprNode::SelfRef);
@@ -86,15 +97,38 @@ fn walk_inline(e: &mut Expr) -> bool {
     }
     let mut changed = false;
     e.node.for_each_child_mut(&mut |c| {
-        if walk_inline(c) {
+        if walk_inline(c, mode) {
             changed = true;
         }
     });
+    // Preserve the call, its arguments and its block. Counting an inlined
+    // raise cannot reproduce nested assertions, argument failures, or returns.
+    if mode == AssertionMode::Minitest && minitest_call(e) {
+        return changed;
+    }
     if let Some(replacement) = rewrite_send(e) {
         *e = replacement;
         return true;
     }
     changed
+}
+
+fn minitest_call(e: &Expr) -> bool {
+    let ExprNode::Send { method, args, .. } = &*e.node else { return false };
+    match method.as_str() {
+        "assert_raises" | "assert_raise" => {
+            // The app-specific match: extension is not Minitest's contract.
+            !args.iter().any(|arg| matches!(&*arg.node, ExprNode::Hash { kwargs: true, .. }))
+        }
+        "assert" | "refute" | "assert_not" | "assert_equal" | "refute_equal"
+        | "assert_not_equal" | "assert_nil" | "refute_nil" | "assert_not_nil"
+        | "assert_empty" | "refute_empty" | "assert_not_empty" | "assert_includes"
+        | "refute_includes" | "assert_not_includes" | "assert_kind_of"
+        | "assert_instance_of" | "assert_same" | "refute_same" | "assert_not_same"
+        | "assert_match" | "refute_match" | "assert_no_match" | "assert_operator"
+        | "refute_operator" | "assert_predicate" | "refute_predicate" | "assert_throws" => true,
+        _ => false,
+    }
 }
 
 /// Rewrite a bare-receiver `assert_*`/`refute_*` Send into an inline

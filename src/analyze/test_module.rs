@@ -114,6 +114,12 @@ impl Analyzer {
                 extract_ivar_assignments(setup, &mut ctx.ivar_bindings);
                 ctx.ivar_bindings.retain(|_, ty| !ty.is_unknown());
             }
+            if let Some(setup) = module.helpers.iter_mut().find(|method| method.name.as_str() == "setup") {
+                let method_ctx = self.seed_method_params(&ctx, &module.name, setup);
+                self.body_typer().analyze_expr(&mut setup.body, &method_ctx);
+                extract_ivar_assignments(&setup.body, &mut ctx.ivar_bindings);
+                ctx.ivar_bindings.retain(|_, ty| !ty.is_unknown());
+            }
             for method in &mut module.helpers {
                 let mut default_ctx = ctx.clone();
                 for index in 0..method.params.len() {
