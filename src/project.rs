@@ -1288,6 +1288,7 @@ pub fn target_files(
     };
     if target != BuildTarget::Blog {
         report_unsupported_harness_reads(app, target, &files);
+        report_unsupported_harness_calls(app, target, &files);
     }
 
     // Blog is the verbatim Rails source — it ships `db/seeds.rb` and is
@@ -2553,6 +2554,7 @@ fn ruby_family_runtime_files(
     apply_module_mixins(&mut files, app, MixinForm::ExplicitReceiver);
     if matches!(flavor, RubyFlavor::CRuby) {
         apply_test_helper_connection(&mut files, app)?;
+        apply_test_harness_methods(&mut files, app)?;
     }
     Ok(files)
 }
@@ -3832,6 +3834,50 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
                 target.as_str(),
                 "harness_constant",
                 format!("{name} is declared by the Ruby-family test harness, which {} does not emit", target.as_str()),
+            );
+        }
+    }
+}
+
+/// Add Minitest's `capture_io` to the CRuby harness when a test body
+/// calls it. Only CRuby is run here; the Spinel tree cannot swap the
+/// output globals, and the JRuby tree is unverified, so both are left
+/// without it and refused at the call.
+fn apply_test_harness_methods(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+    const SOURCE: &str = "runtime/spinel/cruby/test/capture_io.rb";
+    if !crate::analyze::test_harness_calls::harness_calls(app).iter().any(|(_, name)| *name == "capture_io") {
+        return Ok(());
+    }
+    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
+        return Ok(());
+    };
+    let source = crate::runtime_files::read_to_string(SOURCE)?;
+    if !helper.ends_with('\n') {
+        helper.push('\n');
+    }
+    helper.push_str(&source);
+    Ok(())
+}
+
+/// A test body's call to a Minitest method the harness supplies
+/// (`capture_io`) is supported where the finished tree's own
+/// `test/test_helper.rb` defines it on `TestBase`, and refused on every
+/// other target, before a test calling it is emitted.
+fn report_unsupported_harness_calls(app: &App, target: BuildTarget, files: &[(String, String)]) {
+    let calls = crate::analyze::test_harness_calls::harness_calls(app);
+    if calls.is_empty() {
+        return;
+    }
+    let declared = files.iter().find(|(path, _)| path == "test/test_helper.rb")
+        .map(|(_, text)| crate::analyze::test_harness_calls::declared_methods(text))
+        .unwrap_or_default();
+    for (span, name) in calls {
+        if !declared.iter().any(|method| method == name) {
+            emit::diagnostics::report_unsupported(
+                span,
+                target.as_str(),
+                "harness_method",
+                format!("{name} is defined by the CRuby test harness, which {} does not emit", target.as_str()),
             );
         }
     }
