@@ -7017,3 +7017,44 @@ fn the_sqlite3_statement_errors_are_refused_off_cruby() {
         }
     }
 }
+
+/// The test helper's own connection setup is not carried: the emitted
+/// harness opens one SQLite file database per test file. Each
+/// `establish_connection` the helper makes is named, so a run is never
+/// read as having used the helper's database.
+fn helper_connection_diagnostics(helper: &str) -> Vec<roundhouse::diagnostic::Diagnostic> {
+    let tree = [
+        ("app/.keep", "".to_string()),
+        ("roundhouse.yml", "test_paths:\n  - test\n".to_string()),
+        ("test/test_helper.rb", helper.to_string()),
+        ("test/thing_test.rb", "require \"test_helper\"\n\nclass ThingTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert true\n  end\nend\n".to_string()),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.into_bytes()))
+    .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let lower = roundhouse::session::analyze_and_lower(&mut app);
+    roundhouse::analyze::diagnose(&app).into_iter().chain(lower).filter(|d| d.message.contains("establish_connection")).collect()
+}
+
+#[test]
+fn a_helper_sqlite3_memory_connection_is_named_as_not_carried() {
+    let diags = helper_connection_diagnostics(
+        "require \"active_record\"\n\nActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n",
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity, roundhouse::diagnostic::Severity::Warning, "{diags:?}");
+    assert!(diags[0].message.contains(":memory:") && diags[0].message.contains("tmp/test/"), "{}", diags[0].message);
+}
+
+#[test]
+fn a_helper_connection_to_another_adapter_is_refused() {
+    for helper in [
+        "ActiveRecord::Base.establish_connection(adapter: \"mysql2\", database: \"core_test\")\n",
+        "ActiveRecord::Base.establish_connection(:test)\n",
+        "ActiveRecord::Base.establish_connection(adapter: ENV[\"DB\"], database: \":memory:\")\n",
+    ] {
+        let diags = helper_connection_diagnostics(helper);
+        assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{helper}: {diags:?}");
+    }
+}

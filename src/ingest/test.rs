@@ -327,6 +327,23 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
     out
 }
 
+/// The test helper's top-level `establish_connection` calls (outside any
+/// class or method body, where the helper runs them once at load), as
+/// written.
+pub fn helper_connections(source: &[u8], file: &str) -> IngestResult<Vec<Expr>> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if constant_id_str(&call.name()) == "establish_connection" {
+            out.push(ingest_expr(&stmt, file)?);
+        }
+    }
+    Ok(out)
+}
+
 /// The app-wide `setup do … end` an app's `test/test_helper.rb` puts on
 /// `ActiveSupport::TestCase` (reopened there, or nested as `module
 /// ActiveSupport; class TestCase`). Rails runs it before every test
