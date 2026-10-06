@@ -12,14 +12,16 @@
 //! the jumps inside it, and those are kept, except where that block is
 //! itself a spliced assertion's: it is checked as its own.
 //!
-//! `return` leaves the test natively. Spliced bare into the test (a
-//! statement `assert_difference`) it still does. But `assert_raises`
-//! and `assert_throws` lower to a `begin`/`catch` around the block, and
-//! an assigned `assert_difference` to a `begin … end` value, which some
-//! targets emit as a function of its own (TypeScript), where `return`
-//! leaves only that; an assigned one can also be a void value. So a
-//! `return` there is refused unless a lambda literal is its target,
-//! also on CRuby, where it would run.
+//! `return` leaves the test natively. Spliced bare into the test's
+//! statements (an `assert_difference` that is itself a statement, in a
+//! sequence or as a whole body) it still does. But `assert_raises` and
+//! `assert_throws` lower to a `begin`/`catch` around the block, an
+//! assigned `assert_difference` to a `begin … end` value, and one
+//! anywhere else (a branch, an argument, an element) to a sequence in
+//! that position, which some targets emit as a function of its own
+//! (TypeScript), where `return` leaves only that; a value can also be
+//! a void value. So a `return` there is refused unless a lambda literal
+//! is its target, also on CRuby, where it would run.
 //!
 //! Only the assertions the inliner reaches are checked: the same
 //! children it descends into (`for_each_rewritten_child`).
@@ -63,19 +65,18 @@ impl Walk<'_> {
     }
 
     /// Find the spliced assertion calls the inliner reaches in `e`;
-    /// `value` is set when `e` is the right of an assignment.
-    fn scan(&mut self, e: &Expr, value: bool) {
+    /// `statement` is set when `e` is a statement of a sequence or a
+    /// whole body, where a spliced sequence joins the enclosing one.
+    fn scan(&mut self, e: &Expr, statement: bool) {
         if let Some(body) = spliced_block(e, self.own) {
             let ExprNode::Send { method, .. } = &*e.node else { unreachable!() };
             let assertion = method.as_str();
-            let wrapped = !assertion.ends_with("difference") || value;
+            let wrapped = !assertion.ends_with("difference") || !statement;
             self.inside(body, assertion, Scope { jumps_confined: false, wrapped, return_confined: false });
         }
-        let rhs = match &*e.node {
-            ExprNode::Assign { value, .. } | ExprNode::MultiAssign { value, .. } => Some(value),
-            _ => None,
-        };
-        for_each_rewritten_child(e, &mut |child| self.scan(child, rhs.is_some_and(|rhs| std::ptr::eq(child, rhs))));
+        // A sequence's members are statements only where it is one.
+        let members = statement && matches!(&*e.node, ExprNode::Seq { .. });
+        for_each_rewritten_child(e, &mut |child| self.scan(child, members));
     }
 
     fn inside(&mut self, e: &Expr, assertion: &str, scope: Scope) {
@@ -132,13 +133,13 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         let own = |name: &str| module.defines_instance_method(&app.test_modules, name);
         let mut walk = Walk { own: &own, seen: HashSet::new(), out: Vec::new() };
         if let Some(setup) = &module.setup {
-            walk.scan(setup, false);
+            walk.scan(setup, true);
         }
         for method in &module.helpers {
-            walk.scan(&method.body, false);
+            walk.scan(&method.body, true);
         }
         for test in &module.tests {
-            walk.scan(&test.body, false);
+            walk.scan(&test.body, true);
         }
         out.extend(walk.out);
     }
