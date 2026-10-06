@@ -7602,3 +7602,50 @@ fn a_test_naming_the_sqlite3_constraint_exception_is_refused_off_cruby() {
         assert!(errors.iter().any(|e| e.contains("SQLite3::ConstraintException")), "{target:?}: {errors:?}");
     }
 }
+
+const HARNESS_NAMES_TEST: &str = "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  test \"harness names\" do\n    store = ActiveSupport::Cache::MemoryStore.new\n    assert store\n    seen = []\n    callback = ->(*args) { seen << args }\n    ActiveSupport::Notifications.subscribed(callback, \"other.event\") { 1 }\n    assert_equal [], seen\n  end\nend\n";
+
+/// `ActiveSupport::Cache::MemoryStore` and `ActiveSupport::Notifications`
+/// are declared by the Ruby-family test harness. A test naming them runs
+/// on Ruby and emits on the trees carrying that harness; every other
+/// target is refused at the name before a test naming it is written.
+#[test]
+fn a_harness_name_runs_on_the_ruby_family_and_is_refused_elsewhere() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/widget.rb", "class Widget\nend\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", HARNESS_NAMES_TEST)
+    };
+    app().run_test("test/models/widget_test.rb").assert_passes();
+    for target in [BuildTarget::Spinel, BuildTarget::Jruby] {
+        let (_, errors) = app().emit(target);
+        assert!(!errors.iter().any(|e| e.contains("harness_constant")), "{target:?}: {errors:?}");
+    }
+    for target in [BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python, BuildTarget::Go] {
+        let (_, errors) = app().emit(target);
+        for name in ["ActiveSupport::Cache::MemoryStore", "ActiveSupport::Notifications"] {
+            assert!(errors.iter().any(|e| e.contains("harness_constant") && e.contains(name)), "{target:?} {name}: {errors:?}");
+        }
+    }
+}
+
+/// Ruby binds a qualified read's first segment lexically: inside
+/// `module Shop` with an app `Shop::ActiveSupport`, `ActiveSupport::
+/// Cache::MemoryStore` reaches the app module and raises NameError, so
+/// the harness name is refused there. Rooted, it reaches the harness.
+#[test]
+fn a_harness_name_shadowed_by_an_app_namespace_is_refused() {
+    use roundhouse::project::BuildTarget;
+    let app = |body: &str| {
+        emit_and_run::empty_app()
+            .write("app/models/shop/active_support.rb", "module Shop\n  module ActiveSupport\n    VERSION = 1\n  end\nend\n")
+            .write("app/models/shop/order.rb", "module Shop\n  class Order\n  end\nend\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/shop/order_test.rb", &format!("require \"test_helper\"\n\nmodule Shop\n  class OrderTest < ::ActiveSupport::TestCase\n    test \"x\" do\n      {body}\n    end\n  end\nend\n"))
+    };
+    let (_, errors) = app("assert ActiveSupport::Cache::MemoryStore.new").emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("constant not supported (all targets): ActiveSupport::Cache::MemoryStore")), "{errors:?}");
+    app("assert ::ActiveSupport::Cache::MemoryStore.new").run_test("test/models/shop_order_test.rb").assert_passes();
+}
