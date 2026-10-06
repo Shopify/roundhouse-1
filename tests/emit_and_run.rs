@@ -7083,6 +7083,18 @@ fn the_sqlite3_statement_errors_are_refused_off_cruby() {
     }
 }
 
+
+/// SQLite enforces a foreign key only under `PRAGMA foreign_keys = ON`,
+/// which no tree's `Db` sets, and the schema loader does not carry
+/// `add_foreign_key`; so nothing raises `InvalidForeignKey`, and a
+/// rescue of it is refused rather than left as a clause that never runs.
+#[test]
+fn a_rescue_of_invalid_foreign_key_is_refused() {
+    let (_, errors) = adapter_app()
+        .write("test/foreign_key_test.rb", "require \"test_helper\"\n\nclass ForeignKeyTest < ActiveSupport::TestCase\n  test \"x\" do\n    begin\n      ActiveRecord::Base.connection.execute(\"SELECT 1\")\n    rescue ActiveRecord::InvalidForeignKey\n      flunk\n    end\n    assert true\n  end\nend\n")
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("`ActiveRecord::InvalidForeignKey` is never raised")), "{errors:?}");
+}
 /// The test helper's own connection setup is not carried: the emitted
 /// harness opens one SQLite file database per test file. Each
 /// `establish_connection` the helper makes is named, so a run is never
@@ -7122,6 +7134,33 @@ fn a_helper_connection_to_another_adapter_is_refused() {
         let diags = helper_connection_diagnostics(helper);
         assert!(diags.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{helper}: {diags:?}");
     }
+}
+
+/// A connection the helper makes under a condition, in a class body, in
+/// a `begin` or inside a method it calls is named like a top-level one;
+/// a non-literal option beside a literal sqlite3 adapter does not make
+/// the adapter unreadable.
+#[test]
+fn a_helper_connection_anywhere_in_the_helper_is_named() {
+    use roundhouse::diagnostic::Severity;
+    let call = "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")";
+    for helper in [
+        format!("if ENV[\"CI\"]\n  {call}\nend\n"),
+        format!("unless defined?(Foo)\n  {call}\nend\n"),
+        format!("class ActiveSupport::TestCase\n  {call}\nend\n"),
+        format!("begin\n  {call}\nrescue LoadError\nend\n"),
+        format!("def connect\n  {call}\nend\nconnect\n"),
+    ] {
+        let diags = helper_connection_diagnostics(&helper);
+        assert_eq!(diags.len(), 1, "{helper}: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Warning, "{helper}: {diags:?}");
+    }
+    let diags = helper_connection_diagnostics(
+        "ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\", timeout: 5000)\n",
+    );
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity, Severity::Warning, "{diags:?}");
+    assert!(diags[0].message.contains("timeout: 5000"), "{}", diags[0].message);
 }
 
 /// A call to the adapter's transaction members names no constant, so

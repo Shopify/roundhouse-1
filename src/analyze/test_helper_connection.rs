@@ -16,9 +16,10 @@ use crate::diagnostic::{Diagnostic, Severity};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::App;
 
-/// The call's options as `key: "value"` pairs, when every key is a
-/// symbol and every value a string or symbol literal.
-fn literal_options(call: &Expr) -> Option<Vec<(String, String)>> {
+/// The call's options as `key: value` pairs, when it passes one hash
+/// with symbol keys: a string or symbol value as its text, an integer
+/// as written, anything else as `None`.
+fn options(call: &Expr) -> Option<Vec<(String, Option<String>)>> {
     let ExprNode::Send { args, .. } = &*call.node else { return None };
     let [hash] = args.as_slice() else { return None };
     let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
@@ -27,9 +28,10 @@ fn literal_options(call: &Expr) -> Option<Vec<(String, String)>> {
         .map(|(k, v)| {
             let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
             let value = match &*v.node {
-                ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
-                ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
-                _ => return None,
+                ExprNode::Lit { value: Literal::Str { value } } => Some(format!("{value:?}")),
+                ExprNode::Lit { value: Literal::Sym { value } } => Some(format!("{:?}", value.as_str())),
+                ExprNode::Lit { value: Literal::Int { value } } => Some(value.to_string()),
+                _ => None,
             };
             Some((key.as_str().to_string(), value))
         })
@@ -40,10 +42,20 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     app.test_helper_connections
         .iter()
         .map(|call| {
-            let options = literal_options(call);
-            let adapter = options.as_ref().and_then(|o| o.iter().find(|(k, _)| k == "adapter")).map(|(_, v)| v.as_str());
+            let options = options(call);
+            let adapter = options
+                .as_ref()
+                .and_then(|o| o.iter().find(|(k, _)| k == "adapter"))
+                .and_then(|(_, v)| v.as_deref())
+                .map(|v| v.trim_matches('"'));
             if adapter == Some("sqlite3") {
-                let written = options.as_ref().unwrap().iter().map(|(k, v)| format!("{k}: {v:?}")).collect::<Vec<_>>().join(", ");
+                let written = options
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", v.as_deref().unwrap_or("…")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let mut d = Diagnostic::unsupported(
                     call.span,
                     None,

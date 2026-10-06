@@ -327,21 +327,27 @@ pub fn helper_reopen_teardowns(source: &[u8], file: &str) -> Vec<String> {
     out
 }
 
-/// The test helper's top-level `establish_connection` calls (outside any
-/// class or method body, where the helper runs them once at load), as
-/// written.
+/// Every `establish_connection` call in the test helper, as written:
+/// at the top level, under a condition, in a class body or `begin`, or
+/// in a method the helper calls. Any of them can name the database the
+/// helper's tests run on, so none is left out.
 pub fn helper_connections(source: &[u8], file: &str) -> IngestResult<Vec<Expr>> {
-    let result = super::prism::parse(source, file);
-    let root = result.node();
-    let Some(program) = root.as_program_node() else { return Ok(Vec::new()) };
-    let mut out = Vec::new();
-    for stmt in program.statements().body().iter() {
-        let Some(call) = stmt.as_call_node() else { continue };
-        if constant_id_str(&call.name()) == "establish_connection" {
-            out.push(ingest_expr(&stmt, file)?);
+    struct Calls<'f> {
+        file: &'f str,
+        found: Vec<IngestResult<Expr>>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Calls<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if constant_id_str(&node.name()) == "establish_connection" {
+                self.found.push(ingest_expr(&node.as_node(), self.file));
+            }
+            ruby_prism::visit_call_node(self, node);
         }
     }
-    Ok(out)
+    let result = super::prism::parse(source, file);
+    let mut calls = Calls { file, found: Vec::new() };
+    ruby_prism::Visit::visit(&mut calls, &result.node());
+    calls.found.into_iter().collect()
 }
 
 /// The app-wide `setup do … end` an app's `test/test_helper.rb` puts on
