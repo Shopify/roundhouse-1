@@ -2593,6 +2593,7 @@ fn ruby_family_runtime_files(
     }
     if primary_postgresql(app) {
         apply_postgres_bootstrap(&mut files, app)?;
+        apply_extension_gem_wiring(&mut files, app)?;
     } else {
         files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
     }
@@ -2665,6 +2666,50 @@ end
                 .ok_or("PostgreSQL bootstrap: missing server schema setup anchor")? + start + last.len();
             content.replace_range(start..end, "    DatabaseConfiguration.configure!");
         }
+    }
+    Ok(())
+}
+
+/// Gems the PostgreSQL CRuby tree carries on disk but never loads: a
+/// runtime port stands in for the gem's Ruby and requires one native
+/// extension of the gem itself. Each row is the gem and the version the
+/// port was compared against. Not in `GEM_REQUIRES`, and not
+/// `Bundler.require`d: the gem's own entry file would redefine the port's
+/// constants and hook the native Active Record adapter through `on_load`.
+/// So the Gemfile line is `require: false`, written only when the app's
+/// own Gemfile declares the gem.
+const CRUBY_EXTENSION_GEMS: [(&str, &str); 1] = [
+    // runtime/spinel/semian*.rb ports semian's circuit breaker, bulkhead,
+    // registry, errors and Active Record PostgreSQL adapter. The bulkhead
+    // requires "semian/semian", the gem's SysV semaphore extension.
+    ("semian", "0.28.3"),
+];
+
+fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+    let Some(lock) = &app.gem_lock else { return Ok(()) };
+    let declared: Vec<_> = CRUBY_EXTENSION_GEMS
+        .iter()
+        .filter(|(gem, _)| lock.dependencies.iter().any(|dep| dep == gem))
+        .collect();
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let gemfile = files
+        .iter_mut()
+        .find(|(path, _)| path == "Gemfile")
+        .ok_or("PostgreSQL project: missing Gemfile")?;
+    for (gem, version) in declared {
+        if gemfile.1.contains(&format!("gem {gem:?}")) {
+            continue;
+        }
+        if !gemfile.1.ends_with('\n') {
+            gemfile.1.push('\n');
+        }
+        gemfile.1.push_str(&format!(
+            "\n# The runtime port requires this gem's native extension, never the\n\
+             # gem itself (project.rs::CRUBY_EXTENSION_GEMS).\n\
+             gem {gem:?}, {version:?}, require: false\n"
+        ));
     }
     Ok(())
 }

@@ -464,3 +464,34 @@ fn postgres_schema_error_is_not_replaced_by_sqlite_or_empty_ddl() {
         roundhouse::project::BuildTarget::Ruby).unwrap_err();
     assert!(error.contains("PostgreSQL schema") && error.contains("virtual table"), "{error}");
 }
+
+#[test]
+fn postgres_project_declares_semian_unloaded_only_when_the_app_does() {
+    use roundhouse::project::{target_files, BuildTarget};
+    const LINE: &str = "gem \"semian\", \"0.28.3\", require: false";
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let lock = |deps: &str| roundhouse::gems::Lockfile::parse(&format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    concurrent-ruby (1.3.5)\n    semian (0.28.3)\n      concurrent-ruby\n\nDEPENDENCIES\n{deps}\n"
+    ));
+    let emitted = |app: &roundhouse::app::App| target_files(app, &fixture, BuildTarget::Ruby).unwrap();
+    let gemfile = |files: &[(String, String)]| files.iter().find(|(p, _)| p == "Gemfile").unwrap().1.clone();
+
+    let mut app = postgres_model_app();
+    app.gem_lock = Some(lock("  semian (~> 0.27)"));
+    let files = emitted(&app);
+    assert_eq!(gemfile(&files).matches(LINE).count(), 1, "{}", gemfile(&files));
+    // Never loaded: no file requires the gem's entry, which would
+    // redefine the port's Semian and hook Active Record.
+    assert!(!files.iter().any(|(p, c)| p.ends_with(".rb")
+        && c.lines().any(|l| l.trim() == "require \"semian\"" || l.contains("\"semian\",") && l.contains(".each do |gem_name|"))),
+        "an emitted file requires semian");
+
+    // Only a transitive spec, not declared by the app: no line.
+    app.gem_lock = Some(lock("  concurrent-ruby"));
+    assert!(!gemfile(&emitted(&app)).contains("gem \"semian\""));
+
+    // A SQLite app that declares semian gets no line either.
+    let mut sqlite = roundhouse::ingest::ingest_app(&fixture).expect("ingest fixture");
+    sqlite.gem_lock = Some(lock("  semian (~> 0.27)"));
+    assert!(!gemfile(&emitted(&sqlite)).contains("gem \"semian\""));
+}
