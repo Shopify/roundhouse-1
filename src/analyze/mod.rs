@@ -60,6 +60,7 @@ pub use diagnostics::{diagnose, diagnose_with_coverage, unknown_receiver_sends, 
 
 pub use body::{BodyTyper, ClassInfo, ConstScope, Ctx};
 pub(crate) use body::PARAM_VALUE;
+pub(crate) use registry::stdlib::CRUBY_ONLY_STDLIB;
 use render::{
     collect_action_render_views, collect_content_partial_literals,
     collect_dynamic_render_ivars, content_partial_view_name,

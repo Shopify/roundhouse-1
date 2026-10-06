@@ -464,6 +464,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ] {
         register_stdlib_class(classes, exc, &[], &exception_surface);
     }
+    // CRuby's own core and default-gem classes, which only the CRuby and
+    // JRuby trees load natively ([`CRUBY_ONLY_STDLIB`]).
+    for (name, exception, class_methods) in CRUBY_ONLY_STDLIB {
+        let class_side: Vec<(&str, Ty)> = class_methods.iter().map(|(m, ty)| (*m, ty())).collect();
+        let instance_side: &[(&str, Ty)] = if *exception { &exception_surface } else { &[] };
+        register_stdlib_class(classes, name, &class_side, instance_side);
+    }
     for (exc, extra) in [
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
@@ -681,6 +688,75 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         register_stdlib_class(classes, gem.name, &class_methods, &instance_methods);
     }
 }
+
+fn untyped() -> Ty {
+    Ty::Untyped
+}
+
+fn string() -> Ty {
+    Ty::Str
+}
+
+/// Ruby core and default-gem constants the CRuby and JRuby trees load
+/// natively: their interpreter defines them, or the tree writes the
+/// require (`project::CRUBY_STDLIB_REQUIRES`). No other runtime defines
+/// them, so `project` refuses them there. Each row is the name, whether
+/// it is an exception class, and its class-side surface. Results that
+/// depend on the data read (`YAML.load_file`) are gradual.
+pub(crate) const CRUBY_ONLY_STDLIB: &[(&str, bool, &[(&str, fn() -> Ty)])] = &[
+    ("Interrupt", true, &[]),
+    ("SignalException", true, &[]),
+    ("SystemExit", true, &[]),
+    ("ScriptError", true, &[]),
+    ("LoadError", true, &[]),
+    ("SyntaxError", true, &[]),
+    ("SecurityError", true, &[]),
+    ("ThreadError", true, &[]),
+    ("FiberError", true, &[]),
+    ("EncodingError", true, &[]),
+    ("LocalJumpError", true, &[]),
+    ("FloatDomainError", true, &[]),
+    ("ClosedQueueError", true, &[]),
+    ("UncaughtThrowError", true, &[]),
+    ("NoMatchingPatternError", true, &[]),
+    ("NoMatchingPatternKeyError", true, &[]),
+    ("SystemCallError", true, &[]),
+    ("Errno::ENOENT", true, &[]),
+    ("Errno::EEXIST", true, &[]),
+    ("Errno::EACCES", true, &[]),
+    ("Errno::EPERM", true, &[]),
+    ("Errno::ESRCH", true, &[]),
+    ("Errno::ECHILD", true, &[]),
+    ("Errno::EPIPE", true, &[]),
+    ("Errno::EINVAL", true, &[]),
+    ("Errno::EAGAIN", true, &[]),
+    ("Errno::EBADF", true, &[]),
+    ("Errno::EISDIR", true, &[]),
+    ("Errno::ENOTDIR", true, &[]),
+    ("Errno::ENOTEMPTY", true, &[]),
+    ("Errno::ENOTTY", true, &[]),
+    ("Errno::EOPNOTSUPP", true, &[]),
+    ("Errno::ECONNREFUSED", true, &[]),
+    ("Errno::ECONNRESET", true, &[]),
+    ("Errno::ETIMEDOUT", true, &[]),
+    ("Errno::EADDRINUSE", true, &[]),
+    ("Errno::EHOSTUNREACH", true, &[]),
+    ("Timeout", false, &[("timeout", untyped)]),
+    ("Timeout::Error", true, &[]),
+    ("Timeout::ExitException", true, &[]),
+    ("Marshal", false, &[("dump", string), ("load", untyped)]),
+    ("FileUtils", false, &[
+        ("mkdir_p", untyped), ("makedirs", untyped), ("mkdir", untyped), ("rm", untyped),
+        ("rm_f", untyped), ("rm_r", untyped), ("rm_rf", untyped), ("rmdir", untyped),
+        ("mv", untyped), ("cp", untyped), ("cp_r", untyped), ("touch", untyped),
+        ("ln_s", untyped), ("ln_sf", untyped), ("chmod", untyped), ("compare_file", untyped),
+    ]),
+    ("YAML", false, &[
+        ("load", untyped), ("load_file", untyped), ("safe_load", untyped),
+        ("safe_load_file", untyped), ("unsafe_load", untyped), ("unsafe_load_file", untyped),
+        ("load_stream", untyped), ("dump", string),
+    ]),
+];
 
 fn register_stdlib_class(
     classes: &mut HashMap<ClassId, ClassInfo>,

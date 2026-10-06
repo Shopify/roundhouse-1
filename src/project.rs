@@ -4007,6 +4007,21 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
             return;
         }
+        // CRuby's core and default-gem classes the analysis admits for the
+        // interpreters that define them natively.
+        if target != "jruby" && let crate::expr::ExprNode::Const { path } = &*expr.node {
+            let name = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::");
+            if crate::analyze::CRUBY_ONLY_STDLIB.iter().any(|(konst, ..)| *konst == name)
+                && !app.library_classes.iter().any(|class| class.name.0.as_str() == name)
+            {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target,
+                    "cruby_stdlib_constant",
+                    format!("{name} is CRuby's own; the {target} runtime does not define it"),
+                );
+            }
+        }
         // Only the Ruby-family trees ship the Duration value class
         // (`runtime/spinel/active_support_duration.rb` and the CRuby
         // overlay twin) that `30.minutes` grounds to and a declared
@@ -6181,6 +6196,10 @@ fn requires_feature(src: &str, require_line: &str) -> bool {
 /// match arms want.
 fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, String)> {
     write_bundled_requires(&mut files);
+    // Only the Ruby family reaches here.
+    for (i, require_line) in require_gaps(&files, &CRUBY_STDLIB_REQUIRES) {
+        files[i].1.insert_str(0, &format!("{require_line}\n"));
+    }
     files
 }
 
@@ -6289,8 +6308,19 @@ const BUNDLED: [(&str, &str); 14] = [
 /// write it. (A tree-wide check let `test/cruby/cgi_io_test.rb`'s
 /// `require "stringio"` mask a missing one in `app/models/story.rb`.)
 fn bundled_require_gaps(files: &[(String, String)]) -> Vec<(usize, String)> {
+    require_gaps(files, &BUNDLED)
+}
+
+/// Default gems only the CRuby and JRuby trees load
+/// (`analyze::CRUBY_ONLY_STDLIB`; every other runtime refuses the
+/// constant). The rest of that table is interpreter core and needs no
+/// require.
+const CRUBY_STDLIB_REQUIRES: [(&str, &str); 3] =
+    [("FileUtils", "fileutils"), ("Timeout", "timeout"), ("YAML", "yaml")];
+
+fn require_gaps(files: &[(String, String)], table: &[(&str, &str)]) -> Vec<(usize, String)> {
     let mut gaps = Vec::new();
-    for (konst, feature) in BUNDLED {
+    for (konst, feature) in table {
         let require_line = format!("require {feature:?}");
         // The program defines the constant itself, so the bundled
         // library is not what the name refers to. A file that REQUIRES
