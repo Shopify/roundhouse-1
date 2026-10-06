@@ -7413,11 +7413,12 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
-// Known gaps, deliberate: has_one, direct has_many with a scope or
-// polymorphic owner, and scope-carrying through-assocs (other than a
-// plain `order("...")`) get no batch arm — the dispatch
+// Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
+// with a scope or polymorphic owner, and scope-carrying through-assocs
+// (other than a plain `order("...")`) get no batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
-// Rails, which also lazy-loads what `includes` doesn't name). Assigning
+// Rails, which also lazy-loads what `includes` doesn't name). Unscoped
+// non-polymorphic has_one uses PreloadKind::HasOne (first-wins). Assigning
 // a belongs_to (`c.story = s`) on a PRELOADED record does not refresh
 // the cache (fresh records never have the loaded flag set, so the
 // benchmark's build-then-render flows are unaffected).
@@ -7546,6 +7547,9 @@ enum PreloadKind {
     BelongsTo { fk: String, target: String, table: String },
     /// (fk column on the target, target class)
     HasMany { fk: String, target: String },
+    /// `has_one` — same FK-on-target batch as has_many, installing one
+    /// record (or nil) per owner through the single-record preload setter.
+    HasOne { fk: String, target: String },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -7598,6 +7602,24 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 out.push((
                     name.as_str().to_string(),
                     PreloadKind::HasMany {
+                        fk: foreign_key.as_str().to_string(),
+                        target: target.0.as_str().to_string(),
+                    },
+                ));
+            }
+            // Same restriction as has_many: FK-only batch. Scoped or
+            // polymorphic has_one stays on the lazy reader until the
+            // batch can preserve those predicates.
+            Association::HasOne {
+                name, target, foreign_key,
+                scope: None, as_interface: None, ..
+            } => {
+                if !model_exists(target) {
+                    continue;
+                }
+                out.push((
+                    name.as_str().to_string(),
+                    PreloadKind::HasOne {
                         fk: foreign_key.as_str().to_string(),
                         target: target.0.as_str().to_string(),
                     },
@@ -7767,6 +7789,32 @@ end
 "#
                 );
             }
+            PreloadKind::HasOne { fk, target } => {
+                let _ = write!(
+                    src,
+                    r#"
+def self._preload_batch_{name}(records)
+  ids = []
+  records.each do |r|
+    ids << r.id
+  end
+  by_id = {{}}
+  loaded = []
+  if ids.length > 0
+    loaded = ActiveRecord::Relation.new({target}).where({fk}: ids).to_a
+  end
+  loaded.each do |rec|
+    k = rec.{fk}
+    by_id[k] = rec if by_id[k].nil?
+  end
+  records.each do |r|
+    r._preload_{name}(by_id[r.id])
+  end
+  loaded
+end
+"#
+                );
+            }
             PreloadKind::Through { target, join, group_col, order } => {
                 let table = crate::naming::pluralize_snake(target.as_str());
                 let order_sql = match order {
@@ -7884,6 +7932,7 @@ end
             let target = match kind {
                 PreloadKind::BelongsTo { target, .. } => Some(target.as_str()),
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
+                PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
                 // `includes(logo_attachment: :blob)`: the blob is already

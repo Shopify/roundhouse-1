@@ -270,7 +270,16 @@ fn emit_node(n: &ExprNode) -> String {
             out
         }
         ExprNode::Assign { target, value } => {
-            format!("{} = {}", emit_lvalue(target), emit_expr(value))
+            // Multi-stmt Seq as RHS (mattr/cattr block defaults) must
+            // group so the assign value is the last expression — bare
+            // newlines end the statement after the first line.
+            let rhs = emit_expr(value);
+            let rhs = if is_multi_seq(value) {
+                format!("({rhs})")
+            } else {
+                rhs
+            };
+            format!("{} = {}", emit_lvalue(target), rhs)
         }
         // Native Ruby compound assignment — `target ||= value`,
         // `target += value`, etc. Preserves source short-circuit

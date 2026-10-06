@@ -665,6 +665,57 @@ fn coerce_for_prop(prop_camel: &str, value: &Expr, val: String) -> String {
     }
 }
 
+/// Declared `Ty` of an instance property by camelCased name (accessors +
+/// body ivars installed by `set_instance_prop_types`).
+fn instance_prop_ty(name: &str) -> Option<crate::ty::Ty> {
+    INSTANCE_PROP_TYPES.with(|m| m.borrow().get(&camel(name)).cloned())
+}
+
+/// Elem type of an Array-typed receiver (ivar field table or
+/// expression ty), peeling a nullable outer `Array[T]?`.
+fn array_elem_ty(r: &Expr) -> Option<crate::ty::Ty> {
+    // Property types apply only to `@ivar` — a local `Var` that
+    // shadows must keep `r.ty` (nullable elem vs non-nullable prop).
+    let from_prop = match &*r.node {
+        ExprNode::Ivar { name } => instance_prop_ty(name.as_str()),
+        _ => None,
+    };
+    let array_ty = from_prop.as_ref().or(r.ty.as_ref());
+    match array_ty {
+        Some(crate::ty::Ty::Array { elem }) => Some((**elem).clone()),
+        Some(crate::ty::Ty::Union { variants }) => variants.iter().find_map(|t| match t {
+            crate::ty::Ty::Array { elem } => Some((**elem).clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// `String?` into `[String]` (HeaderStore `@vals << value` after
+/// `header_value_ok?` rejects nil). Swift rejects the mismatch; coalesce
+/// to `""` so the write typechecks. Non-string / already-matching shapes
+/// pass through unchanged.
+fn coerce_list_elem_arg(recv: &Expr, arg: &Expr, arg_s: &str) -> String {
+    let Some(elem) = array_elem_ty(recv) else {
+        return arg_s.to_string();
+    };
+    let elem_is_plain_str = matches!(elem, crate::ty::Ty::Str | crate::ty::Ty::Sym);
+    let arg_nilable_str = matches!(
+        arg.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+                && variants
+                    .iter()
+                    .any(|v| matches!(v, crate::ty::Ty::Str | crate::ty::Ty::Sym))
+    );
+    if elem_is_plain_str && arg_nilable_str {
+        format!("({arg_s} ?? \"\")")
+    } else {
+        arg_s.to_string()
+    }
+}
+
 /// Is the receiver statically a Hash (directly or through a nullable
 /// Union / the declared prop type)?
 fn recv_is_hash(r: &Expr) -> bool {
@@ -2219,7 +2270,12 @@ fn assign_value(value: &Expr) -> String {
 }
 
 fn emit_assign(target: &LValue, value: &Expr) -> String {
-    let val = emit_expr(value);
+    let val = match target {
+        LValue::Index { recv, .. } if !recv_is_hash(recv) => {
+            coerce_list_elem_arg(recv, value, &emit_expr(value))
+        }
+        _ => emit_expr(value),
+    };
     match target {
         LValue::Var { name, .. } => {
             let n = camel(name.as_str());
@@ -2643,7 +2699,8 @@ fn emit_send(
             }
             // `<<` / `push` → Array.append.
             crate::emit::shared::ops::BinopCase::Append => {
-                return format!("{}.append({})", emit_expr(r), args_s[0]);
+                let arg = coerce_list_elem_arg(r, &args[0], &args_s[0]);
+                return format!("{}.append({})", emit_expr(r), arg);
             }
             crate::emit::shared::ops::BinopCase::NotBinop => {}
         }
@@ -2748,7 +2805,12 @@ fn emit_send(
     }
     if let (Some(r), 2) = (recv, args.len()) {
         if method == "[]=" {
-            return format!("{}[{}] = {}", emit_expr(r), args_s[0], args_s[1]);
+            let val = if recv_is_hash(r) {
+                args_s[1].clone()
+            } else {
+                coerce_list_elem_arg(r, &args[1], &args_s[1])
+            };
+            return format!("{}[{}] = {}", emit_expr(r), args_s[0], val);
         }
         // Ruby `str[start, len]` positional slice.
         if method == "[]" {

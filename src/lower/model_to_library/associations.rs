@@ -1,7 +1,9 @@
 //! Associations: has_many becomes a typed reader returning a where-style
 //! query. `dependent: :destroy` generates a `before_destroy` cascade:
 //! has_many iterates each child; has_one destroys the single child when
-//! present.
+//! present. `has_one` also carries a load-once cache (for `includes` /
+//! `preload`) and, when `autosave: true`, a writer plus `after_save`
+//! that stamps the child FK and saves.
 
 use crate::dialect::{
     AccessorKind, Association, Dependent, MethodDef, MethodReceiver, Model, Param,
@@ -331,7 +333,15 @@ pub(super) fn push_association_methods(
                     methods.push(synth_belongs_to_writer(owner, name, target, foreign_key, sentinel));
                 }
             }
-            Association::HasOne { name, target, foreign_key, as_interface, scope, .. } => {
+            Association::HasOne {
+                name,
+                target,
+                foreign_key,
+                as_interface,
+                scope,
+                autosave,
+                ..
+            } => {
                 methods.push(synth_has_one_reader(
                     owner,
                     name,
@@ -340,6 +350,40 @@ pub(super) fn push_association_methods(
                     as_interface.as_ref(),
                     scope.as_ref(),
                 ));
+                methods.push(synth_has_one_preload_setter(owner, name, target));
+                // Writer + after_save only when `autosave: true`. A cache-only
+                // writer on plain `has_one` would accept `owner.child = …`
+                // then drop the child on save (silent data loss vs Rails /
+                // vs prior NoMethodError). Implicit `autosave: nil` stays
+                // unclaimed.
+                let writer_name = Symbol::from(format!("{}=", name.as_str()));
+                if *autosave
+                    && !model_defines_instance_method(model, &writer_name)
+                    && !methods
+                        .iter()
+                        .any(|m| m.name == writer_name && m.receiver == MethodReceiver::Instance)
+                {
+                    methods.push(synth_has_one_writer(owner, name, target));
+                }
+                if *autosave {
+                    methods.push(synth_has_one_autosave(
+                        owner,
+                        name,
+                        foreign_key,
+                        as_interface.as_ref(),
+                    ));
+                    let call = Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Send {
+                            recv: None,
+                            method: Symbol::from(format!("_autosave_{}", name.as_str())),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    );
+                    super::markers::fold_into_or_push(methods, model, "after_save", call);
+                }
             }
             // HABTM lands when a fixture demands it.
             _ => {}
@@ -780,11 +824,11 @@ fn graft_scope(scope: &Expr, base: Expr) -> Expr {
     }
 }
 
-/// has_one reader — the has_many query narrowed to one row:
-/// `def moderation; Moderation.where(comment_id: @id).first; end`
-/// (lobsters `Comment has_one :moderation`, read by gone_text). No
-/// preload cache — has_one reads are rare enough that the lazy query
-/// is the whole story until an includes() fixture demands more.
+/// has_one reader — the has_many query narrowed to one row, with the
+/// same load-once cache guard has_many uses so `includes` / `preload`
+/// and an assigned writer stash share one contract:
+/// `def moderation; return @moderation_cache if @moderation_loaded;
+/// Moderation.where(comment_id: @id).first; end`
 fn synth_has_one_reader(
     owner: &ClassId,
     name: &Symbol,
@@ -837,6 +881,19 @@ fn synth_has_one_reader(
             parenthesized: false,
         },
     );
+    let guard = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: Expr::new(Span::synthetic(), ExprNode::Ivar { name: loaded_ivar(name) }),
+            then_branch: Expr::new(
+                Span::synthetic(),
+                ExprNode::Return {
+                    value: Expr::new(Span::synthetic(), ExprNode::Ivar { name: cache_ivar(name) }),
+                },
+            ),
+            else_branch: nil_lit(),
+        },
+    );
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -845,7 +902,7 @@ fn synth_has_one_reader(
         name: name.clone(),
         receiver: MethodReceiver::Instance,
         params: Vec::new(),
-        body: first,
+        body: seq(vec![guard, first]),
         signature: Some(fn_sig(
             vec![],
             Ty::Union {
@@ -857,6 +914,188 @@ fn synth_has_one_reader(
         kind: AccessorKind::Method,
         is_async: false,
         mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// `def _preload_<name>(rec); @<name>_cache = rec; @<name>_loaded = true; end`
+/// — belongs_to-shaped (single record or nil), not the has_many list form.
+fn synth_has_one_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
+    let rec = Symbol::from("rec");
+    let rec_ty = Ty::Union {
+        variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+    };
+    synth_assoc_cache_seed(
+        owner,
+        Symbol::from(format!("_preload_{}", name.as_str())),
+        name,
+        rec,
+        rec_ty,
+    )
+}
+
+/// `def <name>=(value); @<name>_cache = value; @<name>_loaded = true; end`
+/// — stashes for read-back and for `autosave: true`'s after_save.
+fn synth_has_one_writer(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
+    let value = Symbol::from("value");
+    let value_ty = Ty::Union {
+        variants: vec![Ty::Class { id: target.clone(), args: vec![] }, Ty::Nil],
+    };
+    synth_assoc_cache_seed(
+        owner,
+        Symbol::from(format!("{}=", name.as_str())),
+        name,
+        value,
+        value_ty,
+    )
+}
+
+/// Shared `@<assoc>_cache = param; @<assoc>_loaded = true` body for
+/// has_one writer, has_one preload setter, and has_many preload setter.
+fn synth_assoc_cache_seed(
+    owner: &ClassId,
+    method_name: Symbol,
+    assoc: &Symbol,
+    param: Symbol,
+    param_ty: Ty,
+) -> MethodDef {
+    let body = seq(vec![
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: LValue::Ivar { name: cache_ivar(assoc) },
+                value: var_ref(param.clone()),
+            },
+        ),
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: LValue::Ivar { name: loaded_ivar(assoc) },
+                value: lit_bool(true),
+            },
+        ),
+    ]);
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: method_name,
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(param.clone())],
+        body,
+        signature: Some(fn_sig(vec![(param, param_ty)], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
+        block_param: None,
+    }
+}
+
+/// `def _autosave_<name>; if @<name>_loaded && !@<name>_cache.nil?;
+/// @<name>_cache.<fk> = @id; [@<name>_cache.<as>_type = "Owner";]
+/// @<name>_cache.save; end; end`
+fn synth_has_one_autosave(
+    owner: &ClassId,
+    name: &Symbol,
+    foreign_key: &Symbol,
+    as_interface: Option<&Symbol>,
+) -> MethodDef {
+    let cache = || Expr::new(Span::synthetic(), ExprNode::Ivar { name: cache_ivar(name) });
+    let loaded = Expr::new(Span::synthetic(), ExprNode::Ivar { name: loaded_ivar(name) });
+    let not_nil = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(cache()),
+                    method: Symbol::from("nil?"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            )),
+            method: Symbol::from("!"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let cond = Expr::new(
+        Span::synthetic(),
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::And,
+            surface: crate::expr::BoolOpSurface::default(),
+            left: loaded,
+            right: not_nil,
+        },
+    );
+    let mut stmts = vec![Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(cache()),
+            method: Symbol::from(format!("{}=", foreign_key.as_str())),
+            args: vec![Expr::new(
+                Span::synthetic(),
+                ExprNode::Ivar { name: Symbol::from("id") },
+            )],
+            block: None,
+            parenthesized: false,
+        },
+    )];
+    if let Some(intf) = as_interface {
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(cache()),
+                method: Symbol::from(format!("{}_type=", intf.as_str())),
+                args: vec![Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit {
+                        value: Literal::Str { value: owner.0.as_str().to_string() },
+                    },
+                )],
+                block: None,
+                parenthesized: false,
+            },
+        ));
+    }
+    stmts.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(cache()),
+            method: Symbol::from("save"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    ));
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond,
+            then_branch: seq(stmts),
+            else_branch: nil_lit(),
+        },
+    );
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from(format!("_autosave_{}", name.as_str())),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body,
+        signature: Some(fn_sig(vec![], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
         block_param: None,
     }
 }
@@ -883,13 +1122,12 @@ fn synth_cache_reader(owner: &ClassId, name: Symbol, ivar: Symbol, ty: Ty) -> Me
     }
 }
 
-/// Cache + loaded-flag ivar names for a has_many association. Kept in
-/// one place so the reader (which reads them) and the setter (which
-/// writes them) can't drift.
-fn cache_ivar(name: &Symbol) -> Symbol {
+/// Cache + loaded-flag ivar names for a has_many / has_one association.
+/// Shared by synthesizers and schema `initialize` so names cannot drift.
+pub(in crate::lower::model_to_library) fn cache_ivar(name: &Symbol) -> Symbol {
     Symbol::from(format!("{}_cache", name.as_str()))
 }
-fn loaded_ivar(name: &Symbol) -> Symbol {
+pub(in crate::lower::model_to_library) fn loaded_ivar(name: &Symbol) -> Symbol {
     Symbol::from(format!("{}_loaded", name.as_str()))
 }
 
@@ -912,12 +1150,27 @@ pub(in crate::lower::model_to_library) fn assoc_cache_ivar_bindings(
 ) -> Vec<(Symbol, Ty)> {
     let mut out = Vec::new();
     for assoc in model.associations() {
-        if let Association::HasMany { name, target, .. } = assoc {
-            out.push((
-                cache_ivar(name),
-                Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) },
-            ));
-            out.push((loaded_ivar(name), Ty::Bool));
+        match assoc {
+            Association::HasMany { name, target, .. } => {
+                out.push((
+                    cache_ivar(name),
+                    Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) },
+                ));
+                out.push((loaded_ivar(name), Ty::Bool));
+            }
+            Association::HasOne { name, target, .. } => {
+                out.push((
+                    cache_ivar(name),
+                    Ty::Union {
+                        variants: vec![
+                            Ty::Class { id: target.clone(), args: vec![] },
+                            Ty::Nil,
+                        ],
+                    },
+                ));
+                out.push((loaded_ivar(name), Ty::Bool));
+            }
+            _ => {}
         }
     }
     out
@@ -937,41 +1190,13 @@ fn lit_bool(value: bool) -> Expr {
 fn synth_preload_setter(owner: &ClassId, name: &Symbol, target: &ClassId) -> MethodDef {
     let list = Symbol::from("list");
     let list_ty = Ty::Array { elem: Box::new(Ty::Class { id: target.clone(), args: vec![] }) };
-
-    let body = seq(vec![
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Assign {
-                target: LValue::Ivar { name: cache_ivar(name) },
-                value: var_ref(list.clone()),
-            },
-        ),
-        Expr::new(
-            Span::synthetic(),
-            ExprNode::Assign {
-                target: LValue::Ivar { name: loaded_ivar(name) },
-                value: lit_bool(true),
-            },
-        ),
-    ]);
-
-    MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from(format!("_preload_{}", name.as_str())),
-        receiver: MethodReceiver::Instance,
-        params: vec![Param::positional(list.clone())],
-        body,
-        signature: Some(fn_sig(vec![(list, list_ty)], Ty::Nil)),
-        effects: EffectSet::default(),
-        enclosing_class: Some(owner.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-        mutates_self: true,
-        block_param: None,
-    }
+    synth_assoc_cache_seed(
+        owner,
+        Symbol::from(format!("_preload_{}", name.as_str())),
+        name,
+        list,
+        list_ty,
+    )
 }
 
 fn synth_belongs_to_reader(

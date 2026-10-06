@@ -443,7 +443,13 @@ const TYPESCRIPT_RUNTIME: &[RuntimeEntry] = &[
         // FormBuilder.model is RBS-typed `ActiveRecord::Base`; the
         // emit surfaces `model: Base` on the field + constructor.
         // Type-only — runtime never instantiates Base directly.
-        imports: &[("type Base", "./active_record_base.js")],
+        // `ActionController.masked_authenticity_token` backs
+        // `form_authenticity_token` (Masked CSRF); the namespace
+        // class lives alongside Base in action_controller_base.ts.
+        imports: &[
+            ("type Base", "./active_record_base.js"),
+            ("ActionController", "./action_controller_base.js"),
+        ],
         prelude: NO_PRELUDE,
         // Roots for the hand-written server.ts that calls into
         // ViewHelpers directly. Suffix-renames apply (`reset_slots!`
@@ -630,6 +636,10 @@ const RUST_RUNTIME: &[RuntimeEntry] = &[
             // resolve. Trait lives in `runtime/rust/http.rs` so it
             // ships alongside the hand-written response shape.
             ("RubyToS", "http"),
+            // Masked CSRF: `form_authenticity_token` calls
+            // `ActionController::masked_authenticity_token`. The
+            // namespace struct lives in action_controller_base.rs.
+            ("ActionController", "action_controller_base"),
         ],
         prelude: NO_PRELUDE,
         extra_roots: NO_EXTRA_ROOTS,
@@ -1247,7 +1257,13 @@ fn swift_format_import(_name: &str, _source: &str) -> String {
 
 /// Top-level `let NAME = VALUE` (Swift allows file-level constants).
 fn swift_format_constant(name: &str, value: &Expr) -> String {
-    format!("let {name} = {}", crate::emit::swift::emit_constant_for_runtime(value))
+    // Arrays mutated via index assign (`FORGERY_SLOT[0] = …`) need `var`;
+    // `let` arrays reject subscript assignment.
+    let kw = match &*value.node {
+        crate::expr::ExprNode::Array { .. } => "var",
+        _ => "let",
+    };
+    format!("{kw} {name} = {}", crate::emit::swift::emit_constant_for_runtime(value))
 }
 
 /// Single flat module; no namespace blocks.
@@ -1556,13 +1572,14 @@ fn elixir_format_constant(name: &str, value: &Expr) -> String {
 
 /// Each class already emits its own `defmodule V2.<Name>` (see
 /// `emit_library_class`), so this hook's job for Elixir is just to
-/// place module-level constants INSIDE their module. `transpile_entry`
+/// place module-level constants INSIDE their modules. `transpile_entry`
 /// emits constants (via `format_constant`) as lines ahead of the class
 /// bodies, but Elixir has no file-level constants and module attributes
-/// don't cross module boundaries — so move any leading constant lines
-/// into the first `defmodule`. (Current const-bearing files are single-
-/// module — `json_builder`, `action_controller/base`; a multi-module
-/// file with constants would need owner-aware routing, revisit then.)
+/// don't cross module boundaries — so inject leading constant lines
+/// into each `defmodule` that actually references the attribute
+/// (`@status_codes` / `@forgery_slot` / …). Blanket injection into
+/// every sibling (HeaderStore + Base + ActionController) trips
+/// `--warnings-as-errors` on unused module attributes.
 /// The `namespace` arg is unused: V2-prefixing + naming happen in
 /// `emit_library_class`.
 fn elixir_wrap_namespace(_namespace: &str, body: &str) -> String {
@@ -1579,16 +1596,55 @@ fn elixir_wrap_namespace(_namespace: &str, body: &str) -> String {
     if consts.is_empty() {
         return body.to_string();
     }
-    let mut out = String::new();
-    out.push_str(lines[first_mod]); // `defmodule V2.X do`
-    out.push('\n');
-    for c in &consts {
-        out.push_str(c);
-        out.push('\n');
+    // Pair each `@name …` constant line with the attribute token a
+    // module body must mention to justify the injection.
+    let const_attrs: Vec<(&str, &str)> = consts
+        .iter()
+        .filter_map(|c| {
+            let trimmed = c.trim_start();
+            if !trimmed.starts_with('@') {
+                return Some((*c, ""));
+            }
+            let name = trimmed[1..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if name.is_empty() {
+                return Some((*c, ""));
+            }
+            Some((*c, name))
+        })
+        .collect();
+
+    // Module spans: start line → end line (exclusive), sibling modules
+    // only (action_controller emit is flat — no nested defmodule).
+    let mut mod_starts: Vec<usize> = Vec::new();
+    for (i, l) in lines.iter().enumerate().skip(first_mod) {
+        if l.trim_start().starts_with("defmodule ") {
+            mod_starts.push(i);
+        }
     }
-    for l in &lines[first_mod + 1..] {
-        out.push_str(l);
+    let mut out = String::new();
+    for (m_idx, &start) in mod_starts.iter().enumerate() {
+        let end = mod_starts
+            .get(m_idx + 1)
+            .copied()
+            .unwrap_or(lines.len());
+        // Emit the defmodule line, then only the constants this body
+        // references, then the rest of the module.
+        out.push_str(lines[start]);
         out.push('\n');
+        let body_text = lines[start + 1..end].join("\n");
+        for (c, attr) in &const_attrs {
+            if attr.is_empty() || body_text.contains(&format!("@{attr}")) {
+                out.push_str(c);
+                out.push('\n');
+            }
+        }
+        for l in &lines[start + 1..end] {
+            out.push_str(l);
+            out.push('\n');
+        }
     }
     out
 }
@@ -1880,6 +1936,7 @@ const PYTHON_RUNTIME: &[RuntimeEntry] = &[
         // encoding rides the Base64/JSON stdlib mappings.
         imports: &[
             ("Base", "app.active_record_base"),
+            ("ActionController", "app.action_controller_base"),
             ("re", ""),
             ("base64", ""),
             ("json", ""),

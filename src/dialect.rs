@@ -86,6 +86,18 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub enum_defaults: IndexMap<Symbol, crate::expr::Literal>,
 
+    /// `mattr_accessor :x, default: …` / `cattr_accessor(:x) { … }` —
+    /// class-ivar seeds lowered into `LibraryClass::class_ivar_initializers`.
+    /// Symbol-only mattr/cattr leave this empty (readers start nil).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
+
+    /// An enclosing module (via EnumConstants nesting) defines a `JSON`
+    /// constant that would shadow bare `JSON` in `serialize` coder
+    /// resolution. Fail closed: claim only `::JSON` when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lexical_json_shadow: bool,
+
     /// STI subclass class-ids whose rows live in THIS model's table
     /// (stamped by `lower::sti_scope`, which already derives the
     /// subclass->base map for scoping and `becomes!`). Non-empty turns
@@ -400,8 +412,9 @@ pub enum Association {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<Expr>,
         /// `autosave: true` — persist a built/assigned child after the
-        /// owner saves. Default false, matching Rails. Carried on IR;
-        /// has_one autosave lowering is still a separate claim.
+        /// owner saves. Default false, matching Rails. When true, the
+        /// shared lowerer stashes via the writer and folds an
+        /// `after_save` that stamps the FK (and `as:` type) then saves.
         #[serde(default, skip_serializing_if = "is_false")]
         autosave: bool,
     },

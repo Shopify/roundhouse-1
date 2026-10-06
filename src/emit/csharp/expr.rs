@@ -39,8 +39,13 @@ thread_local! {
     static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// For locals first assigned `nil`, the nullable C# type taken from a
     /// later non-nil assignment — so `var x = null` (illegal in C#) becomes
-    /// `T? x = null`.
+    /// `T? x = null`. Also filled for the first typed assign with a `?`
+    /// suffix (nil-first path); hoist must not treat that alone as proof
+    /// of a nil write — see `SAW_NIL`.
     static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// Locals that are actually assigned a `nil` literal somewhere in the
+    /// method. Hoisted primitives stay non-nullable unless listed here.
+    static SAW_NIL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// For locals first assigned an empty `{}`/`[]`, the C# container type
     /// inferred from later `map[k]=v` / `list << x` — so the empty literal
     /// gets a precise `new List<T>()` instead of `object?`.
@@ -327,6 +332,24 @@ fn recv_is_hash(r: &Expr) -> bool {
             if matches!(instance_prop_ty(name.as_str()), Some(crate::ty::Ty::Hash { .. })))
 }
 
+/// Key/value C# types for a Hash-typed receiver. Falls back to
+/// `string, object?` when the Hash shape is unknown (Untyped bag).
+fn hash_kv_tys(r: &Expr) -> (String, String) {
+    let hash_ty = match &*r.node {
+        ExprNode::Ivar { name } => instance_prop_ty(name.as_str()),
+        _ => None,
+    };
+    let hash_ty = hash_ty.as_ref().or(r.ty.as_ref());
+    let Some(t) = hash_ty else {
+        return ("string".into(), "object?".into());
+    };
+    // Peel `Hash | Nil` so a nullable opts hash still copies as Dictionary.
+    match t.peel_nilable() {
+        crate::ty::Ty::Hash { key, value } => (csharp_ty(key), csharp_ty(value)),
+        _ => ("string".into(), "object?".into()),
+    }
+}
+
 fn recv_is_array(r: &Expr) -> bool {
     if ty_is(r.ty.as_ref(), |t| matches!(t, crate::ty::Ty::Array { .. })) {
         return true;
@@ -334,6 +357,51 @@ fn recv_is_array(r: &Expr) -> bool {
     matches!(&*r.node,
         ExprNode::Ivar { name } | ExprNode::Var { name, .. }
             if matches!(instance_prop_ty(name.as_str()), Some(crate::ty::Ty::Array { .. })))
+}
+
+/// Elem type of an Array-typed receiver, peeling a nullable outer `Array[T]?`.
+fn array_elem_ty(r: &Expr) -> Option<crate::ty::Ty> {
+    // Instance-property types apply only to `@ivar` reads. A local
+    // `Var` that shadows a same-named property must use `r.ty` so a
+    // nullable-string array param is not coerced as if it were the
+    // non-nullable property.
+    let from_prop = match &*r.node {
+        ExprNode::Ivar { name } => instance_prop_ty(name.as_str()),
+        _ => None,
+    };
+    let array_ty = from_prop.as_ref().or(r.ty.as_ref());
+    match array_ty {
+        Some(crate::ty::Ty::Array { elem }) => Some((**elem).clone()),
+        Some(crate::ty::Ty::Union { variants }) => variants.iter().find_map(|t| match t {
+            crate::ty::Ty::Array { elem } => Some((**elem).clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// `string?` into `List<string>` (HeaderStore `@vals << value` after the
+/// nil-rejecting header_value_ok? guard). With `<Nullable>enable</Nullable>`,
+/// CS8604 fails the write; coalesce to `""`.
+fn coerce_list_elem_arg(recv: &Expr, arg: &Expr, arg_s: &str) -> String {
+    let Some(elem) = array_elem_ty(recv) else {
+        return arg_s.to_string();
+    };
+    let elem_is_plain_str = matches!(elem, crate::ty::Ty::Str | crate::ty::Ty::Sym);
+    let arg_nilable_str = matches!(
+        arg.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+                && variants
+                    .iter()
+                    .any(|v| matches!(v, crate::ty::Ty::Str | crate::ty::Ty::Sym))
+    );
+    if elem_is_plain_str && arg_nilable_str {
+        format!("({arg_s} ?? \"\")")
+    } else {
+        arg_s.to_string()
+    }
 }
 
 fn is_instance_method_of(class_name: &str, method: &str) -> bool {
@@ -507,10 +575,12 @@ pub(super) fn set_returns_unit(b: bool) {
 pub(super) fn begin_method(body: &Expr) {
     let mut counts: HashMap<String, usize> = HashMap::new();
     let mut nil_types: HashMap<String, String> = HashMap::new();
-    count_assigns(body, &mut counts, &mut nil_types);
+    let mut saw_nil: HashSet<String> = HashSet::new();
+    count_assigns(body, &mut counts, &mut nil_types, &mut saw_nil);
     DECLARED.with(|d| d.borrow_mut().clear());
     LOOP_ID.with(|c| *c.borrow_mut() = 0);
     NIL_TYPES.with(|t| *t.borrow_mut() = nil_types);
+    SAW_NIL.with(|s| *s.borrow_mut() = saw_nil);
 
     let mut container_types: HashMap<String, String> = HashMap::new();
     scan_container_types(body, &mut container_types);
@@ -530,9 +600,20 @@ pub(super) fn begin_method(body: &Expr) {
                 // Prefer the nullable nil-first type (a `result` assigned
                 // `null` then `Article` should hoist as `Article?`, not
                 // `object?`), so the eventual `return result` type-checks.
-                let ty = NIL_TYPES
-                    .with(|t| t.borrow().get(n).cloned())
-                    .unwrap_or_else(|| ty.clone());
+                // Do NOT widen primitives merely because count_assigns
+                // tagged the first typed assign with `?` — that made
+                // `if (found)` fail CS0266 (`bool?` → `bool`). Keep the
+                // plain primitive unless the body actually assigns nil.
+                let ty = match ty.as_str() {
+                    "bool" | "long" | "int" | "double" | "string"
+                        if !SAW_NIL.with(|s| s.borrow().contains(n)) =>
+                    {
+                        ty.clone()
+                    }
+                    _ => NIL_TYPES
+                        .with(|t| t.borrow().get(n).cloned())
+                        .unwrap_or_else(|| ty.clone()),
+                };
                 format!("{ty} {n} = {};", cs_default(&ty))
             })
             .collect();
@@ -682,6 +763,7 @@ fn count_assigns(
     e: &Expr,
     counts: &mut HashMap<String, usize>,
     nil_types: &mut HashMap<String, String>,
+    saw_nil: &mut HashSet<String>,
 ) {
     if let ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } = &*e.node {
         *counts.entry(camel(name.as_str())).or_insert(0) += 2;
@@ -689,6 +771,11 @@ fn count_assigns(
     if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
         let cn = camel(name.as_str());
         *counts.entry(cn.clone()).or_insert(0) += 1;
+        if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })
+            || matches!(value.ty.as_ref(), Some(crate::ty::Ty::Nil))
+        {
+            saw_nil.insert(cn.clone());
+        }
         if !nil_types.contains_key(&cn) {
             if let Some(ty) = value.ty.as_ref() {
                 if !matches!(ty, crate::ty::Ty::Nil) {
@@ -702,7 +789,7 @@ fn count_assigns(
         }
     }
     for child in children(e) {
-        count_assigns(child, counts, nil_types);
+        count_assigns(child, counts, nil_types, saw_nil);
     }
 }
 
@@ -1360,7 +1447,7 @@ fn emit_send(
                 if let ExprNode::Range { begin, end, exclusive } = &*args[0].node {
                     return emit_slice_range(&rs, begin.as_ref(), end.as_ref(), *exclusive);
                 }
-                if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Array { .. })) {
+                if recv_is_array(r) {
                     return format!("{rs}[(int)({})]", args_s[0]);
                 }
                 // Ruby `Hash#[]` returns nil for a missing key; C#'s Dictionary
@@ -1386,7 +1473,8 @@ fn emit_send(
                 return format!("{} {} {}", emit_expr(r), op, args_s[0]);
             }
             crate::emit::shared::ops::BinopCase::Append => {
-                return format!("{}.Add({})", emit_expr(r), args_s[0]);
+                let arg = coerce_list_elem_arg(r, &args[0], &args_s[0]);
+                return format!("{}.Add({})", emit_expr(r), arg);
             }
             crate::emit::shared::ops::BinopCase::NotBinop => {}
         }
@@ -1406,7 +1494,17 @@ fn emit_send(
     }
     if let (Some(r), 2) = (recv, args.len()) {
         if method == "[]=" {
-            return format!("{}[{}] = {}", emit_expr(r), args_s[0], args_s[1]);
+            let idx = if list_index_needs_int_cast(r, &args[0]) {
+                format!("(int)({})", args_s[0])
+            } else {
+                args_s[0].clone()
+            };
+            let val = if recv_is_hash(r) {
+                args_s[1].clone()
+            } else {
+                coerce_list_elem_arg(r, &args[1], &args_s[1])
+            };
+            return format!("{}[{}] = {}", emit_expr(r), idx, val);
         }
         if method == "fetch" {
             return format!("({}.GetValueOrDefault({}, {}))", emit_expr(r), args_s[0], args_s[1]);
@@ -1465,6 +1563,15 @@ fn emit_send(
             }
             "keys" if recv_is_hash(r) => return format!("{rs}.Keys.ToList()"),
             "values" if recv_is_hash(r) => return format!("{rs}.Values.ToList()"),
+            // Hash#dup must copy: see kotlin form_with (attrs.delete
+            // must not mutate the caller's opts). Preserve the
+            // receiver's Dictionary<K,V> — Dictionary is invariant, so
+            // `new Dictionary<string, object?>(dict)` does not compile
+            // when `dict` is `Dictionary<string, string>`.
+            "dup" if recv_is_hash(r) => {
+                let (k, v) = hash_kv_tys(r);
+                return format!("new Dictionary<{k}, {v}>({rs})");
+            }
             "freeze" | "dup" | "to_a" => return rs,
             "to_h" if recv_is_hash(r) => return rs,
             _ => {}
@@ -1815,7 +1922,12 @@ fn emit_case_stmt(scrutinee: &Expr, arms: &[Arm]) -> String {
 }
 
 fn emit_assign(target: &LValue, value: &Expr) -> String {
-    let val = emit_expr(value);
+    let val = match target {
+        LValue::Index { recv, .. } if !recv_is_hash(recv) => {
+            coerce_list_elem_arg(recv, value, &emit_expr(value))
+        }
+        _ => emit_expr(value),
+    };
     match target {
         LValue::Var { name, .. } => {
             let n = camel(name.as_str());
@@ -1878,9 +1990,25 @@ fn lvalue_ref(target: &LValue) -> String {
         LValue::Var { name, .. } => camel(name.as_str()),
         LValue::Ivar { name } => format!("this.{}", ivar_name(name.as_str())),
         LValue::Attr { recv, name } => format!("{}.{}", emit_expr(recv), pascal(name.as_str())),
-        LValue::Index { recv, index } => format!("{}[{}]", emit_expr(recv), emit_expr(index)),
+        LValue::Index { recv, index } => {
+            let idx = if list_index_needs_int_cast(recv, index) {
+                format!("(int)({})", emit_expr(index))
+            } else {
+                emit_expr(index)
+            };
+            format!("{}[{}]", emit_expr(recv), idx)
+        }
         LValue::Const { path } => path.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("."),
     }
+}
+
+/// True when `recv[index]` is a List/Array access (not a Dictionary)
+/// that needs a C# `(int)` cast from the IR's `long` index.
+fn list_index_needs_int_cast(recv: &Expr, index: &Expr) -> bool {
+    if recv_is_hash(recv) {
+        return false;
+    }
+    recv_is_array(recv) || matches!(index.ty.as_ref(), Some(crate::ty::Ty::Int))
 }
 
 fn emit_op_assign(target: &LValue, op: OpAssignOp, value: &Expr) -> String {

@@ -117,6 +117,7 @@ pub mod in_predicate;
 pub mod including;
 pub mod enum_symbols;
 pub mod has_json;
+pub mod serialize;
 pub mod assoc_loaded;
 pub mod object_extend;
 pub mod param_rebind;
@@ -1127,7 +1128,7 @@ pub(crate) fn for_each_owned_hook_body(
         }
     }
     for model in &mut app.models {
-        let crate::dialect::Model { name, body, .. } = model;
+        let crate::dialect::Model { name, body, class_attr_defaults, .. } = model;
         let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
         for item in body {
             match item {
@@ -1165,6 +1166,9 @@ pub(crate) fn for_each_owned_hook_body(
                 }
                 _ => {}
             }
+        }
+        for default in class_attr_defaults.values_mut() {
+            f(default);
         }
     }
     for lc in &mut app.library_classes {
@@ -1301,6 +1305,9 @@ pub(crate) fn for_each_hook_body_ref(
                 }
                 _ => {}
             }
+        }
+        for default in model.class_attr_defaults.values() {
+            f(default);
         }
     }
     for lc in &app.library_classes {

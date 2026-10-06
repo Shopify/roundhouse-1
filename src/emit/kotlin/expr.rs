@@ -318,6 +318,51 @@ fn recv_is_array(r: &Expr) -> bool {
             if matches!(instance_prop_ty(name.as_str()), Some(crate::ty::Ty::Array { .. })))
 }
 
+/// Elem type of an Array-typed receiver (ivar field table or
+/// expression ty), peeling a nullable outer `Array[T]?`.
+fn array_elem_ty(r: &Expr) -> Option<crate::ty::Ty> {
+    // Property types apply only to `@ivar` — a local `Var` that
+    // shadows must keep `r.ty` (nullable elem vs non-nullable prop).
+    let from_prop = match &*r.node {
+        ExprNode::Ivar { name } => instance_prop_ty(name.as_str()),
+        _ => None,
+    };
+    let array_ty = from_prop.as_ref().or(r.ty.as_ref());
+    match array_ty {
+        Some(crate::ty::Ty::Array { elem }) => Some((**elem).clone()),
+        Some(crate::ty::Ty::Union { variants }) => variants.iter().find_map(|t| match t {
+            crate::ty::Ty::Array { elem } => Some((**elem).clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// `String?` into `MutableList<String>` (HeaderStore `@vals << value`
+/// after `header_value_ok?` rejects nil). Kotlin rejects the mismatch;
+/// coalesce to `""` so the write typechecks. Non-string / already-
+/// matching shapes pass through unchanged.
+fn coerce_list_elem_arg(recv: &Expr, arg: &Expr, arg_s: &str) -> String {
+    let Some(elem) = array_elem_ty(recv) else {
+        return arg_s.to_string();
+    };
+    let elem_is_plain_str = matches!(elem, crate::ty::Ty::Str | crate::ty::Ty::Sym);
+    let arg_nilable_str = matches!(
+        arg.ty.as_ref(),
+        Some(crate::ty::Ty::Union { variants })
+            if variants.len() == 2
+                && variants.iter().any(|v| matches!(v, crate::ty::Ty::Nil))
+                && variants
+                    .iter()
+                    .any(|v| matches!(v, crate::ty::Ty::Str | crate::ty::Ty::Sym))
+    );
+    if elem_is_plain_str && arg_nilable_str {
+        format!("({arg_s}) ?: \"\"")
+    } else {
+        arg_s.to_string()
+    }
+}
+
 /// Ruby's `Module#<` family. `RecordNotFound < StandardError` is a
 /// subclass test over two class objects, not a value comparison — the
 /// classifier hands it back as [`CmpCase::ClassSubclass`] and every
@@ -983,8 +1028,43 @@ fn emit_literal(lit: &Literal) -> String {
         Literal::Str { value } => format!("\"{}\"", escape_str(value)),
         // No symbol type in Kotlin → string.
         Literal::Sym { value } => format!("\"{}\"", escape_str(value.as_str())),
-        Literal::Regex { pattern, .. } => format!("Regex(\"{}\")", escape_str(pattern)),
+        Literal::Regex { pattern, .. } => {
+            // Ruby `/[\r\n\0\t]/` carries a backslash-zero NUL escape.
+            // Java `Pattern` rejects `\0` (octal needs more digits); use
+            // `\u0000` which both Kotlin's string literal and Pattern accept.
+            let normalized = normalize_java_regex_nul(pattern);
+            format!("Regex(\"{}\")", escape_str(&normalized))
+        }
     }
+}
+
+/// Rewrite Ruby/PCRE `\0` (NUL) escapes to Java `\u0000` before string
+/// escaping. Tracks backslash parity so a literal `\\0` (escaped
+/// backslash then `0`) is left alone.
+fn normalize_java_regex_nul(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\\') => {
+                    // Escaped backslash — keep both; do not treat a
+                    // following `0` as a NUL escape.
+                    chars.next();
+                    out.push('\\');
+                    out.push('\\');
+                }
+                Some('0') => {
+                    chars.next();
+                    out.push_str("\\u0000");
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn escape_str(s: &str) -> String {
@@ -1218,6 +1298,9 @@ fn emit_assign(target: &LValue, value: &Expr) -> String {
         (LValue::Var { .. }, ExprNode::Hash { entries, .. }) if !entries.is_empty() => {
             emit_hash_precise(entries, value)
         }
+        (LValue::Index { recv, .. }, _) if !recv_is_hash(recv) => {
+            coerce_list_elem_arg(recv, value, &emit_expr(value))
+        }
         _ => emit_expr(value),
     };
     match target {
@@ -1271,9 +1354,28 @@ fn lvalue_ref(target: &LValue) -> String {
         LValue::Var { name, .. } => camel(name.as_str()),
         LValue::Ivar { name } => format!("this.{}", camel(name.as_str())),
         LValue::Attr { recv, name } => format!("{}.{}", emit_expr(recv), camel(name.as_str())),
-        LValue::Index { recv, index } => format!("{}[{}]", emit_expr(recv), emit_expr(index)),
+        LValue::Index { recv, index } => {
+            // List indices are `Long` in the IR; Kotlin wants `Int`.
+            // Also cover module constants like `FORGERY_SLOT[0] =` whose
+            // recv ty may not be stamped as Array yet.
+            let idx = if list_index_needs_int_cast(recv, index) {
+                format!("({}).toInt()", emit_expr(index))
+            } else {
+                emit_expr(index)
+            };
+            format!("{}[{}]", emit_expr(recv), idx)
+        }
         LValue::Const { path } => path.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("."),
     }
+}
+
+/// True when `recv[index]` is a List/Array access (not a Hash) that
+/// needs a Kotlin `Int` index cast from the IR's `Long`.
+fn list_index_needs_int_cast(recv: &Expr, index: &Expr) -> bool {
+    if recv_is_hash(recv) {
+        return false;
+    }
+    recv_is_array(recv) || matches!(index.ty.as_ref(), Some(crate::ty::Ty::Int))
 }
 
 fn emit_op_assign(target: &LValue, op: OpAssignOp, value: &Expr) -> String {
@@ -1664,7 +1766,7 @@ fn emit_send(
                     return emit_slice_range(&rs, begin.as_ref(), end.as_ref(), *exclusive);
                 }
                 // List/Array index needs an Int (indices are `Long`).
-                if matches!(r.ty.as_ref(), Some(crate::ty::Ty::Array { .. })) {
+                if recv_is_array(r) {
                     return format!("{rs}[({}).toInt()]", args_s[0]);
                 }
                 return format!("{rs}[{}]", args_s[0]);
@@ -1693,7 +1795,8 @@ fn emit_send(
             }
             // `<<` / `push` → MutableList.add.
             crate::emit::shared::ops::BinopCase::Append => {
-                return format!("{}.add({})", emit_expr(r), args_s[0]);
+                let arg = coerce_list_elem_arg(r, &args[0], &args_s[0]);
+                return format!("{}.add({})", emit_expr(r), arg);
             }
             crate::emit::shared::ops::BinopCase::NotBinop => {}
         }
@@ -1718,7 +1821,17 @@ fn emit_send(
     }
     if let (Some(r), 2) = (recv, args.len()) {
         if method == "[]=" {
-            return format!("{}[{}] = {}", emit_expr(r), args_s[0], args_s[1]);
+            let idx = if list_index_needs_int_cast(r, &args[0]) {
+                format!("({}).toInt()", args_s[0])
+            } else {
+                args_s[0].clone()
+            };
+            let val = if recv_is_hash(r) {
+                args_s[1].clone()
+            } else {
+                coerce_list_elem_arg(r, &args[1], &args_s[1])
+            };
+            return format!("{}[{}] = {}", emit_expr(r), idx, val);
         }
         // `Hash#fetch(k, default)` → `(recv[k] ?: default)` (Ruby returns
         // the value or the default; Kotlin map-get is null for missing).
@@ -1784,7 +1897,11 @@ fn emit_send(
             // Kotlin's are a Set/Collection, so materialize a MutableList.
             "keys" if recv_is_hash(r) => return format!("{rs}.keys.toMutableList()"),
             "values" if recv_is_hash(r) => return format!("{rs}.values.toMutableList()"),
-            // No-ops in Kotlin — drop, keep the receiver.
+            // `freeze`/`to_a` are no-ops. `dup` on a Hash must shallow-
+            // copy: `attrs = opts.to_h.dup; attrs.delete(:method)` must
+            // leave `opts[:method]` readable (form_with). Identity dup
+            // aliases the MutableMap and the delete erases the fetch.
+            "dup" if recv_is_hash(r) => return format!("{rs}.toMutableMap()"),
             "freeze" | "dup" | "to_a" => return rs,
             // `to_h` is a no-op on a Hash; on a user type (e.g. `Session`,
             // `Flash`) it's a real `toH()` method — fall through to the call.

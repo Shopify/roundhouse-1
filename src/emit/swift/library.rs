@@ -811,7 +811,13 @@ fn emit_subscript(
     }
     if let Some(s) = setter {
         begin_method(&s.body, false);
-        let body = emit_body(&s.body, false, None);
+        // Hoist locals first assigned inside nested scopes (e.g. `found`
+        // inside `if header_ok?`) — same prologue emit_method uses.
+        let mut prologue = String::new();
+        for (n, st, d) in super::expr::take_hoisted() {
+            prologue.push_str(&format!("var {n}: {st} = {d}\n"));
+        }
+        let body = format!("{prologue}{}", emit_body(&s.body, false, None));
         // The Ruby setter's value param reads from Swift's `newValue`.
         let alias = s
             .params

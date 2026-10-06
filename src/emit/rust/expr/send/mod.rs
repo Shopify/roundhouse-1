@@ -221,6 +221,33 @@ pub(super) fn emit_send(
             ExprNode::Ivar { name } => super::ivar_field_ty(name.as_str())
                 .map(|t| super::util::is_option_ty(&t))
                 .unwrap_or(false),
+            // Array#[] types as `T | Nil` (past-the-end), but rust
+            // emits a bare `T` (`vec[i].clone()`). Prefer the field-
+            // table elem type when the recv is an ivar — HeaderStore
+            // `@keys` is `Array[String]` (no Option) while `@vals` is
+            // `Array[String?]` (Option). Body-typer `String?` on both
+            // would Option-map a plain `String` and fail to compile.
+            // Mirrors `ruby_to_s_emit`'s ivar-array preference.
+            ExprNode::Send {
+                method: m,
+                recv: Some(inner),
+                ..
+            } if m.as_str() == "[]" => {
+                let array_ty = match &*inner.node {
+                    ExprNode::Ivar { name } => super::ivar_field_ty(name.as_str()),
+                    _ => inner.ty.clone(),
+                };
+                match array_ty.as_ref().map(super::util::peel_nil) {
+                    Some(crate::ty::Ty::Array { elem }) => {
+                        super::util::is_option_ty(elem)
+                    }
+                    _ => r
+                        .ty
+                        .as_ref()
+                        .map(super::util::is_option_ty)
+                        .unwrap_or(false),
+                }
+            }
             // A call's `ty` comes from the callee's declared signature
             // (`article.title()` on a nullable column reads `Option
             // <String>`), so it is trustworthy here.

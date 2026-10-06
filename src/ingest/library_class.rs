@@ -3297,13 +3297,24 @@ pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId,
     walk_dsl_stmts(body, &mut stmts);
     super::survey::without_recording(|| {
         stmts.iter().any(|stmt| {
-            super::model::ingest_model_body_items(stmt, owner, file, Vec::new())
+            super::model::ingest_model_body_items(stmt, owner, file, Vec::new(), None)
                 .is_ok_and(|items| items.iter().any(super::concern_accessors::is_candidate))
         })
     })
 }
 
 pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItems {
+    ingest_concern_model_items_with_constants(source, file, &super::model::EnumConstants::default())
+}
+
+/// Same as [`ingest_concern_model_items`], with the app-wide constant
+/// table so `types: Leafable::TYPES` / bare `TYPES` inside `included do`
+/// resolve the way model-side class-body DSL does.
+pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+) -> ConcernModelItems {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -3316,6 +3327,14 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
         let mut full_path: Vec<String> = scope.clone();
         full_path.extend(name_path);
         let id = ClassId(Symbol::from(full_path.join("::")));
+        let enum_owners = enum_constants
+            .nesting
+            .get(&(file.to_string(), module.location().start_offset()))
+            .cloned()
+            .unwrap_or_default();
+        let resolve_constant = |node: &ruby_prism::Node<'_>| {
+            enum_constants.resolve(node, &enum_owners)
+        };
 
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
@@ -3339,7 +3358,13 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // User::Role. Expanded here for the same reason the
                 // model walk expands it: one statement, many items.
                 if let Some(call) = inner.as_call_node() {
-                    match super::model::expand_class_body_dsl(&call, file, &[], &super::model::ClassConsts::default(), &|_| None) {
+                    match super::model::expand_class_body_dsl(
+                        &call,
+                        file,
+                        &[],
+                        &super::model::ClassConsts::default(),
+                        &resolve_constant,
+                    ) {
                         Ok(Some(super::model::ClassBodyExpansion::DelegatedType(expanded))) => {
                             items.extend(expanded);
                             continue;
@@ -3368,7 +3393,7 @@ pub fn ingest_concern_model_items(source: &[u8], file: &str) -> ConcernModelItem
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
-                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new()) {
+                match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
                             match item {

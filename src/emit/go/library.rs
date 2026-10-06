@@ -1537,7 +1537,7 @@ fn emit_module_singleton_method(class_name: &str, m: &MethodDef) -> String {
 
 #[cfg(test)]
 mod predicate_naming_tests {
-    use super::sanitize_method_name;
+    use super::{emit_library_class, sanitize_method_name};
 
     /// Regression guard: the bare-fn name path affixes `?` → `_pred` so a
     /// predicate (`exists?`) never collides with a same-named reader
@@ -1548,5 +1548,40 @@ mod predicate_naming_tests {
         assert_ne!(sanitize_method_name("exists"), sanitize_method_name("exists?"));
         assert_eq!(sanitize_method_name("exists?"), "exists_pred");
         assert_eq!(sanitize_method_name("save!"), "save_bang");
+    }
+
+    /// HeaderStore keys/vals must be `[]string` (RBS ivar seed), and
+    /// void `send_data`'s disposition ternary IIFE must `return` strings.
+    #[test]
+    fn action_controller_go_emit_typechecks_hotspots() {
+        let ruby = include_str!("../../../runtime/ruby/action_controller/base.rb");
+        let rbs = include_str!("../../../runtime/ruby/action_controller/base.rbs");
+        let classes = crate::runtime_src::parse_library_with_rbs(
+            ruby.as_bytes(),
+            rbs,
+            "action_controller/base.rb",
+        )
+        .expect("action_controller/base parses and types");
+        let mut src = String::new();
+        for c in &classes {
+            src.push_str(&emit_library_class(c).expect("emits"));
+            src.push('\n');
+        }
+        assert!(
+            src.contains("Keys []string") && src.contains("Vals []string"),
+            "HeaderStore must emit []string fields:\n{src}"
+        );
+        assert!(
+            !src.contains("Keys []interface{}") && !src.contains("Vals []interface{}"),
+            "HeaderStore must not erase keys/vals to interface{{}}:\n{src}"
+        );
+        let send = src
+            .find("func (self *ActionControllerBase) SendData")
+            .and_then(|i| src[i..].find("func (self *ActionControllerBase) Verify").map(|j| &src[i..i + j]))
+            .expect("SendData method");
+        assert!(
+            send.contains("return \"inline\"") && send.contains("return \"attachment\""),
+            "void send_data IIFE must return disposition strings:\n{send}"
+        );
     }
 }

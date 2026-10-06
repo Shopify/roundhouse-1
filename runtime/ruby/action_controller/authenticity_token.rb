@@ -84,4 +84,9 @@ module ActionController
   def self.csrf_token_valid?(given, expected)
     AuthenticityToken.valid?(given, expected)
   end
+
+  # Real masked tokens are available — turn the shared flag on. Extras
+  # that omit this file keep the base.rb default (off) so stub-empty
+  # tokens do not fail-closed every POST.
+  set_forgery_flag(true)
 end

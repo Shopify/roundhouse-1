@@ -1517,7 +1517,15 @@ pub(super) fn emit_send_base(
                 recv_s
             };
             if args_s.is_empty() {
-                format!("{recv_s}.{method}")
+                // Crystal `String#size` / `Array#size` return `Int32`;
+                // Roundhouse `Ty::Int` is `Int64`. Cast so returns and
+                // locals typed Int64 (e.g. `find_last`) typecheck —
+                // `return i` where `i = hay.size - n` was Int32.
+                if method == "size" {
+                    format!("{recv_s}.{method}.to_i64")
+                } else {
+                    format!("{recv_s}.{method}")
+                }
             } else if parenthesized {
                 format!("{recv_s}.{method}({})", args_s.join(", "))
             } else {

@@ -1,6 +1,7 @@
 //! `has_one …, dependent: :destroy` cascades through the synthesized
 //! `before_destroy`, the same hook `has_many` already uses. Autosave
-//! and preload stay unclaimed: those need a writer and a cache.
+//! and preload are covered in `has_one_autosave.rs` /
+//! `has_one_preload.rs`.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;

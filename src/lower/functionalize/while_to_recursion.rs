@@ -147,13 +147,23 @@ fn try_transform_seq(m: &MethodDef) -> Option<Vec<MethodDef>> {
         };
 
     // Carried locals = vars bound in the pre-loop statements, in order,
-    // that are referenced in the condition or loop body. (An accumulator
-    // like `params = {}` is found here because `walk` descends into
-    // index-assign targets, so `params[k] = v` counts as a reference.)
+    // that are referenced in the condition, loop body, or post-loop
+    // statements — or assigned in the loop body. (An accumulator like
+    // `params = {}` is found because `walk` descends into index-assign
+    // targets, so `params[k] = v` counts as a reference. A flag like
+    // `found = false` / `found = true` / `unless found` is carried
+    // because assignment targets and post-loop reads count too —
+    // `refs_var` alone misses `LValue::Var` writes.)
     let pre_assigned = assigned_vars(pre);
+    let post_joined = value_of(post);
     let carried: Vec<Symbol> = pre_assigned
         .into_iter()
-        .filter(|name| refs_var(cond, name) || refs_var(while_body, name))
+        .filter(|name| {
+            refs_var(cond, name)
+                || refs_var(while_body, name)
+                || refs_var(&post_joined, name)
+                || assigns_var(while_body, name)
+        })
         .collect();
 
     // The counter (when there is one) must be a carried (pre-loop-bound)
@@ -253,13 +263,22 @@ fn try_transform_seq(m: &MethodDef) -> Option<Vec<MethodDef>> {
         body: syn(ExprNode::If {
             cond: cond.clone(),
             then_branch: cps(&body_stmts, &recurse_call),
-            // Post-loop value. A record-threading helper with nothing
-            // after the loop (e.g. session#initialize's populate loop)
-            // must yield the threaded `record` so the accumulated
-            // struct flows back to the caller — not the `nil` that
-            // falling off a Ruby `while` would produce.
-            else_branch: if threads_record && post.is_empty() {
-                var(&Symbol::from("record"))
+            // Post-loop value. A record-threading helper must yield the
+            // threaded struct when the loop/post mutates instance state:
+            // empty post → `record`; mutating post ends in `self` so a
+            // skipped `unless found` (nil) still returns the struct after
+            // mutation rewrites `self`→`record`. A reader with a trailing
+            // `nil` (HeaderStore `[]`) keeps that nil — do not append.
+            else_branch: if threads_record {
+                if post.is_empty() {
+                    var(&Symbol::from("record"))
+                } else if post.iter().any(mutates_ivar_state) {
+                    let mut stmts = post.to_vec();
+                    stmts.push(syn(ExprNode::SelfRef));
+                    value_of(&stmts)
+                } else {
+                    value_of(post)
+                }
             } else {
                 value_of(post)
             },
@@ -523,6 +542,32 @@ fn assigned_vars(stmts: &[Expr]) -> Vec<Symbol> {
     out
 }
 
+/// True when `e` writes instance state (`@ivar = …`, `@arr[i] = …`,
+/// `@arr << …`). Used to decide whether a record-threading loop's post
+/// must end in `self` so a skipped `unless` still returns the struct.
+fn mutates_ivar_state(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |n| {
+        match &*n.node {
+            ExprNode::Assign {
+                target: LValue::Ivar { .. },
+                ..
+            } => found = true,
+            ExprNode::Send {
+                recv: Some(r),
+                method,
+                ..
+            } if matches!(method.as_str(), "[]=" | "<<")
+                && matches!(&*r.node, ExprNode::Ivar { .. }) =>
+            {
+                found = true;
+            }
+            _ => {}
+        }
+    });
+    found
+}
+
 fn refs_var(e: &Expr, name: &Symbol) -> bool {
     let mut found = false;
     walk(e, &mut |n| {
@@ -530,6 +575,29 @@ fn refs_var(e: &Expr, name: &Symbol) -> bool {
             if vn == name {
                 found = true;
             }
+        }
+    });
+    found
+}
+
+/// True when `e` contains an assignment whose target is local `name`
+/// (`found = true`). `refs_var` misses these — `walk_lvalue` does not
+/// surface `LValue::Var` as an `ExprNode::Var`.
+fn assigns_var(e: &Expr, name: &Symbol) -> bool {
+    let mut found = false;
+    walk(e, &mut |n| {
+        match &*n.node {
+            ExprNode::Assign {
+                target: LValue::Var { name: vn, .. },
+                ..
+            }
+            | ExprNode::OpAssign {
+                target: LValue::Var { name: vn, .. },
+                ..
+            } if vn == name => {
+                found = true;
+            }
+            _ => {}
         }
     });
     found

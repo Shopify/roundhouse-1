@@ -542,20 +542,51 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
 }
 
 /// Map a Ruby method name to a legal Elixir function name. `?`/`!`
-/// suffixes are valid in Elixir and pass through. The indexing
-/// operators `[]`/`[]=` (illegal as Elixir function names) become
-/// `get`/`put`; a writer `foo=` becomes `set_foo`.
+/// suffixes are valid in Elixir and pass through when they *terminate*
+/// the name. The indexing operators `[]`/`[]=` (illegal as Elixir
+/// function names) become `get`/`put`; a writer `foo=` becomes
+/// `set_foo`.
+///
+/// While→recursion helpers append `__loop` to the Ruby name
+/// (`header_key_ok?` → `header_key_ok?__loop`). Elixir identifiers may
+/// *end* in `?`/`!` but cannot continue after them — `?_` is a
+/// character literal — so mid-name `?`/`!` become `_p`/`_b` before the
+/// suffix.
 pub(super) fn elixir_fn_name(name: &str) -> String {
+    // Indexing operators and their while→recursion helpers (`[]__loop`,
+    // `[]=__loop`) are illegal Elixir identifiers — map to get/put.
+    if let Some(rest) = name.strip_prefix("[]=__") {
+        return format!("put__{rest}");
+    }
+    if let Some(rest) = name.strip_prefix("[]__") {
+        return format!("get__{rest}");
+    }
     match name {
         "[]" => return "get".to_string(),
         "[]=" => return "put".to_string(),
         _ => {}
     }
     if let Some(base) = name.strip_suffix('=') {
-        format!("set_{base}")
-    } else {
-        name.to_string()
+        // `foo=` writer — but not `foo?=` / mangled forms.
+        if !base.ends_with(['?', '!']) {
+            return format!("set_{base}");
+        }
     }
+    // `pred?__loop` / `bang!__loop`: rewrite the mid-name punct so the
+    // identifier stays legal (`pred_p__loop` / `bang_b__loop`). A
+    // trailing `?`/`!` (end of name) falls through to the catch-all and
+    // is preserved.
+    let mut out = String::with_capacity(name.len() + 2);
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).copied();
+        match c {
+            '?' if next.is_some() => out.push_str("_p"),
+            '!' if next.is_some() => out.push_str("_b"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -607,5 +638,16 @@ mod tests {
             parenthesized: false,
         });
         assert!(references_var(&bare, "notice"));
+    }
+
+    #[test]
+    fn elixir_fn_name_rewrites_mid_pred_before_loop_suffix() {
+        // Trailing `?`/`!` stay; mid-name (before `__loop`) cannot.
+        assert_eq!(elixir_fn_name("header_key_ok?"), "header_key_ok?");
+        assert_eq!(elixir_fn_name("header_key_ok?__loop"), "header_key_ok_p__loop");
+        assert_eq!(elixir_fn_name("bang!__loop"), "bang_b__loop");
+        assert_eq!(elixir_fn_name("[]__loop"), "get__loop");
+        assert_eq!(elixir_fn_name("[]=__loop"), "put__loop");
+        assert_eq!(elixir_fn_name("title="), "set_title");
     }
 }

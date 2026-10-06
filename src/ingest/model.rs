@@ -34,7 +34,7 @@ use super::{IngestError, IngestResult};
 pub type TablePrefixes = std::collections::HashMap<String, String>;
 
 mod enum_constants;
-pub(super) use enum_constants::EnumConstants;
+pub(in crate::ingest) use enum_constants::EnumConstants;
 
 /// Scan one file for `module <Ns>; def self.table_name_prefix; "<p>"; end`.
 /// Deliberately narrow: only a module-level `self.` def whose body is a
@@ -183,6 +183,7 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut body: Vec<ModelBodyItem> = Vec::new();
     let mut enums: IndexMap<Symbol, Vec<(String, Literal)>> = IndexMap::new();
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
+    let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
     let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
     let mut visibility_overrides = visibility.overrides();
@@ -349,11 +350,53 @@ pub(super) fn ingest_model_with_enum_constants(
             // the library-class pass over this very file registers it
             // under its qualified name. Reaching the expression ingester
             // with it aborted the whole file.
-            if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
+            //
+            // Exception: a nested `class JSON` / `module JSON` shadows
+            // bare `JSON` for `serialize …, coder: JSON` — leave a
+            // synthetic Const-assign marker so lower::serialize can see
+            // the shadow without treating the namespace as a body item.
+            if let Some(path) = stmt
+                .as_class_node()
+                .and_then(|c| constant_path_of(&c.constant_path()))
+                .or_else(|| {
+                    stmt.as_module_node()
+                        .and_then(|m| constant_path_of(&m.constant_path()))
+                })
+            {
+                let path_syms: Vec<Symbol> = path.iter().map(|s| Symbol::from(s.as_str())).collect();
+                if crate::lower::serialize::const_path_shadows_bare_json(
+                    &path_syms,
+                    owner.0.as_str(),
+                ) {
+                    body.push(ModelBodyItem::Unknown {
+                        expr: Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Assign {
+                                target: crate::expr::LValue::Const {
+                                    path: vec![Symbol::from("JSON")],
+                                },
+                                value: Expr::new(
+                                    Span::synthetic(),
+                                    ExprNode::Lit {
+                                        value: crate::expr::Literal::Nil,
+                                    },
+                                ),
+                            },
+                        ),
+                        leading_comments: Vec::new(),
+                        leading_blank_line: false,
+                    });
+                }
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
-            let items = match ingest_model_body_items(&stmt, &owner, file, leading) {
+            let items = match ingest_model_body_items(
+                &stmt,
+                &owner,
+                file,
+                leading,
+                Some(&mut class_attr_defaults),
+            ) {
                 Ok(items) => items,
                 Err(err) if super::survey::is_active() => {
                     super::survey::record(&err);
@@ -399,6 +442,8 @@ pub(super) fn ingest_model_with_enum_constants(
         body,
         enums,
         enum_defaults,
+        class_attr_defaults,
+        lexical_json_shadow: enum_constants.shadows_bare_json(&enum_owners),
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,
@@ -430,6 +475,7 @@ pub(super) fn ingest_model_body_items(
     owner: &ClassId,
     file: &str,
     leading_comments: Vec<Comment>,
+    class_attr_defaults: Option<&mut IndexMap<Symbol, Expr>>,
 ) -> IngestResult<Vec<ModelBodyItem>> {
     use crate::dialect::{Validation, ValidationRule};
     let span = Span {
@@ -485,20 +531,11 @@ pub(super) fn ingest_model_body_items(
                     })
                     .collect());
             }
-            // `cattr_*` / `mattr_*` — class-attribute expansion library
-            // ingest already applies. Models that carry class attrs
-            // (Writebook `ActionText::Markdown.mattr_accessor :renderer`)
-            // must synthesize the singleton reader/writer or `to_html`
-            // and inventory resolve as unresolved `renderer`.
-            //
-            // Plain `attr_*` stays Unknown here on purpose: concern
-            // `included` blocks share this walker, and
-            // `concern_accessors::{is_candidate,is_supported}` plus
-            // visibility's `included_has_accessor` gate all match the
-            // raw `attr_accessor` Send — expanding those into Method
-            // items made `included_has_accessor` false (so `private;`
-            // inside `included` hard-failed ingest) and dropped
-            // concern virtual accessors from the splice.
+            // `cattr_*` / `mattr_*` — same class-attr expansion library
+            // ingest applies. Plain `attr_*` stays Unknown: concern
+            // `included` blocks share this walker, and expanding those
+            // into Method items breaks `included_has_accessor` /
+            // visibility gating for `private;` inside `included`.
             if matches!(
                 name.as_str(),
                 "cattr_reader"
@@ -508,85 +545,224 @@ pub(super) fn ingest_model_body_items(
                     | "mattr_writer"
                     | "mattr_accessor"
             ) {
-                let mut names: Vec<Symbol> = Vec::new();
-                let mut has_options = call.block().is_some();
-                if let Some(args) = call.arguments() {
-                    for arg in args.arguments().iter() {
-                        if let Some(s) = symbol_value(&arg) {
-                            names.push(Symbol::from(s));
-                        } else {
-                            // `default:` / other kwargs are not modeled —
-                            // partial expansion would drop the initializer.
-                            has_options = true;
-                        }
-                    }
-                }
-                // Writebook uses `mattr_accessor :renderer, default:` and
-                // `cattr_accessor :preview_renderer do`. Expanding those
-                // would drop the initializer; erroring rewrote inventory
-                // Errors into ingest-gap Infos. Leave the Send unknown.
-                if has_options {
-                    // fall through to ingest_model_body_item
-                } else {
-                let want_reader =
-                    name.ends_with("_reader") || name.ends_with("_accessor");
-                let want_writer =
-                    name.ends_with("_writer") || name.ends_with("_accessor");
-                let mut out = Vec::new();
-                for (i, attr) in names.iter().enumerate() {
-                    let lead = if i == 0 {
-                        leading_comments.clone()
-                    } else {
-                        Vec::new()
-                    };
-                    // mattr/cattr: class accessors plus instance accessors
-                    // that share the same @ivar storage approximation used
-                    // by library ingest (Rails instance copies read the
-                    // class attribute; here both sides use the ivar).
-                    let receivers = [
-                        crate::dialect::MethodReceiver::Class,
-                        crate::dialect::MethodReceiver::Instance,
-                    ];
-                    let mut first_method = true;
-                    for &recv in &receivers {
-                        if want_reader {
-                            out.push(ModelBodyItem::Method {
-                                method: super::library_class::synth_attr_reader(
-                                    owner, attr, recv,
-                                ),
-                                leading_comments: if first_method {
-                                    lead.clone()
-                                } else {
-                                    Vec::new()
-                                },
-                                leading_blank_line: false,
-                            });
-                            first_method = false;
-                        }
-                        if want_writer {
-                            out.push(ModelBodyItem::Method {
-                                method: super::library_class::synth_attr_writer(
-                                    owner, attr, recv,
-                                ),
-                                leading_comments: if first_method {
-                                    lead.clone()
-                                } else {
-                                    Vec::new()
-                                },
-                                leading_blank_line: false,
-                            });
-                            first_method = false;
-                        }
-                    }
-                }
-                if !out.is_empty() {
-                    return Ok(out);
-                }
+                match expand_mattr_cattr(
+                    &call,
+                    owner,
+                    file,
+                    leading_comments.clone(),
+                    class_attr_defaults,
+                )? {
+                    Some(out) => return Ok(out),
+                    None => {} // unsupported options — fall through Unknown
                 }
             }
         }
     }
     Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?])
+}
+
+/// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
+/// parameterless block. Other kwargs (`instance_reader:`, splats, …) stay
+/// unexpanded so a partial reader cannot drop the initializer.
+fn expand_mattr_cattr(
+    call: &ruby_prism::CallNode<'_>,
+    owner: &ClassId,
+    file: &str,
+    leading_comments: Vec<Comment>,
+    class_attr_defaults: Option<&mut IndexMap<Symbol, Expr>>,
+) -> IngestResult<Option<Vec<ModelBodyItem>>> {
+    let name = constant_id_str(&call.name());
+    let mut names: Vec<Symbol> = Vec::new();
+    let mut default: Option<Expr> = None;
+    let mut unsupported = false;
+    if let Some(args) = call.arguments() {
+        for arg in args.arguments().iter() {
+            if let Some(s) = symbol_value(&arg) {
+                names.push(Symbol::from(s));
+                continue;
+            }
+            if let Some(hash) = arg.as_keyword_hash_node() {
+                for element in hash.elements().iter() {
+                    let Some(assoc) = element.as_assoc_node() else {
+                        unsupported = true;
+                        break;
+                    };
+                    match symbol_value(&assoc.key()).as_deref() {
+                        Some("default") if default.is_none() => {
+                            match ingest_expr(&assoc.value(), file) {
+                                Ok(expr) => default = Some(expr),
+                                Err(_) => unsupported = true,
+                            }
+                        }
+                        _ => unsupported = true,
+                    }
+                }
+                continue;
+            }
+            unsupported = true;
+        }
+    }
+    if let Some(block) = call.block() {
+        let Some(block_node) = block.as_block_node() else {
+            return Ok(None);
+        };
+        if block_node.parameters().is_some() || default.is_some() {
+            return Ok(None);
+        }
+        let Some(body) = block_node.body() else {
+            return Ok(None);
+        };
+        match ingest_expr(&body, file) {
+            Ok(expr) => default = Some(expr),
+            Err(_) => return Ok(None),
+        }
+    }
+    if unsupported || names.is_empty() {
+        return Ok(None);
+    }
+    // A default needs a home on the model; concern collectors that cannot
+    // carry class-ivar seeds must leave the declaration unexpanded.
+    if default.is_some() && class_attr_defaults.is_none() {
+        return Ok(None);
+    }
+    if let (Some(defaults), Some(expr)) = (class_attr_defaults, default) {
+        for attr in &names {
+            defaults.insert(attr.clone(), expr.clone());
+        }
+    }
+    let want_reader = name.ends_with("_reader") || name.ends_with("_accessor");
+    let want_writer = name.ends_with("_writer") || name.ends_with("_accessor");
+    let mut out = Vec::new();
+    for (i, attr) in names.iter().enumerate() {
+        let lead = if i == 0 {
+            leading_comments.clone()
+        } else {
+            Vec::new()
+        };
+        // Class side owns `@attr` (and the default seed). Instance side
+        // delegates to `self.class`, as Rails' mattr/cattr copies do —
+        // a shared ivar on the instance would miss the class default.
+        let mut first_method = true;
+        let mut push = |method: crate::dialect::MethodDef| {
+            out.push(ModelBodyItem::Method {
+                method,
+                leading_comments: if first_method {
+                    lead.clone()
+                } else {
+                    Vec::new()
+                },
+                leading_blank_line: false,
+            });
+            first_method = false;
+        };
+        if want_reader {
+            push(super::library_class::synth_attr_reader(
+                owner,
+                attr,
+                crate::dialect::MethodReceiver::Class,
+            ));
+            push(synth_mattr_instance_reader(owner, attr));
+        }
+        if want_writer {
+            push(super::library_class::synth_attr_writer(
+                owner,
+                attr,
+                crate::dialect::MethodReceiver::Class,
+            ));
+            push(synth_mattr_instance_writer(owner, attr));
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+fn synth_mattr_instance_reader(owner: &ClassId, name: &Symbol) -> crate::dialect::MethodDef {
+    use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility};
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: name.clone(),
+        receiver: MethodReceiver::Instance,
+        visibility: MethodVisibility::Public,
+        params: vec![],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                        method: Symbol::from("class"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                )),
+                method: name.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::AttributeReader,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+fn synth_mattr_instance_writer(owner: &ClassId, name: &Symbol) -> crate::dialect::MethodDef {
+    use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility, Param};
+    use crate::ident::VarId;
+    let value = Symbol::from("value");
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from(format!("{}=", name.as_str())),
+        receiver: MethodReceiver::Instance,
+        visibility: MethodVisibility::Public,
+        params: vec![Param::positional(value.clone())],
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                        method: Symbol::from("class"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                )),
+                method: Symbol::from(format!("{}=", name.as_str())),
+                args: vec![Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Var {
+                        id: VarId(0),
+                        name: value,
+                    },
+                )],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::AttributeWriter,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
 }
 
 /// `leading_comments` is attached regardless of variant so every item
@@ -832,7 +1008,12 @@ pub(super) fn expand_class_body_dsl(
     class_consts: &ClassConsts,
     resolve_constant: &impl Fn(&Node<'_>) -> Option<Vec<(String, Literal)>>,
 ) -> IngestResult<Option<ClassBodyExpansion>> {
-    match super::delegated_type::expand_delegated_type_decl(call, file, leading_comments)? {
+    match super::delegated_type::expand_delegated_type_decl(
+        call,
+        file,
+        leading_comments,
+        resolve_constant,
+    )? {
         Some(items) => return Ok(Some(ClassBodyExpansion::DelegatedType(items))),
         None => {}
     }

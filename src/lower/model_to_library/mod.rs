@@ -538,9 +538,27 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         origin: None,
         constants: collect_model_constants(model),
         unknown_calls: Vec::new(),
-        class_ivar_initializers: Vec::new(),
+        class_ivar_initializers: collect_class_attr_initializers(model),
         visibility_overrides: model.visibility_overrides.clone(),
     }
+}
+
+/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
+/// ivar writes emitted once on the model class object.
+fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
+    model
+        .class_attr_defaults
+        .iter()
+        .map(|(name, value)| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: name.clone() },
+                    value: value.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -676,6 +694,15 @@ fn report_unclaimed_unknowns(model: &Model) {
         // re-deriving the shape (same dance as `has_rich_text`).
         if name == "has_json"
             && crate::lower::has_json::has_json_decls(&model.body)
+                .iter()
+                .any(|d| d.span == expr.span)
+        {
+            continue;
+        }
+        // `serialize :col, coder: JSON` (and legacy positional `JSON`) —
+        // claimed by lower::serialize; accessors go through JsonColumn.
+        if name == "serialize"
+            && crate::lower::serialize::serialize_decls(model)
                 .iter()
                 .any(|d| d.span == expr.span)
         {

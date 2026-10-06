@@ -3,6 +3,8 @@ module ActionController
   def self.header_value_ok?: (String? v) -> bool
   def self.header_control?: (String c) -> bool
   def self.sanitize_location: (String path) -> String
+  def self.strip_leading_controls: (String s) -> String
+  def self.strip_trailing_controls: (String s) -> String
   def self.location_host: (String url) -> String
   def self.find_substr: (String hay, String needle) -> Integer
   def self.find_last: (String hay, String needle) -> Integer

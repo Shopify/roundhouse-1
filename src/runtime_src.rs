@@ -422,6 +422,12 @@ pub fn parse_library_with_rbs(
     let mut library_classes = ingest_library_classes(ruby_src, file)
         .map_err(|e| format!("ingest_library_classes: {e:?}"))?;
     let sigs_by_class = crate::rbs::parse_app_signatures(rbs_src)?;
+    // `@ivar: T` decls (e.g. HeaderStore `@keys: Array[String]`). Pass B
+    // seeds these so empty `[]`/`{}` initializers stamp via
+    // `propagate_expected_to_empty_container` — without this, Go/Kotlin/
+    // C#/Swift emit `[]interface{}` / `MutableList<Any?>` and fail when
+    // `[]` returns `String?`.
+    let rbs_ivars_by_class = crate::rbs::parse_app_ivars(rbs_src)?;
 
     // The class-grouped sig parser doesn't carry the `%a{abstract}`
     // annotation; the flat parser does. Use the flat result purely as
@@ -624,6 +630,16 @@ pub fn parse_library_with_rbs(
                         flow_ivars.insert(m_name.clone(), (**ret).clone());
                     }
                 }
+            }
+        }
+        // Explicit RBS `@ivar: T` wins last — including over a
+        // zero-arg computed method of the same name (e.g. `@items:
+        // Array[String]` must not be replaced by `def items; …; end`
+        // returning Integer). Same contract as the seed that made
+        // HeaderStore `@keys`/`@vals` Array[String].
+        if let Some(declared) = rbs_ivars_by_class.get(&lc.name) {
+            for (name, ty) in declared {
+                flow_ivars.insert(name.clone(), ty.clone());
             }
         }
         if !flow_ivars.is_empty() {
@@ -1929,5 +1945,49 @@ mod tests {
         let m = &methods[0];
         // The If as a whole unions its branches (both StringInterp → Str).
         assert_eq!(m.body.ty.as_ref(), Some(&Ty::Str));
+    }
+
+    /// RBS `@keys`/`@vals` must stamp empty `[]` initializers so
+    /// Go/Kotlin/C#/Swift emit typed slices/lists, not `interface{}`/`Any?`.
+    #[test]
+    fn rbs_ivar_decls_stamp_empty_array_initializers() {
+        let ruby = include_bytes!("../runtime/ruby/action_controller/base.rb");
+        let rbs = include_str!("../runtime/ruby/action_controller/base.rbs");
+        let classes = parse_library_with_rbs(ruby, rbs, "action_controller/base.rb")
+            .expect("action_controller/base parses and types");
+        let hs = classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "ActionController::HeaderStore")
+            .expect("HeaderStore class");
+        let init = hs
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == "initialize")
+            .expect("initialize");
+        fn ivar_assign_ty<'a>(e: &'a crate::expr::Expr, name: &str) -> Option<&'a Ty> {
+            use crate::expr::{ExprNode, LValue};
+            match &*e.node {
+                ExprNode::Assign {
+                    target: LValue::Ivar { name: n },
+                    value,
+                } if n.as_str() == name => value.ty.as_ref(),
+                ExprNode::Seq { exprs } => exprs.iter().find_map(|x| ivar_assign_ty(x, name)),
+                _ => None,
+            }
+        }
+        match ivar_assign_ty(&init.body, "keys") {
+            Some(Ty::Array { elem }) => assert!(
+                matches!(elem.as_ref(), Ty::Str),
+                "expected Array[String], got Array[{elem:?}]"
+            ),
+            other => panic!("@keys = [] must carry Array[String], got {other:?}"),
+        }
+        match ivar_assign_ty(&init.body, "vals") {
+            Some(Ty::Array { elem }) => assert!(
+                matches!(elem.as_ref(), Ty::Str),
+                "expected Array[String], got Array[{elem:?}]"
+            ),
+            other => panic!("@vals = [] must carry Array[String], got {other:?}"),
+        }
     }
 }

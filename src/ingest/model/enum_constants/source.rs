@@ -1,7 +1,7 @@
 //! Prism declaration collection and lexical traversal. Use-context syntax is
 //! classified separately; only policy interprets the resulting typed facts.
 
-use super::super::super::util::{constant_id_str, flatten_statements, string_value};
+use super::super::super::util::{constant_id_str, flatten_statements, symbol_or_string_value};
 use super::super::super::{expr, library_class, prism};
 use super::{
     EnumConstant, EnumConstants, ScopedName, SourceFact, SurfaceUse, ValueContext, context,
@@ -176,7 +176,11 @@ impl EnumConstants {
                             }
                         })
                         .or_insert(value);
-                    if node.as_class_node().is_some() {
+                    // Classes and modules both own lexical constant
+                    // lookup — concern `TYPES` inside `included do`
+                    // resolves through the module entry the same way a
+                    // model class resolves `STATUS` for `enum`.
+                    if node.as_class_node().is_some() || node.as_module_node().is_some() {
                         self.constants.nesting.insert(
                             (self.file.to_string(), node.location().start_offset()),
                             std::iter::once(name.clone())
@@ -256,13 +260,16 @@ impl EnumConstants {
                 }
                 _ => Some(value),
             };
+            // `%w[…]` strings and `%i[…]` / `[:A, :B]` symbols — same
+            // label list `enum_label_values` admits for class-local consts.
             let labels = literal.filter(|_| direct).and_then(|node| {
                 node.as_array_node()?
                     .elements()
                     .iter()
                     .enumerate()
                     .map(|(i, el)| {
-                        string_value(&el).map(|label| (label, Literal::Int { value: i as i64 }))
+                        symbol_or_string_value(&el)
+                            .map(|label| (label, Literal::Int { value: i as i64 }))
                     })
                     .collect()
             });

@@ -159,6 +159,20 @@ impl EmitCtx {
         child.declared = Rc::new(RefCell::new(snapshot));
         child
     }
+
+    /// Value-position IIFE body (`func() T { … }()`). Cleared of
+    /// `void_method` so string/ternary tails emit `return "…"`, even
+    /// when the enclosing Ruby method is `() -> void` (e.g. `send_data`
+    /// assigning `disp = cond ? "inline" : "attachment"`). Also clears
+    /// `return_ty` so branch returns are not coerced to the outer
+    /// method's type (a string IIFE inside an `Int`-returning method
+    /// must not emit `return int64("…")`).
+    pub fn value_iife(&self) -> Self {
+        let mut child = self.enter_scope();
+        child.void_method = false;
+        child.return_ty = None;
+        child
+    }
 }
 
 /// Render a Go expression in its declaration context, selecting whole-call primitives first.
@@ -1126,7 +1140,7 @@ pub(super) fn emit_send(
         let value = &args[0];
         let v = if matches!(&*value.node, ExprNode::If { .. } | ExprNode::Case { .. }) {
             let ret_ty = super::ty::go_ty_stub(value.ty.as_ref());
-            let body = emit_return_body(ctx, value);
+            let body = emit_return_body(&ctx.value_iife(), value);
             let indented = body
                 .lines()
                 .map(|l| format!("\t{l}"))
@@ -2635,7 +2649,7 @@ fn emit_assign(ctx: &EmitCtx, target: &crate::expr::LValue, value: &Expr) -> Str
         // above — using the narrow type lets the resulting assignment
         // typecheck against typed slots without callsite assertion.
         let ret_ty = super::ty::go_ty_stub(value.ty.as_ref());
-        let body = emit_return_body(ctx, value);
+        let body = emit_return_body(&ctx.value_iife(), value);
         let indented = body
             .lines()
             .map(|l| format!("\t{l}"))
@@ -3216,6 +3230,16 @@ fn is_known_class_method(name: &str) -> bool {
         // The value half of the Dirty read surface, called by the
         // synthesized `<col>_previously_was` readers.
         | "attribute_previously_was"
+        // Rails' implicit `protect_from_forgery` preamble emits a bare
+        // `verify_authenticity_token` on Self. Controllers inherit it
+        // via Go embedding of Base, so it is absent from the subclass
+        // `self_methods` set — without parens, `go vet` flags
+        // `self.VerifyAuthenticityToken` as an unused method value.
+        | "verify_authenticity_token"
+        // NOTE: do NOT force-parens `performed?` — Base emits it as the
+        // `Performed` struct field (trivial ivar reader), so the call
+        // site must stay a bare field read (`self.Performed`), not
+        // `self.PerformedPred()`.
     )
 }
 
@@ -3421,7 +3445,7 @@ pub(super) fn emit_return_body(ctx: &EmitCtx, e: &Expr) -> String {
 pub(super) fn emit_expr_as_value(ctx: &EmitCtx, e: &Expr) -> String {
     if matches!(&*e.node, ExprNode::If { .. } | ExprNode::Case { .. }) {
         let ret_ty = super::ty::go_ty_stub(e.ty.as_ref());
-        let body = emit_return_body(ctx, e);
+        let body = emit_return_body(&ctx.value_iife(), e);
         let indented = body
             .lines()
             .map(|l| format!("\t{l}"))

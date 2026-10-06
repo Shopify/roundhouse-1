@@ -35,8 +35,8 @@
 //! rather than onto the new record, which is a different rewrite with an
 //! assignment in it; it lands when a fixture demands it, the way HABTM
 //! does in `associations`. `reload_<assoc>` is likewise absent — the
-//! reader re-queries on every call here, so a reload has nothing to
-//! invalidate, and inventing it would imply a cache that does not exist.
+//! reader has a load-once cache for writer/preload, but no reload
+//! helper clears it yet; inventing one without a fixture is premature.
 
 use crate::app::App;
 use crate::dialect::Association;

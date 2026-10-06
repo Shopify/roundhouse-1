@@ -185,6 +185,8 @@ pub fn synthesize_record_model(app: &mut App) {
         enums: indexmap::IndexMap::new(),
         enum_defaults: indexmap::IndexMap::new(),
         visibility_overrides: Vec::new(),
+        class_attr_defaults: indexmap::IndexMap::new(),
+        lexical_json_shadow: false,
     });
 }
 

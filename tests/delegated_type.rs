@@ -1,5 +1,6 @@
 //! `delegated_type :role, types: …` as a general Active Record pattern.
-//! Documented options (`types:`, `dependent: :destroy`, `foreign_key`,
+//! Documented options (`types:` as literal or compile-time constant /
+//! concern-constant, `dependent: :destroy`, `foreign_key`,
 //! `foreign_type`, `primary_key`, `optional:`) — not a named-app spelling.
 
 use std::collections::HashMap;
@@ -246,6 +247,143 @@ fn included_do_delegated_type_ingests() {
     assert!(inst.iter().any(|n| n == "message?"), "{inst:?}");
 }
 
+/// Class-local `TYPES = %w[…]` then `types: TYPES` — compile-time constant.
+#[test]
+fn class_local_types_constant_ingests() {
+    let app = entry_app(
+        "  TYPES = %w[ Message Comment ]\n  delegated_type :entryable, types: TYPES\n",
+    );
+    let inst = instance_names(&app, "Entry");
+    assert!(inst.iter().any(|n| n == "message?"), "{inst:?}");
+    assert!(inst.iter().any(|n| n == "comment?"), "{inst:?}");
+    let sc = scopes(&app, "Entry");
+    assert!(sc.iter().any(|n| n == "messages"), "{sc:?}");
+}
+
+/// Documented freeze / array spellings for the same constant fold.
+#[test]
+fn frozen_and_string_array_types_constants_ingest() {
+    for body in [
+        "  TYPES = %w[ Message Comment ].freeze\n  delegated_type :entryable, types: TYPES\n",
+        "  TYPES = %w[ Message Comment ]\n  delegated_type :entryable, types: TYPES.freeze\n",
+        "  TYPES = [\"Message\", \"Comment\"]\n  delegated_type :entryable, types: TYPES\n",
+        "  TYPES = %i[Message Comment]\n  delegated_type :entryable, types: TYPES\n",
+    ] {
+        let app = entry_app(body);
+        let inst = instance_names(&app, "Entry");
+        assert!(
+            inst.iter().any(|n| n == "message?") && inst.iter().any(|n| n == "comment?"),
+            "failed for {body:?}: {inst:?}"
+        );
+    }
+}
+
+/// Concern-module `%i[…]` constant — EnumConstants must fold symbols
+/// the same way class-local `enum_label_values` does for `%w` / `%i`.
+#[test]
+fn concern_percent_i_types_constant_ingests() {
+    let app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/entryable.rb",
+            "module Entryable\n  extend ActiveSupport::Concern\n  TYPES = %i[Message Comment]\n  included do\n    has_one :entry, as: :entryable\n  end\nend\n",
+        ),
+        (
+            "app/models/entry.rb",
+            "class Entry < ApplicationRecord\n  delegated_type :entryable, types: Entryable::TYPES, dependent: :destroy\nend\n",
+        ),
+        (
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  include Entryable\nend\n",
+        ),
+        (
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  include Entryable\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let inst = instance_names(&app, "Entry");
+    for name in ["message?", "comment?", "destroy_entryable"] {
+        assert!(inst.iter().any(|n| n == name), "{name} missing from {inst:?}");
+    }
+}
+
+/// Concern-module constant `types: Entryable::TYPES`.
+#[test]
+fn concern_constant_types_ingests() {
+    let app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/entryable.rb",
+            "module Entryable\n  extend ActiveSupport::Concern\n  TYPES = %w[ Message Comment ]\n  included do\n    has_one :entry, as: :entryable\n  end\nend\n",
+        ),
+        (
+            "app/models/entry.rb",
+            "class Entry < ApplicationRecord\n  delegated_type :entryable, types: Entryable::TYPES, dependent: :destroy\nend\n",
+        ),
+        (
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  include Entryable\nend\n",
+        ),
+        (
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  include Entryable\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let inst = instance_names(&app, "Entry");
+    for name in ["message?", "comment?", "message", "comment", "entryable_class", "destroy_entryable"] {
+        assert!(inst.iter().any(|n| n == name), "{name} missing from {inst:?}");
+    }
+    let sc = scopes(&app, "Entry");
+    assert!(sc.iter().any(|n| n == "messages"), "{sc:?}");
+    assert!(sc.iter().any(|n| n == "comments"), "{sc:?}");
+}
+
+/// `included do` with bare / qualified concern constant `types:`.
+#[test]
+fn included_do_types_constant_ingests() {
+    let app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        (
+            "app/models/concerns/entryable_owner.rb",
+            "module EntryableOwner\n  extend ActiveSupport::Concern\n  TYPES = %w[ Message Comment ]\n  included do\n    delegated_type :entryable, types: TYPES\n  end\nend\n",
+        ),
+        (
+            "app/models/entry.rb",
+            "class Entry < ApplicationRecord\n  include EntryableOwner\nend\n",
+        ),
+        (
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  has_one :entry, as: :entryable\nend\n",
+        ),
+        (
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  has_one :entry, as: :entryable\nend\n",
+        ),
+    ]))
+    .expect("ingest");
+    let inst = instance_names(&app, "Entry");
+    assert!(inst.iter().any(|n| n == "message?"), "{inst:?}");
+}
+
+/// Unresolvable or non-class-name constants fail closed.
+#[test]
+fn unresolvable_or_non_class_types_constant_stays_unexpanded() {
+    let missing = entry_app("  delegated_type :entryable, types: Missing::TYPES\n");
+    let inst = instance_names(&missing, "Entry");
+    assert!(!inst.iter().any(|n| n == "message?"), "{inst:?}");
+
+    let enumish = entry_app(
+        "  STATES = %w[ draft active ]\n  delegated_type :entryable, types: STATES\n",
+    );
+    let inst = instance_names(&enumish, "Entry");
+    assert!(
+        !inst.iter().any(|n| n == "draft?"),
+        "enum-style labels must not expand as delegated types: {inst:?}"
+    );
+}
+
 /// `dependent: :nullify` (and other non-destroy values) stay unexpanded
 /// so the unsupported ledger remains honest.
 #[test]
@@ -392,6 +530,60 @@ puts "delegated_type namespaced optional passed"
 }
 
 #[test]
+fn emitted_concern_constant_types_runs() {
+    runtime_app()
+        .write(
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "entries", force: :cascade do |t|
+    t.string "entryable_type"
+    t.integer "entryable_id"
+  end
+  create_table "messages", force: :cascade do |t|
+    t.string "subject"
+  end
+  create_table "comments", force: :cascade do |t|
+    t.string "content"
+  end
+end
+"#,
+        )
+        .write(
+            "app/models/entryable.rb",
+            "module Entryable\n  extend ActiveSupport::Concern\n  TYPES = %w[ Message Comment ]\n  included do\n    has_one :entry, as: :entryable, dependent: :destroy\n  end\nend\n",
+        )
+        .write(
+            "app/models/entry.rb",
+            "class Entry < ApplicationRecord\n  delegated_type :entryable, types: Entryable::TYPES, dependent: :destroy\nend\n",
+        )
+        .write(
+            "app/models/message.rb",
+            "class Message < ApplicationRecord\n  include Entryable\nend\n",
+        )
+        .write(
+            "app/models/comment.rb",
+            "class Comment < ApplicationRecord\n  include Entryable\nend\n",
+        )
+        .run_ruby(
+            r#"
+msg = Message.create!(subject: "hello")
+entry = Entry.create!(entryable: msg)
+raise "predicate" unless entry.message?
+raise "typed reader" unless entry.message.subject == "hello"
+raise "types" unless Entry.entryable_types == ["Message", "Comment"]
+raise "scope" unless Entry.messages.where(id: entry.id).exists?
+c = Comment.create!(content: "hi")
+entry.entryable = c
+raise "reassign" unless entry.comment?
+entry.destroy
+raise "dependent destroy" if Comment.find_by(id: c.id)
+puts "delegated_type concern-constant types passed"
+"#,
+        )
+        .assert_passes();
+}
+
+#[test]
 fn emitted_foreign_key_type_and_primary_key_runs() {
     runtime_app()
         .write(
@@ -430,3 +622,4 @@ puts "delegated_type foreign_key foreign_type primary_key passed"
         )
         .assert_passes();
 }
+

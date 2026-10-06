@@ -1158,6 +1158,11 @@ end
             set_index.contains("header_key_ok_pred(Some("),
             "header_key_ok? takes String?, wrap &str:\n{set_index}"
         );
+        let key_at = method_body(&src, "key_at");
+        assert!(
+            !key_at.contains(".map("),
+            "keys[i].to_s on Array[String] must not Option-map a plain String:\n{key_at}"
+        );
         let val_at = method_body(&src, "val_at");
         assert!(
             val_at.contains("unwrap_or_default()"),

@@ -7,7 +7,9 @@
 //! → `NameError` at boot. This suite pins the storage-side fix:
 //! model in `app.models`, table `action_text_markdowns`, attr `content`.
 //!
-//! Does **not** claim `has_markdown`, Page `#body`, renderer, or uploads.
+//! Does **not** claim `has_markdown`, Page `#body`, or uploads.
+//! Optioned `mattr_accessor :renderer, default:` is claimed (class +
+//! instance readers); bare `mattr_accessor :renderer` also expands.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -162,10 +164,9 @@ end
 }
 
 #[test]
-fn optioned_mattr_on_a_model_does_not_fail_ingest() {
-    // Writebook's ActionText::Markdown uses `mattr_accessor :renderer, default:`.
-    // Expanding without the initializer would drop the default; erroring
-    // turns existing unresolved sends into ingest-gap Infos. Leave unknown.
+fn optioned_mattr_on_a_model_expands_with_its_default() {
+    // `mattr_accessor :renderer, default:` must synthesize the reader and
+    // keep the initializer — expanding without the seed was the old refuse.
     let app = ingest(&[
         ("db/schema.rb", SCHEMA),
         ("app/models/application_record.rb", APPLICATION_RECORD),
@@ -185,12 +186,18 @@ end
         .find(|m| m.name.0.as_str() == "ActionText::Markdown")
         .expect("still a model");
     assert!(
-        !md.body.iter().any(|item| matches!(
+        md.body.iter().any(|item| matches!(
             item,
             roundhouse::dialect::ModelBodyItem::Method { method, .. }
                 if method.name.as_str() == "renderer"
+                    && method.receiver == roundhouse::dialect::MethodReceiver::Class
         )),
-        "optioned mattr must not synthesize a reader that drops default:"
+        "optioned mattr must synthesize a class reader"
+    );
+    assert!(
+        md.class_attr_defaults.contains_key(&roundhouse::Symbol::from("renderer")),
+        "default: must seed class_attr_defaults, got {:?}",
+        md.class_attr_defaults.keys().map(|k| k.as_str()).collect::<Vec<_>>()
     );
 }
 

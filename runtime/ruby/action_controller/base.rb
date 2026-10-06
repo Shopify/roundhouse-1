@@ -5,7 +5,14 @@ require_relative "../action_view"
 module ActionController
   # One-slot array so class-level CSRF state is a store every target
   # can index, not a `self` ivar or `class << self` writer.
-  FORGERY_SLOT = [true]
+  #
+  # Default OFF: extras transpile this file without
+  # `authenticity_token.rb` (empty `masked_authenticity_token` stub),
+  # so fail-closed CSRF turns every POST into 422. The ruby-family
+  # reopen in authenticity_token.rb flips the flag on when the real
+  # masked-token implementation is present. Tests that need the check
+  # set `allow_forgery_protection = true` explicitly.
+  FORGERY_SLOT = [false]
 
   def self.forgery_flag
     FORGERY_SLOT[0] == true
@@ -78,27 +85,41 @@ module ActionController
       s = s.gsub(REDIRECT_LINE_BREAK_PATTERN, REDIRECT_LINE_BREAKS)
     end
     s = s.tr("\\", "/")
-    # No `break`: go/typescript emit cannot lower it (MCP wont_lower
-    # and the TS real-blog gate both flagged this walk).
-    keep = true
-    while keep && s.length > 0
-      c = s[0, 1].to_s
-      if c == " " || header_control?(c)
-        s = s[1, s.length].to_s
-      else
-        keep = false
-      end
-    end
-    keep = true
-    while keep && s.length > 0
-      c = s[s.length - 1, 1].to_s
-      if c == " " || header_control?(c)
-        s = s[0, s.length - 1].to_s
-      else
-        keep = false
-      end
-    end
+    # Index-walk strip helpers (one counter while each). Not
+    # `while keep && …` (Elixir BoolOp) and not two whiles in this
+    # method (while_to_recursion allows one top-level while per method).
+    s = strip_leading_controls(s)
+    s = strip_trailing_controls(s)
     s
+  end
+
+  def self.strip_leading_controls(s)
+    # Index walk — not per-char recursion (stack-safe on long pads).
+    # Canonical counter `while` so Elixir while_to_recursion applies:
+    # early return when a kept char is found; trailing `i += 1` step.
+    n = s.length
+    i = 0
+    while i < n
+      c = s[i, 1].to_s
+      if !(c == " " || header_control?(c))
+        return s[i, n - i].to_s
+      end
+      i += 1
+    end
+    ""
+  end
+
+  def self.strip_trailing_controls(s)
+    n = s.length
+    i = n
+    while i > 0
+      c = s[i - 1, 1].to_s
+      if !(c == " " || header_control?(c))
+        return s[0, i].to_s
+      end
+      i -= 1
+    end
+    ""
   end
 
   # Host of an absolute URL (`http://h/path`), or "" when the value is
@@ -569,11 +590,14 @@ module ActionController
     # `authenticity_token` or `X-CSRF-Token`. An empty session token
     # matches nothing (fail closed). Tests set
     # `allow_forgery_protection = false`.
+    #
+    # No trailing `nil`: Elixir's mutation-threaded emit would assign
+    # the `unless`/`render` result to `record` and then discard it,
+    # tripping `--warnings-as-errors` on an unused variable.
     def verify_authenticity_token
       unless verified_request?
         render "<h1>422 Unprocessable Content</h1>", status: :unprocessable_content
       end
-      nil
     end
 
     def verified_request?
@@ -581,7 +605,11 @@ module ActionController
       verb = @request_method.to_s
       return true if verb == "" || verb == "GET" || verb == "HEAD"
       expected = session[:_csrf_token].to_s
-      return true if ActionController.csrf_token_valid?(params["authenticity_token"].to_s, expected)
+      # `.fetch(k, "")` — not bare `params[k]`. Crystal Hash#[] raises
+      # KeyError on a missing key; Python's `.get(k)` returns None and
+      # `.to_s` then AttributeErrors. Cross-target nil-safe read.
+      token = params.fetch("authenticity_token", "")
+      return true if ActionController.csrf_token_valid?(token.to_s, expected)
       ActionController.csrf_token_valid?(csrf_header_token, expected)
     end
 

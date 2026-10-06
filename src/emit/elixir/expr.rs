@@ -852,6 +852,13 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 return s;
             }
         }
+        // Mutable SCREAMING_SNAKE constants (`FORGERY_SLOT[0] = …`) —
+        // module attributes are compile-time only, so index assign/
+        // read go through the process dictionary with the attribute
+        // as the unset default.
+        if let Some(s) = emit_const_slot_send(r, method, args) {
+            return s;
+        }
     }
 
     // Ruby stdlib module calls (`Base64`, `JSON`) → their Elixir
@@ -905,9 +912,10 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
         return "__MODULE__".to_string();
     }
 
-    // `recv.__index_put__(k, v)` (from local_accumulation's `x[k]=v`)
-    // rendered by receiver type: a struct routes to its `put` setter,
-    // a map (or unknown) to `Map.put`.
+    // `recv.__index_put__(k, v)` (from local_accumulation's `x[k]=v`
+    // and mutation_to_struct_return's `@x[k]=v`) rendered by receiver
+    // type: a struct routes to its `put` setter; an Int-indexed write
+    // is a List slot (`List.replace_at`); otherwise Map.put.
     if method == "__index_put__" && args.len() == 2 {
         if let Some(r) = recv {
             let r_s = emit_expr(r);
@@ -915,6 +923,18 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
             if let Some(crate::ty::Ty::Class { id, .. }) = r.ty.as_ref() {
                 let module = super::library::v2_module_name(id.0.as_str());
                 return format!("{module}.put({r_s}, {k}, {v})");
+            }
+            // Array slot write: HeaderStore `@vals[i] = value` and similar.
+            // Int index → List; Hash key → Map.
+            let index_is_int = matches!(
+                args[0].ty.as_ref(),
+                Some(crate::ty::Ty::Int)
+            ) || matches!(
+                effective_recv_ty(r),
+                Some(crate::ty::Ty::Array { .. })
+            );
+            if index_is_int {
+                return format!("List.replace_at({r_s}, {k}, {v})");
             }
             return format!("Map.put({r_s}, {k}, {v})");
         }
@@ -1565,7 +1585,7 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                     format!("{fname}(record, {})", arg_strs.join(", "))
                 };
             }
-            format!("{}({})", method, arg_strs.join(", "))
+            format!("{fname}({})", arg_strs.join(", "))
         }
         Some(r) => {
             let r_s = emit_expr(r);
@@ -2062,6 +2082,35 @@ fn emit_ivar_state_send(name: &str, method: &str, args: &[Expr]) -> Option<Strin
             Some(format!("Map.get({get}, {}, {})", emit_expr(&args[0]), emit_expr(&args[1])))
         }
         ("fetch", 1) => Some(format!("Map.fetch!({get}, {})", emit_expr(&args[0]))),
+        _ => None,
+    }
+}
+
+/// Mutable declared module constants used as array slots
+/// (`FORGERY_SLOT[0] = value`). Module attributes cannot be reassigned
+/// at runtime — mirror the ivar path through `Process` with the
+/// attribute as the default so reads see writes.
+fn emit_const_slot_send(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
+    let ExprNode::Const { path } = &*recv.node else {
+        return None;
+    };
+    if path.len() != 1 || !is_screaming_snake(path[0].as_str()) {
+        return None;
+    }
+    let name = path[0].as_str();
+    if !DECLARED_CONSTANTS.with(|c| c.borrow().contains(name)) {
+        return None;
+    }
+    let attr = format!("@{}", name.to_lowercase());
+    let key = format!(":rh_const_{}", name.to_lowercase());
+    let get = format!("Process.get({key}, {attr})");
+    match (method, args.len()) {
+        ("[]=", 2) => Some(format!(
+            "Process.put({key}, List.replace_at({get}, {}, {}))",
+            emit_expr(&args[0]),
+            emit_expr(&args[1])
+        )),
+        ("[]", 1) => Some(format!("Enum.at({get}, {})", emit_expr(&args[0]))),
         _ => None,
     }
 }

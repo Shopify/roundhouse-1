@@ -71,13 +71,24 @@ enum SourceFact {
 #[derive(Default)]
 pub(in crate::ingest) struct EnumConstants {
     values: std::collections::HashMap<String, EnumConstant>,
-    pub(super) nesting: std::collections::HashMap<(String, usize), Vec<String>>,
+    /// Lexical owners at each class/module open, keyed by (file, start).
+    /// Concern `included do` resolution reads the same table models use.
+    pub(in crate::ingest) nesting: std::collections::HashMap<(String, usize), Vec<String>>,
     /// Superclass identities are lookup barriers, never additional enum inputs.
     parents: std::collections::HashMap<String, Vec<ScopedName>>,
     facts: Vec<SourceFact>,
 }
 
 impl EnumConstants {
+    /// True when any lexical owner defines a `JSON` constant that would
+    /// win bare `JSON` lookup inside that nest (e.g. `Admin::JSON` for
+    /// `module Admin; class Article`).
+    pub(in crate::ingest) fn shadows_bare_json(&self, lexical_owners: &[String]) -> bool {
+        lexical_owners
+            .iter()
+            .any(|owner| self.values.contains_key(&format!("{owner}::JSON")))
+    }
+
     /// Only already-consumed original Ruby can add mutation facts here.
     /// Declaration admission remains the prepass's input roots. Revalidate
     /// enum declarations only: no model replacement or unrelated diagnostics.
@@ -178,7 +189,7 @@ impl EnumConstants {
         true
     }
 
-    pub(super) fn resolve(
+    pub(in crate::ingest) fn resolve(
         &self,
         node: &Node<'_>,
         owners: &[String],

@@ -124,7 +124,7 @@ fn ingest_rewritten_body(
     let program = parsed.node().as_program_node()?;
     for stmt in program.statements().body().iter() {
         absorb_items(
-            ingest_model_body_items(&stmt, owner, file, Vec::new()).ok()?,
+            ingest_model_body_items(&stmt, owner, file, Vec::new(), None).ok()?,
             methods,
             items,
         );

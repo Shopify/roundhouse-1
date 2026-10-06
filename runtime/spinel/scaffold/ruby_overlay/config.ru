@@ -17,6 +17,19 @@ require_relative "runtime/gzip_cache"
 
 Main.configure_default_adapter!
 
+# Every WebSocket client holds a socket, and all of them live in this
+# process. At the soft RLIMIT_NOFILE most environments start with — 1024,
+# including Docker's default (soft 1024, hard 524288) — the 1,000-client tier
+# stops at ~991 connections: accept() fails with EMFILE and nothing else is
+# served. Raise the soft limit to the hard one, as Go's runtime does at
+# startup and as the once-campfire Ruby port's server does. A runtime that
+# cannot (or a hard limit already reached) keeps what it has.
+begin
+  soft, hard = Process.getrlimit(:NOFILE)
+  Process.setrlimit(:NOFILE, hard, hard) if soft < hard
+rescue NotImplementedError, Errno::EPERM, Errno::EINVAL
+end
+
 # Serving, so WAL checkpoints move off the request path: each process
 # that serves runs them on a background thread instead of inside some
 # request's COMMIT (Db.checkpoint_in_background!).

@@ -833,9 +833,28 @@ fn rewrite_expr(e: &Expr) -> Expr {
         // [v]}`. On mutable targets the accessor returns the @errors Array
         // and `<<` mutates it in place; the functional equivalent threads
         // a struct-update append (the accessor name is the field name).
+        //
+        // Same for `@arr << v` (HeaderStore `@keys << key`): ivar recv,
+        // not an accessor Send.
         ExprNode::Send { recv: Some(r), method, args, .. }
             if method.as_str() == "<<" && args.len() == 1 =>
         {
+            if let ExprNode::Ivar { name } = &*r.node {
+                let appended = syn(ExprNode::Send {
+                    recv: Some(field_read(name)),
+                    method: Symbol::from("++"),
+                    args: vec![syn(ExprNode::Array {
+                        elements: vec![rewrite_expr(&args[0])],
+                        style: ArrayStyle::Brackets,
+                    })],
+                    block: None,
+                    parenthesized: false,
+                });
+                return syn(ExprNode::Assign {
+                    target: LValue::Var { id: VarId(0), name: Symbol::from(RECORD) },
+                    value: struct_put(name, appended),
+                });
+            }
             if let ExprNode::Send { recv: ar, method: field, args: fargs, .. } = &*r.node {
                 if fargs.is_empty()
                     && ar.as_ref().is_none_or(|x| matches!(&*x.node, ExprNode::SelfRef))
@@ -1079,10 +1098,14 @@ fn mutates_record(e: &Expr) -> bool {
             found = true
         }
         // `errors << v` — `<<` onto a bareword/self list accessor.
+        // `@arr << v` — same for a direct ivar (HeaderStore `@keys << key`).
+        // rewrite_expr already rebinds both; classification must match.
         ExprNode::Send { recv: Some(r), method, args, .. }
             if method.as_str() == "<<" && args.len() == 1 =>
         {
-            if let ExprNode::Send { recv: ar, method: _, args: fargs, .. } = &*r.node {
+            if matches!(&*r.node, ExprNode::Ivar { .. }) {
+                found = true;
+            } else if let ExprNode::Send { recv: ar, method: _, args: fargs, .. } = &*r.node {
                 if fargs.is_empty()
                     && ar.as_ref().is_none_or(|x| matches!(&*x.node, ExprNode::SelfRef))
                 {
@@ -1553,6 +1576,50 @@ mod tests {
         assert!(
             ex.contains("%{record | errors: record.errors ++ [\"oops\"]}"),
             "errors << → struct append:\n{ex}"
+        );
+    }
+
+    #[test]
+    fn ivar_shovel_classifies_as_record_mutation() {
+        // HeaderStore `@keys << key` — rewrite_expr rebinds, and
+        // mutates_record must agree so compute_registry / trailing
+        // `record` return fire for a body that only appends.
+        let push = send(
+            Some(syn(ExprNode::Ivar { name: sym("keys") })),
+            "<<",
+            vec![vr("key")],
+        );
+        let body = syn(ExprNode::Seq { exprs: vec![push] });
+        assert!(
+            mutates_record(&body),
+            "@keys << key must count as a record mutation"
+        );
+        let ex = render_via_elixir(vec![tx(instance_method("add_key", &["key"], body))]);
+        assert!(
+            ex.contains("%{record | keys: record.keys ++ [key]}"),
+            "@keys << → struct append:\n{ex}"
+        );
+    }
+
+    #[test]
+    fn local_shovel_does_not_classify_as_record_mutation() {
+        // Unsupported `<<` shape (bare local) — classifier leaves it
+        // alone; emitter keeps the dynamic send rather than a struct
+        // update.
+        let push = send(Some(vr("arr")), "<<", vec![vr("key")]);
+        let body = syn(ExprNode::Seq { exprs: vec![push] });
+        assert!(
+            !mutates_record(&body),
+            "local arr << key must not count as a record mutation"
+        );
+        let ex = render_via_elixir(vec![tx(instance_method("push_local", &["arr", "key"], body))]);
+        assert!(
+            !ex.contains("%{record |"),
+            "unsupported << must not become a struct update:\n{ex}"
+        );
+        assert!(
+            ex.contains("<<") || ex.contains("arr"),
+            "dynamic << path preserved:\n{ex}"
         );
     }
 
