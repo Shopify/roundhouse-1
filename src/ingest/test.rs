@@ -17,7 +17,8 @@ use super::library_class::{
     ingest_library_method, library_class_from_node, library_class_from_node_with_scope,
 };
 use super::util::{
-    class_name_path, constant_id_str, constant_path_of, flatten_statements, module_name_path,
+    class_name_path, constant_id_str, constant_path_is_rooted, constant_path_of, flatten_statements,
+    module_name_path,
 };
 use super::{IngestError, IngestResult};
 
@@ -99,6 +100,14 @@ fn ingest_test_class(
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
+    let parent_span = class
+        .superclass()
+        .filter(|n| !n.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p)))
+        .map(|n| Span {
+            file: super::sources::file_id(file),
+            start: n.location().start_offset() as u32,
+            end: n.location().end_offset() as u32,
+        });
 
     // Rails convention: `ArticleTest` tests `Article`. Strip the `Test`
     // suffix off the last name-path segment. Unusual naming → None.
@@ -277,6 +286,7 @@ fn ingest_test_class(
     Ok(TestModule {
         name,
         parent,
+        parent_span,
         target,
         tests,
         setup,
@@ -942,5 +952,24 @@ end
         let helpers: Vec<&str> =
             tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
         assert_eq!(helpers, ["Fakes::Client"]);
+    }
+}
+
+/// A test class's superclass is a name Ruby resolves in the modules
+/// around the class: `class SkiplistTest < TestCase` inside `module
+/// SqliteTestCompat` subclasses the `SqliteTestCompat::TestCase` the
+/// helper defines. Where Rubydex resolves the written name to a test
+/// class the app defines, that class is the parent, so the emitted
+/// file loads it and the analyzer inherits its helpers. Any other
+/// parent keeps its written path.
+pub(super) fn resolve_test_parents(app: &mut crate::App) {
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let defined: std::collections::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
+    for tm in &mut app.test_modules {
+        let (Some(span), Some(parent)) = (tm.parent_span, &tm.parent) else { continue };
+        let path: Vec<Symbol> = parent.0.as_str().split("::").map(Symbol::from).collect();
+        if let Some(id) = resolver.namespace(span, &path).filter(|id| defined.contains(*id)) {
+            tm.parent = Some(id.clone());
+        }
     }
 }

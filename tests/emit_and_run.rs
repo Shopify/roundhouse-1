@@ -7380,3 +7380,143 @@ fn a_transaction_with_options_is_refused() {
         assert!(errors.iter().any(|e| e.contains("`transaction` with options")), "{target:?}: {errors:?}");
     }
 }
+
+// Constants written in a test body. Test bodies are typed by the same
+// constant resolver as the app's code, but nothing reported what it
+// could not resolve there: `assert_raises(Missing)` checked clean and
+// the emitted test died on a NameError.
+
+const CONSTANT_WIDGET: &str = "class Widget\n  class Broken < StandardError; end\n\n  def self.boom\n    raise Broken, \"boom\"\n  end\n\n  def self.missing\n    raise ActiveRecord::RecordNotFound, \"none\"\n  end\n\n  def self.parse(text)\n    Integer(text)\n  end\nend\n";
+const CONSTANT_ORDER: &str = "module Shop\n  class Order\n    class Late < StandardError; end\n\n    def self.check\n      raise Late, \"late\"\n    end\n  end\nend\n";
+
+/// The constant errors `check` reports for a test file, each as the
+/// source text its span covers and its message.
+fn test_constant_errors(test_path: &str, test: &str) -> Vec<(String, String)> {
+    let tree = [
+        ("app/models/widget.rb", CONSTANT_WIDGET),
+        ("app/models/shop/order.rb", CONSTANT_ORDER),
+        ("test/test_helper.rb", "require \"active_support\"\n"),
+        (test_path, test),
+    ];
+    let tree = tree.into_iter().map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec())).collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let lower = roundhouse::session::analyze_and_lower(&mut app);
+    roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .chain(lower)
+        .filter(|d| d.severity == roundhouse::diagnostic::Severity::Error)
+        .map(|d| {
+            let source = &app.sources[d.span.file.0 as usize - 1];
+            assert!(source.path.ends_with(test_path), "{} at {}", d.message, source.path);
+            (source.text[d.span.start as usize..d.span.end as usize].to_string(), d.message)
+        })
+        .collect()
+}
+
+fn in_a_test(statements: &str) -> String {
+    format!("require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  test \"x\" do\n    {statements}\n  end\nend\n")
+}
+
+/// A constant nothing defines, wherever a test body writes it, is an
+/// error at the name as written.
+#[test]
+fn an_unresolved_constant_in_a_test_body_is_refused_where_it_is_written() {
+    let test = "test/models/widget_test.rb";
+    let mut misses = Vec::new();
+    for (source, name) in [
+        (in_a_test("assert_raises(Nope) { Widget.boom }"), "Nope"),
+        (in_a_test("assert_raises(Widget::Broken, Nope) { Widget.boom }"), "Nope"),
+        (in_a_test("begin\n      Widget.boom\n    rescue Nope => e\n      assert e\n    end"), "Nope"),
+        (in_a_test("begin\n      Widget.boom\n    rescue Widget::Missing\n      assert true\n    end"), "Widget::Missing"),
+        (in_a_test("assert_raises(::Nope) { Widget.boom }"), "::Nope"),
+        (in_a_test("assert_equal 1, Nope.size"), "Nope"),
+        ("require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  setup do\n    @widget = Nope.new\n  end\n\n  test \"x\" do\n    assert @widget\n  end\nend\n".to_string(), "Nope"),
+        ("require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  def build\n    Nope.new\n  end\n\n  test \"x\" do\n    assert build\n  end\nend\n".to_string(), "Nope"),
+        ("require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  LIMIT = Nope::MAX\n\n  test \"x\" do\n    assert LIMIT\n  end\nend\n".to_string(), "Nope::MAX"),
+        ("require \"test_helper\"\n\nmodule Shop\n  class OrderTest < ActiveSupport::TestCase\n    test \"x\" do\n      assert_raises(Order::Missing) { Order.check }\n    end\n  end\nend\n".to_string(), "Order::Missing"),
+    ] {
+        // A constant assigned from it is unresolved too, where it is read.
+        let errors = test_constant_errors(test, &source);
+        if !errors.iter().any(|(at, _)| at == name) || !errors.iter().all(|(_, message)| message.contains("constant not supported")) {
+            misses.push(format!("{name}: {errors:?}\n{source}"));
+        }
+    }
+    assert!(misses.is_empty(), "{} of 10 not refused at the name:\n{}", misses.len(), misses.join("\n"));
+}
+
+/// Every name a test body resolves, as Ruby resolves it: nested in an
+/// app class, rooted, the framework's and Ruby's own exceptions, the
+/// test class's own class and constant, and a name found through the
+/// module enclosing the test class. Checks clean and runs.
+#[test]
+fn resolved_constants_in_a_test_body_check_clean_and_run() {
+    let widget_test = "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  class Local < StandardError; end\n  LIMIT = 3\n\n  test \"an app constant nested in its class\" do\n    error = assert_raises(Widget::Broken) { Widget.boom }\n    assert_equal \"boom\", error.message\n  end\n\n  test \"a rooted name\" do\n    assert_raises(::Widget::Broken) { Widget.boom }\n    begin\n      Widget.boom\n    rescue ::Widget::Broken => e\n      assert_equal \"boom\", e.message\n    end\n  end\n\n  test \"a framework exception\" do\n    error = assert_raises(ActiveRecord::RecordNotFound) { Widget.missing }\n    assert_equal \"none\", error.message\n  end\n\n  test \"a core exception\" do\n    assert_raises(ArgumentError) { Widget.parse(\"x\") }\n  end\n\n  test \"the test class's own class and constant\" do\n    caught = begin\n      raise Local, \"local\"\n    rescue Local => e\n      e.message\n    end\n    assert_equal \"local\", caught\n    assert_equal 3, LIMIT\n  end\nend\n";
+    let order_test = "require \"test_helper\"\n\nmodule Shop\n  class OrderTest < ActiveSupport::TestCase\n    test \"a name resolved in the enclosing module\" do\n      error = assert_raises(Order::Late) { Order.check }\n      assert_equal \"late\", error.message\n    end\n  end\nend\n";
+    assert_eq!(test_constant_errors("test/models/widget_test.rb", widget_test), vec![]);
+    assert_eq!(test_constant_errors("test/models/shop/order_test.rb", order_test), vec![]);
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/models/widget.rb", CONSTANT_WIDGET)
+            .write("app/models/shop/order.rb", CONSTANT_ORDER)
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/widget_test.rb", widget_test)
+            .write("test/models/shop/order_test.rb", order_test)
+    };
+    app().run_test("test/models/widget_test.rb").assert_passes();
+    app().run_test("test/models/shop_order_test.rb").assert_passes();
+}
+
+/// A test class inside a module subclasses a base the helper defines in
+/// that module, by the name Ruby finds there (`class SkiplistTest <
+/// TestCase` inside `module SqliteTestCompat`). The emitted file loaded
+/// no base: NameError on `TestCase` before any test ran.
+#[test]
+fn a_test_base_named_through_the_enclosing_module_is_loaded() {
+    emit_and_run::empty_app()
+        .write("app/.keep", "")
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("lib/fragments.rb", "module Fragments\n  def self.random\n    \"RANDOM()\"\n  end\nend\n")
+        .write("test/test_helper.rb", "require \"active_support\"\n\nmodule GemCompat\n  class TestCase < ActiveSupport::TestCase\n  end\nend\n")
+        .write("test/fragments_test.rb", "require \"test_helper\"\n\nmodule GemCompat\n  class FragmentsTest < TestCase\n    test \"random\" do\n      assert_equal \"RANDOM()\", Fragments.random\n    end\n  end\nend\n")
+        .run_test("test/models/gem_compat_fragments_test.rb")
+        .assert_passes();
+}
+
+/// The CRuby tree's SQLite3 adapter is a class only that tree carries;
+/// naming it in a test is supported there and refused everywhere else.
+#[test]
+fn a_test_naming_the_cruby_sqlite3_adapter_is_refused_off_cruby() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/.keep", "")
+            .write("roundhouse.yml", "test_paths:\n  - test\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/adapter_test.rb", "require \"test_helper\"\n\nclass AdapterTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert_kind_of Class, ActiveRecord::ConnectionAdapters::SQLite3Adapter\n  end\nend\n")
+    };
+    app().run_test("test/models/adapter_test.rb").assert_passes();
+    for target in [BuildTarget::Spinel, BuildTarget::Jruby, BuildTarget::Typescript, BuildTarget::Rust] {
+        let (_, errors) = app().emit(target);
+        assert!(errors.iter().any(|e| e.contains("ActiveRecord::ConnectionAdapters::SQLite3Adapter")), "{target:?}: {errors:?}");
+    }
+}
+
+/// `Fiber` is a Ruby core class the Ruby-family runtimes use themselves:
+/// named in a test it runs on CRuby and is refused where no runtime
+/// carries it.
+#[test]
+fn a_test_naming_fiber_runs_on_cruby_and_is_refused_without_a_runtime() {
+    use roundhouse::project::BuildTarget;
+    let app = || {
+        emit_and_run::empty_app()
+            .write("app/.keep", "")
+            .write("roundhouse.yml", "test_paths:\n  - test\n")
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/fiber_test.rb", "require \"test_helper\"\n\nclass FiberTest < ActiveSupport::TestCase\n  test \"x\" do\n    assert_equal 2, Fiber.new { 1 + 1 }.resume\n  end\nend\n")
+    };
+    app().run_test("test/models/fiber_test.rb").assert_passes();
+    for target in [BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python] {
+        let (_, errors) = app().emit(target);
+        assert!(errors.iter().any(|e| e.contains("Fiber is not available")), "{target:?}: {errors:?}");
+    }
+}
