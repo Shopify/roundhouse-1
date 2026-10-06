@@ -1132,6 +1132,9 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    if primary_postgresql(app) && !matches!(target, BuildTarget::Ruby | BuildTarget::Blog) {
+        return Err(format!("postgresql database: no emitted runtime adapter for target {} (not substituted)", target.as_str()));
+    }
     let without_health;
     let app = match without_rails_health_controller(app, target) {
         Some(trimmed) => {
@@ -2180,11 +2183,18 @@ fn jruby_runtime_files(
     ruby_family_runtime_files(app, fixture, RubyFlavor::JRuby)
 }
 
+fn primary_postgresql(app: &App) -> bool {
+    app.databases.iter().any(|db| db.primary && db.adapter == crate::database::DatabaseAdapter::Postgresql)
+}
+
 fn ruby_family_runtime_files(
     app: &App,
     fixture: &Path,
     flavor: RubyFlavor,
 ) -> Result<Vec<(String, String)>, String> {
+    if primary_postgresql(app) && flavor != RubyFlavor::CRuby {
+        return Err("postgresql database: only the CRuby runtime has a pg driver (not substituted)".into());
+    }
     let (mut files, test_stems) = spinel_files(app, fixture)?;
 
     files.retain(|(p, _)| p != "runtime/db.rb");
@@ -2360,10 +2370,15 @@ fn ruby_family_runtime_files(
     const TIME_PARSING_REQUIRE: &str = "require_relative \"active_support_time_parsing\"\n";
     match flavor {
         RubyFlavor::CRuby => {
-            let sql_functions = cruby_sql_functions_file(app);
+            let postgres = primary_postgresql(app);
+            let sql_functions = if postgres { None } else { cruby_sql_functions_file(app) };
             for (path, content) in files.iter_mut() {
                 if path == "runtime/db_cruby.rb" {
                     *path = "runtime/db.rb".to_string();
+                    if postgres {
+                        *content = crate::runtime_files::read_to_string("runtime/spinel/db_pg_cruby.rb")
+                            .map_err(|e| format!("read PostgreSQL driver: {e}"))?;
+                    }
                     content.insert_str(0, TIME_PARSING_REQUIRE);
                     if sql_functions.is_some() {
                         content.insert_str(0, "require_relative \"sql_functions\"\n");
@@ -2372,6 +2387,21 @@ fn ruby_family_runtime_files(
             }
             if let Some(src) = sql_functions {
                 files.push(("runtime/sql_functions.rb".to_string(), src));
+            }
+            if postgres {
+                let gemfile = files.iter_mut().find(|(path, _)| path == "Gemfile")
+                    .ok_or("PostgreSQL project: missing Gemfile")?;
+                if !gemfile.1.contains("gem \"sqlite3\"") {
+                    return Err("PostgreSQL project: expected SQLite backend declaration to replace".into());
+                }
+                gemfile.1 = gemfile.1.replace("gem \"sqlite3\"", "gem \"pg\"");
+                // The scaffold lock pins the sqlite3 backend. It is not a valid
+                // dependency resolution for a pg project; let Bundler resolve it.
+                files.retain(|(path, _)| path != "Gemfile.lock");
+                files.retain(|(path, _)| path != "config/schema.rb" && path != "sig/config/schema.rbs");
+                files.extend(sort_files(emit::ruby::emit_lowered_schema_pair_for(
+                    app, emit::shared::schema_sql::Dialect::Postgres,
+                ).map_err(|error| format!("PostgreSQL schema: {error}"))?));
             }
         }
         RubyFlavor::JRuby => {

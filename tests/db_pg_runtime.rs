@@ -160,7 +160,11 @@ fn model_sql_uses_owning_database_dialect() {
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn emitted_model_crud_executes_on_postgresql() {
     let app = postgres_model_app();
-    let files = roundhouse::emit::ruby::emit_lowered_models(&app);
+    let files = roundhouse::project::target_files(
+        &app,
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog"),
+        roundhouse::project::BuildTarget::Ruby,
+    ).expect("package PostgreSQL Ruby project");
     struct ProjectDir(std::path::PathBuf);
     impl Drop for ProjectDir {
         fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
@@ -168,29 +172,25 @@ fn emitted_model_crud_executes_on_postgresql() {
     let project = ProjectDir(std::env::temp_dir().join(format!(
         "roundhouse-pg-model-{}", std::process::id())));
     std::fs::create_dir(&project.0).expect("project directory");
-    for file in files {
-        let path = project.0.join(file.path);
+    for (name, content) in files {
+        let path = project.0.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, file.content).unwrap();
+        std::fs::write(path, content).unwrap();
     }
-    std::os::unix::fs::symlink(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/ruby"),
-        project.0.join("runtime"),
-    ).unwrap();
     let model_path = serde_json::to_string(&project.0.join("app/models/entry.rb")).unwrap();
-    let ddl = roundhouse::emit::shared::schema_sql::render_schema_statements_for(
-        &app.schema, roundhouse::emit::shared::schema_sql::Dialect::Postgres,
-    ).unwrap().into_iter().map(|sql| format!("Db.exec({})\n", serde_json::to_string(&sql).unwrap()))
-        .collect::<String>();
-    // The actual emitted model uses Roundhouse's shared framework, never Rails.
-    // Project bootstrap/packaging is not certified by this isolated model gate.
+    let runtime_path = serde_json::to_string(&project.0.join("runtime/db.rb")).unwrap();
+    let support_path = serde_json::to_string(&project.0.join("runtime/active_support_ext.rb")).unwrap();
+    let schema_path = serde_json::to_string(&project.0.join("config/schema.rb")).unwrap();
+    // Execute the packaged driver, schema, shared framework and model. The
+    // authored Core bootstrap is a separate integration still being repaired.
     let script = format!(r#"
-require_relative "runtime/ruby/active_support_ext"
-require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/active_support_time_parsing"
+require {runtime_path}
+require {support_path}
+require {schema_path}
 require {model_path}
 class PostgreSQLRuntimeTest
   def test_emitted_model_crud
-    {ddl}
+    Schema.statements.each {{ |sql| Db.exec(sql) }}
     first = Entry.create!(Title: "l'été \\ hi", enabled: true)
     second = Entry.create!(Title: "false", enabled: false)
     assert_equal 1, first.id
@@ -230,6 +230,42 @@ end
         .args(["-r", "./tests/db_pg_runtime.rb", "-e", &script, "--", "--name", "test_emitted_model_crud"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output().expect("ruby");
+    println!("packaged model: {}", String::from_utf8_lossy(&result.stdout).trim());
     assert!(result.status.success(), "emitted code={script}\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+#[test]
+fn postgres_project_packages_matching_driver_schema_and_gem() {
+    use roundhouse::project::{target_files, BuildTarget};
+    let app = postgres_model_app();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).unwrap();
+    let source = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.as_str();
+    assert!(source("runtime/db.rb").contains("require \"pg\""));
+    assert!(!source("runtime/db.rb").contains("require \"sqlite3\""));
+    assert!(source("Gemfile").contains("gem \"pg\""));
+    assert!(!source("Gemfile").contains("gem \"sqlite3\""));
+    assert!(!files.iter().any(|(p, _)| p == "Gemfile.lock"));
+    assert!(source("config/schema.rb").contains("serial PRIMARY KEY"));
+    assert!(source("config/schema.rb").contains("boolean NOT NULL"));
+    assert_eq!(files.iter().filter(|(p, _)| p == "runtime/db.rb").count(), 1);
+    assert_eq!(files.iter().filter(|(p, _)| p == "config/schema.rb").count(), 1);
+    for target in [BuildTarget::Jruby, BuildTarget::Spinel, BuildTarget::Rust] {
+        let error = target_files(&app, &fixture, target).unwrap_err();
+        assert!(error.contains("postgresql") && error.contains("not substituted"), "{error}");
+    }
+}
+
+#[test]
+fn postgres_schema_error_is_not_replaced_by_sqlite_or_empty_ddl() {
+    let mut app = postgres_model_app();
+    app.schema.tables.get_mut(&roundhouse::ident::Symbol::from("entries")).unwrap()
+        .virtual_module = Some(roundhouse::schema::VirtualModule {
+            module: "fts5".into(), args: vec!["Title".into()],
+        });
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let error = roundhouse::project::target_files(&app, &fixture,
+        roundhouse::project::BuildTarget::Ruby).unwrap_err();
+    assert!(error.contains("PostgreSQL schema") && error.contains("virtual table"), "{error}");
 }

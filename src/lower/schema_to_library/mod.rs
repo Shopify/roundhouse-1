@@ -37,8 +37,24 @@ pub fn lower_schema_to_library_functions(schema: &Schema) -> Vec<LibraryFunction
     if schema.tables.is_empty() {
         return Vec::new();
     }
+    schema_functions(crate::emit::shared::schema_sql::render_schema_statements(schema))
+}
+
+/// Render the selected database's schema and preserve unsupported-DDL errors.
+/// Empty, like `lower_schema_to_library_functions`, when there are no tables.
+pub fn lower_schema_to_library_functions_for(
+    schema: &Schema,
+    dialect: crate::emit::shared::schema_sql::Dialect,
+) -> Result<Vec<LibraryFunction>, String> {
+    if schema.tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::emit::shared::schema_sql::render_schema_statements_for(schema, dialect)
+        .map(schema_functions)
+}
+
+fn schema_functions(stmts: Vec<String>) -> Vec<LibraryFunction> {
     let module_path = vec![Symbol::from("Schema")];
-    let stmts = crate::emit::shared::schema_sql::render_schema_statements(schema);
     let elements: Vec<Expr> = stmts.into_iter().map(lit_str).collect();
     let body = with_ty(
         Expr::new(

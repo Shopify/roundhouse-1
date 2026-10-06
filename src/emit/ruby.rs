@@ -402,6 +402,18 @@ pub fn emit_lowered_schema_pair(app: &App) -> Vec<EmittedFile> {
     library::emit_module_file_pair(&funcs, app, PathBuf::from("config/schema.rb"))
 }
 
+/// Fallible schema emission for a selected database dialect. Packaging must
+/// propagate the error rather than silently emit an empty or SQLite schema.
+pub fn emit_lowered_schema_pair_for(
+    app: &App,
+    dialect: crate::emit::shared::schema_sql::Dialect,
+) -> Result<Vec<EmittedFile>, String> {
+    let funcs = crate::lower::schema_to_library::lower_schema_to_library_functions_for(
+        &app.schema, dialect,
+    )?;
+    Ok(library::emit_module_file_pair(&funcs, app, PathBuf::from("config/schema.rb")))
+}
+
 /// Emit `config/routes.rb` in spinel-blog shape — a `RouteTable` module
 /// `RouteTable` module exposing the dispatch data via class methods:
 /// `RouteTable.table` returns the array of `{method:, pattern:,
