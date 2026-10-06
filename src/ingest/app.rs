@@ -846,6 +846,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // referenced at runtime) drops out. Same isolate-per-file tolerance
     // as extras/lib — the file carries Bundler/railtie noise that must
     // not abort ingest.
+    // `config.eager_load` per environment: the emitted CRuby app
+    // decides at boot, as Rails does, whether to load every file or
+    // autoload on reference (`project::apply_models_autoload`).
+    app.eager_load = super::environments::ingest_eager_load(vfs, dir);
+
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
         let file = app_config_path.display().to_string();
@@ -6257,9 +6262,10 @@ struct ConfigAssignment {
 /// and stays a reported gap. `filter_parameters` is not inert: it is
 /// applied (`extract_filter_parameters`, the Application reopen).
 const INERT_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
-    // The emitted app requires every file at boot; there is no
-    // autoloader whose eager-load mode this selects.
-    ("eager_load", "no autoloader: every file is loaded at boot"),
+    // The emitted CRuby app takes its eager-load mode from
+    // `config/environments/<env>.rb` (`ingest::environments`), where
+    // Rails apps set it; the spinel tree always loads every file.
+    ("eager_load", "eager-load mode is read from config/environments/<env>.rb"),
     // Selects code reloading, which the emitted app does not have.
     ("cache_classes", "no code reloading in the emitted app"),
     // Names the asset digest generation; the emitted app serves
@@ -6381,7 +6387,7 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment
 /// so its block parameter is the receiver itself, and `p.config` is the
 /// config. Any other `configure` (`Kaminari.configure do |config|`)
 /// binds nothing.
-fn walk_config_statements<'pr>(
+pub(super) fn walk_config_statements<'pr>(
     stmts: Vec<ruby_prism::Node<'pr>>,
     app_param: Option<&str>,
     f: &mut dyn FnMut(&ruby_prism::Node<'pr>, Option<&str>),
@@ -6757,7 +6763,7 @@ fn config_receiver_path(
 ///
 /// Inside `<x>.application.configure do |app_param|`, `app_param.config`
 /// is the config too (see [`walk_config_statements`]).
-fn config_path_in(
+pub(super) fn config_path_in(
     node: &ruby_prism::Node<'_>,
     depth: usize,
     app_param: Option<&str>,
