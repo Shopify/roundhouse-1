@@ -103,6 +103,12 @@ pub struct App {
     /// the runtime's generated `ContentHelper.app_allowed_attributes`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_helper_allowed_attributes: Vec<String>,
+    /// Each top-level `establish_connection` call in `test/test_helper.rb`,
+    /// as written. The emitted harness opens its own SQLite database, so
+    /// none of them is carried; `analyze::test_helper_connection` names
+    /// every one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_helper_connections: Vec<Expr>,
     /// Call-site-unified parameter types, written by the analyzer's
     /// fixpoint (`unify_params_from_call_sites`) as its last act and
     /// read by lowerings that build method signatures — the controller
@@ -701,6 +707,7 @@ impl App {
             gem_lock: None,
             gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
+            test_helper_connections: Vec::new(),
             inferred_method_params: HashMap::new(),
             helper_method_index: HashMap::new(),
             view_visible_controller_methods: BTreeSet::new(),

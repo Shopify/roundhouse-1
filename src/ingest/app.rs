@@ -1399,6 +1399,11 @@ end
                     message: format!("test teardown not modeled: `{class}`'s teardown in the test helper would run after no test"),
                 }))?;
             }
+            if let Some(calls) =
+                unwrap_or_record(super::test::helper_connections(&source, &helper_rb.display().to_string()))?
+            {
+                app.test_helper_connections = calls;
+            }
             if let Some(tms) =
                 unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
             {
