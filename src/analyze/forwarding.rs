@@ -355,6 +355,8 @@ fn walk(
             Some("forwarding source has an unrepresented parameter declaration")
         } else if !enclosing.params.iter().any(|p| p.forwarding) {
             Some("forwarding call has no preserved forwarding declaration")
+        } else if native_core_destination(app, e) {
+            None
         } else {
             contract_error(
                 Some((owner, enclosing)),
@@ -374,6 +376,29 @@ fn walk(
     }
     e.node
         .for_each_child(&mut |c| walk(app, contracts, owner, enclosing, c, out));
+}
+
+/// `recv.m(...)` where `recv` is typed as a Ruby core value (a Hash,
+/// Array, String, Symbol, Integer or Float) and the app reopens that
+/// class with no method `m`: the destination is the core method itself,
+/// whose argument contract is Ruby's own, so `...` hands it exactly
+/// what the caller passed. (`delegate :fetch, to: :hash` on a Hash
+/// target is the shape.)
+fn native_core_destination(app: &App, e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node else { return false };
+    let class = match recv.ty.as_ref() {
+        Some(Ty::Hash { .. }) => "Hash",
+        Some(Ty::Array { .. }) => "Array",
+        Some(Ty::Str) => "String",
+        Some(Ty::Sym) => "Symbol",
+        Some(Ty::Int) => "Integer",
+        Some(Ty::Float) => "Float",
+        _ => return false,
+    };
+    !app.library_classes
+        .iter()
+        .filter(|c| c.name.0.as_str() == class)
+        .any(|c| c.methods.iter().any(|m| &m.name == method))
 }
 
 fn accepts_keywords(method: &MethodDef) -> bool {

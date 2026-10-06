@@ -235,6 +235,9 @@ impl Overlay {
             .map(|d| format!("{:?}: {}", d.span, d.message)));
         let files = files.expect("target files");
         roundhouse::project::write_to_dir(&files, &emitted).expect("write ruby target tree");
+        // The verbatim passthrough the CLI writes after the tree.
+        roundhouse::project::write_binary_assets(&app.binary_assets, &files, &emitted)
+            .expect("write verbatim assets");
         (emitted, errors)
     }
 }

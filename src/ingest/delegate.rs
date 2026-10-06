@@ -35,6 +35,14 @@
 //! `fragment` is a reader on both sides — and closing it properly means
 //! the arity coming from the TARGET's own signature rather than from
 //! call sites.
+//!
+//! ## The class side
+//!
+//! `delegate` inside `class << self` (recorded by the body walk as
+//! `singleton_class.delegate`, which a class body may also write) defines
+//! class methods. Their callers are other files, so no call site here
+//! says what arity they need: each forwards `(...)`, which is exactly
+//! the method Rails generates.
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -47,6 +55,13 @@ struct Delegation {
     target: Symbol,
     name: String,
     allow_nil: bool,
+    /// Declared on the singleton class (`delegate` inside `class << self`,
+    /// or `singleton_class.delegate`): the forwarder is a class method.
+    /// Its callers are other files' (`Secrets.fetch(:mysql)`), so it
+    /// forwards every argument with `(...)`, as Rails' generated
+    /// method does, instead of reading an arity off this class's own
+    /// call sites.
+    class_side: bool,
     /// The real app file the `delegate` call was declared in, when the
     /// source registry can still resolve it (it can, at this point in
     /// the pipeline — see `ingest::sources`'s module doc). Empty when
@@ -158,10 +173,16 @@ fn take_delegate_decls(lc: &mut LibraryClass, decline: &std::collections::HashSe
     let called_with_args = names_called_with_arguments(lc);
     let mut out = Vec::new();
     lc.unknown_calls.retain(|call| {
-        let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return true };
+        let ExprNode::Send { recv, method, args, .. } = &*call.node else { return true };
         if method.as_str() != "delegate" {
             return true;
         }
+        let class_side = match recv {
+            None => false,
+            Some(recv) if matches!(&*recv.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                if method.as_str() == "singleton_class" && args.is_empty()) => true,
+            Some(_) => return true,
+        };
         let mut names: Vec<Symbol> = Vec::new();
         let (mut to, mut prefix, mut allow_nil) = (None, false, false);
         let mut unknown_option = false;
@@ -210,10 +231,12 @@ fn take_delegate_decls(lc: &mut LibraryClass, decline: &std::collections::HashSe
         // `self.behavior = v` calling `behavior=` WITH an argument is
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
-        if names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str())) {
+        if !class_side
+            && names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str()))
+        {
             return true;
         }
-        if names.iter().any(|n| decline.contains(n.as_str())) {
+        if !class_side && names.iter().any(|n| decline.contains(n.as_str())) {
             return true;
         }
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
@@ -223,7 +246,7 @@ fn take_delegate_decls(lc: &mut LibraryClass, decline: &std::collections::HashSe
             } else {
                 m.as_str().to_string()
             };
-            out.push(Delegation { method: m, target: target.clone(), name, allow_nil, file: file.clone() });
+            out.push(Delegation { method: m, target: target.clone(), name, allow_nil, class_side, file: file.clone() });
         }
         false
     });
@@ -289,14 +312,13 @@ fn operator_forwarder(t: &str, m: &str) -> Option<(&'static str, String)> {
 }
 
 fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
-    let defines = |name: &str| {
-        lc.methods
-            .iter()
-            .any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name)
+    let defines = |name: &str, class_side: bool| {
+        let receiver = if class_side { MethodReceiver::Class } else { MethodReceiver::Instance };
+        lc.methods.iter().any(|m| m.receiver == receiver && m.name.as_str() == name)
     };
     let mut body = String::new();
     for d in delegates {
-        if defines(&d.name) {
+        if defines(&d.name, d.class_side) {
             continue;
         }
         let (target, m) = (receiver(d.target.as_str()), d.method.as_str());
@@ -308,13 +330,16 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
             forwarder
         } else if let Some(attr) = m.strip_suffix('=') {
             ("value", format!("{t}.{attr} = value"))
+        } else if d.class_side {
+            ("...", format!("{t}.{m}(...)"))
         } else {
             ("", format!("{t}.{m}"))
         };
+        let name = if d.class_side { format!("self.{}", d.name) } else { d.name.clone() };
         let signature = if params.is_empty() {
-            d.name.clone()
+            name
         } else {
-            format!("{}({params})", d.name)
+            format!("{name}({params})")
         };
         // Rails evaluates the receiver once. Nil's own operators still run
         // under allow_nil (for example `nil == other` returns a Boolean).

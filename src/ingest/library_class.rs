@@ -2131,7 +2131,30 @@ fn walk_decl_body_with_visibility<'pr>(
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
-                            if let Ok(e) = ingest_expr(&stmt, file) {
+                            if let Ok(mut e) = ingest_expr(&stmt, file) {
+                                // `delegate` inside `class << self` is a
+                                // call on the singleton class: Rails
+                                // defines the forwarders as class
+                                // methods. Recorded the way a class body
+                                // writes the same call,
+                                // `singleton_class.delegate(...)`, so
+                                // `ingest::delegate` expands it on the
+                                // class side instead of as instance
+                                // methods.
+                                if force_class_receiver && kw == "delegate" {
+                                    if let ExprNode::Send { recv: recv @ None, .. } = &mut *e.node {
+                                        *recv = Some(Expr::new(
+                                            e.span,
+                                            ExprNode::Send {
+                                                recv: None,
+                                                method: Symbol::from("singleton_class"),
+                                                args: Vec::new(),
+                                                block: None,
+                                                parenthesized: false,
+                                            },
+                                        ));
+                                    }
+                                }
                                 out.unknown_calls.push(e);
                             }
                         }

@@ -2156,9 +2156,33 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
             walk_binary_assets(vfs, dir, &start, app);
         }
     }
+    collect_config_data(vfs, dir, &dir.join("config"), app);
     // Deterministic order: the emit is byte-compared across runs, and
     // `read_dir` order is explicitly unspecified by the trait.
     app.binary_assets.sort_by(|a, b| a.0.cmp(&b.0));
+}
+
+/// The app's JSON data under `config/`, carried verbatim beside the
+/// binary assets: files app code reads at run time by a path it builds
+/// (Core's `Secrets` reads `config/secrets.#{env}.json` under the app
+/// root), so no emitter produces them and nothing can know statically
+/// which one a run opens. JSON only: `config/` also holds encrypted
+/// material (`*.ejson`, `credentials.yml.enc`, `master.key`), which is
+/// never copied, and YAML the compiler reads itself.
+fn collect_config_data<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {
+    let Ok(entries) = vfs.read_dir(dir) else { return };
+    for entry in entries {
+        if vfs.is_dir(&entry) {
+            collect_config_data(vfs, root, &entry, app);
+            continue;
+        }
+        if entry.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = vfs.read(&entry) else { continue };
+        let rel = entry.strip_prefix(root).unwrap_or(&entry);
+        app.binary_assets.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+    }
 }
 
 fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {
