@@ -53,6 +53,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(super::database_identity::diagnose(app));
     out.extend(super::test_constants::diagnose(app));
     out.extend(super::test_harness_calls::diagnose(app));
+    out.extend(super::test_assertion_jumps::diagnose(app));
     // Rubydex's unresolved constants emit refusal stubs. Collect those
     // annotations from support methods/defaults/constants as well, so
     // an emitted raise cannot be hidden by the library diagnostic policy.

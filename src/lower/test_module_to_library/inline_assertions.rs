@@ -187,6 +187,28 @@ pub(crate) const LOWERED: &[&str] = &[
     "assert_difference", "assert_no_difference",
 ];
 
+/// The assertions whose lowering splices their block's statements into
+/// the test, rather than passing the block to a method: a `next` or
+/// `break` aimed at that block lands somewhere else once it is spliced
+/// (`analyze::test_assertion_jumps`).
+pub(crate) const SPLICING: &[&str] =
+    &["assert_difference", "assert_no_difference", "assert_raises", "assert_raise", "assert_throws"];
+
+/// The block body this assertion call's lowering splices into the test,
+/// if it is one `rewrite_send` lowers: the same decision, not a copy of it.
+pub(crate) fn spliced_block<'a>(e: &'a Expr, own: &dyn Fn(&str) -> bool) -> Option<&'a Expr> {
+    let ExprNode::Send { method, block, .. } = &*e.node else {
+        return None;
+    };
+    if !SPLICING.contains(&method.as_str()) || rewrite_send(e, own).is_none() {
+        return None;
+    }
+    match block.as_ref().map(|b| &*b.node) {
+        Some(ExprNode::Lambda { body, .. }) => Some(body),
+        _ => None,
+    }
+}
+
 /// Rewrite a bare-receiver `assert_*`/`refute_*` Send into an inline
 /// raise expression. Returns None for non-assertion Sends so the
 /// caller passes them through unchanged.
