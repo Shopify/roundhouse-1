@@ -642,7 +642,7 @@ fn run_and_publish(
     let diags = gate(diags, request.settings);
     let config_path = root.join("roundhouse.yml");
     let config_uri = path_to_uri(&config_path);
-    let config_diags = match &analysis {
+    let mut config_diags = match &analysis {
         Err(IngestError::Parse { file, message })
             if canonical(Path::new(file)) == canonical(&config_path) =>
         {
@@ -656,6 +656,20 @@ fn run_and_publish(
         }
         _ => Vec::new(),
     };
+    // A diagnostic the analysis places in the config itself (a
+    // `database_configurations:` manifest it cannot find) is published
+    // with it: the config's notification below would otherwise clear it.
+    if let Ok(analysis) = &analysis {
+        let in_config: Vec<RhDiagnostic> = diags
+            .iter()
+            .filter(|d| {
+                ide::source(&analysis.app, d.span.file)
+                    .is_some_and(|src| canonical(Path::new(&src.path)) == canonical(&config_path))
+            })
+            .cloned()
+            .collect();
+        config_diags.extend(convert_diags(&analysis.app, &in_config));
+    }
     // The config is not an App source. Publish it separately, including
     // when no good snapshot exists or the config is not open in the editor.
     let open: Vec<_> = request
@@ -1125,9 +1139,23 @@ mod tests {
         assert!(errors[0].message.contains("app-relative"), "{errors:?}");
         assert!(Arc::ptr_eq(&last_good, shared.lock().unwrap().as_ref().unwrap()));
 
-        run_and_publish(&root, request(valid), &sender, &shared);
+        run_and_publish(&root, request(valid.clone()), &sender, &shared);
         assert!(config_diagnostics().is_empty());
         assert!(!Arc::ptr_eq(&last_good, shared.lock().unwrap().as_ref().unwrap()));
+
+        // A manifest the config names but the tree lacks is an analysis
+        // error located in the config, and is published there.
+        let missing = HashMap::from([(
+            root.join("roundhouse.yml"),
+            "database_configurations: config/roundhouse/databases.json\n".to_string(),
+        )]);
+        run_and_publish(&root, request(missing), &sender, &shared);
+        let errors = config_diagnostics();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert!(errors[0].message.contains("not in the tree"), "{errors:?}");
+        run_and_publish(&root, request(valid), &sender, &shared);
+        assert!(config_diagnostics().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 
