@@ -1446,7 +1446,7 @@ impl<'a> BodyTyper<'a> {
                     let class_object = class_object_receiver;
                     if send::is_module_protocol(method) && !class_object
                         && !self.owns_operator(recv_ty.as_ref(), method, false)
-                        && !send::is_query_any_receiver_may_answer(method, recv_ty.as_ref()) {
+                        && !send::is_query_any_receiver_may_answer(method, recv_ty.as_ref(), self.classes()) {
                         expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                             target: None,
                             construct: Symbol::from("Module protocol"),

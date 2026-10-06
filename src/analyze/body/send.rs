@@ -16,6 +16,8 @@ use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
 use super::{BodyTyper, Ctx, union_many, union_of, unknown};
+use crate::analyze::ClassInfo;
+use std::collections::HashMap;
 
 impl<'a> BodyTyper<'a> {
     /// `record[:column]` / `read_attribute(:column)` (and their writer
@@ -2927,16 +2929,23 @@ pub(super) fn is_module_protocol(method: &Symbol) -> bool {
 /// `include?` is Module's ancestry query and also Array's, String's,
 /// Hash's, Set's and Range's membership test. On a receiver whose type
 /// is unknown or gradual, the Module reading is a guess: the send is an
-/// ordinary unknown (or gradual) one, not a missing class object.
-pub(super) fn is_query_any_receiver_may_answer(method: &Symbol, recv_ty: Option<&Ty>) -> bool {
-    fn unproven(ty: &Ty) -> bool {
+/// ordinary unknown (or gradual) one, not a missing class object. So is
+/// a class the registry does not hold: a signature named it, but nothing
+/// says what it is.
+pub(super) fn is_query_any_receiver_may_answer(
+    method: &Symbol,
+    recv_ty: Option<&Ty>,
+    classes: &HashMap<ClassId, ClassInfo>,
+) -> bool {
+    fn unproven(ty: &Ty, classes: &HashMap<ClassId, ClassInfo>) -> bool {
         match ty {
             Ty::Var { .. } | Ty::Untyped => true,
-            Ty::Union { variants } => variants.iter().any(unproven),
+            Ty::Class { id, .. } => !classes.contains_key(id),
+            Ty::Union { variants } => variants.iter().any(|v| unproven(v, classes)),
             _ => false,
         }
     }
-    method.as_str() == "include?" && recv_ty.is_some_and(unproven)
+    method.as_str() == "include?" && recv_ty.is_some_and(|ty| unproven(ty, classes))
 }
 
 /// A value typed `Class` or `Module` is a class object whatever its

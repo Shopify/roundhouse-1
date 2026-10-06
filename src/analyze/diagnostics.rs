@@ -9,9 +9,10 @@ use crate::ide::render_ty;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ty::Ty;
-use crate::ident::Symbol;
+use crate::ident::{ClassId, Symbol};
+use std::collections::HashMap;
 
-use super::PreloadCoverage;
+use super::{ClassInfo, PreloadCoverage};
 use super::preload;
 
 
@@ -212,22 +213,29 @@ pub struct UnknownReceiverSend {
 /// all for a gradual one, so in a library class the send is silent. A
 /// drop in errors that only moves sends here is a reclassification, not
 /// progress; `check` prints the count beside the error total.
-pub fn unknown_receiver_sends(app: &App) -> Vec<UnknownReceiverSend> {
-    fn visit(expr: &Expr, out: &mut Vec<UnknownReceiverSend>) {
+///
+/// A receiver typed as a class the registry does not hold
+/// (`#: (Missing::AccessControl)`, a name whose file the closure left
+/// out) is unknown, not known: there is no method table to check it
+/// against.
+pub fn unknown_receiver_sends(app: &App, classes: &HashMap<ClassId, ClassInfo>) -> Vec<UnknownReceiverSend> {
+    fn visit(expr: &Expr, classes: &HashMap<ClassId, ClassInfo>, out: &mut Vec<UnknownReceiverSend>) {
         if let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node {
             let gradual = matches!(r.ty, Some(Ty::Untyped));
-            let known_receiver = !gradual && !is_unknown_ty(r.ty.as_ref()) && is_unknown_ty(expr.ty.as_ref());
-            if (gradual || known_receiver || is_unknown_ty(r.ty.as_ref()))
+            let unknown = is_unknown_ty(r.ty.as_ref())
+                || matches!(&r.ty, Some(Ty::Class { id, .. }) if !classes.contains_key(id));
+            let known_receiver = !gradual && !unknown && is_unknown_ty(expr.ty.as_ref());
+            if (gradual || known_receiver || unknown)
                 && expr.diagnostic.is_none()
                 && !expr.span.is_synthetic()
             {
                 out.push(UnknownReceiverSend { span: expr.span, method: method.clone(), gradual, known_receiver });
             }
         }
-        expr.node.for_each_child(&mut |child| visit(child, out));
+        expr.node.for_each_child(&mut |child| visit(child, classes, out));
     }
     let mut out = Vec::new();
-    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, &mut out));
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, classes, &mut out));
     let mut seen = std::collections::HashSet::new();
     out.retain(|s| seen.insert((s.span.file, s.span.start, s.span.end, s.method.clone())));
     out

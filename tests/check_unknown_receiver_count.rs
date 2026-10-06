@@ -54,3 +54,18 @@ fn a_diagnosed_unresolved_send_is_not_also_counted() {
     assert!(text.contains("no known method `frobnicate`"), "{text}");
     assert!(text.contains(", 0 unresolved on known receivers"), "{text}");
 }
+
+/// A signature can name a class the registry does not hold (its file is
+/// outside the checked closure). No method table answers for it, so its
+/// sends are unknown-receiver sends, and its `include?` is an unchecked
+/// membership-or-ancestry query, not a refused Module protocol send.
+#[test]
+fn a_receiver_typed_as_an_unregistered_class_is_unknown() {
+    let lib = "class Syncer\n  #: (Missing::AccessControl) -> bool\n  def has(access)\n    access.include?(\"a\")\n  end\n\n  #: (Missing::AccessControl) -> bool\n  def other(access)\n    access.frobnicate(\"a\")\n  end\nend\n";
+    let text = check(&[], &[("app/lib/syncer.rb", lib)]);
+    assert!(!text.contains("Module protocol"), "{text}");
+    assert!(
+        text.contains("roundhouse-check: 2 send(s) on unknown receivers, 0 on gradual receivers, 0 unresolved on known receivers"),
+        "{text}"
+    );
+}

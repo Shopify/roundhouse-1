@@ -192,7 +192,8 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    crate::timings::phase("analyze", || Analyzer::new(&app).analyze(&mut app));
+    let mut analyzer = Analyzer::new(&app);
+    crate::timings::phase("analyze", || analyzer.analyze(&mut app));
     let mut diags = crate::timings::phase("diagnose", || diagnose(&app));
     // Survey mode: diagnostics that trace back to a recorded ingest gap
     // are the tool's coverage problem, not the app's — downgrade them to
@@ -266,7 +267,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // `diagnose` covers the body; only the uncovered sites count here.
     let diagnosed: std::collections::HashSet<_> =
         diags.iter().map(|d| (d.span.file, d.span.start, d.span.end)).collect();
-    let unknown_sends: Vec<_> = crate::analyze::unknown_receiver_sends(&app)
+    let unknown_sends: Vec<_> = crate::analyze::unknown_receiver_sends(&app, analyzer.class_registry())
         .into_iter()
         .filter(|s| !(s.known_receiver && diagnosed.contains(&(s.span.file, s.span.start, s.span.end))))
         .collect();
