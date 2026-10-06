@@ -3813,29 +3813,6 @@ fn apply_test_helper_connection(files: &mut [(String, String)], app: &App) -> Re
     Ok(())
 }
 
-/// These class objects are supplied by Ruby/Spinel's bundled libraries,
-/// not by the transpiled runtimes. Recognizing them during inference
-/// must not turn a missing target implementation into a clean emit.
-///
-/// The CRuby tree's SQLite3 adapter (ruby_overlay
-/// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
-/// supply the adapter class, the statement-error classes and its transaction
-/// members, and only that tree's `Db` translates a driver error into
-/// them, so those are refused on every target but Ruby, Spinel
-/// included: by constant, and by member name for a call that names no
-/// constant.
-///
-/// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
-/// too: the harness's file database enforces no foreign key and the
-/// schema loader drops `add_foreign_key`, so nothing raises it there.
-/// The test helper's in-memory connection does enforce one (and
-/// `translate` maps it), but the name stays refused rather than
-/// supported on one setup only.
-///
-/// `transaction` with options is refused on every target, Ruby too: the
-/// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
-/// checked only when the transaction first runs a statement, which the
-/// runtime's eager BEGIN does not reproduce.
 /// A test body's read of a name only the Ruby-family test harness
 /// declares (`ActiveSupport::Cache::MemoryStore`) is supported where the
 /// finished tree's own `test/test_helper.rb` declares it, and refused on
@@ -3860,6 +3837,29 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
     }
 }
 
+/// These class objects are supplied by Ruby/Spinel's bundled libraries,
+/// not by the transpiled runtimes. Recognizing them during inference
+/// must not turn a missing target implementation into a clean emit.
+///
+/// The CRuby tree's SQLite3 adapter (ruby_overlay
+/// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
+/// supply the adapter class, the statement-error classes and its transaction
+/// members, and only that tree's `Db` translates a driver error into
+/// them, so those are refused on every target but Ruby, Spinel
+/// included: by constant, and by member name for a call that names no
+/// constant.
+///
+/// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
+/// too: the harness's file database enforces no foreign key and the
+/// schema loader drops `add_foreign_key`, so nothing raises it there.
+/// The test helper's in-memory connection does enforce one (and
+/// `translate` maps it), but the name stays refused rather than
+/// supported on one setup only.
+///
+/// `transaction` with options is refused on every target, Ruby too: the
+/// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
+/// checked only when the transaction first runs a statement, which the
+/// runtime's eager BEGIN does not reproduce.
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;
