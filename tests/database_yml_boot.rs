@@ -411,3 +411,38 @@ fn renderer_spans_point_into_the_template() {
     walk(&render.body, &text, &mut found);
     assert_eq!(found, vec!["DbSettings.user_for(:writer)".to_string()]);
 }
+
+/// ERB code in config/database.yml is indexed as the top-level code
+/// Rails' `ERB#result` runs, so `check` resolves its constants as it
+/// does a `.rb` file's: the app's `DbSettings` resolves, and an
+/// unresolved name is an error at its position in the template.
+#[test]
+fn unresolved_erb_constants_are_check_errors_at_the_template() {
+    let yml = "test:\n  adapter: postgresql\n  username: <%= DbSettings.user_for(:writer) %>\n  password: <%= Missing::Secret.value %>\n  port: <%= Nope.port %><%= DbSettings.ticket_timeout %>\n";
+    let app_dir = fixture_app(yml);
+    let mut app = ingest(&app_dir);
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let text = std::fs::read_to_string(app_dir.0.join("config/database.yml")).unwrap();
+    let file = app
+        .database_yml
+        .as_ref()
+        .and_then(|_| {
+            app.library_classes.iter().find(|c| c.name.0.as_str() == "DatabaseYml")
+        })
+        .and_then(|c| c.methods.first())
+        .map(|m| m.body.span.file)
+        .expect("renderer compiled");
+    let mut constants: Vec<String> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .filter(|d| d.span.file == file && d.severity == roundhouse::diagnostic::Severity::Error)
+        .map(|d| format!("{}: {}", &text[d.span.start as usize..d.span.end as usize], d.message))
+        .collect();
+    constants.sort();
+    assert_eq!(
+        constants,
+        vec![
+            "Missing::Secret: constant not supported (all targets): Missing::Secret".to_string(),
+            "Nope: constant not supported (all targets): Nope".to_string(),
+        ],
+    );
+}

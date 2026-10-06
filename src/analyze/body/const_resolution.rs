@@ -76,7 +76,31 @@ pub(crate) struct ConstResolver {
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
-    source.path.ends_with(".rb")
+    source.path.ends_with(".rb") || is_database_yml(source)
+}
+
+/// `config/database.yml` when its ERB is compiled as app code
+/// (`ingest::database_yml`): Rails renders it with `ERB#result`, whose
+/// binding is top-level, so its tag code resolves constants exactly as
+/// a top-level Ruby file would. Rubydex indexes that code at the
+/// template's own offsets (`erb::stdlib_code_projection`), so the
+/// renderer's template spans get source answers like any `.rb`.
+fn is_database_yml(source: &SourceFile) -> bool {
+    source.path.ends_with(crate::ingest::database_yml::PATH) && source.text.contains("<%")
+}
+
+/// The Ruby text Rubydex indexes for an indexed source, at the source's
+/// byte offsets.
+fn indexed_text(source: &SourceFile) -> std::borrow::Cow<'_, str> {
+    if is_database_yml(source) {
+        // A template that does not compile is refused at ingest; index
+        // nothing for it rather than the YAML.
+        crate::erb::stdlib_code_projection(&source.text)
+            .map(std::borrow::Cow::Owned)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(" ".repeat(source.text.len())))
+    } else {
+        std::borrow::Cow::Borrowed(&source.text)
+    }
 }
 
 fn source_fingerprint(sources: &[SourceFile]) -> u64 {
@@ -535,17 +559,17 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
             language: LanguageId::Ruby,
         }),
     );
-    documents.extend(
-        sources
-            .iter()
-            .filter(|source| is_indexed(source))
-            .map(|source| Document {
-                uri_prefix: "",
-                path: &source.path,
-                text: &source.text,
-                language: LanguageId::Ruby,
-            }),
-    );
+    let texts: Vec<_> = sources
+        .iter()
+        .filter(|source| is_indexed(source))
+        .map(|source| (source, indexed_text(source)))
+        .collect();
+    documents.extend(texts.iter().map(|(source, text)| Document {
+        uri_prefix: "",
+        path: &source.path,
+        text: text.as_ref(),
+        language: LanguageId::Ruby,
+    }));
     index_documents(&documents)
 }
 
@@ -658,10 +682,11 @@ fn answer_file(
     let Some(document) = graph.documents().get(&UriId::from(source.path.as_str())) else {
         return answers;
     };
+    let text = indexed_text(source);
     let parenthesized_receivers = if document.diagnostics().iter()
         .any(|diagnostic| *diagnostic.rule() == Rule::DynamicSingletonDefinition)
     {
-        parenthesized_factory_receivers(&source.text)
+        parenthesized_factory_receivers(&text)
     } else {
         HashSet::new()
     };
@@ -674,9 +699,7 @@ fn answer_file(
         // so it starts at the same offset as the `A` reference. Only a
         // reference whose span is exactly its written name belongs to
         // that offset.
-        let written = source
-            .text
-            .get(offset.start() as usize..offset.end() as usize);
+        let written = text.get(offset.start() as usize..offset.end() as usize);
         let name = graph
             .names()
             .get(reference.name_id())

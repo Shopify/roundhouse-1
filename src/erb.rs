@@ -514,6 +514,30 @@ pub fn compile_erb_stdlib_mapped(source: &str) -> Result<(String, Vec<ErbSegment
     Ok((out, map))
 }
 
+/// The tag code of a stdlib-ERB template (`compile_erb_stdlib_mapped`)
+/// at its own byte offsets, every other byte blanked (newlines kept),
+/// with each tag's `%` of `%>` turned into `;` so consecutive tags stay
+/// separate statements. A Ruby indexer reads this as the code the
+/// template's binding runs, top-level, and its answers are keyed by
+/// template offsets. `None` when the template does not compile.
+pub fn stdlib_code_projection(source: &str) -> Option<String> {
+    let (compiled, map) = compile_erb_stdlib_mapped(source).ok()?;
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = bytes.iter().map(|&b| if b == b'\n' { b'\n' } else { b' ' }).collect();
+    for seg in &map {
+        let (c, e) = (seg.c_start as usize..seg.c_end as usize, seg.e_start as usize..seg.e_end as usize);
+        // Tag code is copied byte for byte; a text literal is quoted.
+        if compiled.get(c) != source.get(e.clone()) {
+            continue;
+        }
+        out[e.clone()].copy_from_slice(&bytes[e.clone()]);
+        if let Some(close) = find_at(bytes, e.end, b"%>") {
+            out[close] = b';';
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Double-quoted Ruby literal whose every byte is data: `#` is escaped
 /// (no interpolation) along with quotes, backslashes and control bytes.
 fn stdlib_text_literal(s: &str) -> String {
