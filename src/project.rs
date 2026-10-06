@@ -2610,6 +2610,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let adapter = crate::runtime_files::read_to_string("runtime/spinel/postgres_adapter.rb")
         .map_err(|e| format!("read PostgreSQL adapter: {e}"))?;
     files.push(("runtime/postgres_adapter.rb".into(), adapter));
+    // semian 0.28.3's core and its ActiveRecord PostgreSQL adapter, ported
+    // onto this tree's adapter. Loaded only by the app's own
+    // `require "semian/activerecord_postgresql_adapter"`, which must
+    // compile to `require_relative` of the second file before
+    // `DatabaseConfiguration.configure!`.
+    for stem in ["semian", "semian_activerecord_postgresql_adapter"] {
+        let source = crate::runtime_files::read_to_string(&format!("runtime/spinel/{stem}.rb"))
+            .map_err(|e| format!("read {stem} runtime: {e}"))?;
+        files.push((format!("runtime/{stem}.rb"), source));
+    }
     files.push(("runtime/database_configuration.rb".into(), format!(r#"# Runtime connection configuration; the schema manifest contains no credentials.
 module DatabaseConfiguration
   def self.configure!
@@ -4511,8 +4521,10 @@ fn spinel_files(app: &App, fixture: &Path) -> Result<(Vec<(String, String)>, Vec
     // the spinel-subset compliance gate) must never see. It is injected
     // only by `jruby_runtime_files`, so keep it out of the shared base.
     // Likewise, the pg-gem driver is selected only for PostgreSQL CRuby
-    // projects, never included by the generic runtime directory walk.
-    files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb");
+    // projects, never included by the generic runtime directory walk, and
+    // so is the semian port that wraps that driver's adapter.
+    files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
+        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance
