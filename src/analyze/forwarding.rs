@@ -35,6 +35,17 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 "parameter declaration",
                 formal.description(),
             ));
+        } else if method.params.iter().any(crate::dialect::Param::is_nameless_rest)
+            && contracts.fragments.get(owner).copied().unwrap_or(0) > 1
+        {
+            // A reopened class's fragments are not shown to be emitted
+            // together, so its admitted `*` is not shown to run.
+            out.push(Diagnostic::unsupported(
+                method.name_span,
+                None,
+                "anonymous positional rest declaration",
+                "a nameless rest in a reopened class fragment is not verified",
+            ));
         }
         if method.params.iter().any(|p| p.forwarding) {
             // Ingest applies these rewrites regardless of receiver ownership,
@@ -74,11 +85,52 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             walk(app, &contracts, owner, method, default, &mut out);
         }
     }
+    out.extend(keyword_splats_into_nameless_rest(app));
     for (span, policy) in keyword_calls_with_index(app, &contracts) {
         if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
             out.push(keyword_refusal(span, policy));
         }
     }
+    out
+}
+
+/// The ordinary `**value` lowering passes the hash positionally, which a
+/// rest destination takes as one more positional. Refuse it where the
+/// selector can name an admitted nameless rest, by selector alone.
+pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
+    fn visit(selectors: &HashSet<&Symbol>, enclosing: Option<&Symbol>, e: &Expr, out: &mut Vec<Diagnostic>) {
+        let (selector, args) = match &*e.node {
+            ExprNode::Send { method, args, .. } => (Some(method), args.as_slice()),
+            ExprNode::Super { args: Some(args) } => (enclosing, args.as_slice()),
+            _ => (None, [].as_slice()),
+        };
+        if selector.is_some_and(|s| selectors.contains(s))
+            && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. }))
+        {
+            out.push(Diagnostic::unsupported(
+                e.span,
+                None,
+                "keyword splat into an anonymous positional rest",
+                "the keyword splat lowering would pass the hash as a positional",
+            ));
+        }
+        e.node.for_each_child(&mut |c| visit(selectors, enclosing, c, out));
+    }
+    let selectors: HashSet<&Symbol> = methods(app)
+        .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
+        .map(|(_, m)| &m.name)
+        .collect();
+    let mut out = Vec::new();
+    if selectors.is_empty() {
+        return out;
+    }
+    for (_, method) in methods(app) {
+        visit(&selectors, Some(&method.name), &method.body, &mut out);
+        for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
+            visit(&selectors, Some(&method.name), default, &mut out);
+        }
+    }
+    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(&selectors, None, e, &mut out));
     out
 }
 
@@ -302,7 +354,11 @@ fn association_method(app: &App, owner: &ClassId, method: &MethodDef) -> bool {
 }
 
 fn declaration_error((method, _model): (&MethodDef, bool)) -> Option<&'static str> {
-    if method.unsupported_formals.is_some() {
+    // An admitted nameless rest is kept only as written on the CRuby
+    // tree; forwarding into it is not part of that admission.
+    if method.unsupported_formals.is_some()
+        || method.params.iter().any(crate::dialect::Param::is_nameless_rest)
+    {
         Some("forwarding destination has an unrepresented parameter declaration")
     } else if method.has_anonymous_block {
         Some("forwarding destination's anonymous block binding is not preserved hygienically")

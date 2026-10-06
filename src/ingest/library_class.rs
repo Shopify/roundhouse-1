@@ -293,6 +293,7 @@ pub(super) fn library_class_and_struct_base(
     let base = struct_members
         .as_ref()
         .map(|members| struct_base_class(&owner, members));
+    admit_nameless_rest(&mut methods);
     Ok((
         LibraryClass {
             name: owner,
@@ -1037,6 +1038,37 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
     }
+}
+
+/// A nameless positional rest (`def m(*)`) is carried only on a library
+/// class's own instance methods: those are emitted where they are
+/// written, so the emitted `def` keeps Ruby's arity with no binding.
+/// A module's methods are copied into whatever includes it, and a
+/// class-side `def self.m(*)` into other carriers, which are not shown
+/// to keep it, so those stay refused. So does a body that passes the
+/// rest on, by a bare `*` (ingested as a splat of nil, which would pass
+/// nothing) or an implicit `super` (which passes it implicitly).
+fn admit_nameless_rest(methods: &mut [MethodDef]) {
+    for m in methods {
+        if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
+            && m.receiver == MethodReceiver::Instance
+            && m.params.iter().any(Param::is_nameless_rest)
+            && !passes_rest_on(&m.body)
+        {
+            m.unsupported_formals = None;
+        }
+    }
+}
+
+fn passes_rest_on(e: &Expr) -> bool {
+    let here = match &*e.node {
+        ExprNode::Splat { value } => matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }) && value.span.is_synthetic(),
+        ExprNode::Super { args: None } => true,
+        _ => false,
+    };
+    let mut found = here;
+    e.node.for_each_child(&mut |c| found |= passes_rest_on(c));
+    found
 }
 
 /// Same as `library_class_from_node` but for module-as-namespace
@@ -2128,6 +2160,11 @@ pub(super) fn ingest_library_method(
                     if let Ok(s) = std::str::from_utf8(loc.as_slice()) {
                         params.push(Param::rest(Symbol::from(s)));
                     }
+                } else {
+                    // `*`: the slot is kept for arity, but stays
+                    // refused (`unsupported_formals`) unless the
+                    // context admits it (`admit_nameless_rest`).
+                    params.push(Param::nameless_rest());
                 }
             }
         }

@@ -9,7 +9,7 @@ use crate::expr::{Expr, ExprNode};
 
 pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
     let plans = keyword_calls(app);
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = crate::analyze::forwarding::keyword_splats_into_nameless_rest(app);
     for (span, policy) in &plans {
         if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
             diagnostics.push(keyword_refusal(*span, *policy));

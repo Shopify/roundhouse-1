@@ -1642,8 +1642,8 @@ pub(super) fn ingest_method(
         // the splat left `def tagged` with a body still reading
         // `labels` — an ArgumentError at every call site that passes
         // one, while the same method on a plain class kept it. An
-        // anonymous `*` has no name to bind and is skipped, as the
-        // library-class path skips it.
+        // anonymous `*` has no name to bind and is skipped; the
+        // declaration stays refused (`unsupported_formals`).
         if let Some(rest) = pn.rest() {
             if let Some(loc) = rest.as_rest_parameter_node().and_then(|rp| rp.name()) {
                 params.push(crate::dialect::Param::rest(Symbol::from(constant_id_str(&loc))));

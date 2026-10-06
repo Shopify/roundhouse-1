@@ -994,3 +994,22 @@ fn runtime_full_declarations_refuse_both_entry_paths_and_project_legacy_keywords
     assert!(emitted.contains("target(kw)"), "{emitted}");
     assert!(!emitted.contains("**kw"), "{emitted}");
 }
+
+/// The ordinary `**value` lowering passes the hash positionally, so a
+/// splat that can reach an admitted nameless rest is refused by `check`
+/// itself, before lowering, for a send and for a `super`.
+#[test]
+fn a_keyword_splat_into_a_nameless_rest_is_refused_before_lowering() {
+    for source in [
+        "class Probe; def m(*, **kw); kw; end; def go(h); m(**h); end; end",
+        "class Probe; def m(*); 7; end; end; class Kid < Probe; def m(**h); super(**h); end; end",
+        "class Probe; def m(*); 7; end; def go(h); [1, m(**h)]; end; end",
+    ] {
+        let app = analyzed(source);
+        let errors: Vec<_> = diagnose(&app).into_iter().filter(|d| d.severity == Severity::Error).collect();
+        assert!(
+            errors.iter().any(|d| d.message.contains("keyword splat into an anonymous positional rest")),
+            "{source}: {errors:?}"
+        );
+    }
+}

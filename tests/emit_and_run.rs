@@ -7901,3 +7901,72 @@ fn a_nested_destructuring_target_is_refused_by_name() {
     let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
     assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
 }
+
+const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(a, *, k: 1, &blk)\n    [a, k, blk ? blk.call : nil]\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def post(a, *, z)\n    [a, z]\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(a, *rest)\n    [rest.size] + super(a)\n  end\nend\n";
+
+const NAMELESS_REST_TEST: &str = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"arity\" do\n    p = Probe.new\n    assert_equal [1, 1, nil], p.m(1, 2, 3)\n    assert_equal [1, 5, 9], p.m(1, 2, k: 5) { 9 }\n    assert_equal \"wrong number of arguments (given 0, expected 1+)\", assert_raises(ArgumentError) { p.m }.message\n    assert_equal 44, p.acquire(:a, b: 1) { 44 }\n    assert_equal [1, 4], p.post(1, 2, 3, 4)\n    assert_raises(ArgumentError) { p.post(1) }\n    assert_equal 7, p.first_of([7, 8])\n    assert_equal [2, 1, 1, nil], Child.new.m(1, 2, 3)\n  end\nend\n";
+
+fn nameless_rest_app(probe: &str, test: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/probe.rb", probe)
+        .write("test/test_helper.rb", "require \"active_support\"\n")
+        .write("test/models/probe_test.rb", test)
+}
+
+/// `def m(a, *)` takes any number of extra positionals and binds none.
+/// A library class's own instance method is emitted where it is
+/// written, so the CRuby tree keeps that arity.
+#[test]
+fn a_nameless_rest_keeps_its_arity_on_cruby() {
+    nameless_rest_app(NAMELESS_REST_PROBE, NAMELESS_REST_TEST).run_test("test/models/probe_test.rb").assert_passes();
+}
+
+/// No other target is shown to keep the arity, so the declaration is
+/// refused there even where only a call in another class reaches it.
+#[test]
+fn a_nameless_rest_is_refused_off_cruby() {
+    use roundhouse::project::BuildTarget;
+    let probe = "class Probe\n  def n(*)\n    :ok\n  end\nend\n\nclass User\n  def go\n    Probe.new.n(1, 2)\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert_equal :ok, User.new.go\n  end\nend\n";
+    nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
+    for target in [BuildTarget::Jruby, BuildTarget::Spinel, BuildTarget::Typescript, BuildTarget::Rust, BuildTarget::Python, BuildTarget::Go] {
+        let (_, errors) = nameless_rest_app(probe, test).emit(target);
+        assert!(errors.iter().any(|e| e.contains("anonymous positional rest declaration not supported")), "{target:?}: {errors:?}");
+        let named = "class Probe\n  def n(*args)\n    args.size\n  end\nend\n";
+        let (_, errors) = nameless_rest_app(named, "require \"test_helper\"\n").emit(target);
+        assert!(!errors.iter().any(|e| e.contains("anonymous positional rest")), "named {target:?}: {errors:?}");
+    }
+}
+
+/// Where the rest is passed on (a bare `*`, an implicit `super`), copied
+/// to another carrier (a module, the class side, a test helper), split
+/// across reopened fragments, or declared beside `**nil`, the emitted
+/// program is not shown to keep it, so the declaration stays refused.
+/// So do `...` and a `**` splat into it, whose lowerings do not carry it.
+#[test]
+fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
+    use roundhouse::project::BuildTarget;
+    let base = "class Base\n  def m(*args)\n    args.size\n  end\nend\n";
+    let cases: &[(&str, &str, &str)] = &[
+        ("bare_send", "class Probe\n  def m(*)\n    other(*)\n  end\n\n  def other(*args)\n    args.size\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("bare_array", "class Probe\n  def m(*)\n    [*]\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("bare_super", "class Probe < Base\n  def m(*)\n    super(*)\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("implicit_super", "class Probe < Base\n  def m(*)\n    super\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("module", "module Mixin\n  def m(*)\n    :mixed\n  end\nend\n\nclass Probe\n  include Mixin\nend\n", "anonymous positional rest is not retained"),
+        ("class_side", "class Probe\n  def self.m(*)\n    :klass\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("singleton", "class Probe\n  class << self\n    def m(*)\n      :klass\n    end\n  end\nend\n", "anonymous positional rest is not retained"),
+        ("reopened", "class Probe\n  def first\n    :first\n  end\nend\n\nclass Probe\n  def m(a, *)\n    [a, first]\n  end\nend\n", "nameless rest in a reopened class fragment"),
+        ("no_keywords", "class Probe\n  def m(*, **nil)\n    :ok\n  end\nend\n", "no-keywords constraint is not retained"),
+        ("forwarded_into", "class Probe\n  def m(a, *)\n    a\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
+        ("keyword_splat_super", "class Probe\n  def m(*)\n    7\n  end\nend\n\nclass Kid < Probe\n  def m(**h)\n    super(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+        ("keyword_splat_into", "class Probe\n  def m(*, **kw)\n    kw\n  end\n\n  def go(h)\n    m(**h)\n  end\nend\n", "keyword splat into an anonymous positional rest"),
+    ];
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert Probe\n  end\nend\n";
+    for (name, probe, why) in cases {
+        let (_, errors) = nameless_rest_app(&format!("{base}\n{probe}"), test).emit(BuildTarget::Ruby);
+        assert!(errors.iter().any(|e| e.contains(why)), "{name}: {errors:?}");
+    }
+    let helper = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  def helper(a, *)\n    a\n  end\n\n  test \"t\" do\n    assert_equal 1, helper(1, 2)\n  end\nend\n";
+    let (_, errors) = nameless_rest_app("class Probe\nend\n", helper).emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("anonymous positional rest is not retained")), "helper: {errors:?}");
+}
