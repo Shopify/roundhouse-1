@@ -284,6 +284,23 @@ fn is_stdlib_only(graph: &Graph, declaration: &Declaration) -> bool {
         })
 }
 
+/// The name a declaration answers to once ingest has hoisted it.
+///
+/// Rubydex names what `class << self` declares by its singleton class:
+/// `Locking::<Locking>::ERROR`. Every Roundhouse walk replays such a
+/// constant in the enclosing body (`singleton_class::SingletonBody::
+/// class_body`, `library_class::walk_decl_body`), so emitted code defines
+/// it as `Locking::ERROR`. Qualifying a reference with the singleton
+/// segment emitted `Locking::<Locking>::ERROR`, which is not Ruby.
+fn hoisted_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains('<') {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    std::borrow::Cow::Owned(
+        name.split("::").filter(|segment| !segment.starts_with('<')).collect::<Vec<_>>().join("::"),
+    )
+}
+
 fn resolved_namespace(graph: &Graph, name: NameId) -> Option<&Declaration> {
     let id = graph.name_id_to_declaration_id(name)?;
     let id = graph.resolve_alias(id).unwrap_or(*id);
@@ -727,12 +744,12 @@ fn answer_file(
                     .flatten()
                     .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
                     .filter(|(_, target)| target.as_namespace().is_some());
-                let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(declaration.name()))));
+                let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
                 let (id, declaration) = aliased.unwrap_or((id, declaration));
                 if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
                     let (class, runtime, stdlib) = class_cache.entry(id).or_insert_with(|| {
                         (
-                            Arc::new(ClassId(Symbol::from(declaration.name()))),
+                            Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
                             is_runtime_declaration(graph, declaration),
                             is_stdlib_only(graph, declaration),
                         )
@@ -781,7 +798,7 @@ fn answer_file(
                     } else {
                         None
                     };
-                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(name))), runtime, stdlib }
+                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))), runtime, stdlib }
                 }
             });
         match answers.references.entry(offset.start()) {
@@ -811,7 +828,7 @@ fn answer_file(
             if let Some(written) = graph.strings().get(name.str()) {
                 let owner = parent.and_then(|id| graph.name_id_to_declaration_id(*id))
                     .and_then(|id| graph.declarations().get(id));
-                let full = owner.map_or_else(|| written.to_string(), |owner| format!("{}::{}", owner.name(), written.as_str()));
+                let full = owner.map_or_else(|| written.to_string(), |owner| format!("{}::{}", hoisted_name(owner.name()), written.as_str()));
                 if matches!(definition, Some(Definition::Class(_) | Definition::Module(_))) {
                     answers.class_definitions.insert(full.clone().into());
                 }
@@ -856,7 +873,7 @@ fn answer_file(
         if let (Some(name), Some(id)) = (name, id) {
             answers.constants.push((offset.end(), name.as_str().into(), *id));
             if let Some(declaration) = graph.declarations().get(id) {
-                answers.constant_classes.insert(*id, ClassId(Symbol::from(declaration.name())));
+                answers.constant_classes.insert(*id, ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref())));
             }
         }
     }
