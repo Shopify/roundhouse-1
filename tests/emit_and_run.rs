@@ -7745,6 +7745,8 @@ fn assertions_inside_a_destructured_block_run_where_they_are_written() {
         ("own", "  def assert_includes(collection, item)\n    Widget.hit\n    assert collection.downcase.include?(item.downcase)\n  end\n\n  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      $stdout.puts \"HELLO\"\n      assert_includes \"HELLO\", \"hello\"\n      assert_shouted \"LOUD\"\n    end\n    assert_includes out, \"hello\"\n    assert_equal 2, Widget.hits\n  end\n"),
         ("plain", "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal x, x\n      Widget.hit\n      x * 10\n    end\n    assert_equal [10, 20], [first, second]\n    assert_equal 2, Widget.hits\n  end\n"),
         ("splat", "  test \"t\" do\n    out, *rest = capture_io do\n      $stderr.puts \"e\"\n      assert_equal 1, 1\n      Widget.hit\n    end\n    assert_equal \"\", out\n    assert_equal [\"e\\n\"], rest\n    assert_equal 1, Widget.hits\n  end\n"),
+        ("diff_ma", "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal [5, 6], [a, b]\n    assert_equal 1, Widget.hits\n  end\n"),
+        ("diff_value", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      7\n    end\n    assert_equal 7, v\n  end\n"),
     ];
     for (name, members) in cases {
         let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
@@ -7765,6 +7767,10 @@ fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
         ("ensure", "assertion failed", 1, "  test \"t\" do\n    out, err = capture_io do\n      begin\n        Widget.hit\n      ensure\n        assert false\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
         ("own_fail", "assert_equal failed", 0, "  def assert_shouted(text)\n    assert_equal text.upcase, text\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_shouted \"quiet\"\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
         ("plain_fail", "assert_equal failed", 1, "  test \"t\" do\n    first, second = [1, 2].map do |x|\n      assert_equal 1, x\n      Widget.hit\n      x\n    end\n    Widget.hit\n  end\n"),
+        ("branch_fail", "assert_equal failed", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
+        ("class_method", "assert_equal failed", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
+        ("diff_bind_fail", "assert_equal failed", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
+        ("diff_delta_fail", "Widget.hits didn't change by 2", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      [5, 6]\n    end\n    Widget.hit\n  end\n"),
     ];
     for (name, failure, hits, members) in cases {
         let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");
@@ -7773,6 +7779,22 @@ fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
         assert!(run.stdout.contains(&format!("FAIL WidgetTest#test_t: {failure}")), "{name}: {}", run.stdout);
         assert!(run.stdout.contains(&format!("F3 {name} HITS={hits}\n")), "{name}: {}", run.stdout);
     }
+}
+
+/// A test class's own assertion that calls `super` reaches Minitest's,
+/// which no emitted harness defines once the inliner leaves the call to
+/// the override: refused by name, not emitted to raise NoMethodError.
+/// (Natively it passes with one hit, f3/native-r1.log.)
+#[test]
+fn a_test_class_assertion_calling_super_is_refused_by_name() {
+    use roundhouse::project::BuildTarget;
+    for target in [BuildTarget::Spinel, BuildTarget::Rust, BuildTarget::Typescript] {
+        let app = destructured_block_app("own_super", "  def assert_includes(collection, item)\n    Widget.hit\n    super\n  end\n\n  test \"t\" do\n    assert_includes [1, 2], 2\n  end\n");
+        let (_, errors) = app.emit(target);
+        assert!(errors.iter().any(|e| e.contains("assertion_super") && e.contains("assert_includes")), "{target:?}: {errors:?}");
+    }
+    let run = destructured_block_app("own_super", "  def assert_includes(collection, item)\n    Widget.hit\n    super(collection, item)\n  end\n\n  test \"t\" do\n    assert_includes [1, 2], 2\n  end\n").run_test("test/models/widget_test.rb");
+    assert!(run.errors.iter().any(|e| e.contains("assertion_super") && e.contains("assert_includes")), "{:?}", run.errors);
 }
 
 /// A nested destructuring target is refused by name at ingest rather
