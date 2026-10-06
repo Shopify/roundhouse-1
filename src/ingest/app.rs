@@ -1376,8 +1376,31 @@ end
             test_files.extend(read_test_rb_files(vfs, dir, &tests_dir)?);
         }
     }
+    // The helper, the shared helper modules and the fixtures are read on
+    // their own terms, above and below; a `test_paths` entry of `test`
+    // must not read them a second time as test files.
+    let helper_rb = dir.join("test/test_helper.rb");
+    let (helpers_dir, fixtures_dir) = (dir.join("test/test_helpers"), dir.join("test/fixtures"));
+    test_files.retain(|f| f != &helper_rb && !f.starts_with(&helpers_dir) && !f.starts_with(&fixtures_dir));
     test_files.sort();
     test_files.dedup();
+
+    // A test-case base the helper DEFINES (`class SqliteTestCompat::TestCase
+    // < ActiveSupport::TestCase`), which the app's tests then subclass. A
+    // reopen (`class ActiveSupport::TestCase` with no superclass) is the
+    // helper configuring Rails' own base, not a class of the app's.
+    if vfs.exists(&helper_rb) {
+        if let Some(source) = read_or_ledger(vfs, &helper_rb)? {
+            if let Some(tms) =
+                unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
+            {
+                for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
+                    splice_test_helpers(&mut tm, &shared_test_helpers);
+                    app.test_modules.push(tm);
+                }
+            }
+        }
+    }
 
     for entry in test_files {
         let Some(source) = read_or_ledger(vfs, &entry)? else { continue };
