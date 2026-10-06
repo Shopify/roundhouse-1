@@ -7801,11 +7801,13 @@ fn a_test_class_assertion_calling_super_is_refused_by_name() {
 /// the lowerer splices into the test (`assert_difference`,
 /// `assert_raises`, `assert_throws`) would, once spliced, leave whatever
 /// encloses the assertion instead: a false pass, other effects, or a
-/// syntax error, where natively it leaves only the block. So is a
-/// `return` in the tail of an `assert_difference` block whose value is
-/// assigned, which becomes a void value (conservatively also when only
-/// one branch returns, which Ruby would accept). Each is refused by
-/// name, on every target. Outcomes natively: f3a/native.log.
+/// syntax error, where natively it leaves only the block. A `return`
+/// in a block the lowering wraps (`assert_raises`, `assert_throws`, an
+/// assigned `assert_difference`) would leave only the wrapper where a
+/// target emits it as a function (TypeScript), or be a void value; it
+/// is refused too, also where CRuby would run it. Each is refused by
+/// name, on every target, in a helper as in a test. Outcomes natively:
+/// f3a/native.log.
 #[test]
 fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
     use roundhouse::project::BuildTarget;
@@ -7817,6 +7819,12 @@ fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
         ("diff_next_capio", "next", "  test \"t\" do\n    out, err = capture_io do\n      v = assert_difference(\"Widget.hits\", 2) do\n        Widget.hit\n        next 3\n      end\n      Widget.hit\n    end\n  end\n"),
         ("diff_return_tail", "return", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return\n    end\n    Widget.hit\n  end\n"),
         ("diff_return_cond_tail", "return", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n    end\n    Widget.hit\n  end\n"),
+        ("diff_return_value", "return", "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n      4\n    end\n    Widget.hit\n  end\n"),
+        ("raises_return", "return", "  test \"t\" do\n    assert_raises(ArgumentError) do\n      Widget.hit\n      return if Widget.hits == 1\n      raise ArgumentError\n    end\n    Widget.hit\n  end\n"),
+        ("throws_return", "return", "  test \"t\" do\n    assert_throws(:done) do\n      Widget.hit\n      return if Widget.hits == 1\n      throw :done\n    end\n    Widget.hit\n  end\n"),
+        ("diff_redo", "redo", "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      redo if Widget.hits == 1\n    end\n    Widget.hit\n  end\n"),
+        ("helper_next", "next", "  def checked\n    [1].each do\n      assert_raises(ArgumentError) do\n        Widget.hit\n        next\n      end\n      Widget.hit\n    end\n  end\n\n  test \"t\" do\n    checked\n  end\n"),
+        ("raises_each_return", "return", "  test \"t\" do\n    assert_raises(ArgumentError) do\n      [1].each do\n        Widget.hit\n        return\n      end\n    end\n    Widget.hit\n  end\n"),
         ("raises_next", "next", "  test \"t\" do\n    [1].each do\n      assert_raises(ArgumentError) do\n        Widget.hit\n        next\n      end\n      Widget.hit\n    end\n  end\n"),
         ("throws_next", "next", "  test \"t\" do\n    assert_throws(:done) do\n      Widget.hit\n      next\n    end\n    Widget.hit\n  end\n"),
         ("throws_break", "break", "  test \"t\" do\n    [1].each do\n      assert_throws(:done) do\n        Widget.hit\n        break\n      end\n      Widget.hit\n    end\n  end\n"),
@@ -7831,10 +7839,19 @@ fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
             );
         }
     }
+    // The scan follows exactly the assertions the lowerer reaches. Main's
+    // in-place inliner (`walk_inline`) descends into a `while` body too,
+    // so an assertion there is spliced and the jump in its block, which
+    // would then continue the loop instead of leaving the block, is
+    // refused. (On the old map_expr inliner a `while` body was not
+    // reached, and this case was pinned as not refused.)
+    let (_, errors) = destructured_block_app("while_raises_next", "  test \"t\" do\n    i = 0\n    while i < 1\n      i += 1\n      assert_raises(ArgumentError) do\n        next if Widget.flag\n        raise ArgumentError\n      end\n    end\n  end\n").emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("assertion_block_jump") && e.contains("`next`")), "{errors:?}");
 }
 
 /// A jump confined to a loop, block or lambda inside the spliced block,
-/// a statement-position `return` (which leaves the test either way), and
+/// a `return` from a statement `assert_difference` (spliced bare, so it
+/// leaves the test either way), and
 /// a jump in a block the lowerer does not splice (a test class's own
 /// `assert_difference`, `capture_io`) run as natively, with its effect
 /// count.
@@ -7842,9 +7859,9 @@ fn a_jump_out_of_a_spliced_assertion_block_is_refused_by_name() {
 fn a_jump_that_stays_inside_an_assertion_block_runs_as_written() {
     let cases = [
         ("diff_return_stmt", 1, "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n    end\n    Widget.hit\n  end\n"),
-        ("diff_return_value", 1, "  test \"t\" do\n    v = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      return if Widget.hits == 1\n      4\n    end\n    Widget.hit\n  end\n"),
         ("inner_each_next", 2, "  test \"t\" do\n    assert_difference(\"Widget.hits\", 2) do\n      [1, 2, 3].each do |x|\n        next if x == 2\n        Widget.hit\n      end\n    end\n    assert_equal 2, Widget.hits\n  end\n"),
         ("inner_while_break", 1, "  test \"t\" do\n    v = assert_difference(\"Widget.hits\") do\n      while true\n        Widget.hit\n        break\n      end\n      5\n    end\n    assert_equal 5, v\n  end\n"),
+        ("raises_lambda_return", 2, "  test \"t\" do\n    assert_raises(ArgumentError) do\n      f = -> { return 5 }\n      Widget.hit if f.call == 5\n      raise ArgumentError\n    end\n    Widget.hit\n  end\n"),
         ("inner_lambda", 1, "  test \"t\" do\n    assert_difference(\"Widget.hits\") do\n      f = -> { return 5 }\n      Widget.hit if f.call == 5\n    end\n  end\n"),
         ("own_difference", 2, "  def assert_difference(_expression, _delta = 1)\n    Widget.hit\n    yield\n  end\n\n  test \"t\" do\n    assert_difference(\"Widget.hits\") do\n      next\n    end\n    Widget.hit\n    assert_equal 2, Widget.hits\n  end\n"),
         ("capio_next", 1, "  test \"t\" do\n    out, err = capture_io do\n      Widget.hit\n      $stdout.puts \"x\"\n      next\n    end\n    assert_equal \"x\\n\", out\n    assert_equal 1, Widget.hits\n  end\n"),

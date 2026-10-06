@@ -160,6 +160,15 @@ fn lower_value_in_place(e: &mut Expr, own: &dyn Fn(&str) -> bool) -> bool {
     }
 }
 
+/// The children `walk_inline` descends into: the expressions whose
+/// assertions are rewritten. That walk reaches every child
+/// (`for_each_child_mut`), a `while` body and the right of `||=`
+/// included, so this is every child as well; a scan that skipped one
+/// would miss an assertion the inliner splices.
+pub(crate) fn for_each_rewritten_child<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
+    e.node.for_each_child(f);
+}
+
 fn walk_lvalue(target: &mut LValue, own: &dyn Fn(&str) -> bool) {
     match target {
         LValue::Attr { recv, .. } => {
