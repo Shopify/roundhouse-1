@@ -6860,6 +6860,8 @@ fn a_teardown_on_a_nested_or_integration_reopen_is_refused() {
     for helper in [
         "require \"active_support\"\n\nmodule ActiveSupport\n  class TestCase\n    teardown do\n      raise \"global cleanup ran\"\n    end\n  end\nend\n",
         "require \"active_support\"\n\nclass ActionDispatch::IntegrationTest\n  teardown do\n    raise \"global cleanup ran\"\n  end\nend\n",
+        // Delta 3 q7: every Rails test case is a `Minitest::Test`.
+        "require \"active_support\"\n\nclass Minitest::Test\n  def teardown\n    raise \"global cleanup ran\"\n  end\nend\n",
     ] {
         let tree = [
             ("app/.keep", ""),
