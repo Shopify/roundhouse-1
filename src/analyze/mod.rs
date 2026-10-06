@@ -31,6 +31,7 @@ pub(crate) mod test_constants;
 pub(crate) mod test_assertion_jumps;
 pub(crate) mod test_harness_calls;
 pub mod test_helper_connection;
+mod database_identity;
 mod fixture_entries;
 mod body;
 mod class_configuration;

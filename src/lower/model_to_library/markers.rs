@@ -271,7 +271,7 @@ fn is_primary_abstract_class(model: &Model) -> bool {
 /// Literal abstract markers take effect in declaration order. Admission
 /// requires a concrete includer; production separately checks whether
 /// the model is a primary base before suppressing inherited methods.
-pub(super) fn is_abstract_class(model: &Model) -> bool {
+pub(crate) fn is_abstract_class(model: &Model) -> bool {
     let mut abstract_class = false;
     for item in &model.body {
         if let ModelBodyItem::Unknown { expr, .. } = item {

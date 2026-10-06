@@ -50,6 +50,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(super::fixture_entries::diagnose(app));
     out.extend(super::test_teardown::diagnose(app));
     out.extend(super::test_helper_connection::diagnose(app));
+    out.extend(super::database_identity::diagnose(app));
     out.extend(super::test_constants::diagnose(app));
     out.extend(super::test_harness_calls::diagnose(app));
     out.extend(super::test_assertion_jumps::diagnose(app));

@@ -60,6 +60,56 @@ follow symbolic links below selected folders.
 Roundhouse reads `test/test_helper.rb`, `test/test_helpers/`, and
 `test/fixtures/` outside this folder list.
 
+### Database configurations
+
+Without further configuration, Roundhouse loads `db/schema.rb`, or
+`db/structure.sql` when there is no `db/schema.rb`. An app with several
+databases, a schema elsewhere, or a configuration resolved through ERB
+states Rails' own resolution as data instead:
+
+```yaml
+database_configurations: config/roundhouse/databases.json
+```
+
+Write the manifest inside the app, under the environment it describes:
+
+```sh
+RAILS_ENV=test bin/rails runner /path/to/roundhouse/scripts/rails-database-manifest.rb -- \
+  --out config/roundhouse/databases.json
+```
+
+The manifest lists each configuration of the test environment (name,
+adapter, primary or replica, schema format, schema source,
+`schema_search_path`, non-secret options, migrations paths) and pins, by
+sha256, the configuration file Rails loaded, `Gemfile.lock`, every
+schema file it selects, and the extractor itself. It never records
+credentials, hosts, database names or code. An input whose name or
+value looks like a credential is recorded by name only. When the authored
+setup loads a schema that Rails would not dump (for example
+`schema_dump: false` with a versioned dump), name it with
+`--schema-source NAME=PATH:FORMAT:NOTE`. Roundhouse does not infer these
+filenames.
+
+The primary's schema is chosen by its configured format and source, not
+by which file exists. A manifest that is missing, from another version,
+environment or extractor, or whose pins no longer match the tree is an
+error. Roundhouse never falls back to the default order. The recorded Rails and Ruby
+versions are checked against `Gemfile.lock` where it locks them. The
+hashes do not prove that the manifest is fresh. ERB in a
+configuration file can read environment variables, other files, and app
+constants that the manifest does not hash, and the source revision is
+recorded but not verified. Roundhouse reports these as a warning.
+Regenerate the manifest whenever any input changes.
+
+Which database a model uses comes from source: a literal
+`connects_to database: { writing: :name }` in an abstract class, which
+its subclasses inherit. A database the emitted runtime does not open is
+an error at that `connects_to`. Today that is any database other than
+the primary, and any postgresql, postgis, mysql2 or trilogy database.
+Other routing is also an error at its call: a computed or conditional
+`connects_to`, `shards:`, `establish_connection`, `connected_to`, or a
+connection method the app defines itself.
+
 Transpilation is the analysis from [`check.md`](check.md) followed by
 lowering and emit. It requires zero analysis errors and a runtime for
 the modeled constructs on the selected target. A clean target-independent

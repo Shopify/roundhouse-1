@@ -38,7 +38,26 @@ pub struct HelperConnection {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct App {
     pub schema_version: u32,
+    /// The primary database's schema. For an app with a
+    /// `database_configurations` manifest it is the schema the manifest
+    /// selects for the primary configuration; otherwise `db/schema.rb`,
+    /// else `db/structure.sql`, else the folded migrations.
     pub schema: Schema,
+    /// The manifest's database configurations for its environment, in
+    /// manifest order; empty for an app without a manifest
+    /// ([`crate::database`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<crate::database::Database>,
+    /// Each model's database, read from source (`connects_to` through
+    /// abstract parents, app-defined connection overrides). Empty when
+    /// the app has no manifest and no model declares any routing.
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
+    pub model_databases: indexmap::IndexMap<ClassId, crate::database::ModelDatabase>,
+    /// Database-identity facts the emitted runtime does not carry (a
+    /// stale manifest, a second database, unresolvable routing), each
+    /// reported as an error by `analyze::database_identity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub database_refusals: Vec<crate::database::DatabaseRefusal>,
     pub models: Vec<Model>,
     /// Non-model classes living under `app/models/` (e.g. specialized
     /// has_many proxies). Classified at ingest time by superclass:
@@ -709,6 +728,9 @@ impl App {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             schema: Schema::default(),
+            databases: Vec::new(),
+            model_databases: indexmap::IndexMap::new(),
+            database_refusals: Vec::new(),
             binary_assets: Vec::new(),
             models: Vec::new(),
             library_classes: Vec::new(),
