@@ -89,7 +89,9 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
         .find("  \"models/roundhouse_files/lib/foo/engine\",\n].each { |file| require RoundhouseAutoload.path(file) }")
         .unwrap_or_else(|| panic!("{models}"));
     let program = std::fs::read_to_string(dir.join("app/models/roundhouse_files/lib/foo/engine.rb")).expect("engine.rb's program");
-    assert!(program.contains("require \"rails\"\nend\nrequire RoundhouseAutoload.path(\"models/foo/settings\")\nrequire RoundhouseAutoload.path(\"models/foo\")\nrequire RoundhouseAutoload.path(\"models/foo/engine\")\n"), "{program}");
+    // `require "rails"` is the runtime ports' (loaded at boot), named and
+    // not required: the gem home's railties is real Rails.
+    assert!(program.contains("# lib/foo/engine.rb:1: `require \"rails\"` is a Rails feature this tree's runtime ports answer; not required\nrequire RoundhouseAutoload.path(\"models/foo/settings\")\nrequire RoundhouseAutoload.path(\"models/foo\")\nrequire RoundhouseAutoload.path(\"models/foo/engine\")\n"), "{program}");
     let boot = models.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{models}"));
     assert!(root < load && load < boot, "{models}");
 
