@@ -11,15 +11,18 @@
 //!   recursion widening does not see. Its return gained an
 //!   `Array[Hash[_, …]]` level (about 12 nodes) per round.
 //! - `Risk::Service#recommendations_for_orders` has an instance method
-//!   and a class method of the same name, which share one parameter
+//!   and a class method of the same name, which shared one parameter
 //!   key. The instance method wraps each element of its argument in a
 //!   Hash and passes the array to the class method, so the shared slot
-//!   received its own value one Hash deeper every round.
+//!   received its own value one Hash deeper every round. Params are now
+//!   keyed by side, which breaks this loop; the test still pins the
+//!   class method's param.
 //!
 //! Neither revisits a value, so cycle widening never applies. Depth
 //! limiting does: after a slot sets a new nesting high three times in a
 //! loop, the levels below the limit become `Untyped`.
 use roundhouse::analyze::Analyzer;
+use roundhouse::dialect::MethodReceiver;
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::{App, ClassId, Symbol, Ty};
 use std::path::PathBuf;
@@ -137,10 +140,10 @@ fn depth(ty: &Ty) -> usize {
     }
 }
 
-fn params<'a>(app: &'a App, class: &str, method: &str) -> &'a [Ty] {
+fn params<'a>(app: &'a App, class: &str, method: &str, side: MethodReceiver) -> &'a [Ty] {
     app.inferred_method_params
-        .get(&(ClassId(Symbol::from(class)), Symbol::from(method)))
-        .unwrap_or_else(|| panic!("{class}#{method} has inferred params"))
+        .get(&(ClassId(Symbol::from(class)), Symbol::from(method), side))
+        .unwrap_or_else(|| panic!("{class} {method} ({side:?}) has inferred params"))
 }
 
 #[test]
@@ -169,7 +172,7 @@ fn a_return_nesting_itself_through_another_instance_is_depth_limited() {
 #[test]
 fn a_param_fed_its_own_value_one_hash_deeper_is_depth_limited() {
     let a = analyzed();
-    let [param] = params(&a.app, "Risk::Service", "recommendations_for_orders") else {
+    let [param] = params(&a.app, "Risk::Service", "recommendations_for_orders", MethodReceiver::Class) else {
         panic!("one param")
     };
     // Unlimited, this gained a `Hash[Sym, …]` level per round.

@@ -78,8 +78,9 @@ pub(super) fn report(label: &str, prev: &InferenceSig, now: &InferenceSig) {
     let mut changes = Vec::new();
     diff_methods("instance", &prev.instance, &now.instance, &mut changes);
     diff_methods("class", &prev.class_methods, &now.class_methods, &mut changes);
-    for ((cid, name), tys) in &now.params {
-        let old = prev.params.get(&(cid.clone(), name.clone()));
+    for (key, tys) in &now.params {
+        let (cid, name, _) = key;
+        let old = prev.params.get(key);
         if old != Some(tys) {
             let before: usize = old.map(|v| v.iter().map(ty_size).sum()).unwrap_or(0);
             let after: usize = tys.iter().map(ty_size).sum();

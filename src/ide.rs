@@ -3049,10 +3049,10 @@ pub fn candidate_signature(
     method: &Symbol,
 ) -> Option<String> {
     let info = analyzer.class_registry().get(class_id)?;
-    let known = info
-        .instance_methods
-        .get(method)
-        .or_else(|| info.class_methods.get(method))?;
+    let (known, side) = match info.instance_methods.get(method) {
+        Some(ty) => (ty, crate::dialect::MethodReceiver::Instance),
+        None => (info.class_methods.get(method)?, crate::dialect::MethodReceiver::Class),
+    };
     if matches!(known, Ty::Fn { .. }) {
         return crate::rbs::print_method_signature(method.as_str(), known);
     }
@@ -3060,7 +3060,7 @@ pub fn candidate_signature(
         return None; // a `-> untyped` candidate prices nothing
     }
     let param_names = method_def_param_names(app, class_id, method)?;
-    let inferred = analyzer.inferred_param_types(class_id, method);
+    let inferred = analyzer.inferred_param_types(class_id, method, side);
     let params: Vec<crate::ty::Param> = param_names
         .iter()
         .enumerate()

@@ -37,6 +37,7 @@
 use crate::app::App;
 use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode, Literal};
+use crate::dialect::MethodReceiver;
 use crate::ident::{ClassId, Symbol};
 use crate::lower::controller_to_library::util::map_expr;
 use crate::ty::Ty;
@@ -57,7 +58,22 @@ fn rewrite_send(e: &Expr, app: &App) -> Option<Expr> {
         return None;
     };
     let callee = callee_class(r)?;
-    let params = app.inferred_method_params.get(&(callee, method.clone()))?;
+    // A constant or `x.class` receiver calls the class; any other receiver an
+    // instance. Each falls back to the other side for a name only
+    // that side defines, as `apply_param_sites` does.
+    let class_recv = match &*r.node {
+        ExprNode::Const { .. } => true,
+        ExprNode::Send { method, args, .. } => method.as_str() == "class" && args.is_empty(),
+        _ => false,
+    };
+    let sides = if class_recv {
+        [MethodReceiver::Class, MethodReceiver::Instance]
+    } else {
+        [MethodReceiver::Instance, MethodReceiver::Class]
+    };
+    let params = sides
+        .iter()
+        .find_map(|side| app.inferred_method_params.get(&(callee.clone(), method.clone(), *side)))?;
     let mut changed = false;
     let rewritten: Vec<Expr> = args
         .iter()

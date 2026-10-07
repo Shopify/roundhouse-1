@@ -72,7 +72,7 @@ pub(super) fn diagnose(app: &crate::App) -> Vec<Diagnostic> {
         let (class, span) = resources[&id];
         let object_type = app
             .inferred_method_params
-            .get(&(id.clone(), Symbol::from("initialize")))
+            .get(&(id.clone(), Symbol::from("initialize"), crate::dialect::MethodReceiver::Instance))
             .and_then(|params| params.first());
         let serializer = class
             .methods

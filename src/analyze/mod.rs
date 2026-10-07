@@ -82,6 +82,8 @@ use rubydex::model::ids::DeclarationId;
 
 use crate::adapter::{DatabaseAdapter, SqliteAdapter};
 use crate::App;
+use crate::app::ParamKey;
+use crate::dialect::MethodReceiver;
 use crate::dialect::{
     Action, Controller, ControllerBodyItem, Filter, FilterKind, LayoutDecl, MethodDef, Model,
     ModelBodyItem, RenderTarget,
@@ -101,7 +103,7 @@ pub struct Analyzer {
     /// instead of falling back to `Ty::Var` (the unknown sentinel).
     /// The Symbol key is the method name; the Vec aligns positionally
     /// with `MethodDef.params`.
-    inferred_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    inferred_params: HashMap<ParamKey, Vec<Ty>>,
     /// (class, method) pairs an author wrote a signature for, as opposed
     /// to a `Fn` the registry stamped from the def itself. Only in the
     /// first is an `untyped` slot a statement rather than an inference
@@ -209,6 +211,11 @@ impl std::fmt::Display for FixpointRounds {
     }
 }
 
+/// One call site's evidence for a `def`'s parameters: the receiver's
+/// class, the method, the side the call is written on, the positional
+/// argument types and the keyword group.
+type ParamSite = (ClassId, Symbol, MethodReceiver, Vec<Ty>, SiteKeywords);
+
 /// Snapshot of the data the fixpoint refines: per-class instance/class
 /// method return types plus `inferred_params`. HashMap equality is
 /// order-independent, so this matches the previous sorted-string
@@ -217,7 +224,7 @@ impl std::fmt::Display for FixpointRounds {
 struct InferenceSig {
     instance: HashMap<ClassId, HashMap<Symbol, Ty>>,
     class_methods: HashMap<ClassId, HashMap<Symbol, Ty>>,
-    params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    params: HashMap<ParamKey, Vec<Ty>>,
 }
 
 /// Which call-site trees `unify_params_from_call_sites` walks.
@@ -1055,8 +1062,13 @@ impl Analyzer {
         self.fixpoint_rounds
     }
 
-    pub fn inferred_param_types(&self, class: &ClassId, method: &Symbol) -> Option<&[Ty]> {
-        self.inferred_params.get(&(class.clone(), method.clone())).map(|v| v.as_slice())
+    pub fn inferred_param_types(
+        &self,
+        class: &ClassId,
+        method: &Symbol,
+        side: MethodReceiver,
+    ) -> Option<&[Ty]> {
+        self.inferred_params.get(&(class.clone(), method.clone(), side)).map(|v| v.as_slice())
     }
 
     /// Walk the app, annotating every expression's `ty` field, then
@@ -1177,15 +1189,19 @@ impl Analyzer {
             crate::timings::phase(format_args!("round {round}: unify params"), || {
                 self.unify_params_from_call_sites(app, UnifyScope::Production)
             });
-            self.widen_cycles(&prev_sig, &mut cycles);
+            crate::timings::phase(format_args!("round {round}: widen cycles"), || {
+                self.widen_cycles(&prev_sig, &mut cycles)
+            });
             if fixpoint_debug::enabled() {
                 fixpoint_debug::report(&format!("production round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
+            let _sig = crate::timings::begin(format_args!("round {round}: compare signature"));
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.production = Some(round + 1);
                 break;
             }
             prev_sig = self.capture_inference_sig();
+            drop(_sig);
             // Re-type the whole app with the refined registry. Idempotent
             // BodyTyper means a second pass simply resolves dispatches
             // and Var bindings the first pass couldn't.
@@ -1295,13 +1311,21 @@ impl Analyzer {
                         )
                     },
                 );
-                self.harvest_returns_to_registry(app, true);
-                self.unify_params_from_call_sites(app, UnifyScope::WithViews);
+                crate::timings::phase(format_args!("round {round}: absorb harvest returns"), || {
+                    self.harvest_returns_to_registry(app, true)
+                });
+                crate::timings::phase(format_args!("round {round}: absorb unify params"), || {
+                    self.unify_params_from_call_sites(app, UnifyScope::WithViews)
+                });
                 if let Some(snapshot) = production_view_params.as_mut() {
                     snapshot.clone_from(&self.inferred_params);
                 }
-                self.overlay_test_params(app);
-                self.widen_cycles(&absorb_sig, &mut cycles);
+                crate::timings::phase(format_args!("round {round}: absorb test params"), || {
+                    self.overlay_test_params(app)
+                });
+                crate::timings::phase(format_args!("round {round}: absorb widen cycles"), || {
+                    self.widen_cycles(&absorb_sig, &mut cycles)
+                });
                 if fixpoint_debug::enabled() {
                     fixpoint_debug::report(&format!("absorb round {round} ({})", cycles.round_summary(self, &absorb_sig)), &absorb_sig, &self.capture_inference_sig());
                 }
@@ -1397,19 +1421,22 @@ impl Analyzer {
             }
         }
 
-        if let Ok(name) = std::env::var("RH_DEBUG_CLASS") {
-            let id = ClassId(Symbol::from(name.as_str()));
+        if let Ok(names) = std::env::var("RH_DEBUG_CLASS") {
+          for name in names.split(',') {
+            let id = ClassId(Symbol::from(name));
             if let Some(ci) = self.classes.get(&id) {
                 eprintln!("DBG class {name} instance={:?}", ci.instance_methods);
                 eprintln!("DBG class {name} class={:?}", ci.class_methods);
-                for ((c, m), v) in &self.inferred_params {
+                for ((c, m, side), v) in &self.inferred_params {
                     if c == &id {
-                        eprintln!("DBG params {}#{} = {:?}", c.0.as_str(), m.as_str(), v);
+                        let sep = if *side == MethodReceiver::Class { "." } else { "#" };
+                        eprintln!("DBG params {}{sep}{} = {:?}", c.0.as_str(), m.as_str(), v);
                     }
                 }
             } else {
                 eprintln!("DBG class {name} NOT REGISTERED");
             }
+        }
         }
         // Direct-helper bodies last: they are the one app-authored
         // expression the fixpoint above never touches, and typing them
@@ -1623,7 +1650,7 @@ impl Analyzer {
                 if method.name.as_str() == "initialize" {
                     continue;
                 }
-                let key = (owner.clone(), method.name.clone());
+                let key = (owner.clone(), method.name.clone(), method.receiver);
                 let inferred = self.inferred_params.get(&key);
                 let has_params = inferred
                     .is_some_and(|v| !v.iter().all(|t| matches!(t, Ty::Var { .. })));
@@ -2892,12 +2919,12 @@ impl Analyzer {
                 // helper that itself calls another ivar-writing helper is
                 // not chased (the direct-call case is what recurs). Own
                 // and before_action assignments already present win.
-                let mut sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)> = Vec::new();
+                let mut sites: Vec<ParamSite> = Vec::new();
                 // Only own-class sites are consumed below, so helper
                 // attribution is irrelevant — an empty index keeps
                 // this walk exactly as before.
-                self.collect_send_sites(&action.body, Some(&ctrl_name), &HashMap::default(), &mut sites);
-                for (class_id, method, _, _) in &sites {
+                self.collect_send_sites(&action.body, Some(&ctrl_name), MethodReceiver::Instance, &HashMap::default(), &mut sites);
+                for (class_id, method, _, _, _) in &sites {
                     if *class_id != ctrl_name {
                         continue;
                     }
@@ -3902,7 +3929,7 @@ impl Analyzer {
         class_id: &ClassId,
         method: &crate::dialect::MethodDef,
     ) -> Ctx {
-        let key = (class_id.clone(), method.name.clone());
+        let key = (class_id.clone(), method.name.clone(), method.receiver);
         let observed = self.inferred_params.get(&key);
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
@@ -3958,9 +3985,9 @@ impl Analyzer {
         kw_params: &[(Symbol, Option<crate::expr::Expr>)],
         block_param: Option<&Symbol>,
     ) -> Ctx {
-        let own = self.inferred_params.get(&(class_id.clone(), action_name.clone()));
+        let own = self.inferred_params.get(&(class_id.clone(), action_name.clone(), MethodReceiver::Instance));
         let from_origin =
-            origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone())));
+            origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone(), MethodReceiver::Instance)));
         let mut ctx = base.clone();
         for (i, name) in params.fields.keys().enumerate() {
             if self.declared_untyped_param(class_id, action_name, Some(i), name) {
@@ -4798,44 +4825,48 @@ impl Analyzer {
         // description of the argument list that disagrees with the
         // `def`. campfire's `next_involvement_for` emitted exactly
         // that, and spinel gave the param an `sp_SymPolyHash *`.
-        let mut sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)> = Vec::new();
+        let mut sites: Vec<ParamSite> = Vec::new();
+        let shapes_span = crate::timings::begin("unify: shapes");
         let params_by_method = Self::param_shapes(app);
         let defined = Self::defined_methods(app);
+        drop(shapes_span);
+        let collect_span = crate::timings::begin("unify: collect");
         for model in &app.models {
             for method in model.methods() {
-                self.collect_send_sites(&method.body, Some(&model.name), helpers, &mut sites);
+                self.collect_send_sites(&method.body, Some(&model.name), method.receiver, helpers, &mut sites);
             }
             for scope_item in model.scopes() {
-                self.collect_send_sites(&scope_item.body, Some(&model.name), helpers, &mut sites);
+                self.collect_send_sites(&scope_item.body, Some(&model.name), MethodReceiver::Class, helpers, &mut sites);
             }
         }
         for lc in &app.library_classes {
             for method in &lc.methods {
-                self.collect_send_sites(&method.body, Some(&lc.name), helpers, &mut sites);
+                self.collect_send_sites(&method.body, Some(&lc.name), method.receiver, helpers, &mut sites);
             }
         }
         for controller in &app.controllers {
             for action in controller.actions() {
-                self.collect_send_sites(&action.body, Some(&controller.name), helpers, &mut sites);
+                self.collect_send_sites(&action.body, Some(&controller.name), MethodReceiver::Instance, helpers, &mut sites);
             }
             for method in controller.class_methods() {
-                self.collect_send_sites(&method.body, Some(&controller.name), helpers, &mut sites);
+                self.collect_send_sites(&method.body, Some(&controller.name), MethodReceiver::Class, helpers, &mut sites);
             }
         }
         if matches!(scope, UnifyScope::WithViews) {
             for view in &app.views {
-                self.collect_send_sites(&view.body, None, helpers, &mut sites);
+                self.collect_send_sites(&view.body, None, MethodReceiver::Instance, helpers, &mut sites);
             }
             if let Some(seeds) = &app.seeds {
-                self.collect_send_sites(seeds, None, helpers, &mut sites);
+                self.collect_send_sites(seeds, None, MethodReceiver::Instance, helpers, &mut sites);
             }
         }
+        drop(collect_span);
 
-        self.apply_param_sites(sites, &params_by_method, &defined);
+        crate::timings::phase("unify: apply", || self.apply_param_sites(sites, &params_by_method, &defined));
         // Production signatures keep their production callers' shape.
         // Fold before adding test-owned observations: a same-named test
         // helper must not feed an included production concern either.
-        self.fold_concern_param_sites(app);
+        crate::timings::phase("unify: fold concerns", || self.fold_concern_param_sites(app));
     }
 
     /// Replay production+view param observations, then overlay typed
@@ -4844,7 +4875,7 @@ impl Analyzer {
     fn unify_test_params_onto(
         &mut self,
         app: &App,
-        snapshot: &HashMap<(ClassId, Symbol), Vec<Ty>>,
+        snapshot: &HashMap<ParamKey, Vec<Ty>>,
     ) {
         self.inferred_params.clone_from(snapshot);
         self.overlay_test_params(app);
@@ -4862,36 +4893,56 @@ impl Analyzer {
         &self,
         app: &App,
         helpers: &HashMap<Symbol, ClassId>,
-    ) -> Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)> {
+    ) -> Vec<ParamSite> {
         let mut test_sites = Vec::new();
         for module in &app.test_modules {
             if let Some(setup) = &module.setup {
-                self.collect_send_sites(setup, Some(&module.name), helpers, &mut test_sites);
+                self.collect_send_sites(setup, Some(&module.name), MethodReceiver::Instance, helpers, &mut test_sites);
             }
             for body in module.helpers.iter().flat_map(|method| {
                 method.params.iter().filter_map(|param| param.default.as_ref())
                     .chain(std::iter::once(&method.body))
             })
                 .chain(module.tests.iter().map(|test| &test.body)) {
-                self.collect_send_sites(body, Some(&module.name), helpers, &mut test_sites);
+                self.collect_send_sites(body, Some(&module.name), MethodReceiver::Instance, helpers, &mut test_sites);
             }
         }
-        test_sites.into_iter().filter_map(|(class, method, args, kwargs)| {
+        test_sites.into_iter().filter_map(|(class, method, side, args, kwargs)| {
             self.test_helper_owner(app, &class, &method)
-                .map(|owner| (owner, method, args, kwargs))
+                .map(|owner| (owner, method, side, args, kwargs))
         }).collect()
     }
 
     fn apply_param_sites(
         &mut self,
-        sites: Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)>,
-        params_by_method: &HashMap<(ClassId, Symbol), Vec<ParamShape>>,
-        defined: &BTreeSet<(ClassId, Symbol)>,
+        sites: Vec<ParamSite>,
+        params_by_method: &HashMap<ParamKey, Vec<ParamShape>>,
+        defined: &BTreeSet<ParamKey>,
     ) {
-        for (class_id, method, arg_tys, kw_tys) in sites {
-            let class_id = self.inherited_param_owner(defined, class_id, &method);
+        for (class_id, method, side, arg_tys, kw_tys) in sites {
+            // The written side is the default; a chain that defines the
+            // name only on the other side is the method Ruby reaches
+            // (`extend self` modules, `self.class.m` from an instance).
+            let (class_id, definer, side) = match self.inherited_param_owner(defined, &class_id, &method, side) {
+                Some((owner, definer)) => (owner, definer, side),
+                None => {
+                    let other = match side {
+                        MethodReceiver::Instance => MethodReceiver::Class,
+                        MethodReceiver::Class => MethodReceiver::Instance,
+                    };
+                    match self.inherited_param_owner(defined, &class_id, &method, other) {
+                        Some((owner, definer)) => (owner, definer, other),
+                        None => (class_id.clone(), class_id, side),
+                    }
+                }
+            };
+            // Placed by the shape of the `def` the call reaches. For a
+            // module's method the site stays keyed to the includer (the
+            // concern fold moves it), but the includer has no `def` of
+            // its own: without the module's shape a call's keywords
+            // stayed one Hash in the first slot.
             let arg_tys = match Self::site_shape(
-                params_by_method.get(&(class_id.clone(), method.clone())),
+                params_by_method.get(&(definer, method.clone(), side)),
                 &arg_tys,
                 &kw_tys,
             ) {
@@ -4909,7 +4960,7 @@ impl Analyzer {
             let arity = arg_tys.len();
             let entry = self
                 .inferred_params
-                .entry((class_id.clone(), method.clone()))
+                .entry((class_id.clone(), method.clone(), side))
                 .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
             if entry.len() < arity {
                 entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
@@ -4920,22 +4971,25 @@ impl Analyzer {
         }
     }
 
-    /// Every `(class, method)` the app defines, by name.
-    fn defined_methods(app: &App) -> BTreeSet<(ClassId, Symbol)> {
-        let mut defined: BTreeSet<(ClassId, Symbol)> = BTreeSet::new();
+    /// Every `(class, method, side)` the app defines.
+    fn defined_methods(app: &App) -> BTreeSet<ParamKey> {
+        let mut defined: BTreeSet<ParamKey> = BTreeSet::new();
         for lc in &app.library_classes {
             for m in &lc.methods {
-                defined.insert((lc.name.clone(), m.name.clone()));
+                defined.insert((lc.name.clone(), m.name.clone(), m.receiver));
             }
         }
         for model in &app.models {
             for m in model.methods() {
-                defined.insert((model.name.clone(), m.name.clone()));
+                defined.insert((model.name.clone(), m.name.clone(), m.receiver));
             }
         }
         for c in &app.controllers {
             for a in c.actions() {
-                defined.insert((c.name.clone(), a.name.clone()));
+                defined.insert((c.name.clone(), a.name.clone(), MethodReceiver::Instance));
+            }
+            for m in c.class_methods() {
+                defined.insert((c.name.clone(), m.name.clone(), MethodReceiver::Class));
             }
         }
         defined
@@ -4951,18 +5005,21 @@ impl Analyzer {
     /// Walks Ruby's lookup order: the class, the modules it includes,
     /// then its parent. A class that defines the method keeps the site.
     /// A site that reaches an included module first stays where it is —
-    /// `fold_concern_param_sites` owns that case — as does a chain with
-    /// no definer.
+    /// `fold_concern_param_sites` owns that case. Returns the key the
+    /// site is recorded under and the class or module whose `def` it
+    /// reaches; `None` when nothing on the chain defines the method on
+    /// `side`.
     fn inherited_param_owner(
         &self,
-        defined: &BTreeSet<(ClassId, Symbol)>,
-        class: ClassId,
+        defined: &BTreeSet<ParamKey>,
+        class: &ClassId,
         method: &Symbol,
-    ) -> ClassId {
+        side: MethodReceiver,
+    ) -> Option<(ClassId, ClassId)> {
         let mut cur = class.clone();
         for _ in 0..32 {
-            if defined.contains(&(cur.clone(), method.clone())) {
-                return cur;
+            if defined.contains(&(cur.clone(), method.clone(), side)) {
+                return Some((cur.clone(), cur));
             }
             let Some(info) = self.classes.get(&cur) else { break };
             let mut modules: Vec<&ClassId> = info.includes.iter().collect();
@@ -4971,8 +5028,8 @@ impl Analyzer {
                 if !seen.insert(module) {
                     continue;
                 }
-                if defined.contains(&(module.clone(), method.clone())) {
-                    return class;
+                if defined.contains(&(module.clone(), method.clone(), side)) {
+                    return Some((class.clone(), module.clone()));
                 }
                 if let Some(m) = self.classes.get(module) {
                     modules.extend(m.includes.iter());
@@ -4981,7 +5038,7 @@ impl Analyzer {
             let Some(parent) = &info.parent else { break };
             cur = self.lexical_parent(&cur, parent);
         }
-        class
+        None
     }
 
     /// Parents are recorded as written, so `module Api; class
@@ -5025,12 +5082,13 @@ impl Analyzer {
     /// the call sites are evidence about that def, and the module's
     /// same-named method is a different one Ruby never reaches.
     fn fold_concern_param_sites(&mut self, app: &App) {
-        let mut module_methods: HashMap<ClassId, BTreeSet<Symbol>> = HashMap::default();
-        let mut owned: BTreeSet<(ClassId, Symbol)> = BTreeSet::new();
+        let mut module_methods: HashMap<ClassId, BTreeSet<(Symbol, MethodReceiver)>> = HashMap::default();
+        let mut owned: BTreeSet<ParamKey> = BTreeSet::new();
         for lc in &app.library_classes {
-            let names: BTreeSet<Symbol> = lc.methods.iter().map(|m| m.name.clone()).collect();
-            for n in &names {
-                owned.insert((lc.name.clone(), n.clone()));
+            let names: BTreeSet<(Symbol, MethodReceiver)> =
+                lc.methods.iter().map(|m| (m.name.clone(), m.receiver)).collect();
+            for (n, side) in &names {
+                owned.insert((lc.name.clone(), n.clone(), *side));
             }
             if lc.is_module {
                 module_methods.insert(lc.name.clone(), names);
@@ -5041,7 +5099,7 @@ impl Analyzer {
         }
         for model in &app.models {
             for m in model.methods() {
-                owned.insert((model.name.clone(), m.name.clone()));
+                owned.insert((model.name.clone(), m.name.clone(), m.receiver));
             }
         }
 
@@ -5076,7 +5134,7 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
-        let mut adds: Vec<((ClassId, Symbol), Vec<Ty>)> = Vec::new();
+        let mut adds: Vec<(ParamKey, Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
             let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
@@ -5092,7 +5150,7 @@ impl Analyzer {
                     }
                 }
                 let Some(names) = module_methods.get(&m) else { continue };
-                for name in names {
+                for (name, side) in names {
                     // The includer's OWN def wins — unless it is this
                     // module's def, spliced in verbatim
                     // (`splice_concern_class_methods_into_includers`).
@@ -5103,11 +5161,11 @@ impl Analyzer {
                         .get(&id)
                         .and_then(|per| per.get(name))
                         == Some(&m);
-                    if !spliced_from_here && owned.contains(&(id.clone(), name.clone())) {
+                    if !spliced_from_here && owned.contains(&(id.clone(), name.clone(), *side)) {
                         continue;
                     }
-                    if let Some(tys) = self.inferred_params.get(&(id.clone(), name.clone())) {
-                        adds.push(((m.clone(), name.clone()), tys.clone()));
+                    if let Some(tys) = self.inferred_params.get(&(id.clone(), name.clone(), *side)) {
+                        adds.push(((m.clone(), name.clone(), *side), tys.clone()));
                     }
                 }
             }
@@ -5127,21 +5185,20 @@ impl Analyzer {
     /// — the shape `place_keyword_args` needs to put a
     /// call's kwargs on the right slots.
     ///
-    /// Keyed the way `inferred_params` is, by (class, method) with no
-    /// receiver distinction, so a class method and an instance method
-    /// of the same name collide — and so do a concern's `module
-    /// ClassMethods` def and the module's own `class << self` def,
-    /// which ingest flattens to the same Class-receiver name. Every
-    /// distinct shape is kept; [`Self::site_shape`] picks one per call
-    /// only when the call's keys say which `def` it reaches.
-    fn param_shapes(app: &App) -> HashMap<(ClassId, Symbol), Vec<ParamShape>> {
-        let mut out: HashMap<(ClassId, Symbol), Vec<ParamShape>> = HashMap::default();
+    /// Keyed the way `inferred_params` is, by (class, method, side). A
+    /// concern's `module ClassMethods` def and the module's own `class
+    /// << self` def still collide: ingest flattens both to the same
+    /// Class-receiver name. Every distinct shape is kept;
+    /// [`Self::site_shape`] picks one per call only when the call's
+    /// keys say which `def` it reaches.
+    fn param_shapes(app: &App) -> HashMap<ParamKey, Vec<ParamShape>> {
+        let mut out: HashMap<ParamKey, Vec<ParamShape>> = HashMap::default();
         let mut record = |class: &ClassId, m: &crate::dialect::MethodDef| {
             let shape = ParamShape {
                 slots: m.params.iter().map(|p| (p.name.clone(), p.ty_kind())).collect(),
                 keywords_by_kind: false,
             };
-            let shapes = out.entry((class.clone(), m.name.clone())).or_default();
+            let shapes = out.entry((class.clone(), m.name.clone(), m.receiver)).or_default();
             if !shapes.contains(&shape) {
                 shapes.push(shape);
             }
@@ -5180,7 +5237,7 @@ impl Analyzer {
                 // Controller lowering keeps every keyword a keyword, so a
                 // key binds by kind here, never to a same-named positional.
                 let shape = ParamShape { slots: shape, keywords_by_kind: true };
-                let shapes = out.entry((controller.name.clone(), a.name.clone())).or_default();
+                let shapes = out.entry((controller.name.clone(), a.name.clone(), MethodReceiver::Instance)).or_default();
                 if !shapes.contains(&shape) {
                     shapes.push(shape);
                 }
@@ -5413,8 +5470,9 @@ impl Analyzer {
         &self,
         expr: &Expr,
         self_class: Option<&ClassId>,
+        side: MethodReceiver,
         helpers: &HashMap<Symbol, ClassId>,
-        out: &mut Vec<(ClassId, Symbol, Vec<Ty>, SiteKeywords)>,
+        out: &mut Vec<ParamSite>,
     ) {
         match &*expr.node {
             ExprNode::Send { recv, method, args, block, .. } => {
@@ -5521,125 +5579,144 @@ impl Analyzer {
                         out.push((
                             class_id.clone(),
                             Symbol::from("initialize"),
+                            MethodReceiver::Instance,
                             arg_tys.clone(),
                             kw_tys.clone(),
                         ));
                     }
-                    out.push((class_id, method.clone(), arg_tys, kw_tys));
+                    // The side the call is written on: a constant or
+                    // `x.class` receiver calls the class, `self` and an
+                    // implicit self call whichever side the enclosing
+                    // `def` is on, anything else an instance. Instances
+                    // and the class object share one `Ty::Class`, so
+                    // the syntax is the evidence; `apply_param_sites`
+                    // moves the site to the other side when only that
+                    // side defines the name (`extend self` modules).
+                    let site_side = match recv.as_ref().map(|r| &*r.node) {
+                        None | Some(ExprNode::SelfRef) => side,
+                        Some(ExprNode::Const { .. }) => MethodReceiver::Class,
+                        Some(ExprNode::Send { method: m, args: a, .. })
+                            if m.as_str() == "class" && a.is_empty() =>
+                        {
+                            MethodReceiver::Class
+                        }
+                        Some(_) => MethodReceiver::Instance,
+                    };
+                    out.push((class_id, method.clone(), site_side, arg_tys, kw_tys));
                 }
-                if let Some(r) = recv { self.collect_send_sites(r, self_class, helpers, out); }
-                for a in args { self.collect_send_sites(a, self_class, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, helpers, out); }
+                if let Some(r) = recv { self.collect_send_sites(r, self_class, side, helpers, out); }
+                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
             }
             ExprNode::Seq { exprs } | ExprNode::Array { elements: exprs, .. } => {
-                for e in exprs { self.collect_send_sites(e, self_class, helpers, out); }
+                for e in exprs { self.collect_send_sites(e, self_class, side, helpers, out); }
             }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
-                    self.collect_send_sites(k, self_class, helpers, out);
-                    self.collect_send_sites(v, self_class, helpers, out);
+                    self.collect_send_sites(k, self_class, side, helpers, out);
+                    self.collect_send_sites(v, self_class, side, helpers, out);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
-                self.collect_send_sites(cond, self_class, helpers, out);
-                self.collect_send_sites(then_branch, self_class, helpers, out);
-                self.collect_send_sites(else_branch, self_class, helpers, out);
+                self.collect_send_sites(cond, self_class, side, helpers, out);
+                self.collect_send_sites(then_branch, self_class, side, helpers, out);
+                self.collect_send_sites(else_branch, self_class, side, helpers, out);
             }
             ExprNode::Case { scrutinee, arms } => {
-                self.collect_send_sites(scrutinee, self_class, helpers, out);
+                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
                 for arm in arms {
-                    if let Some(g) = &arm.guard { self.collect_send_sites(g, self_class, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, helpers, out);
+                    if let Some(g) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
+                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
                 }
             }
             ExprNode::CaseMatch { scrutinee, arms, else_body } => {
-                self.collect_send_sites(scrutinee, self_class, helpers, out);
+                self.collect_send_sites(scrutinee, self_class, side, helpers, out);
                 for arm in arms {
-                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, helpers, out));
-                    if let Some((_, g)) = &arm.guard { self.collect_send_sites(g, self_class, helpers, out); }
-                    self.collect_send_sites(&arm.body, self_class, helpers, out);
+                    arm.pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
+                    if let Some((_, g)) = &arm.guard { self.collect_send_sites(g, self_class, side, helpers, out); }
+                    self.collect_send_sites(&arm.body, self_class, side, helpers, out);
                 }
-                if let Some(e) = else_body { self.collect_send_sites(e, self_class, helpers, out); }
+                if let Some(e) = else_body { self.collect_send_sites(e, self_class, side, helpers, out); }
             }
             ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
-                self.collect_send_sites(value, self_class, helpers, out);
-                pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, helpers, out));
+                self.collect_send_sites(value, self_class, side, helpers, out);
+                pattern.for_each_expr(&mut |e| self.collect_send_sites(e, self_class, side, helpers, out));
             }
             ExprNode::BoolOp { left, right, .. }
             | ExprNode::RescueModifier { expr: left, fallback: right } => {
-                self.collect_send_sites(left, self_class, helpers, out);
-                self.collect_send_sites(right, self_class, helpers, out);
+                self.collect_send_sites(left, self_class, side, helpers, out);
+                self.collect_send_sites(right, self_class, side, helpers, out);
             }
             ExprNode::Let { value, body, .. } => {
-                self.collect_send_sites(value, self_class, helpers, out);
-                self.collect_send_sites(body, self_class, helpers, out);
+                self.collect_send_sites(value, self_class, side, helpers, out);
+                self.collect_send_sites(body, self_class, side, helpers, out);
             }
-            ExprNode::Lambda { body, .. } => self.collect_send_sites(body, self_class, helpers, out),
+            ExprNode::Lambda { body, .. } => self.collect_send_sites(body, self_class, side, helpers, out),
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
-                    self.collect_send_sites(r, self_class, helpers, out);
+                    self.collect_send_sites(r, self_class, side, helpers, out);
                 }
             }
             ExprNode::Apply { fun, args, block } => {
-                self.collect_send_sites(fun, self_class, helpers, out);
-                for a in args { self.collect_send_sites(a, self_class, helpers, out); }
-                if let Some(b) = block { self.collect_send_sites(b, self_class, helpers, out); }
+                self.collect_send_sites(fun, self_class, side, helpers, out);
+                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
+                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
             }
             ExprNode::Assign { target, value }
             | ExprNode::OpAssign { target, value, .. } => {
-                self.collect_send_sites(value, self_class, helpers, out);
+                self.collect_send_sites(value, self_class, side, helpers, out);
                 if let LValue::Attr { recv, .. } = target {
-                    self.collect_send_sites(recv, self_class, helpers, out);
+                    self.collect_send_sites(recv, self_class, side, helpers, out);
                 }
                 if let LValue::Index { recv, index } = target {
-                    self.collect_send_sites(recv, self_class, helpers, out);
-                    self.collect_send_sites(index, self_class, helpers, out);
+                    self.collect_send_sites(recv, self_class, side, helpers, out);
+                    self.collect_send_sites(index, self_class, side, helpers, out);
                 }
             }
             ExprNode::StringInterp { parts } => {
                 for p in parts {
                     if let crate::expr::InterpPart::Expr { expr } = p {
-                        self.collect_send_sites(expr, self_class, helpers, out);
+                        self.collect_send_sites(expr, self_class, side, helpers, out);
                     }
                 }
             }
             ExprNode::Yield { args } => {
-                for a in args { self.collect_send_sites(a, self_class, helpers, out); }
+                for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
             }
-            ExprNode::Raise { value } => self.collect_send_sites(value, self_class, helpers, out),
-            ExprNode::Return { value } => self.collect_send_sites(value, self_class, helpers, out),
+            ExprNode::Raise { value } => self.collect_send_sites(value, self_class, side, helpers, out),
+            ExprNode::Return { value } => self.collect_send_sites(value, self_class, side, helpers, out),
             ExprNode::Super { args } => {
                 if let Some(args) = args {
-                    for a in args { self.collect_send_sites(a, self_class, helpers, out); }
+                    for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
                 }
             }
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
-                self.collect_send_sites(body, self_class, helpers, out);
+                self.collect_send_sites(body, self_class, side, helpers, out);
                 for rc in rescues {
-                    for c in &rc.classes { self.collect_send_sites(c, self_class, helpers, out); }
-                    self.collect_send_sites(&rc.body, self_class, helpers, out);
+                    for c in &rc.classes { self.collect_send_sites(c, self_class, side, helpers, out); }
+                    self.collect_send_sites(&rc.body, self_class, side, helpers, out);
                 }
-                if let Some(e) = else_branch { self.collect_send_sites(e, self_class, helpers, out); }
-                if let Some(e) = ensure { self.collect_send_sites(e, self_class, helpers, out); }
+                if let Some(e) = else_branch { self.collect_send_sites(e, self_class, side, helpers, out); }
+                if let Some(e) = ensure { self.collect_send_sites(e, self_class, side, helpers, out); }
             }
             ExprNode::Next { value } | ExprNode::Break { value } => {
-                if let Some(v) = value { self.collect_send_sites(v, self_class, helpers, out); }
+                if let Some(v) = value { self.collect_send_sites(v, self_class, side, helpers, out); }
             }
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
-                self.collect_send_sites(value, self_class, helpers, out)
+                self.collect_send_sites(value, self_class, side, helpers, out)
             }
             ExprNode::MultiAssign { value, .. } => {
-                self.collect_send_sites(value, self_class, helpers, out)
+                self.collect_send_sites(value, self_class, side, helpers, out)
             }
             ExprNode::While { cond, body, .. } => {
-                self.collect_send_sites(cond, self_class, helpers, out);
-                self.collect_send_sites(body, self_class, helpers, out);
+                self.collect_send_sites(cond, self_class, side, helpers, out);
+                self.collect_send_sites(body, self_class, side, helpers, out);
             }
             ExprNode::Range { begin, end, .. } => {
-                if let Some(b) = begin { self.collect_send_sites(b, self_class, helpers, out); }
-                if let Some(e) = end { self.collect_send_sites(e, self_class, helpers, out); }
+                if let Some(b) = begin { self.collect_send_sites(b, self_class, side, helpers, out); }
+                if let Some(e) = end { self.collect_send_sites(e, self_class, side, helpers, out); }
             }
-            ExprNode::Cast { value, .. } => self.collect_send_sites(value, self_class, helpers, out),
+            ExprNode::Cast { value, .. } => self.collect_send_sites(value, self_class, side, helpers, out),
             ExprNode::Lit { .. }
             | ExprNode::Var { .. }
             | ExprNode::Ivar { .. }

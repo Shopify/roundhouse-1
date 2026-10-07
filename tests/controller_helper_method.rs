@@ -104,7 +104,7 @@ end
         .collect();
     let app = ingest_app_from_tree(tree).unwrap();
     let params_ty = Ty::Class { id: ClassId(Symbol::from("ArticleParams")), args: vec![] };
-    let inferred = [((ClassId(Symbol::from("ArticlesController")), Symbol::from("caption")), vec![params_ty.clone()])]
+    let inferred = [((ClassId(Symbol::from("ArticlesController")), Symbol::from("caption"), MethodReceiver::Instance), vec![params_ty.clone()])]
         .into_iter().collect();
     let routed = roundhouse::det::HashMap::default();
     let classes = lower_controllers_with_arel_views_assocs_and_routes(

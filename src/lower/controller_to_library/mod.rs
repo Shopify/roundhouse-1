@@ -276,7 +276,7 @@ pub struct LowerControllerOptions<'a> {
     /// `untyped`, which is what every param was before the channel
     /// existed.
     pub inferred_params:
-        Option<&'a crate::det::HashMap<(ClassId, Symbol), Vec<crate::ty::Ty>>>,
+        Option<&'a crate::det::HashMap<crate::app::ParamKey, Vec<crate::ty::Ty>>>,
     /// The app's models — read for `has_one_attached` declarations, so
     /// a permitted field that is one (`:avatar`) is typed as an
     /// uploaded file on the synthesized params class
@@ -1014,7 +1014,7 @@ fn build_methods(
     // html(+simple-json) flatten, emit unchanged.
     format_breadth: FormatBreadth,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
-    inferred_params: Option<&crate::det::HashMap<(ClassId, Symbol), Vec<Ty>>>,
+    inferred_params: Option<&crate::det::HashMap<crate::app::ParamKey, Vec<Ty>>>,
 ) -> Vec<MethodDef> {
     let mut methods: Vec<MethodDef> = controller.class_methods().cloned().collect();
 
@@ -2349,7 +2349,7 @@ fn action_to_method(
     format_breadth: FormatBreadth,
     shadows: &crate::det::HashSet<Symbol>,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
-    inferred_params: Option<&crate::det::HashMap<(ClassId, Symbol), Vec<Ty>>>,
+    inferred_params: Option<&crate::det::HashMap<crate::app::ParamKey, Vec<Ty>>>,
     deferred_renders: &crate::det::HashSet<Symbol>,
     deferred_out: &mut crate::det::HashMap<Symbol, Expr>,
 ) -> MethodDef {
@@ -2499,7 +2499,7 @@ fn action_to_method(
     // Keyed by the SOURCE name (`a.name`) — the analyzer typed the app
     // before `method_name_for_action`'s renames (`new` → `new_action`).
     let unified = inferred_params
-        .and_then(|t| t.get(&(controller.name.clone(), a.name.clone())));
+        .and_then(|t| t.get(&(controller.name.clone(), a.name.clone(), crate::dialect::MethodReceiver::Instance)));
     let sig_params: Vec<(Symbol, Ty)> = params
         .iter()
         .enumerate()

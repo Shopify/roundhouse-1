@@ -36,6 +36,14 @@ pub struct HelperConnection {
     pub top_level: bool,
 }
 
+/// Which `def` a call-site parameter observation belongs to: the
+/// class, the method name, and the side it is defined on. A class
+/// method and an instance method of the same name (`def self.call` /
+/// `def call`, every service object) are different methods with
+/// different parameters; keyed by (class, name) alone, each one's
+/// call sites typed the other's params.
+pub type ParamKey = (ClassId, Symbol, crate::dialect::MethodReceiver);
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct App {
     pub schema_version: u32,
@@ -162,7 +170,7 @@ pub struct App {
     /// analyzer's own table: (declaring class, method) → positional
     /// param types, `Ty::Var` where no call site contributed.
     #[serde(skip)]
-    pub inferred_method_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    pub inferred_method_params: HashMap<ParamKey, Vec<Ty>>,
     /// Source files the text pipeline cannot represent — every emitted
     /// file's content is a `String`, so an app's images, fonts and
     /// binary test fixtures were silently dropped on the floor. Carried

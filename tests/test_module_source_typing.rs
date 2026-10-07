@@ -444,7 +444,7 @@ end
             elem: Box::new(Ty::Str)
         })
     );
-    let key = (base.name.clone(), "values".into());
+    let key = (base.name.clone(), "values".into(), roundhouse::dialect::MethodReceiver::Instance);
     assert_eq!(app.inferred_method_params.get(&key), Some(&vec![Ty::Str]));
     let child = app
         .test_modules
@@ -453,7 +453,7 @@ end
         .unwrap();
     assert!(
         !app.inferred_method_params
-            .contains_key(&(child.name.clone(), "values".into()))
+            .contains_key(&(child.name.clone(), "values".into(), roundhouse::dialect::MethodReceiver::Instance))
     );
 }
 
@@ -498,6 +498,7 @@ end
         let key = (
             roundhouse::ident::ClassId("ProductionConcern".into()),
             "rows".into(),
+            roundhouse::dialect::MethodReceiver::Instance,
         );
         assert_eq!(
             app.inferred_method_params.get(&key),
@@ -509,6 +510,7 @@ end
         let key = (
             roundhouse::ident::ClassId("BaseProbeTest".into()),
             "rows".into(),
+            roundhouse::dialect::MethodReceiver::Instance,
         );
         if include_on_child {
             assert!(
@@ -564,7 +566,7 @@ end
         .unwrap();
     assert_eq!(
         app.inferred_method_params
-            .get(&(base.name.clone(), "articles".into())),
+            .get(&(base.name.clone(), "articles".into(), roundhouse::dialect::MethodReceiver::Instance)),
         Some(&vec![Ty::Sym])
     );
     let child = app
