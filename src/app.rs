@@ -344,6 +344,12 @@ pub struct App {
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hooks: Vec<LoadHook>,
+    /// `config.eager_load = …` from each `config/environments/<env>.rb`,
+    /// in file-name order. The emitted CRuby app evaluates the one for
+    /// `Rails.env` at boot to choose eager loading or autoload on
+    /// reference, as Rails' `eager_load!` finisher does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eager_load: Vec<EagerLoadSetting>,
     /// SQL functions an initializer registers on every SQLite
     /// connection (`raw_connection.create_function("regexp", 2) do …`,
     /// `create_aggregate("stddev", 1) do step … finalize … end`).
@@ -635,6 +641,16 @@ pub struct InitializerFilter {
 /// One initializer statement (a whole top-level statement, or one
 /// statement of a container a reader partly consumed) that nothing in
 /// ingest applies to the emitted app.
+/// One environment's `config.eager_load` (`config/environments/<env>.rb`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EagerLoadSetting {
+    /// The environment, from the file name (`test`).
+    pub env: String,
+    /// The assigned expression, or why it cannot be read as one
+    /// (assigned under a condition, reads a local of the file).
+    pub value: Result<crate::expr::Expr, String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InitializerGap {
     /// The statement's source range.
@@ -835,6 +851,7 @@ impl App {
             initializer_files: Vec::new(),
             initializer_gaps: Vec::new(),
             load_hooks: Vec::new(),
+            eager_load: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),
