@@ -239,6 +239,10 @@ struct ConstTyping {
     tree: Expr,
 }
 
+/// How many `build_constant_registry` rounds keep their maps and
+/// typings for the next pass.
+const CONST_MEMO_ROUNDS: usize = 16;
+
 /// The constant-read keys whose answers differ between two rounds' maps.
 fn const_answers_moved(
     old_map: &HashMap<Symbol, Ty>,
@@ -2010,7 +2014,7 @@ impl Analyzer {
             memo.pass += 1;
         }
         let pass = memo.pass;
-        let mut all_reads: Vec<u64> = Vec::new();
+        let mut all_reads: crate::det::HashSet<u64> = crate::det::HashSet::default();
         let mut kept_typings = 0usize;
         /// A value's tree as this pass last left it.
         enum Cur {
@@ -2041,14 +2045,19 @@ impl Analyzer {
                 break;
             }
             rounds += 1;
+            // Only the first rounds are kept across passes: a value that
+            // changes every round runs the loop to its bound, and a copy
+            // of the maps and typings per round held gigabytes on full
+            // Core. Later rounds type as without a memo.
+            let memo_round = on && version < CONST_MEMO_ROUNDS;
             // The constant reads this round answers differently than the
             // last pass's same round (`None`: that pass had no such round).
-            let answers_moved: Option<crate::det::HashSet<u64>> = if on {
+            let answers_moved: Option<crate::det::HashSet<u64>> = if memo_round {
                 memo.maps.get(version).map(|(old_map, old_resolved)| const_answers_moved(old_map, old_resolved, &map, &resolved))
             } else {
                 None
             };
-            if on {
+            if memo_round {
                 new_maps.push((map.clone(), clone_identity_map(&resolved)));
                 if memo.typings.len() <= version {
                     memo.typings.push((0..entries.len()).map(|_| None).collect());
@@ -2091,7 +2100,7 @@ impl Analyzer {
                     let (reads, ty) = (t.deps.clone(), t.ty.clone());
                     cur[index] = Cur::Kept(version);
                     kept_typings += 1;
-                    all_reads.extend_from_slice(&reads);
+                    all_reads.extend(reads.iter().copied());
                     last[index] = Some((version, reads, ty.clone()));
                     ty
                 } else {
@@ -2139,8 +2148,8 @@ impl Analyzer {
                         }
                     }
                     let reads = deps.take();
-                    all_reads.extend_from_slice(&reads);
-                    if on {
+                    all_reads.extend(reads.iter().copied());
+                    if memo_round {
                         memo.typings[version][index] = Some(ConstTyping {
                             input,
                             output: incremental::expr_print(&value),
@@ -2214,8 +2223,8 @@ impl Analyzer {
                 }
             }
             memo.maps = new_maps;
+            let mut all_reads: Vec<u64> = all_reads.into_iter().collect();
             all_reads.sort_unstable();
-            all_reads.dedup();
             memo.whole = Some(ConstWhole {
                 tick,
                 inputs,
