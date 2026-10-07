@@ -1991,6 +1991,14 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             if let Ok(value) = &mut local.value {
                 substitute_body_locals(value, &body_locals, file)?;
+                if local.stored {
+                    let constant = body_local_constant(&local.name, file, lw.location().start_offset());
+                    let mut read = Expr::new(value.span, ExprNode::Const { path: vec![constant.clone()] });
+                    // Each read borrows the source read's span; no source
+                    // constant is written there.
+                    read.decisions |= crate::expr::GENERATED_CONST_REF;
+                    out.constants.push((constant, std::mem::replace(value, read)));
+                }
             }
             body_locals.push(local);
             continue;
@@ -2561,16 +2569,51 @@ fn walk_decl_body_with_visibility<'pr>(
 ///   object. Each read becomes `"…".freeze`, which CRuby compiles to that
 ///   same object whatever the emitted file's magic comment.
 ///
-/// Anything else (`client = Client.new`, a string a reader might mutate,
-/// a lambda passed as a value, a local assigned twice) is refused by
-/// name at its first read rather than dropped: before this, the write
-/// vanished and the reads were bare method calls, a NameError at load.
-/// A local nothing kept reads stays as it was, outside the IR.
+/// Any other value (`real_production = Rails.env.production? && …`,
+/// `params_accessors = %i[…]`, `client = Client.new`) is evaluated once,
+/// where the source evaluated it, so every reader sees the same object:
+/// the local is stored in a private constant of the body,
+/// `RH_BODY_LOCAL_<name>` (see [`BODY_LOCAL_CONSTANT_PREFIX`]), written
+/// at its place among the body's constants, and each read becomes a read
+/// of that constant. A body local is visible only in the body and in
+/// the blocks it holds, which is where a lexical constant read resolves
+/// too. A private constant leaves `constants` and `Foo::NAME` as the
+/// source had them.
+///
+/// A lambda that closes over something, a lambda passed as a value and a
+/// local assigned twice are refused by name at their first read rather
+/// than dropped: before that, the write vanished and the reads were bare
+/// method calls, a NameError at load. A local nothing kept reads stays as
+/// it was, outside the IR, unless it is stored.
 struct BodyLocal {
     name: Symbol,
     /// The value each read becomes, or why a read cannot keep its scope.
     value: Result<Expr, String>,
     lambda: bool,
+    /// The value is evaluated once into a private constant; reads read it.
+    stored: bool,
+}
+
+/// Name prefix for the private constant that stores a class-body local
+/// (see [`BodyLocal`]). The Ruby family writes `private_constant` after it.
+pub const BODY_LOCAL_CONSTANT_PREFIX: &str = "RH_BODY_LOCAL_";
+
+/// `RH_BODY_LOCAL_<name>_<hash of the write's file and offset>`: unique
+/// app-wide, because the analyzer types a stored local's reads by name
+/// (`states` is a local of many GraphQL enum bodies).
+fn body_local_constant(name: &Symbol, file: &str, offset: usize) -> Symbol {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    (file, offset).hash(&mut hasher);
+    Symbol::from(format!("{BODY_LOCAL_CONSTANT_PREFIX}{}_{:08x}", name.as_str(), hasher.finish() as u32))
+}
+
+/// The source name of a stored class-body local's constant
+/// (`RH_BODY_LOCAL_states_1a2b3c4d` → `states`), for diagnostics.
+pub fn stored_body_local_name(constant: &str) -> Option<&str> {
+    let rest = constant.strip_prefix(BODY_LOCAL_CONSTANT_PREFIX)?;
+    let (name, hash) = rest.rsplit_once('_')?;
+    (hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(name)
 }
 
 fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> IngestResult<BodyLocal> {
@@ -2617,9 +2660,14 @@ fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> Ingest
         let mut outer = Outer { depth: 0, name: None };
         ruby_prism::Visit::visit(&mut outer, &value);
         if let Some(captured) = outer.name {
-            return Ok(BodyLocal { name, value: Err(format!("is a lambda that closes over `{captured}`")), lambda: true });
+            return Ok(BodyLocal {
+                name,
+                value: Err(format!("is a lambda that closes over `{captured}`")),
+                lambda: true,
+                stored: false,
+            });
         }
-        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: true });
+        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: true, stored: false });
     }
     let immediate = value.as_integer_node().is_some()
         || value.as_float_node().is_some()
@@ -2628,7 +2676,7 @@ fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> Ingest
         || value.as_false_node().is_some()
         || value.as_nil_node().is_some();
     if immediate {
-        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: false });
+        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: false, stored: false });
     }
     if let Some(text) = frozen_string_literal(&value) {
         let location = value.location();
@@ -2645,13 +2693,13 @@ fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> Ingest
             block: None,
             parenthesized: false,
         };
-        return Ok(BodyLocal { name, value: Ok(Expr::new(span, frozen)), lambda: false });
+        return Ok(BodyLocal { name, value: Ok(Expr::new(span, frozen)), lambda: false, stored: false });
     }
-    Ok(BodyLocal {
-        name,
-        value: Err("holds a value that is not a closure-free lambda or an immediate literal".to_string()),
-        lambda: false,
-    })
+    let value = match ingest_expr(&value, file) {
+        Ok(value) => Ok(value),
+        Err(err) => Err(format!("holds a value ingest cannot read ({err})")),
+    };
+    Ok(BodyLocal { name, value, lambda: false, stored: true })
 }
 
 /// The text of a string literal prism marks frozen (the file's
