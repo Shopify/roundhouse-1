@@ -201,6 +201,40 @@ fn collect(
     Ok(())
 }
 
+/// `do |klass| … end` whose one required parameter no statement of the
+/// block reads.
+fn unread_class_parameter(block: &BlockNode<'_>) -> bool {
+    let Some(params) = block.parameters().and_then(|p| p.as_block_parameters_node()) else { return false };
+    if params.locals().iter().next().is_some() {
+        return false;
+    }
+    let Some(list) = params.parameters() else { return false };
+    let required: Vec<_> = list.requireds().iter().collect();
+    let only_required = list.optionals().iter().next().is_none()
+        && list.rest().is_none()
+        && list.posts().iter().next().is_none()
+        && list.keywords().iter().next().is_none()
+        && list.keyword_rest().is_none()
+        && list.block().is_none();
+    let [param] = required.as_slice() else { return false };
+    let Some(param) = param.as_required_parameter_node() else { return false };
+    if !only_required {
+        return false;
+    }
+    let name = constant_id_str(&param.name()).to_string();
+    struct Reads<'a>(&'a str, bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+        }
+    }
+    let mut reads = Reads(&name, false);
+    if let Some(body) = block.body() {
+        ruby_prism::Visit::visit(&mut reads, &body);
+    }
+    !reads.1
+}
+
 fn unsupported(file: &str, message: &str) -> IngestError {
     IngestError::Unsupported { file: file.into(), message: message.into() }
 }
@@ -237,7 +271,10 @@ fn factory_class(
             args.push(ingest_expr(arg, file)?);
         }
     }
-    if block.is_some_and(|block| block.parameters().is_some()) {
+    // Ruby passes the new class to the block (`do |klass|`). A single
+    // parameter the block never reads (Core's `do |_klass|`) changes
+    // nothing; any other parameter list is refused.
+    if block.is_some_and(|block| block.parameters().is_some() && !unread_class_parameter(block)) {
         return Err(unsupported(
             file,
             &format!("block parameters on a {generator} factory body are not modeled"),

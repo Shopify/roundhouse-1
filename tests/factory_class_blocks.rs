@@ -350,6 +350,19 @@ end
     assert_eq!(run.stdout, expected);
 }
 
+/// Ruby passes the new class to the block; Core's
+/// `Changes = Struct.new(...) do |_klass|` never reads it, so the block is
+/// the plain class body.
+#[test]
+fn an_unread_class_parameter_on_a_factory_block_is_the_plain_body() {
+    const CHANGES: &str = "module Billing\n  Changes = Struct.new(:removed, :created) do |_klass|\n    def empty? = removed.nil? && created.nil?\n  end\nend\n";
+    let run = emit_and_run::real_blog()
+        .write("app/lib/billing.rb", CHANGES)
+        .run_ruby("p Billing::Changes.new(nil, nil).empty?, Billing::Changes.new(1, nil).empty?\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "true\nfalse\n");
+}
+
 /// Shapes the class model does not carry are named, not dropped.
 #[test]
 fn unmodeled_factory_block_shapes_are_named_refusals() {
@@ -359,7 +372,7 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
             "Struct factory with a body block needs literal symbol members",
         ),
         (
-            "X = Data.define(:a) do |klass|\n  def twice = a * 2\nend\n",
+            "X = Data.define(:a) do |klass|\n  def twice = a * 2\n  klass\nend\n",
             "block parameters on a Data factory body are not modeled",
         ),
         (
