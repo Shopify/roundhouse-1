@@ -392,6 +392,7 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
         diagnostic: expr.diagnostic.clone(),
         hint: expr.hint,
         decisions: expr.decisions,
+        keyword_arg: expr.keyword_arg.clone(),
     }
 }
 
@@ -626,6 +627,8 @@ fn wrap_in_cast(arg: &Expr, target_ty: &Ty) -> Expr {
         leading_blank_line: arg.leading_blank_line,
         diagnostic: None,
         hint: None,
-        decisions: 0,
+        // The keyword marks belong to the argument slot, which the cast now fills.
+        decisions: arg.decisions & (crate::expr::SOURCE_KEYWORD_ARG | crate::expr::KEYWORD_DEFAULT_FILL),
+        keyword_arg: arg.keyword_arg.clone(),
     }
 }

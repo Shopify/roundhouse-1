@@ -76,6 +76,33 @@ pub fn is_self_binding(expr: &Expr) -> bool {
 /// reaches the files carried there. Other targets emit the literal.
 pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 
+/// A call argument the SOURCE passed by keyword, which a lowering (or the
+/// analyzer's trailing-kwargs normalization) made positional because the
+/// callee's keyword was flattened to a positional-with-default
+/// (`Param::from_keyword`, `Param::from_kwrest`). Ruby 3 binds a trailing
+/// keyword Hash to the first optional positional, so once the ruby-family
+/// tree writes the callee's keywords back (`name: default`, `**rest`) this
+/// argument has to go back to keyword form too:
+///
+/// - with a key ([`Expr::keyword_arg`] is `Some(key)`): `key: value`. Set
+///   by `lower::helper_kwargs`' splice and by synthesized forwarders that
+///   pass a flattened keyword parameter on (`lower::keyword_marks`);
+/// - with no key, on a `Hash`: its entries unbraced, as the source wrote
+///   them (`normalize_trailing_kwargs` flipped the call's `kwargs` flag).
+///
+/// Marked arguments form the call's trailing run, after every positional
+/// one; an emitter may join them into one keyword list. Every other
+/// target ignores the bit and keeps the positional form the lowering chose.
+pub const SOURCE_KEYWORD_ARG: u64 = 1 << 14;
+
+/// A call argument a lowering FILLED with the flattened keyword's declared
+/// default, to reach a later keyword slot positionally (`helper_kwargs`'
+/// gap defaults, `kwrest_forward`'s padding). The source omitted it, so
+/// the ruby family drops it and lets the callee bind its own default;
+/// [`Expr::keyword_arg`] names the keyword. Every argument after a fill is
+/// itself keyword-form ([`SOURCE_KEYWORD_ARG`] or [`ERASED_KEYWORD_SPLAT`]).
+pub const KEYWORD_DEFAULT_FILL: u64 = 1 << 15;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -173,6 +200,11 @@ pub struct Expr {
     /// that don't run a decide pass see no behavioral change.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub decisions: u64,
+    /// The source keyword a [`SOURCE_KEYWORD_ARG`] or
+    /// [`KEYWORD_DEFAULT_FILL`] argument was bound to. Boxed so the field
+    /// costs one pointer on every other node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword_arg: Option<Box<Symbol>>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -192,6 +224,7 @@ impl PartialEq for Expr {
             && self.diagnostic == other.diagnostic
             && self.hint == other.hint
             && self.decisions == other.decisions
+            && self.keyword_arg == other.keyword_arg
     }
 }
 
@@ -206,7 +239,29 @@ impl Expr {
             diagnostic: None,
             hint: None,
             decisions: 0,
+            keyword_arg: None,
         }
+    }
+
+    /// Mark this call argument as the value the source passed as `key:`
+    /// ([`SOURCE_KEYWORD_ARG`]).
+    pub fn mark_source_keyword(&mut self, key: Symbol) {
+        self.decisions |= SOURCE_KEYWORD_ARG;
+        self.decisions &= !KEYWORD_DEFAULT_FILL;
+        self.keyword_arg = Some(Box::new(key));
+    }
+
+    /// Mark this call argument as a filled-in default for the omitted
+    /// keyword `key` ([`KEYWORD_DEFAULT_FILL`]).
+    pub fn mark_keyword_default_fill(&mut self, key: Symbol) {
+        self.decisions |= KEYWORD_DEFAULT_FILL;
+        self.decisions &= !SOURCE_KEYWORD_ARG;
+        self.keyword_arg = Some(Box::new(key));
+    }
+
+    /// The keyword a marked argument stands for, if any.
+    pub fn keyword_arg(&self) -> Option<&Symbol> {
+        self.keyword_arg.as_deref()
     }
 
     /// Provenance backfill for lowerer-synthesized subtrees: every node
@@ -1517,6 +1572,7 @@ mod tests {
             RESOLVED_CLASS_REF, RESOLVED_DATA_FACTORY, GENERATED_CONST_REF, CLASS_OBJECT_VALUE,
             RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
+            SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL,
         ];
         let mut seen = 0u64;
         for bit in bits {
