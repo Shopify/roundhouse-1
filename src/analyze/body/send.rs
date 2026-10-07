@@ -910,7 +910,14 @@ impl<'a> BodyTyper<'a> {
         // which have no arm for a class the analyzer models only as a
         // name. Blockless (`then` returning an Enumerator) is not a
         // shape any corpus app writes; `Untyped` is the honest answer.
-        if matches!(method.as_str(), "then" | "yield_self") && recv_ty.is_some() {
+        // A class defining its own `then` (promise.rb's `Promise#then`,
+        // which yields the fulfilled value and answers a new Promise) is
+        // not Kernel's: its declaration answers, as `block_params_for`
+        // leaves the block's parameters unbound for it.
+        if matches!(method.as_str(), "then" | "yield_self")
+            && recv_ty.is_some()
+            && !self.owns_operator(recv_ty, method, false)
+        {
             return block_ret.cloned().unwrap_or(Ty::Untyped);
         }
         // `Model.transaction { … }` / `ActiveRecord::Base.transaction

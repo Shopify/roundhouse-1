@@ -1047,6 +1047,15 @@ fn map_class_instance(name: &str, args: Vec<Ty>) -> Ty {
         // class named Hash with nothing to call on it.
         ("Hash", []) => Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) },
         ("Array", []) => Ty::Array { elem: Box::new(Ty::Untyped) },
+        // A Hash subclass whose keys are Strings, as
+        // `with_indifferent_access` types it (registry::stdlib).
+        ("ActiveSupport::HashWithIndifferentAccess" | "HashWithIndifferentAccess", []) => {
+            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) }
+        }
+        ("ActiveSupport::HashWithIndifferentAccess" | "HashWithIndifferentAccess", [key, value]) => Ty::Hash {
+            key: Box::new(key.clone()),
+            value: Box::new(value.clone()),
+        },
         _ => Ty::Class {
             id: ClassId(Symbol::new(name)),
             args,

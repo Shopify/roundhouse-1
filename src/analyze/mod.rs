@@ -286,6 +286,28 @@ const CONST_MEMO_ROUNDS: usize = 16;
 /// rounds as it is long, and Core's longest takes far fewer.
 const UNSETTLED_CONSTANT_ROUNDS: usize = 64;
 
+/// The declarations the file programs carry only inline (see
+/// [`Analyzer::analyze`]), in source order, branches included.
+fn guarded_declarations(programs: &[crate::app::FileProgram]) -> Vec<crate::dialect::LibraryClass> {
+    fn walk(items: &[crate::app::ProgramItem], out: &mut Vec<crate::dialect::LibraryClass>) {
+        for item in items {
+            match item {
+                crate::app::ProgramItem::Inline(classes) => out.extend(classes.iter().cloned()),
+                crate::app::ProgramItem::Branch { then_items, else_items, .. } => {
+                    walk(then_items, out);
+                    walk(else_items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for program in programs {
+        walk(&program.items, &mut out);
+    }
+    out
+}
+
 /// Name, on stderr, the values whose type the round after
 /// [`UNSETTLED_CONSTANT_ROUNDS`] changes again. A value that changes
 /// every round (one typed from itself) keeps the registry going to its
@@ -1421,7 +1443,30 @@ impl Analyzer {
     /// parameter types across call sites, and (c) re-runs typing with
     /// the refined registry. Iterates to a fixed point (capped; see
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
+    ///
+    /// A support file's declarations behind a file-level `return` or
+    /// inside a file-level conditional reach the IR only in its file
+    /// program (`ProgramItem::Inline`), where emit places them behind
+    /// the guard. graphql-shopify's `batch/loader.rb` opens with `begin
+    /// require "graphql/batch" rescue LoadError; return; end`, so its
+    /// `class Loader < GraphQL::Batch::Loader` was no class at all, and
+    /// every loader below it lost `self.for`. Typing sees them as
+    /// library classes: they are lent to `library_classes` for the
+    /// analysis (the registry rebuilt to include them) and taken back
+    /// after, leaving the file programs as ingested.
     pub fn analyze(&mut self, app: &mut App) {
+        let carried = app.library_classes.len();
+        let guarded = guarded_declarations(&app.file_programs);
+        if !guarded.is_empty() {
+            app.library_classes.extend(guarded);
+            let adapter = std::mem::replace(&mut self.adapter, Box::new(SqliteAdapter));
+            *self = Self::with_adapter(app, adapter);
+        }
+        self.analyze_carried(app);
+        app.library_classes.truncate(carried);
+    }
+
+    fn analyze_carried(&mut self, app: &mut App) {
         self.param_tables = None;
         self.constant_rounds = 0;
         self.site_cache = Default::default();
