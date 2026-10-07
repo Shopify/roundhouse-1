@@ -97,6 +97,51 @@ fn non_nil_assertion_checks_are_refused_where_the_tree_cannot_run_them() {
     }
 }
 
+/// sorbet's class check of `T.let` / `T.cast` / `T.bind` /
+/// `T.assert_type!` runs on the CRuby and JRuby trees, through the
+/// overlay's SorbetRuntimeCheck (tests/author_casts_run.rs runs it).
+/// Other targets refuse each site by name instead of dropping the check.
+#[test]
+fn sorbet_type_checks_are_refused_where_the_tree_cannot_run_them() {
+    for body in [
+        "T.let(title, String)",
+        "T.cast(Probe.find_by(id: 1), T.nilable(Probe))",
+        "T.assert_type!(title, T.any(String, Integer))",
+        "T.let(Probe.all.to_a, T::Array[Probe])",
+    ] {
+        let root = probe_app(body);
+        let (ok, text) = run(&root, &["check"]);
+        assert!(ok, "check refused {body}: {text}");
+        let (ok, text) = run(&root, &["--target", "ruby"]);
+        assert!(ok, "ruby refused {body}: {text}");
+        for target in ["typescript", "rust"] {
+            let (ok, text) = run(&root, &["--target", target]);
+            assert!(!ok, "{target} accepted {body}: {text}");
+            assert!(
+                text.contains("sorbet type check not supported") && text.contains(&format!("CRuby and JRuby trees, not {target}")),
+                "{target} lost named refusal for {body}: {text}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    // A check that cannot fail is the value alone, on every target.
+    let root = probe_app("T.let(nil, T.nilable(String))");
+    for target in ["ruby", "typescript"] {
+        let (ok, text) = run(&root, &["--target", target]);
+        assert!(ok, "{target} refused a check that cannot fail: {text}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A type form the check cannot rebuild is refused at the site by name,
+/// on `check` and on the Ruby tree alike.
+#[test]
+fn uncheckable_sorbet_types_are_refused_by_name() {
+    refuses("T.let(title, T.proc.params(x: Integer).returns(String))", "is a proc type");
+    refuses("T.let(title, [String, Integer])", "is a tuple shape");
+    refuses("T.cast(title, T.self_type)", "T.self_type");
+}
+
 #[test]
 fn for_scope_is_not_a_block_scope() {
     for body in [

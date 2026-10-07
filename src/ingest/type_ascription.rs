@@ -79,7 +79,7 @@ pub(super) fn sorbet_declared_type(node: &Node<'_>) -> Option<Ty> {
     if method == "unsafe" {
         return Some(Ty::Untyped);
     }
-    if !matches!(method, "let" | "cast" | "bind") {
+    if !matches!(method, "let" | "cast" | "bind" | "assert_type!") {
         return None;
     }
     let args = call.arguments()?.arguments();

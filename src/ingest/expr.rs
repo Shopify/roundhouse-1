@@ -301,6 +301,18 @@ fn ingest_statement_list(
             exprs.extend(parts);
             continue;
         }
+        // `T.bind(self, Type)` ingests as its check then its self binding
+        // (`sorbet_check`); the binding has to be a statement of this list
+        // for the body typer to read it.
+        if sorbet_assertion_is_bind(child) && matches!(&*expr.node, ExprNode::Seq { .. }) {
+            let leading_blank_line = expr.leading_blank_line;
+            let ExprNode::Seq { exprs: mut parts } = *expr.node else { unreachable!() };
+            if let Some(first) = parts.first_mut() {
+                first.leading_blank_line |= leading_blank_line;
+            }
+            exprs.extend(parts);
+            continue;
+        }
         exprs.push(expr);
     }
     Ok(exprs)
@@ -646,10 +658,18 @@ fn ingest_written_value(value: &Node<'_>, loc: &ruby_prism::Location<'_>, file: 
 
 /// A string literal naming this source file's own location (`__FILE__`,
 /// `__dir__`), app-root relative and flagged `SOURCE_FILE_PATH`.
-fn source_file_path_lit(span: Span, path: String) -> Expr {
+pub(super) fn source_file_path_lit(span: Span, path: String) -> Expr {
     let mut lit = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: path } });
     lit.decisions |= crate::expr::SOURCE_FILE_PATH;
     lit
+}
+
+/// A refused `sorbet_check`: `nil` carrying the refusal, standing where
+/// the check would.
+fn sorbet_check_refused(span: Span, reason: &str) -> Expr {
+    let mut expr = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    expr.diagnostic = Some(super::sorbet_check::refusal(reason.to_string()));
+    expr
 }
 
 fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
@@ -679,12 +699,52 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         } else {
             value
         };
-        let ascribed = super::type_ascription::ascribe(value, declared);
-        if sorbet_assertion_is_bind(node) {
+        // `T.let` / `T.cast` / `T.bind` / `T.assert_type!` check the value's
+        // class at runtime (`sorbet_check`); `T.unsafe` does not, and the
+        // nil check of `T.must` / `T.must_because` is lowered above.
+        let call = node.as_call_node().expect("a sorbet assertion is a call");
+        let plan = if matches!(constant_id_str(&call.name()), "unsafe" | "must" | "must_because") {
+            super::sorbet_check::Plan::Value
+        } else {
+            super::sorbet_check::plan(&call, &inner, file)?
+        };
+        let bind = sorbet_assertion_is_bind(node);
+        let self_bind = bind && matches!(&*value.node, ExprNode::SelfRef);
+        // A self binding stays a bare `Cast` of `self`, the statement the
+        // body typer reads; its check is a statement before it, which
+        // `ingest_statement_list` splices into the enclosing list.
+        let (value, check) = match plan {
+            super::sorbet_check::Plan::Value => (value, None),
+            super::sorbet_check::Plan::Check(ty) if self_bind => {
+                match super::sorbet_check::checked_cast(span, &call, value.clone(), ty, file) {
+                    Some(check) => (value, Some(check)),
+                    None => (value, Some(sorbet_check_refused(span, "the call has no source line to name"))),
+                }
+            }
+            super::sorbet_check::Plan::Check(ty) => {
+                match super::sorbet_check::checked_cast(span, &call, value.clone(), ty, file) {
+                    Some(check) => (check, None),
+                    None => (value, Some(sorbet_check_refused(span, "the call has no source line to name"))),
+                }
+            }
+            super::sorbet_check::Plan::Refuse(reason) => (value, Some(sorbet_check_refused(span, &reason))),
+        };
+        let mut ascribed = super::type_ascription::ascribe(value, declared);
+        if bind {
             let class_object = super::type_ascription::sorbet_binds_class_object(node);
-            return Ok(super::type_ascription::bind_self(ascribed, class_object));
+            ascribed = super::type_ascription::bind_self(ascribed, class_object);
         }
-        return Ok(ascribed);
+        return Ok(match check {
+            None => ascribed,
+            // Refused off a self binding: the refusal is the value's.
+            Some(refused) if !self_bind && refused.diagnostic.is_some() => {
+                if ascribed.diagnostic.is_none() {
+                    ascribed.diagnostic = refused.diagnostic;
+                }
+                ascribed
+            }
+            Some(check) => Expr::new(span, ExprNode::Seq { exprs: vec![check, ascribed] }),
+        });
     }
 
     // `T.absurd(x)` is NOT an assertion that evaluates to its argument:

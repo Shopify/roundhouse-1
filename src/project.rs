@@ -5181,6 +5181,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 format!("the nil check `T.must`, `T.must_because` and `#: as !nil` lower to runs on the Ruby-family trees, not {target}"),
             );
         }
+        // sorbet-runtime's class check `T.let` / `T.cast` / `T.bind` /
+        // `T.assert_type!` lower to (`ingest::sorbet_check`) is the CRuby
+        // overlay's `SorbetRuntimeCheck`, which reads `Method#owner` and
+        // binds `Module#name`; only the CRuby and JRuby trees carry it.
+        if !matches!(target, "ruby" | "jruby") && crate::ingest::sorbet_check::is_check(expr) {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                crate::ingest::sorbet_check::CONSTRUCT,
+                format!("sorbet-runtime's class check of `T.let`, `T.cast`, `T.bind` and `T.assert_type!` runs on the CRuby and JRuby trees, not {target}"),
+            );
+        }
         if target == "ruby" {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
             return;

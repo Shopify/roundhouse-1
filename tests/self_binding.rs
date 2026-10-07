@@ -163,15 +163,18 @@ fn emitted_config(config: &str) -> String {
         .expect("config.rb")
 }
 
-/// Neither form leaves a statement behind; a `T.bind` whose value is the
-/// block's keeps its value, `self`.
+/// The `#:` comment leaves nothing behind; `T.bind` leaves sorbet's class
+/// check of `self` (tests/author_casts_run.rs runs it), and one whose value
+/// is the block's keeps its value, `self`.
 #[test]
-fn the_binding_emits_nothing_but_a_used_value() {
+fn the_binding_emits_its_check_and_a_used_value() {
     let config = "class Config\n  #: -> void\n  def narrowed\n    Builder.configure do\n      #: self as Widget\n      label.upcase\n      T.bind(self, Widget)\n      label.downcase\n    end\n  end\n\n  #: -> untyped\n  def answer\n    T.bind(self, Widget)\n  end\nend\n";
     let out = emitted_config(config);
     assert!(out.contains("label.upcase"), "{out}");
     assert!(out.contains("label.downcase"), "{out}");
-    assert!(!out.contains("T.bind"), "{out}");
+    assert!(!out.contains("T.bind("), "{out}");
+    assert_eq!(out.matches("SorbetRuntimeCheck.cast(self, Widget, \"T.bind\"").count(), 2, "{out}");
+    assert!(out.contains("label.upcase\n      SorbetRuntimeCheck.cast(self, Widget"), "the comment emits nothing:\n{out}");
     let bare_self = out.lines().filter(|l| l.trim() == "self").count();
     assert_eq!(bare_self, 1, "only `answer`'s value remains:\n{out}");
 }

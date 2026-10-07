@@ -206,15 +206,28 @@ reader. The assertions split by what they do natively:
 - `T.must`, `T.must_because` and the `#: as !nil` comment keep their
   nil check on the Ruby trees: `TypeError` with sorbet-runtime's
   message, raised where the assertion stood.
-- `T.let`, `T.cast`, `T.bind` and the `#: as Type` comment become the
-  value they wrap, unchanged, on the Ruby trees (ruby, jruby, spinel,
-  roda). The comment is inert natively, so `nil #: as Integer` is nil
-  here as it is there, never `0`. sorbet-runtime's `T.let`/`T.cast`
-  also check the value's class and raise `TypeError` on a mismatch;
-  that check is NOT repeated, so a value sorbet would reject flows on
-  where the native run would have stopped. The check only fires on a
-  path the native suite cannot pass through, which is why it is the
-  one divergence kept.
+- The `#: as Type` comment becomes the value it wraps, unchanged: it is
+  inert natively, so `nil #: as Integer` is nil here as it is there,
+  never `0`.
+- `T.let`, `T.cast`, `T.bind` and `T.assert_type!` keep sorbet-runtime's
+  class check on the CRuby and JRuby trees. Each lowers to
+  `SorbetRuntimeCheck.cast(value, type, "T.let", path, line)` (the
+  overlay's `runtime/sorbet_runtime_check.rb`), which returns the value
+  or raises sorbet's `TypeError`, message and `Caller:` line included.
+  The type is checked as sorbet 0.6.13502 does: the outer class
+  (`is_a?`), `T.nilable` as nil-or, `T.any` as any-of, `T::Boolean` as
+  true/false, `T.class_of`, and the stdlib generics (`T::Array[X]`, ...)
+  and user generics by their outer class only. A check that cannot fail
+  (`T.untyped`, `checked: false`, `T.let(nil, T.nilable(X))`,
+  `T.let([], T::Array[X])`) is the value alone. A type the check cannot
+  rebuild faithfully (`T.proc`, `T.self_type`, `T.attached_class`, type
+  parameters, `T.all`, tuple and hash shapes, sorbet's own constants
+  such as `T::Struct`) is refused at the site by name, as is a type
+  alias constant (the aliases are not carried into the tree). The other
+  targets (spinel, roda and the strict ones) refuse the check by name
+  (`sorbet type check not supported`) rather than drop it.
+  `tests/author_casts_run.rs` compares every result and message with
+  the native run on Core's sorbet-runtime.
 - The type a cast declares still types the analysis, and
   `roundhouse check` trusts it. Lowerings do not fold a value-dependent
   predicate on it: `n = list.first #: as Integer; n.present?` keeps the
@@ -223,7 +236,8 @@ reader. The assertions split by what they do natively:
   cast keeps its grounding plus a nil check. A declared type that
   arrives through a method return or an RBS signature is trusted like
   any other declared type.
-- The strict targets keep the conversion each emitter writes for a cast
+- The strict targets keep the conversion each emitter writes for a `#:`
+  cast or a check that cannot fail
   (Go and Swift assert the type and fail loudly; C# `Convert.*` and
   Kotlin's parse convert), because a typed slot needs a representation.
   An author cast with no backing type is a known per-target divergence
