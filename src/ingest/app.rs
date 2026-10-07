@@ -2169,6 +2169,16 @@ end
     let late_sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&[], &late_sources);
     app.dropped_files = survey::dropped_files();
+    // Survey mode goes on past a file whose class ingest failed, as the
+    // support-dir walk does outside it: each is an error at the
+    // construct that failed it too, not only a punch-list entry.
+    for dropped in &app.dropped_files {
+        // The source registry is drained above; `app.sources` is its snapshot.
+        let Some(index) = app.sources.iter().position(|s| s.path == dropped.file) else { continue };
+        let file = crate::span::FileId(index as u32 + 1);
+        let span = crate::span::Span { file, start: dropped.start as u32, end: dropped.end as u32 };
+        app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone() });
+    }
     Ok(app)
 }
 

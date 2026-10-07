@@ -339,12 +339,13 @@ pub struct App {
     /// `initializer_unsupported` error by `analyze::initializer_coverage`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_gaps: Vec<InitializerGap>,
-    /// Source files whose library-class ingest failed outside survey
-    /// mode and that the isolate-tolerant support-dir walk left out of
-    /// the IR: none of their classes, modules or constants are in the
-    /// emitted app. Each is an `ingest_unsupported` error at the
-    /// construct that failed it (`analyze::ingest_coverage`). Survey
-    /// mode records the same gaps in its punch list instead.
+    /// Source files whose library-class ingest failed and that ingest
+    /// went on without (the isolate-tolerant support-dir walk; in survey
+    /// mode, every per-file class ingest): none of their classes,
+    /// modules or constants are in the emitted app. Each is an
+    /// `ingest_unsupported` error at the construct that failed it
+    /// (`analyze::ingest_coverage`); survey mode also lists the gap in
+    /// its punch list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingest_drops: Vec<IngestDrop>,
     /// `config.eager_load = …` from each `config/environments/<env>.rb`,

@@ -84,6 +84,10 @@ fn emitted_constants_match_native_ruby() {
 /// Plain `check` (no `--continue`): the refusal is an
 /// `ingest_unsupported` error at the read, not a silently dropped file.
 fn check(source: &str) -> String {
+    check_with(source, &[])
+}
+
+fn check_with(source: &str, args: &[&str]) -> String {
     let root = std::env::temp_dir().join(format!(
         "roundhouse-body-locals-refusal-{}-{}",
         std::process::id(),
@@ -101,6 +105,7 @@ fn check(source: &str) -> String {
     }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
         .arg("check")
+        .args(args)
         .arg(&root)
         .output()
         .unwrap();
@@ -132,4 +137,10 @@ fn an_observable_local_is_refused_by_name() {
         assert!(text.contains(reason), "missing `{reason}` in:\n{text}");
         assert!(text.contains("error[ingest_unsupported]"), "not an ingest_unsupported error:\n{text}");
     }
+    // Survey mode goes on without the file too, and says so at the read.
+    let survey = check_with(
+        "module Podish\n  module Registry\n    store = Object.new\n    DEFAULT = store\n  end\nend\n",
+        &["--continue"],
+    );
+    assert!(survey.contains("registry.rb:4:15: error[ingest_unsupported]: class-body local `store`"), "{survey}");
 }
