@@ -7008,13 +7008,17 @@ fn is_app_class(name: &str, app: &App) -> bool {
 /// The declared superclass of an app class named by a namespace
 /// segment, so a nested file can reopen it with the same parent.
 fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
-    if let Some(m) = app.models.iter().find(|m| m.name.0.as_str() == name) {
-        return m.parent.clone();
+    if is_model_named(name, app) {
+        if let Some(m) = app.models.iter().find(|m| m.name.0.as_str() == name) {
+            return m.parent.clone();
+        }
     }
-    if let Some(c) = app.controllers.iter().find(|c| c.name.0.as_str() == name) {
-        return c.parent.clone();
+    if is_controller_named(name, app) {
+        if let Some(c) = app.controllers.iter().find(|c| c.name.0.as_str() == name) {
+            return c.parent.clone();
+        }
     }
-    if let Some(c) = app.library_classes.iter().find(|c| c.name.0.as_str() == name && !c.is_module) {
+    if let Some(c) = library_classes_named(name, app).into_iter().find(|c| !c.is_module) {
         return c.parent.clone();
     }
     // A test class nesting another (`PermissionGeneratorTest::
@@ -7038,10 +7042,7 @@ fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
     if written.starts_with("::") {
         return parent.clone();
     }
-    let defined = |candidate: &str| {
-        app.models.iter().any(|m| m.name.0.as_str() == candidate)
-            || app.library_classes.iter().any(|lc| lc.name.0.as_str() == candidate)
-    };
+    let defined = |candidate: &str| is_model_or_library_class(candidate, app);
     let mut scope: Vec<&str> = child.split("::").collect();
     scope.pop();
     while !scope.is_empty() {
@@ -7063,11 +7064,7 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
         // itself first, so subclasses see both the framework methods
         // and the app's additions. Without this the reopen dangles:
         // nothing else in the require graph names it.
-        if app
-            .library_classes
-            .iter()
-            .any(|lc| lc.name.0.as_str() == "ActiveRecord::Base")
-        {
+        if !library_classes_named("ActiveRecord::Base", app).is_empty() {
             return Some("app/models/active_record/base".to_string());
         }
         return Some("runtime/active_record".to_string());
@@ -7095,13 +7092,11 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
     if raw == "Logger::Formatter" || raw == "::Logger::Formatter" {
         return Some("runtime/logger".to_string());
     }
-    if app.models.iter().any(|m| m.name.0.as_str() == raw)
-        || app.library_classes.iter().any(|lc| lc.name.0.as_str() == raw)
-    {
+    if is_model_or_library_class(raw, app) {
         // underscore: namespaced parents nest (see emit_library_class_decls).
         return Some(format!("app/models/{}", crate::naming::underscore(raw)));
     }
-    if app.controllers.iter().any(|c| c.name.0.as_str() == raw) {
+    if is_controller_named(raw, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(raw)));
     }
     // A SUPERCLASS that is a gem's class — lobsters' `TimeSeries <
