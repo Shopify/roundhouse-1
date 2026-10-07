@@ -2696,6 +2696,19 @@ fn ruby_family_runtime_files(
         ));
         drop_harness_memory_store(&mut files)?;
     }
+    // MemCacheStore (activesupport 8.1.4 on the dalli gem), where app code
+    // names the class: Core's VersionedMemCacheStore subclasses it. It
+    // requires dalli and connection_pool when loaded, as the native file
+    // does, so it rides only where named. Naming it names
+    // ActiveSupport::Cache, so the base port above is carried too.
+    let carries_mem_cache = carries_cache && carries_named(&files, &["ActiveSupport::Cache::MemCacheStore"]);
+    if carries_mem_cache {
+        files.push((
+            "runtime/active_support_mem_cache_store.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_mem_cache_store.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_mem_cache_store.rb: {e}"))?,
+        ));
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2781,6 +2794,11 @@ fn ruby_family_runtime_files(
     };
     let gem_facades = if carries_cache {
         format!("{gem_facades}require_relative \"active_support_cache\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_mem_cache {
+        format!("{gem_facades}require_relative \"active_support_mem_cache_store\"\n")
     } else {
         gem_facades
     };
@@ -5282,6 +5300,7 @@ fn spinel_files_with_assertions(
     // Monitor and computed-name dispatch, pushed back by the two
     // ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
+    files.retain(|(p, _)| p != "runtime/active_support_mem_cache_store.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -6925,11 +6944,17 @@ const ACTIVE_SUPPORT_CACHE_NAMES: &[&str] = &[
 /// `ActiveSupport::Cache::MemoryStore.new` alone is the harness's
 /// (`drop_harness_memory_store`), so tests do not count.
 fn carries_active_support_cache(files: &[(String, String)]) -> bool {
+    carries_named(files, ACTIVE_SUPPORT_CACHE_NAMES)
+}
+
+/// True where app code (not the runtime, not a test body) names one of
+/// `names`.
+fn carries_named(files: &[(String, String)], names: &[&str]) -> bool {
     files.iter().any(|(path, content)| {
         path.ends_with(".rb")
             && !path.starts_with("runtime/")
             && !path.starts_with("test/")
-            && ACTIVE_SUPPORT_CACHE_NAMES.iter().any(|name| names_constant(content, name))
+            && names.iter().any(|name| names_constant(content, name))
     })
 }
 
@@ -6973,7 +6998,9 @@ fn names_constant(src: &str, konst: &str) -> bool {
         // exactly once, exactly here, and the gem went undeclared.
         if let Some(rest) = line.trim().strip_prefix("class ") {
             if let Some((_, parent)) = rest.split_once('<') {
-                if parent.trim() == konst {
+                // `< ::Name` is the same top-level parent.
+                let parent = parent.trim();
+                if parent.strip_prefix("::").unwrap_or(parent) == konst {
                     return true;
                 }
             }
@@ -8348,6 +8375,11 @@ mod tests {
             "x = ActiveSupport::IsolatedExecutionState[:k]\n".to_string(),
         ));
         assert!(carries_active_support_cache(&files[2..]));
+        let mem_cache = "class VersionedMemCacheStore < ::ActiveSupport::Cache::MemCacheStore\nend\n";
+        assert!(!carries_named(&files, &["ActiveSupport::Cache::MemCacheStore"]));
+        let named = vec![("app/models/versioned.rb".to_string(), mem_cache.to_string())];
+        assert!(carries_named(&named, &["ActiveSupport::Cache::MemCacheStore"]));
+        assert!(carries_active_support_cache(&named));
 
         drop_harness_memory_store(&mut files).unwrap();
         let dropped = &files[0].1;

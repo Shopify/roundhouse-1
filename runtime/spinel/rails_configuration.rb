@@ -40,6 +40,26 @@ module Rails
     end
   end
 
+  # `Rails.logger` takes the stdlib Logger's call forms here: the shared
+  # runtime's Logger (rails.rb) takes one positional message, which is
+  # every call the strict targets compile, while gems on this tree log
+  # lazily (`Dalli.logger.debug { "..." }`, `.warn { "..." }`; dalli logs
+  # through Rails.logger when Rails is defined). As in the stdlib
+  # (`Logger#add`), a block is the message and the argument becomes the
+  # progname. Same class_eval reasoning as above: Rails::Logger is the
+  # shared runtime's to gate.
+  Logger.class_eval do
+    %i[info error warn fatal].each do |level|
+      write = instance_method(level)
+      define_method(level) do |progname = nil, &block|
+        write.bind_call(self, block ? block.call : progname)
+      end
+    end
+
+    # Dropped, as the shared runtime's debug is; the block is not called.
+    define_method(:debug) { |progname = nil, &block| nil }
+  end
+
   class Configuration
     def initialize(application)
       @application = application

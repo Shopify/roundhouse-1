@@ -26,6 +26,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
+    ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
 ];
 
 /// Each gated namespace and the finished-tree file that declares it.
@@ -183,6 +184,8 @@ mod tests {
             ("ActiveSupport::Cache::MemoryStore", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::Strategy::LocalCache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }
