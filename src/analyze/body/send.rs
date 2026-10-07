@@ -343,6 +343,7 @@ impl<'a> BodyTyper<'a> {
                 | "any?" | "all?" | "none?" | "one?"
                 | "to_h" => Some(vec![(**elem).clone()]),
                 "each_with_index" | "with_index" => Some(vec![(**elem).clone(), Ty::Int]),
+                "each_slice" | "each_cons" => Some(vec![recv_ty.clone()]),
                 "sort_by!" | "select!" | "reject!" | "keep_if" | "delete_if" => Some(vec![(**elem).clone()]),
                 _ => None,
             },
@@ -1672,7 +1673,11 @@ impl<'a> BodyTyper<'a> {
                     return t.rebind_class(&anc, of);
                 }
                 if let Some(cls) = self.classes().get(of) {
-                    match cls.class_method(method) {
+                    // A declared class method is stored as its `Ty::Fn`
+                    // (`unwrap_fn_ret`). The call answers its return.
+                    let model = Ty::Class { id: of.clone(), args: vec![] };
+                    let entry = cls.class_method(method).map(|ty| unwrap_fn_ret(&ty.subst_self(&model)));
+                    match entry.as_ref() {
                         Some(ret @ Ty::Relation { .. }) => return ret.clone(),
                         // A class-side entry that answers with a
                         // COLLECTION. Chain methods preserve the
@@ -2448,7 +2453,10 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         // `partition { … }` → `[matching, rest]`: two same-element
         // Arrays, so an Array of Array-of-elem. Rails' own
         // `users.partition(&:administrator?)` destructures it.
-        "partition" => Ty::Array {
+        // `each_slice(n)` / `each_cons(n)` yield same-element sub-arrays.
+        // Core chains the enumerator (`ids.each_slice(500).flat_map { |batch| … }`),
+        // so the value is those batches.
+        "partition" | "each_slice" | "each_cons" => Ty::Array {
             elem: Box::new(Ty::Array { elem: Box::new(elem.clone()) }),
         },
         // `each`, predicates, and shape-preserving transforms keep elem.
