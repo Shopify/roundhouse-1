@@ -398,12 +398,14 @@ pub struct App {
     /// `ActiveSupport.on_load(:hook)` block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub load_hook_bases: std::collections::BTreeMap<String, String>,
-    /// Top-level calls of support files whose declarations ingest
-    /// carried (`Money::Converters.register(…)` after the class). Ruby
-    /// runs each when it loads the file, and the emitted app does not.
-    /// Each is a `file_statement_unsupported` error at the call
+    /// The file-level statements of support files that their file
+    /// programs (`App::file_programs`) do not carry
+    /// (`ProgramItem::NotCarried`): a statement the expression ingest
+    /// refuses, a method defined in a block, a declaration inside a
+    /// `case` or `begin`. Ruby runs each when it loads the file; the
+    /// emitted app names it at boot. Each is a
+    /// `file_statement_unsupported` error at the statement
     /// (`analyze::ingest_coverage`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_statement_gaps: Vec<InitializerGap>,
     /// How many source declarations ingest merged into each library
     /// class reopened across declarations (`class X … end` again, in
@@ -425,10 +427,7 @@ pub struct App {
     /// modules or constants are in the emitted app. Each is an
     /// `ingest_unsupported` error at the construct that failed it
     /// (`analyze::ingest_coverage`); survey mode also lists the gap in
-    /// its punch list. Also each support-file definition the ingest does
-    /// not carry as Ruby runs it: one inside a file-level conditional,
-    /// or after a file-level `return`
-    /// (`ingest::library_class::file_level_definition_gaps`).
+    /// its punch list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingest_drops: Vec<IngestDrop>,
     /// The `Rails::Railtie` and `Rails::Engine` subclasses the support
@@ -440,6 +439,18 @@ pub struct App {
     /// Rails' does, and runs their initializers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub railties: Vec<CarriedRailtie>,
+    /// Each support file whose top level runs more than declarations
+    /// when Ruby loads it (`ingest::library_class::file_program`): its
+    /// statements, conditional definitions and the definitions behind a
+    /// file-level `return`, in source order. The Ruby family emits each
+    /// as one file the boot loads (`app/models/roundhouse_files/…`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_programs: Vec<FileProgram>,
+    /// Each support file the ingest carried => the library classes and
+    /// modules it declares, in the order it declares them; what a
+    /// `require` of that file loads in the emitted tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_class_files: Vec<(String, Vec<ClassId>)>,
     /// `config.eager_load = …` from each `config/environments/<env>.rb`,
     /// in file-name order. The emitted CRuby app evaluates the one for
     /// `Rails.env` at boot to choose eager loading or autoload on
@@ -822,6 +833,59 @@ pub struct CarriedRailtie {
     pub root: Option<String>,
 }
 
+/// A support file's file-level program ([`App::file_programs`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileProgram {
+    /// The source file, as ingested.
+    pub source: String,
+    pub items: Vec<ProgramItem>,
+}
+
+/// One top-level statement of a [`FileProgram`], in source order.
+/// A part of a `class_eval` body ([`ProgramItem::ClassEval`]), in
+/// source order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ClassEvalPart {
+    /// Body statements, as the methods and constants of a module named
+    /// `ingest::library_class::CLASS_EVAL_BODY`.
+    Body(crate::dialect::LibraryClass),
+    /// An `if`/`unless` in the body that defines methods.
+    Branch { cond: Expr, negate: bool, then_parts: Vec<ClassEvalPart>, else_parts: Vec<ClassEvalPart> },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ProgramItem {
+    /// A `class`/`module` the walk carried as library classes (these
+    /// names), loaded here so the statements around it run in order.
+    Declared(Vec<ClassId>),
+    /// A statement Ruby runs as the file loads.
+    Statement(Expr),
+    /// A file-level `return` (or `return unless …`): the rest of the
+    /// file runs only when it does not return.
+    Guard(Expr),
+    /// `require "feature"` / `require_relative "path"`, resolved against
+    /// the tree when emitted.
+    Require { span: crate::span::Span, feature: String, relative: bool },
+    /// Declarations carried only here, as Ruby evaluates them: inside a
+    /// file-level conditional, or behind a file-level `return`.
+    Inline(Vec<crate::dialect::LibraryClass>),
+    /// `receiver.method do … end` (`class_eval` and kin), its body as
+    /// the methods and constants of a module named
+    /// `ingest::library_class::CLASS_EVAL_BODY` (`None`: an empty body).
+    ClassEval { receiver: Expr, method: String, parts: Vec<ClassEvalPart> },
+    /// A file-level `if`/`unless` holding declarations.
+    Branch {
+        cond: Expr,
+        negate: bool,
+        then_items: Vec<ProgramItem>,
+        else_items: Vec<ProgramItem>,
+    },
+    /// A statement the ingest cannot carry, named when the file loads
+    /// and reported as `file_statement_unsupported`. `construct` is the
+    /// groupable name (`Money::Converters.register`, `if`, `begin`).
+    NotCarried { span: crate::span::Span, construct: String, message: String },
+}
+
 /// A source file a failed library-class ingest left out of the IR.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestDrop {
@@ -832,7 +896,7 @@ pub struct IngestDrop {
     pub message: String,
     /// Set when the file was ingested and only the statement at `span`
     /// is not carried as Ruby runs it: the `unsupported` construct it
-    /// is reported as (`file_level_definition`), rather than a whole
+    /// is reported as, rather than a whole
     /// file left out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub construct: Option<String>,
@@ -1105,6 +1169,8 @@ impl App {
             load_hooks: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),
+            file_programs: Vec::new(),
+            library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),
             sql_functions: Vec::new(),

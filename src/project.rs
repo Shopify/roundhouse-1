@@ -3234,6 +3234,14 @@ fn ruby_family_files(
     apply_controller_dispatch(&mut files, app, true);
     // Lazy flavor of the models aggregator: autoload on reference unless
     // the environment's `config.eager_load` says otherwise.
+    // Each support file's file program, which the boot loads ahead of
+    // the boot files (apply_models_autoload).
+    let emitted_anchors: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter_map(|(p, _)| p.strip_prefix("app/").filter(|p| p.starts_with("models/")).and_then(|p| p.strip_suffix(".rb")))
+        .map(str::to_string)
+        .collect();
+    files.extend(emit::ruby::file_program_files(app, &emitted_anchors));
     apply_models_autoload(&mut files, app);
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
@@ -5239,6 +5247,34 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         .filter(|(anchor, _)| !ignored_anchors.contains(anchor))
         .collect();
     models.sort();
+    // The support files' file programs: neither autoloaded nor
+    // eager-loaded. One another emitted file requires (a program's
+    // `require`, an engine's glob) loads there, as Ruby loads it; the
+    // rest, which nothing in the tree requires (config/boot.rb's
+    // `require "strict_warnings"`, Bundler.require's gem entry), load at
+    // boot in source order, ahead of the boot files.
+    let (programs, rest): (Vec<(String, String)>, Vec<(String, String)>) =
+        models.into_iter().partition(|(anchor, _)| anchor.starts_with("models/roundhouse_files/"));
+    let mut models = rest;
+    let mut required: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    const PROGRAM: &str = "\"models/roundhouse_files/";
+    for (path, content) in files.iter() {
+        let own = path.strip_prefix("app/").and_then(|p| p.strip_suffix(".rb"));
+        let mut rest = content.as_str();
+        while let Some(at) = rest.find(PROGRAM) {
+            let tail = &rest[at + 1..];
+            let Some(end) = tail.find('"') else { break };
+            let anchor = &tail[..end];
+            if Some(anchor) != own {
+                required.insert(anchor);
+            }
+            rest = &tail[end..];
+        }
+    }
+    let mut programs: Vec<String> =
+        programs.into_iter().map(|(a, _)| a).filter(|a| !required.contains(a.as_str())).collect();
+    programs.sort();
+    models.sort();
 
     // namespace ("Object" for the top level) -> child -> (file, written as module)
     #[derive(Default)]
@@ -5355,23 +5391,29 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     if !app.eager_load.is_empty() {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
     }
-    body.push_str(
-        "RoundhouseAutoload.register(Object)\n\
-         RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n",
-    );
+    body.push_str("RoundhouseAutoload.register(Object)\n");
     // The railties and engines the app carries (`App::railties`, kept
     // only where the tree ports Rails::Railtie and Rails::Engine), loaded
     // at boot in Rails' order, as Bundler.require and
     // config/application.rb define them before Application#initialize!.
-    // Each engine's root first: the directory the source has it in,
-    // where its data files are carried (`Rails::Engine.source_roots`).
+    // Each engine's root first, before anything loads: the directory the
+    // source has it in, where its data files are carried
+    // (`Rails::Engine.source_roots`). A railtie whose file runs more than
+    // its declarations loads as its file program, in that order.
+    let program_of = |name: &crate::ident::ClassId| {
+        app.file_programs
+            .iter()
+            .find(|p| p.items.iter().any(|i| matches!(i, crate::app::ProgramItem::Declared(names) if names.contains(name))))
+            .map(|p| emit::ruby::file_program_anchor(app, p))
+    };
     let railtie_files: Vec<(&crate::app::CarriedRailtie, String)> = app
         .railties
         .iter()
         .filter(|r| app.library_classes.iter().any(|c| c.name == r.name))
-        .map(|r| (r, anchor_of(&r.name)))
-        .filter(|(_, anchor)| models.iter().any(|(m, _)| m == anchor))
+        .filter(|r| models.iter().any(|(m, _)| *m == anchor_of(&r.name)))
+        .map(|r| (r, program_of(&r.name).unwrap_or_else(|| anchor_of(&r.name))))
         .collect();
+    programs.retain(|p| !railtie_files.iter().any(|(_, anchor)| anchor == p));
     if !railtie_files.is_empty() {
         body.push_str("# The app's railties and engines, in Rails' load order (runtime/rails_engine.rb).\n");
         for (railtie, _) in &railtie_files {
@@ -5385,6 +5427,18 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 .unwrap();
             }
         }
+    }
+    if !programs.is_empty() {
+        body.push_str("# The support files' file-level programs (app/models/roundhouse_files): what\n# Ruby runs when it loads each, beyond the declarations autoloaded above.\n[\n");
+        for program in &programs {
+            writeln!(body, "  {program:?},").unwrap();
+        }
+        body.push_str("].each { |file| require RoundhouseAutoload.path(file) }\n");
+    }
+    body.push_str(
+        "RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n",
+    );
+    if !railtie_files.is_empty() {
         body.push_str("[\n");
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for (_, anchor) in &railtie_files {
@@ -5410,6 +5464,26 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   def self.path(file)
     File.expand_path("#{file}.rb", ROOT)
+  end
+
+  # A file-level statement of a support file's program: runs it, and
+  # names one that fails (the rest of the file goes on, as the emitted
+  # app has not ported everything a statement may reach).
+  def self.file_statement(site)
+    yield
+  rescue StandardError, LoadError, NotImplementedError => e
+    warn "roundhouse: error[file_statement_not_run]: the file-level statement at #{site} did not run: #{e.class}: #{e.message}"
+  end
+
+  # A file-level conditional's condition: its value, or NOT_RUN when it
+  # raises (named), and then neither branch runs.
+  NOT_RUN = Object.new.freeze
+
+  def self.file_condition(site)
+    yield
+  rescue StandardError, LoadError, NotImplementedError => e
+    warn "roundhouse: error[file_statement_not_run]: the file-level condition at #{site} did not run: #{e.class}: #{e.message}; neither branch ran"
+    NOT_RUN
   end
 
   # A carried engine's `Dir[config.root.join(pattern)]`: the emitted files

@@ -257,7 +257,7 @@ impl Diagnostic {
                 construct.as_str()
             ),
             DiagnosticKind::FileStatementUnsupported { construct, detail } => format!(
-                "file-level call `{}` does not run in the emitted app: Ruby runs it when it loads the file, outside every class; the file's classes, modules and constants are carried: {detail}",
+                "file-level statement `{}` does not run in the emitted app: Ruby runs it when it loads the file, and the emitted file program names it there instead; the file's other statements, classes, modules and constants are carried: {detail}",
                 construct.as_str()
             ),
             DiagnosticKind::IngestUnsupported { detail } => format!(
@@ -564,12 +564,14 @@ pub enum DiagnosticKind {
     /// statement's first line. Default severity `Error`: boot behavior
     /// the emitted program silently lacks is not a faithful compile.
     InitializerUnsupported { construct: Symbol, detail: String },
-    /// A call at the top level of a support file, outside every class
-    /// and module, whose classes ingest carried. Ruby runs it when it
-    /// loads the file, and the emitted app does not
-    /// (`analyze::ingest_coverage`). `construct` is the receiver and
-    /// method (`Money::Converters.register`), `detail` the statement's
-    /// first line. Default severity `Error`.
+    /// A file-level statement of a support file, outside every class
+    /// and module, that the file's program does not carry
+    /// (`ProgramItem::NotCarried`). Ruby runs it when it loads the file,
+    /// and the emitted app does not (`analyze::ingest_coverage`).
+    /// `construct` is the receiver and method of a call
+    /// (`Money::Converters.register`) or the statement's first word,
+    /// `detail` why it is not carried and its first line. Default
+    /// severity `Error`.
     FileStatementUnsupported { construct: Symbol, detail: String },
     /// A construct roundhouse cannot ingest, in a support-dir file
     /// (`lib/`, an engine's `lib/`, `app/helpers/`, …) whose library

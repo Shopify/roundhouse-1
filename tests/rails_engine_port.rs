@@ -66,21 +66,30 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
         .write("lib/foo/engine.rb", ENGINE)
         .write("lib/foo/settings.rb", "module Foo\n  class Settings\n    def initialize(size)\n      @size = size\n    end\n\n    def size\n      @size\n    end\n  end\nend\n")
         .write("lib/foo/patches/string_shout.rb", "class String\n  def shout\n    upcase + \"!\"\n  end\nend\n")
+        // A statement-only patch is carried as its file program; a file
+        // with nothing to carry is named where the glob matches it.
         .write("lib/foo/patches/statement_only.rb", "Comparable.instance_method(:clamp)\n")
+        .write("lib/foo/patches/notes.rb", "# frozen_string_literal: true\n")
         .emit(BuildTarget::Ruby);
     let engine = std::fs::read_to_string(dir.join("app/models/foo/engine.rb")).expect("the engine is carried");
     assert!(engine.contains("class Engine < Rails::Engine"), "{engine}");
     assert!(engine.contains("run_body_statement(\"lib/foo/engine.rb:8\") do"), "{engine}");
     assert!(engine.contains("require RoundhouseAutoload.path(\"models/foo/settings\")"), "{engine}");
     assert!(
-        engine.contains("RoundhouseAutoload.carried_files(\"lib/foo/patches/**/*.rb\", [\"models/string\"], [\"lib/foo/patches/statement_only.rb\"])"),
+        engine.contains("RoundhouseAutoload.carried_files(\"lib/foo/patches/**/*.rb\", [\"models/roundhouse_files/lib/foo/patches/statement_only\", \"models/string\"], [\"lib/foo/patches/notes.rb\"])"),
         "{engine}"
     );
     let models = std::fs::read_to_string(dir.join("app/models.rb")).expect("app/models.rb");
     let root = models
         .find("Rails::Engine.source_roots[\"Foo::Engine\"] = File.expand_path(\"../\", RoundhouseAutoload::ROOT)")
         .unwrap_or_else(|| panic!("{models}"));
-    let load = models.find("  \"models/foo/engine\",\n].each { |file| require RoundhouseAutoload.path(file) }").unwrap_or_else(|| panic!("{models}"));
+    // engine.rb's top-level requires make it a file program, which
+    // loads in the engine's place.
+    let load = models
+        .find("  \"models/roundhouse_files/lib/foo/engine\",\n].each { |file| require RoundhouseAutoload.path(file) }")
+        .unwrap_or_else(|| panic!("{models}"));
+    let program = std::fs::read_to_string(dir.join("app/models/roundhouse_files/lib/foo/engine.rb")).expect("engine.rb's program");
+    assert!(program.contains("require \"rails\"\nend\nrequire RoundhouseAutoload.path(\"models/foo/settings\")\nrequire RoundhouseAutoload.path(\"models/foo\")\nrequire RoundhouseAutoload.path(\"models/foo/engine\")\n"), "{program}");
     let boot = models.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{models}"));
     assert!(root < load && load < boot, "{models}");
 
@@ -128,7 +137,7 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
         "{stderr}"
     );
     assert!(
-        stderr.contains("roundhouse: error[engine_glob_file_not_carried]: lib/foo/patches/statement_only.rb matches lib/foo/patches/**/*.rb in the source, but the tree carries no file for it; it was not loaded"),
+        stderr.contains("roundhouse: error[engine_glob_file_not_carried]: lib/foo/patches/notes.rb matches lib/foo/patches/**/*.rb in the source, but the tree carries no file for it; it was not loaded"),
         "{stderr}"
     );
     assert!(stderr.contains("roundhouse: 1 railtie and engine initializer(s), hook(s) and body statement(s) did not run"), "{stderr}");

@@ -199,6 +199,8 @@ fn tiny_blog_round_trips() {
         initializer_constants: Vec::new(),
         railties: Vec::new(),
         file_statement_gaps: Vec::new(),
+        file_programs: Vec::new(),
+        library_class_files: Vec::new(),
         library_class_reopens: Default::default(),
     };
 

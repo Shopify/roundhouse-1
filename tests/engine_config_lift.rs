@@ -176,3 +176,98 @@ fn emitted_ruby_reads_the_engine_config_through_rails_configuration() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED);
 }
+
+/// Core's per-environment configs are empty: `config/test.rb` is
+/// `class Config; class Test < Config; end; end`. With no body there is
+/// no span to tell the file apart from `config.rb`, so `Config::Test`
+/// was spliced into `config.rb`; there `class Test` triggered the
+/// autoload the `inherited` hook had just registered, for a
+/// `config/test.rb` the tree did not have (LoadError at
+/// checkouts_component/config.rb:8 and nine more components in the
+/// release-10 boot survey). The file that declares it says where it was
+/// written.
+const WIDGETS_CONFIG_TEST_EMPTY: &str = r#"module Widgets
+  class Config < ::Kit::Config
+    class Test < Config; end
+  end
+end
+"#;
+
+const REPORT_LIB_EMPTY: &str = r#"module WidgetReport
+  def self.line
+    Rails.configuration.widgets.name_from_env
+  end
+end
+"#;
+
+const EXPECTED_EMPTY: &str = "gadget\nWidgets::Config::Test\n";
+
+fn empty_test_files() -> Vec<(&'static str, &'static str)> {
+    FILES
+        .iter()
+        .map(|&(path, text)| match path {
+            "engines/widgets/lib/widgets/config/test.rb" => (path, WIDGETS_CONFIG_TEST_EMPTY),
+            "app/lib/widget_report.rb" => (path, REPORT_LIB_EMPTY),
+            _ => (path, text),
+        })
+        .collect()
+}
+
+#[test]
+fn an_empty_environment_config_keeps_its_own_file() {
+    let files = empty_test_files();
+    // Native Ruby on the same source is the oracle.
+    let root = std::env::temp_dir().join(format!("roundhouse-engine-config-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for (path, text) in &files {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, text).unwrap();
+    }
+    let native = std::process::Command::new("ruby")
+        .arg("-I")
+        .arg(root.join("gems/kit/lib"))
+        .arg("-I")
+        .arg(root.join("engines/widgets/lib"))
+        .arg("-e")
+        .arg("require \"widgets/config\"\nc = Widgets::Config.for(\"test\").new(ENV.to_hash)\nputs c.name_from_env\nputs c.class.name\n")
+        .env("WIDGET_NAME", "gadget")
+        .output()
+        .expect("native Ruby control");
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), EXPECTED_EMPTY);
+
+    let lock = std::fs::read_to_string(roundhouse::fixtures::real_blog().join("Gemfile.lock")).unwrap();
+    let mut fixture = emit_and_run::real_blog().write("Gemfile.lock", &format!("{PATH_GEMS}{lock}"));
+    for (path, text) in &files {
+        fixture = fixture.write(path, text);
+    }
+    let (emitted, errors) = fixture.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    assert!(
+        emitted.join("app/models/widgets/config/test.rb").is_file(),
+        "the empty Config::Test keeps its own file beside config.rb"
+    );
+    let config = std::fs::read_to_string(emitted.join("app/models/widgets/config.rb")).unwrap();
+    assert!(!config.contains("class Test"), "config.rb does not define Test itself:\n{config}");
+    let main = emitted.join("main").display().to_string();
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!(
+            "require {main:?}\nMain.configure_default_adapter!\nputs WidgetReport.line\nputs Rails.configuration.widgets.class.name\n"
+        ))
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .env("RAILS_ENV", "test")
+        .env("WIDGET_NAME", "gadget")
+        .output()
+        .expect("spawn ruby");
+    assert!(
+        output.status.success(),
+        "emitted program failed in {}:\n{}",
+        emitted.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), EXPECTED_EMPTY);
+}
