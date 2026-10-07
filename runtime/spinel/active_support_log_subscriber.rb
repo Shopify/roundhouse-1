@@ -1,8 +1,73 @@
 # Ruby-family subscriber dispatch over our notification runtime. No native
-# ActiveSupport is loaded by the emitted application.
+# ActiveSupport is loaded by the emitted application. Ported from the
+# ActiveSupport native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha):
+# subscriber.rb, log_subscriber.rb, colorize_logging.rb.
 require_relative "active_support_notifications"
 
 module ActiveSupport
+  # `ActiveSupport.colorize_logging` (default true), which Rails 8.2's
+  # `config.colorize_logging=` writes; LogSubscriber reads it.
+  @colorize_logging = true unless instance_variable_defined?(:@colorize_logging)
+
+  class << self
+    attr_accessor :colorize_logging
+  end
+
+  # Rails 8.2's ColorizeLogging, which LogSubscriber includes: the level
+  # helpers and `color` are public.
+  module ColorizeLogging
+    MODES = { clear: 0, bold: 1, italic: 3, underline: 4 }.freeze
+
+    BLACK   = "\e[30m"
+    RED     = "\e[31m"
+    GREEN   = "\e[32m"
+    YELLOW  = "\e[33m"
+    BLUE    = "\e[34m"
+    MAGENTA = "\e[35m"
+    CYAN    = "\e[36m"
+    WHITE   = "\e[37m"
+
+    def info(progname = nil, &block)
+      logger.info(progname, &block) if logger
+    end
+
+    def debug(progname = nil, &block)
+      logger.debug(progname, &block) if logger
+    end
+
+    def warn(progname = nil, &block)
+      logger.warn(progname, &block) if logger
+    end
+
+    def error(progname = nil, &block)
+      logger.error(progname, &block) if logger
+    end
+
+    def fatal(progname = nil, &block)
+      logger.fatal(progname, &block) if logger
+    end
+
+    def unknown(progname = nil, &block)
+      logger.unknown(progname, &block) if logger
+    end
+
+    def color(text, color, mode_options = {})
+      return text unless colorize_logging
+      color = self.class.const_get(color.upcase) if color.is_a?(Symbol)
+      mode = mode_from(mode_options)
+      clear = "\e[#{MODES[:clear]}m"
+      "#{mode}#{color}#{text}#{clear}"
+    end
+
+    def mode_from(options)
+      modes = MODES.values_at(*options.reject { |_, value| value.nil? || value == false || (value.respond_to?(:empty?) && value.empty?) }.keys)
+      "\e[#{modes.join(";")}m" if modes.any?
+    end
+
+    def colorize_logging
+      ActiveSupport.colorize_logging
+    end
+  end
   class Subscriber
     SUBSCRIBERS = []
 
@@ -63,34 +128,26 @@ module ActiveSupport
   end
 
   class LogSubscriber < Subscriber
+    include ColorizeLogging
+
     LEVEL_CHECKS = [:debug, :info, :error].freeze
 
-    # `mattr_accessor :colorize_logging, default: true`: one value shared by
-    # every subclass and instance.
-    @@colorize_logging = true
-
-    def self.colorize_logging
-      @@colorize_logging
-    end
-
-    def self.colorize_logging=(value)
-      @@colorize_logging = value
-    end
-
-    def colorize_logging
-      @@colorize_logging
-    end
-
-    def colorize_logging=(value)
-      @@colorize_logging = value
-    end
-
     class << self
-      attr_writer :logger
-
+      # Rails 8.2: a plain reader, set by railties' `active_support.
+      # set_log_subscriber_logger` initializer (`LogSubscriber.logger =
+      # Rails.logger`, after initialize_logger). The emitted boot runs no
+      # railtie initializers, so the first read stands in for that one:
+      # it takes Rails.logger unless a logger was assigned (nil included).
       def logger
-        @logger ||= Rails.logger if defined?(Rails) && Rails.respond_to?(:logger)
+        unless instance_variable_defined?(:@logger)
+          self.logger = Rails.logger if defined?(Rails) && Rails.respond_to?(:logger)
+        end
         @logger
+      end
+
+      def logger=(logger)
+        @logger = logger
+        @supports_flush = logger.respond_to?(:flush)
       end
 
       def log_levels
@@ -108,14 +165,14 @@ module ActiveSupport
       end
 
       def flush_all!
-        logger.flush if logger.respond_to?(:flush)
+        logger.flush if @supports_flush
       end
 
       private
 
       def subscribe_log_level(event, level)
         raise KeyError, "unsupported log level: #{level}" unless LEVEL_CHECKS.include?(level)
-        @log_levels = log_levels.merge(event => level)
+        @log_levels = log_levels.merge(event => level).freeze
         set_event_levels
       end
 
@@ -152,32 +209,6 @@ module ActiveSupport
       end
       ActiveSupport.error_reporter.report(error, source: event.name)
       logger.error("Could not log #{event.name.inspect} event. #{error.class}: #{error.message} #{error.backtrace}") if logger
-    end
-
-    private
-
-    def debug(message = nil, &block)
-      logger.debug(message, &block) if logger
-    end
-
-    def info(message = nil, &block)
-      logger.info(message, &block) if logger
-    end
-
-    def warn(message = nil, &block)
-      logger.warn(message, &block) if logger
-    end
-
-    def error(message = nil, &block)
-      logger.error(message, &block) if logger
-    end
-
-    def fatal(message = nil, &block)
-      logger.fatal(message, &block) if logger
-    end
-
-    def unknown(message = nil, &block)
-      logger.unknown(message, &block) if logger
     end
   end
 end

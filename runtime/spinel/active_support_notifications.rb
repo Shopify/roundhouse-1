@@ -1,5 +1,9 @@
 # Ruby-family notification boundary. Events are delivered synchronously around
 # real operations; no Rails runtime or post-hoc query-log replay is involved.
+# Delivery order and the subscribe API follow the ActiveSupport native Core
+# runs (Shopify/rails 5813559f4aed, 8.2.0.alpha, notifications/fanout.rb):
+# a name's String subscribers first, in subscription order (`prepend: true`
+# puts one first), then the Regexp and catch-all ones.
 require "securerandom"
 
 module ActiveSupport
@@ -30,21 +34,22 @@ module ActiveSupport
         @mutex = Mutex.new
       end
 
-      def subscribe(pattern = nil, callback = nil, &block)
-        add_subscription(pattern, callback || block, false)
+      def subscribe(pattern = nil, callback = nil, prepend: false, &block)
+        add_subscription(pattern, callback || block, false, prepend: prepend)
       end
 
-      def monotonic_subscribe(pattern = nil, callback = nil, &block)
-        add_subscription(pattern, callback || block, true)
+      def monotonic_subscribe(pattern = nil, callback = nil, prepend: false, &block)
+        add_subscription(pattern, callback || block, true, prepend: prepend)
       end
 
-      def add_subscription(pattern, callback, monotonic)
+      def add_subscription(pattern, callback, monotonic, prepend: false)
         unless pattern.nil? || pattern.is_a?(String) || pattern.is_a?(Regexp)
           raise ArgumentError, "notification pattern must be a String, Regexp or nil"
         end
+        raise ArgumentError, "Cannot prepend Regex subscribers" if prepend && !pattern.is_a?(String)
         raise ArgumentError, "notification subscriber must be callable" unless callback.respond_to?(:call)
         subscription = Subscription.new(pattern, callback, monotonic, [])
-        @mutex.synchronize { @subscriptions << subscription }
+        @mutex.synchronize { prepend ? @subscriptions.unshift(subscription) : @subscriptions << subscription }
         subscription
       end
 
@@ -106,6 +111,7 @@ module ActiveSupport
 
       def listeners_for(name)
         entries = @mutex.synchronize { @subscriptions.select { |entry| entry.matches?(name) } }
+        entries = entries.partition { |entry| entry.pattern.is_a?(String) }.flatten(1)
         entries.reject { |entry| entry.callback.respond_to?(:silenced?) && entry.callback.silenced?(name) }
       end
 
@@ -146,12 +152,12 @@ module ActiveSupport
         registry[notifier] ||= Instrumenter.new(notifier)
       end
 
-      def subscribe(pattern = nil, callback = nil, &block)
-        notifier.subscribe(pattern, callback, &block)
+      def subscribe(pattern = nil, callback = nil, prepend: false, &block)
+        notifier.subscribe(pattern, callback, prepend: prepend, &block)
       end
 
-      def monotonic_subscribe(pattern = nil, callback = nil, &block)
-        notifier.monotonic_subscribe(pattern, callback, &block)
+      def monotonic_subscribe(pattern = nil, callback = nil, prepend: false, &block)
+        notifier.monotonic_subscribe(pattern, callback, prepend: prepend, &block)
       end
 
       def unsubscribe(subscriber)

@@ -15,7 +15,9 @@ if ARGV.first == "compare"
 end
 
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  # The ActiveSupport native Core runs (RH_RAILS_ORACLE overrides it).
+  require_relative "support/rails_oracle"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/notifications"
 else
@@ -74,6 +76,25 @@ Thread.new { notifications.instrument("thread.contract") }.join
 notifications.unsubscribe(listener)
 observed[:thread_identity] = ids.uniq.length == 2
 
+# Delivery order: the name's String subscribers (a prepended one first),
+# then Regexp and catch-all ones, whatever the subscription order.
+order = []
+subscriptions = [
+  notifications.subscribe(/order\.contract/) { order << :regexp },
+  notifications.subscribe("order.contract") { order << :first },
+  notifications.subscribe("order.contract") { order << :second },
+  notifications.subscribe("order.contract", prepend: true) { order << :prepended },
+]
+notifications.instrument("order.contract")
+subscriptions.each { |subscription| notifications.unsubscribe(subscription) }
+prepend_regexp = begin
+  notifications.subscribe(/order/, prepend: true) { nil }
+  :subscribed
+rescue ArgumentError => error
+  error.message
+end
+observed[:order] = [order, prepend_regexp]
+
 expected = {
   synchronous: [:result, [["contract", true, true, true, 1]]],
   event: ["contract", 2, true, true, true],
@@ -81,7 +102,8 @@ expected = {
   exception: [true, true, ["RuntimeError", "expected failure"]],
   scoped_cleanup: true,
   pattern_unsubscribe: ["contract.one", "contract.two"],
-  thread_identity: true
+  thread_identity: true,
+  order: [[:prepended, :first, :second, :regexp], "Cannot prepend Regex subscribers"]
 }
 abort "unexpected contract: #{observed.inspect}" unless observed == expected
 puts JSON.generate(observed)
