@@ -130,3 +130,23 @@ fn a_class_whose_base_is_modelled_still_drops_its_body() {
     assert!(!emitted.contains("default_thing"), "got:\n{emitted}");
     assert!(emitted.contains("def go"), "got:\n{emitted}");
 }
+
+#[test]
+fn a_singleton_include_extends_the_class() {
+    // `class << self; include Greeter; end` puts Greeter's methods on
+    // the class, as `extend Greeter` does. It was recorded as an
+    // instance include, so `Widget.greet` was a NoMethodError and
+    // `Widget.new.greet` answered.
+    let emitted = emitted(
+        &[
+            ("app/services/greeter.rb", "module Greeter\n  def greet\n    \"hi\"\n  end\nend\n"),
+            (
+                "app/services/widget.rb",
+                "class Widget\n  class << self\n    include Greeter\n  end\n\n  def go\n    2\n  end\nend\n",
+            ),
+        ],
+        "widget.rb",
+    );
+    assert!(emitted.contains("extend Greeter"), "got:\n{emitted}");
+    assert!(!emitted.contains("include Greeter"), "got:\n{emitted}");
+}

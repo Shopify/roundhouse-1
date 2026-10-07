@@ -7656,16 +7656,90 @@ fn runtime_reopen_anchor(name: &str) -> Option<&'static str> {
 ///
 /// A reopen of a loaded gem's class or module (`reopens_loaded_gem_class`)
 /// replays for the same reason: the receiver is the gem's own class.
+///
+/// The base is found through the app's own classes: a superclass the
+/// app compiles (a gem source's, carried as app code) is not the end of
+/// the chain. Core's `GraphApi::ObjectType < GraphQL::Shopify::Types::BaseObject`
+/// (graphql-shopify, a gem source) `< GraphQL::Schema::Object` (the
+/// graphql gem, loaded natively): every `field` / `description` /
+/// `argument` in a Core type's body is graphql's DSL on graphql's class,
+/// and dropping it loads the type with no fields. A module replays by
+/// the same rule when it includes, directly or through app modules, a
+/// module of a natively loaded gem (`GraphApi::InterfaceType` includes
+/// graphql-shopify's `BaseInterface`, which includes
+/// `GraphQL::Schema::Interface`), unless it is a concern (its hooks are
+/// spliced into each includer).
 fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
     if InlineDeclaration::active() || reopens_loaded_gem_class(lc, app) {
         return true;
     }
     if lc.is_module {
+        return !is_concern_body(lc) && includes_loaded_gem_module(lc, app, &mut Vec::new());
+    }
+    let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
+    let mut parent = lc.parent.as_ref();
+    while let Some(p) = parent {
+        if require_path_for_parent(p, app).is_none() {
+            return !is_core_class_name(p.0.as_str());
+        }
+        // An app class (a gem source's included): its own superclass
+        // decides. A model, a controller or a runtime base ends here.
+        if is_model_named(p.0.as_str(), app) || seen.contains(&p.0.as_str()) {
+            return false;
+        }
+        seen.push(p.0.as_str());
+        parent = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.as_ref());
+    }
+    false
+}
+
+/// Whether a module body uses ActiveSupport::Concern's hooks, which
+/// `splice_concerns_into_models` applies to each includer.
+fn is_concern_body(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| match &*call.node {
+        ExprNode::Send { recv: None, method, args, .. } => match method.as_str() {
+            "included" | "class_methods" | "prepended" => true,
+            "extend" => args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+/// Whether `lc` includes a module of a gem the tree loads natively,
+/// directly or through the app's own modules. An include written
+/// relative to the module's namespace resolves lexically, innermost
+/// first.
+fn includes_loaded_gem_module<'a>(lc: &'a LibraryClass, app: &'a App, seen: &mut Vec<&'a str>) -> bool {
+    if seen.contains(&lc.name.0.as_str()) {
         return false;
     }
-    lc.parent.as_ref().is_some_and(|p| {
-        require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
-    })
+    seen.push(lc.name.0.as_str());
+    let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    for inc in &lc.includes {
+        let written = inc.0.as_str().trim_start_matches("::");
+        let candidates: Vec<String> = if inc.0.as_str().starts_with("::") {
+            vec![written.to_string()]
+        } else {
+            (0..=scope.len()).rev().map(|n| if n == 0 { written.to_string() } else { format!("{}::{written}", scope[..n].join("::")) }).collect()
+        };
+        for name in &candidates {
+            let own: Vec<&LibraryClass> = library_classes_named(name, app).into_iter().filter(|c| c.is_module).collect();
+            if !own.is_empty() {
+                if own.iter().any(|m| includes_loaded_gem_module(m, app, seen)) {
+                    return true;
+                }
+                break;
+            }
+            let id = ClassId(Symbol::from(name.as_str()));
+            let gem_module = app.gem_boundary.loaded_reopen(&id).is_some_and(|g| g.is_module)
+                || app.gem_boundary.loaded_source_reopen(&id).is_some_and(|(_, kind)| kind.is_module);
+            if gem_module {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The class-body calls of a plain class (no superclass, or a core one)

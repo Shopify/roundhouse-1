@@ -3055,6 +3055,26 @@ fn walk_decl_body_with_visibility<'pr>(
                 }
                 match kw {
                     "include" => {
+                        // `class << self; include M; end` is `extend M`:
+                        // M's methods are the class's own, not its
+                        // instances'. Kept as that `extend` (an unknown
+                        // call, replayed where the body replays and
+                        // reported where it is not), never as an
+                        // instance include. The route-helper marker
+                        // below is the one singleton include modeled.
+                        if force_class_receiver
+                            && call.arguments().is_some_and(|args| {
+                                args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                            })
+                        {
+                            if let Ok(mut e) = ingest_expr(&stmt, file) {
+                                if let ExprNode::Send { method, .. } = &mut *e.node {
+                                    *method = Symbol::from("extend");
+                                }
+                                out.unknown_calls.push(e);
+                            }
+                            continue;
+                        }
                         if let Some(args) = call.arguments() {
                             // `include Resolvers.for(:product)`: a module
                             // computed at load time. Dropping it emitted
