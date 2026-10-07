@@ -6371,8 +6371,53 @@ fn emit_library_class_decl_inner(
     // reaches Object#initialize and raises. Those (and any constant
     // reading them) emit after the methods, which is where the source
     // had them. `emit_deferred_constants` renders that tail.
+    // Class-body calls the ingest didn't model (`LibraryClass::
+    // unknown_calls`), replayed verbatim when — and only when — the
+    // class extends a base we don't model at all, or reopens a loaded
+    // gem's class. See `replays_foreign_class_body`.
+    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app) {
+        lc.unknown_calls.iter().collect()
+    } else {
+        for call in &lc.unknown_calls {
+            report_dropped_class_body_call(lc, call);
+        }
+        Vec::new()
+    };
+    // A replayed call the source has above an eager constant runs
+    // before it, as the class body does: Core's liquid_ext.rb
+    // `remove_const :SYNTAX` and then assigns the new `SYNTAX`, which
+    // written the other way round would remove the new one. Only by
+    // real spans in one file; the rest follow the constants, as before.
+    let mut calls_before: crate::det::HashMap<usize, Vec<&Expr>> = crate::det::HashMap::default();
+    let mut leading: crate::det::HashSet<crate::span::Span> = crate::det::HashSet::default();
+    for call in &replayed {
+        let at = eager
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let value = &lc.constants[i].1;
+                value.span != crate::span::Span::synthetic()
+                    && call.span != crate::span::Span::synthetic()
+                    && value.span.file == call.span.file
+                    && call.span.start < value.span.start
+            })
+            .min_by_key(|&i| lc.constants[i].1.span.start);
+        if let Some(i) = at {
+            calls_before.entry(i).or_default().push(*call);
+            leading.insert(call.span);
+        }
+    }
     let render_constants = |s: &mut String, which: &[usize]| {
         for &i in which {
+            for call in calls_before.get(&i).into_iter().flatten() {
+                for line in super::emit_expr(call).lines() {
+                    if line.is_empty() {
+                        writeln!(s).unwrap();
+                    } else {
+                        writeln!(s, "{body_pad}{line}").unwrap();
+                    }
+                }
+            }
             let (cname, value) = &lc.constants[i];
             let rendered = super::emit_expr(value);
             let mut lines = rendered.lines();
@@ -6416,11 +6461,9 @@ fn emit_library_class_decl_inner(
         writeln!(s).unwrap();
     }
 
-    // Class-body calls the ingest didn't model (`LibraryClass::
-    // unknown_calls`), replayed verbatim when — and only when — the
-    // class extends a base we don't model at all. See
-    // `replays_foreign_class_body`. After the constants (a captured
-    // call may reference one) and before the methods.
+    // The replayed calls not written above a constant: after the
+    // constants (a captured call may reference one) and before the
+    // methods.
     //
     // Finite class-side initialization (`class_ivar_initializers`) is
     // lowered IR, not replay of a framework DSL. Each assignment runs
@@ -6428,14 +6471,7 @@ fn emit_library_class_decl_inner(
     // their ivar absent. A replayed call and a body ivar write keep
     // their source order (`@registry = {}` then `register :x`), so the
     // two interleave by source position when every one has a real span.
-    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app) {
-        lc.unknown_calls.iter().collect()
-    } else {
-        for call in &lc.unknown_calls {
-            report_dropped_class_body_call(lc, call);
-        }
-        Vec::new()
-    };
+    let replayed: Vec<&Expr> = replayed.into_iter().filter(|call| !leading.contains(&call.span)).collect();
     let mut body_effects: Vec<&Expr> = replayed.iter().copied().chain(lc.class_ivar_initializers.iter()).collect();
     let real_span = |e: &&Expr| e.span != crate::span::Span::synthetic();
     if !replayed.is_empty()
@@ -7096,13 +7132,44 @@ fn runtime_reopen_anchor(name: &str) -> Option<&'static str> {
 ///
 /// A dropped call is no longer silent either way — see
 /// `report_dropped_class_body_call`.
+///
+/// A reopen of a loaded gem's class or module (`reopens_loaded_gem_class`)
+/// replays for the same reason: the receiver is the gem's own class.
 fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
+    if reopens_loaded_gem_class(lc, app) {
+        return true;
+    }
     if lc.is_module {
         return false;
     }
     lc.parent.as_ref().is_some_and(|p| {
         require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
     })
+}
+
+/// Whether `lc` is an app declaration of a class or module that a gem
+/// the tree loads defines (`GemBoundary::loaded_reopen`), naming no other
+/// superclass: a reopen. Ruby runs its body on the gem's class object
+/// once the gem is loaded, which the CRuby tree does at boot before any
+/// app file (`runtime/gem_facades.rb`), and the autoloader requires the
+/// reopen's file as soon as it registers the already defined constant.
+/// Core's essentials liquid_ext.rb `prepend`s a patch onto and
+/// `remove_const`s from the liquid gem's `Liquid::Render` this way. Not
+/// a framework class the runtime models (`runtime_reopen_anchor`).
+fn reopens_loaded_gem_class(lc: &LibraryClass, app: &App) -> bool {
+    if lc.origin.is_some() || runtime_reopen_anchor(lc.name.0.as_str()).is_some() {
+        return false;
+    }
+    let Some(gem) = app.gem_boundary.loaded_reopen(&lc.name) else { return false };
+    if gem.is_module != lc.is_module {
+        return false;
+    }
+    let written = |id: &crate::ident::ClassId| id.0.as_str().trim_start_matches("::").to_string();
+    match (&lc.parent, &gem.parent) {
+        (None, _) => true,
+        (Some(own), Some(gems)) => written(own) == written(gems),
+        (Some(_), None) => false,
+    }
 }
 
 /// Ledger a class-body call we captured but chose not to replay. The

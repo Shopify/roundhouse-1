@@ -27,32 +27,7 @@ use crate::ty::Ty;
 
 use super::super::body::ClassInfo;
 
-/// Ruby's own top-level names. An RBI that mentions them is patching or
-/// extending the language, not declaring a gem class.
-pub(in crate::analyze) const RUBY_CORE: &[&str] = &[
-    "BasicObject", "Object", "Module", "Class", "Kernel", "Comparable", "Enumerable", "Enumerator",
-    "Numeric", "Integer", "Float", "Rational", "Complex", "String", "Symbol", "Array", "Hash",
-    "Range", "Regexp", "MatchData", "Struct", "Proc", "Method", "UnboundMethod", "Time", "Date",
-    "DateTime", "IO", "File", "Dir", "Exception", "StandardError", "RuntimeError", "NilClass",
-    "TrueClass", "FalseClass", "Set", "Random", "Process", "Signal", "Math", "Marshal", "GC",
-    "ObjectSpace", "Thread", "Mutex", "Fiber", "Ractor", "Data", "Encoding", "Binding",
-    "BigDecimal", "Pathname", "StringIO", "URI", "JSON", "Logger", "Singleton", "Forwardable",
-];
-
-/// Ruby's standard-library namespaces that a gem's RBI reopens (json-jwt
-/// patches `OpenSSL::PKey::RSA`). The name is the stdlib's, not the
-/// gem's, and loading the gem would not make the stdlib part load, so
-/// none of them are registered: such a constant is unknown, like every
-/// other stdlib constant the analysis does not model. `DRb` and `Prism`
-/// are not here: they are the bundled drb and default prism gems, which
-/// the CRuby tree loads, so their own RBIs declare them
-/// (`project.rs::RUNTIME_GEMS`).
-pub(in crate::analyze) const RUBY_STDLIB: &[&str] = &[
-    "OpenSSL", "Net", "Digest", "Socket", "Zlib", "Psych", "YAML", "ERB", "CGI", "Base64",
-    "SecureRandom", "Open3", "Timeout", "Tempfile", "FileUtils", "Benchmark", "Coverage",
-    "Etc", "Find", "Shellwords", "OptionParser", "IPAddr", "Resolv", "PP", "Ripper", "Monitor",
-    "WeakRef", "Gem", "Bundler", "Errno",
-];
+pub(in crate::analyze) use crate::gem_boundary::{RUBY_CORE, RUBY_STDLIB};
 
 /// Mixins that add no callable surface a caller could miss: sorbet's
 /// own `extend T::Sig`, and the ActiveSupport::Concern marker.
@@ -191,6 +166,76 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
         }
     }
 
+    // An app declaration of a class or module a loaded gem defines is a
+    // REOPEN: Ruby runs its body on the gem's own class object (Core's
+    // essentials liquid_ext.rb reopens `Liquid::Render` to prepend a
+    // patch and rebuild `SYNTAX` from the gem's `Liquid::Render::FOR`).
+    // So the app's source is that body, not the whole class: the gem's
+    // constants, methods, superclass and mixins are the class's too,
+    // wherever the app's declaration does not speak, and the class is
+    // the gem's, so a tree that does not load the gem refuses it. A
+    // declaration that names another superclass is not a reopen (Ruby
+    // raises a superclass mismatch) and stays the app's alone.
+    struct GemReopen {
+        id: ClassId,
+        gem: String,
+        parent: Option<ClassId>,
+        includes: Vec<ClassId>,
+        instance_methods: Vec<(Symbol, Ty)>,
+        class_methods: Vec<(Symbol, Ty)>,
+        constants: Vec<Symbol>,
+        open: bool,
+    }
+    let mut gem_reopens: Vec<GemReopen> = Vec::new();
+    let app_names: HashSet<&ClassId> = app
+        .models
+        .iter()
+        .map(|m| &m.name)
+        .chain(app.controllers.iter().map(|c| &c.name))
+        .chain(app.library_classes.iter().map(|lc| &lc.name))
+        .collect();
+    // A namespace the catalog nests a class in exists without the gem
+    // (`framework_namespaces` above also counts the app's own nesting,
+    // which is no evidence: Core nests `Liquid::Render`'s patch modules
+    // in the gem's `Liquid`).
+    let catalog_namespace = |scope: &str| {
+        let inside = format!("{scope}::");
+        classes.iter().any(|(id, info)| !info.gem_boundary && !app_names.contains(id) && id.0.as_str().starts_with(&inside))
+    };
+    for lc in &app.library_classes {
+        if lc.origin.is_some() || gem_reopens.iter().any(|r| r.id == lc.name) {
+            continue;
+        }
+        let Some(gem) = app.gem_boundary.loaded_reopen(&lc.name).filter(|gem| gem.is_module == lc.is_module) else { continue };
+        let scope = lc.name.0.as_str();
+        if !classes.contains_key(&lc.name) || catalog_namespace(scope) {
+            continue;
+        }
+        let parent = gem.parent.as_ref().map(|p| resolve(p, scope).unwrap_or_else(|| p.clone()));
+        if lc.parent.is_some() && lc.parent != parent {
+            continue;
+        }
+        let mut open = gem.dynamic;
+        let mut includes = Vec::new();
+        for include in &gem.includes {
+            match resolve(include, scope) {
+                Some(found) => includes.push(found),
+                None if is_marker(include.0.as_str()) => {}
+                None => open = true,
+            }
+        }
+        gem_reopens.push(GemReopen {
+            id: lc.name.clone(),
+            gem: gem.gem.clone(),
+            parent,
+            includes,
+            instance_methods: gem.instance_methods.iter().map(|(n, ty)| (n.clone(), prune(ty, scope))).collect(),
+            class_methods: gem.class_methods.iter().map(|(n, ty)| (n.clone(), prune(ty, scope))).collect(),
+            constants: gem.constants.clone(),
+            open,
+        });
+    }
+
     for (id, mut info) in built {
         info.open = open.contains(&id);
         classes.insert(id, info);
@@ -235,6 +280,31 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
                 info.class_methods.entry(name).or_insert(ty);
             }
         }
+    }
+
+    for reopen in gem_reopens {
+        let Some(info) = classes.get_mut(&reopen.id) else { continue };
+        let is_open = reopen.open || info.includes.iter().chain(&reopen.includes).any(|m| open.contains(m));
+        for (name, ty) in reopen.instance_methods {
+            info.instance_methods.entry(name).or_insert(ty);
+        }
+        for (name, ty) in reopen.class_methods {
+            info.class_methods.entry(name).or_insert(ty);
+        }
+        for name in reopen.constants {
+            info.constants.entry(name).or_insert(Ty::Untyped);
+        }
+        if info.parent.is_none() {
+            info.parent = reopen.parent;
+        }
+        for include in reopen.includes {
+            if !info.includes.contains(&include) {
+                info.includes.push(include);
+            }
+        }
+        info.open |= is_open;
+        info.gem = Some(reopen.gem);
+        info.gem_loaded = true;
     }
 }
 

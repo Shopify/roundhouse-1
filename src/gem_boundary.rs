@@ -21,6 +21,33 @@ use serde::{Deserialize, Serialize};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
+/// Ruby's own top-level names. An RBI that mentions them is patching or
+/// extending the language, not declaring a gem class.
+pub const RUBY_CORE: &[&str] = &[
+    "BasicObject", "Object", "Module", "Class", "Kernel", "Comparable", "Enumerable", "Enumerator",
+    "Numeric", "Integer", "Float", "Rational", "Complex", "String", "Symbol", "Array", "Hash",
+    "Range", "Regexp", "MatchData", "Struct", "Proc", "Method", "UnboundMethod", "Time", "Date",
+    "DateTime", "IO", "File", "Dir", "Exception", "StandardError", "RuntimeError", "NilClass",
+    "TrueClass", "FalseClass", "Set", "Random", "Process", "Signal", "Math", "Marshal", "GC",
+    "ObjectSpace", "Thread", "Mutex", "Fiber", "Ractor", "Data", "Encoding", "Binding",
+    "BigDecimal", "Pathname", "StringIO", "URI", "JSON", "Logger", "Singleton", "Forwardable",
+];
+
+/// Ruby's standard-library namespaces that a gem's RBI reopens (json-jwt
+/// patches `OpenSSL::PKey::RSA`). The name is the stdlib's, not the
+/// gem's, and loading the gem would not make the stdlib part load, so
+/// none of them are registered: such a constant is unknown, like every
+/// other stdlib constant the analysis does not model. `DRb` and `Prism`
+/// are not here: they are the bundled drb and default prism gems, which
+/// the CRuby tree loads, so their own RBIs declare them
+/// (`project.rs::RUNTIME_GEMS`).
+pub const RUBY_STDLIB: &[&str] = &[
+    "OpenSSL", "Net", "Digest", "Socket", "Zlib", "Psych", "YAML", "ERB", "CGI", "Base64",
+    "SecureRandom", "Open3", "Timeout", "Tempfile", "FileUtils", "Benchmark", "Coverage",
+    "Etc", "Find", "Shellwords", "OptionParser", "IPAddr", "Resolv", "PP", "Ripper", "Monitor",
+    "WeakRef", "Gem", "Bundler", "Errno",
+];
+
 /// Every gem class or module an RBI declares, by qualified name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GemBoundary {
@@ -73,6 +100,20 @@ impl GemBoundary {
     /// app's lock routes to Bundler.require.
     pub fn loads(&self, gem: &str) -> bool {
         crate::project::ruby_tree_loads_gem(gem) || self.loaded.contains(gem)
+    }
+
+    /// The gem class or module an app declaration of `name` reopens: a
+    /// name the RBI of a gem some emitted tree loads declares, outside
+    /// Ruby's core and standard library (an RBI that patches `String`
+    /// does not make `String` the gem's). Ruby runs such a declaration's
+    /// body on the gem's own class object, after the gem has loaded.
+    pub fn loaded_reopen(&self, name: &ClassId) -> Option<&GemClass> {
+        let text = name.0.as_str();
+        let top = text.split("::").next().unwrap_or(text);
+        if RUBY_CORE.contains(&top) || RUBY_STDLIB.contains(&top) {
+            return None;
+        }
+        self.classes.get(name).filter(|class| self.loads(&class.gem))
     }
 
     /// The gem whose RBI declares the constant `path`: the class or

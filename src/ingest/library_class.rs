@@ -2570,6 +2570,16 @@ fn walk_decl_body_with_visibility<'pr>(
                 if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
+            } else if super::util::is_constant_receiver_call(&call) {
+                // `::Liquid::Include.prepend(LiquidIncludeExt)` in Core's
+                // essentials liquid_ext.rb `module Liquid`: a call on
+                // another class that the body runs as it loads. It was
+                // dropped with no diagnostic. Captured like any class-body
+                // call: replayed where the body is replayed, reported as
+                // dropped everywhere else.
+                if let Ok(e) = ingest_expr(&stmt, file) {
+                    out.unknown_calls.push(e);
+                }
             }
         }
         // Nested class/module declarations also fall through here; they
