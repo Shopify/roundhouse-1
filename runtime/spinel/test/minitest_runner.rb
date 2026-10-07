@@ -94,6 +94,12 @@ module RoundhouseTestRunner
       capture(errors, "setup") do
         yield if block_given?
         test.__roundhouse_setup_fixtures
+        # ActiveRecord::TestFixtures#setup_fixtures' transactions, where
+        # the tree carries them (the PostgreSQL tree's
+        # runtime/active_record_test_fixtures.rb).
+        if test.respond_to?(:__roundhouse_setup_transactional_fixtures)
+          test.__roundhouse_setup_transactional_fixtures(name)
+        end
         test.__roundhouse_before_setup
         test.setup
       end
@@ -102,6 +108,10 @@ module RoundhouseTestRunner
       # Minitest's after_teardown hook, where something defines it
       # (ActiveSupport's TimeHelpers travels back there).
       capture(errors, "teardown") { test.after_teardown } if test.respond_to?(:after_teardown)
+      # TestFixtures#after_teardown's teardown_fixtures, last.
+      if test.respond_to?(:__roundhouse_teardown_fixtures)
+        capture(errors, "teardown") { test.__roundhouse_teardown_fixtures(name) }
+      end
     end
     # Keep all phase failures. Error wins over failure/skip; a teardown error
     # cannot turn into a pass or disappear behind an earlier skip.

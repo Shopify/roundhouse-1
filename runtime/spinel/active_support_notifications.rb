@@ -80,11 +80,8 @@ module ActiveSupport
         listeners = listeners_for(name)
         return block_given? ? yield(payload) : nil if listeners.empty?
 
-        identities = Thread.current.thread_variable_get(:roundhouse_notification_ids) ||
-          Thread.current.thread_variable_set(:roundhouse_notification_ids, {})
-        id = identities[self] ||= SecureRandom.hex(10)
-        started = Time.now
-        monotonic_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        handle = Handle.new(self, name, payload, listeners)
+        handle.start
         begin
           block_given? ? yield(payload) : nil
         rescue Exception => error
@@ -92,24 +89,77 @@ module ActiveSupport
           payload[:exception_object] = error
           raise
         ensure
+          handle.finish
+        end
+      end
+
+      # Fanout#build_handle: an event started and finished by its caller
+      # (Active Record's transaction.active_record, which spans calls).
+      # Its listeners are the ones subscribed when it is built.
+      def build_handle(name, payload)
+        Handle.new(self, name, payload, listeners_for(name))
+      end
+
+      def notification_id # :nodoc:
+        identities = Thread.current.thread_variable_get(:roundhouse_notification_ids) ||
+          Thread.current.thread_variable_set(:roundhouse_notification_ids, {})
+        identities[self] ||= SecureRandom.hex(10)
+      end
+
+      # Fanout::Handle: listeners receive the finished event (the runtime
+      # has no start-event subscribers), with Rails' callback arities.
+      class Handle
+        def initialize(notifier, name, payload, listeners)
+          @notifier = notifier
+          @name = name
+          @payload = payload
+          @listeners = listeners
+          @state = :initialized
+        end
+
+        def start
+          ensure_state!(:initialized)
+          @state = :started
+          return if @listeners.empty?
+          @id = @notifier.notification_id
+          @started = Time.now
+          @monotonic_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
+
+        def finish
+          finish_with_values(@name, @id, @payload)
+        end
+
+        def finish_with_values(name, id, payload) # :nodoc:
+          ensure_state!(:started)
+          @state = :finished
+          return if @listeners.empty?
           finished = Time.now
           monotonic_finish = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          duration = (monotonic_finish - monotonic_start) * 1000.0
-          event = Event.new(name, monotonic_start, monotonic_finish, id, payload, duration)
-          listeners.each do |entry|
+          duration = (monotonic_finish - @monotonic_start) * 1000.0
+          event = Event.new(name, @monotonic_start, monotonic_finish, id, payload, duration)
+          @listeners.each do |entry|
             callback = entry.callback
             procish = callback.respond_to?(:parameters) ? callback : callback.method(:call)
             if procish.arity == 1 && procish.parameters.length == 1
               callback.call(event)
             else
-              start_time, end_time = entry.monotonic ? [monotonic_start, monotonic_finish] : [started, finished]
+              start_time, end_time = entry.monotonic ? [@monotonic_start, monotonic_finish] : [@started, finished]
               callback.call(name, start_time, end_time, id, payload)
             end
           end
         end
+
+        private
+          def ensure_state!(expected)
+            if @state != expected
+              raise ArgumentError, "expected state to be #{expected.inspect} but was #{@state.inspect}"
+            end
+          end
       end
 
       def listeners_for(name)
+(name)
         entries = @mutex.synchronize { @subscriptions.select { |entry| entry.matches?(name) } }
         entries = entries.partition { |entry| entry.pattern.is_a?(String) }.flatten(1)
         entries.reject { |entry| entry.callback.respond_to?(:silenced?) && entry.callback.silenced?(name) }
@@ -138,6 +188,10 @@ module ActiveSupport
 
       def instrument(name, payload = {}, &block)
         @notifier.instrument(name, payload, &block)
+      end
+
+      def build_handle(name, payload)
+        @notifier.build_handle(name, payload)
       end
     end
 

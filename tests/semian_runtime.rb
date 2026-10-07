@@ -18,6 +18,8 @@
 # 127.0.0.1. Every process uses its own Semian.namespace, so its SysV
 # semaphores are its own, and destroys its resources before it exits.
 require "socket"
+require "tmpdir"
+require "fileutils"
 require_relative "support/rails_oracle"
 
 MODE, PART = ARGV
@@ -338,7 +340,13 @@ module EmittedSide
     require File.join(root, "runtime/ruby/active_record/connection_not_established")
     require File.join(root, "runtime/ruby/active_record/connection")
     require File.join(root, "runtime/spinel/db_pg_cruby")
-    require File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime/active_record_postgresql_adapter")
+    # The adapter and its connection handling sit side by side in the
+    # emitted tree's runtime/ (project.rs apply_postgres_bootstrap).
+    staged = File.join(Dir.mktmpdir("semian-emitted"), "runtime")
+    FileUtils.cp_r(File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime"), staged)
+    FileUtils.cp(File.join(root, "runtime/spinel/cruby/active_record_connection_handling.rb"), staged)
+    FileUtils.cp(File.join(root, "runtime/spinel/cruby/active_record_transactions.rb"), staged)
+    require File.join(staged, "active_record_postgresql_adapter")
     require File.join(root, "runtime/spinel/semian_activerecord_postgresql_adapter")
   end
 

@@ -242,6 +242,27 @@ fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     find.0
 }
 
+/// `def self.use_transactional_tests; <value>; end` on the test class.
+fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
+    MethodDef {
+        name_span: Span::synthetic(),
+        name: Symbol::from("use_transactional_tests"),
+        receiver: crate::dialect::MethodReceiver::Class,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Bool { value } }),
+        signature: Some(crate::lower::typing::fn_sig(vec![], crate::ty::Ty::Bool)),
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(class.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
 fn ingest_test_class(
     (scope, class): &ScopedClass<'_>,
     top_level_helper_nodes: &[ScopedClass<'_>],
@@ -364,6 +385,33 @@ fn ingest_test_class(
                             }
                         }
                     }
+                    continue;
+                }
+                // `self.use_transactional_tests = false` (ActiveRecord::
+                // TestFixtures' class_attribute): the class reader the
+                // runtime's transactional fixtures consult, as a class
+                // method answering the literal. Inherited by subclasses,
+                // as the class_attribute is. Only a literal is modeled.
+                if call.receiver().is_some_and(|r| r.as_self_node().is_some())
+                    && constant_id_str(&call.name()) == "use_transactional_tests="
+                {
+                    let value = call.arguments().and_then(|args| {
+                        let list: Vec<_> = args.arguments().iter().collect();
+                        match list.as_slice() {
+                            [arg] if arg.as_true_node().is_some() => Some(true),
+                            [arg] if arg.as_false_node().is_some() => Some(false),
+                            _ => None,
+                        }
+                    });
+                    let Some(value) = value else {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: "`self.use_transactional_tests =` with a value other than a true/false literal is not modeled".into(),
+                        });
+                    };
+                    helpers.retain(|m| !(m.name.as_str() == "use_transactional_tests"
+                        && matches!(m.receiver, crate::dialect::MethodReceiver::Class)));
+                    helpers.push(use_transactional_tests_reader(&name, value));
                     continue;
                 }
                 if call.receiver().is_none()

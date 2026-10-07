@@ -103,10 +103,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         let base = classes
             .entry(ClassId(Symbol::from("ActiveRecord::Base")))
             .or_default();
+        // `connection_handler`: Rails' ConnectionHandler, carried by the
+        // PostgreSQL runtime's connection handling; elsewhere refused by
+        // name (ingest/database_ownership.rs).
         for m in [
             "transaction",
             "connection_pool",
             "establish_connection",
+            "connection_handler",
         ] {
             base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
         }

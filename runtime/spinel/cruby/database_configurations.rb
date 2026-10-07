@@ -89,6 +89,23 @@ module DatabaseConfigurations
       configuration_hash[:migrations_paths]
     end
 
+    # hash_config.rb readers.
+    def host
+      configuration_hash[:host]
+    end
+
+    def socket
+      configuration_hash[:socket]
+    end
+
+    def database
+      configuration_hash[:database]
+    end
+
+    def for_current_env?
+      env_name == DatabaseConfiguration.default_env
+    end
+
     private
 
     # hash_config.rb:221-234.
@@ -238,7 +255,56 @@ module DatabaseConfigurations
       first_config && name == first_config.name
     end
 
+    # database_configurations.rb `resolve`: a configuration object as it
+    # is, a Symbol by name (or environment), a Hash or URL String built as
+    # the current environment's `primary`.
+    def resolve(config)
+      return config if config.is_a?(HashConfig)
+
+      case config
+      when Symbol
+        resolve_symbol_connection(config)
+      when Hash, String
+        build_db_config_from_raw_config(default_env, "primary", config)
+      else
+        raise TypeError, "Invalid type for configuration. Expected Symbol, String, or Hash. Got #{config.inspect}"
+      end
+    end
+
+    def empty?
+      configurations.empty?
+    end
+    alias :blank? :empty?
+
     private
+
+    def resolve_symbol_connection(name)
+      if (db_config = find_db_config(name))
+        db_config
+      else
+        error = defined?(::ActiveRecord::AdapterNotSpecified) ? ::ActiveRecord::AdapterNotSpecified : ArgumentError
+        raise error, <<~MSG
+          The `#{name}` database is not configured for the `#{default_env}` environment.
+
+            Available database configurations are:
+
+            #{build_configuration_sentence}
+        MSG
+      end
+    end
+
+    def build_configuration_sentence
+      configs = configs_for(include_hidden: true)
+
+      configs.group_by(&:env_name).map do |env, config|
+        names = config.map(&:name)
+        if names.size > 1
+          "#{env}: #{names.join(", ")}"
+        else
+          env
+        end
+      end.join("\n")
+    end
 
     def for_current_env?(config)
       config.env_name == default_env
@@ -431,14 +497,14 @@ module DatabaseConfigurations
   # DATABASE_URL into a configuration (url_config.rb `merge(build_url_hash)`),
   # every key the endpoint names wins and every other key is kept; a key
   # the entry spells either way (`username`/`user`) is replaced in both.
-  def apply_endpoint(entry, endpoint)
+  def apply_endpoint(entry, endpoint, variable: "ROUNDHOUSE_DATABASE_URL")
     named = PG::Connection.conninfo_parse(endpoint.to_s).each_with_object({}) do |option, out|
       out[ENDPOINT_NAMES.fetch(option[:keyword].to_sym, option[:keyword].to_sym)] = option[:val] if option[:val]
     end
     replaced = ENDPOINT_NAMES.select { |_libpq, rails| named.key?(rails) }.keys
     entry.reject { |key, _| replaced.include?(key) }.merge(named)
   rescue PG::Error
-    raise Error.new("database_endpoint", "ROUNDHOUSE_DATABASE_URL is not a libpq connection string or URI")
+    raise Error.new("database_endpoint", "#{variable} is not a libpq connection string or URI")
   end
 
   # semian's ActiveRecord PostgreSQL adapter, prepended onto the adapter
@@ -453,7 +519,10 @@ module DatabaseConfigurations
   # `env`; cross-check a manifest's recorded facts when the app has one;
   # pick the runtime primary; check it names the compiled adapter and that
   # every model's `connects_to` role resolves (`ownership`: [class,
-  # writing, reading]). Returns [configurations, primary HashConfig].
+  # writing, reading]). Each role becomes a pool of its own when boot
+  # replays the `connects_to` (DatabaseConfiguration.configure!), so a
+  # role that names no configuration is Rails' error, raised here before
+  # anything connects. Returns [configurations, primary HashConfig].
   def resolve(renderer:, env:, compiled_adapter:, path: "config/database.yml", manifest: nil, ownership: [], environment: ENV)
     configurations = load(renderer: renderer, path: path, env: env, environment: environment)
     cross_check!(configurations, manifest) if manifest
@@ -469,18 +538,69 @@ module DatabaseConfigurations
         raise Error.new("connects_to", "The `#{role}` database is not configured for the `#{env}` environment " \
           "(`connects_to` on #{klass}).")
       end
-      next if writing == primary.name
-      raise Error.new("connects_to", "models under #{klass} write to `#{writing}`; the emitted runtime opens only " \
-        "the primary configuration `#{primary.name}`")
     end
     [configurations, primary]
+  end
+
+  # Where a configuration's database lives, as libpq reads the entry.
+  def database_location(db_config)
+    hash = db_config.configuration_hash
+    [hash[:host], hash[:port]&.to_s, hash[:database], hash[:socket]]
+  end
+
+  # The entry the pool of `db_config` connects with, or the named Error
+  # its first connection raises. The run's endpoint comes from the
+  # environment: ROUNDHOUSE_<NAME>_DATABASE_URL names the database for
+  # configuration NAME, and ROUNDHOUSE_DATABASE_URL the primary's. A
+  # configuration without a variable of its own uses the endpoint of a
+  # configuration naming the same database (host, port, database, socket):
+  # a replica entry, or Core's test environment, which points every
+  # PostgreSQL configuration at one database as native runs connect them.
+  # A configuration naming another database without an endpoint is
+  # refused: it is never sent to a different configuration's database.
+  def pool_entry(db_config, primary, compiled_adapter, environment = ENV, configurations: nil)
+    unless db_config.adapter == compiled_adapter
+      return Error.new("database_adapter", "configuration `#{db_config.name}` uses adapter #{db_config.adapter.inspect}; " \
+        "the program carries only the #{compiled_adapter} driver")
+    end
+    variable = pool_endpoint(db_config, primary, environment, configurations: configurations)
+    return variable if variable.is_a?(Error)
+    connection_entry(db_config, environment[variable], variable: variable)
+  rescue Error => error
+    error
+  end
+
+  # The variables that name `db_config`'s endpoint, its own first.
+  def endpoint_variables(db_config, primary)
+    own = "ROUNDHOUSE_#{db_config.name.upcase}_DATABASE_URL"
+    db_config.equal?(primary) ? [own, "ROUNDHOUSE_DATABASE_URL"] : [own]
+  end
+
+  # The environment variable naming the endpoint of `db_config`'s pool,
+  # or the named Error (see `pool_entry`).
+  def pool_endpoint(db_config, primary, environment = ENV, configurations: nil)
+    set = ->(config) { endpoint_variables(config, primary).find { |v| !environment[v].to_s.empty? } }
+    if (variable = set.(db_config))
+      return variable
+    end
+    location = database_location(db_config)
+    peers = [primary, *(configurations ? configurations.configs_for(env_name: db_config.env_name, include_hidden: true) : [])]
+    peers.uniq(&:object_id).each do |peer|
+      next if peer.equal?(db_config) || database_location(peer) != location
+      if (variable = set.(peer))
+        return variable
+      end
+    end
+    return "ROUNDHOUSE_DATABASE_URL" if db_config.equal?(primary) || location == database_location(primary)
+    Error.new("database_endpoint", "configuration `#{db_config.name}` names a different database than " \
+      "the primary configuration `#{primary.name}`; set ROUNDHOUSE_#{db_config.name.upcase}_DATABASE_URL to the run's database for it")
   end
 
   # The entry Db.configure_database receives: the primary's whole resolved
   # hash with the harness endpoint over it. `semian:` is honoured only by
   # semian's adapter, which must be loaded first; carried without it, the
   # key would be silently ignored, so that is refused.
-  def connection_entry(primary, endpoint)
+  def connection_entry(primary, endpoint, variable: "ROUNDHOUSE_DATABASE_URL")
     entry = primary.configuration_hash
     if entry.key?(:semian) && !semian_adapter_loaded?
       raise Error.new("semian_adapter", "configuration `#{primary.name}` carries `semian:`, and semian's " \
@@ -488,8 +608,8 @@ module DatabaseConfigurations
         "before the database is configured")
     end
     if endpoint.nil? || endpoint.empty?
-      raise Error.new("database_endpoint", "ROUNDHOUSE_DATABASE_URL must name the local PostgreSQL database")
+      raise Error.new("database_endpoint", "#{variable} must name the local PostgreSQL database")
     end
-    apply_endpoint(entry, endpoint)
+    apply_endpoint(entry, endpoint, variable: variable)
   end
 end

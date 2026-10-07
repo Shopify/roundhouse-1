@@ -2579,6 +2579,15 @@ fn database_configuration_source(app: &App, yml: &crate::database::DatabaseYml) 
         }
     }
     let ownership = ruby_data_literal(&serde_json::Value::Array(ownership));
+    // Each model whose connection the compiler could not resolve, with
+    // the reason its first connection lookup raises.
+    let mut unresolved = serde_json::Map::new();
+    for (model, owner) in &app.model_databases {
+        if let crate::database::ModelDatabase::Unresolved { reason, .. } = owner {
+            unresolved.insert(model.0.as_str().to_string(), serde_json::Value::String(reason.clone()));
+        }
+    }
+    let unresolved = ruby_data_literal(&serde_json::Value::Object(unresolved));
     let renderer = match (&yml.renderer, yml.present) {
         (Some(class), _) => class.0.as_str().to_string(),
         (None, true) => format!(
@@ -2604,8 +2613,10 @@ module DatabaseConfiguration
   COMPILED_ADAPTER = {adapter}
   # The facts a database_configurations manifest records; nil without one.
   MANIFEST = {manifest}
-  # [class, writing, reading] for each `connects_to`.
+  # [class, writing, reading] for each `connects_to`, replayed at boot.
   OWNERSHIP = {ownership}
+  # Model => reason, for each model whose connection did not compile.
+  UNRESOLVED = {unresolved}
 
   class << self
     attr_reader :configurations, :primary
@@ -2628,8 +2639,24 @@ module DatabaseConfiguration
       manifest: MANIFEST, ownership: OWNERSHIP, environment: environment)
   end
 
+  # The entry the pool of `db_config` connects with, or the named error
+  # its first connection raises (DatabaseConfigurations.pool_entry).
+  def self.connection_entry_for(db_config)
+    DatabaseConfigurations.pool_entry(db_config, @primary, COMPILED_ADAPTER, ENV, configurations: @configurations)
+  end
+
+  # The variable naming that pool's endpoint, or the named error.
+  def self.endpoint_for(db_config)
+    DatabaseConfigurations.pool_endpoint(db_config, @primary, ENV, configurations: @configurations)
+  end
+
+  # What Rails' boot does with database.yml: Base.configurations, then
+  # Base's connection (the railtie's `establish_connection`) and each
+  # abstract class's `connects_to` as its class body runs it. Every pool
+  # is established without connecting (runtime/active_record_connection_handling.rb).
   def self.configure!
     @configurations, @primary = resolve
+    ActiveRecord::Base.configurations = @configurations
     # Active Record loads the adapter class here (establish_connection ->
     # resolve_pool_config -> db_config.validate! -> adapter_class), and the
     # adapter file ends with run_load_hooks (activerecord 8.1.4
@@ -2638,8 +2665,17 @@ module DatabaseConfiguration
       @adapter_loaded = true
       ActiveSupport.run_load_hooks(:active_record_postgresqladapter, ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
     end
-    Db.configure_database("primary", DatabaseConfigurations.connection_entry(@primary, ENV["ROUNDHOUSE_DATABASE_URL"]))
+    ActiveRecord::Base.establish_connection
     ActiveRecord.adapter = PostgresAdapter
+    OWNERSHIP.each do |name, writing, reading|
+      klass = begin
+        Object.const_get(name)
+      rescue NameError => error
+        raise DatabaseConfigurations::Error.new("connects_to", "`#{{name}}` declares `connects_to` and is not defined " \
+          "in the program (#{{error.message}})")
+      end
+      klass.connects_to(database: {{ writing: writing.to_sym, reading: reading&.to_sym }}.compact)
+    end
     Schema.statements.each {{ |sql| Db.exec(sql) }}
   end
 end
@@ -3390,6 +3426,20 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
+    // Rails' multiple-database model (ConnectionHandler, pools per
+    // configuration, connects_to / connected_to), required by the
+    // PostgreSQL adapter overlay.
+    let handling = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_connection_handling.rb")
+        .map_err(|e| format!("read connection handling runtime: {e}"))?;
+    files.push(("runtime/active_record_connection_handling.rb".into(), handling));
+    // Rails' TransactionManager (lazy transactions, savepoints,
+    // `requires_new:`, ActiveRecord::Rollback), required by the handling.
+    let transactions = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_transactions.rb")
+        .map_err(|e| format!("read transactions runtime: {e}"))?;
+    files.push(("runtime/active_record_transactions.rb".into(), transactions));
+    let test_fixtures = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/active_record_test_fixtures.rb")
+        .map_err(|e| format!("read test fixtures runtime: {e}"))?;
+    files.push(("runtime/active_record_test_fixtures.rb".into(), test_fixtures));
     files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
@@ -3478,6 +3528,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
+            // rails/test_help.rb's ActiveRecord::TestFixtures: transactional
+            // tests on every writing pool.
+            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\n");
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")
@@ -6044,10 +6097,13 @@ fn is_nil_assertion_check(expr: &crate::expr::Expr) -> bool {
 /// `translate` maps it), but the name stays refused rather than
 /// supported on one setup only.
 ///
-/// `transaction` with options is refused on every target, Ruby too: the
-/// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
-/// checked only when the transaction first runs a statement, which the
-/// runtime's eager BEGIN does not reproduce.
+/// `transaction` with options is refused on every target but the
+/// PostgreSQL Ruby tree: the shared runtime's `Base.transaction` takes
+/// none, and Rails' `isolation:` is checked only when the transaction
+/// first runs a statement, which its eager BEGIN does not reproduce. The
+/// PostgreSQL tree carries Rails' TransactionManager
+/// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
+/// `requires_new:`, `joinable:`, `isolation:`).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;
@@ -6058,7 +6114,9 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             let ar_class = matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. })
                 if matches!(id.0.as_str(), "ActiveRecord::Base" | "ApplicationRecord")
                     || app.models.iter().any(|model| model.name == *id));
-            if method.as_str() == "transaction" && !args.is_empty() && ar_class {
+            let postgres_ruby = target == "ruby"
+                && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+            if method.as_str() == "transaction" && !args.is_empty() && ar_class && !postgres_ruby {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target,
