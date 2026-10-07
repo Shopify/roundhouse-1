@@ -354,6 +354,11 @@ pub struct App {
     /// reference, as Rails' `eager_load!` finisher does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub eager_load: Vec<EagerLoadSetting>,
+    /// Zeitwerk loaders support files create (`Zeitwerk::Loader.for_gem`
+    /// in an in-repo gem's entry file), compiled into the generated
+    /// autoload instead of run (`ingest::zeitwerk`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zeitwerk_loaders: Vec<ZeitwerkLoader>,
     /// SQL functions an initializer registers on every SQLite
     /// connection (`raw_connection.create_function("regexp", 2) do …`,
     /// `create_aggregate("stddev", 1) do step … finalize … end`).
@@ -655,6 +660,22 @@ pub struct EagerLoadSetting {
     pub value: Result<crate::expr::Expr, String>,
 }
 
+/// A Zeitwerk loader a support file creates, read statically
+/// (`ingest::zeitwerk`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ZeitwerkLoader {
+    /// The constant holding it (`Functions::ZeitwerkLoader`).
+    pub constant: String,
+    /// The directory it manages.
+    pub root: String,
+    /// Classes defined by the files it autoloads and eager-loads.
+    pub managed: Vec<crate::ident::ClassId>,
+    /// Classes defined by files under its root that it leaves alone (an
+    /// ignored path, or every file when it is never set up): carried,
+    /// but neither autoloaded nor eager-loaded.
+    pub ignored: Vec<crate::ident::ClassId>,
+}
+
 /// A source file a failed library-class ingest left out of the IR.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestDrop {
@@ -854,6 +875,7 @@ impl App {
             initializer_gaps: Vec::new(),
             ingest_drops: Vec::new(),
             eager_load: Vec::new(),
+            zeitwerk_loaders: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),
