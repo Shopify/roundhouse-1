@@ -5429,7 +5429,17 @@ const AUTOLOAD_RUNTIME: &str = r##"
       if mod.const_defined?(name, false)
         defined << [name, file] unless mod.autoload?(name, false)
       elsif file
-        mod.autoload(name, path(file))
+        # `autoload` calls `const_added`, which must not resolve the
+        # child: when the child's file is the one loading now (it was
+        # required before its parent's file, which its `module` line
+        # autoloaded), `autoload?` reads nil and `const_get` re-enters
+        # the in-flight file.
+        @registering_autoload = true
+        begin
+          mod.autoload(name, path(file))
+        ensure
+          @registering_autoload = false
+        end
       elsif written_module
         mod.const_set(name, Module.new)
       end
@@ -5439,6 +5449,10 @@ const AUTOLOAD_RUNTIME: &str = r##"
       register(child) if child.is_a?(Module)
       require path(file) if file
     end
+  end
+
+  def self.registering_autoload?
+    @registering_autoload
   end
 
   def self.eager_load!
@@ -5479,7 +5493,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
       return if !equal?(Object) && owner.nil?
       key = owner ? "#{owner}::#{name}" : name.to_s
       return unless RoundhouseAutoload::NAMESPACES.key?(key)
-      return if autoload?(name, false)
+      return if RoundhouseAutoload.registering_autoload? || autoload?(name, false)
       child = const_get(name, false)
       RoundhouseAutoload.register(child) if child.is_a?(Module)
     end

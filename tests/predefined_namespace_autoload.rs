@@ -69,3 +69,47 @@ fn a_predefined_namespace_s_children_autoload_while_its_file_runs() {
     assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, "[\"Probe::Sub\", \"encoder\"]\n");
 }
+
+const REAPER: &str = r##"module Reaper
+  DEFAULT_COLUMN = :deleted_at
+end
+"##;
+
+const REAPER_MODEL: &str = r##"module Reaper
+  module Model
+    def self.column
+      DEFAULT_COLUMN
+    end
+  end
+end
+"##;
+
+const REAPER_CLASS_METHODS: &str = r##"module Reaper
+  module Model
+    module ClassMethods
+    end
+  end
+end
+"##;
+
+/// Core's platform/reaper/model.rb, required before platform/reaper.rb:
+/// its `module Reaper` line autoloads the parent, whose definition
+/// registers `Reaper::Model`'s autoload to the file loading now. The
+/// registration's `const_added` resolved the child (a namespace, with
+/// `ClassMethods` under it) and met `uninitialized constant
+/// Reaper::Model`.
+#[test]
+fn a_child_file_required_before_its_parent_s_file_loads() {
+    let run = emit_and_run::empty_app()
+        // Lazy, as Core's local test boot is (`run_ruby` boots development).
+        .write("config/environments/development.rb", "Rails.application.configure do\n  config.eager_load = false\nend\n")
+        .write("app/models/reaper.rb", REAPER)
+        .write("app/models/reaper/model.rb", REAPER_MODEL)
+        .write("app/models/reaper/model/class_methods.rb", REAPER_CLASS_METHODS)
+        .run_ruby(
+            "require File.expand_path(\"app/models/reaper/model\", Dir.pwd)\n\
+             p [Reaper::Model.name, Reaper::Model.column, Reaper::Model::ClassMethods.name]\n",
+        );
+    run.assert_passes();
+    assert_eq!(run.stdout, "[\"Reaper::Model\", :deleted_at, \"Reaper::Model::ClassMethods\"]\n");
+}
