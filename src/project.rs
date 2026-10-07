@@ -6284,35 +6284,197 @@ const GEM_REQUIRES: &[&str] = &[
 ];
 
 /// Shopify Core's Bundler.require, in its Gemfile order, as (require
-/// path, lockfile gem): the entries whose load closure is Rails-free
-/// (the rest are `RAILS_DEPENDENT_GEMS`). Unlike `GEM_REQUIRES` these
-/// load only where the app's Gemfile.lock resolves the gem, so a tree's
-/// load set does not follow whatever gems the machine has installed.
+/// path, lockfile gem): the default-group entries whose load closure is
+/// Rails-free (the rest are `RAILS_DEPENDENT_GEMS` or unclassified).
+/// Unlike `GEM_REQUIRES` these load only where the app's Gemfile.lock
+/// resolves the gem, so a tree's load set does not follow whatever gems
+/// the machine has installed.
+///
+/// Rails-free is measured (`runs/rails-free-probe`, docs/RUNTIME_GEMS.md):
+/// the entry requires with no error and no Rails gem loaded, both bare
+/// and with the runtime's `Rails`/`ActiveSupport`/`ActiveRecord`/
+/// `ActionController` modules defined, and registers no
+/// `ActiveSupport.on_load` hook. Left out though Rails-free: rbtrace,
+/// which starts a tracer when required.
 const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
+    ("stringio", "stringio"),
+    ("fstring/all", "symbol-fstring"),
+    ("rake", "rake"),
     ("rack", "rack"),
+    ("brotli", "brotli"),
+    ("roaring", "roaring"),
+    ("ipaddr", "ipaddr"),
+    ("json", "json"),
+    ("bootsnap", "bootsnap"),
+    ("tzinfo/data", "tzinfo-data"),
+    ("actionpack-xml_parser", "actionpack-xml_parser"),
+    ("csv", "csv"),
+    ("gda", "gda"),
     ("redis", "redis"),
     ("hiredis-client", "hiredis-client"),
+    ("ephemeral_cache_header", "ephemeral_cache_header"),
     ("stack_frames", "stack_frames"),
     ("snappy", "snappy"),
+    ("lz4_flex", "lz4_flex"),
+    ("zstd-ruby", "zstd-ruby"),
+    ("graphql", "graphql"),
+    ("graphql-c_parser", "graphql-c_parser"),
+    ("graphql/batch", "graphql-batch"),
+    ("rollouts_mutex", "rollouts_mutex"),
+    ("liquid", "liquid"),
+    ("liquid_rewriter", "liquid_rewriter"),
+    ("liquid_extensions", "liquid_extensions"),
+    ("dev_dashboard_design_system", "dev_dashboard_design_system"),
+    ("address_validation", "address_validation"),
+    ("braintree", "braintree"),
+    ("stripe", "stripe"),
+    ("mail", "mail"),
+    ("browser_sniffer", "browser_sniffer"),
+    ("search_query_parser", "search_query_parser"),
+    ("cel", "cel"),
+    ("mruby_engine", "mruby_engine"),
+    ("enterprise_script_service", "enterprise_script_service"),
+    ("redis-namespace", "redis-namespace"),
+    ("aws-sdk-s3", "aws-sdk-s3"),
+    ("aws-sdk-sns", "aws-sdk-sns"),
+    ("aws-sdk-eventbridge", "aws-sdk-eventbridge"),
+    ("aws-sdk-sqs", "aws-sdk-sqs"),
+    ("ruby-saml", "ruby-saml"),
+    ("barby", "barby"),
+    ("chunky_png", "chunky_png"),
+    ("rqrcode_core", "rqrcode_core"),
+    ("blake3-rb", "blake3-rb"),
+    ("RedCloth", "RedCloth"),
+    ("redcarpet", "redcarpet"),
+    ("rack/sanitizer", "rack-sanitizer"),
+    ("raindrops", "raindrops"),
+    ("hsluv", "hsluv"),
+    ("mini_mime", "mini_mime"),
+    ("geoip", "geoip"),
+    ("maxmind/geoip2/reader", "maxmind-geoip2"),
+    ("h3", "h3"),
     ("faraday", "faraday"),
+    ("faraday/net_http_persistent", "faraday-net_http_persistent"),
+    ("faraday/retry", "faraday-retry"),
     ("faraday/gzip", "faraday-gzip"),
+    ("faraday/typhoeus", "faraday-typhoeus"),
+    ("async/http", "async-http"),
+    ("async", "async"),
+    ("prawn", "prawn"),
+    ("prawn-svg", "prawn-svg"),
+    ("prawn/table", "prawn-table"),
+    ("combine_pdf", "combine_pdf"),
+    ("public_suffix", "public_suffix"),
+    ("simpleidn", "simpleidn"),
+    ("whois", "whois"),
+    ("escape_utils", "escape_utils"),
+    ("cityhash", "cityhash"),
+    ("concurrent-ruby", "concurrent-ruby"),
+    ("opentelemetry-instrumentation-concurrent_ruby", "opentelemetry-instrumentation-concurrent_ruby"),
+    ("opentelemetry-instrumentation-action_view", "opentelemetry-instrumentation-action_view"),
     ("opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-trilogy"),
     ("opentelemetry-instrumentation-pg", "opentelemetry-instrumentation-pg"),
+    ("opentelemetry-instrumentation-grpc", "opentelemetry-instrumentation-grpc"),
     ("lru_redux", "lru_redux"),
+    ("diffy", "diffy"),
+    ("jaro_winkler", "jaro_winkler"),
+    ("tiny_segmenter", "tiny_segmenter"),
+    ("dry-validation", "dry-validation"),
+    ("dry-types", "dry-types"),
+    ("json_schema", "json_schema"),
+    ("perfect_toml", "perfect_toml"),
+    ("base32/crockford", "base32-crockford"),
+    ("addressable", "addressable"),
+    ("holidays", "holidays"),
+    ("smart_properties", "smart_properties"),
+    ("sqlite3", "sqlite3"),
+    ("sassc", "sassc"),
+    ("execjs", "execjs"),
+    ("terser", "terser"),
+    ("premailer", "premailer"),
+    ("sprockets", "sprockets"),
+    ("schmooze", "schmooze"),
+    ("google_service_account_faraday", "google_service_account_faraday"),
+    ("dns_manager", "dns_manager"),
     ("trilogy", "trilogy"),
+    ("pg", "pg"),
+    ("shopify_metrics/autoload", "shopify_metrics"),
+    ("shopify_metrics/client_adapters", "shopify_metrics"),
+    ("fast_blank", "fast_blank"),
+    ("vernier", "vernier"),
+    ("stackprof", "stackprof"),
+    ("openssl", "openssl"),
+    ("acme-client", "acme-client"),
+    ("net/sftp", "net-sftp"),
+    ("ed25519", "ed25519"),
+    ("bcrypt_pbkdf", "bcrypt_pbkdf"),
+    ("i18n", "i18n"),
+    ("rbnacl", "rbnacl"),
+    ("ruby-vips", "ruby-vips"),
+    ("image_size", "image_size"),
+    ("exiftool_vendored", "exiftool_vendored"),
+    ("connection_pool", "connection_pool"),
+    ("type_toolkit", "type_toolkit"),
+    ("rollouts", "rollouts"),
     ("shopify_bots", "shopify_bots"),
     ("shopify_bots/agent_classification_identifier", "shopify_bots"),
     ("shopify_bots/rack/middleware", "shopify_bots"),
     ("shopify_bots/request_extension", "shopify_bots"),
     ("shopify_bots/session/object_agent_classification_record", "shopify_bots"),
     ("shopify_bots/session/agent_classification_updater", "shopify_bots"),
+    ("image_transformations", "image_transformations"),
+    ("query_layer", "query_layer"),
+    ("cloud_storage_utils", "cloud_storage_utils"),
+    ("shipping_base", "shipping_base"),
+    ("shipify/client", "shipify-client"),
     ("sabertooth", "sabertooth"),
     ("sabertooth/prelude", "sabertooth"),
+    ("messenger", "messenger"),
+    ("splunk_formatter", "splunk_formatter"),
     ("shopify-opensrs", "shopify-opensrs"),
+    ("global_phone", "global_phone"),
+    ("jp_postal_codes", "jp_postal_codes"),
+    ("service_operation", "service_operation"),
     ("customer_privacy_api_ruby", "customer_privacy_api_ruby"),
-    ("magellan-ruby", "magellan-ruby"),
     ("shopify/adt", "shopify-adt"),
-    ("graphql", "graphql"),
+    ("shopifyql_parser", "shopifyql_parser"),
+    ("credit_card_bin", "credit_card_bin"),
+    ("merchant_category_codes", "merchant_category_codes"),
+    ("i18n/compact", "i18n-compact"),
+    ("monorail-schemas", "monorail-schemas"),
+    ("bugsnag", "bugsnag"),
+    ("observe/instrument", "observe-instrument"),
+    ("production_change_events", "production_change_events"),
+    ("mcp-ruby", "mcp-ruby"),
+    ("payment_service_client", "payment_service_client"),
+    ("magellan-ruby", "magellan-ruby"),
+    ("shopify-types", "shopify-types"),
+    ("theraphosa", "theraphosa"),
+    ("shopify_metafields", "shopify_metafields"),
+    ("shopify_mysql_utf8mb4_general_ci_compat", "shopify_mysql_utf8mb4_general_ci_compat"),
+    ("bluejay", "bluejay"),
+    ("filter_values_sorter", "filter_values_sorter"),
+    ("cloudflare_ruby", "cloudflare_ruby"),
+    ("cube_api_client", "cube_api_client"),
+    ("hosted_fields", "hosted_fields"),
+    ("nuevo_protobuf", "nuevo_protobuf"),
+    ("shopify_session", "shopify_session"),
+    ("shopkv", "shopkv"),
+    ("feast-sdk", "feast-sdk"),
+    ("shopify/exp/bandits", "exp-bandits-ruby"),
+    ("adyen_ruby", "adyen_ruby"),
+    ("dhm", "dhm"),
+    ("pitchfork", "pitchfork"),
+    ("webrick", "webrick"),
+    ("openai", "ruby-openai"),
+    ("twilio-ruby", "twilio-ruby"),
+    ("vonage", "vonage"),
+    ("rugged", "rugged"),
+    ("benchmark", "benchmark"),
+    ("resolv", "resolv"),
+    ("jose", "jose"),
+    ("tiktoken_ruby", "tiktoken_ruby"),
+    ("colorize", "colorize"),
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -6607,6 +6769,21 @@ pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
     runtime_gems().iter().any(|(_, loaded)| *loaded == gem) || CRUBY_TEST_GEMS.contains(&gem)
 }
 
+/// The gems `lock` resolves that the CRuby tree's Bundler.require
+/// (`LOCK_GATED_REQUIRES`) loads, with every spec they depend on: the
+/// dependency closure loads too (stripe's, or shopify_session's
+/// identity gems), so its constants run as the gems'.
+pub(crate) fn lock_loaded_gems(lock: &crate::gems::Lockfile) -> std::collections::BTreeSet<String> {
+    let mut loaded = std::collections::BTreeSet::new();
+    let mut stack: Vec<&str> = LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
+    while let Some(gem) = stack.pop() {
+        if loaded.insert(gem.to_string()) {
+            stack.extend(lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str));
+        }
+    }
+    loaded
+}
+
 /// The test framework the CRuby test process runs on: real Minitest
 /// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the
 /// reporters Core's test boot subclasses. Its constants are the gems',
@@ -6836,7 +7013,12 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
             needed.push(gem);
         }
     }
-    if needed.is_empty() {
+    // The lock-gated Bundler.require entries load whatever app/ names,
+    // so a GIT-sourced one (Core's sprockets fork) is activated too.
+    let gated: Vec<&str> = lock
+        .map(|l| LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
+        .unwrap_or_default();
+    if needed.is_empty() && gated.is_empty() {
         return;
     }
     if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile") {
@@ -6866,7 +7048,13 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
             gemfile.push_str(&block);
         }
     }
-    apply_git_gem_load_paths(files, &needed, lock);
+    let mut activated = needed;
+    for gem in gated {
+        if !activated.contains(&gem) {
+            activated.push(gem);
+        }
+    }
+    apply_git_gem_load_paths(files, &activated, lock);
     apply_locked_bundled_gems(files, lock);
 }
 

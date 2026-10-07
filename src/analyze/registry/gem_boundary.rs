@@ -116,7 +116,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>, ap
         let gem = &declared[*id];
         let scope = id.0.as_str();
         let owner = (!framework_namespaces.contains(scope)).then(|| gem.gem.clone());
-        let mut info = ClassInfo { gem_boundary: true, gem: owner, ..ClassInfo::default() };
+        let gem_loaded = owner.as_deref().is_some_and(|g| app.gem_boundary.loads(g));
+        let mut info = ClassInfo { gem_boundary: true, gem: owner, gem_loaded, ..ClassInfo::default() };
         for (name, ty) in &gem.instance_methods {
             info.instance_methods.insert(name.clone(), prune(ty, scope));
         }

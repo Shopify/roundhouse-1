@@ -590,16 +590,84 @@ fn the_locked_bundled_gems_are_on_the_load_path_and_a_partial_gem_load_is_named(
     assert!(!stderr.contains("require \"bcrypt\""), "an absent gem stays quiet: {stderr}");
 }
 
-/// The Rails-free part of Core's Bundler.require list, in its Gemfile
-/// order.
-const CORE_REQUIRES: [&str; 24] = [
-    "rack", "redis", "hiredis-client", "stack_frames", "snappy", "faraday", "faraday/gzip",
-    "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux",
+/// Part of the Rails-free half of Core's Bundler.require list, in its
+/// Gemfile order.
+const CORE_REQUIRES: [&str; 28] = [
+    "rack", "redis", "hiredis-client", "stack_frames", "snappy", "graphql", "liquid", "stripe", "faraday",
+    "faraday/gzip", "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux",
     "trilogy", "shopify_bots", "shopify_bots/agent_classification_identifier", "shopify_bots/rack/middleware",
     "shopify_bots/request_extension", "shopify_bots/session/object_agent_classification_record",
     "shopify_bots/session/agent_classification_updater", "sabertooth", "sabertooth/prelude", "shopify-opensrs",
-    "customer_privacy_api_ruby", "magellan-ruby", "shopify/adt", "graphql",
+    "customer_privacy_api_ruby", "shopify/adt", "magellan-ruby", "shopify_session", "colorize",
 ];
+
+const BUNDLED_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    jwt (2.10.1)\n    shopify_session (7.40.0)\n      jwt (>= 2.0)\n    stripe (18.4.2)\n\nDEPENDENCIES\n  activesupport\n  shopify_session\n  stripe (~> 18.4.2)\n";
+
+fn bundled_app(lock: &str) -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", lock)
+        .write("sorbet/rbi/gems/stripe@18.4.2.rbi", &rbi("module Stripe; end\nclass Stripe::Customer\n  def id; end\nend\n"))
+        .write("sorbet/rbi/gems/jwt@2.10.1.rbi", &rbi("module JWT; end\nclass JWT::DecodeError < StandardError; end\n"))
+        .write("lib/billing_reader.rb", r#"class BillingReader
+  def customer?(value)
+    value.is_a?(Stripe::Customer)
+  end
+
+  def bad_token?(error)
+    error.is_a?(JWT::DecodeError)
+  end
+end
+"#)
+}
+
+/// A Gemfile gem Core's Bundler.require loads runs as the gem on the
+/// CRuby tree, and so does every spec it depends on: jwt is not in the
+/// list, but shopify_session requires it.
+#[test]
+fn a_bundler_required_gem_and_its_dependencies_run_as_the_gems() {
+    let (dir, errors) = bundled_app(BUNDLED_LOCK).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    for feature in ["stripe", "shopify_session"] {
+        assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
+    assert!(!facades.contains("\"jwt\""), "loaded by shopify_session, not required itself: {facades}");
+
+    let (_, errors) = bundled_app(BUNDLED_LOCK).emit(BuildTarget::Rust);
+    for gem in ["stripe", "jwt"] {
+        assert!(errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem"))), "{gem}: {errors:#?}");
+    }
+}
+
+/// Core's sprockets is a fork from a GIT source, which plain RubyGems
+/// cannot find: the Bundler.require entry activates its checkout first,
+/// though no app constant demands it.
+#[test]
+fn a_git_sourced_bundler_required_gem_is_activated() {
+    let lock = format!(
+        "GIT\n  remote: https://github.com/Shopify/sprockets.git\n  revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    sprockets (4.2.1)\n\n{}",
+        BUNDLED_LOCK.replace("  stripe (~> 18.4.2)\n", "  sprockets!\n  stripe (~> 18.4.2)\n")
+    );
+    let (dir, errors) = bundled_app(&lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let git = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
+    assert!(git.contains("[\"sprockets\", \"sprockets-0123456789ab\""), "{git}");
+}
+
+/// Without the gem that loads it, a dependency's constants have nothing
+/// to run them, and are refused by its name.
+#[test]
+fn a_dependency_no_required_gem_loads_is_refused() {
+    let lock = BUNDLED_LOCK.replace("    shopify_session (7.40.0)\n      jwt (>= 2.0)\n", "").replace("  shopify_session\n", "  jwt\n");
+    let (_, errors) = bundled_app(&lock).emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("JWT::DecodeError is declared by the jwt gem, which no emitted tree loads")),
+        "{errors:#?}"
+    );
+    assert!(!errors.iter().any(|e| e.contains("stripe")), "{errors:#?}");
+}
 
 /// A blog-shaped app whose lock names none of Core's gems requires none
 /// of them, whatever the machine has installed.

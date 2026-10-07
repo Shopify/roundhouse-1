@@ -245,8 +245,10 @@ pub struct ClassInfo {
     pub gem_boundary: bool,
     /// The gem whose RBI declared it, when `gem_boundary`. An RBI is a
     /// type, not a runtime: a constant it declares runs only on a tree
-    /// that loads that gem (`crate::project::ruby_tree_loads_gem`).
+    /// that loads that gem (`crate::gem_boundary::GemBoundary::loads`).
     pub gem: Option<String>,
+    /// Some emitted tree loads `gem`, so its constants run as the gem's.
+    pub gem_loaded: bool,
     /// The surface cannot be enumerated (`method_missing`, an unresolved
     /// mixin, an ancestor the RBI could not name): a lookup that misses
     /// is unknown, not wrong.
@@ -335,16 +337,17 @@ impl<'a> BodyTyper<'a> {
 
     /// The gem whose RBI is the only declaration of the constant `path`
     /// names: the class or module itself, else a value its owner assigns.
-    fn declaring_gem(&self, path: &[Symbol]) -> Option<String> {
-        if let Some(gem) = self.classes().get(&written_class_id(path)).and_then(|info| info.gem.clone()) {
-            return Some(gem);
+    /// With it, whether an emitted tree loads that gem.
+    fn declaring_gem(&self, path: &[Symbol]) -> Option<(String, bool)> {
+        if let Some(info) = self.classes().get(&written_class_id(path)).filter(|info| info.gem.is_some()) {
+            return info.gem.clone().map(|gem| (gem, info.gem_loaded));
         }
         let (name, owner) = path.split_last()?;
         if owner.is_empty() {
             return None;
         }
         let info = self.classes().get(&written_class_id(owner))?;
-        info.constants.contains_key(name).then(|| info.gem.clone()).flatten()
+        info.constants.contains_key(name).then(|| info.gem.clone().map(|gem| (gem, info.gem_loaded))).flatten()
     }
 
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
@@ -799,8 +802,8 @@ impl<'a> BodyTyper<'a> {
                 // A gem's RBI types the constant; only a tree that loads
                 // the gem can run it.
                 if expr.diagnostic.is_none() && !app_value {
-                    if let Some(gem) = self.declaring_gem(path) {
-                        if crate::project::ruby_tree_loads_gem(&gem) {
+                    if let Some((gem, loaded)) = self.declaring_gem(path) {
+                        if loaded {
                             expr.decisions |= crate::expr::GEM_CONSTANT_REF;
                         } else if let Some(reason) = crate::project::gem_requires_rails(&gem) {
                             // Named apart from "no tree loads it": the
