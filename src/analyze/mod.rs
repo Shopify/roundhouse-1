@@ -564,6 +564,9 @@ impl Analyzer {
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);
+            for (name, ty) in registry::ar::connection_switches() {
+                cls.class_methods.insert(Symbol::from(name), ty);
+            }
             cls.class_methods.insert(Symbol::from("table_name"), Ty::Str);
             // `Model.human_attribute_name(:col)` — the ActiveModel
             // translation entry point every form label and table header

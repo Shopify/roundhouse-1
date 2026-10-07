@@ -79,6 +79,23 @@ fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
     }
 }
 
+/// Rails' role and shard switches (`ActiveRecord::ConnectionHandling`),
+/// on Base and on every model's class side. The CRuby PostgreSQL runtime
+/// carries them (runtime/spinel/cruby/active_record_connection_handling.rb).
+/// Where no runtime carries them, the call is refused at its site
+/// (ingest/database_ownership.rs). A block form answers its block's value.
+/// That value is not tracked here, as for `transaction`.
+pub(in crate::analyze) fn connection_switches() -> impl Iterator<Item = (&'static str, Ty)> {
+    let untyped = ["connected_to", "connected_to_many", "connected_to_all_shards", "connecting_to", "while_preventing_writes", "prohibit_shard_swapping"];
+    let bool = ["connected_to?", "current_preventing_writes", "shard_swapping_prohibited?"];
+    let sym = ["current_role", "current_shard", "default_role", "default_shard"];
+    untyped
+        .into_iter()
+        .map(|m| (m, Ty::Untyped))
+        .chain(bool.into_iter().map(|m| (m, Ty::Bool)))
+        .chain(sym.into_iter().map(|m| (m, Ty::Sym)))
+}
+
 pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_connection_surface(classes);
     // `ActiveRecord::Base` itself — the literal base class, called
@@ -113,6 +130,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             "connection_handler",
         ] {
             base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
+        }
+        for (m, ty) in connection_switches() {
+            base.class_methods.entry(Symbol::from(m)).or_insert(ty);
         }
         base.class_methods
             .entry(Symbol::from("connection"))
