@@ -3125,7 +3125,9 @@ fn walk_decl_body_with_visibility<'pr>(
                         if is_class_attr {
                             class_attributes.extend(names.iter().cloned());
                         }
-                        let recv = if is_class_attr || force_class_receiver {
+                        // Under `extend self` the accessors are module
+                        // methods too, as its `def`s are.
+                        let recv = if is_class_attr || force_class_receiver || extend_self_active {
                             MethodReceiver::Class
                         } else {
                             MethodReceiver::Instance
@@ -3201,6 +3203,11 @@ fn walk_decl_body_with_visibility<'pr>(
                             .unwrap_or(false) =>
                     {
                         extend_self_active = true;
+                        // Kept for the Ruby family, which replays it
+                        // (`app_extension_calls`): a macro replayed later
+                        // in the body defines instance methods, which
+                        // `extend self` makes module methods as well.
+                        out.unknown_calls.push(ingest_expr(&stmt, file)?);
                     }
                     "module_function" => {
                         // Bare `module_function` (no args) — flip the
