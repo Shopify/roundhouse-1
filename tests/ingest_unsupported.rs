@@ -5,8 +5,9 @@
 //! left the file's classes out of the IR with nothing said: a Core
 //! `check` reported zero errors for Podding files the emitted app did
 //! not contain. Each such file is now an `ingest_unsupported` error at
-//! the construct that failed it; `--continue` lists the same gap in its
-//! survey punch list instead.
+//! the construct that failed it. `--continue` absorbs an expression gap
+//! (the file stays in), and lists a gap that still drops the file both
+//! as that error and in its punch list.
 
 use std::path::Path;
 use std::process::Command;
@@ -68,11 +69,10 @@ fn a_class_methods_carrier_singleton_is_refused_by_name() {
     )
     .unwrap();
     let (_, text) = check(&root, &[]);
+    let (_, survey) = check(&root, &["--continue"]);
     let _ = std::fs::remove_dir_all(&root);
-    assert!(
-        text.contains(
-            "lib/sharded.rb:5:5: error[ingest_unsupported]: `class << self` in a concern's `ClassMethods` defines the carrier module's own singleton methods"
-        ),
-        "{text}"
-    );
+    let error = "lib/sharded.rb:5:5: error[ingest_unsupported]: `class << self` in a concern's `ClassMethods` defines the carrier module's own singleton methods";
+    assert!(text.contains(error), "{text}");
+    // Survey mode absorbs it (the file's classes stay in) and lists it.
+    assert!(survey.contains("`class << self` in a concern's `ClassMethods`"), "{survey}");
 }

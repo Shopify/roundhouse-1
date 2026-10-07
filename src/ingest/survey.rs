@@ -44,6 +44,10 @@ struct Survey {
 pub struct DroppedFile {
     pub file: String,
     pub message: String,
+    /// The byte range of the construct that failed it
+    /// (`super::error_site`), `0..0` when no frame noted one.
+    pub start: usize,
+    pub end: usize,
 }
 
 /// Activate survey mode for the current thread. Subsequent
@@ -113,9 +117,12 @@ pub(super) fn record_dropped_file(err: &IngestError) {
     record(err);
     SURVEY_STATE.with(|s| {
         if let Some(survey) = s.borrow_mut().as_mut() {
+            let (start, end) = super::error_site::of(err).unwrap_or((0, 0));
             survey.dropped.push(DroppedFile {
                 file: err_file(err).to_string(),
                 message: err_message(err),
+                start,
+                end,
             });
         }
     });

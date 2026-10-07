@@ -1,9 +1,10 @@
-//! Ingest coverage: every support-dir file (`lib/`, an in-repo engine's
-//! `lib/`, `app/helpers/`, …) whose library-class ingest failed outside
-//! survey mode (`App::ingest_drops`). The walk over those dirs tolerates
-//! a failed file so one gap does not abort the app, which left the file
-//! out of the IR in silence; each is now an `ingest_unsupported` error
-//! at the construct that failed it.
+//! Ingest coverage: every file whose library-class ingest failed and
+//! that ingest went on without (`App::ingest_drops`): a support-dir file
+//! (`lib/`, an in-repo engine's `lib/`, `app/helpers/`, …), whose walk
+//! tolerates a failed file so one gap does not abort the app, or in
+//! survey mode any per-file class ingest. That left the file out of the
+//! IR in silence (or as a file-only punch-list line); each is now an
+//! `ingest_unsupported` error at the construct that failed it.
 
 use crate::diagnostic::Diagnostic;
 use crate::App;
