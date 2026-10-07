@@ -358,7 +358,7 @@ pub(crate) fn expand_type_aliases_by(
                     Ty::Class { id: (self.class)(id, scope), args: Vec::new() }
                 }
                 Ty::Class { id, args } => Ty::Class {
-                    id: (self.class)(id, scope),
+                    id: if is_stdlib_generic(id) { id.clone() } else { (self.class)(id, scope) },
                     args: args.iter().map(|t| self.ty(t, scope, depth)).collect(),
                 },
                 Ty::Array { elem } => Ty::Array { elem: Box::new(self.ty(elem, scope, depth)) },
@@ -410,6 +410,21 @@ pub(crate) fn expand_type_aliases_by(
         }
     }
     Expand { alias, class, normalize }.ty(ty, scope, 0)
+}
+
+/// A parameterized stdlib generic written unqualified: `Set[String]`,
+/// `Range[Integer]`, `Enumerable[T]`, `Enumerator[T]`, `Class[top]`,
+/// `Module[top]`, and `T::Set[X]` read the same way. Sorbet reads such a
+/// name as `T::Set[String]` (the stdlib class) whatever the lexical scope
+/// holds: inside `module Metafields`, beside `Metafields::Set`, `#: ->
+/// Set[String]` is `T::Set[String]` while a bare `#: -> Set` is
+/// `Metafields::Set` (srb 0.6.13502 `T.reveal_type`). So only the
+/// argument-less spelling resolves lexically.
+fn is_stdlib_generic(id: &ClassId) -> bool {
+    matches!(
+        id.0.as_str(),
+        "Set" | "Range" | "Enumerable" | "Enumerator" | "Enumerator::Lazy" | "Enumerator::Chain" | "Class" | "Module"
+    )
 }
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
@@ -2686,9 +2701,15 @@ impl<'a> BodyTyper<'a> {
                     _ => expand_type_aliases(target_ty, "", self.classes()),
                 };
                 let resolved = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
-                    Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
-                        lexical_class(id, scope.0.as_str(), self.classes()).unwrap_or_else(|| id.clone())
-                    }),
+                    // As a signature reads it: `Set[String]` stays the
+                    // stdlib generic (`is_stdlib_generic`).
+                    Some(Ty::Class { id: scope, .. }) => expand_type_aliases_by(
+                        target_ty,
+                        scope.0.as_str(),
+                        &|_, _| None,
+                        &|id, scope| lexical_class(id, scope, self.classes()).unwrap_or_else(|| id.clone()),
+                        false,
+                    ),
                 _ => target_ty.clone(),
                 };
                 let missing = std::cell::RefCell::new(Vec::new());
