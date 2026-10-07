@@ -2046,30 +2046,45 @@ end
             .extend(methods);
     }
 
-    // The app's own sorbet-runtime `sig` blocks, read from the trees
+    // The app's own sorbet-runtime `sig` blocks and RBS-inline `#:`
+    // comments, read from every Ruby file ingested above: the trees
     // that hold its classes. Same table, same consumers as the `sig/`
     // sidecar above — and the sidecar wins where both declare a method,
     // because it is written for this analyzer while a `sig` is written
     // for Sorbet. A `sig` outside the grammar the reader models is
     // dropped whole and the method is inferred as before.
-    for root in ["app", "lib"] {
-        let tree = dir.join(root);
-        if !vfs.is_dir(&tree) {
-            continue;
+    //
+    // This used to walk only the root `app/` and `lib/`, so a Packwerk
+    // package's or an engine's declarations were never read: their
+    // methods' returns were whatever the body inferred. In Shopify Core,
+    // where nearly every class lives under `components/*/app`, that
+    // left `#: (Hash[Symbol, untyped]) -> Hash[Symbol, untyped]` on
+    // `StripePaymentMethod::Base#remove_blank_values` unread, and the
+    // hashes its callers built nested one level deeper every other
+    // fixpoint round.
+    //
+    // Not from a file whose class ingest failed (survey mode goes on past
+    // one): its classes are not in the IR, and their declarations alone
+    // would register a class with only the declared methods. Core's
+    // OrderTransaction, dropped for an ingest gap, read as a class whose
+    // undeclared methods were missing, in place of the error naming the
+    // gap at each reference.
+    let dropped: crate::det::HashSet<String> = survey::dropped_files().into_iter().map(|d| d.file).collect();
+    let mut abstract_methods: HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> =
+        HashMap::default();
+    for source in sources.iter().filter(|source| source.path.ends_with(".rb") && !dropped.contains(&source.path)) {
+        let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(source.text.as_bytes());
+        for (class_id, names) in abstracts {
+            abstract_methods.entry(class_id).or_default().extend(names);
         }
-        let Ok(entries) = read_rb_files(vfs, &tree) else { continue };
-        for entry in entries {
-            let Ok(source) = vfs.read(&entry) else { continue };
-            let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(&source);
-            drop_abstract_stubs(&mut app, &abstracts);
-            for (class_id, methods) in signatures {
-                let declared = app.rbs_signatures.entry(class_id).or_default();
-                for (name, ty) in methods {
-                    declared.entry(name).or_insert(ty);
-                }
+        for (class_id, methods) in signatures {
+            let declared = app.rbs_signatures.entry(class_id).or_default();
+            for (name, ty) in methods {
+                declared.entry(name).or_insert(ty);
             }
         }
     }
+    drop_abstract_stubs(&mut app, &abstract_methods);
 
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
