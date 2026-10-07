@@ -408,6 +408,12 @@ impl GemAncestry {
                     let Some(target) = self.resolve_edge(&id, edge, false) else {
                         return GemClaim::Uncertain;
                     };
+                    if edge.scopes.is_none()
+                        && !edge.parent
+                        && Self::may_be_misqualified_root(&id, &target, census, declares)
+                    {
+                        return GemClaim::Uncertain;
+                    }
                     pending.push(target);
                 }
             } else {
@@ -431,6 +437,35 @@ impl GemAncestry {
             }
             _ => GemClaim::Uncertain,
         }
+    }
+
+    /// An IR include is qualified lexically after ingest has dropped a
+    /// rooted path's leading `::` (`include ::Gem::Mod` inside `class C`
+    /// that also declares `C::Gem::Mod` becomes the edge `C::Gem::Mod`).
+    /// So an IR edge `<lexical scope>::R` may stand for `::R`. When an
+    /// unknown gem claims `R`, the two readings disagree on gem
+    /// evidence: rootedness is unknown, and attribution must not pick one.
+    fn may_be_misqualified_root(
+        owner: &ClassId,
+        target: &ClassId,
+        census: &GemCensus,
+        declares: &dyn Fn(&str, &str) -> Option<bool>,
+    ) -> bool {
+        let target = target.0.as_str();
+        let mut scope = Some(owner.0.as_str());
+        while let Some(prefix) = scope {
+            if let Some(rest) = target
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix("::"))
+                .filter(|rest| !rest.is_empty())
+            {
+                if !gems_owning_constant_with(census, rest, declares).is_empty() {
+                    return true;
+                }
+            }
+            scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+        }
+        false
     }
 
     /// A single statically recognized declaration reaching a receiver.

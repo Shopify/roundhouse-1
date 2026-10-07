@@ -188,6 +188,9 @@ fn consumed_class_includes_use_original_literal_source_without_guessing() {
     }
     // Restoring a precise source edge must not erase an ambiguous retained
     // IR edge, whose rootedness was lost. Both kinds of evidence stay visible.
+    // The lost `::` can also surface as a lexically qualified IR edge
+    // (`ArticleResource::QuartzSerializer::Resource`, since the empty nested
+    // module is retained as a marker): it stays ambiguous, not local.
     let app = app("class ArticleResource\n module QuartzSerializer; module Resource; end; end\n include ::QuartzSerializer::Resource\nend\n", Some(QUARTZ_LOCK));
     let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
     attribute_unknown_gems(&mut diags, &app);
@@ -289,9 +292,16 @@ fn module_supplements_preserve_reopens_roots_and_declarative_boundaries() {
             "module SerializerBridge\n  include QuartzSerializer::Resource\nend\nmodule SerializerBridge\n  def helper; 1; end\nend\n",
             Severity::Info,
         ),
+        // The empty nested `Resource` is now kept as a marker module, so
+        // the bridge is retained in IR too, with the same ambiguous IR
+        // edge as the `def helper` case below: ingest drops the rooted
+        // `::` and the lexical qualification reads the edge as
+        // `SerializerBridge::QuartzSerializer::Resource`. A rooted
+        // source edge alone, with no retained IR edge, is still a note:
+        // see consumed_class_includes_use_original_literal_source_without_guessing.
         (
             "module SerializerBridge\n  module QuartzSerializer\n    module Resource\n    end\n  end\n  include ::QuartzSerializer::Resource\nend\n",
-            Severity::Info,
+            Severity::Error,
         ),
         (
             "module SerializerBridge\n  module QuartzSerializer\n    module Resource\n    end\n  end\n  include QuartzSerializer::Resource\nend\n",
@@ -424,4 +434,22 @@ fn union_arms_must_agree_and_cycles_do_not_hide_reachable_evidence() {
             diags[0].message
         );
     }
+}
+
+#[test]
+fn lexically_qualified_ir_include_without_a_gem_reading_still_attributes() {
+    // `include Helpers` inside `ArticleResource` is qualified to the local
+    // `ArticleResource::Helpers`. No unknown gem claims `Helpers`, so the
+    // possible lost `::` changes no gem evidence and the ancestry walk
+    // continues through the local module to the gem it includes.
+    let app = app(
+        "class ArticleResource\n  module Helpers\n    include QuartzSerializer::Resource\n  end\n  include Helpers\nend\n",
+        Some(QUARTZ_LOCK),
+    );
+    let lc = app.library_classes.iter().find(|c| c.name.0.as_str() == "ArticleResource").unwrap();
+    assert!(lc.includes.iter().any(|i| i.0.as_str() == "ArticleResource::Helpers"), "{:?}", lc.includes);
+    let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
+    attribute_unknown_gems(&mut diags, &app);
+    assert_eq!(diags[0].severity, Severity::Info, "{}", diags[0].message);
+    assert!(diags[0].message.contains("the `quartz_serializer` gem"), "{}", diags[0].message);
 }
