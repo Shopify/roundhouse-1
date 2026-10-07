@@ -6188,6 +6188,10 @@ fn emit_library_class_decl_inner(
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
     }
+    // A class-variable initializer runs at load, after the constants.
+    for init in &lc.class_ivar_initializers {
+        body_requires.extend(resolve_all(init, true));
+    }
     for m in &lc.methods {
         body_requires.extend(resolve_all(&m.body, false));
     }

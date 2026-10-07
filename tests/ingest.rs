@@ -1254,16 +1254,41 @@ end
 }
 
 #[test]
-fn non_nil_classvar_initializer_is_refused() {
+fn non_nil_classvar_initializers_are_retained_in_source_order() {
     use roundhouse::ingest::ingest_library_classes;
 
-    // A non-nil `@@X = <expr>` initializer can't be dropped silently —
-    // strict ingest refuses it (survey mode records the gap per-item).
-    let src = b"class Twitter\n  @@TIMEOUT = 30\nend\n";
-    assert!(
-        ingest_library_classes(src, "extras/twitter.rb").is_err(),
-        "non-nil class-variable initializer must not be silently dropped"
-    );
+    // A non-nil `@@X = <expr>` initializer is native class-body code, kept
+    // in source order rather than dropped (shopify-money's
+    // `Money::Currency`: `@@mutex = Mutex.new`, `@@loaded_currencies = {}`).
+    let src = b"class Twitter\n  TIMEOUT = 30\n  @@TIMEOUT = TIMEOUT\n  @@mutex = Mutex.new\n  @@cache = {}\nend\n";
+    let classes = ingest_library_classes(src, "extras/twitter.rb").unwrap();
+    let names: Vec<_> = classes[0].class_ivar_initializers.iter().map(|expr| match &*expr.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+            assert!(!matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Nil }));
+            name.as_str()
+        }
+        other => panic!("unexpected initializer: {other:?}"),
+    }).collect();
+    assert_eq!(names, ["@@TIMEOUT", "@@mutex", "@@cache"]);
+
+    // The emitted body puts every initializer before the defs, so one that
+    // runs this class's own code could see a def it preceded in source,
+    // or miss one it followed.
+    for source in [
+        "class Twitter; def self.build; {}; end; @@cache = build; end",
+        "class Twitter; def self.build; {}; end; @@cache = self.build; end",
+        "class Twitter; def self.build; {}; end; @@cache = Twitter.build; end",
+        "class Twitter; @@probe = new; def initialize; end; end",
+        "class Twitter; @@cache = [1].map { build }; def self.build; end; end",
+        "class Twitter; DEFAULT = new; @@cache = {}; end",
+    ] {
+        let err = ingest_library_classes(source.as_bytes(), "extras/twitter.rb")
+            .expect_err("an initializer running own code cannot keep its order");
+        assert!(err.to_string().contains("requires source ordering"), "{source}: {err}");
+    }
+    // A stored closure runs later, when every def exists.
+    ingest_library_classes(b"class Twitter; @@hook = -> { build }; def self.build; end; end", "extras/twitter.rb")
+        .expect("a stored lambda does not run at initialization");
 }
 
 #[test]
@@ -1703,14 +1728,35 @@ fn post_rest_effectful_targets_remain_explicitly_unsupported() {
 }
 
 #[test]
-fn class_method_classvar_writes_cannot_be_normalized_to_per_class_storage() {
+fn class_method_classvar_writes_keep_native_shared_storage() {
+    // Never normalized to the per-class `@count` ivar: the Ruby family emits
+    // `@@count` verbatim in the same lexical class, so the class and every
+    // subclass share it (run against CRuby in tests/class_variables_cruby.rs).
+    fn classvar_ops(expr: &roundhouse::Expr) -> (usize, usize) {
+        let (mut writes, mut ivars) = (0, 0);
+        match &*expr.node {
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+            | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count" => writes += 1,
+            ExprNode::Ivar { .. } | ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+            | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. } => ivars += 1,
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |child| {
+            let (w, i) = classvar_ops(child);
+            writes += w;
+            ivars += i;
+        });
+        (writes, ivars)
+    }
     for method in ["def self.bump", "class << self; def bump"] {
         for write in ["@@count ||= 11", "@@count = 14", "@@count &&= 17", "@@count += 3", "@@count -= 1"] {
             let extra_end = if method.starts_with("class") { "end" } else { "" };
             let source = format!("class Parent; {method}; {write}; @@count; end; {extra_end}; end\nclass Child < Parent; end");
-            let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                .expect_err("shared classvar storage must not become a class ivar");
-            assert!(err.to_string().contains("shared inheritance storage"), "{err}");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .unwrap_or_else(|e| panic!("{source}: {e}"));
+            let parent = classes.iter().find(|c| c.name.0.as_str() == "Parent").unwrap();
+            let bump = parent.methods.iter().find(|m| m.name.as_str() == "bump").unwrap();
+            assert_eq!(classvar_ops(&bump.body), (1, 0), "{source}: native @@count write kept, no class ivar");
         }
     }
 }
@@ -1796,11 +1842,18 @@ fn native_classvar_initialization_uses_owned_initializer_ir() {
     assert!(classes[0].unknown_calls.is_empty());
     assert!(matches!(&*classes[0].class_ivar_initializers[0].node,
         ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
-    for declaration in ["arbitrary_dsl", "INITIAL = @@count", "include Other"] {
+    for declaration in ["arbitrary_dsl", "INITIAL = @@count", "include Other", "class << self; LATER = 1; end"] {
         let source = format!("class Probe; @@count = nil; {declaration}; end");
         let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
             .expect_err("separate class-body buckets cannot preserve interleaving");
         assert!(err.to_string().contains("requires source ordering"), "{err}");
+    }
+    // Declarations BEFORE every initializer emit before them too.
+    for declaration in ["arbitrary_dsl", "INITIAL = 1", "include Other"] {
+        let source = format!("class Probe; {declaration}; @@count = nil; @@table = {{}}; def self.current; @@count; end; end");
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(classes[0].class_ivar_initializers.len(), 2, "{source}");
     }
 }
 
