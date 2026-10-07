@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ruby_prism::Node;
 
-use crate::gem_boundary::{GemSourceConstants, GemSourceScan};
+use crate::gem_boundary::{GemSourceConstants, GemSourceScan, SourceKind};
 use crate::gems::Lockfile;
 use crate::vfs::Vfs;
 
@@ -52,6 +52,8 @@ struct DirScan {
     declared: BTreeMap<String, String>,
     /// Namespace -> first file filling it under a computed name.
     dynamic: BTreeMap<String, String>,
+    /// Class or module -> how its first `class`/`module` statement opens it.
+    kinds: BTreeMap<String, SourceKind>,
     files: usize,
     bytes: u64,
     complete: bool,
@@ -100,6 +102,9 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         }
         for (name, file) in &read.dynamic {
             out.dynamic.entry(name.clone()).or_default().insert(gem.clone(), file.clone());
+        }
+        for (name, kind) in &read.kinds {
+            out.kinds.entry(name.clone()).or_default().insert(gem.clone(), kind.clone());
         }
         out.scans.insert(
             gem.clone(),
@@ -198,6 +203,9 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     }
     for (name, gems) in read.dynamic {
         sources.dynamic.entry(name).or_default().extend(gems);
+    }
+    for (name, gems) in read.kinds {
+        sources.kinds.entry(name).or_default().extend(gems);
     }
     sources.scans.extend(read.scans);
 }
@@ -394,10 +402,13 @@ impl Walker<'_> {
         }
     }
 
-    fn nested(&mut self, path: &Node<'_>, body: Option<Node<'_>>) {
+    fn nested(&mut self, path: &Node<'_>, body: Option<Node<'_>>, kind: SourceKind) {
         let Some((rooted, written)) = written_path(path) else { return };
         let name = self.qualify(rooted, &written);
         self.declare(&name);
+        if self.singleton == 0 && self.in_def == 0 {
+            self.out.kinds.entry(name.clone()).or_insert(kind);
+        }
         if let Some(body) = body {
             self.scope.push(name);
             ruby_prism::Visit::visit(self, &body);
@@ -422,14 +433,21 @@ fn is_constant_name(name: &str) -> bool {
 
 impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-        self.nested(&node.constant_path(), node.body());
+        self.nested(&node.constant_path(), node.body(), SourceKind { is_module: true, parent: None });
     }
 
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         if let Some(superclass) = node.superclass() {
             ruby_prism::Visit::visit(self, &superclass);
         }
-        self.nested(&node.constant_path(), node.body());
+        // The superclass as written (`Tag`, `::Liquid::Tag`); an
+        // expression (`Struct.new(...)`) is recorded as dynamic.
+        let parent = node.superclass().map(|sup| match written_path(&sup) {
+            Some((_, written)) => Some(written),
+            None => None,
+        });
+        let kind = SourceKind { is_module: false, parent: parent.map(|p| p.unwrap_or_default()) };
+        self.nested(&node.constant_path(), node.body(), kind);
     }
 
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {

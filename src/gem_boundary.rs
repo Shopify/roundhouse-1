@@ -96,6 +96,19 @@ pub struct GemSourceConstants {
     /// computed name (`const_set(name, ...)`): what the gem puts there
     /// cannot be read from the source, only that it puts something.
     pub dynamic: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Class or module -> gem -> how the gem's first `class`/`module`
+    /// statement for it opens it.
+    #[serde(default)]
+    pub kinds: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceKind>>,
+}
+
+/// How a gem's source opens a class or module: `module`, or `class` with
+/// the superclass as written (`Some("")` for an expression superclass,
+/// `Struct.new(...)`, which no written name matches).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceKind {
+    pub is_module: bool,
+    pub parent: Option<String>,
 }
 
 /// One gem's read: where, how much, and whether the bounds cut it short.
@@ -275,6 +288,20 @@ impl GemBoundary {
             return None;
         }
         self.classes.get(name).filter(|class| self.loads(&class.gem))
+    }
+
+    /// [`Self::loaded_reopen`] for a tree with no RBI for the gem: the
+    /// class or module the installed source of a gem the CRuby tree loads
+    /// opens (`GemSourceConstants::kinds`), with the gem. Every gem read
+    /// there is one the tree loads (Bundler.require's closure, or a gem a
+    /// gem source requires).
+    pub fn loaded_source_reopen(&self, name: &ClassId) -> Option<(&str, &SourceKind)> {
+        let text = name.0.as_str().trim_start_matches("::");
+        let top = text.split("::").next().unwrap_or(text);
+        if RUBY_CORE.contains(&top) || RUBY_STDLIB.contains(&top) {
+            return None;
+        }
+        self.source_constants.kinds.get(text)?.iter().next().map(|(gem, kind)| (gem.as_str(), kind))
     }
 
     /// The gem whose RBI declares the constant `path`: the class or

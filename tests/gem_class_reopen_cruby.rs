@@ -169,8 +169,8 @@ fn gem_path(home: &Path) -> String {
     format!("{}:{}", home.display(), String::from_utf8_lossy(&out.stdout))
 }
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-gem-class-reopen-{}", std::process::id()));
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("roundhouse-gem-class-reopen-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -182,7 +182,20 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 
 #[test]
 fn a_reopen_of_a_loaded_gem_class_runs_on_the_gem_class_as_in_cruby() {
-    let root = scratch();
+    reopen_runs_as_in_cruby(true);
+}
+
+/// With no `sorbet/` directory (the RBI-free Core slice): the reopen is
+/// known from the gem's installed source in `gem_home:`
+/// (`GemSourceConstants::kinds`). Before, the emitter dropped the
+/// `prepend` and `remove_const` as lower_residue there.
+#[test]
+fn a_reopen_is_known_from_the_installed_source_without_an_rbi() {
+    reopen_runs_as_in_cruby(false);
+}
+
+fn reopen_runs_as_in_cruby(rbi: bool) {
+    let root = scratch(if rbi { "rbi" } else { "source" });
     let home = gem_home(&root);
     let gem_path = gem_path(&home);
     std::fs::write(root.join("liquid_ext.rb"), PATCH).unwrap();
@@ -208,12 +221,13 @@ fn a_reopen_of_a_loaded_gem_class_runs_on_the_gem_class_as_in_cruby() {
     }
     assert!(!String::from_utf8_lossy(&native.stderr).contains("already initialized constant"));
 
-    let (tree, errors) = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("Gemfile.lock", LOCK)
-        .write("sorbet/rbi/gems/liquid@5.13.0.rbi", RBI)
-        .write("lib/patches/liquid_ext.rb", PATCH)
-        .emit(BuildTarget::Ruby);
+    let app = emit_and_run::empty_app().write("Gemfile.lock", LOCK).write("lib/patches/liquid_ext.rb", PATCH);
+    let app = if rbi {
+        app.write("roundhouse.yml", "test_paths:\n  - test\n").write("sorbet/rbi/gems/liquid@5.13.0.rbi", RBI)
+    } else {
+        app.write("roundhouse.yml", &format!("test_paths:\n  - test\ngem_home: {}\n", home.display()))
+    };
+    let (tree, errors) = app.emit(BuildTarget::Ruby);
     let patch_errors: Vec<&String> = errors.iter().filter(|e| !e.contains("FileId(0)")).collect();
     let run = Command::new("ruby")
         .current_dir(&tree)

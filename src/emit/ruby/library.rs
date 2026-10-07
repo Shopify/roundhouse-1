@@ -7805,14 +7805,21 @@ fn reopens_loaded_gem_class(lc: &LibraryClass, app: &App) -> bool {
     if lc.origin.is_some() || runtime_reopen_anchor(lc.name.0.as_str()).is_some() {
         return false;
     }
-    let Some(gem) = app.gem_boundary.loaded_reopen(&lc.name) else { return false };
-    if gem.is_module != lc.is_module {
+    let written = |id: &crate::ident::ClassId| id.0.as_str().trim_start_matches("::").to_string();
+    let (is_module, parent) = match app.gem_boundary.loaded_reopen(&lc.name) {
+        Some(gem) => (gem.is_module, gem.parent.as_ref().map(written)),
+        // No RBI for the gem: what its installed source opens.
+        None => match app.gem_boundary.loaded_source_reopen(&lc.name) {
+            Some((_, kind)) => (kind.is_module, kind.parent.as_deref().map(|p| p.trim_start_matches("::").to_string())),
+            None => return false,
+        },
+    };
+    if is_module != lc.is_module {
         return false;
     }
-    let written = |id: &crate::ident::ClassId| id.0.as_str().trim_start_matches("::").to_string();
-    match (&lc.parent, &gem.parent) {
+    match (&lc.parent, parent) {
         (None, _) => true,
-        (Some(own), Some(gems)) => written(own) == written(gems),
+        (Some(own), Some(gems)) => written(own) == gems,
         (Some(_), None) => false,
     }
 }
