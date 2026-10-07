@@ -29,7 +29,7 @@
 //! module body the block-less form stays that scope's constant, which
 //! `analyze::data` reads.
 
-use ruby_prism::{BlockNode, CallNode, Node};
+use ruby_prism::{BlockNode, CallNode, ConstantWriteNode, Node};
 
 use crate::dialect::{LibraryClass, LibraryClassOrigin, MethodReceiver};
 use crate::expr::{Expr, ExprNode};
@@ -81,6 +81,23 @@ pub(super) fn factory_block<'pr>(value: &Node<'pr>) -> Option<(CallNode<'pr>, Bl
 pub(super) fn is_factory_class_write(stmt: &Node<'_>) -> bool {
     stmt.as_constant_write_node()
         .is_some_and(|write| factory_block(&write.value()).is_some())
+}
+
+/// The constant writes directly in the body block of a factory class
+/// write. Ruby evaluates the block with the cref of the scope the write
+/// sits in, so `HDR = /x/` in `module M; X = Data.define(:a) do … end`
+/// defines `M::HDR`, not `X::HDR` (CRuby 4.0: `M::HDR` is the regexp and
+/// `X.const_defined?(:HDR, false)` is false). The enclosing scope's walk
+/// carries them, before the class constant, as Ruby assigns them.
+pub(super) fn block_constant_writes<'pr>(stmt: &Node<'pr>) -> Vec<ConstantWriteNode<'pr>> {
+    let Some(write) = stmt.as_constant_write_node() else { return Vec::new() };
+    let Some((_, block)) = factory_block(&write.value()) else { return Vec::new() };
+    body_constant_writes(&block)
+}
+
+fn body_constant_writes<'pr>(block: &BlockNode<'pr>) -> Vec<ConstantWriteNode<'pr>> {
+    let Some(body) = block.body() else { return Vec::new() };
+    flatten_statements(body).into_iter().filter_map(|stmt| stmt.as_constant_write_node()).collect()
 }
 
 /// A file-level statement `factory_classes` turns into a class: a
@@ -227,7 +244,16 @@ fn factory_class(
         ));
     }
     let owner = ClassId(Symbol::from(path.join("::")));
-    let body = super::library_class::factory_class_body(block.and_then(|block| block.body()), &owner, file)?;
+    // The block's own constant writes are the enclosing scope's, which
+    // its walk carries (`block_constant_writes`).
+    let carried: Vec<Symbol> = block
+        .map(body_constant_writes)
+        .unwrap_or_default()
+        .iter()
+        .map(|write| Symbol::from(constant_id_str(&write.name())))
+        .collect();
+    let body =
+        super::library_class::factory_class_body(block.and_then(|block| block.body()), &owner, &carried, file)?;
     let loc = call.location();
     let span = Span {
         file: super::sources::file_id(file),

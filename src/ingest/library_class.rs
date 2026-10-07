@@ -829,6 +829,13 @@ fn file_level_constants(
             continue;
         }
         if super::factory_class::is_file_factory_class_write(&stmt) {
+            for write in super::factory_class::block_constant_writes(&stmt) {
+                out.push((
+                    Symbol::from(constant_id_str(&write.name())),
+                    block_constant_value(&write, file)?,
+                    after_declarations,
+                ));
+            }
             continue;
         }
         out.push((
@@ -2537,15 +2544,37 @@ pub(super) struct FactoryClassBody {
     pub(super) visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
 }
 
+/// The value of a constant written in a factory body block, which the
+/// enclosing scope carries (`factory_class::block_constant_writes`).
+fn block_constant_value(write: &ruby_prism::ConstantWriteNode<'_>, file: &str) -> IngestResult<Expr> {
+    // A type alias the sorbet check would read as the block's class's.
+    if is_sorbet_type_alias(&write.value()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "type alias assigned inside a Struct.new/Data.define body block is not modeled".into(),
+        });
+    }
+    if super::factory_class::is_factory_class_write(&write.as_node()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "Struct.new/Data.define body block nested in another one is not modeled".into(),
+        });
+    }
+    ingest_expr(&write.value(), file)
+}
+
 /// Walk a factory block as the class body Ruby evaluates it as. The
 /// visibility pass starts afresh on the block, as Ruby's does: markers
 /// inside it apply to its methods, and none from the enclosing body
 /// reach in. Constants and class variables in the block are lexically
 /// the ENCLOSING scope's (`class_eval` with a block keeps the caller's
-/// cref), which a class body cannot express, so those are refused.
+/// cref). The enclosing walk carries the constants the block writes
+/// directly (`carried`, `factory_class::block_constant_writes`); any
+/// other constant the walk reports, and every class variable, is refused.
 pub(super) fn factory_class_body(
     body: Option<ruby_prism::Node<'_>>,
     owner: &ClassId,
+    carried: &[Symbol],
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
     let DeclBody {
@@ -2565,7 +2594,7 @@ pub(super) fn factory_class_body(
                 .into(),
         });
     }
-    if !constants.is_empty() || !class_initializers.is_empty() {
+    if constants.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: "constant or class variable assigned inside a Struct.new/Data.define body block \
@@ -2768,6 +2797,10 @@ fn walk_decl_body_with_visibility<'pr>(
                                   carrier is not modeled"
                             .into(),
                     });
+                }
+                for write in super::factory_class::block_constant_writes(stmt) {
+                    out.constants
+                        .push((Symbol::from(constant_id_str(&write.name())), block_constant_value(&write, file)?));
                 }
                 continue;
             }

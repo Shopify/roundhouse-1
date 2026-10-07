@@ -217,6 +217,17 @@ pub(super) fn ingest_model_with_enum_constants(
             // (`factory_class`). As a body item its block's defs would
             // be lost.
             if super::factory_class::is_factory_class_write(stmt) {
+                // Its block's constant writes are this model's
+                // (`factory_class::block_constant_writes`), which a
+                // model body does not carry.
+                if !super::factory_class::block_constant_writes(stmt).is_empty() {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "constant assigned inside a Struct.new/Data.define body block in a model \
+                                  (it is the model's constant) is not modeled"
+                            .into(),
+                    });
+                }
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
