@@ -1074,14 +1074,22 @@ impl Analyzer {
         // User-authored RBS sidecars. Signatures discovered under
         // `sig/**/*.rbs` at ingest time apply on top of the hardcoded
         // catalog — later entries win, so RBS overrides conventions
-        // when both declare the same method. All RBS methods land in
-        // `instance_methods` since dispatch consults both tables and
-        // parse_app_signatures doesn't yet distinguish singleton vs
-        // instance; per-kind separation is a follow-up when it matters.
+        // when both declare the same method. A source signature read on
+        // the singleton side (`def self.x`, `class << self`) types the
+        // class method: in `instance_methods` it invented an instance
+        // method Ruby does not have, and left the class method's entry
+        // to whatever inference harvested from its body. The rest land
+        // in `instance_methods`; a sidecar's `def self.x:` is not told
+        // apart yet, and dispatch consults both tables.
         for (class_id, methods) in &app.rbs_signatures {
+            let singleton = app.rbs_singleton_methods.get(class_id);
             let cls = classes.entry(class_id.clone()).or_default();
             for (name, ty) in methods {
-                cls.instance_methods.insert(name.clone(), ty.clone());
+                if singleton.is_some_and(|names| names.contains(name)) {
+                    cls.class_methods.insert(name.clone(), ty.clone());
+                } else {
+                    cls.instance_methods.insert(name.clone(), ty.clone());
+                }
             }
         }
 
@@ -1195,10 +1203,10 @@ impl Analyzer {
             .filter(|(_, _, before, after)| before != after)
             .collect();
         for (class_id, name, before, after) in resolved {
-            if let Some(slot) = classes
-                .get_mut(&class_id)
-                .and_then(|c| c.instance_methods.get_mut(&name))
-            {
+            let singleton = app.rbs_singleton_methods.get(&class_id).is_some_and(|names| names.contains(&name));
+            if let Some(slot) = classes.get_mut(&class_id).and_then(|c| {
+                if singleton { c.class_methods.get_mut(&name) } else { c.instance_methods.get_mut(&name) }
+            }) {
                 if *slot == before {
                     *slot = after;
                 }
@@ -4487,14 +4495,12 @@ impl Analyzer {
         &self,
         class_id: &ClassId,
         method: &Symbol,
+        class_side: bool,
         positional: Option<usize>,
         name: &Symbol,
     ) -> Option<Ty> {
         let cls = self.classes.get(class_id)?;
-        let ty = cls
-            .instance_methods
-            .get(method)
-            .or_else(|| cls.class_methods.get(method))?;
+        let ty = own_side_method(cls, method, class_side)?;
         let Ty::Fn { params, .. } = ty else { return None };
         let found = params.iter().find(|p| p.name == *name).or_else(|| {
             let n = positional?;
@@ -4516,6 +4522,7 @@ impl Analyzer {
         &self,
         class_id: &ClassId,
         method: &Symbol,
+        class_side: bool,
         positional: Option<usize>,
         name: &Symbol,
     ) -> bool {
@@ -4523,9 +4530,7 @@ impl Analyzer {
             return false;
         }
         let Some(cls) = self.classes.get(class_id) else { return false };
-        let Some(Ty::Fn { params, .. }) =
-            cls.instance_methods.get(method).or_else(|| cls.class_methods.get(method))
-        else {
+        let Some(Ty::Fn { params, .. }) = own_side_method(cls, method, class_side) else {
             return false;
         };
         params
@@ -4556,14 +4561,14 @@ impl Analyzer {
             let is_positional = !param.keyword && !param.rest && !param.from_keyword;
             let positional = is_positional.then_some(positional_seen);
             positional_seen += usize::from(is_positional);
-            if self.declared_untyped_param(class_id, &method.name, positional, &param.name) {
+            if self.declared_untyped_param(class_id, &method.name, ctx.class_side, positional, &param.name) {
                 ctx.local_bindings.insert(param.name.clone(), Ty::Untyped);
                 continue;
             }
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
             let ty = prefer_declared(
-                self.declared_param_ty(class_id, &method.name, positional, &param.name),
+                self.declared_param_ty(class_id, &method.name, ctx.class_side, positional, &param.name),
                 seeded,
             );
             if let Some(ty) = ty {
@@ -4608,7 +4613,7 @@ impl Analyzer {
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone(), MethodReceiver::Instance)));
         let mut ctx = base.clone();
         for (i, name) in params.fields.keys().enumerate() {
-            if self.declared_untyped_param(class_id, action_name, Some(i), name) {
+            if self.declared_untyped_param(class_id, action_name, false, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);
                 continue;
             }
@@ -4619,7 +4624,7 @@ impl Analyzer {
                 .filter(|t| !matches!(t, Ty::Var { .. }))
                 .reduce(unify_param_ty);
             let ty = prefer_declared(
-                self.declared_param_ty(class_id, action_name, Some(i), name),
+                self.declared_param_ty(class_id, action_name, false, Some(i), name),
                 observed,
             );
             if let Some(ty) = ty {
@@ -4636,7 +4641,7 @@ impl Analyzer {
                 continue;
             }
             if let Some(ty) =
-                self.declared_param_ty(class_id, action_name, None, name)
+                self.declared_param_ty(class_id, action_name, false, None, name)
             {
                 ctx.local_bindings.insert(name.clone(), ty);
             }
@@ -8743,6 +8748,18 @@ fn symbol_arg(expr: &Expr) -> Option<&Symbol> {
     }
 }
 
+
+/// The method table entry for `method` on the side being typed, falling
+/// back to the other side: a sidecar's `def self.x:` still sits in
+/// `instance_methods`, and dispatch consults both.
+fn own_side_method<'c>(cls: &'c ClassInfo, method: &Symbol, class_side: bool) -> Option<&'c Ty> {
+    let (own, other) = if class_side {
+        (&cls.class_methods, &cls.instance_methods)
+    } else {
+        (&cls.instance_methods, &cls.class_methods)
+    };
+    own.get(method).or_else(|| other.get(method))
+}
 
 #[cfg(test)]
 mod typed_store_tests {

@@ -31,22 +31,30 @@ use super::util::constant_id_str;
 /// Method signatures declared with `sig` in one Ruby file, keyed by the
 /// enclosing class's qualified name.
 pub fn ingest_sorbet_signatures(source: &[u8]) -> HashMap<ClassId, HashMap<Symbol, Ty>> {
-    ingest_sorbet_declarations(source).0
+    ingest_sorbet_declarations(source).signatures
+}
+
+/// What one Ruby file declares: its method signatures, the names declared
+/// `sig { abstract… }`, and which signatures are the singleton side's.
+#[derive(Default)]
+pub struct SorbetDeclarations {
+    /// Per class, method name → `Ty::Fn`, both sides in one table.
+    pub signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// Per class or module, the instance methods declared abstract.
+    pub abstracts: HashMap<ClassId, crate::det::HashSet<Symbol>>,
+    /// Per class, the `signatures` names defined only on the singleton
+    /// side (`def self.x`, a `def` in `class << self`).
+    pub singleton: HashMap<ClassId, crate::det::HashSet<Symbol>>,
 }
 
 /// Signatures plus the names declared `sig { abstract… }` per class or
 /// module. An abstract method is a declaration with no implementation to
 /// carry: the includer supplies it.
-pub fn ingest_sorbet_declarations(
-    source: &[u8],
-) -> (
-    HashMap<ClassId, HashMap<Symbol, Ty>>,
-    HashMap<ClassId, crate::det::HashSet<Symbol>>,
-) {
+pub fn ingest_sorbet_declarations(source: &[u8]) -> SorbetDeclarations {
     let result = ruby_prism::parse(source);
     let node = result.node();
     let Some(program) = node.as_program_node() else {
-        return (HashMap::default(), HashMap::default());
+        return SorbetDeclarations::default();
     };
     let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
     let mut abstracts = HashMap::default();
@@ -80,7 +88,13 @@ pub fn ingest_sorbet_declarations(
             *ty = unnamed_relation_is_gradual(ty);
         }
     }
-    (out, abstracts)
+    let mut singleton: HashMap<ClassId, crate::det::HashSet<Symbol>> = HashMap::default();
+    for ((class, name), (instance, class_side)) in &sides {
+        if *class_side && !*instance && out.get(class).is_some_and(|methods| methods.contains_key(name)) {
+            singleton.entry(class.clone()).or_default().insert(name.clone());
+        }
+    }
+    SorbetDeclarations { signatures: out, abstracts, singleton }
 }
 
 /// A relation type that does not name its model, `ActiveRecord::Relation`
