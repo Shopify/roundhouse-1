@@ -2993,8 +2993,20 @@ pub(super) fn is_query_any_receiver_may_answer(
 /// Methods that change the class (`define_method`) still need to know
 /// which class.
 pub(super) fn is_module_query_on_module_value(method: &Symbol, recv_ty: Option<&Ty>) -> bool {
-    method.as_str() == "include?"
+    is_module_query(method)
         && matches!(recv_ty, Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "Class" | "Module"))
+}
+
+/// The Module protocol's pure queries: they read a class's constants,
+/// methods or ancestry and change nothing, so any proven class object
+/// answers them (Core's `self.class.const_get(:CACHE_KEY_PREFIX)`).
+pub(super) fn is_module_query(method: &Symbol) -> bool {
+    matches!(method.as_str(),
+        "include?" | "const_get" | "const_defined?" | "constants"
+        | "method_defined?" | "public_method_defined?" | "private_method_defined?"
+        | "instance_methods" | "public_instance_methods" | "private_instance_methods"
+        | "instance_method" | "public_instance_method"
+        | "class_variable_get" | "class_variable_defined?")
 }
 
 pub(super) fn object_protocol_method(
