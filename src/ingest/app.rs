@@ -2375,6 +2375,7 @@ end
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
     super::delegate::lower_delegates(&mut app);
+    super::class_eval_macro::qualify_inherited_includes(&mut app);
     super::class_eval_macro::expand_class_eval_macros(&mut app);
     // Channels, before the concern splices for the same reason `Current`
     // is: this turns a class-body macro into real methods, and every

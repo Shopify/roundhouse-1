@@ -6472,14 +6472,15 @@ fn emit_library_class_decl_inner(
         None => lc,
     };
     // A `class_eval` heredoc macro's methods are written by the macro
-    // itself when its call is replayed (`App::class_eval_macro_expansions`).
+    // itself when its call is replayed, or when the include whose
+    // `included` hook calls it runs (`App::class_eval_macro_expansions`).
     let without_macro_copies;
     let lc = match app.class_eval_macro_expansions.get(&lc.name) {
         Some(expansions) => {
             let replayed: Vec<crate::span::Span> = app_extension_calls(lc, app).iter().map(|c| c.span).collect();
             let dropped: Vec<&Symbol> = expansions
                 .iter()
-                .filter(|e| replayed.contains(&e.call))
+                .filter(|e| e.hook || replayed.contains(&e.call))
                 .flat_map(|e| e.methods.iter())
                 .collect();
             let mut copy = lc.clone();

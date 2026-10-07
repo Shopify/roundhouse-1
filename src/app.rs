@@ -759,6 +759,10 @@ pub struct ClassEvalExpansion {
     pub call: crate::span::Span,
     /// The instance methods its `class_eval` heredoc defines.
     pub methods: Vec<Symbol>,
+    /// The call is `base.<macro>(…)` in the `self.included(base)` hook of
+    /// a module the class includes, so on Ruby the include itself runs it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hook: bool,
 }
 
 /// One concern's nested `module ClassMethods`, as an includer received it

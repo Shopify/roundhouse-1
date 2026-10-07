@@ -24,11 +24,14 @@
 //! class body, and its instance `def`s join the calling class. The macro
 //! must reach the class the way Ruby reaches it: an instance method of an
 //! app module that the class, or an app library ancestor, `extend`s,
-//! including modules that module includes.
+//! including modules that module includes. The call is either in the
+//! class body or a top-level `base.<macro>(…)` in the `self.included(base)`
+//! hook of a module the class includes (Core's `Entity::WithIdentifiers`
+//! does `base.attribute(:id, CustomerFoundations::Id)`).
 //!
 //! In the Ruby tree the macro itself runs: the emit replays the `extend`
 //! and the call (`emit::ruby::library`'s `inherited_class_macro_calls`),
-//! and writes the class without these copies
+//! or the include runs the hook, and writes the class without these copies
 //! (`App::class_eval_macro_expansions`). Analysis and the other targets
 //! use the copies.
 
@@ -49,11 +52,18 @@ pub fn expand_class_eval_macros(app: &mut App) {
             continue;
         }
         let mut out = Vec::new();
-        for call in &lc.unknown_calls {
-            let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { continue };
-            if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
-                continue;
-            }
+        let own = lc.unknown_calls.iter().filter_map(|call| {
+            let ExprNode::Send { recv, .. } = &*call.node else { return None };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)).then_some((call, false))
+        });
+        let hooked = lc
+            .includes
+            .iter()
+            .filter_map(|inc| resolve_in_ancestry(lc, inc.0.as_str(), &app.library_classes))
+            .flat_map(included_hook_calls)
+            .map(|call| (call, true));
+        for (call, hook) in own.chain(hooked).collect::<Vec<_>>() {
+            let ExprNode::Send { method, args, block: None, .. } = &*call.node else { continue };
             let Some(def) = modules.iter().find_map(|m| module_method(m, method, &app.library_classes, &mut Vec::new()))
             else {
                 continue;
@@ -68,7 +78,7 @@ pub fn expand_class_eval_macros(app: &mut App) {
                 continue;
             }
             let names = methods.iter().map(|m| m.name.clone()).collect();
-            out.push((ClassEvalExpansion { call: call.span, methods: names }, methods));
+            out.push((ClassEvalExpansion { call: call.span, methods: names, hook }, methods));
         }
         if !out.is_empty() {
             planned.push((i, out));
@@ -86,6 +96,39 @@ pub fn expand_class_eval_macros(app: &mut App) {
     }
 }
 
+/// Qualify an `include M` that Ruby resolves through the class's app
+/// superclasses rather than lexically. Constant lookup in a class body
+/// tries the lexical scopes, then the ancestors' constants, so
+/// `include(WithIdentifiers)` in `Customers::CustomerEntity <
+/// CustomerFoundations::Entity` names
+/// `CustomerFoundations::Entity::WithIdentifiers`. Ingest records the
+/// name as written, which no class is, so the include was refused as
+/// unresolved and none of the module's methods or hooks reached the
+/// class. The full name replaces the written one only when no lexical
+/// scope declares the written name and the full name itself resolves,
+/// from the class, to the same module.
+pub fn qualify_inherited_includes(app: &mut App) {
+    let mut planned: Vec<(usize, usize, ClassId)> = Vec::new();
+    for (i, lc) in app.library_classes.iter().enumerate() {
+        if lc.origin.is_some() {
+            continue;
+        }
+        for (j, inc) in lc.includes.iter().enumerate() {
+            let written = inc.0.as_str();
+            if written.starts_with("::") || resolve(lc, written, true, &app.library_classes).is_some() {
+                continue;
+            }
+            let Some(found) = resolve_in_ancestry(lc, written, &app.library_classes) else { continue };
+            if resolve(lc, found.name.0.as_str(), true, &app.library_classes).is_some_and(|m| m.name == found.name) {
+                planned.push((i, j, found.name.clone()));
+            }
+        }
+    }
+    for (i, j, name) in planned {
+        app.library_classes[i].includes[j] = name;
+    }
+}
+
 /// `written` as Ruby resolves it from `lc`'s namespace outwards, among
 /// the app's library classes (`module: true` for a module).
 fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
@@ -95,6 +138,55 @@ fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &'a [Lib
         let name = if n == 0 { written.to_string() } else { format!("{}::{written}", scope[..n].join("::")) };
         classes.iter().find(|c| c.is_module == module && c.origin.is_none() && c.name.0.as_str() == name)
     })
+}
+
+/// `written` as Ruby resolves it in `lc`'s class body: lexically, then
+/// as a constant of an app library superclass (`include(WithIdentifiers)`
+/// in `Customers::CustomerEntity < CustomerFoundations::Entity` names
+/// `CustomerFoundations::Entity::WithIdentifiers`).
+fn resolve_in_ancestry<'a>(lc: &LibraryClass, written: &str, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
+    if let Some(found) = resolve(lc, written, true, classes) {
+        return Some(found);
+    }
+    let written = written.trim_start_matches("::");
+    let mut seen: Vec<&ClassId> = vec![&lc.name];
+    let mut at = lc.parent.as_ref().and_then(|p| resolve(lc, p.0.as_str(), false, classes));
+    while let Some(c) = at.take() {
+        if seen.contains(&&c.name) {
+            break;
+        }
+        seen.push(&c.name);
+        let name = format!("{}::{written}", c.name.0.as_str());
+        if let Some(found) = classes.iter().find(|m| m.is_module && m.origin.is_none() && m.name.0.as_str() == name) {
+            return Some(found);
+        }
+        at = c.parent.as_ref().and_then(|p| resolve(c, p.0.as_str(), false, classes));
+    }
+    None
+}
+
+/// The top-level `base.<name>(…)` statements of module `m`'s
+/// `self.included(base)` hook: calls Ruby makes on the including class.
+fn included_hook_calls(m: &LibraryClass) -> Vec<&Expr> {
+    let Some(hook) = m.methods.iter().find(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "included")
+    else {
+        return Vec::new();
+    };
+    let [base] = hook.params.as_slice() else { return Vec::new() };
+    if base.keyword || base.rest || base.forwarding || base.default.is_some() {
+        return Vec::new();
+    }
+    let statements: Vec<&Expr> = match &*hook.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&hook.body],
+    };
+    statements
+        .into_iter()
+        .filter(|s| {
+            matches!(&*s.node, ExprNode::Send { recv: Some(r), .. }
+                if matches!(&*r.node, ExprNode::Var { name, .. } if *name == base.name))
+        })
+        .collect()
 }
 
 /// The app modules a bare `extend M` in `lc` or in one of its app library

@@ -119,3 +119,86 @@ fn the_heredoc_readers_are_methods_of_the_calling_class_for_analysis() {
         .content;
     assert!(emitted.contains("attribute :value, String") && !emitted.contains("def value"), "{emitted}");
 }
+
+/// Core's `CustomerFoundations::Entity::WithIdentifiers` declares
+/// `CustomerEntity#id` from its `self.included(base)` hook with
+/// `base.attribute(:id, CustomerFoundations::Id)`, and
+/// `Customers::CustomerEntity` reaches the module through its superclass's
+/// constants, not lexically.
+const WITH_IDS: &str = r##"module Cs
+  class Base
+    module WithIds
+      class << self
+        #: (singleton(Base)) -> void
+        def included(base)
+          base.attribute(:id, Integer)
+        end
+      end
+    end
+  end
+end
+"##;
+
+const THING: &str = r##"module Other
+  class Thing < Cs::Base
+    include(WithIds)
+    attribute :name, String
+  end
+end
+"##;
+
+const THING_SCRIPT: &str = r##"t = Other::Thing.new({ id: 7, name: "n" })
+p [t.id, t.name, Other::Thing._internal_attributes]
+p Other::Thing.public_instance_methods(false).sort
+"##;
+
+fn thing_tree() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("app/models/cs/helpers.rb", HELPERS),
+        ("app/models/cs/class_methods.rb", CLASS_METHODS),
+        ("app/models/cs/base.rb", BASE),
+        ("app/models/cs/base/with_ids.rb", WITH_IDS),
+        ("app/models/other/thing.rb", THING),
+    ]
+}
+
+#[test]
+fn an_included_hook_s_macro_call_defines_the_includer_s_reader() {
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{HELPERS}\n{CLASS_METHODS}\n{BASE}\n{WITH_IDS}\n{THING}\n{THING_SCRIPT}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "[7, \"n\", {id: Integer, name: String}]\n[:id, :name]\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    let mut app = emit_and_run::empty_app();
+    for (path, src) in thing_tree() {
+        app = app.write(path, src);
+    }
+    let run = app.run_ruby(THING_SCRIPT);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+}
+
+/// Analysis sees the hook's reader on the includer; the Ruby tree leaves
+/// it to the include, as it leaves `name` to the replayed call.
+#[test]
+fn the_included_hook_s_reader_is_a_method_of_the_includer_for_analysis() {
+    use roundhouse::det::HashMap;
+    use std::path::PathBuf;
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        thing_tree().into_iter().map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec())).collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let thing = app.library_classes.iter().find(|c| c.name.0.as_str() == "Other::Thing").expect("Other::Thing");
+    let includes: Vec<&str> = thing.includes.iter().map(|m| m.0.as_str()).collect();
+    assert_eq!(includes, ["Cs::Base::WithIds"]);
+    let names: Vec<&str> = thing.methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(names.contains(&"id") && names.contains(&"name"), "{names:?}");
+    let emitted = roundhouse::emit::ruby::emit_library(&app)
+        .into_iter()
+        .find(|f| f.path.to_string_lossy().ends_with("other/thing.rb"))
+        .expect("other/thing.rb")
+        .content;
+    assert!(!emitted.contains("def id") && !emitted.contains("def name"), "{emitted}");
+}
