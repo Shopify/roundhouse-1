@@ -996,7 +996,8 @@ pub enum LibraryClassOrigin {
     },
     /// A constant whose value is a class factory with a body block:
     /// `X = Struct.new(:a, keyword_init: true) do … end` or
-    /// `X = Data.define(:a) do … end` (`ingest::factory_class`). Ruby
+    /// `X = Data.define(:a) do … end` (`ingest::factory_class`), or at
+    /// file level without one (`X = Struct.new(:a)`). Ruby
     /// evaluates the block as the body of the class the factory
     /// returns, so its defs and visibility markers belong to `X`.
     ///
@@ -1007,6 +1008,15 @@ pub enum LibraryClassOrigin {
     FactoryClass {
         factory: crate::expr::Expr,
     },
+    /// Not a class: a source file that declares no class or module and
+    /// holds only file-level constants (`RemoteDomain =
+    /// DomainSubscription`, Shopify Core's alias kept for old YAML
+    /// columns). Named for its first constant, so the file keeps its
+    /// path and Rails' autoloader maps it to that constant; every constant
+    /// is in `top_level_constants`. The analyzer gives it no class entry
+    /// (a class alias resolves to its target through the source index),
+    /// and the Ruby family writes only the constants.
+    FileConstants,
 }
 
 impl LibraryClassOrigin {

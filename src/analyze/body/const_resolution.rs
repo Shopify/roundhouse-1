@@ -722,13 +722,28 @@ fn resolved_constant(
     let runtime_alias = !stdlib_alias
         && matches!(declaration, Declaration::ConstantAlias(_))
         && is_runtime_only(graph, declaration);
-    let aliased = (stdlib_alias || runtime_alias)
+    // So is the app's own alias of a class or module, when every
+    // definition of the name is that alias (`RemoteDomain =
+    // DomainSubscription`, Shopify Core's name kept for old YAML
+    // columns): Ruby binds the name to the very class, so `RemoteDomain.
+    // find` is `DomainSubscription.find`. The written name stays as it
+    // is in the emitted code, which defines it the same way.
+    let app_alias = !stdlib_alias
+        && !runtime_alias
+        && matches!(declaration, Declaration::ConstantAlias(_))
+        && declaration.definitions().iter().all(|definition| {
+            matches!(graph.definitions().get(definition), Some(Definition::ConstantAlias(_)))
+        });
+    let aliased = (stdlib_alias || runtime_alias || app_alias)
         .then(|| graph.resolve_alias(&id))
         .flatten()
         .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
         .filter(|(_, target)| target.as_namespace().is_some()
-            && (stdlib_alias || is_runtime_declaration(graph, target)));
-    let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
+            && (stdlib_alias || app_alias || is_runtime_declaration(graph, target)));
+    // The modeled name a stdlib or runtime alias keeps (`Mutex`); an app
+    // alias has no class of its own.
+    let alias = (aliased.is_some() && !app_alias)
+        .then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
     let (id, declaration) = aliased.unwrap_or((id, declaration));
     let resolved = if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
         let (class, runtime, stdlib) = class_cache.entry(id).or_insert_with(|| {

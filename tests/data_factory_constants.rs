@@ -443,24 +443,31 @@ fn a_result_name_in_another_owner_does_not_answer_an_unresolved_constant() {
     );
 }
 
+/// A file-level block-less factory is a class of its own, at the top
+/// level where Ruby binds it (`ingest::factory_class`), no longer a
+/// constant rehomed onto the file's first class.
 #[test]
-fn rehomed_file_level_factories_remain_unsupported() {
+fn file_level_blockless_factories_are_top_level_classes() {
     let source = format!(
         "GlobalResult = Data.define(:name)\n{}",
         data_factory::DECLARATIONS
     );
     let mut app = ingest(&source, "GlobalResult.new(name: \"global\")");
-    assert!(
-        !Analyzer::new(&app)
-            .class_registry()
-            .contains_key(&ClassId(Symbol::from("GlobalResult")))
-    );
+    let id = ClassId(Symbol::from("GlobalResult"));
+    {
+        let analyzer = Analyzer::new(&app);
+        let class = &analyzer.class_registry()[&id];
+        assert_eq!(class.class_methods.get(&Symbol::from("new")), Some(&Ty::Class { id: id.clone(), args: vec![] }));
+        assert!(class.instance_methods.contains_key(&Symbol::from("name")));
+        assert!(!class.instance_methods.contains_key(&Symbol::from("name=")));
+    }
+    assert!(!app.library_classes.iter().any(|class| class.name.0.as_str() == "FactoryExamples::GlobalResult"));
     roundhouse::session::analyze_and_lower(&mut app);
     let diagnostics = roundhouse::analyze::diagnose(&app);
     assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error),
+        !diagnostics.iter().any(|diagnostic| diagnostic.severity
+            == roundhouse::diagnostic::Severity::Error
+            && diagnostic.message.contains("GlobalResult")),
         "{diagnostics:?}"
     );
 }

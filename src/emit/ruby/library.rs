@@ -6527,7 +6527,12 @@ fn emit_with_top_level_constants(
     let mut class = lc.clone();
     class.constants.retain(|(name, _)| !top.contains(name.as_str()));
     class.top_level_constants.clear();
-    let inner = emit_library_class_decl_inner(&class, app, out_path.clone(), synthesized_siblings);
+    // A file of constants alone has no class to write around them.
+    let inner = if matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants)) {
+        EmittedFile { path: out_path.clone(), content: String::new() }
+    } else {
+        emit_library_class_decl_inner(&class, app, out_path.clone(), synthesized_siblings)
+    };
 
     let out_dir = out_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let self_anchor = out_path.with_extension("").to_string_lossy().into_owned();
@@ -6566,7 +6571,7 @@ fn emit_with_top_level_constants(
     }
     let before = s.len();
     render(&mut s, false);
-    if s.len() > before {
+    if s.len() > before && !inner.content.is_empty() {
         writeln!(s).unwrap();
     }
     s.push_str(&inner.content);

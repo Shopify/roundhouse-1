@@ -48,6 +48,11 @@ pub(in crate::analyze) fn register(
         .collect();
 
     for lc in &app.library_classes {
+        // A file of constants alone declares no class (`RemoteDomain =
+        // DomainSubscription` is DomainSubscription to every reader).
+        if matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants)) {
+            continue;
+        }
         let cls = classes.entry(lc.name.clone()).or_default();
         // The AR instance surface a concern inherits from its includer.
         // `or_insert`, so a name the module DEFINES always wins, and so
@@ -116,8 +121,14 @@ pub(in crate::analyze) fn register(
     // Every sorbet type alias, carried or not, on its owner: the
     // declared type of a cast reads through it (`body::expand_type_aliases`).
     // A library class's or model's; a test class has no entry here.
-    let owners: crate::det::HashSet<&crate::ident::ClassId> =
-        app.library_classes.iter().map(|lc| &lc.name).chain(app.models.iter().map(|m| &m.name)).collect();
+    // Not a file of constants alone, which is no class.
+    let owners: crate::det::HashSet<&crate::ident::ClassId> = app
+        .library_classes
+        .iter()
+        .filter(|lc| !matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants)))
+        .map(|lc| &lc.name)
+        .chain(app.models.iter().map(|m| &m.name))
+        .collect();
     for (owner, name, value) in &app.sorbet_type_aliases {
         if !owners.contains(owner) {
             continue;

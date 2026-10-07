@@ -1114,6 +1114,19 @@ fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(
             class.name.0.as_str()
         ));
     }
+    // A file of constants alone (`RemoteDomain = DomainSubscription`)
+    // is written as those constants at the top level, which only the
+    // Ruby family does; another target would invent a class.
+    if let Some(class) = app.library_classes.iter().find(|class| {
+        matches!(class.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants))
+    }) {
+        return Err(format!(
+            "{}: {} is a file of top-level constants with no class or module, which this target \
+             has no representation for; use Ruby or Spinel",
+            target.as_str(),
+            class.name.0.as_str()
+        ));
+    }
     fn visit(expr: &crate::expr::Expr, target: &str, found: &mut bool) {
         if expr.decisions & crate::expr::RESOLVED_DATA_FACTORY != 0 {
             *found = true;
@@ -4653,21 +4666,28 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     }
     // The leading chain: headers at indent 0, 2, 4, … on consecutive lines.
     let mut chain: Vec<(String, bool)> = Vec::new();
+    // Whether the chain ends in a constant assignment rather than a
+    // `class`/`module` header.
+    let mut assigned_leaf = false;
     for (indent, text) in &lines {
         let header = text
             .strip_prefix("module ")
             .map(|rest| (rest, true))
             .or_else(|| text.strip_prefix("class ").map(|rest| (rest, false)));
         let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else {
-            // The constant itself may be a factory class's assignment
+            // The constant itself may be an assignment: a factory class
             // (`Enum = Struct.new(:name) do`, `SignalType = Data.define(...)
-            // do`): the leaf of the chain, a class. Loaded at boot instead,
-            // its `module Podding; module Priority` reopen autoloaded
-            // priority.rb, whose `require_relative "priority/enum"` was
-            // the file already loading, and its read of `Enum` raised.
+            // do`) or a constant of its own (`RemoteDomain =
+            // DomainSubscription`), the leaf of the chain. Zeitwerk maps
+            // the file to it by name either way. Loaded at boot instead,
+            // Podding::Priority::Enum's `module Podding; module Priority`
+            // reopen autoloaded priority.rb, whose `require_relative
+            // "priority/enum"` was the file already loading, and its read
+            // of `Enum` raised.
             if *indent == 2 * chain.len() {
-                if let Some(name) = factory_class_assignment(text) {
+                if let Some(name) = constant_assignment(text) {
                     chain.push((name.to_string(), false));
+                    assigned_leaf = true;
                 }
             }
             break;
@@ -4687,9 +4707,18 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
         crate::naming::underscore(&full) == stem
     })?;
     // Every level above the constant's body holds only the next block:
-    // at indent 2k, exactly that level's header and its `end`.
+    // at indent 2k, exactly that level's header and its `end`. An
+    // assigned constant's own level holds its assignment and only the
+    // lines that close its value (`end`, `)`, `]`, `}`): one constant.
     for level in 0..depth {
         let at: Vec<&str> = lines.iter().filter(|(i, _)| *i == 2 * level).map(|(_, t)| *t).collect();
+        if assigned_leaf && level + 1 == depth && depth == chain.len() {
+            let closes = |t: &&str| t.starts_with([')', ']', '}']) || *t == "end" || t.starts_with("end.");
+            if at.is_empty() || !at[1..].iter().all(closes) {
+                return None;
+            }
+            continue;
+        }
         if at.len() != 2 || at[1] != "end" {
             return None;
         }
@@ -4698,24 +4727,16 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     Some(chain)
 }
 
-/// `Name = Struct.new(...) do` / `Name = Data.define(...) do`: the
-/// constant name, when the line assigns a factory class (one with a
-/// block; the block-less form is a constant of the enclosing file) to a
-/// bare constant.
-fn factory_class_assignment(text: &str) -> Option<&str> {
+/// `Name = <value>`: the constant name, when the line assigns a bare
+/// constant (a factory class `Name = Struct.new(...) do`, a class
+/// alias `Name = Other`, any other value).
+fn constant_assignment(text: &str) -> Option<&str> {
     let (name, value) = text.split_once(" = ")?;
-    if name.is_empty()
-        || !name.starts_with(|c: char| c.is_ascii_uppercase())
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return None;
-    }
-    let value = value.trim_start();
-    ["Struct.new", "Data.define", "::Struct.new", "::Data.define"]
-        .iter()
-        .any(|f| value.strip_prefix(f).is_some_and(|rest| rest.starts_with(['(', ' '])))
-        .then_some(name)
-        .filter(|_| value.ends_with(" do") || value.contains(" do |"))
+    (!name.is_empty()
+        && !value.trim().is_empty()
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(name)
 }
 
 /// The CRuby/JRuby `app/models.rb`: Rails' autoloader, generated.

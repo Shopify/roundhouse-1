@@ -667,6 +667,11 @@ pub(crate) fn settle_type_aliases(app: &mut crate::App) {
         let kept: crate::det::HashSet<Symbol> = lc.constants.iter().map(|(name, _)| name.clone()).collect();
         lc.top_level_constants.retain(|c| kept.contains(&c.name));
     }
+    // A file that held only such aliases (`LooseCurrency = T.type_alias
+    // { ... }`) leaves nothing to write.
+    app.library_classes.retain(|lc| {
+        !(matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FileConstants)) && lc.constants.is_empty())
+    });
     for tm in &mut app.test_modules {
         tm.constants.retain(|(name, value)| !unread(name, value));
     }

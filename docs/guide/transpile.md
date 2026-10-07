@@ -280,14 +280,25 @@ module, is Object's in Ruby, and a bare read from any class in any
 file finds it. The Ruby trees write it at the top level of the
 emitted file of that source file's first class, ahead of the class
 where the source had it ahead of the first declaration and after it
-otherwise; that file then loads at boot. A file with no class or
-module declaration has no such carrier unless it declares a factory
-class (`X = Struct.new(...) do … end`): its other constants, such as
-a class alias `RemoteDomain = DomainSubscription` or a blockless
-`Pair = Struct.new(:a, :b)`, are not carried, and a read of one is
-refused as `constant not supported`. The strict targets keep the
+otherwise; that file then loads at boot. The strict targets keep the
 constant on the first class. `tests/file_level_constants_run.rs`
 compares the CRuby tree with the native run.
+
+A file-level `Struct.new`/`Data.define` with literal members is a
+class of its own, with or without a body block (`Pair =
+Struct.new(:a, :b)` alone in `app/models/pair.rb`). A file that
+declares no class, module or factory class but writes constants is
+carried whole (`LibraryClassOrigin::FileConstants`), named for its
+first constant: the Ruby trees write only the constants, and Rails'
+autoloader maps the file to that constant by name, so it autoloads
+like a class file. A class alias, there or in a class body
+(`RemoteDomain = DomainSubscription`), is the class it names to the
+analyzer, so `RemoteDomain.find` and `RemoteDomain <= ApplicationRecord`
+type as on DomainSubscription; the emitted code keeps the alias name.
+An alias of a class the tree does not have is refused at the alias
+and at each read. The strict targets refuse such a file outright.
+`tests/constant_only_files_run.rs` compares the CRuby tree with the
+native run.
 
 The server targets all serve the app on `http://localhost:3000` (`PORT`
 overrides), with Action Cable at `/cable`, against a SQLite file at

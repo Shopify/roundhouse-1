@@ -56,6 +56,28 @@ pub fn ingest_library_classes(
     source: &[u8],
     file: &str,
 ) -> IngestResult<Vec<LibraryClass>> {
+    library_classes(source, file, false)
+}
+
+/// [`ingest_library_classes`] for an app file Rails' autoloader loads
+/// (`app/models`, the autoloaded support dirs): a file that declares
+/// no class or module but writes file-level constants still defines
+/// them, so it is carried as a `LibraryClassOrigin::FileConstants`
+/// holder named for its first constant (`RemoteDomain =
+/// DomainSubscription` in `remote_domain.rb`). Other callers ingest
+/// snippets or files whose constants another path owns (initializers).
+pub fn ingest_app_library_classes(
+    source: &[u8],
+    file: &str,
+) -> IngestResult<Vec<LibraryClass>> {
+    library_classes(source, file, true)
+}
+
+fn library_classes(
+    source: &[u8],
+    file: &str,
+    constant_files: bool,
+) -> IngestResult<Vec<LibraryClass>> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
@@ -135,6 +157,10 @@ pub fn ingest_library_classes(
     // declares (a factory or `Class.new` constant) carries the rest.
     if let Some(first) = top_level.first_mut() {
         carry_file_constants(first, file_constants);
+    } else if constant_files && !file_constants.is_empty() {
+        let mut holder = file_constants_holder(&file_constants[0].0);
+        carry_file_constants(&mut holder, file_constants);
+        top_level.push(holder);
     }
     // `Sub = Class.new(Err)` inside `module Foo` names `Foo::Err` when
     // this file declares it: Ruby's lexical lookup, innermost scope
@@ -156,6 +182,25 @@ pub fn ingest_library_classes(
         }
     }
     Ok(top_level)
+}
+
+/// The `LibraryClassOrigin::FileConstants` holder of a file whose
+/// first constant is `first`.
+fn file_constants_holder(first: &Symbol) -> LibraryClass {
+    LibraryClass {
+        top_level_constants: Vec::new(),
+        name: ClassId(first.clone()),
+        is_module: false,
+        parent: None,
+        includes: Vec::new(),
+        methods: Vec::new(),
+        nullable_columns: Vec::new(),
+        origin: Some(crate::dialect::LibraryClassOrigin::FileConstants),
+        constants: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
+    }
 }
 
 /// Moves each `NAME = Class.new(Parent)` out of `owner`'s constants and
@@ -260,7 +305,7 @@ fn file_level_constants(
             }
             continue;
         }
-        if super::factory_class::is_factory_class_write(&stmt) {
+        if super::factory_class::is_file_factory_class_write(&stmt) {
             continue;
         }
         out.push((
@@ -3061,7 +3106,13 @@ pub fn classify_class_file(source: &[u8], bases: &ModelBases) -> Option<ClassKin
         if !find_all_modules_with_scope(&root).is_empty() {
             return Some(ClassKind::LibraryClass);
         }
-        return None;
+        // Nor a module: a file of file-level constants (`RemoteDomain =
+        // DomainSubscription`, `Pair = Struct.new(:a, :b)`) declares
+        // those, which the library ingest carries.
+        let writes_constants = root.as_program_node().is_some_and(|program| {
+            program.statements().body().iter().any(|stmt| stmt.as_constant_write_node().is_some())
+        });
+        return writes_constants.then_some(ClassKind::LibraryClass);
     };
     let parent_path = class
         .superclass()

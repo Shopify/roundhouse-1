@@ -21,6 +21,13 @@
 //! (`is_factory_class_write`); `factory_classes` claims them. Both use
 //! `factory_block`, so a block is either a class here or the walk's
 //! named refusal, never a constant whose defs were dropped.
+//!
+//! At FILE level the block-less form is a class too: `Pair =
+//! Struct.new(:left, :right)` alone in `app/models/pair.rb` is how an
+//! app declares the class Zeitwerk loads for `Pair` (Shopify Core's
+//! `ApiClientVisibilityParent`, `SmsLengthParent`). Inside a class or
+//! module body the block-less form stays that scope's constant, which
+//! `analyze::data` reads.
 
 use ruby_prism::{BlockNode, CallNode, Node};
 
@@ -76,6 +83,58 @@ pub(super) fn is_factory_class_write(stmt: &Node<'_>) -> bool {
         .is_some_and(|write| factory_block(&write.value()).is_some())
 }
 
+/// A file-level statement `factory_classes` turns into a class: a
+/// factory with a body block, or a block-less one with literal
+/// members ([`blockless_factory`]).
+pub(super) fn is_file_factory_class_write(stmt: &Node<'_>) -> bool {
+    stmt.as_constant_write_node().is_some_and(|write| {
+        factory_block(&write.value()).is_some() || blockless_factory(&write.value()).is_some()
+    })
+}
+
+/// `Struct.new(:a, :b)`, `Struct.new(:a, keyword_init: true)` or
+/// `Data.define(:a)` with no block: the call, when every member is a
+/// literal symbol (and Struct's one option, a literal `keyword_init:`,
+/// comes last). Any other argument (`Struct.new("Name", :a)`, a
+/// splatted member list) stays a constant, as it was.
+fn blockless_factory<'pr>(value: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = value.as_call_node()?;
+    let generator = match constant_id_str(&call.name()) {
+        "new" => "Struct",
+        "define" => "Data",
+        _ => return None,
+    };
+    let receiver = call.receiver()?;
+    if constant_path_of(&receiver)? != [generator] || call.block().is_some() {
+        return None;
+    }
+    literal_members(&call, generator == "Struct").then_some(call)
+}
+
+/// Every argument a literal symbol member, except a trailing literal
+/// `keyword_init:` for Struct.
+fn literal_members(call: &CallNode<'_>, struct_factory: bool) -> bool {
+    let Some(arguments) = call.arguments() else { return true };
+    let arguments: Vec<_> = arguments.arguments().iter().collect();
+    arguments.iter().enumerate().all(|(index, arg)| {
+        symbol_value(arg).is_some()
+            || (struct_factory && index + 1 == arguments.len() && is_keyword_init(arg))
+    })
+}
+
+/// `keyword_init: true|false|nil`, the one option Struct.new takes.
+fn is_keyword_init(arg: &Node<'_>) -> bool {
+    arg.as_keyword_hash_node().is_some_and(|hash| {
+        let elements: Vec<_> = hash.elements().iter().collect();
+        matches!(elements.as_slice(), [only] if only.as_assoc_node().is_some_and(|assoc| {
+            symbol_value(&assoc.key()).as_deref() == Some("keyword_init")
+                && (assoc.value().as_true_node().is_some()
+                    || assoc.value().as_false_node().is_some()
+                    || assoc.value().as_nil_node().is_some())
+        }))
+    })
+}
+
 /// Every factory class written directly in the file's top level or in a
 /// `class`/`module` body, at any nesting, under the qualified name Ruby
 /// gives it.
@@ -96,10 +155,17 @@ fn collect(
     let Some(body) = body else { return Ok(()) };
     for stmt in flatten_statements(body) {
         if let Some(write) = stmt.as_constant_write_node() {
-            if let Some((call, block)) = factory_block(&write.value()) {
+            let value = write.value();
+            let factory = match factory_block(&value) {
+                Some((call, block)) => Some((call, Some(block))),
+                // At file level only: see the module doc.
+                None if scope.is_empty() => blockless_factory(&value).map(|call| (call, None)),
+                None => None,
+            };
+            if let Some((call, block)) = factory {
                 let mut path = scope.to_vec();
                 path.push(constant_id_str(&write.name()).to_string());
-                out.push(factory_class(&path, &call, &block, file)?);
+                out.push(factory_class(&path, &call, block.as_ref(), file)?);
             }
         } else if let Some(class) = stmt.as_class_node() {
             if let Some(name) = class_name_path(&class) {
@@ -125,7 +191,7 @@ fn unsupported(file: &str, message: &str) -> IngestError {
 fn factory_class(
     path: &[String],
     call: &CallNode<'_>,
-    block: &BlockNode<'_>,
+    block: Option<&BlockNode<'_>>,
     file: &str,
 ) -> IngestResult<LibraryClass> {
     let struct_factory = constant_id_str(&call.name()) == "new";
@@ -141,17 +207,7 @@ fn factory_class(
             }
             // `keyword_init: true|false|nil`, the one option Struct.new
             // takes, last. Data.define takes none.
-            let keyword_init = struct_factory
-                && index + 1 == arguments.len()
-                && arg.as_keyword_hash_node().is_some_and(|hash| {
-                    let elements: Vec<_> = hash.elements().iter().collect();
-                    matches!(elements.as_slice(), [only] if only.as_assoc_node().is_some_and(|assoc| {
-                        symbol_value(&assoc.key()).as_deref() == Some("keyword_init")
-                            && (assoc.value().as_true_node().is_some()
-                                || assoc.value().as_false_node().is_some()
-                                || assoc.value().as_nil_node().is_some())
-                    }))
-                });
+            let keyword_init = struct_factory && index + 1 == arguments.len() && is_keyword_init(arg);
             if !keyword_init {
                 return Err(unsupported(
                     file,
@@ -164,14 +220,14 @@ fn factory_class(
             args.push(ingest_expr(arg, file)?);
         }
     }
-    if block.parameters().is_some() {
+    if block.is_some_and(|block| block.parameters().is_some()) {
         return Err(unsupported(
             file,
             &format!("block parameters on a {generator} factory body are not modeled"),
         ));
     }
     let owner = ClassId(Symbol::from(path.join("::")));
-    let body = super::library_class::factory_class_body(block.body(), &owner, file)?;
+    let body = super::library_class::factory_class_body(block.and_then(|block| block.body()), &owner, file)?;
     let loc = call.location();
     let span = Span {
         file: super::sources::file_id(file),

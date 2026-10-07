@@ -570,7 +570,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     // just PORO classes. The singular path uses
                     // find_first_class and would drop a module.
                     if let Some(classes) =
-                        survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
+                        survey::unwrap_or_drop_file(super::library_class::ingest_app_library_classes(&source, &path_str))?
                     {
                         app.library_classes.extend(classes);
                         // Concern modules (app/models/concerns/…) also
@@ -742,7 +742,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     }
                 }
             }
-            match ingest_library_classes(&source, &path_str) {
+            match super::library_class::ingest_app_library_classes(&source, &path_str) {
                 Ok(classes) => {
                     if !classes.is_empty() && declarations_only(&source) {
                         loaded_support.insert(entry.clone());
