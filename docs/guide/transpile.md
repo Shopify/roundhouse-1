@@ -225,7 +225,8 @@ what they do natively:
   parameters, `T.all`, tuple and hash shapes, sorbet's own constants
   such as `T::Struct`) is refused at the site by name. A type alias
   (`X = T.type_alias { T }` in a library class, model, test or module
-  body) is carried on the Ruby trees as
+  body) that a check reads (directly or through another alias) is
+  carried on the Ruby trees as
   `X = SorbetRuntimeCheck.type_alias { <T> }`, resolved at its first
   check as sorbet's `aliased_type` is and unwrapped wherever a type is
   read (a union of aliases names their flattened members); the analysis

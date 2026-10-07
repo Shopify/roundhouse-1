@@ -505,6 +505,12 @@ pub struct App {
     /// reference to one of them. Empty outside survey mode.
     #[serde(skip)]
     pub dropped_files: Vec<crate::ingest::survey::DroppedFile>,
+    /// Every readable `X = T.type_alias { T }` in a class body, by
+    /// owner, whether or not the Ruby trees carry it
+    /// (`ingest::sorbet_check::settle_type_aliases`). The analysis reads
+    /// a declared type through these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sorbet_type_aliases: Vec<(ClassId, Symbol, crate::expr::Expr)>,
     /// Ingested source apps cannot enter the standalone IR-only analyzer mode
     /// if a caller drops their source table. Persisted across serialization.
     #[serde(default)]
@@ -919,6 +925,7 @@ impl App {
             sources: Vec::new(),
             const_resolver: Default::default(),
             dropped_files: Vec::new(),
+            sorbet_type_aliases: Vec::new(),
             source_index_required: false,
             root: String::new(),
             app_roots: Vec::new(),

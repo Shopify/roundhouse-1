@@ -112,19 +112,18 @@ pub(in crate::analyze) fn register(
         if lc.parent.is_some() {
             cls.parent = lc.parent.clone();
         }
-        for (name, value) in &lc.constants {
-            if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(value) {
-                cls.type_aliases.insert(name.clone(), aliased);
-            }
-        }
     }
-    // A model's sorbet type aliases, which its body carries as constants
-    // (`lower::model_to_library::collect_model_constants`).
-    for model in &app.models {
-        for (name, value) in crate::lower::model_to_library::collect_model_constants(model) {
-            if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(&value) {
-                classes.entry(model.name.clone()).or_default().type_aliases.insert(name, aliased);
-            }
+    // Every sorbet type alias, carried or not, on its owner: the
+    // declared type of a cast reads through it (`body::expand_type_aliases`).
+    // A library class's or model's; a test class has no entry here.
+    let owners: crate::det::HashSet<&crate::ident::ClassId> =
+        app.library_classes.iter().map(|lc| &lc.name).chain(app.models.iter().map(|m| &m.name)).collect();
+    for (owner, name, value) in &app.sorbet_type_aliases {
+        if !owners.contains(owner) {
+            continue;
+        }
+        if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(value) {
+            classes.entry(owner.clone()).or_default().type_aliases.insert(name.clone(), aliased);
         }
     }
 

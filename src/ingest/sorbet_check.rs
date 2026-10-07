@@ -502,3 +502,94 @@ pub(super) fn refusal(detail: String) -> crate::diagnostic::DiagnosticKind {
         detail,
     }
 }
+
+/// Keep the carried type aliases a check reads; record every one.
+///
+/// sorbet-runtime resolves an alias at its first check, so one that only
+/// `sig`s read (the tree drops those) never runs its block, and the
+/// constants it names need not load. Carrying it anyway made the
+/// analysis read those constants, a refusal per name the tree does not
+/// carry, at aliases nothing on the tree evaluates.
+///
+/// A carried alias stays when a lowered check's type names it (by its
+/// last segment, so a homonym keeps it too), or when a kept alias names
+/// it. Every alias, kept or not, is recorded in
+/// `App::sorbet_type_aliases` with its owner: the declared type of a
+/// cast that cannot fail (`T.let(nil, T.nilable(Name))`) still reads
+/// through it.
+pub(crate) fn settle_type_aliases(app: &mut crate::App) {
+    let mut found: Vec<(crate::ident::ClassId, Symbol, Expr)> = Vec::new();
+    for lc in &app.library_classes {
+        for (name, value) in &lc.constants {
+            if is_alias(value) {
+                found.push((lc.name.clone(), name.clone(), value.clone()));
+            }
+        }
+    }
+    for model in &app.models {
+        for (name, value) in crate::lower::model_to_library::collect_model_constants(model) {
+            if is_alias(&value) {
+                found.push((model.name.clone(), name, value));
+            }
+        }
+    }
+    for tm in &app.test_modules {
+        for (name, value) in &tm.constants {
+            if is_alias(value) {
+                found.push((tm.name.clone(), name.clone(), value.clone()));
+            }
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    fn const_names(expr: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        if let ExprNode::Const { path } = &*expr.node
+            && let Some(last) = path.last()
+        {
+            out.insert(last.clone());
+        }
+        expr.node.for_each_child(&mut |child| const_names(child, out));
+    }
+    fn check_types(expr: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        if is_check(expr)
+            && let ExprNode::Send { args, .. } = &*expr.node
+            && let Some(ty) = args.get(1)
+        {
+            const_names(ty, out);
+        }
+        expr.node.for_each_child(&mut |child| check_types(child, out));
+    }
+    let mut read = crate::det::HashSet::default();
+    crate::lower::for_each_emit_body_ref(app, &mut |body| check_types(body, &mut read));
+    loop {
+        let before = read.len();
+        for (_, name, value) in &found {
+            if read.contains(name) {
+                const_names(value, &mut read);
+            }
+        }
+        if read.len() == before {
+            break;
+        }
+    }
+    let unread = |name: &Symbol, value: &Expr| is_alias(value) && !read.contains(name);
+    for lc in &mut app.library_classes {
+        lc.constants.retain(|(name, value)| !unread(name, value));
+    }
+    for tm in &mut app.test_modules {
+        tm.constants.retain(|(name, value)| !unread(name, value));
+    }
+    for model in &mut app.models {
+        model.body.retain(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                ExprNode::Assign { target: crate::expr::LValue::Const { path }, value } if path.len() == 1 => {
+                    !unread(&path[0], value)
+                }
+                _ => true,
+            },
+            _ => true,
+        });
+    }
+    app.sorbet_type_aliases = found;
+}
