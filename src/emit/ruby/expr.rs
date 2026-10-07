@@ -21,6 +21,17 @@ thread_local! {
     /// see the comment there. Off everywhere else, so ordinary app and
     /// library bodies keep reading the way they always have.
     static IN_CORE_CLASS_REOPEN: Cell<bool> = const { Cell::new(false) };
+    /// True while emitting a ruby-family tree (CRuby, JRuby), whose
+    /// interpreter binds keywords natively. See `emit_keyword_forward_arg`.
+    static NATIVE_KEYWORD_SPLATS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` emitting for an interpreter with Ruby 3 keyword arguments.
+pub fn with_native_keyword_splats<R>(f: impl FnOnce() -> R) -> R {
+    let prev = NATIVE_KEYWORD_SPLATS.with(|c| c.replace(true));
+    let r = f();
+    NATIVE_KEYWORD_SPLATS.with(|c| c.set(prev));
+    r
 }
 
 /// Run `f` while emitting a core-class reopen's body (or not). The
@@ -1477,11 +1488,15 @@ pub(crate) fn ruby_sym_literal(value: &str) -> String {
 
 /// A call or `super` argument. A bare `**` is already a keyword splat;
 /// wrapping it again would print `****`. A splat the shared lowering
-/// made positional is written back as one.
+/// made positional is written back as one in a ruby-family tree: a
+/// positional Hash does not bind Ruby 3 keyword parameters. The spinel
+/// tree keeps the positional form the legacy lowering chose.
 fn emit_keyword_forward_arg(arg: &Expr) -> String {
     if matches!(&*arg.node, ExprNode::KeywordSplat { .. }) {
         emit_node(&arg.node)
-    } else if arg.decisions & crate::expr::ERASED_KEYWORD_SPLAT != 0 {
+    } else if arg.decisions & crate::expr::ERASED_KEYWORD_SPLAT != 0
+        && NATIVE_KEYWORD_SPLATS.with(Cell::get)
+    {
         format!("**{}", paren_multiline(emit_arg(arg)))
     } else {
         emit_arg(arg)

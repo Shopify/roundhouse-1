@@ -2400,7 +2400,18 @@ end
 "#)
 }
 
+/// Ruby 3 binds keywords natively, so the ruby family writes back the
+/// keyword splats the shared legacy lowering made positional; the spinel
+/// tree keeps them positional (`emit::ruby::with_native_keyword_splats`).
 fn ruby_family_runtime_files(
+    app: &App,
+    fixture: &Path,
+    flavor: RubyFlavor,
+) -> Result<Vec<(String, String)>, String> {
+    emit::ruby::with_native_keyword_splats(|| ruby_family_files(app, fixture, flavor))
+}
+
+fn ruby_family_files(
     app: &App,
     fixture: &Path,
     flavor: RubyFlavor,

@@ -34,7 +34,7 @@ pub mod source_markers;
 pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
-pub use expr::emit_expr;
+pub use expr::{emit_expr, with_native_keyword_splats};
 
 /// Emit a single `MethodDef` as Ruby source (trailing newline included).
 /// The signature and effects are not emitted — they belong to the RBS
