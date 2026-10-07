@@ -404,6 +404,7 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
 
 fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
     LibraryClass {
+        conditional_definitions: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(name)),
         is_module: true,

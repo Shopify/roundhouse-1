@@ -277,6 +277,7 @@ fn build_fixture_class(
     });
 
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: owner_id,

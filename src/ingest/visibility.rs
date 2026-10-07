@@ -1,5 +1,17 @@
 //! Resolve local visibility while declaration order and lexical scopes still
 //! exist. Never replay these calls from LibraryClass::unknown_calls.
+//!
+//! A library class or module body (and its `class << self`) may hold a
+//! load-time conditional whose branches define methods (`if
+//! Rails.env.test?; def x = false; else; def x = …; end`, see
+//! [`conditional_definition`]). Each branch's `def` takes the visibility
+//! in effect around the statement, and definitions of one name in
+//! different branches are alternatives, not redefinitions: a later
+//! `private :x` changes all of them. A visibility marker inside a branch
+//! would leave a different default in effect after the statement
+//! depending on the branch taken, so that shape stays refused, as does a
+//! conditional in a model body, a concern's class-method carrier or an
+//! `included do` block, whose definitions are flattened elsewhere.
 
 use crate::det::{HashMap, HashSet};
 
@@ -39,6 +51,74 @@ pub(super) struct Visibility {
     /// Walking a concern's `ClassMethods` carrier, whose body is the
     /// includers' class side rather than a singleton of its own.
     carrier: bool,
+    /// Walking a nested `module ClassMethods` (not a `class_methods do`
+    /// block or a hook's `class << base`): a real module, whose own
+    /// singleton its own declaration pass resolves.
+    carrier_module: bool,
+    /// Load-time conditional definitions are admitted (a library class
+    /// or module body, whose emit writes the conditional).
+    conditionals: bool,
+    /// Def offsets inside a load-time conditional: (the statement's
+    /// offset, the branch index). Two definitions of a name in different
+    /// branches of one statement are alternatives.
+    alternatives: HashMap<usize, (usize, usize)>,
+    /// A load-time conditional's statement offset, to its branch count
+    /// when it ends in `else` (some branch always runs); absent otherwise.
+    exhaustive: HashMap<usize, usize>,
+    /// What this body is, when its load-time conditional definitions are
+    /// refused (`a model body`); names the refusal.
+    scope: &'static str,
+}
+
+/// The branches of a class-body `if` / `elsif` / `else` or `unless` /
+/// `else` statement, when one of them defines a method.
+pub(super) struct ConditionalDefinition<'pr> {
+    /// `unless`.
+    pub negated: bool,
+    /// (condition, body) per branch, in source order; the `else` branch
+    /// has no condition. A branch with an empty body has no statements.
+    pub arms: Vec<(Option<Node<'pr>>, Vec<Node<'pr>>)>,
+}
+
+/// `node` as a load-time conditional definition: an `if` (with its
+/// `elsif`s and `else`) or `unless` statement, not a ternary, one of
+/// whose branches holds a `def` directly. `None` for any other node,
+/// including a conditional with no `def` in its branches.
+pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<ConditionalDefinition<'pr>> {
+    let body = |statements: Option<ruby_prism::StatementsNode<'pr>>| -> Vec<Node<'pr>> {
+        statements.map(|s| flatten_statements(s.as_node())).unwrap_or_default()
+    };
+    let mut arms = Vec::new();
+    let negated;
+    if let Some(branch) = node.as_if_node() {
+        // A ternary (`c ? a : b`) has no `if` keyword.
+        branch.if_keyword_loc()?;
+        negated = false;
+        arms.push((Some(branch.predicate()), body(branch.statements())));
+        let mut next = branch.subsequent();
+        while let Some(sub) = next {
+            if let Some(elsif) = sub.as_if_node() {
+                arms.push((Some(elsif.predicate()), body(elsif.statements())));
+                next = elsif.subsequent();
+            } else if let Some(other) = sub.as_else_node() {
+                arms.push((None, body(other.statements())));
+                next = None;
+            } else {
+                return None;
+            }
+        }
+    } else if let Some(branch) = node.as_unless_node() {
+        negated = true;
+        arms.push((Some(branch.predicate()), body(branch.statements())));
+        if let Some(other) = branch.else_clause() {
+            arms.push((None, body(other.statements())));
+        }
+    } else {
+        return None;
+    }
+    arms.iter()
+        .any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some()))
+        .then_some(ConditionalDefinition { negated, arms })
 }
 
 pub(super) fn marker(call: &CallNode<'_>) -> bool {
@@ -113,7 +193,28 @@ impl Visibility {
         file: &str,
         module_owner: Option<&ClassId>,
     ) -> IngestResult<Self> {
-        let mut out = Self { module: module_owner.is_some(), ..Self::default() };
+        Self::resolve_body(body, file, module_owner, false)
+    }
+
+    /// [`Self::resolve`] for a library class or module body, whose
+    /// load-time conditional definitions are admitted (see the module
+    /// doc).
+    pub(super) fn resolve_library(
+        body: Option<&Node<'_>>,
+        file: &str,
+        module_owner: Option<&ClassId>,
+    ) -> IngestResult<Self> {
+        Self::resolve_body(body, file, module_owner, true)
+    }
+
+    fn resolve_body(
+        body: Option<&Node<'_>>,
+        file: &str,
+        module_owner: Option<&ClassId>,
+        conditionals: bool,
+    ) -> IngestResult<Self> {
+        let scope = if conditionals { "" } else { "a model body" };
+        let mut out = Self { module: module_owner.is_some(), conditionals, scope, ..Self::default() };
         STATEMENT.set(None);
         if let Some(body) = body {
             let Some(statements) = body.as_statements_node() else {
@@ -234,7 +335,19 @@ impl Visibility {
         file: &str,
     ) -> IngestResult<()> {
         let key = (class_side, name.clone());
-        if let Some(previous) = self.known.get(&key) {
+        // A definition in another branch of the same load-time
+        // conditional is an alternative to this one, not a definition
+        // this one replaces.
+        let exclusive = |p: &usize| {
+            matches!((self.alternatives.get(p), self.alternatives.get(&offset)),
+                (Some((a, x)), Some((b, y))) if a == b && x != y)
+        };
+        let previous: Option<Vec<usize>> = self
+            .known
+            .get(&key)
+            .map(|p| p.iter().copied().filter(|p| !exclusive(p)).collect::<Vec<_>>())
+            .filter(|p| !p.is_empty());
+        if let Some(previous) = previous {
             // A repeated ordinary constructor has the same implicit
             // visibility on every definition. Keep the pre-existing duplicate
             // bodies so semantic consumers (e.g. Alba's evidence gate) can
@@ -287,13 +400,38 @@ impl Visibility {
             self.overrides.push((key, visibility, span));
             return Ok(());
         };
-        let [position] = positions.as_slice() else {
+        // One definition, or one per branch of a single load-time
+        // conditional that always runs a branch: whichever branch ran
+        // defined the method. A change of a method only some branches
+        // define raises NameError in Ruby when another branch ran.
+        let statement = positions.first().and_then(|p| self.alternatives.get(p)).map(|(s, _)| *s);
+        let mut branches: Vec<usize> = positions
+            .iter()
+            .filter_map(|p| self.alternatives.get(p).filter(|(s, _)| Some(*s) == statement).map(|(_, b)| *b))
+            .collect();
+        branches.sort_unstable();
+        branches.dedup();
+        let alternatives = statement.is_some() && branches.len() == positions.len();
+        if positions.len() != 1 && !alternatives {
             return Err(Self::unsupported(
                 file,
                 format!("ambiguous visibility for redefined method `{name}`"),
             ));
-        };
-        self.values.insert((*position, name), visibility);
+        }
+        if let Some(statement) = statement.filter(|_| alternatives) {
+            if self.exhaustive.get(&statement) != Some(&branches.len()) {
+                return Err(Self::unsupported(
+                    file,
+                    format!(
+                        "visibility change for `{name}`, which a load-time conditional defines in only some \
+                         branches, is not modeled"
+                    ),
+                ));
+            }
+        }
+        for position in positions.clone() {
+            self.values.insert((position, name.clone()), visibility);
+        }
         self.changed.insert(key);
         Ok(())
     }
@@ -345,10 +483,15 @@ impl Visibility {
         Ok(names)
     }
 
-    fn walk_carrier(&mut self, body: Option<Node<'_>>, file: &str) -> IngestResult<()> {
+    fn walk_carrier(&mut self, body: Option<Node<'_>>, file: &str, carrier_module: bool) -> IngestResult<()> {
         // A Concern's ClassMethods module is NOT the concern's own singleton
         // class. Their methods only share a bucket after flattening.
-        let mut carrier = Self { carrier: true, ..Self::default() };
+        let mut carrier = Self {
+            carrier: true,
+            carrier_module,
+            scope: "a concern's class-method carrier",
+            ..Self::default()
+        };
         carrier.walk(body, true, file, None)?;
         if let Some(((_, name), _, _)) = carrier.overrides.first() {
             // Its entry would belong to the carrier module, not to the
@@ -492,6 +635,133 @@ impl Visibility {
         }
     }
 
+    /// A load-time conditional definition (see the module doc): each
+    /// branch's `def` with the visibility in effect around the statement,
+    /// recorded as an alternative to the other branches' definitions.
+    fn walk_conditional(
+        &mut self,
+        node: &Node<'_>,
+        conditional: &ConditionalDefinition<'_>,
+        class_side: bool,
+        default: MethodVisibility,
+        module_function: bool,
+        file: &str,
+    ) -> IngestResult<()> {
+        if !self.conditionals {
+            let scope = if self.scope.is_empty() { "this body" } else { self.scope };
+            return Err(Self::unsupported(
+                file,
+                format!("a load-time conditional definition in {scope} is not modeled"),
+            ));
+        }
+        if module_function {
+            return Err(Self::unsupported(
+                file,
+                "a load-time conditional definition under `module_function` is not modeled",
+            ));
+        }
+        if class_side {
+            // The Ruby family writes the conditional in the class body,
+            // around `def self.x`: there `self` is the class, not the
+            // singleton the source evaluated the condition in.
+            for condition in conditional.arms.iter().filter_map(|(condition, _)| condition.as_ref()) {
+                if reads_self(condition) {
+                    return Err(Self::unsupported(
+                        file,
+                        "a load-time conditional in `class << self` whose condition reads `self` is not modeled",
+                    ));
+                }
+            }
+        }
+        let statement = node.location().start_offset();
+        if conditional.arms.last().is_some_and(|(condition, _)| condition.is_none()) {
+            self.exhaustive.insert(statement, conditional.arms.len());
+        }
+        for (arm, (_, statements)) in conditional.arms.iter().enumerate() {
+            for stmt in statements {
+                let offset = stmt.location().start_offset();
+                STATEMENT.set(Some((offset, stmt.location().end_offset())));
+                let Some(def) = definition(stmt) else {
+                    return Err(Self::unsupported(file, Self::conditional_branch_refusal(stmt)));
+                };
+                let inline = match stmt.as_call_node() {
+                    Some(call) => match constant_id_str(&call.name()) {
+                        "public" => Some(MethodVisibility::Public),
+                        "protected" => Some(MethodVisibility::Protected),
+                        "private" => Some(MethodVisibility::Private),
+                        _ => {
+                            return Err(Self::unsupported(
+                                file,
+                                "class-method visibility inside a load-time conditional definition is not modeled",
+                            ));
+                        }
+                    },
+                    None => None,
+                };
+                if super::library_class::included_hook_class_methods_body(&def).is_some() {
+                    return Err(Self::unsupported(
+                        file,
+                        "an `included` hook defined inside a load-time conditional is not modeled",
+                    ));
+                }
+                if let Some(receiver) = def.receiver() {
+                    if receiver.as_self_node().is_none() {
+                        return Err(Self::unsupported(
+                            file,
+                            "visibility of a definition on a foreign receiver is not modeled",
+                        ));
+                    }
+                    if class_side {
+                        return Err(Self::unsupported(file, "nested singleton method definition is not modeled"));
+                    }
+                }
+                let name = constant_id_str(&def.name()).to_string();
+                let side = class_side || def.receiver().is_some();
+                let key = (side, name.clone());
+                if self.accessors.remove(&key) && !self.changed.contains(&key) {
+                    self.known.remove(&key);
+                }
+                let visibility = inline.unwrap_or_else(|| {
+                    if !side && PRIVATE_HOOKS.contains(&name.as_str()) {
+                        MethodVisibility::Private
+                    } else if def.receiver().is_some() {
+                        MethodVisibility::Public
+                    } else {
+                        default
+                    }
+                });
+                self.alternatives.insert(offset, (statement, arm));
+                self.define(offset, name, side, visibility, file)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Why a branch statement other than a `def` keeps a load-time
+    /// conditional definition refused.
+    fn conditional_branch_refusal(stmt: &Node<'_>) -> &'static str {
+        if stmt.as_call_node().is_some_and(|c| c.receiver().is_none() && marker(&c)) {
+            "a visibility declaration inside a load-time conditional definition is not modeled \
+             (the visibility in effect after it would depend on the branch taken)"
+        } else if stmt.as_if_node().is_some() || stmt.as_unless_node().is_some() || stmt.as_case_node().is_some() {
+            "a conditional nested in a load-time conditional definition is not modeled"
+        } else if stmt.as_singleton_class_node().is_some() {
+            "`class << self` inside a load-time conditional definition is not modeled"
+        } else if stmt.as_constant_write_node().is_some() {
+            "a constant assigned in a load-time conditional definition is not modeled"
+        } else if wrapped_declaration(stmt).is_some()
+            || stmt.as_call_node().is_some_and(|c| {
+                c.receiver().is_none()
+                    && matches!(constant_id_str(&c.name()), "attr_reader" | "attr_writer" | "attr_accessor" | "alias_method")
+            })
+            || stmt.as_alias_method_node().is_some()
+        {
+            "an accessor or alias declared in a load-time conditional definition is not modeled"
+        } else {
+            "a load-time conditional definition whose branch holds a statement other than a `def` is not modeled"
+        }
+    }
+
     /// Walk one lexical body. A refusal keeps the innermost statement
     /// as its site; a body that walks clean hands the enclosing
     /// statement back to the caller's refusals.
@@ -619,7 +889,7 @@ impl Visibility {
             }
             if let Some(def) = def {
                 if let Some(inner) = super::library_class::included_hook_class_methods_body(&def) {
-                    self.walk_carrier(Some(inner), file)?;
+                    self.walk_carrier(Some(inner), file, false)?;
                     continue;
                 }
                 if let Some(receiver) = def.receiver() {
@@ -674,11 +944,22 @@ impl Visibility {
                 if self.carrier && class_side && sc.expression().as_self_node().is_some() {
                     // Not the includers' class side: the carrier module's
                     // own singleton, whose hooks Ruby runs when
-                    // `ActiveSupport::Concern` extends an includer with it.
+                    // `ActiveSupport::Concern` (or an authored `included`
+                    // hook) extends an includer with it. A nested `module
+                    // ClassMethods` is a module of its own: its declaration
+                    // pass resolves this singleton, its `def self.extended`
+                    // stays on it (the concern splice copies only its
+                    // instance methods), and the emitted module runs it as
+                    // Ruby does. A `class_methods do` block or a hook's
+                    // `class << base` has no module of its own to hold it.
+                    if self.carrier_module {
+                        continue;
+                    }
                     return Err(Self::unsupported(
                         file,
-                        "`class << self` in a concern's `ClassMethods` defines the carrier module's own \
-                         singleton methods (such as an `extended` hook), which are not modeled",
+                        "`class << self` in a `class_methods do` block defines the class-method carrier's \
+                         own singleton methods (such as an `extended` hook), which only a nested \
+                         `module ClassMethods` models",
                     ));
                 }
                 if class_side || sc.expression().as_self_node().is_none() {
@@ -696,8 +977,12 @@ impl Visibility {
             }
             if let Some(module) = node.as_module_node() {
                 if module_name_path(&module).as_deref() == Some(&["ClassMethods".to_string()]) {
-                    self.walk_carrier(module.body(), file)?;
+                    self.walk_carrier(module.body(), file, true)?;
                 }
+                continue;
+            }
+            if let Some(conditional) = conditional_definition(node) {
+                self.walk_conditional(node, &conditional, class_side, default, module_function, file)?;
                 continue;
             }
             let Some(call) = node.as_call_node() else {
@@ -764,7 +1049,7 @@ impl Visibility {
             // the includer's class side. Its methods are kept on the
             // concern (`walk_decl_body`), looked up by their offsets.
             if !class_side && let Some(block) = included_block_with_defs(&call) {
-                let mut block_body = Self::default();
+                let mut block_body = Self { scope: "an `included do` block", ..Self::default() };
                 block_body.walk(block.body(), false, file, None)?;
                 self.values.extend(block_body.values);
                 continue;
@@ -780,7 +1065,7 @@ impl Visibility {
             }
             if name == "class_methods" {
                 if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
-                    self.walk_carrier(block.body(), file)?;
+                    self.walk_carrier(block.body(), file, false)?;
                 }
             } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor" | "alias_method") {
                 self.declare(&call, offset, class_side, default, file)?;
@@ -790,4 +1075,21 @@ impl Visibility {
         }
         Ok(())
     }
+}
+
+/// `node` reads `self`: explicitly, or through a receiverless call.
+fn reads_self(node: &Node<'_>) -> bool {
+    struct Reads(bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads {
+        fn visit_self_node(&mut self, _node: &ruby_prism::SelfNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_call_node(&mut self, node: &CallNode<'pr>) {
+            self.0 |= node.receiver().is_none();
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut reads = Reads(false);
+    ruby_prism::Visit::visit(&mut reads, node);
+    reads.0
 }

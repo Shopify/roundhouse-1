@@ -1466,6 +1466,7 @@ end
         }
         if !methods.is_empty() {
             app.rails_application = Some(crate::dialect::LibraryClass {
+                conditional_definitions: Vec::new(),
                 method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
@@ -2928,6 +2929,16 @@ fn splice_concern_class_methods_into_includers(
         (added, provenance, carried)
     };
 
+    // Carriers with an `extended` hook of their own (`module ClassMethods;
+    // class << self; def extended(base)`), which Ruby runs when
+    // ActiveSupport::Concern extends an includer with the carrier.
+    let extended_hooks: HashSet<ClassId> = app
+        .library_classes
+        .iter()
+        .filter(|lc| lc.is_module && crate::app::class_methods_carrier_owner(&lc.name).is_some())
+        .filter(|lc| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "extended"))
+        .map(|lc| lc.name.clone())
+        .collect();
     let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::default();
     let mut carrier_splices: HashMap<ClassId, Vec<crate::app::ClassMethodsCarrierSplice>> = HashMap::default();
     for model in &mut app.models {
@@ -2935,9 +2946,20 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        // A model emits no `include`: its concerns are flattened into it,
-        // the class side as these copies.
-        let (added, provenance, _) = copies(crate::analyze::model_includes(model), taken);
+        // A model's concerns reach its class side as these copies. Only a
+        // carrier with its own `extended` hook is also extended, where
+        // ActiveSupport::Concern would extend it, so the hook runs as in
+        // Ruby; the copies stay the model's own class methods, ahead of
+        // the carrier in its singleton's ancestors.
+        let (added, provenance, carried) = copies(crate::analyze::model_includes(model), taken);
+        let hooked: Vec<crate::app::ClassMethodsCarrierSplice> = carried
+            .into_iter()
+            .filter(|splice| splice.extend && extended_hooks.contains(&splice.carrier))
+            .map(|splice| crate::app::ClassMethodsCarrierSplice { methods: Vec::new(), ..splice })
+            .collect();
+        if !hooked.is_empty() {
+            carrier_splices.insert(model.name.clone(), hooked);
+        }
         model.body.extend(added.into_iter().map(|method| ModelBodyItem::Method {
             method,
             leading_comments: Vec::new(),

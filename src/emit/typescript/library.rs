@@ -213,6 +213,7 @@ fn synthesize_module_lc(
         })
         .collect();
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: module_id,
@@ -492,6 +493,7 @@ fn collect_imports_for_function(
     // import collector verbatim. The synthesized class never reaches
     // the file output — only its method body is walked for refs.
     let synthetic_lc = LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: crate::ident::ClassId(crate::ident::Symbol::from(

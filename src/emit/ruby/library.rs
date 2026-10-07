@@ -6267,6 +6267,7 @@ fn synthesize_module_lc(
         })
         .collect();
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: module_id,
@@ -6867,84 +6868,24 @@ fn emit_library_class_decl_inner(
         writeln!(s).unwrap();
     }
 
+    // A load-time conditional definition (`ConditionalDefinitions`) is
+    // written whole, as the source has it, where its first member stands.
     let mut first = true;
+    let mut written = vec![false; lc.conditional_definitions.len()];
     for (index, m) in lc.methods.iter().enumerate() {
+        let conditional = lc.conditional_definitions.iter().position(|c| c.contains(m));
+        if let Some(at) = conditional {
+            if std::mem::replace(&mut written[at], true) {
+                continue;
+            }
+        }
         if !first {
             writeln!(s).unwrap();
         }
         first = false;
-        // An alias copy is written as the native alias, so a `super` in
-        // it keeps looking up the original's name, as in the source. The
-        // alias takes the original's visibility; a different one on the
-        // copy is a later visibility change, written after it.
-        if let Some(original) = native_alias_original(lc, index) {
-            let (to, from) = (m.name.as_str(), original.name.as_str());
-            match m.receiver {
-                MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
-                MethodReceiver::Class => {
-                    writeln!(s, "{body_pad}class << self").unwrap();
-                    writeln!(s, "{body_pad}  alias_method :{to}, :{from}").unwrap();
-                    writeln!(s, "{body_pad}end").unwrap();
-                }
-            }
-            if m.visibility != original.visibility {
-                match (m.receiver, m.visibility) {
-                    (MethodReceiver::Instance, MethodVisibility::Public) => writeln!(s, "{body_pad}public :{to}"),
-                    (MethodReceiver::Instance, MethodVisibility::Protected) => writeln!(s, "{body_pad}protected :{to}"),
-                    (MethodReceiver::Instance, MethodVisibility::Private) => writeln!(s, "{body_pad}private :{to}"),
-                    (MethodReceiver::Class, MethodVisibility::Public) => writeln!(s, "{body_pad}public_class_method :{to}"),
-                    (MethodReceiver::Class, MethodVisibility::Private) => writeln!(s, "{body_pad}private_class_method :{to}"),
-                    (MethodReceiver::Class, MethodVisibility::Protected) => {
-                        writeln!(s, "{body_pad}class << self").unwrap();
-                        writeln!(s, "{body_pad}  protected :{to}").unwrap();
-                        writeln!(s, "{body_pad}end")
-                    }
-                }
-                .unwrap();
-            }
-            continue;
-        }
-        if lc.method_aliases.iter().any(|a| a.name == m.name && a.receiver == m.receiver)
-            && contains_super(&m.body)
-        {
-            crate::emit::diagnostics::report_unsupported(
-                m.body.span,
-                "ruby",
-                "alias_method copy calling super",
-                "its original is not the def emitted before it, so it cannot be a native alias, \
-                 and a copied def would look `super` up under the alias's name",
-            );
-        }
-        let body = super::emit_method(m);
-        for line in body.lines() {
-            if line.is_empty() {
-                writeln!(s).unwrap();
-            } else {
-                writeln!(s, "{body_pad}{line}").unwrap();
-            }
-        }
-        // Named, immediately after its own def: a sticky `private` section
-        // would privatize unrelated methods once source bodies are flattened.
-        // Public needs no annotation, except for Ruby's implicitly private
-        // constructor/copy hooks when the source explicitly made one public.
-        let implicit_private = m.receiver == MethodReceiver::Instance
-            && matches!(m.name.as_str(), "initialize" | "initialize_copy" | "initialize_dup" | "initialize_clone");
-        let directive = match (m.receiver, m.visibility) {
-            (_, MethodVisibility::Public) if !implicit_private => None,
-            (MethodReceiver::Instance, MethodVisibility::Public) => Some("public"),
-            (MethodReceiver::Instance, MethodVisibility::Protected) => Some("protected"),
-            (MethodReceiver::Instance, MethodVisibility::Private) => Some("private"),
-            (MethodReceiver::Class, MethodVisibility::Private) => Some("private_class_method"),
-            (MethodReceiver::Class, MethodVisibility::Public) => None,
-            (MethodReceiver::Class, MethodVisibility::Protected) => {
-                writeln!(s, "{body_pad}class << self").unwrap();
-                writeln!(s, "{body_pad}  protected :{}", m.name).unwrap();
-                writeln!(s, "{body_pad}end").unwrap();
-                None
-            }
-        };
-        if let Some(directive) = directive {
-            writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
+        match conditional {
+            Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad),
+            None => write_library_method(&mut s, lc, index, &body_pad),
         }
     }
 
@@ -6984,6 +6925,119 @@ fn emit_library_class_decl_inner(
     }
 
     EmittedFile { path: out_path, content: s }
+}
+
+/// `lc.methods[index]`, then its visibility.
+fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pad: &str) {
+    let m = &lc.methods[index];
+    // An alias copy is written as the native alias, so a `super` in
+    // it keeps looking up the original's name, as in the source. The
+    // alias takes the original's visibility; a different one on the
+    // copy is a later visibility change, written after it.
+    if let Some(original) = native_alias_original(lc, index) {
+        let (to, from) = (m.name.as_str(), original.name.as_str());
+        match m.receiver {
+            MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
+            MethodReceiver::Class => {
+                writeln!(s, "{body_pad}class << self").unwrap();
+                writeln!(s, "{body_pad}  alias_method :{to}, :{from}").unwrap();
+                writeln!(s, "{body_pad}end").unwrap();
+            }
+        }
+        if m.visibility != original.visibility {
+            match (m.receiver, m.visibility) {
+                (MethodReceiver::Instance, MethodVisibility::Public) => writeln!(s, "{body_pad}public :{to}"),
+                (MethodReceiver::Instance, MethodVisibility::Protected) => writeln!(s, "{body_pad}protected :{to}"),
+                (MethodReceiver::Instance, MethodVisibility::Private) => writeln!(s, "{body_pad}private :{to}"),
+                (MethodReceiver::Class, MethodVisibility::Public) => writeln!(s, "{body_pad}public_class_method :{to}"),
+                (MethodReceiver::Class, MethodVisibility::Private) => writeln!(s, "{body_pad}private_class_method :{to}"),
+                (MethodReceiver::Class, MethodVisibility::Protected) => {
+                    writeln!(s, "{body_pad}class << self").unwrap();
+                    writeln!(s, "{body_pad}  protected :{to}").unwrap();
+                    writeln!(s, "{body_pad}end")
+                }
+            }
+            .unwrap();
+        }
+        return;
+    }
+    if lc.method_aliases.iter().any(|a| a.name == m.name && a.receiver == m.receiver)
+        && contains_super(&m.body)
+    {
+        crate::emit::diagnostics::report_unsupported(
+            m.body.span,
+            "ruby",
+            "alias_method copy calling super",
+            "its original is not the def emitted before it, so it cannot be a native alias, \
+             and a copied def would look `super` up under the alias's name",
+        );
+    }
+    let body = super::emit_method(m);
+    for line in body.lines() {
+        if line.is_empty() {
+            writeln!(s).unwrap();
+        } else {
+            writeln!(s, "{body_pad}{line}").unwrap();
+        }
+    }
+    // Named, immediately after its own def: a sticky `private` section
+    // would privatize unrelated methods once source bodies are flattened.
+    // Public needs no annotation, except for Ruby's implicitly private
+    // constructor/copy hooks when the source explicitly made one public.
+    let implicit_private = m.receiver == MethodReceiver::Instance
+        && matches!(m.name.as_str(), "initialize" | "initialize_copy" | "initialize_dup" | "initialize_clone");
+    let directive = match (m.receiver, m.visibility) {
+        (_, MethodVisibility::Public) if !implicit_private => None,
+        (MethodReceiver::Instance, MethodVisibility::Public) => Some("public"),
+        (MethodReceiver::Instance, MethodVisibility::Protected) => Some("protected"),
+        (MethodReceiver::Instance, MethodVisibility::Private) => Some("private"),
+        (MethodReceiver::Class, MethodVisibility::Private) => Some("private_class_method"),
+        (MethodReceiver::Class, MethodVisibility::Public) => None,
+        (MethodReceiver::Class, MethodVisibility::Protected) => {
+            writeln!(s, "{body_pad}class << self").unwrap();
+            writeln!(s, "{body_pad}  protected :{}", m.name).unwrap();
+            writeln!(s, "{body_pad}end").unwrap();
+            None
+        }
+    };
+    if let Some(directive) = directive {
+        writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
+    }
+}
+
+/// A load-time conditional definition: the source's `if` / `elsif` /
+/// `else` (or `unless` / `else`) around each branch's methods, so the
+/// branch Ruby selects when the body loads is the one that defines them.
+fn write_conditional_definitions(
+    s: &mut String,
+    lc: &LibraryClass,
+    conditional: &crate::dialect::ConditionalDefinitions,
+    body_pad: &str,
+) {
+    let inner_pad = format!("{body_pad}  ");
+    for (at, arm) in conditional.arms.iter().enumerate() {
+        let head = match (&arm.condition, at) {
+            (Some(condition), 0) => {
+                format!("{} {}", if conditional.negated { "unless" } else { "if" }, super::emit_expr(condition))
+            }
+            (Some(condition), _) => format!("elsif {}", super::emit_expr(condition)),
+            (None, _) => "else".to_string(),
+        };
+        for (n, line) in head.lines().enumerate() {
+            let pad = if n == 0 { body_pad } else { inner_pad.as_str() };
+            writeln!(s, "{pad}{line}").unwrap();
+        }
+        let mut first = true;
+        for member in &arm.methods {
+            let Some(index) = lc.methods.iter().position(|m| member.is(m)) else { continue };
+            if !first {
+                writeln!(s).unwrap();
+            }
+            first = false;
+            write_library_method(s, lc, index, &inner_pad);
+        }
+    }
+    writeln!(s, "{body_pad}end").unwrap();
 }
 
 /// The method `lc.methods[index]` is a native alias of: it is recorded

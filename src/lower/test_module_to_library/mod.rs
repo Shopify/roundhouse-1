@@ -765,6 +765,7 @@ fn build_library_class(
         methods.push(m);
     }
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: tm.name.clone(),

@@ -105,7 +105,14 @@ fn a_block_scoped_declaration_names_its_block() {
     let thing = classes.iter().find(|c| c.name.0.as_str() == "Thing").expect("Thing");
     let open = thing.methods.iter().find(|m| m.name.as_str() == "open").expect("open");
     assert_eq!(open.visibility, MethodVisibility::Public);
+    // A load-time conditional definition is modeled
+    // (tests/conditional_definitions.rs), but not a marker in its branch:
+    // the visibility after the statement would depend on the branch.
     let source = "class Thing\n  if ready\n    private\n    def hidden; 1; end\n  end\nend";
+    let error = ingest_library_class(source.as_bytes(), "thing.rb").unwrap_err().to_string();
+    assert!(error.contains("a visibility declaration inside a load-time conditional definition is not modeled"), "{error}");
+    // A marker in a branch without a `def` is still the dynamic declaration.
+    let source = "class Thing\n  if ready\n    private\n  end\n  def hidden; 1; end\nend";
     let error = ingest_library_class(source.as_bytes(), "thing.rb").unwrap_err().to_string();
     assert!(error.contains("conditional or dynamic visibility declarations"), "{error}");
 }
