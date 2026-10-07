@@ -316,7 +316,14 @@ impl<'a> BodyTyper<'a> {
         // each arm. campfire's `Opengraph::Location.new(url).then { |l|
         // l.read_html }` is the shape: without this the block parameter
         // is unbound and every read through it goes unresolved.
+        // A class that defines its own `then` is not Kernel's: promise.rb's
+        // `Promise#then` yields the fulfilled value (Core's
+        // `load_customer_tag_values.then { |owned_tags| … }`), which no
+        // signature names, so its parameters stay unbound.
         if matches!(method.as_str(), "then" | "yield_self" | "tap") {
+            if self.owns_operator(Some(recv_ty), method, false) {
+                return None;
+            }
             return Some(vec![recv_ty.clone()]);
         }
         if let Ty::Tuple { elems } = recv_ty {
