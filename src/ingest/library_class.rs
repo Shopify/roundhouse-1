@@ -2734,12 +2734,17 @@ pub const BODY_LOCAL_CONSTANT_PREFIX: &str = "RH_BODY_LOCAL_";
 
 /// `RH_BODY_LOCAL_<name>_<hash of the write's file and offset>`: unique
 /// app-wide, because the analyzer types a stored local's reads by name
-/// (`states` is a local of many GraphQL enum bodies).
+/// (`states` is a local of many GraphQL enum bodies). The file is
+/// root-relative and the hash is FNV-1a, so the name depends on neither
+/// the directory the app sits in nor the toolchain's std hasher.
 fn body_local_constant(name: &Symbol, file: &str, offset: usize) -> Symbol {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    (file, offset).hash(&mut hasher);
-    Symbol::from(format!("{BODY_LOCAL_CONSTANT_PREFIX}{}_{:08x}", name.as_str(), hasher.finish() as u32))
+    let relative = super::sources::relative_path(file);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in relative.bytes().chain([0]).chain((offset as u64).to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Symbol::from(format!("{BODY_LOCAL_CONSTANT_PREFIX}{}_{:08x}", name.as_str(), hash as u32))
 }
 
 /// The source name of a stored class-body local's constant
