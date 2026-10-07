@@ -4,9 +4,11 @@
 // runtime port and requires them equal.
 //
 // Both tests need the semian 0.28.3 gem (its compiled bulkhead ext) on
-// GEM_PATH; the adapter test also needs activerecord 8.1.4, the pg gem and a
-// local PostgreSQL server in ROUNDHOUSE_PG_TEST_URL. It creates and drops its
-// own database there.
+// GEM_PATH (both modes use Core's pinned gem home, tests/support/rails_oracle.rb);
+// the adapter test compares against the Active Record native Core runs
+// (Shopify/rails 5813559f4aed, 8.2.0.alpha; RH_RAILS_ORACLE overrides it) and
+// needs a local PostgreSQL server in ROUNDHOUSE_PG_TEST_URL. It creates and
+// drops its own database there.
 
 use std::path::Path;
 use std::process::Command;
@@ -48,7 +50,7 @@ fn semian_core_answers_like_the_gem() {
 }
 
 #[test]
-#[ignore = "needs semian 0.28.3, activerecord 8.1.4 and ROUNDHOUSE_PG_TEST_URL"]
+#[ignore = "needs semian 0.28.3, the pinned activerecord and ROUNDHOUSE_PG_TEST_URL"]
 fn semian_postgresql_adapter_answers_like_the_gem_on_rails() {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "ROUNDHOUSE_PG_TEST_URL is not set");
     let stdout = compare("adapter");
@@ -58,7 +60,15 @@ fn semian_postgresql_adapter_answers_like_the_gem_on_rails() {
         "identity => [\"ActiveRecord::ConnectionAdapters::PostgreSQLAdapter\", :postgresql_rhgood",
         "busy statement !! ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::ResourceBusyError",
         "down 2 !! ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::CircuitOpenError: [postgresql_rhdown] Semian::OpenCircuitError caused by",
+        // Rails 8.2's lifecycle: a finished session is not connected and the
+        // next statement reconnects; a terminated one is marked
+        // needs_reconnect by its FATAL result.
+        "connected after finish => [false, true]",
+        "query on finished session => :ok",
+        "query on terminated session !! ActiveRecord::ConnectionFailed: [postgresql_rhgood] FATAL:  terminating connection due to administrator command",
+        "session after termination => [false, true]",
         "reconnects inside the statement => :ok",
+        "session after reconnect => [true, false, true]",
         "recovered circuit => [true, false]",
         // database.yml session settings and pool size, as Rails applies them.
         "entry configured pool => 2",

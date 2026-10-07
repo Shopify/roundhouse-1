@@ -17,28 +17,42 @@ module Db
   TYPE_MAP_QUERY = "SELECT t.oid, t.typname, t.typelem, t.typdelim, ti.proname AS typinput " \
     "FROM pg_type as t JOIN pg_proc as ti ON ti.oid = t.typinput"
 
-  # The connection lifecycle of Rails 8.1.4's PostgreSQLAdapter
-  # (abstract_adapter.rb, postgresql_adapter.rb), one object per pooled
-  # PostgreSQL session. It is the seam a prepended adapter module wraps:
+  # The connection lifecycle of the PostgreSQLAdapter of the Rails native
+  # Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha: abstract_adapter.rb,
+  # postgresql_adapter.rb, postgresql/database_statements.rb), one object
+  # per pooled PostgreSQL session. It is the seam a prepended adapter module wraps:
   # semian's ActiveRecordAdapter overrides `connect` (each PG.connect),
   # `raw_execute` (each statement) and `active?` (each ping), exactly the
   # three members it overrides on Rails' adapter, with Rails' call graph:
   #
-  #   connect!  -> verify! -> active?, then reconnect! unless active
+  #   connect!  -> verify! -> active?, then reconnect! unless active (or
+  #                 when an error marked the session `needs_reconnect`)
   #   reconnect! -> reconnect (reset, else connect) -> configure_connection,
   #                 retrying a connection error `connection_retries` times
   #                 (default 1) with `sleep 0.1 * attempt`
   #   configure_connection -> one raw_execute per session statement
   #   raw_execute -> sql.active_record event -> with_raw_connection
-  #   with_raw_connection -> connect!/verify! when the session was lost and
-  #                 no transaction is open, then the statement; a failure
-  #                 marks the session unverified
+  #   with_raw_connection -> connect! when the session is not connected
+  #                 (none, finished, or bad) and no transaction is open;
+  #                 verify! unless verified, or used within
+  #                 `verify_timeout` (default 2 s), or not restorable;
+  #                 then the statement, sent with send_query and read
+  #                 with get_result (perform_query). A failure that is not
+  #                 a retryable query error marks the session unverified,
+  #                 and a connection error marks it `needs_reconnect`.
+  #   notice receiver -> a FATAL/PANIC notice (the server ending the
+  #                 session while it was idle) is kept, raised by the next
+  #                 statement, and marks the session `needs_reconnect`.
+  #                 Other notices are dropped, as Rails does without
+  #                 `db_warnings_action` (not modeled).
   #
   # Not modeled: lazy BEGIN (the runtime's BEGIN is its own statement),
-  # verification on pool checkout or after `verify_timeout`, query retry
-  # (`allow_retry`), Rails' transaction restoration on reconnect, and the
-  # dirty mark Rails' public `raw_connection` sets (which stops implicit
-  # reconnects until checkout).
+  # verification on pool checkout, query retry (`allow_retry`; the retry
+  # budget of every statement is 0), Rails' transaction restoration on
+  # reconnect, preconnect, the dirty mark Rails' public `raw_connection`
+  # sets (which stops implicit reconnects until checkout), and Rails'
+  # redundant-SET elision in configure_connection (the settings a session
+  # ends with are the same; only SCHEMA statements differ).
   module ConnectionLifecycle
     # Statements after which no transaction is open, whatever their
     # outcome (Rails pops the transaction when COMMIT/ROLLBACK fails).
@@ -62,6 +76,9 @@ module Db
       @connection_parameters = conn_params
       @raw_connection = nil
       @verified = false
+      @needs_reconnect = false
+      @last_activity = nil
+      @notice_receiver_fatal_error = nil
       @transaction_open = false
       @search_path = nil
       @rh_pg_changes = 0
@@ -69,7 +86,19 @@ module Db
     end
 
     def connected?
-      !@raw_connection.nil?
+      !(@raw_connection.nil? || @raw_connection.finished? || @raw_connection.status != PG::CONNECTION_OK)
+    end
+
+    def verified?
+      @verified
+    end
+
+    def needs_reconnect?
+      @needs_reconnect
+    end
+
+    def seconds_since_last_activity
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - @last_activity if @raw_connection && @last_activity
     end
 
     def connect!
@@ -78,37 +107,40 @@ module Db
     end
 
     def verify!
-      reconnect! unless active?
+      reconnect! if @needs_reconnect || !active?
+      @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       @verified = true
     end
 
     def active?
-      return false unless @raw_connection
+      return false unless connected?
       @raw_connection.query(";").clear
-      @verified = true
+      verified!
       true
     rescue PG::Error
       false
     end
 
     def reconnect!
-      retries_available = connection_retries
+      retries_remaining = connection_retries
       deadline = retry_deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) + retry_deadline
       attempt_configure_connection do
         begin
           reconnect
+          @needs_reconnect = false
+          @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           @verified = true
           @transaction_open = false
           configure_connection
         rescue => original_exception
           translated_exception = Db.translate_exception_class(original_exception, nil, [])
-          retry_deadline_exceeded = deadline && deadline < Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          if !retry_deadline_exceeded && retries_available > 0
-            retries_available -= 1
-            if retryable_connection_error?(translated_exception)
-              backoff(connection_retries - retries_available)
-              retry
-            end
+          # Rails' RetryBudget: `connection_retries` attempts within the
+          # deadline, each after `sleep 0.1 * attempts used`.
+          if retryable_connection_error?(translated_exception) && retries_remaining > 0 &&
+              !(deadline && deadline < Process.clock_gettime(Process::CLOCK_MONOTONIC))
+            retries_remaining -= 1
+            backoff(connection_retries - retries_remaining)
+            retry
           end
           raise translated_exception
         end
@@ -118,6 +150,8 @@ module Db
 
     def disconnect!
       @verified = false
+      @needs_reconnect = false
+      @last_activity = nil
       @transaction_open = false
       begin
         @raw_connection&.close
@@ -125,6 +159,7 @@ module Db
         nil
       end
       @raw_connection = nil
+      @notice_receiver_fatal_error = nil
     end
 
     # Rails' discard!: after fork, redirect only the child's descriptor
@@ -159,19 +194,49 @@ module Db
       !@transaction_open
     end
 
+    # Rails 8.2's perform_query: a FATAL notice kept since the last
+    # statement is raised first; then the statement is sent and every
+    # result read, a connection-terminating error result raising at once,
+    # and the last result checked. A success verifies the session.
+    def perform_query(conn, sql, binds = nil, prepared: nil)
+      if (fatal = consume_notice_receiver_fatal_error)
+        raise fatal
+      end
+      conn.discard_results
+      if prepared
+        conn.send_query_prepared(prepared, binds || [])
+      elsif binds && !binds.empty?
+        conn.send_query_params(sql, binds)
+      else
+        conn.send_query(sql)
+      end
+      result = nil
+      while (incoming = conn.get_result)
+        result&.clear
+        result = incoming
+        result.check if result.result_status == PG::PGRES_FATAL_ERROR && Db.connection_terminating_severity?(result)
+      end
+      result&.check
+      verified!
+      result
+    end
+
     private
 
+    # Rails' with_raw_connection(allow_retry: false): its retry budget is
+    # empty, so a failure is raised after downgrading the session.
     def with_raw_connection(sql = nil, binds = [])
-      connect! if @raw_connection.nil? && reconnect_can_restore_state?
-      verify! if !@verified && reconnect_can_restore_state?
+      ensure_connection_ready
       observe_transaction_state
       begin
         yield @raw_connection
       rescue => original_exception
         translated_exception = Db.translate_exception_class(original_exception, sql, binds)
-        @verified = false unless retryable_query_error?(translated_exception)
+        downgrade_connection_after_error(translated_exception)
         raise translated_exception
       rescue Exception
+        # A non-StandardError (Timeout) abandoned the statement partway.
+        @last_activity = nil
         @verified = false
         raise
       ensure
@@ -179,18 +244,85 @@ module Db
       end
     end
 
+    # Rails' ensure_connection_ready and skip_verification? (allow_retry:
+    # false).
+    def ensure_connection_ready
+      connect! if !connected? && reconnect_can_restore_state?
+      reconnectable = reconnect_can_restore_state?
+      verify! unless skip_verification?(reconnectable)
+      reconnectable
+    end
+
+    def skip_verification?(reconnectable)
+      if @verified && connected? && !@needs_reconnect
+        true
+      elsif !@needs_reconnect && (last_activity = seconds_since_last_activity) && last_activity < verify_timeout
+        true
+      else
+        !reconnectable
+      end
+    end
+
+    def downgrade_connection_after_error(exception)
+      return if retryable_query_error?(exception)
+      @last_activity = nil
+      @verified = false
+      @needs_reconnect = true if retryable_connection_error?(exception)
+    end
+
+    def verified!
+      @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      @verified = true
+    end
+
+    # Rails 8.2's notice receiver (installed by configure_connection).
+    def install_notice_receiver(conn)
+      @notice_receiver_fatal_error = nil
+      conn.set_notice_receiver { |result| capture_fatal_notice(result) }
+    end
+
+    def capture_fatal_notice(result)
+      return false unless Db.connection_terminating_severity?(result)
+      begin
+        result.check
+      rescue PG::Error => error
+        # The result is cleared when the receiver returns; the error keeps
+        # a snapshot of its fields.
+        snapshot = Db::ErrorResultSnapshot.new(result)
+        error.define_singleton_method(:result) { snapshot }
+        @notice_receiver_fatal_error = error
+      end
+      @last_activity = nil
+      @verified = false
+      @needs_reconnect = true
+      true
+    end
+
+    def consume_notice_receiver_fatal_error
+      consumed, @notice_receiver_fatal_error = @notice_receiver_fatal_error, nil
+      consumed
+    end
+
     # libpq tracks the transaction state locally, so it is current until a
     # failed exchange marks the session bad; then the last observation is
-    # what the session held.
+    # what the session held. A command still in flight (ACTIVE: a
+    # statement raised before its results were drained, as Rails 8.2's
+    # get_result does on a session-ending error) says nothing about the
+    # transaction, so it keeps the last observation too.
     def observe_transaction_state
       conn = @raw_connection
       return if conn.nil? || conn.finished? || conn.status != PG::CONNECTION_OK
       status = conn.transaction_status
-      @transaction_open = status == PG::PQTRANS_INTRANS || status == PG::PQTRANS_INERROR || status == PG::PQTRANS_ACTIVE
+      return if status == PG::PQTRANS_ACTIVE
+      @transaction_open = status == PG::PQTRANS_INTRANS || status == PG::PQTRANS_INERROR
     end
 
     def connection_retries
       (@config[:connection_retries] || 1).to_i
+    end
+
+    def verify_timeout
+      (@config[:verify_timeout] || 2).to_i
     end
 
     def retry_deadline
@@ -203,14 +335,16 @@ module Db
         (defined?(ActiveRecord::ConnectionFailed) && exception.is_a?(ActiveRecord::ConnectionFailed))
     end
 
-    # Rails' PostgreSQLAdapter override over AbstractAdapter's. It reads
-    # the session's transaction status first, so on a session the client
-    # itself finished that read raises PG::ConnectionBad out of
-    # with_raw_connection's rescue (cause: the statement's error),
-    # untranslated and leaving the session verified, as in Rails.
+    # Rails' PostgreSQLAdapter override over AbstractAdapter's: nothing is
+    # retryable inside a failed transaction. A session the client itself
+    # finished has no status to read and is not in one.
     def retryable_query_error?(exception)
-      @raw_connection&.transaction_status != ::PG::PQTRANS_INERROR &&
-        retryable_query_error_class?(exception)
+      in_failed_transaction = begin
+        @raw_connection&.transaction_status == ::PG::PQTRANS_INERROR
+      rescue PG::ConnectionBad
+        false
+      end
+      !in_failed_transaction && retryable_query_error_class?(exception)
     end
 
     def retryable_query_error_class?(exception)
@@ -242,7 +376,8 @@ module Db
       raise
     end
 
-    # Rails 8.1.4's PostgreSQLAdapter#configure_connection, from the
+    # Rails' PostgreSQLAdapter#configure_connection (8.1.4's statements;
+    # 8.2 skips the SETs the session already has, see above), from the
     # adapter's configuration (a resolved database.yml entry), in Rails'
     # order and each setting a statement of its own as its internal_execute.
     # A reset session has lost its prepared statements. Rails' own type
@@ -251,11 +386,12 @@ module Db
       @raw_connection.instance_variable_set(:@rh_pg_cache, {})
       check_version
       @raw_connection.set_client_encoding(@config[:encoding]) if @config[:encoding]
+      install_notice_receiver(@raw_connection)
       session_statement("SET client_min_messages TO '#{@config[:min_messages] || "warning"}'")
       if (path = @search_path)
         # Db's own search path (the schema manifest's), a value.
         sql = "SELECT pg_catalog.set_config('search_path', $1, false)"
-        raw_execute(sql, "SCHEMA", [path]) { |conn| conn.exec_params(sql, [path]).clear }
+        raw_execute(sql, "SCHEMA", [path]) { |conn| perform_query(conn, sql, [path]).clear }
       elsif (path = @config[:schema_search_path] || @config[:schema_order])
         # Rails' schema_search_path=: the configured list as SQL.
         session_statement("SET search_path TO #{path}")
@@ -299,7 +435,7 @@ module Db
     end
 
     def session_statement(sql)
-      raw_execute(sql, "SCHEMA") { |conn| conn.exec(sql).clear }
+      raw_execute(sql, "SCHEMA") { |conn| perform_query(conn, sql).clear }
     end
 
     # Rails' PostgreSQL quote for the value classes a configuration holds.
@@ -347,7 +483,7 @@ module Db
   # connection string.
   #
   # The pool holds `pool_size:` adapters when given; otherwise the entry's
-  # `max_connections` or `pool` as Rails 8.1.4's HashConfig#max_connections
+  # `max_connections` or `pool` as Rails' HashConfig#max_connections
   # reads them (both set and different, or `pool` with `min_connections`,
   # is Rails' ambiguity error); otherwise Rails' 5 for a Hash entry and
   # `default_pool_size` for a connection string. Every adapter connects
@@ -388,7 +524,8 @@ module Db
     nil
   end
 
-  # Rails 8.1.4 HashConfig#max_connections: `max_connections`, else `pool`,
+  # Rails' HashConfig#max_connections (8.1.4 and 8.2.0.alpha alike):
+  # `max_connections`, else `pool`,
   # as an Integer; nil when neither is set (the caller's default applies).
   # A negative value (Rails' unbounded pool) cannot be held by an eagerly
   # connected pool, so it is refused.
@@ -548,7 +685,7 @@ module Db
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
-    result = adapter.raw_execute(sql) { |conn| conn.exec(sql) }
+    result = adapter.raw_execute(sql) { |conn| adapter.perform_query(conn, sql) }
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     nil
   ensure
@@ -561,7 +698,7 @@ module Db
     record_query(sql)
     context[:cache]&.clear
     adapter = current_adapter
-    result = adapter.raw_execute(sql) { |conn| conn.exec(sql) }
+    result = adapter.raw_execute(sql) { |conn| adapter.perform_query(conn, sql) }
     raise "INSERT RETURNING must produce one key" unless result.ntuples == 1 && result.nfields == 1
     adapter.instance_variable_set(:@rh_pg_changes, result.cmd_tuples)
     Integer(result.getvalue(0, 0))
@@ -577,19 +714,47 @@ module Db
     current_adapter.instance_variable_get(:@rh_pg_changes)
   end
 
-  # Rails' PostgreSQLAdapter#translate_exception. A driver error without
-  # a SQLSTATE is about the session, not the statement: "connection is
-  # closed" / "no connection to the server" and pg-internal ConnectionBad
-  # are ConnectionNotEstablished, and a libpq ConnectionBad (its message
-  # ends in a newline: the server may have run part of the statement) is
-  # ConnectionFailed. Their message is the driver error itself.
+  # Rails 8.2's ErrorResultSnapshot: the error fields of a notice result,
+  # which libpq clears when the notice receiver returns.
+  class ErrorResultSnapshot
+    def initialize(result)
+      @fields = PG.constants.grep(/\APG_DIAG_/).map { |name| PG.const_get(name) }
+        .each_with_object({}) { |field, out| out[field] = result.error_field(field) }
+      @error_message = result.error_message
+    end
+
+    def error_field(field)
+      @fields[field]
+    end
+    alias_method :result_error_field, :error_field
+
+    attr_reader :error_message
+    alias_method :result_error_message, :error_message
+  end
+
+  # Rails 8.2's connection_terminating_severity?.
+  def self.connection_terminating_severity?(result)
+    severity = result&.error_field(PG::PG_DIAG_SEVERITY_NONLOCALIZED)
+    severity == "FATAL" || severity == "PANIC"
+  end
+
+  # Rails 8.2's PostgreSQLAdapter#translate_exception. A driver error
+  # without a SQLSTATE is about the session, not the statement:
+  # "connection is closed" / "no connection to the server" and pg-internal
+  # ConnectionBad (or any driver error on a bad session) are
+  # ConnectionNotEstablished, and a libpq one (its message ends in a
+  # newline: the server may have run part of the statement) is
+  # ConnectionFailed. Their message is the driver error itself. A server
+  # error ending the session (FATAL/PANIC, e.g. pg_terminate_backend) is
+  # ConnectionFailed too.
   def self.translate(error, sql, binds = [])
     return error unless defined?(ActiveRecord::StatementInvalid)
     state = error.result&.error_field(PG::Result::PG_DIAG_SQLSTATE)
     if state.nil? && defined?(ActiveRecord::ConnectionNotEstablished)
       if error.message.match?(/connection is closed/i) || error.message.match?(/no connection to the server/i)
         return ActiveRecord::ConnectionNotEstablished.new(error)
-      elsif error.is_a?(PG::ConnectionBad)
+      elsif error.is_a?(PG::ConnectionBad) ||
+          (error.is_a?(PG::Error) && error.connection&.status == PG::CONNECTION_BAD)
         if error.message.end_with?("\n") && defined?(ActiveRecord::ConnectionFailed)
           return ActiveRecord::ConnectionFailed.new(error, sql: sql, binds: binds.dup)
         end
@@ -599,9 +764,15 @@ module Db
     class_name = {
       "23505" => :RecordNotUnique, "23502" => :NotNullViolation,
       "23503" => :InvalidForeignKey, "23514" => :CheckViolation,
+      "23P01" => :ExclusionViolation, "22001" => :ValueTooLong,
+      "22003" => :RangeError, "42P04" => :DatabaseAlreadyExists,
       "40001" => :SerializationFailure, "40P01" => :Deadlocked,
       "55P03" => :LockWaitTimeout, "57014" => :QueryCanceled
     }.fetch(state, :StatementInvalid)
+    if class_name == :StatementInvalid && connection_terminating_severity?(error.result) &&
+        defined?(ActiveRecord::ConnectionFailed)
+      return ActiveRecord::ConnectionFailed.new(error, sql: sql, binds: binds.dup)
+    end
     klass = ActiveRecord.const_defined?(class_name) ? ActiveRecord.const_get(class_name) : ActiveRecord::StatementInvalid
     klass.new("#{error.class}: #{error.message}", sql: sql, binds: binds.dup)
   end
@@ -675,7 +846,7 @@ module Db
     record_query(sql)
     result = adapter.raw_execute(sql, "SQL", binds) do |conn|
       if binds.empty?
-        conn.exec(sql)
+        adapter.perform_query(conn, sql)
       else
         cache = conn.instance_variable_get(:@rh_pg_cache)
         name = cache.delete(sql)
@@ -690,7 +861,7 @@ module Db
           conn.prepare(name, sql).clear
         end
         cache[sql] = name
-        conn.exec_prepared(name, binds)
+        adapter.perform_query(conn, sql, binds, prepared: name)
       end
     end
     handle[:result] = result

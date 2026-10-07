@@ -3,7 +3,8 @@
 #
 #   ruby tests/semian_runtime.rb native core      the gem: require "semian"
 #   ruby tests/semian_runtime.rb emitted core     the port
-#   ruby tests/semian_runtime.rb native adapter   activerecord 8.1.4's PostgreSQLAdapter
+#   ruby tests/semian_runtime.rb native adapter   the PostgreSQLAdapter of the Rails native Core runs
+#                                                 (tests/support/rails_oracle.rb)
 #                                                 + semian/rails + semian/activerecord_postgresql_adapter
 #   ruby tests/semian_runtime.rb emitted adapter  the tree's Db + PostgreSQLAdapter + the port
 #   ruby tests/semian_runtime.rb compare core|adapter
@@ -15,6 +16,7 @@
 # 127.0.0.1. Every process uses its own Semian.namespace, so its SysV
 # semaphores are its own, and destroys its resources before it exits.
 require "socket"
+require_relative "support/rails_oracle"
 
 MODE, PART = ARGV
 CORE_ENVIRONMENTS = [
@@ -31,7 +33,9 @@ if MODE == "compare"
   lines = 0
   environments.each do |env|
     outputs = ["native", "emitted"].map do |mode|
-      stdout, stderr, status = Open3.capture3(env, RbConfig.ruby, __FILE__, mode, PART)
+      # The emitted side loads semian's compiled ext (and pg) from the
+      # pinned gem home too; the native side re-executes into the oracle.
+      stdout, stderr, status = Open3.capture3(RailsOracle.core_gems_env.merge(env), RbConfig.ruby, __FILE__, mode, PART)
       abort "#{mode} #{PART} #{env.keys.join(",")}: #{stderr}#{stdout}" unless status.success?
       stdout
     end
@@ -47,7 +51,7 @@ if MODE == "compare"
   end
   if PART == "core"
     # The port refuses the circuit breakers it does not model.
-    stdout, stderr, status = Open3.capture3(RbConfig.ruby, __FILE__, "emitted", "unsupported")
+    stdout, stderr, status = Open3.capture3(RailsOracle.core_gems_env, RbConfig.ruby, __FILE__, "emitted", "unsupported")
     abort "emitted unsupported: #{stderr}" unless status.success?
     puts stdout
   end
@@ -264,9 +268,12 @@ end
 module NativeSide
   ADAPTERS = {}
 
+  # Before anything else in the process: activation may re-execute it.
+  def self.activate
+    RailsOracle.activate("activerecord", semian: "0.28.3")
+  end
+
   def self.load
-    gem "activerecord", "8.1.4"
-    gem "semian", "0.28.3"
     require "active_record"
     require "active_record/connection_adapters/postgresql_adapter"
     require "semian"
@@ -312,6 +319,8 @@ module NativeSide
 end
 
 module EmittedSide
+  def self.activate; end
+
   def self.load
     require "pg"
     root = File.expand_path("..", __dir__)
@@ -354,6 +363,7 @@ module EmittedSide
 end
 
 def run_adapter(side)
+  side.activate
   admin, endpoint = admin_options
   database = "roundhouse_semian_#{Process.pid}"
   missing = "roundhouse_semian_missing_#{Process.pid}"
@@ -394,27 +404,31 @@ def run_adapter(side)
     show("bad sql") { side.run("good", "SELECT * FROM no_such_table") }
     show("after bad sql") { [side.run("good", "SELECT 2"), good.semian_resource.closed?] }
     flush("bad sql")
-    # A session the client itself finished: Rails' retryable_query_error?
-    # reads its transaction status and raises PG::ConnectionBad again, so
-    # the session stays verified and is never reconnected implicitly.
+    # A session the client itself finished: Rails 8.2's connected? is false
+    # for it, so the next statement reconnects first and succeeds (8.1.4
+    # raised PG::ConnectionBad out of retryable_query_error? instead).
     # The session is reached through the adapter's ivar: Rails' public
     # `raw_connection` marks the adapter dirty, which disables reconnects
     # (not modeled by the runtime, see BOOT_BOUNDARIES.md).
     session = -> { good.instance_variable_get(:@raw_connection) }
     show("finished session") { session.call.finish }
+    show("connected after finish") { [good.connected?, good.verified?] }
     show("query on finished session") { side.run("good", "SELECT 3") }
     show("circuit after finish") { [good.semian_resource.closed?, good.semian_resource.circuit_breaker.last_error&.class&.name] }
     show("finished session again") { side.run("good", "SELECT 3") }
     show("explicit reconnect") { good.reconnect!; good.active? }
     flush("finished session", skip_query_success: true)
     sleep 0.6 # the two errors leave the breaker's error_timeout window
-    # A session the server terminated: the statement's failure marks the
-    # session unverified, and the next statement reconnects.
+    # A session the server terminated: Rails 8.2 reads the server's FATAL
+    # result (PG::AdminShutdown, a ConnectionFailed), marks the session
+    # needs_reconnect, and the next statement reconnects.
     show("terminate backend") { admin.exec("SELECT pg_terminate_backend($1)", [session.call.backend_pid]).getvalue(0, 0) }
     sleep 0.2
     show("query on terminated session") { side.run("good", "SELECT 4") }
     show("circuit after termination") { [good.semian_resource.closed?, good.semian_resource.circuit_breaker.last_error&.class&.name] }
+    show("session after termination") { [good.verified?, good.needs_reconnect?] }
     show("reconnects inside the statement") { side.run("good", "SELECT 4") }
+    show("session after reconnect") { [good.verified?, good.needs_reconnect?, good.connected?] }
     flush("terminated session", skip_query_success: true)
     sleep 0.6
     show("held ticket") do
@@ -502,7 +516,7 @@ end
 
 case [MODE, PART]
 when ["native", "core"]
-  gem "semian", "0.28.3"
+  RailsOracle.activate(semian: "0.28.3")
   require "semian"
   run_core
 when ["emitted", "core"]
