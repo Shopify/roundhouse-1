@@ -4,7 +4,7 @@
 //! plain reopen or inside the `ActiveSupport.on_load` block the app
 //! defers it with.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{Analyzer, DiagnosticKind, diagnose};

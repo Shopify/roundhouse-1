@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::expr::{
     Arm, BoolOpKind, Expr, ExprNode, InterpPart, IrHint, LValue, Literal, OpAssignOp, Pattern,
@@ -24,17 +24,17 @@ use super::ty::kotlin_ty;
 thread_local! {
     /// Local names already declared in the current method body (so the
     /// first `Assign` emits `val`/`var` and later ones emit bare `=`).
-    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Local names assigned more than once → declared `var` (else `val`).
-    static REASSIGNED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static REASSIGNED: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// For locals first assigned `nil`, the nullable Kotlin type taken
     /// from a later non-nil assignment — so `var x = null` (which Kotlin
     /// infers as `Nothing?`) becomes `var x: T? = null`.
-    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// For locals first assigned an empty `{}`/`[]`, the element type
     /// inferred from later `map[k]=v` / `list << x` — so the empty literal
     /// gets a precise declared type instead of `<Any?>`.
-    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// When set, `return` emits `return@<label>` — used for `initialize`
     /// bodies wrapped in `run { }` (Kotlin `init` blocks can't `return`).
     static RETURN_LABEL: RefCell<Option<&'static str>> = const { RefCell::new(None) };
@@ -47,28 +47,28 @@ thread_local! {
     /// a Kotlin property read only when its name is in here; everything else
     /// is a method call needing `()`. Empty for `object`s (modules), whose
     /// self-sends are always method calls.
-    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased parameter names of the method currently being emitted. A
     /// zero-arg, no-receiver `Send` whose name is in here is a reference to
     /// the parameter, not a self-method call — emit the bare identifier
     /// without `()`. (The view lowerer represents a partial local like
     /// `article` as a bare implicit-self `Send` in argument position but as
     /// a `Var` in receiver position; this reconciles the two.)
-    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Instance property name → declared `Ty`, so a `self.col = <Any?>`
     /// write (the `assign_from_row`/`initialize`/`update` column shape,
     /// where the RHS is an untyped `row[k]`/`attrs[k]` lookup) can coerce
     /// the value to the column's scalar type. Kotlin won't assign `Any?`
     /// to a `Long`/`String` slot. Set per class beside `INSTANCE_PROPS`.
     static INSTANCE_PROP_TYPES: RefCell<HashMap<String, crate::ty::Ty>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Object.prop"` keys for module/object-level accessor properties
     /// (`class << self; attr_accessor :adapter` → `ActiveRecord.adapter`).
     /// A `Const`-receiver zero-arg send keyed here reads as a property
     /// (`ActiveRecord.adapter`) instead of a call. Populated by a pre-scan
     /// of all runtime classes before rendering (see
     /// `library::register_object_accessors`).
-    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Name of the class currently being emitted, so an implicit-self
     /// `new(attrs)` (a companion factory like `Base.create`) resolves to
     /// the Kotlin constructor `Base(attrs)`. Empty for object/module emit.
@@ -79,7 +79,7 @@ thread_local! {
     /// members it inherits (Kotlin requires explicit `override`, unlike
     /// TS/Crystal). See `library::register_class_hierarchy`.
     static CLASS_HIERARCHY: RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Class simple name → camelCased names of its *zero-arg instance
     /// methods* (excludes `attr_*` / body-ivar properties). A zero-arg send
     /// to a typed-`Class` receiver whose member is in this set (walking
@@ -88,7 +88,7 @@ thread_local! {
     /// (has-many loader method) emit `article.comments()` while
     /// `article.title` (column property) stays `article.title`.
     static CLASS_INSTANCE_METHODS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Receiver.method"` → the callee's camelCased parameter names. Used
     /// to decide whether a call-site `kwargs:true` hash splats into Kotlin
     /// named arguments (`truncate(body, length = 100)`, when the keys are a
@@ -97,7 +97,7 @@ thread_local! {
     /// hand-written `Broadcasts` primitive) falls back to the map literal —
     /// the safe default.
     static METHOD_PARAMS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Full `var <name>: <T> = <default>` declarations for locals whose
     /// first assignment is inside a nested scope (an `if`/loop/block) yet are
     /// also assigned at an outer level — Kotlin would scope the in-branch
@@ -109,14 +109,14 @@ thread_local! {
     /// `if (!prop.nil?)` guard — read with a `!!` so Kotlin accepts them in a
     /// non-null position (it won't smart-cast a mutable property). Scoped to
     /// the guarded branch by `emit_if`.
-    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased `@ivar` names of the current `object`/module that hold
     /// mutable singleton state (e.g. ViewHelpers' `@slots` content_for store).
     /// In a concurrent server (Javalin dispatches each request on its own
     /// thread) such process-global state would bleed across requests, so it's
     /// emitted as a `ThreadLocal`: reads become `name.get()`, whole-reassigns
     /// `name.set(…)`. Empty for instance classes (their ivars are per-object).
-    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
 }
 
 /// Install the current object's thread-local field names (see
@@ -475,7 +475,7 @@ pub(super) fn register_class_hierarchy(name: &str, parent: Option<&str>, members
 /// to get the set a member must be in to need an `override` modifier.
 /// Unknown classes (e.g. `RuntimeException`) contribute nothing.
 pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -502,7 +502,7 @@ pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
 /// (a property defined on `ActionController::Base`) must read as a property,
 /// not a `()` call, even though it isn't in the subclass's own prop set.
 pub(super) fn ancestor_props(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -600,8 +600,8 @@ pub(super) fn set_returns_unit(b: bool) {
 /// reassignment counts. Called by `library::emit_method` before the body
 /// is rendered.
 pub(super) fn begin_method(body: &Expr) {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut nil_types: HashMap<String, String> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut nil_types: HashMap<String, String> = HashMap::default();
     count_assigns(body, &mut counts, &mut nil_types);
     DECLARED.with(|d| d.borrow_mut().clear());
     REASSIGNED.with(|r| {
@@ -616,7 +616,7 @@ pub(super) fn begin_method(body: &Expr) {
     NIL_TYPES.with(|t| *t.borrow_mut() = nil_types);
     set_return_label(None);
 
-    let mut container_types: HashMap<String, String> = HashMap::new();
+    let mut container_types: HashMap<String, String> = HashMap::default();
     scan_container_types(body, &mut container_types);
     CONTAINER_TYPES.with(|t| *t.borrow_mut() = container_types);
 

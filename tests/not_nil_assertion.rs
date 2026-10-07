@@ -2,7 +2,7 @@
 //! Analysis types it so; which trees can run it is `project`'s refusal
 //! (see `tests/not_nil_type_toolkit.rs`, which runs the emitted call).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

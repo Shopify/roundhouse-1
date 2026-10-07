@@ -15,7 +15,7 @@
 //! nothing for it to attach to). So there is no arity to detect and no
 //! model to choose.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

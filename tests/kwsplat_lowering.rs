@@ -104,9 +104,9 @@ end
 /// Restoring `**payload` would move the Hash from `items` onto `opts`.
 #[test]
 fn a_positional_rest_beside_keyword_rest_is_not_an_erased_splat() {
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define(version: 1) do\n  create_table :rooms do |t|\n    t.string :name\n  end\nend\n".to_vec(),
@@ -453,9 +453,9 @@ end
 /// their literal defaults in hand.
 #[test]
 fn a_test_classs_own_helper_forwarding_a_splat_expands_against_the_class() {
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define(version: 1) do\n  create_table :rooms do |t|\n    t.string :name\n  end\nend\n".to_vec(),
@@ -511,9 +511,9 @@ end
 /// campfire's `embeds_from(**details)` → `attachments_for(details)`.
 #[test]
 fn a_splat_into_keyword_rest_is_restored() {
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define(version: 1) do\n  create_table :rooms do |t|\n    t.string :name\n  end\nend\n".to_vec(),
@@ -583,9 +583,9 @@ end
 /// become `**h`; a consuming `**rest` still flattens to `name = {}`.
 #[test]
 fn a_splat_into_a_forwarding_keyword_rest_is_restored() {
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define(version: 1) do\n  create_table :rooms do |t|\n    t.string :name\n  end\nend\n".to_vec(),

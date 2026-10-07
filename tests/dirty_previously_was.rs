@@ -14,7 +14,7 @@
 //! hydration factories now call `_note_hydrated`, whose Base no-op is
 //! what the strict lanes compile.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

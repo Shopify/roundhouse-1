@@ -7,7 +7,7 @@
 //! DomainSubscription?" -- 38 errors on core, and 783 models declare
 //! their table this way.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

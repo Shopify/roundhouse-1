@@ -10,7 +10,7 @@
 //! guessed. `to_s` is the one that punishes guessing: it delegates to
 //! `inspect` and answers `#<Mode::Fill>`, NOT the serialized value.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

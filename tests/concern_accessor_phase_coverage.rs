@@ -3,7 +3,7 @@
 
 use roundhouse::ingest::ingest_app_from_tree;
 
-fn files(include: &str) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+fn files(include: &str) -> roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> {
     [
         (
             "db/schema.rb",
@@ -100,7 +100,7 @@ fn duplicate_model_names_cannot_advertise_a_fresh_accessor() {
 
 #[test]
 fn lexical_constant_resolution_preserves_post_analysis_ownership() {
-    fn input(include: &str) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+    fn input(include: &str) -> roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> {
         let mut input = files("");
         input.insert("app/services/labels.rb".into(),
             b"class Label\n  def self.value\n    [1]\n  end\nend\nmodule API\n  class Label\n    def self.value\n      'lexical'\n    end\n  end\nend\n".to_vec());
@@ -125,7 +125,7 @@ fn lexical_constant_resolution_preserves_post_analysis_ownership() {
 
 #[test]
 fn accessor_typing_must_not_be_replaced_by_an_inherited_reader() {
-    fn inherited(include: &str) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+    fn inherited(include: &str) -> roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> {
         let mut input = files(include);
         input.insert("app/models/widget_base.rb".into(),
             b"class WidgetBase < ApplicationRecord\n  self.abstract_class = true\n  def scratch\n    [1]\n  end\nend\n".to_vec());
@@ -159,7 +159,7 @@ fn accessor_typing_must_not_be_replaced_by_an_inherited_reader() {
 
 #[test]
 fn a_late_user_override_cannot_hide_preload_ownership() {
-    fn input(include: &str) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+    fn input(include: &str) -> roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> {
         [
             ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :messages do |t|\n    t.string :body\n    t.integer :message_id\n  end\nend\n".to_string()),
             ("app/models/concerns/virtual.rb", "module Virtual\n  extend ActiveSupport::Concern\n  included { attr_accessor :_preload_message }\nend\n".to_string()),

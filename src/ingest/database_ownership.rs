@@ -26,7 +26,7 @@
 //! role or shard switch (`connected_to`, `connecting_to`,
 //! `while_preventing_writes`) anywhere in the app is refused at its call.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::database::{DatabaseRefusal, ModelDatabase};
 use crate::dialect::{MethodReceiver, Model, ModelBodyItem};

@@ -7,7 +7,7 @@
 //! Inline MapVfs app so the fixture stays next to the assertions —
 //! tiny-blog/real-blog deliberately keep their emit-stable shapes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

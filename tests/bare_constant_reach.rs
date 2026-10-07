@@ -10,7 +10,7 @@
 //! `Monorail.track(...)` (the gem's `Monorail`) was typed as that
 //! unrelated class, and the calls failed against its methods.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

@@ -1,7 +1,7 @@
 //! The static part of Writebook's Positionable concern. Whole ordering,
 //! locking and rebalance compatibility are separate runtime obligations.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodReceiver, MethodVisibility, ModelBodyItem};
@@ -92,7 +92,7 @@ fn unexpanded(app: &roundhouse::App, name: &str) -> usize {
 
 #[test]
 fn rejected_recognized_macro_is_strict_error_but_survey_retains_source_body() {
-    let files = HashMap::from([
+    let files = HashMap::from_iter([
         (PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define do\n  create_table :leaves do |t|; t.string :title; end\nend\n".to_vec()),
         (PathBuf::from("app/models/concerns/positionable.rb"), POSITIONABLE.as_bytes().to_vec()),
         (PathBuf::from("app/models/leaf.rb"), b"class Leaf < ApplicationRecord\n  include Positionable\n  positioned_within :book, association: :leaves\nend\n".to_vec()),
@@ -118,7 +118,7 @@ fn rejected_recognized_macro_is_strict_error_but_survey_retains_source_body() {
     assert!(instances(&surveyed, "Leaf").is_empty());
     assert!(!survey::is_active());
 
-    let valid = HashMap::from([
+    let valid = HashMap::from_iter([
         (PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define do\n  create_table :leaves do |t|; t.string :title; end\nend\n".to_vec()),
         (PathBuf::from("app/models/concerns/positionable.rb"), POSITIONABLE.as_bytes().to_vec()),
         (PathBuf::from("app/models/leaf.rb"), b"class Leaf < ApplicationRecord\n  include Positionable\n  positioned_within :book, association: :leaves, filter: :active\nend\n".to_vec()),

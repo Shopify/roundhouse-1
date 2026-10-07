@@ -42,7 +42,7 @@ const ATTR_METHODS: &[&str] = &[
     "merge",
 ];
 
-pub(crate) type EnumMap = std::collections::HashMap<String, std::collections::HashMap<String, Literal>>;
+pub(crate) type EnumMap = crate::det::HashMap<String, crate::det::HashMap<String, Literal>>;
 
 pub fn apply_enum_symbol_lowering(app: &mut App) {
     let map = enum_columns(app);
@@ -73,14 +73,14 @@ pub fn apply_enum_symbol_lowering(app: &mut App) {
 /// wrong integer into a real query.
 pub(crate) fn enum_columns(app: &App) -> EnumMap {
     let mut out: EnumMap = Default::default();
-    let mut conflicted: std::collections::HashSet<String> = Default::default();
+    let mut conflicted: crate::det::HashSet<String> = Default::default();
     for model in &app.models {
         for (column, labels) in &model.enums {
             let col = column.as_str().to_string();
             if conflicted.contains(&col) {
                 continue;
             }
-            let mapping: std::collections::HashMap<String, Literal> =
+            let mapping: crate::det::HashMap<String, Literal> =
                 labels.iter().cloned().collect();
             match out.get(&col) {
                 Some(existing) if !same_mapping(existing, &mapping) => {
@@ -98,8 +98,8 @@ pub(crate) fn enum_columns(app: &App) -> EnumMap {
 }
 
 fn same_mapping(
-    a: &std::collections::HashMap<String, Literal>,
-    b: &std::collections::HashMap<String, Literal>,
+    a: &crate::det::HashMap<String, Literal>,
+    b: &crate::det::HashMap<String, Literal>,
 ) -> bool {
     a.len() == b.len()
         && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| literal_eq(v, w)))
@@ -153,7 +153,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, map: &EnumMap) {
 /// Rails does with one.
 fn rewrite_value(
     value: &mut Expr,
-    mapping: &std::collections::HashMap<String, Literal>,
+    mapping: &crate::det::HashMap<String, Literal>,
 ) {
     if let ExprNode::Array { elements, .. } = &mut *value.node {
         let mut all_int = !elements.is_empty();
@@ -178,7 +178,7 @@ fn rewrite_value(
 /// stored literal when it did.
 fn rewrite_label(
     value: &mut Expr,
-    mapping: &std::collections::HashMap<String, Literal>,
+    mapping: &crate::det::HashMap<String, Literal>,
 ) -> Option<Literal> {
     let ExprNode::Lit { value: Literal::Sym { value: label } } = &*value.node else {
         return None;

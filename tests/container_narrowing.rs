@@ -1,7 +1,7 @@
 //! Core container tests preserve known element types and the recursive request
 //! value contract; an arbitrary untyped input must keep its gradual escape.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{BodyTyper, ClassInfo, Ctx};
@@ -49,7 +49,7 @@ fn narrowed_branches(input: Ty, path: &[&str], predicate: &str) -> (Ty, Ty) {
             else_branch: variable(),
         },
     );
-    let classes: HashMap<ClassId, ClassInfo> = HashMap::new();
+    let classes: HashMap<ClassId, ClassInfo> = HashMap::default();
     let mut context = Ctx::default();
     context.local_bindings.insert(Symbol::from("value"), input);
     BodyTyper::new(&classes).analyze_expr(&mut expression, &context);

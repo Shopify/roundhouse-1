@@ -27,7 +27,7 @@
 //! builder recognizes the `group(:col).count` PAIR and declines
 //! everything else, leaving it on the runtime Relation.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

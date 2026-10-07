@@ -31,7 +31,8 @@ use crate::dialect::{LibraryClass, LibraryFunction};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::det::{HashMap, HashSet};
 
 /// A method-call target: (class that owns/defines or inherits the
 /// method, method name). The same method name on different classes
@@ -128,7 +129,7 @@ impl Reachability {
         // cross-references where the typer carries only the
         // simple name, we fall back to "every class with this
         // name" and pick the first that has the method.
-        let mut registry: HashMap<ClassId, Vec<&LibraryClass>> = HashMap::new();
+        let mut registry: HashMap<ClassId, Vec<&LibraryClass>> = HashMap::default();
         for lc in app_classes {
             registry.entry(lc.name.clone()).or_default().push(lc);
         }
@@ -136,8 +137,8 @@ impl Reachability {
             registry.entry(alias.clone()).or_default().push(lc);
         }
 
-        let mut reachable: HashSet<MethodId> = HashSet::new();
-        let mut reachable_names: HashSet<Symbol> = HashSet::new();
+        let mut reachable: HashSet<MethodId> = HashSet::default();
+        let mut reachable_names: HashSet<Symbol> = HashSet::default();
         let mut queue: VecDeque<MethodId> = VecDeque::new();
 
         let record = |target: MethodId,
@@ -390,8 +391,8 @@ fn walk_inheritance_for_method(
     registry: &HashMap<ClassId, Vec<&LibraryClass>>,
     method: &Symbol,
 ) -> Option<ClassId> {
-    let mut visited: std::collections::HashSet<ClassId> =
-        std::collections::HashSet::new();
+    let mut visited: crate::det::HashSet<ClassId> =
+        crate::det::HashSet::default();
     let mut stack: Vec<&LibraryClass> = vec![start];
     while let Some(lc) = stack.pop() {
         if !visited.insert(lc.name.clone()) {
@@ -430,8 +431,8 @@ fn lookup_method<'a>(
     // includes) looking for the method. First match wins.
     let candidates = registry.get(class)?;
     for start in candidates {
-        let mut visited: std::collections::HashSet<ClassId> =
-            std::collections::HashSet::new();
+        let mut visited: crate::det::HashSet<ClassId> =
+            crate::det::HashSet::default();
         let mut stack: Vec<&LibraryClass> = vec![*start];
         while let Some(lc) = stack.pop() {
             if !visited.insert(lc.name.clone()) {
@@ -484,7 +485,7 @@ fn lookup_method<'a>(
 /// untyped `record.update!(...)` keeps `update!` on every model).
 pub fn filter_synthesized_model_methods(
     class: &LibraryClass,
-    shakeable: &std::collections::HashSet<Symbol>,
+    shakeable: &crate::det::HashSet<Symbol>,
     reach: &Reachability,
 ) -> LibraryClass {
     let mut filtered = class.clone();

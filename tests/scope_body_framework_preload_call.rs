@@ -27,7 +27,7 @@
 //! seeded to the same shape — a tag-tally oracle cannot see this class
 //! of bug, and this test is what stands in for one.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -67,7 +67,7 @@ end
 "#;
 
 fn emitted() -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),
@@ -104,7 +104,7 @@ fn the_bare_preload_scope_call_is_threaded() {
 /// into the general path.
 #[test]
 fn the_relation_delegate_preloads() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

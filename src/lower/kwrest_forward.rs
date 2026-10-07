@@ -91,7 +91,7 @@
 //! bundle, this one for the subset that names a keyword, and campfire's
 //! two call sites are both in the correct subset.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -128,7 +128,7 @@ pub fn apply_kwrest_forward_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// Full `Param`s rather than names: this pass needs the flattening marks
 /// and the declared defaults, not just the arity.
 fn helper_signatures(app: &App) -> HashMap<Symbol, Vec<Param>> {
-    let mut out: HashMap<Symbol, Vec<Param>> = HashMap::new();
+    let mut out: HashMap<Symbol, Vec<Param>> = HashMap::default();
     for (name, owner) in &app.helper_method_index {
         let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {
             continue;

@@ -19,7 +19,7 @@
 //!      wrapper, and `JsonBuilder.encode_value` escapes for JSON, not
 //!      for HTML.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

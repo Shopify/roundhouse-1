@@ -71,7 +71,7 @@ const FRAME_OPEN: &str = "<turbo-frame";
 /// `turbo_frame_tag dom_id(room, :involvement)` (a Send with a receiver
 /// and arguments) correctly answers no to. Both owners ask through here
 /// so the signal has one definition.
-pub(crate) fn names_a_record(e: &Expr, models: &std::collections::HashSet<String>) -> bool {
+pub(crate) fn names_a_record(e: &Expr, models: &crate::det::HashSet<String>) -> bool {
     super::bare_record_name(e)
         .map(|name| models.contains(&name))
         .unwrap_or(false)

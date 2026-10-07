@@ -6,7 +6,7 @@
 //! `lower::status_literal` grounds the literal to the name Rails' table
 //! gives it; a JSON payload's `status:` key is data and stays an Integer.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

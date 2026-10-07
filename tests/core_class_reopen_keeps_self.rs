@@ -33,7 +33,7 @@
 //! can be correct in the IR and undone by the emitter; only the emitted
 //! string can tell you which.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -47,7 +47,7 @@ end
 "#;
 
 fn emit_reopen(src: &str, stem: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/message.rb"),

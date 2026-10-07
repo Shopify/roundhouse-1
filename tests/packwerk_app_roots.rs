@@ -5,7 +5,7 @@
 //! shapes: default discovery, an explicit `package_paths:` glob, the
 //! no-Packwerk case (behavior unchanged), and a deeper default-scan hit.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

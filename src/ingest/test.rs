@@ -972,7 +972,7 @@ end
 /// parent keeps its written path.
 pub(super) fn resolve_test_parents(app: &mut crate::App) {
     let resolver = app.const_resolver.for_sources(&app.sources);
-    let defined: std::collections::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
+    let defined: crate::det::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
     for tm in &mut app.test_modules {
         let (Some(span), Some(parent)) = (tm.parent_span, &tm.parent) else { continue };
         let path: Vec<Symbol> = parent.0.as_str().split("::").map(Symbol::from).collect();

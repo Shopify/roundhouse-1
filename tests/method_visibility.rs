@@ -1,7 +1,7 @@
 //! Local, statically known visibility survives lexical flattening and Ruby
 //! family emission. This does not claim strict-target dispatch equivalence.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodDef, MethodReceiver, MethodVisibility, ModelBodyItem};

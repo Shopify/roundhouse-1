@@ -137,7 +137,7 @@ fn emit_ctrl_test_send(
             let u = emit_url_expr(url, app);
             let form_body = params
                 .map(|h| flatten_params_to_form(h, None, app))
-                .unwrap_or_else(|| "std::collections::HashMap::<String, String>::new()".to_string());
+                .unwrap_or_else(|| "crate::det::HashMap::<String, String>::default()".to_string());
             format!("let resp = server.{method}(&{u}).form(&{form_body}).await;")
         }
         Some(ControllerTestSend::HttpDelete { url }) => {
@@ -188,7 +188,7 @@ fn flatten_params_to_form(expr: &Expr, scope: Option<&str>, app: &App) -> String
         })
         .collect();
     format!(
-        "std::collections::HashMap::<String, String>::from([{}])",
+        "crate::det::HashMap::<String, String>::from_iter([{}])",
         pairs.join(", "),
     )
 }

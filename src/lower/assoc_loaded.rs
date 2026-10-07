@@ -18,7 +18,7 @@
 //! `account.settings_foo?`): the intermediate object Rails invents is
 //! erased, and every target keeps a typed one-hop call.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -31,7 +31,7 @@ use crate::ty::Ty;
 /// reader. Keyed by owner ClassId so `room.boosts.loaded?` is not
 /// rewritten when only `Message` declares `has_many :boosts`.
 pub(crate) fn has_many_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
-    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         // Every model gets a key so `in_model` owner checks don't treat
         // a has_many-less model (Room) as a view/library class.
@@ -52,7 +52,7 @@ pub(crate) fn has_many_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> 
 /// may collapse onto. Keyed by owner so `room.association(:boosts).target`
 /// is not rewritten when only `Message` declares `:boosts`.
 pub(crate) fn association_readers_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
-    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         let entry = out.entry(model.name.clone()).or_default();
         for (_, assoc) in model.spanned_associations() {

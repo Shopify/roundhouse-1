@@ -15,7 +15,7 @@
 //!   (`Thing`), an uninitialized constant. Now the declared target
 //!   (`seeds_to_library::rewrite_assoc_create_with_models`).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

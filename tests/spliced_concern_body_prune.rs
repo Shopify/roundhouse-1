@@ -14,7 +14,7 @@
 //! spliced": a concern included by something that is NOT a controller
 //! keeps every method, because that includer still calls them.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

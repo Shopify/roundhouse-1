@@ -15,14 +15,14 @@
 //! `Hash[String, String]` came back poly far enough downstream to
 //! produce two C errors in an otherwise-clean AOT build.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby::emit_library;
 use roundhouse::ingest::ingest_app_from_tree;
 
 fn sidecars(lib_src: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"body\", null: false\n  end\nend\n".to_vec(),

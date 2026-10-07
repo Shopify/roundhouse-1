@@ -12,7 +12,7 @@
 //! `to_gid_param`, so Rails returns nil and takes the `|| s` arm; the
 //! nil guard called it and raised.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

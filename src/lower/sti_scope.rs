@@ -59,7 +59,7 @@
 //! a primary-key SELECT — re-rooting it would move that work onto the
 //! Relation path for no scoping gain a primary key can use.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Param};
@@ -100,7 +100,7 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
     // the synthesized `becomes_from`: a class method nobody calls is
     // dead weight on every target, and on the strict ones it is dead
     // weight that still has to type-check.
-    let mut recast: HashSet<ClassId> = HashSet::new();
+    let mut recast: HashSet<ClassId> = HashSet::default();
     // Inside a subclass's OWN class method the receiver is implicit:
     // campfire's `Rooms::Direct.find_for` writes `all.joins(:users)
     // .detect { … }`, and Rails scopes that `all` to the subclass. Left
@@ -146,7 +146,7 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
 /// Models, so the per-model synthesizer can't see them). Sorted, so
 /// the generated `case` arms are deterministic.
 fn stamp_sti_subclasses(app: &mut App, bases: &HashMap<ClassId, ClassId>) {
-    let mut by_base: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    let mut by_base: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for (subclass, base) in bases {
         by_base.entry(base.clone()).or_default().push(subclass.clone());
     }
@@ -375,7 +375,7 @@ fn no_arg_send(recv: Expr, method: &str) -> Expr {
 /// parent walk and the inheritance-column check that would drift from
 /// this one.
 pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let model_named = |id: &ClassId| app.models.iter().find(|m| &m.name == id);
     for lc in &app.library_classes {
         let mut cursor = lc.parent.clone();

@@ -4,7 +4,7 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -271,7 +271,7 @@ fn native_and_emitted_forwarding_preserve_arguments_keywords_and_block() {
 }
 
 fn analyzed(source: &str) -> roundhouse::App {
-    let mut app = ingest_app_from_tree(HashMap::from([(
+    let mut app = ingest_app_from_tree(HashMap::from_iter([(
         PathBuf::from("app/lib/probe.rb"),
         source.as_bytes().to_vec(),
     )]))
@@ -287,7 +287,7 @@ fn forwarding_markers_are_not_values_or_gradual_escapes() {
 
     let sink = "class Sink; def self.target(a,b); a-b; end; end";
     let methods = "def relay(...); Sink.target(...); end; def opaque; yield; end";
-    let mut app = ingest_app_from_tree(HashMap::from([
+    let mut app = ingest_app_from_tree(HashMap::from_iter([
         (PathBuf::from("app/lib/sink.rb"), sink.as_bytes().to_vec()),
         (PathBuf::from("app/models/article.rb"), format!("class Article < ApplicationRecord; {methods}; end").into_bytes()),
     ])).unwrap();
@@ -655,7 +655,7 @@ end
 fn model_formal_rejection_survives_body_rewriting() {
     let sink = "class Sink; def target(n,factor:); n*factor; end; end";
     let method = "def relay((a,b),...); helper=Sink.new; helper.target(...); end";
-    let mut app = ingest_app_from_tree(HashMap::from([
+    let mut app = ingest_app_from_tree(HashMap::from_iter([
         (PathBuf::from("app/lib/sink.rb"), sink.as_bytes().to_vec()),
         (
             PathBuf::from("app/models/article.rb"),
@@ -791,7 +791,7 @@ fn source_adapter_and_association_extension_retain_formal_facts() {
         Some(UnsupportedFormal::Destructured)
     );
 
-    let app = ingest_app_from_tree(HashMap::from([
+    let app = ingest_app_from_tree(HashMap::from_iter([
         (PathBuf::from("app/models/article.rb"), b"class Article < ApplicationRecord; has_many :comments do; def unpack((a,b)); 7; end; end; end".to_vec()),
         (PathBuf::from("app/models/comment.rb"), b"class Comment < ApplicationRecord; end".to_vec()),
     ])).unwrap();
@@ -1069,7 +1069,7 @@ fn a_keyword_splat_whose_receiver_lookup_cannot_reach_a_nameless_rest_is_admitte
     const REST: &str = "class Loose; def initialize(*, **kw); @kw = kw; end; end; ";
     const GEM: &str = "class GemError < StandardError; def initialize(*); super('gem'); end; end";
     let refused = |source: &str, vendored: Option<&str>| {
-        let mut tree = HashMap::from([(PathBuf::from("app/lib/probe.rb"), format!("{REST}{source}").into_bytes())]);
+        let mut tree = HashMap::from_iter([(PathBuf::from("app/lib/probe.rb"), format!("{REST}{source}").into_bytes())]);
         if let Some(gem) = vendored {
             tree.insert(PathBuf::from("app/lib/vendor/gems/kit-1.0.0/gem_error.rb"), gem.as_bytes().to_vec());
         }

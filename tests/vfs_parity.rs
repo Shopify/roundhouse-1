@@ -2,7 +2,7 @@
 //! produces the same emit output as `ingest_app` on the same disk path.
 //! Validates the `MapVfs` implementation against the canonical `FsVfs`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::analyze::Analyzer;
@@ -10,7 +10,7 @@ use roundhouse::emit::typescript;
 use roundhouse::ingest::{ingest_app, ingest_app_from_tree};
 
 fn load_tree_from_disk(root: &Path) -> HashMap<PathBuf, Vec<u8>> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read_dir") {

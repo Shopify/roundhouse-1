@@ -5,7 +5,7 @@
 //! factory's name suffixes, so a call to a key the table has resolves
 //! and a call to one it lacks is still a dispatch failure.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{Analyzer, DiagnosticKind, diagnose};

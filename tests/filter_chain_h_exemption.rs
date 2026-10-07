@@ -14,14 +14,14 @@
 //! this file gates is the rewrite itself, which every emitter then
 //! prints as written.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::expr::{Expr, ExprNode};
 use roundhouse::ingest::ingest_app_from_tree;
 
 fn lowered_helper_body(helper_src: &str) -> Expr {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"body\", null: false\n  end\nend\n".to_vec(),

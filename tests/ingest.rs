@@ -276,7 +276,7 @@ fn ingests_namespaced_and_split_routes() {
     // namespace / scope / singular resource / draw(:name) — the
     // Mastodon-class routing surface (#63 follow-up). The split file
     // is standard DSL at top level, loaded by `draw(:admin)`.
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
         (
             "config/routes.rb",
             r#"Rails.application.routes.draw do
@@ -936,7 +936,7 @@ fn classifies_models_vs_library_classes() {
 #[test]
 fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
     use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[
@@ -1001,7 +1001,7 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
 #[test]
 fn spelled_lambda_scope_ingests_like_arrow_form() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1038,7 +1038,7 @@ fn spelled_lambda_scope_ingests_like_arrow_form() {
 #[test]
 fn arrow_lambda_scope_do_end_and_defaulted_param_ingest() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1085,7 +1085,7 @@ fn arrow_lambda_scope_do_end_and_defaulted_param_ingest() {
 #[test]
 fn parenthesized_lambda_scope_ingests() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1128,7 +1128,7 @@ fn parenthesized_lambda_scope_ingests() {
 #[test]
 fn survey_mode_keeps_the_class_when_one_body_item_is_unsupported() {
     use roundhouse::ingest::{ingest_app_from_tree, survey, IngestError};
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(
@@ -1389,7 +1389,7 @@ fn multi_write_with_attr_targets_ingests_and_round_trips() {
 #[test]
 fn computed_enum_map_to_h_over_constant_ingests() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let computed_src = concat!(
@@ -1424,7 +1424,7 @@ fn computed_enum_map_to_h_over_constant_ingests() {
 #[test]
 fn computed_enum_index_by_and_index_with_over_constant_ingest() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let files: &[(&str, &str)] = &[(

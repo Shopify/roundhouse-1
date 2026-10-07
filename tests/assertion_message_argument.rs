@@ -20,7 +20,7 @@
 //! the one-argument family, plus `assert_not_includes` — Rails' spelling
 //! of `refute_includes`, which was in neither table.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

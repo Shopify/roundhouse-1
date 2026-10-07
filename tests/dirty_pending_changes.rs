@@ -14,7 +14,7 @@
 //! the ruby-family connection.rb reopen, and Base's stubs answer
 //! false/nil on the strict lanes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

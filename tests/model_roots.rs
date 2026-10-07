@@ -10,7 +10,7 @@
 //! `support_roots` already collected those directories and their files
 //! were already read; only the classification never ran on them.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::diagnostic::Diagnostic;

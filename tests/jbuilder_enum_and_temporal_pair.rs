@@ -11,7 +11,7 @@
 //!   the LABEL ("bot"), which the column reader itself now answers, so the
 //!   attribute rides `encode_value` like any other String.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby::emit_method;

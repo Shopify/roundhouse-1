@@ -15,7 +15,7 @@
 //! `lower::broadcasts::stream_name`, and the last test here pins them
 //! together.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

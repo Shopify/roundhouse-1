@@ -1,6 +1,6 @@
 //! A declared nominal type requires a real declaration or modeled dependency.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

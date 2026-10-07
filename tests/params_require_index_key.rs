@@ -16,7 +16,7 @@
 //! an ActiveSupport core_ext reopen only the CRuby overlay could host,
 //! so every other target had an unresolved call.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

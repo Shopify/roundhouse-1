@@ -13,7 +13,7 @@
 //! message, …)`), so nil there is a seed contradiction — the strict
 //! compiler refuses it rather than reinterpreting the value.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

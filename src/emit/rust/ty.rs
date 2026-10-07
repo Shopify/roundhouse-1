@@ -38,7 +38,7 @@ pub fn rust_ty(ty: &Ty) -> String {
         }
         Ty::Array { elem } => format!("Vec<{}>", rust_ty(elem)),
         Ty::Hash { key, value } => format!(
-            "std::collections::HashMap<{}, {}>",
+            "crate::det::HashMap<{}, {}>",
             rust_ty(key),
             rust_ty(value)
         ),

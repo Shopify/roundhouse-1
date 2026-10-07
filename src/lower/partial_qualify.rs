@@ -19,7 +19,7 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::naming::underscore;
 
 pub fn apply_partial_qualification(app: &mut App) {
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
 
     // Every (dir, stem) a partial exists at.
     let existing: HashSet<(String, String)> = app
@@ -56,8 +56,8 @@ pub fn apply_partial_qualification(app: &mut App) {
 fn qualify(
     expr: &mut Expr,
     own_dir: &str,
-    existing: &std::collections::HashSet<(String, String)>,
-    parent_dir: &std::collections::HashMap<String, String>,
+    existing: &crate::det::HashSet<(String, String)>,
+    parent_dir: &crate::det::HashMap<String, String>,
 ) {
     expr.node
         .for_each_child_mut(&mut |c| qualify(c, own_dir, existing, parent_dir));

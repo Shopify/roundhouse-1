@@ -1,7 +1,7 @@
 //! Known literal load-hook mixins are carried; unsupported hooks and
 //! dynamic includes remain reported gaps. This does not model Markdown DSLs.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::ModelBodyItem;

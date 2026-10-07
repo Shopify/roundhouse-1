@@ -7,7 +7,7 @@
 //! Forcing coverage is synthetic overlays on the blog fixtures — not a
 //! named app macro. Dynamic string eval stays unexpanded.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{Association, MethodReceiver, ModelBodyItem};

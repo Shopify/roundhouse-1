@@ -25,7 +25,7 @@
 //! `mentions_model_chain_start`: a class-root query or write terminal
 //! must reach the rewriter even when no named scope is declared.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

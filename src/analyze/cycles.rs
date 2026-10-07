@@ -46,7 +46,7 @@
 //! levels above the limit keep their precise types. A slot that stops
 //! growing, or grows only within the limit, is untouched.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;

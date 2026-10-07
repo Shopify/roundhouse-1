@@ -200,7 +200,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
             m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref())
         })
         .collect();
-    let temporal_set: std::collections::HashSet<String> = temporal_readers
+    let temporal_set: crate::det::HashSet<String> = temporal_readers
         .iter()
         .map(|m| super::shared::py_method_name(m.name.as_str()))
         .collect();
@@ -210,7 +210,7 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // one `notice` field). Everything else emits as a method. Temporal
     // readers are skipped — they emit as `@property` getters below.
     let mut fields: Vec<(String, Ty)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in class.methods.iter().filter(|m| is_accessor(m)) {
         // Legalize the attribute name for a Python identifier — a
         // predicate accessor (`abstract?`) must become `abstract_p`, not

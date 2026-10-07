@@ -8,7 +8,7 @@
 //! class is a real miss, and everything that is NOT fully declared
 //! (unresolved names, `method_missing`, an app subclass) stays gradual.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

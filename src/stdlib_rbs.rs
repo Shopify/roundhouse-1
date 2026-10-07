@@ -9,7 +9,7 @@
 //! them; `project` refuses the names elsewhere, and writes the `require`
 //! a stdlib library needs (`requires`) on the CRuby tree.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use crate::ty::Ty;
@@ -31,7 +31,7 @@ struct Index {
 fn index() -> &'static Index {
     static INDEX: OnceLock<Index> = OnceLock::new();
     INDEX.get_or_init(|| {
-        let mut namespaces = HashSet::new();
+        let mut namespaces = HashSet::default();
         let mut aliases = Vec::new();
         let mut constants = Vec::new();
         for (path, text) in documents() {
@@ -56,7 +56,7 @@ fn index() -> &'static Index {
             });
             !missing.get()
         };
-        let mut values = HashMap::new();
+        let mut values = HashMap::default();
         for (name, ty) in constants {
             let ty = ty.ok().filter(|ty| known(ty)).unwrap_or(Ty::Untyped);
             values.insert(name, Arc::new(ty));

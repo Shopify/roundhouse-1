@@ -1,7 +1,7 @@
 //! Dropped state-machine declarations belong on the ingest ledger, not
 //! in the typed method table. No gem runtime support is claimed here.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{Analyzer, attribution::attribute_ingest_gaps, diagnose};

@@ -14,7 +14,7 @@
 //! [`BodyTyper`] with a simpler dispatch table (no user classes, just
 //! the primitive method tables).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::{DeclarationId, declaration_id_from_lookup_name};
 
@@ -105,7 +105,7 @@ pub struct Ctx {
     pub local_bindings: HashMap<Symbol, Ty>,
     /// Locals whose assigned value is proven to be a class/module object.
     /// Nominal instance types alone do not establish this identity.
-    pub class_objects: std::collections::HashSet<Symbol>,
+    pub class_objects: crate::det::HashSet<Symbol>,
     /// Module/class-level typed constants such as
     /// `STATUS_CODES = { ok: 200, ... }.freeze`. Rubydex IDs resolve
     /// source-backed reads; this scope types generated expressions.
@@ -180,7 +180,7 @@ pub struct ClassInfo {
     /// return is a record and so matches no relation shape. Without it
     /// the chain typed to nothing and `room_url(…)` rendered
     /// `/rooms/#<Room:0x…>`.
-    pub relation_derived: std::collections::HashSet<Symbol>,
+    pub relation_derived: crate::det::HashSet<Symbol>,
     /// Scopes whose body the seed classifier read as ending in a
     /// MATERIALIZING terminal — `ordered.last(PAGE_SIZE)` — as opposed
     /// to the ones it could not read at all. Both kinds may carry the
@@ -189,7 +189,7 @@ pub struct ClassInfo {
     /// tells them apart at a Relation receiver: a materializing scope
     /// answers its Array, an unclassified one is assumed to still be a
     /// query and re-wraps as the relation.
-    pub materializing_scopes: std::collections::HashSet<Symbol>,
+    pub materializing_scopes: crate::det::HashSet<Symbol>,
     /// Methods whose every return is the value of the BLOCK they were
     /// called with — `yield` on each path, or the block handed on to
     /// another such method (lobsters' `get_from_cache(opts, &)`, which
@@ -199,7 +199,7 @@ pub struct ClassInfo {
     /// type for these, the way it already does for `then` and
     /// `transaction`. Harvested each fixpoint round
     /// (`Analyzer::harvest_method_returns`).
-    pub block_value_methods: std::collections::HashSet<Symbol>,
+    pub block_value_methods: crate::det::HashSet<Symbol>,
     /// Methods callable on an instance: `post.title`, `post.destroy`.
     pub instance_methods: HashMap<Symbol, Ty>,
     /// AccessorKind per method — lets the body-typer flag Method
@@ -315,7 +315,7 @@ pub struct BodyTyper<'a> {
     /// Methods whose value is an ActiveSupport inquirer (see
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
-    inquirers: Option<&'a std::collections::HashSet<Symbol>>,
+    inquirers: Option<&'a crate::det::HashSet<Symbol>>,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -389,7 +389,7 @@ impl<'a> BodyTyper<'a> {
     /// type as Bool instead of failing dispatch on `Str`.
     pub fn with_inquirers(
         mut self,
-        inquirers: &'a std::collections::HashSet<Symbol>,
+        inquirers: &'a crate::det::HashSet<Symbol>,
     ) -> Self {
         self.inquirers = Some(inquirers);
         self
@@ -1571,7 +1571,7 @@ impl<'a> BodyTyper<'a> {
                 // reads `user` as `User` in the then-branch, `User?`
                 // in the else-branch. (Narrowing before seeding would
                 // find no binding to narrow and leave the nil arm.)
-                let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::new();
+                let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::default();
                 collect_var_assignments_into(cond, &mut cond_assigns);
                 let mut base = ctx.clone();
                 for (k, v) in &cond_assigns {
@@ -1695,7 +1695,7 @@ impl<'a> BodyTyper<'a> {
                 // `strings.Join`). Recording the index lets the
                 // refinement retro-stamp the seed. A later reassignment
                 // of the name retires its entry.
-                let mut array_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::new();
+                let mut array_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::default();
                 // Statement index + accumulated type of each live
                 // nil-seeded LOCAL (`size = nil`). The scalar analog of
                 // `array_seed_idx`, and the same decl-site hazard: a
@@ -1714,10 +1714,10 @@ impl<'a> BodyTyper<'a> {
                 // path (`emit/go/expr.rs`, LValue::Var), and ivars emit
                 // through package vars / struct fields that never take a
                 // seed-derived decl type.
-                let mut nil_seed: HashMap<Symbol, (usize, Ty)> = HashMap::new();
+                let mut nil_seed: HashMap<Symbol, (usize, Ty)> = HashMap::default();
                 // Statement index of each live empty-hash seed (`attrs =
                 // {}`) — the Hash counterpart of `array_seed_idx`.
-                let mut hash_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::new();
+                let mut hash_seed_idx: HashMap<(bool, Symbol), usize> = HashMap::default();
                 for i in 0..exprs.len() {
                     let read_structurally_later = match &*exprs[i].node {
                         ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
@@ -2092,7 +2092,7 @@ impl<'a> BodyTyper<'a> {
                     if let ExprNode::If { cond, .. } | ExprNode::While { cond, .. } =
                         &*e.node
                     {
-                        let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::new();
+                        let mut cond_assigns: HashMap<Symbol, Ty> = HashMap::default();
                         collect_var_assignments_into(cond, &mut cond_assigns);
                         for (name, ty) in cond_assigns {
                             if ty.is_open() {
@@ -2798,7 +2798,7 @@ mod tests {
     }
 
     fn empty_classes() -> HashMap<ClassId, ClassInfo> {
-        HashMap::new()
+        HashMap::default()
     }
 
     fn ctx_with_local(name: &str, ty: Ty) -> Ctx {
@@ -4121,7 +4121,7 @@ impl BodyTyper<'_> {
     fn has_declared_constructor(&self, ty: Option<&Ty>) -> bool {
         let Some(Ty::Class { id, .. }) = ty else { return false };
         let mut next = Some(id);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         while let Some(id) = next {
             if !seen.insert(id) { break; }
             let Some(class) = self.classes().get(id) else { break };

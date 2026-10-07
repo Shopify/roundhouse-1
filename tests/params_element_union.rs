@@ -13,7 +13,7 @@
 //! a send resolves on whichever arms answer it, and an `is_a?` guard
 //! selects the arm.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

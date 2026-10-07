@@ -14,7 +14,7 @@
 //! - `only: []` meant "all seven actions" instead of none;
 //! - `get :x, controller: "c"` had no controller.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -88,7 +88,7 @@ end
 fn a_block_taking_method_the_app_never_mixed_in_is_not_a_scope() {
     // Without the `Mapper.prepend`, `routing_method` is an unknown
     // call: it is reported, and its block is not silently entered.
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("lib/annotations.rb"), ANNOTATIONS.1.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("config/routes.rb"),

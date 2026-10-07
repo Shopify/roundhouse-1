@@ -20,7 +20,7 @@
 //!     EMPTY — its temporal normalize was guarded by a `.to_s.nil?` that
 //!     is never true.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -14,7 +14,7 @@
 //! plain Struct for the record) against what Rails 8.1 + jbuilder 2.15
 //! render for the same templates and row.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

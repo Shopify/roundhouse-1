@@ -22,7 +22,7 @@
 //! wrong there costs nothing). A receiver typed as something concrete
 //! and non-relational — a plain Array — is left alone.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

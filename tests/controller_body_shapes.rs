@@ -16,7 +16,7 @@
 //! silent no-ops, and `using` earns a specific ledger line instead of
 //! the generic "not recognized" one.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

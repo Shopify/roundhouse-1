@@ -4,7 +4,8 @@
 //! Roundhouse retains source-position answers and keys inferred values
 //! by Rubydex declaration IDs.
 
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::collections::hash_map::Entry;
+use crate::det::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
@@ -314,8 +315,8 @@ fn is_assigned_value(graph: &Graph, declaration: &Declaration) -> bool {
 fn runtime_value_types() -> &'static HashMap<String, Arc<Ty>> {
     static VALUES: std::sync::OnceLock<HashMap<String, Arc<Ty>>> = std::sync::OnceLock::new();
     VALUES.get_or_init(|| {
-        let mut values: HashMap<String, Arc<Ty>> = HashMap::new();
-        let mut ambiguous = std::collections::HashSet::new();
+        let mut values: HashMap<String, Arc<Ty>> = HashMap::default();
+        let mut ambiguous = crate::det::HashSet::default();
         for (_, text) in crate::runtime_files::ruby_sources() {
             let (_, owners) = crate::runtime_src::parse_module_constant_tables(text, true);
             for (owner, constants) in owners {
@@ -666,7 +667,7 @@ fn parenthesized_factory_receivers(text: &str) -> HashSet<u32> {
         }
     }
     let parsed = ruby_prism::parse(text.as_bytes());
-    let mut receivers = Receivers(HashSet::new());
+    let mut receivers = Receivers(HashSet::default());
     if parsed.errors().next().is_none() {
         ruby_prism::Visit::visit(&mut receivers, &parsed.node());
     }
@@ -688,7 +689,7 @@ fn answer_file(
     {
         parenthesized_factory_receivers(&text)
     } else {
-        HashSet::new()
+        HashSet::default()
     };
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
@@ -942,7 +943,7 @@ mod tests {
         use crate::{Expr, ExprNode};
         let sources = vec![source("app/services/first.rb", "First")];
         let resolver = Arc::new(ConstResolver::from_app_sources(&sources));
-        let classes = HashMap::from([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
+        let classes = HashMap::from_iter([(ClassId(Symbol::from("Object")), ClassInfo::default())]);
         let typer = BodyTyper::new(&classes).with_const_resolver(resolver);
         let make = |file| {
             Expr::new(

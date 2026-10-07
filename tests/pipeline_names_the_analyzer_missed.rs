@@ -21,7 +21,7 @@
 //! day its receiver got a type, and raised `select: no columns`. A type
 //! getting better must not change what a gate decides about one value.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

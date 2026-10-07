@@ -21,7 +21,7 @@
 //! Demand-gated: a controller nobody subclasses this way keeps a
 //! byte-identical body and dispatcher, which the last test here pins.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -35,7 +35,7 @@ const ROUTES: &str = "Rails.application.routes.draw do\n  \
     namespace :notes do\n    resources :bots, only: [ :create ]\n  end\nend\n";
 
 fn emit(files: Vec<(&str, &str)>) -> HashMap<String, String> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/note.rb"),

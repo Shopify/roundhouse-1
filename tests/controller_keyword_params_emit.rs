@@ -12,7 +12,7 @@
 //! cannot express the construct reports it instead of receiving a
 //! lossy rewrite.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

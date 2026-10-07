@@ -87,7 +87,7 @@ pub(super) fn synthesize_process_action(
     publics: &[Action],
     inherited: &[Symbol],
     enclosing_class: Symbol,
-    deferred_tails: &std::collections::HashMap<Symbol, Expr>,
+    deferred_tails: &crate::det::HashMap<Symbol, Expr>,
     rescues: &[RescueHandler],
     wraps: &WrapFilters,
 ) -> MethodDef {
@@ -444,7 +444,7 @@ fn include_check(only: &[Symbol], except: &[Symbol]) -> Expr {
 fn case_dispatch(
     publics: &[Action],
     inherited: &[Symbol],
-    deferred_tails: &std::collections::HashMap<Symbol, Expr>,
+    deferred_tails: &crate::det::HashMap<Symbol, Expr>,
 ) -> Expr {
     // The default render for an action whose body must not carry it —
     // see `actions_reached_by_super`. Already lowered: it was

@@ -1,7 +1,7 @@
 //! Resolve local visibility while declaration order and lexical scopes still
 //! exist. Never replay these calls from LibraryClass::unknown_calls.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use ruby_prism::{CallNode, Node};
 

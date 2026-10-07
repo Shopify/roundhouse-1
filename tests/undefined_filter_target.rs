@@ -7,7 +7,7 @@
 //! `new`/`create` unauthenticated. The cases below are the places a
 //! target legitimately lives, each of which must stay quiet.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

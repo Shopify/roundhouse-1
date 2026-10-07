@@ -25,7 +25,7 @@ pub use ir::{
 };
 pub use visitor::{ArelVisitor, PostgresVisitor, SqlDialect, SqliteVisitor};
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::expr::{Expr, ExprNode, InterpPart};
@@ -82,7 +82,7 @@ pub fn rewrite_arel_in_expr_for_dialect(
     // Moderation.all...`). Materializing the assigned chain here would
     // hand those refiners an Array — leave such statements on the
     // runtime Relation path.
-    let mut refined = std::collections::HashSet::new();
+    let mut refined = crate::det::HashSet::default();
     collect_relation_refined_names(expr, &mut refined);
     let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, dialect);
     // Both call sites hand us a METHOD BODY, and a body that is a
@@ -154,8 +154,8 @@ fn requires_relation_receiver(method: &str) -> bool {
 /// campfire's caller is `users_scope.active`, and `active` is a scope.
 pub fn relation_refined_method_names(
     body: &Expr,
-    scopes: &std::collections::HashSet<crate::ident::Symbol>,
-    out: &mut std::collections::HashSet<crate::ident::Symbol>,
+    scopes: &crate::det::HashSet<crate::ident::Symbol>,
+    out: &mut crate::det::HashSet<crate::ident::Symbol>,
 ) {
     if let ExprNode::Send { recv: Some(r), method, .. } = body.node.as_ref() {
         if requires_relation_receiver(method.as_str()) || scopes.contains(method) {
@@ -186,7 +186,7 @@ fn self_call_name(e: &Expr) -> Option<crate::ident::Symbol> {
 
 fn collect_relation_refined_names(
     expr: &Expr,
-    out: &mut std::collections::HashSet<crate::ident::Symbol>,
+    out: &mut crate::det::HashSet<crate::ident::Symbol>,
 ) {
     if let ExprNode::Send { recv: Some(r), method, .. } = expr.node.as_ref() {
         if requires_relation_receiver(method.as_str()) {
@@ -206,7 +206,7 @@ fn rewrite_arel_inner(
     schema: &Schema,
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
-    refined: &std::collections::HashSet<crate::ident::Symbol>,
+    refined: &crate::det::HashSet<crate::ident::Symbol>,
     dialect: SqlDialect,
 ) -> bool {
     if let ExprNode::Assign { target, .. } = expr.node.as_ref() {
@@ -296,7 +296,7 @@ fn rewrite_arel_spine_args(
     schema: &Schema,
     registry: &HashMap<ClassId, ClassInfo>,
     assocs: &[crate::lower::model_associations::AssociationEdge],
-    refined: &std::collections::HashSet<crate::ident::Symbol>,
+    refined: &crate::det::HashSet<crate::ident::Symbol>,
     dialect: SqlDialect,
 ) -> bool {
     let mut changed = false;

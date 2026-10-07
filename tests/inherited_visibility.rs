@@ -4,7 +4,7 @@
 //! override, the Ruby emit writes the declaration back, and the targets
 //! that cannot express it refuse it by name.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::dialect::{MethodReceiver, MethodVisibility, VisibilityOverride};

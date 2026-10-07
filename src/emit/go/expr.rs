@@ -7,7 +7,7 @@
 //! lowered-IR coverage, transpiled-runtime call shapes).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::expr::{desugar_op_assign, Expr, ExprNode, IrHint, Literal};
@@ -117,8 +117,8 @@ impl EmitCtx {
         Self {
             class_name: None,
             in_class_method: false,
-            var_renames: HashMap::new(),
-            declared: Rc::new(RefCell::new(HashSet::new())),
+            var_renames: HashMap::default(),
+            declared: Rc::new(RefCell::new(HashSet::default())),
             void_method: false,
             in_module_singleton: false,
             self_methods: None,

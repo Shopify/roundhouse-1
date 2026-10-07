@@ -51,7 +51,7 @@
 //! runtime raises rather than silently dropping, which is the trade
 //! this whole pass is making.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -83,7 +83,7 @@ const FINDERS: &[&str] = &["find_by", "find_by!", "exists?"];
 type ModelBelongsTo = HashMap<crate::ident::ClassId, HashMap<Symbol, Symbol>>;
 
 pub fn apply_assoc_attr_key_lowering(app: &mut App) -> Vec<Diagnostic> {
-    let mut per_model: ModelBelongsTo = HashMap::new();
+    let mut per_model: ModelBelongsTo = HashMap::default();
     for m in &app.models {
         for a in m.associations() {
             if let Association::BelongsTo { name, foreign_key, polymorphic: false, .. } = a {
@@ -95,8 +95,8 @@ pub fn apply_assoc_attr_key_lowering(app: &mut App) -> Vec<Diagnostic> {
         super::for_each_hook_body(app, &mut |b| rewrite_conditions(b, &per_model));
         super::for_each_test_body(app, &mut |b| rewrite_conditions(b, &per_model));
     }
-    let mut table: BelongsTo = HashMap::new();
-    let mut conflicted: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+    let mut table: BelongsTo = HashMap::default();
+    let mut conflicted: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
     for m in &app.models {
         for a in m.associations() {
             if let Association::BelongsTo { name, foreign_key, .. } = a {

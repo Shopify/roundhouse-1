@@ -2,7 +2,7 @@
 //! argument with nil ruled out; `T.must_because` remains unsupported
 //! until its runtime semantics are shared.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

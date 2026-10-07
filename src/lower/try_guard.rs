@@ -50,7 +50,7 @@
 //! corpus site (`:username`, `"is_moderator"`). A computed method name
 //! is left as a plain `try` send for the analyzer to report.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::MethodReceiver;
@@ -285,7 +285,7 @@ fn ancestry(name: &Symbol, parents: &HashMap<Symbol, Symbol>) -> Vec<Symbol> {
     let mut out = vec![name.clone()];
     let mut cur = name.clone();
     // A malformed tree with a parent cycle must not hang the compiler.
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     while let Some(p) = parents.get(&cur) {
         if !seen.insert(p.clone()) {
             break;
@@ -347,7 +347,7 @@ const SYNTHESIZED_ON_EVERY_MODEL: [&str; 1] = ["to_gid_param"];
 
 /// method name -> the app classes defining it as an INSTANCE method.
 pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
-    let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    let mut out: HashMap<Symbol, HashSet<Symbol>> = HashMap::default();
     for m in &app.models {
         let owner = m.name.0.clone();
         for name in SYNTHESIZED_ON_EVERY_MODEL {
@@ -374,7 +374,7 @@ pub(crate) fn collect_definers(app: &App) -> HashMap<Symbol, HashSet<Symbol>> {
 
 /// class -> superclass, over models and library classes both.
 pub(crate) fn collect_parents(app: &App) -> HashMap<Symbol, Symbol> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for m in &app.models {
         if let Some(p) = &m.parent {
             out.insert(m.name.0.clone(), p.0.clone());

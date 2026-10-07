@@ -26,7 +26,7 @@
 //! read of each multi-read var now moves instead of cloning. Same
 //! HTTP-response semantics, byte-different emitted Rust.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode, InterpPart, LValue};
@@ -53,8 +53,8 @@ fn stamp_method(body: &mut Expr) {
     collect_var_reads(body, &mut seq, &mut reads);
 
     // Aggregate: read count + max sequence per name.
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut last_seq: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut last_seq: HashMap<String, usize> = HashMap::default();
     for (name, s) in &reads {
         *counts.entry(name.clone()).or_insert(0) += 1;
         last_seq

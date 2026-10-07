@@ -11,7 +11,7 @@
 //! (`@enabled = enabled`) read `has no known type` in every other
 //! method.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

@@ -7,7 +7,7 @@
 //! exact, including a later redefinition of the original not reaching
 //! the alias.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

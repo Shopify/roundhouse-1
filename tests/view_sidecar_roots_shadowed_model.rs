@@ -9,7 +9,7 @@
 //! names the model from anywhere; a name no enclosing segment shadows
 //! is written as before.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

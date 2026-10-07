@@ -26,7 +26,7 @@
 //! Runs on the post-analyze hook (`apply_post_analyze_lowerings`) so
 //! every target consumes the inlined form.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;

@@ -9,7 +9,7 @@
 //! lexically inside the declaring class, so the owner's own table
 //! answers first (#130).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};

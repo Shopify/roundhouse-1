@@ -21,7 +21,7 @@ fn binops(files: &[(&str, &str)]) -> Vec<String> {
         ("db/schema.rb", "ActiveRecord::Schema.define(version: 1) do\nend\n"),
     ];
     all.extend_from_slice(files);
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = all
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = all
         .iter()
         .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
         .collect();

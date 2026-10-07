@@ -16,7 +16,7 @@
 //! the top-level one. The second fixture below pins every spelling
 //! against competing bases.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -19,7 +19,7 @@
 //! `Opengraph::Location` (Validations + its own one-arg `initialize`)
 //! must keep the constructor it wrote.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

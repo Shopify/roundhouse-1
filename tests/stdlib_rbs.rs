@@ -8,7 +8,7 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

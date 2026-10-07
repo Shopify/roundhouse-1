@@ -63,7 +63,8 @@
 //! the source shape in place and files a residue diagnostic. Emitting a
 //! setter that doesn't exist would trade a named gap for a silent one.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -98,8 +99,8 @@ pub fn apply_params_merge_lowering(app: &mut App) -> Vec<Diagnostic> {
     // Writer surface per model, so a merged key can be checked before
     // anything is rewritten. Same authority the permit-writer filter
     // uses — `model_to_library::writable_field_set`.
-    let mut writers: HashMap<Symbol, WriterSet> = HashMap::new();
-    let mut resource_of: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut writers: HashMap<Symbol, WriterSet> = HashMap::default();
+    let mut resource_of: HashMap<Symbol, Symbol> = HashMap::default();
     for m in &app.models {
         let Some(table) = app.schema.tables.get(&m.table.0) else { continue };
         writers.insert(
@@ -235,8 +236,8 @@ impl SiteShapes {
 /// (`User::Bot`) contributes under its own last segment as well —
 /// harmless, because a binding is only ever read back through
 /// `callee_class`, which answers the OWNER's name.
-fn user_declared_methods(app: &App) -> std::collections::HashSet<(Symbol, Symbol)> {
-    let mut out = std::collections::HashSet::new();
+fn user_declared_methods(app: &App) -> crate::det::HashSet<(Symbol, Symbol)> {
+    let mut out = crate::det::HashSet::default();
     let unqualified = |id: &ClassId| {
         Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()))
     };
@@ -274,7 +275,7 @@ fn user_declared_methods(app: &App) -> std::collections::HashSet<(Symbol, Symbol
 /// `Room::MessagePusher` is a PORO — and attributing its parameters to
 /// `Room` would bind a method `Room` does not answer.
 fn including_models(app: &App) -> HashMap<ClassId, Vec<Symbol>> {
-    let mut out: HashMap<ClassId, Vec<Symbol>> = HashMap::new();
+    let mut out: HashMap<ClassId, Vec<Symbol>> = HashMap::default();
     for model in &app.models {
         let owner = Symbol::from(
             model.name.0.as_str().rsplit("::").next().unwrap_or(model.name.0.as_str()),
@@ -298,7 +299,7 @@ fn including_models(app: &App) -> HashMap<ClassId, Vec<Symbol>> {
 
 
 fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
-    let mut seen: HashMap<BindKey, SiteShapes> = HashMap::new();
+    let mut seen: HashMap<BindKey, SiteShapes> = HashMap::default();
     let models = crate::lower::scope_chain::model_set(&app.models);
     let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
     let assoc = AssocCtx { models: &models, assocs: &assocs };
@@ -397,8 +398,8 @@ fn scan_bindings(app: &App, specs: &ParamsSpecs) -> HashMap<BindKey, Binding> {
 /// `delete` and `[]=` only. `merge` is deliberately absent:
 /// `convert_attributes_in` already rewrites a params receiver's `merge`
 /// to `to_attrs.merge` at the site, so a body calling it proves nothing.
-fn hash_only_params(app: &App) -> std::collections::HashSet<BindKey> {
-    let mut out = std::collections::HashSet::new();
+fn hash_only_params(app: &App) -> crate::det::HashSet<BindKey> {
+    let mut out = crate::det::HashSet::default();
     let unqualified = |id: &ClassId| Symbol::from(id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()));
     let mut visit = |owner: Symbol, method: &MethodDef| {
         for (i, p) in method.params.iter().enumerate() {
@@ -506,7 +507,7 @@ fn unqualified(name: &str) -> Symbol {
 }
 
 struct AssocCtx<'a> {
-    models: &'a std::collections::HashSet<ClassId>,
+    models: &'a crate::det::HashSet<ClassId>,
     assocs: &'a crate::lower::scope_chain::AssocRegistry,
 }
 

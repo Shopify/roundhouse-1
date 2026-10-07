@@ -15,7 +15,7 @@
 //! `<time>` carried `data-local-time-target="{class: …}"` and lost its
 //! `class`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -32,7 +32,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 /// EMPTY string, which turns every `!contains` assertion into a
 /// vacuous pass.
 fn emit_helpers(time_helper: &str, rooms_helper: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

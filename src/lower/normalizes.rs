@@ -26,7 +26,7 @@
 //! Not reproduced, and left alone rather than half-applied: a `with:`
 //! that is not a one-parameter lambda literal, and `apply_to_nil: true`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, ModelBodyItem, Param};
@@ -43,7 +43,7 @@ pub(crate) fn normalizer_name(attr: &Symbol) -> Symbol {
 /// Every attribute `model` declares a reproducible normalization for,
 /// with the lambda's parameter and body.
 pub(crate) fn normalizations(model: &Model) -> HashMap<Symbol, (Symbol, Expr)> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };

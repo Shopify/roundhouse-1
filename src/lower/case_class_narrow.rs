@@ -23,14 +23,14 @@ use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
 pub fn apply_case_class_narrowing(app: &mut App) {
-    let models: std::collections::HashSet<String> =
+    let models: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for view in &mut app.views {
         rewrite(&mut view.body, &models);
     }
 }
 
-fn rewrite(expr: &mut Expr, models: &std::collections::HashSet<String>) {
+fn rewrite(expr: &mut Expr, models: &crate::det::HashSet<String>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, models));
     let ExprNode::Case { scrutinee, arms } = &mut *expr.node else { return };
     if !super::case_lambda::is_pure_read(scrutinee)

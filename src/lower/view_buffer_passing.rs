@@ -30,7 +30,7 @@
 //! buffer" at all, and lowering it for everyone would put a construct
 //! in the shared IR that the weakest emitter cannot spell.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::{LibraryClass, MethodDef, Param};
 use crate::expr::{Expr, ExprNode, IrHint, LValue, Literal};
@@ -283,7 +283,7 @@ fn rewrite_appends(e: &mut Expr, variants: &HashMap<(String, String), Vec<Option
 /// Give every convertible view method a buffer-taking variant and point
 /// view-to-view appends at it.
 pub fn apply(lcs: &mut [LibraryClass]) {
-    let mut variants: HashMap<(String, String), Vec<Option<Expr>>> = HashMap::new();
+    let mut variants: HashMap<(String, String), Vec<Option<Expr>>> = HashMap::default();
     for lc in lcs.iter() {
         for m in &lc.methods {
             if accumulator_name(m).is_some() && forwardable(m) {

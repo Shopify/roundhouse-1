@@ -5,14 +5,14 @@
 //! Postgres dialect (unit-tested in `emit::shared::schema_sql`) and the
 //! Roda conversion's Sequel migrations, pinned here.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;
 
 #[test]
 fn the_roda_migration_declares_an_eight_byte_integer_as_bignum() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         br#"ActiveRecord::Schema[8.1].define(version: 1) do

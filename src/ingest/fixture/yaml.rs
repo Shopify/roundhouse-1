@@ -1,7 +1,7 @@
 //! Fixture YAML values with last-key-wins maps and fresh anchor identities.
 //! Parse structure before resolving aliases: text inside scalars is never syntax.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use serde_yaml_ng::{Mapping, Value};
 use yaml_rust2::parser::{Event, Parser, Tag};
@@ -10,7 +10,7 @@ use yaml_rust2::scanner::TScalarStyle;
 pub(super) fn parse(source: &str) -> Result<Value, String> {
     let mut reader = Reader {
         parser: Parser::new_from_str(source),
-        anchors: HashMap::new(),
+        anchors: HashMap::default(),
     };
     reader.expect(Event::StreamStart)?;
     match reader.next()? {

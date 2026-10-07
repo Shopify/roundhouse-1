@@ -4,7 +4,7 @@ use roundhouse::diagnostic::Severity;
 use roundhouse::emit;
 use roundhouse::project::BuildTarget;
 use roundhouse::ty::Ty;
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 /// Keep inference and the actual backend dispatch on the same ordinary Ruby
@@ -28,7 +28,7 @@ end
 /// Analyze a standalone support class without bringing Rails behavior into
 /// byte-method typing and control-flow tests.
 fn analyze_source(source: &str) -> roundhouse::App {
-    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from([(
+    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from_iter([(
         PathBuf::from("app/lib/byte_probe.rb"),
         source.as_bytes().to_vec(),
     )]))
@@ -126,7 +126,7 @@ fn no_block_returns_integer_array_and_block_returns_string() {
 fn analyzed_model(body: &str) -> roundhouse::App {
     let source =
         format!("class ByteProbe < ActiveRecord::Base\n  def values\n    {body}\n  end\nend\n");
-    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from([
+    let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from_iter([
             (PathBuf::from("app/models/byte_probe.rb"), source.into_bytes()),
             (PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define do\n  create_table :byte_probes do |t|\n    t.string :name\n  end\nend\n".to_vec()),
         ])).unwrap();
@@ -328,7 +328,7 @@ fn nil_bytes_exemption_preserves_other_forwarding_boundaries() {
         "class ByteProbe < ActiveRecord::Base\n  def receiver\n    \"A\"\n  end\n  def values\n    receiver(&nil).bytes(&nil)\n  end\nend\n",
         "class ByteProbe < ActiveRecord::Base\n  def values\n    \"A\".bytes(&(puts(\"side effect\"); nil))\n  end\nend\n",
     ] {
-        let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from([
+        let mut app = roundhouse::ingest::ingest_app_from_tree(HashMap::from_iter([
             (PathBuf::from("app/models/byte_probe.rb"), source.as_bytes().to_vec()),
             (PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define do\n  create_table :byte_probes do |t|\n    t.string :name\n  end\nend\n".to_vec()),
         ])).unwrap();

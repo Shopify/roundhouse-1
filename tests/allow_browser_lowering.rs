@@ -5,7 +5,7 @@
 //! its own page) and from a controller body (the Rails 7.2+ generator's
 //! `allow_browser versions: :modern`).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -702,7 +702,7 @@ fn post_analyze_pass_order_is_sound() -> bool {
 /// computed.
 pub fn apply_post_analyze_lowerings(
     app: &mut crate::app::App,
-    registry: &std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    registry: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
 ) -> Vec<crate::diagnostic::Diagnostic> {
     // Templates ingested for the analyzer only (`View::analysis_only`)
     // leave here: the type checker and the IDE have seen them; no
@@ -1040,7 +1040,7 @@ pub(crate) fn for_each_model_body_named(
     app: &mut crate::app::App,
     f: &mut impl FnMut(&str, &mut crate::expr::Expr),
 ) {
-    let model_names: std::collections::HashSet<String> =
+    let model_names: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         let name = model.name.0.as_str().to_string();

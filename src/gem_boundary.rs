@@ -13,7 +13,8 @@
 //! declares. A gem's methods are not the app's to declare, so they are
 //! carried here and only the analyzer's dispatch registry reads them.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use serde::{Deserialize, Serialize};
 

@@ -10,7 +10,7 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::expr::{Expr, ExprNode, LValue};
 use crate::ty::Ty;
 use crate::ident::{ClassId, Symbol};
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use super::{ClassInfo, PreloadCoverage};
 use super::preload;
@@ -120,7 +120,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
     // escape. Every other action's tail is its value.
-    let filter_targets: std::collections::HashSet<Symbol> = app
+    let filter_targets: crate::det::HashSet<Symbol> = app
         .controllers
         .iter()
         .flat_map(|c| c.body.iter())
@@ -176,7 +176,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // walker emits the outer node before recursing, that's the longest,
     // outermost span. Self-correcting: once span preservation gives links
     // distinct starts, they survive on their own again.
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     out.retain(|d| seen.insert((d.span.file, d.span.start, d.code(), d.message.clone())));
     (out, coverage)
 }
@@ -239,7 +239,7 @@ pub fn unknown_receiver_sends(app: &App, classes: &HashMap<ClassId, ClassInfo>) 
     }
     let mut out = Vec::new();
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, classes, &mut out));
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     out.retain(|s| seen.insert((s.span.file, s.span.start, s.span.end, s.method.clone())));
     out
 }

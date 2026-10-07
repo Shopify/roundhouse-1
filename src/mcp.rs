@@ -504,7 +504,7 @@ impl Server {
         // models, so one unlowered declaration was reported once per
         // composition (five times for the guide's store). One line per
         // construct, first occurrence's order.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::det::HashSet::default();
         let gaps: Vec<String> = diags
             .iter()
             .filter(|d| matches!(d.kind, DiagnosticKind::Unsupported { .. }))

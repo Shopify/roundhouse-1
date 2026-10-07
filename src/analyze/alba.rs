@@ -2,7 +2,7 @@
 //! A joined constructor parameter discards unknown observations, so validate
 //! each represented constructor argument as well as the converged field reads.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::diagnostic::Diagnostic;
 use crate::dialect::{LibraryClass, LibraryClassOrigin, MethodDef, MethodReceiver};
@@ -26,7 +26,7 @@ pub(super) fn diagnose(app: &crate::App) -> Vec<Diagnostic> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    let mut instantiated = HashSet::new();
+    let mut instantiated = HashSet::default();
     let mut pending = Vec::new();
     let generated_spans: HashSet<_> = resources.values().map(|(_, span)| *span).collect();
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
@@ -208,8 +208,8 @@ impl<'a> InstanceEvidence<'a> {
         Self {
             app,
             owner,
-            locals: HashMap::new(),
-            getters: HashSet::new(),
+            locals: HashMap::default(),
+            getters: HashSet::default(),
         }
     }
 
@@ -221,7 +221,7 @@ impl<'a> InstanceEvidence<'a> {
         }
         // Reopenings and duplicate defs do not have one unambiguous body.
         // Do not prove a first getter/initializer while Ruby uses a later one.
-        let mut methods = HashSet::new();
+        let mut methods = HashSet::default();
         class
             .methods
             .iter()

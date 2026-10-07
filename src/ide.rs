@@ -18,7 +18,7 @@
 //! code units, not bytes or Unicode scalars), so multi-byte and astral
 //! characters land where the editor expects.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -476,13 +476,13 @@ pub fn members_of(
     class_id: &ClassId,
     side: MemberSide,
 ) -> Vec<Member> {
-    let mut out: HashMap<Symbol, Member> = HashMap::new();
+    let mut out: HashMap<Symbol, Member> = HashMap::default();
     // Own class first, then includes, then up the parent chain (BFS via
     // pop_front so includes are consulted before the parent, mirroring
     // dispatch) — insert-if-absent makes the nearest definition win.
     let mut queue: std::collections::VecDeque<&ClassId> = std::collections::VecDeque::new();
     queue.push_back(class_id);
-    let mut visited: HashSet<&ClassId> = HashSet::new();
+    let mut visited: HashSet<&ClassId> = HashSet::default();
     while let Some(id) = queue.pop_front() {
         if !visited.insert(id) {
             continue;
@@ -766,7 +766,7 @@ pub fn related_files(app: &App, path: &str) -> Vec<RelatedFile> {
 /// classes, and everything else resolve through their first
 /// real-spanned body expression.
 pub fn class_file_index(app: &App) -> HashMap<ClassId, FileId> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for m in &app.models {
         if !m.span.is_synthetic() {
             out.insert(m.name.clone(), m.span.file);
@@ -1034,7 +1034,7 @@ pub fn root_class(ty: &Ty) -> Option<ClassId> {
 /// contribute). The substrate for `@` completion and for typing an
 /// ivar receiver on a line the stale snapshot hasn't seen.
 pub fn file_ivars(app: &App, path: &str) -> HashMap<Symbol, Option<Ty>> {
-    let mut seen: HashMap<Symbol, Option<Ty>> = HashMap::new();
+    let mut seen: HashMap<Symbol, Option<Ty>> = HashMap::default();
     let Some(file) = file_id(app, path) else { return seen };
     nodes_in_range(app, file, 0, u32::MAX, &mut |e| {
         match &*e.node {
@@ -1540,7 +1540,7 @@ fn variable_references(app: &App, file: FileId, offset: u32) -> Option<Vec<Refer
 
 /// First occurrence wins; order is the caller's.
 fn dedup_keep_order(refs: Vec<Reference>) -> Vec<Reference> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     refs.into_iter().filter(|r| seen.insert((r.span.file.0, r.span.start, r.span.end))).collect()
 }
 
@@ -2022,7 +2022,7 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
     // Applicable `skip_before_action` declarations, target → declarer.
     // Rails' skip gating is itself `only:`/`except:`-scoped, so apply
     // per-action here rather than at persist time.
-    let mut skips: HashMap<Symbol, ClassId> = HashMap::new();
+    let mut skips: HashMap<Symbol, ClassId> = HashMap::default();
     for rf in &resolution.filter_chain {
         if matches!(rf.filter.kind, crate::dialect::FilterKind::Skip)
             && crate::analyze::before_filter_applies(&rf.filter, &action_name)
@@ -2193,7 +2193,7 @@ pub fn traceroute(app: &App, query: &str) -> Option<Trace> {
         let (file, line, effects, assigns) = match action_def {
             Some((_, a)) => {
                 let (f, l) = expr_location(app, &a.body);
-                let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+                let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
                 crate::analyze::extract_ivar_assignments(&a.body, &mut ivars);
                 (
                     f,
@@ -2330,7 +2330,7 @@ pub struct TraceTarget {
 /// routes first (in table order) then unrouted view-rendering actions.
 pub fn trace_targets(app: &App) -> Vec<TraceTarget> {
     let mut out: Vec<TraceTarget> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     for r in crate::lower::routes::flatten_routes(app) {
         let query = format!("{}#{}", r.controller.0.as_str(), r.action.as_str());
         if !seen.insert(query.clone()) {
@@ -2526,7 +2526,7 @@ fn response_terminal(body: &Expr) -> Option<String> {
 /// (a helper from a gem, a model method) contributes nothing.
 fn with_helper_bodies<'a>(app: &'a App, chain: &[ClassId], body: &'a Expr) -> Vec<&'a Expr> {
     let mut out: Vec<&'a Expr> = vec![body];
-    let mut seen: HashSet<Symbol> = HashSet::new();
+    let mut seen: HashSet<Symbol> = HashSet::default();
     let mut i = 0;
     while i < out.len() {
         let mut calls: Vec<Symbol> = Vec::new();
@@ -3982,7 +3982,7 @@ mod tests {
 
 
     fn tree_app(files: &[(&str, &str)]) -> App {
-        let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = files
+        let tree: crate::det::HashMap<std::path::PathBuf, Vec<u8>> = files
             .iter()
             .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
             .collect();

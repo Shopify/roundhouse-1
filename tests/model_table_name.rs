@@ -1,6 +1,6 @@
 //! A model's explicit table name binds both its row and its emitted adapters.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::{ingest_app_from_tree, survey};

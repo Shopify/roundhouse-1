@@ -509,7 +509,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // None` and the Vec bridges don't fire.
     let (mut model_lcs, model_registry): (
         Vec<crate::dialect::LibraryClass>,
-        std::collections::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+        crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
     ) = if !app.models.is_empty() {
         let (mut lcs, registry) = crate::lower::lower_models_with_registry_and_params(
             &app.models,
@@ -524,7 +524,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         decide::decide_classes(&mut lcs);
         (lcs, registry)
     } else {
-        (Vec::new(), std::collections::HashMap::new())
+        (Vec::new(), crate::det::HashMap::default())
     };
 
     let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
@@ -882,7 +882,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                         pub fn id_previously_changed_pred(&self) -> bool {{ false }}\n\
                         pub fn attribute_previously_was(&self, name: &str) -> serde_json::Value {{ let _ = name; serde_json::Value::Null }}\n\
                         pub fn _note_hydrated(&self) {{}}\n\
-                        pub fn create(attrs: std::collections::HashMap<String, serde_json::Value>) -> {name} {{ let mut m = Self::new(attrs); m.save(); m }}\n\
+                        pub fn create(attrs: crate::det::HashMap<String, serde_json::Value>) -> {name} {{ let mut m = Self::new(attrs); m.save(); m }}\n\
                     }}\n",
                     name = lc.name.0.as_str(),
                     destroy_body = destroy_body,
@@ -1060,14 +1060,14 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     \x20   pub fn render(&self, content: String) {{\n\
                     \x20       crate::http::response_set_body(content);\n\
                     \x20   }}\n\
-                    \x20   pub fn render_with(&self, content: String, opts: std::collections::HashMap<String, crate::param_value::ParamValue>) {{\n\
+                    \x20   pub fn render_with(&self, content: String, opts: crate::det::HashMap<String, crate::param_value::ParamValue>) {{\n\
                     \x20       let content_type = opts.get(\"content_type\").and_then(|v| v.as_str()).map(|s| s.to_string());\n\
                     \x20       let status = opts.get(\"status\").and_then(|v| v.as_str()).map(|s| s.to_string());\n\
                     \x20       let status_code = status.as_deref().map(crate::http::status_name_to_code_pub);\n\
                     \x20       crate::http::response_set_body_with(content, content_type, status_code);\n\
                     \x20   }}\n\
                     \x20   pub fn request_format(&self) -> String {{ crate::http::request_format_get() }}\n\
-                    \x20   pub fn redirect_to(&self, url: String, opts: std::collections::HashMap<String, crate::param_value::ParamValue>) {{\n\
+                    \x20   pub fn redirect_to(&self, url: String, opts: crate::det::HashMap<String, crate::param_value::ParamValue>) {{\n\
                     \x20       // Carry `notice:` / `alert:` to the next request via the\n\
                     \x20       // flash cookie (the per-action wrapper sweeps FLASH_OUT into\n\
                     \x20       // Set-Cookie). Recorded in a thread-local rather than on\n\
@@ -1078,7 +1078,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                     \x20       let status = opts.get(\"status\").and_then(|v| v.as_str()).unwrap_or(\"see_other\");\n\
                     \x20       crate::http::response_set_redirect(url, crate::http::status_name_to_code_pub(status));\n\
                     \x20   }}\n\
-                    \x20   pub fn head(&self, status: &str, opts: std::collections::HashMap<String, serde_json::Value>) {{\n\
+                    \x20   pub fn head(&self, status: &str, opts: crate::det::HashMap<String, serde_json::Value>) {{\n\
                     \x20       let content_type = opts.get(\"content_type\").and_then(|v| v.as_str()).map(|s| s.to_string());\n\
                     \x20       crate::http::response_set_head(status, content_type);\n\
                     \x20   }}\n\
@@ -1461,7 +1461,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // build-site's zip writer rejects duplicate filenames, so we
     // dedupe here instead. Iterate from the end so the most recent
     // write survives.
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
     let mut rev_kept: Vec<EmittedFile> = Vec::with_capacity(files.len());
     for f in files.into_iter().rev() {
         if seen.insert(f.path.clone()) {
@@ -1507,7 +1507,7 @@ fn render_axum_handler_wrappers(
     // the same action under multiple paths. The wrappers themselves
     // don't depend on the path (path params come in via extractors),
     // so one wrapper per (controller, action) suffices.
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     let routes: Vec<&crate::lower::FlatRoute> = flat_routes
         .iter()
         .filter(|r| r.controller.0.as_str() == controller_name)
@@ -1581,7 +1581,7 @@ fn render_axum_handler_wrappers(
             // after the `Path` extractors keeps the consumption
             // ordering deterministic).
             args.push(
-                "axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>"
+                "axum::extract::Form(form): axum::extract::Form<crate::det::HashMap<String, String>>"
                     .to_string(),
             );
         }
@@ -1594,7 +1594,7 @@ fn render_axum_handler_wrappers(
             body.push_str("    let mut params = crate::http::params_from_form(form);\n");
         } else if !path_params.is_empty() {
             body.push_str(
-                "    let mut params: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();\n",
+                "    let mut params: crate::det::HashMap<String, serde_json::Value> = crate::det::HashMap::default();\n",
             );
         }
         // Path params land as serde_json::Value::from(i64) under
@@ -2191,13 +2191,13 @@ fn emit_controllers_mod_rs(entries: &[(String, String)]) -> EmittedFile {
 /// from `MethodDef.signature` when present; methods without a typed
 /// signature get an empty Tys vec and the Const-recv arity-pad path
 /// no-ops (same behavior as no entry).
-type GlobalMethodsMap = std::collections::HashMap<
+type GlobalMethodsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<crate::ty::Param>>,
+    crate::det::HashMap<String, Vec<crate::ty::Param>>,
 >;
-type GlobalDefaultsMap = std::collections::HashMap<
+type GlobalDefaultsMap = crate::det::HashMap<
     String,
-    std::collections::HashMap<String, Vec<Option<String>>>,
+    crate::det::HashMap<String, Vec<Option<String>>>,
 >;
 
 fn collect_global_class_methods(
@@ -2217,7 +2217,7 @@ fn collect_global_class_methods(
         lc: &LibraryClass,
         out: &mut GlobalMethodsMap,
         out_defaults: &mut GlobalDefaultsMap,
-        out_mutating: &mut std::collections::HashSet<String>,
+        out_mutating: &mut crate::det::HashSet<String>,
     ) {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
@@ -2280,9 +2280,9 @@ fn collect_global_class_methods(
         }
     }
 
-    let mut out: GlobalMethodsMap = std::collections::HashMap::new();
-    let mut out_defaults: GlobalDefaultsMap = std::collections::HashMap::new();
-    let mut out_mutating: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: GlobalMethodsMap = crate::det::HashMap::default();
+    let mut out_defaults: GlobalDefaultsMap = crate::det::HashMap::default();
+    let mut out_mutating: crate::det::HashSet<String> = crate::det::HashSet::default();
     for lc in model_lcs {
         collect_one(lc, &mut out, &mut out_defaults, &mut out_mutating);
     }

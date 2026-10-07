@@ -14,7 +14,7 @@
 //! always hashes the same.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::det::HashMap;
 use std::hash::{Hash, Hasher};
 
 use rubydex::model::ids::DeclarationId;

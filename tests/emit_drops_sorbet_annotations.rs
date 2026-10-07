@@ -17,7 +17,7 @@
 //! filter must not cross: a declaration on a base class the tree does
 //! not contain.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

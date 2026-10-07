@@ -24,7 +24,7 @@
 //!   the page instead of failing loudly. Measured: three
 //!   `profile_form_with` calls became three `io << ""`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::app::App;

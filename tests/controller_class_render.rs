@@ -11,7 +11,7 @@
 //! partial:` call site in a view binds against — so the two cannot
 //! disagree about what the partial takes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::app::App;

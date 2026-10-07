@@ -1,6 +1,6 @@
 //! Connection routing requires a runtime implementation, even on abstract records.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

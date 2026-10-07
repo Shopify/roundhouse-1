@@ -12,7 +12,7 @@
 //! models that mix `ActionText::Attachable` in, which campfire does one
 //! level down (`User` includes `Mentionable`, which includes it).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

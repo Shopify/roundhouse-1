@@ -5,7 +5,7 @@
 //! the idiom for more than one class method — read as having declared
 //! nothing at all. Not a degraded type: no type.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};

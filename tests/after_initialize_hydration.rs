@@ -19,7 +19,7 @@
 //!   `Inflector.parameterize` — the grounding walked `def` methods only,
 //!   and spinel has no String#parameterize to dispatch.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

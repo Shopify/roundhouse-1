@@ -6,7 +6,7 @@
 //! gradual; a type nobody declares is reported. The binding runs no
 //! code, so the emitted Ruby keeps only the statements around it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 

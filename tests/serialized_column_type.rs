@@ -7,7 +7,7 @@
 //! reader was typed `String?` and ~50 such calls on core read as
 //! "no known method `map` on String?".
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

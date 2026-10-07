@@ -14,7 +14,7 @@
 //! That needs a per-target answer rather than a lowering, and is
 //! filed on its own.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

@@ -12,7 +12,7 @@
 //! So the bound moves to the CALL SITE, composed from the reader and
 //! the value-half the same synthesis already emits.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::app::App;

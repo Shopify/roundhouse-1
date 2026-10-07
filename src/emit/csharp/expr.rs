@@ -24,7 +24,7 @@
 #![allow(dead_code)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::expr::{
     Arm, BoolOpKind, Expr, ExprNode, InterpPart, IrHint, LValue, Literal, OpAssignOp, Pattern,
@@ -36,68 +36,68 @@ use super::ty::csharp_ty;
 thread_local! {
     /// Local names already declared in the current method body (so the
     /// first `Assign` emits a declaration and later ones a bare `=`).
-    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static DECLARED: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// For locals first assigned `nil`, the nullable C# type taken from a
     /// later non-nil assignment — so `var x = null` (illegal in C#) becomes
     /// `T? x = null`. Also filled for the first typed assign with a `?`
     /// suffix (nil-first path); hoist must not treat that alone as proof
     /// of a nil write — see `SAW_NIL`.
-    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static NIL_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// Locals that are actually assigned a `nil` literal somewhere in the
     /// method. Hoisted primitives stay non-nullable unless listed here.
-    static SAW_NIL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static SAW_NIL: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// For locals first assigned an empty `{}`/`[]`, the C# container type
     /// inferred from later `map[k]=v` / `list << x` — so the empty literal
     /// gets a precise `new List<T>()` instead of `object?`.
-    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static CONTAINER_TYPES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// Whether the method currently being emitted returns `void`. A guard
     /// `return nil` in a void method emits a bare `return;`.
     static RETURNS_UNIT: RefCell<bool> = const { RefCell::new(false) };
     /// camelCased names of the current class's accessor-backed properties
     /// (`attr_*` + body ivars). A zero-arg `self`-receiver send resolves to
     /// a property read only when its name is in here.
-    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static INSTANCE_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased parameter names of the method currently being emitted.
-    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static PARAM_NAMES: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Instance property name → declared `Ty`, so a `self.col = <object?>`
     /// write (the row/attrs column shape) can coerce the value to the
     /// column's scalar type.
     static INSTANCE_PROP_TYPES: RefCell<HashMap<String, crate::ty::Ty>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Object.prop"` keys for module/object-level accessor properties
     /// (`class << self; attr_accessor :adapter` → `ActiveRecord.adapter`).
-    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// Name of the class currently being emitted, so an implicit-self
     /// `new(attrs)` resolves to the C# constructor `new Base(attrs)`.
     static CURRENT_CLASS: RefCell<String> = const { RefCell::new(String::new()) };
     /// Class hierarchy: simple class name → (parent simple name, instance
     /// member names). For override resolution.
     static CLASS_HIERARCHY: RefCell<HashMap<String, (Option<String>, HashSet<String>)>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Class simple name → camelCased names of its zero-arg instance methods
     /// (excludes property accessors). A zero-arg send to a typed-`Class`
     /// receiver whose member is in this set keeps its `()`.
     static CLASS_INSTANCE_METHODS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// `"Receiver.method"` → the callee's camelCased parameter names. Decides
     /// whether a call-site `kwargs:true` hash splats into named arguments.
     static METHOD_PARAMS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
     /// Full `T name = default;` declarations for locals first assigned inside
     /// a nested scope yet used at an outer level — they hoist to the method
     /// top (emitted by `library::emit_method`).
     static HOISTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// camelCased instance-property names proven non-null by an enclosing
     /// `if (!prop.nil?)` guard — read with `!` (null-forgiving).
-    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static NONNULL_PROPS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// camelCased `@ivar` names of the current object/module that hold mutable
     /// singleton state — emitted as a thread-local (`name.Value`).
-    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static OBJECT_TL_FIELDS: RefCell<HashSet<String>> = RefCell::new(HashSet::default());
     /// `@ivar` (camelCased) → the C# field name to read/write it as, when the
     /// ivar's natural name collides with a same-named method (C# forbids a
     /// property and method sharing a name — `base.rb`'s `@errors` + `errors`).
     /// The colliding ivar emits as a private renamed field.
-    static IVAR_RENAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static IVAR_RENAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
 }
 
 pub(super) fn set_ivar_renames(m: HashMap<String, String>) {
@@ -291,7 +291,7 @@ thread_local! {
     /// static (`Base.find`) HIDES it in C# (statics don't override), which
     /// warns CS0108 unless marked `new`.
     static CLASS_STATIC_METHODS: RefCell<HashMap<String, HashSet<String>>> =
-        RefCell::new(HashMap::new());
+        RefCell::new(HashMap::default());
 }
 
 pub(super) fn register_static_methods(name: &str, methods: HashSet<String>) {
@@ -302,7 +302,7 @@ pub(super) fn register_static_methods(name: &str, methods: HashSet<String>) {
 /// parents, excluding the class itself) — the set a static must mark `new` to
 /// shadow without a warning.
 pub(super) fn ancestor_static_methods(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = CLASS_HIERARCHY
         .with(|h| h.borrow().get(class_name).and_then(|(p, _)| p.clone()));
     let mut guard = 0;
@@ -442,7 +442,7 @@ pub(super) fn register_class_hierarchy(name: &str, parent: Option<&str>, members
 }
 
 pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -465,7 +465,7 @@ pub(super) fn ancestor_members(class_name: &str) -> HashSet<String> {
 }
 
 pub(super) fn ancestor_props(class_name: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut cur = Some(class_name.to_string());
     let mut guard = 0;
     while let Some(name) = cur {
@@ -573,16 +573,16 @@ pub(super) fn set_returns_unit(b: bool) {
 /// Reset per-method local-decl tracking and pre-scan the body for the
 /// container/nil/hoist signals. Called by `library::emit_method`.
 pub(super) fn begin_method(body: &Expr) {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut nil_types: HashMap<String, String> = HashMap::new();
-    let mut saw_nil: HashSet<String> = HashSet::new();
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    let mut nil_types: HashMap<String, String> = HashMap::default();
+    let mut saw_nil: HashSet<String> = HashSet::default();
     count_assigns(body, &mut counts, &mut nil_types, &mut saw_nil);
     DECLARED.with(|d| d.borrow_mut().clear());
     LOOP_ID.with(|c| *c.borrow_mut() = 0);
     NIL_TYPES.with(|t| *t.borrow_mut() = nil_types);
     SAW_NIL.with(|s| *s.borrow_mut() = saw_nil);
 
-    let mut container_types: HashMap<String, String> = HashMap::new();
+    let mut container_types: HashMap<String, String> = HashMap::default();
     scan_container_types(body, &mut container_types);
     CONTAINER_TYPES.with(|t| *t.borrow_mut() = container_types);
 

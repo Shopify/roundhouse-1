@@ -23,7 +23,7 @@
 //! bare `User.some_method` carries no scope, and growing a parameter for
 //! it would be pure cost.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

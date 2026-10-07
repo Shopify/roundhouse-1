@@ -24,7 +24,7 @@
 //! properly needs an `Array[String]` params field, which the record
 //! (every slot `Ty::Str`, filled by `Params.str`) has no shape for yet.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

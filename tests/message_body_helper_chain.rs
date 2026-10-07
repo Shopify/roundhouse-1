@@ -23,7 +23,7 @@
 //! oracle comparison, where `/rooms/1/messages` is tag-for-tag identical
 //! to Rails on real bodies.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -44,7 +44,7 @@ end
 "#;
 
 fn emitted() -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/message.rb"),

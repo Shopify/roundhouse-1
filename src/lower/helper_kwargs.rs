@@ -50,7 +50,7 @@
 //! an earlier parameter (`def f(a, b = a)`) or the callee's `self` means
 //! something different there, and such a call is left alone.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -95,7 +95,7 @@ pub fn apply_helper_kwarg_positional_lowering(app: &mut App) {
 /// positional (`def f(x, opts = {})`) called with `f(x, opts: 1)` is
 /// handed the Hash `{opts: 1}` by Ruby, and must keep it.
 fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
-    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if m.receiver != crate::dialect::MethodReceiver::Class {
@@ -155,7 +155,7 @@ fn rewrite_class_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), Vec
 /// `fetch_content_type` of its own, with no parameters. Same narrowing
 /// as the class-method rule — only `from_keyword` slots may be named.
 fn instance_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
-    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::new();
+    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
     for lc in &app.library_classes {
         for m in &lc.methods {
             if m.receiver != crate::dialect::MethodReceiver::Instance {
@@ -210,7 +210,7 @@ fn rewrite_instance_calls_node(e: &mut Expr, params: &HashMap<(String, Symbol), 
 /// because then the call site genuinely does not say which.
 fn apply_to_test_modules(app: &mut App) {
     for tm in &mut app.test_modules {
-        let mut params: HashMap<Symbol, Vec<Slot>> = HashMap::new();
+        let mut params: HashMap<Symbol, Vec<Slot>> = HashMap::default();
         let mut ambiguous: Vec<Symbol> = Vec::new();
         for m in &tm.helpers {
             // Same two exclusions as the module path: a `rest` parameter
@@ -261,7 +261,7 @@ fn slot_of(p: &crate::dialect::Param) -> Slot {
 /// call site alone, and binding it to the wrong signature is exactly
 /// the failure being fixed.
 fn helper_param_names(app: &App) -> HashMap<Symbol, Vec<Slot>> {
-    let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::new();
+    let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::default();
     let mut ambiguous: Vec<Symbol> = Vec::new();
     for (name, owner) in &app.helper_method_index {
         let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {

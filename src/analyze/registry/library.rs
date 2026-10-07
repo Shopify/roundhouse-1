@@ -2,7 +2,7 @@
 //! Singleton, superclass links), ActionMailer classes, ActiveJob classes,
 //! and Sidekiq workers. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::App;
@@ -41,7 +41,7 @@ pub(in crate::analyze) fn register(
     // `diagnose` never walks `library_classes`, which is why a gap this
     // broad stayed invisible: the strict emit reported zero errors while
     // the AOT compiler would not accept the tree.
-    let model_concerns: std::collections::HashSet<ClassId> = app
+    let model_concerns: crate::det::HashSet<ClassId> = app
         .models
         .iter()
         .flat_map(crate::analyze::model_includes)
@@ -155,7 +155,7 @@ pub(in crate::analyze) fn register(
     // that synthesizes it. Nobody writes the name by hand, so a
     // registration here cannot mask a typo.
     {
-        let model_names: std::collections::HashSet<&ClassId> =
+        let model_names: crate::det::HashSet<&ClassId> =
             app.models.iter().map(|m| &m.name).collect();
         for lc in &app.library_classes {
             if !lc.parent.as_ref().is_some_and(|p| model_names.contains(p)) {

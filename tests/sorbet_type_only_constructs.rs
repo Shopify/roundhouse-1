@@ -12,7 +12,7 @@
 //! branch where a wrong answer travels furthest before anything
 //! notices, so it lowers to the raise sorbet performs.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

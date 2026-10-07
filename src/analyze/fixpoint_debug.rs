@@ -4,7 +4,7 @@
 //! nodes every round); this names the entries and their sizes so the
 //! growing quantity can be read off the log instead of guessed.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
@@ -94,7 +94,7 @@ pub(super) fn report(label: &str, prev: &InferenceSig, now: &InferenceSig) {
         .map(ty_size)
         .sum::<usize>()
         + now.params.values().flatten().map(ty_size).sum::<usize>();
-    let mut per_kind: HashMap<&str, (usize, isize)> = HashMap::new();
+    let mut per_kind: HashMap<&str, (usize, isize)> = HashMap::default();
     for c in &changes {
         let e = per_kind.entry(c.kind).or_default();
         e.0 += 1;

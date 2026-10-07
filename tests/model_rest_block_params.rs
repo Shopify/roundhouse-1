@@ -8,7 +8,7 @@
 //! at every call site — while the same method on a plain class under
 //! `app/models` kept its splat (#208).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

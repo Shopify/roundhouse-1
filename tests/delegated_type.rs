@@ -3,7 +3,7 @@
 //! concern-constant, `dependent: :destroy`, `foreign_key`,
 //! `foreign_type`, `primary_key`, `optional:`) — not a named-app spelling.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{Association, MethodReceiver, ModelBodyItem};

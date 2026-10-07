@@ -13,15 +13,15 @@ use super::{
     coerce_arg_for_param_ty, current_return_ty, emit_expr, in_return_tail,
 };
 
-/// Emit a Hash literal as `std::collections::HashMap::from([(k, v), ...])`.
-/// Empty literals become `HashMap::new()`. Heterogeneous-value tuples
+/// Emit a Hash literal as `crate::det::HashMap::from_iter([(k, v), ...])`.
+/// Empty literals become `HashMap::default()`. Heterogeneous-value tuples
 /// get `.to_string()` coercion to keep type unification happy when the
 /// surrounding map is String-typed.
 pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
     if entries.is_empty() {
-        return "std::collections::HashMap::new()".to_string();
+        return "crate::det::HashMap::default()".to_string();
     }
-    // Tuple-type unification: HashMap::from([(k, v), ...]) infers from
+    // Tuple-type unification: HashMap::from_iter([(k, v), ...]) infers from
     // the first tuple; later tuples must share that type. Coerce
     // string-literal values to String when any sibling value is a
     // non-literal String-typed expression.
@@ -44,7 +44,7 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
 
     // Heterogeneous primitive-value detection. When entries mix a
     // string-typed value (Ty::Str / Sym) with a non-string primitive
-    // (Ty::Int / Bool / Float), `HashMap::from([(k, v), ...])` infers
+    // (Ty::Int / Bool / Float), `HashMap::from_iter([(k, v), ...])` infers
     // V from the first entry's type and rejects later entries — even
     // when callers will wrap the result in `.into_iter().map(...)
     // .collect()` to coerce K/V at the boundary, the inner array
@@ -78,7 +78,7 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
                 format!("(({k_s}).to_string(), serde_json::Value::from({v_s}))")
             })
             .collect();
-        return format!("std::collections::HashMap::from([{}])", pairs.join(", "));
+        return format!("crate::det::HashMap::from_iter([{}])", pairs.join(", "));
     }
     let pairs: Vec<String> = entries
         .iter()
@@ -144,7 +144,7 @@ pub(super) fn emit_hash(entries: &[(Expr, Expr)]) -> String {
             format!("({k_s}, {v_s})")
         })
         .collect();
-    format!("std::collections::HashMap::from([{}])", pairs.join(", "))
+    format!("crate::det::HashMap::from_iter([{}])", pairs.join(", "))
 }
 
 /// Emit an Array literal as a `vec![...]` macro invocation. Tail-position

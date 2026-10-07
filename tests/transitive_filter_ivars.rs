@@ -13,7 +13,7 @@
 //! and every one of those hops used to make `@project` invisible to the
 //! analyzer.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

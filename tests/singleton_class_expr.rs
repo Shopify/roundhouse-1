@@ -6,7 +6,7 @@
 //! node" fallthrough; it now evaluates to its last statement, with its
 //! defs lifting to nil like any bare `def`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::{ingest_app_from_tree, survey};

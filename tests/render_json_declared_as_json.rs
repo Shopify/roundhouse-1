@@ -16,7 +16,7 @@
 //! against the runtime encoder on the real app (byte-identical, 25
 //! stories).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -124,7 +124,7 @@ end
 "#;
 
 fn analyzed(story: &str) -> roundhouse::App {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/story.rb"), story.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/tag.rb"), TAG.as_bytes().to_vec());
@@ -229,7 +229,7 @@ fn a_record_without_its_own_as_json_keeps_the_runtime_encoder() {
   end
 end
 "#;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/story.rb"), b"class Story < ApplicationRecord\nend\n".to_vec());
     tree.insert(PathBuf::from("app/models/tag.rb"), tag.as_bytes().to_vec());

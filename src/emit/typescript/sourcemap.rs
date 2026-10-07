@@ -18,7 +18,7 @@
 //! ERB offset translation from ingest), so a mapped position lands
 //! on the template line the user wrote.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use super::printer::Mapping;
 use crate::span::SourceFile;
@@ -74,7 +74,7 @@ pub(super) fn build_source_map(
     // (gen_line, gen_col, src_index, src_line0, src_col0), in
     // emission order. The printer writes linearly so generated
     // positions are already non-decreasing.
-    let mut src_index: HashMap<u32, usize> = HashMap::new();
+    let mut src_index: HashMap<u32, usize> = HashMap::default();
     let mut used: Vec<&SourceFile> = Vec::new();
     let mut resolved: Vec<(u32, u32, usize, u32, u32)> = Vec::new();
     for m in mappings {

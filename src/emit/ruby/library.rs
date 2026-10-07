@@ -7,7 +7,8 @@
 //! resolution, so this emitter is shorter than the TS analog: no ivar
 //! field block, no import partition.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -90,15 +91,15 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // tree entirely, which the broadcast tests caught at once. Those
     // keep their own file and the extra body-end with it; moving them
     // is a change to the model emit, not to this one.
-    let emitted_here: std::collections::HashSet<&str> =
+    let emitted_here: crate::det::HashSet<&str> =
         lcs.iter().map(|lc| lc.name.0.as_str()).collect();
     let owner_in_this_tree = |lc: &LibraryClass| -> Option<String> {
         let owner = file_owner(lc.name.0.as_str(), app);
         (owner != lc.name.0.as_str() && emitted_here.contains(owner.as_str())).then_some(owner)
     };
 
-    let mut children: std::collections::HashMap<String, Vec<&LibraryClass>> =
-        std::collections::HashMap::new();
+    let mut children: crate::det::HashMap<String, Vec<&LibraryClass>> =
+        crate::det::HashMap::default();
     for lc in &lcs {
         if let Some(owner) = owner_in_this_tree(lc) {
             children.entry(owner).or_default().push(lc);
@@ -230,11 +231,11 @@ fn splice_nested(
     // require between two files used to satisfy. Left to the
     // collection's own order this works by luck.
     let kids = {
-        let names: std::collections::HashSet<&str> =
+        let names: crate::det::HashSet<&str> =
             kids.iter().map(|k| k.name.0.as_str()).collect();
         let mut pending: Vec<&LibraryClass> = kids.to_vec();
         let mut ordered: Vec<&LibraryClass> = Vec::new();
-        let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut placed: crate::det::HashSet<String> = crate::det::HashSet::default();
         while !pending.is_empty() {
             let before = pending.len();
             pending.retain(|k| {
@@ -471,7 +472,7 @@ fn hash_locals(arg: Option<&Expr>) -> Vec<(Symbol, Expr)> {
 
 fn rewrite_library_partial_render(
     expr: &mut Expr,
-    contracts: &std::collections::HashMap<
+    contracts: &crate::det::HashMap<
         (String, String),
         crate::lower::view_to_library::PartialCallContract,
     >,
@@ -617,7 +618,7 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
         // than a `__scope_` hop to a body that returns its argument;
         // leaving them here would make `by_name` claim them and the
         // identity arm skip them as "a declared scope of the same name".
-        let synthesized: std::collections::HashSet<String> =
+        let synthesized: crate::det::HashSet<String> =
             crate::lower::rich_text::preload_scope_names(model)
                 .into_iter()
                 .chain(crate::lower::attached::preload_scope_names(model))
@@ -1610,7 +1611,7 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
     if bases.is_empty() {
         return;
     }
-    let mut subs_of: HashMap<ClassId, Vec<ClassId>> = HashMap::new();
+    let mut subs_of: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for (sub, base) in &bases {
         subs_of.entry(base.clone()).or_default().push(sub.clone());
     }
@@ -2328,7 +2329,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // generated `RouteHelpers` module. (The view walker rewrites route
     // helpers in the URL positions it classifies; bare calls nested in
     // unclassified expressions fall through to this pass.)
-    let route_helpers: std::collections::HashSet<Symbol> =
+    let route_helpers: crate::det::HashSet<Symbol> =
         crate::lower::lower_routes_to_library_functions(app)
             .into_iter()
             .map(|f| f.name)
@@ -2340,7 +2341,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // `app.library_classes`, not the local `lcs` slice — this pass
     // also runs over the lowered-models stack, whose slice doesn't
     // contain the including class itself.
-    let url_helper_classes: std::collections::HashSet<Symbol> = app
+    let url_helper_classes: crate::det::HashSet<Symbol> = app
         .library_classes
         .iter()
         .filter(|lc| lc.includes.iter().any(|i| i.0.as_str() == "RouteHelpers"))
@@ -2365,7 +2366,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // The class's own method names shadow the helper index inside its
         // bodies — a bare call to one of them is a self-dispatch, never a
         // cross-module helper reference.
-        let own_methods: std::collections::HashSet<Symbol> =
+        let own_methods: crate::det::HashSet<Symbol> =
             lc.methods.iter().map(|m| m.name.clone()).collect();
         for m in &mut lc.methods {
             // A helper module's own methods become module-functions so the
@@ -2388,7 +2389,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             // helpers BENEATH a template's locals.) Passed SEPARATELY from
             // own_methods so the arity guard (bare-reference only) applies
             // to params but not to real self-dispatched methods.
-            let own_params: std::collections::HashSet<Symbol> =
+            let own_params: crate::det::HashSet<Symbol> =
                 m.params.iter().map(|p| p.name.clone()).collect();
             rewrite_helper_calls(
                 &mut m.body,
@@ -2474,7 +2475,7 @@ fn helper_read_ivars(app: &App) -> std::collections::BTreeSet<Symbol> {
             collect_ivar_reads(&m.body, &mut out);
         }
     }
-    let controller_methods: std::collections::HashSet<Symbol> = app
+    let controller_methods: crate::det::HashSet<Symbol> = app
         .controllers
         .iter()
         .flat_map(|c| c.body.iter())
@@ -2945,7 +2946,7 @@ fn hoistable_call_key(e: &Expr) -> Option<String> {
 fn hoisted_const_name(
     method: &str,
     args: &[Expr],
-    used: &mut std::collections::HashSet<String>,
+    used: &mut crate::det::HashSet<String>,
 ) -> Symbol {
     let mut base = format!("HOISTED_{}", method.to_uppercase());
     if let Some(first) = args.iter().find_map(|a| match &*a.node {
@@ -2977,9 +2978,9 @@ fn hoisted_const_name(
 /// the two can never both fire on the same node).
 fn hoist_in_expr(
     e: &mut Expr,
-    minted: &mut std::collections::HashMap<String, Symbol>,
+    minted: &mut crate::det::HashMap<String, Symbol>,
     order: &mut Vec<(Symbol, Expr)>,
-    used: &mut std::collections::HashSet<String>,
+    used: &mut crate::det::HashSet<String>,
 ) {
     hoist_in_expr_at(e, false, minted, order, used)
 }
@@ -2990,9 +2991,9 @@ fn hoist_in_expr(
 fn hoist_in_expr_at(
     e: &mut Expr,
     in_concat: bool,
-    minted: &mut std::collections::HashMap<String, Symbol>,
+    minted: &mut crate::det::HashMap<String, Symbol>,
     order: &mut Vec<(Symbol, Expr)>,
-    used: &mut std::collections::HashSet<String>,
+    used: &mut crate::det::HashSet<String>,
 ) {
     let child_in_concat = matches!(&*e.node, ExprNode::Send { method, args, block: None, .. }
         if method.as_str() == "+" && args.len() == 1);
@@ -3063,13 +3064,13 @@ fn hoist_in_expr_at(
 fn hoist_pure_helper_constants(lcs: &mut [LibraryClass]) {
     // Seeded from every class, so a hoisted name can never collide with an
     // app constant defined in a sibling file of the same namespace either.
-    let mut used: std::collections::HashSet<String> = lcs
+    let mut used: crate::det::HashSet<String> = lcs
         .iter()
         .flat_map(|lc| lc.constants.iter().map(|(n, _)| n.as_str().to_string()))
         .collect();
     for lc in lcs.iter_mut() {
-        let mut minted: std::collections::HashMap<String, Symbol> =
-            std::collections::HashMap::new();
+        let mut minted: crate::det::HashMap<String, Symbol> =
+            crate::det::HashMap::default();
         // Source order of first use, so the emitted constants read down the
         // file in the order the template reaches them.
         let mut order: Vec<(Symbol, Expr)> = Vec::new();
@@ -3208,11 +3209,11 @@ fn view_helpers_path() -> Vec<Symbol> {
 fn rewrite_helper_calls(
     expr: &mut Expr,
     index: &HashMap<Symbol, ClassId>,
-    route_helpers: &std::collections::HashSet<Symbol>,
-    url_helper_classes: &std::collections::HashSet<Symbol>,
+    route_helpers: &crate::det::HashSet<Symbol>,
+    url_helper_classes: &crate::det::HashSet<Symbol>,
     rewrite_request: bool,
-    own_methods: &std::collections::HashSet<Symbol>,
-    own_params: &std::collections::HashSet<Symbol>,
+    own_methods: &crate::det::HashSet<Symbol>,
+    own_params: &crate::det::HashSet<Symbol>,
     view_visible: &std::collections::BTreeSet<Symbol>,
 ) {
     expr.node.for_each_child_mut(&mut |c| {
@@ -4216,7 +4217,7 @@ pub(crate) fn apply_duration_lowering(lcs: &mut [LibraryClass], app: &App) {
 /// looks scalar" would have to enumerate those instead, and would wrap
 /// the next unfamiliar shape by default.
 pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
-    let all_models: std::collections::HashSet<String> =
+    let all_models: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     if all_models.is_empty() {
         return;
@@ -4234,7 +4235,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
     // Skipping them by name is the one place this pass can tell the
     // difference: a generated resource helper's segment is a param, a
     // direct helper's argument is whatever its block says it is.
-    let direct_helpers: std::collections::HashSet<String> = app
+    let direct_helpers: crate::det::HashSet<String> = app
         .routes
         .direct_helpers
         .iter()
@@ -4263,8 +4264,8 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
             .iter()
             .filter_map(|c| c.name.0.as_str().rsplit("::").next().map(str::to_string))
             .collect(),
-        self_returns: std::collections::HashMap::new(),
-        local_records: std::collections::HashMap::new(),
+        self_returns: crate::det::HashMap::default(),
+        local_records: crate::det::HashMap::default(),
         self_model: None,
     };
     // What each INSTANCE method in this slice answers, to a fixpoint.
@@ -4303,7 +4304,7 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
                 _ => None,
             })
             .collect();
-        let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut ambiguous: crate::det::HashSet<String> = crate::det::HashSet::default();
         for _ in 0..8 {
             let mut grew = false;
             let slice_methods = lcs.iter().flat_map(|lc| {
@@ -4366,16 +4367,16 @@ pub(crate) fn apply_route_param_lowering(lcs: &mut [LibraryClass], app: &App) {
 fn collect_local_records(
     body: &Expr,
     sig: &RecordSignals<'_>,
-) -> std::collections::HashMap<String, String> {
+) -> crate::det::HashMap<String, String> {
     fn walk(
         e: &Expr,
         sig: &RecordSignals<'_>,
-        out: &mut std::collections::HashMap<String, String>,
-        poisoned: &mut std::collections::HashSet<String>,
+        out: &mut crate::det::HashMap<String, String>,
+        poisoned: &mut crate::det::HashSet<String>,
     ) {
         let unresolve = |name: &Symbol,
-                             out: &mut std::collections::HashMap<String, String>,
-                             poisoned: &mut std::collections::HashSet<String>| {
+                             out: &mut crate::det::HashMap<String, String>,
+                             poisoned: &mut crate::det::HashSet<String>| {
             out.remove(name.as_str());
             poisoned.insert(name.as_str().to_string());
         };
@@ -4408,8 +4409,8 @@ fn collect_local_records(
         }
         e.node.for_each_child(&mut |c| walk(c, sig, out, poisoned));
     }
-    let mut out = std::collections::HashMap::new();
-    let mut poisoned = std::collections::HashSet::new();
+    let mut out = crate::det::HashMap::default();
+    let mut poisoned = crate::det::HashSet::default();
     walk(body, sig, &mut out, &mut poisoned);
     out
 }
@@ -4432,9 +4433,9 @@ fn body_tail(body: &Expr) -> &Expr {
 /// receiver is a `has_many :through` and so carries no type at all.
 /// The METHOD NAME carries it instead, on the same uniqueness rule the
 /// association maps use — a name two models declare answers None.
-fn record_answering_class_methods(app: &App) -> std::collections::HashMap<String, String> {
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+fn record_answering_class_methods(app: &App) -> crate::det::HashMap<String, String> {
+    let mut out: crate::det::HashMap<String, String> = crate::det::HashMap::default();
+    let mut ambiguous: crate::det::HashSet<String> = crate::det::HashSet::default();
     // Read from `app.models`, not from the LibraryClass slice this pass
     // was handed: the pass runs over CONTROLLERS too, and the class
     // method a controller body names lives on a model that slice does
@@ -4473,7 +4474,7 @@ fn record_answering_class_methods(app: &App) -> std::collections::HashMap<String
 }
 
 /// Model names (`Tag`, `User`) whose class defines its own `to_param`.
-fn models_overriding_to_param(app: &App) -> std::collections::HashSet<String> {
+fn models_overriding_to_param(app: &App) -> crate::det::HashSet<String> {
     app.models
         .iter()
         .filter(|m| {
@@ -4497,10 +4498,10 @@ fn models_overriding_to_param(app: &App) -> std::collections::HashSet<String> {
 /// none of the name-based signals see it, and it redirected to
 /// `/rooms/#<Room:0x…>`. An ambiguous name is dropped rather than
 /// guessed, exactly as the singular map does.
-fn collection_association_targets(app: &App) -> std::collections::HashMap<String, String> {
+fn collection_association_targets(app: &App) -> crate::det::HashMap<String, String> {
     use crate::dialect::Association;
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: crate::det::HashMap<String, String> = crate::det::HashMap::default();
+    let mut ambiguous: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in &app.models {
         for a in m.associations() {
             let Association::HasMany { name, target, .. } = a else { continue };
@@ -4522,10 +4523,10 @@ fn collection_association_targets(app: &App) -> std::collections::HashMap<String
     out
 }
 
-fn singular_association_targets(app: &App) -> std::collections::HashMap<String, String> {
+fn singular_association_targets(app: &App) -> crate::det::HashMap<String, String> {
     use crate::dialect::Association;
-    let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: crate::det::HashMap<String, String> = crate::det::HashMap::default();
+    let mut ambiguous: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in &app.models {
         for a in m.associations() {
             let (name, target) = match a {
@@ -4572,8 +4573,8 @@ fn singular_association_targets(app: &App) -> std::collections::HashMap<String, 
 /// `route_helper_receiver` already documents.
 fn route_helper_param_types(
     app: &App,
-) -> std::collections::HashMap<String, Vec<crate::ty::Ty>> {
-    let mut out = std::collections::HashMap::new();
+) -> crate::det::HashMap<String, Vec<crate::ty::Ty>> {
+    let mut out = crate::det::HashMap::default();
     for f in crate::lower::routes_to_library::lower_routes_to_library_functions(app) {
         if f.module_path.last().map(|s| s.as_str()) != Some("RouteHelpers") {
             continue;
@@ -4590,29 +4591,29 @@ fn route_helper_param_types(
 }
 
 pub(crate) struct RecordSignals<'a> {
-    all_models: &'a std::collections::HashSet<String>,
-    slug_models: &'a std::collections::HashSet<String>,
-    assoc_targets: &'a std::collections::HashMap<String, String>,
-    collection_targets: &'a std::collections::HashMap<String, String>,
+    all_models: &'a crate::det::HashSet<String>,
+    slug_models: &'a crate::det::HashSet<String>,
+    assoc_targets: &'a crate::det::HashMap<String, String>,
+    collection_targets: &'a crate::det::HashMap<String, String>,
     /// A model CLASS METHOD whose body answers one record of that model
     /// — `Room.original` is `order(:created_at).first`. Unambiguous
     /// names only.
-    class_method_targets: &'a std::collections::HashMap<String, String>,
-    direct_helpers: &'a std::collections::HashSet<String>,
+    class_method_targets: &'a crate::det::HashMap<String, String>,
+    direct_helpers: &'a crate::det::HashSet<String>,
     /// `<helper>_path` -> declared type per positional parameter.
-    helper_param_tys: &'a std::collections::HashMap<String, Vec<crate::ty::Ty>>,
+    helper_param_tys: &'a crate::det::HashMap<String, Vec<crate::ty::Ty>>,
     /// Controller class names (last path segment), so a class-side
     /// respelling (`ApplicationController.last_room_visited`) is
     /// recognized as the controller-method read it is.
-    controller_names: std::collections::HashSet<String>,
-    self_returns: std::collections::HashMap<String, String>,
+    controller_names: crate::det::HashSet<String>,
+    self_returns: crate::det::HashMap<String, String>,
     /// Locals THE BODY BEING REWRITTEN binds to a resolvable record —
     /// campfire's `if last_room = last_room_visited` puts the record
     /// behind a name no other signal can read. Rebuilt per method;
     /// a name is held to the same standard as every map here: every
     /// assignment must resolve, and to the same model, or the name
     /// answers nothing.
-    local_records: std::collections::HashMap<String, String>,
+    local_records: crate::det::HashMap<String, String>,
     /// The model whose methods are being rewritten, when the enclosing
     /// class is one — what a bare `self` names there.
     self_model: Option<String>,
@@ -5496,7 +5497,7 @@ pub(crate) fn apply_constant_rooting(
 
     // Every class name this emit defines, app and runtime alike — the
     // authority for "does the inner reading have a target?".
-    let class_names: std::collections::HashSet<String> = app
+    let class_names: crate::det::HashSet<String> = app
         .models
         .iter()
         .map(|m| m.name.0.as_str().to_string())
@@ -6482,13 +6483,13 @@ fn constant_readers(
     lc: &LibraryClass,
     app: &App,
     resolve: &dyn Fn(&Vec<String>, bool) -> Option<String>,
-) -> std::collections::HashMap<String, BTreeSet<String>> {
+) -> crate::det::HashMap<String, BTreeSet<String>> {
     let own = lc.name.0.as_str();
     let own_segs: Vec<&str> = own.split("::").collect();
-    let names: std::collections::HashSet<&str> =
+    let names: crate::det::HashSet<&str> =
         lc.constants.iter().map(|(n, _)| n.as_str()).collect();
-    let mut out: std::collections::HashMap<String, BTreeSet<String>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<String, BTreeSet<String>> =
+        crate::det::HashMap::default();
     for other in &app.library_classes {
         let other_name = other.name.0.as_str();
         if other_name == own {
@@ -6547,7 +6548,7 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
-    fn calls_self(expr: &Expr, own: &std::collections::HashSet<&str>, deferred_names: &std::collections::HashSet<String>, class_name: &str) -> bool {
+    fn calls_self(expr: &Expr, own: &crate::det::HashSet<&str>, deferred_names: &crate::det::HashSet<String>, class_name: &str) -> bool {
         match &*expr.node {
             // A closure that is STORED rather than run — `proc { … }`,
             // `lambda { … }`, `Proc.new { … }`, `->() { … }` — executes
@@ -6605,9 +6606,9 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         }
     }
 
-    let own: std::collections::HashSet<&str> =
+    let own: crate::det::HashSet<&str> =
         lc.methods.iter().map(|m| m.name.as_str()).collect();
-    let mut deferred_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred_names: crate::det::HashSet<String> = crate::det::HashSet::default();
     let (mut eager, mut deferred) = (Vec::new(), Vec::new());
     for (i, (name, value)) in lc.constants.iter().enumerate() {
         if calls_self(value, &own, &deferred_names, lc.name.0.as_str()) {
@@ -8086,7 +8087,7 @@ fn raw_helper_sites(app: &App) -> BTreeSet<(Symbol, usize)> {
 
 fn collect_raw_helper_sites(
     e: &Expr,
-    index: &std::collections::HashMap<Symbol, ClassId>,
+    index: &crate::det::HashMap<Symbol, ClassId>,
     out: &mut BTreeSet<(Symbol, usize)>,
 ) {
     e.node.for_each_child(&mut |c| collect_raw_helper_sites(c, index, out));

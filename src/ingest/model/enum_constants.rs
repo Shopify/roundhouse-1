@@ -70,12 +70,12 @@ enum SourceFact {
 
 #[derive(Default)]
 pub(in crate::ingest) struct EnumConstants {
-    values: std::collections::HashMap<String, EnumConstant>,
+    values: crate::det::HashMap<String, EnumConstant>,
     /// Lexical owners at each class/module open, keyed by (file, start).
     /// Concern `included do` resolution reads the same table models use.
-    pub(in crate::ingest) nesting: std::collections::HashMap<(String, usize), Vec<String>>,
+    pub(in crate::ingest) nesting: crate::det::HashMap<(String, usize), Vec<String>>,
     /// Superclass identities are lookup barriers, never additional enum inputs.
-    parents: std::collections::HashMap<String, Vec<ScopedName>>,
+    parents: crate::det::HashMap<String, Vec<ScopedName>>,
     facts: Vec<SourceFact>,
 }
 
@@ -96,7 +96,7 @@ impl EnumConstants {
         &mut self,
         app: &crate::App,
         sources: &[crate::span::SourceFile],
-        input_files: &std::collections::HashSet<std::path::PathBuf>,
+        input_files: &crate::det::HashSet<std::path::PathBuf>,
     ) -> super::super::IngestResult<()> {
         for source in sources {
             let path = std::path::Path::new(&source.path);
@@ -128,14 +128,14 @@ impl EnumConstants {
     }
 
     fn resolve_name(&self, path: &str, owners: &[String]) -> Option<String> {
-        self.resolve_name_in(path, owners, &mut std::collections::HashSet::new())
+        self.resolve_name_in(path, owners, &mut crate::det::HashSet::default())
     }
 
     fn resolve_name_in(
         &self,
         path: &str,
         owners: &[String],
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut crate::det::HashSet<String>,
     ) -> Option<String> {
         if let Some(rooted) = path.strip_prefix("::") {
             return Some(rooted.to_string());
@@ -163,7 +163,7 @@ impl EnumConstants {
         &self,
         owner: &str,
         first: &str,
-        visited: &mut std::collections::HashSet<String>,
+        visited: &mut crate::det::HashSet<String>,
     ) -> bool {
         if !visited.insert(owner.to_string()) {
             return true; // Cyclic ancestry is not a provable root lookup.

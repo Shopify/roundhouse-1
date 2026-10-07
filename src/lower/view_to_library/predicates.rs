@@ -38,9 +38,9 @@ use super::send;
 /// them would change real collection semantics.
 pub(super) fn rewrite_predicates(
     cond: &Expr,
-    nullable: &std::collections::HashSet<String>,
-    refs: &std::collections::HashSet<String>,
-    nilable_reads: &std::collections::HashSet<String>,
+    nullable: &crate::det::HashSet<String>,
+    refs: &crate::det::HashSet<String>,
+    nilable_reads: &crate::det::HashSet<String>,
 ) -> Expr {
     let new_node = match &*cond.node {
         ExprNode::Send {

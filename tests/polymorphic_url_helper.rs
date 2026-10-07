@@ -13,7 +13,7 @@
 //! is the point: the gap gets one named home instead of reading like a
 //! compiler bug.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

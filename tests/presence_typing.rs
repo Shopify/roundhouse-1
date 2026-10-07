@@ -1,6 +1,6 @@
 //! `presence` on a receiver typed `T` is `T?`, not `untyped`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

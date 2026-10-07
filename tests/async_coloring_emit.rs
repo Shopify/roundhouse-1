@@ -82,7 +82,7 @@ fn dump_propagation_marks_real_blog() {
     use roundhouse::analyze::async_color;
     use roundhouse::expr::{Expr, ExprNode, LValue};
     use roundhouse::profile::DeploymentProfile;
-    use std::collections::HashSet;
+    use roundhouse::det::HashSet;
 
     let app = analyzed("fixtures/real-blog");
     let profile = DeploymentProfile::node_async();

@@ -5,7 +5,7 @@
 //! machinery doesn't apply; we just collect methods and `include`
 //! directives.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use ruby_prism::parse;
 
@@ -101,7 +101,7 @@ pub fn ingest_library_classes(
     // declaration, so it becomes the `class Err < StandardError; end`
     // it stands for, right after its owner. See `class_new_declaration`.
     let mut i = 0;
-    let mut synthesized = HashSet::new();
+    let mut synthesized = HashSet::default();
     while i < out.len() {
         let declared = take_class_new_declarations(&mut out[i]);
         synthesized.extend(declared.iter().map(|class| class.name.clone()));
@@ -547,8 +547,8 @@ pub(super) fn literal_sorbet_members(
     if members.len() != statements.len() {
         return None;
     }
-    let mut names = HashSet::new();
-    let mut serialized = HashSet::new();
+    let mut names = HashSet::default();
+    let mut serialized = HashSet::default();
     members.into_iter().map(|member| {
         if !names.insert(member.name.clone()) {
             return None;
@@ -1626,7 +1626,7 @@ fn walk_decl_body_with_visibility<'pr>(
     visibility: &Visibility,
 ) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
-    let mut class_attributes: HashSet<Symbol> = HashSet::new();
+    let mut class_attributes: HashSet<Symbol> = HashSet::default();
     let mut has_class_attr_default = false;
     // `module_function` (called bare inside a module body) marks every
     // subsequent direct `def` as a module-function — both an instance
@@ -2632,12 +2632,12 @@ fn declares_abstract_class(class: &ruby_prism::ClassNode<'_>) -> bool {
 /// the pre-pass collects, so a chain of any depth resolves.
 #[derive(Debug, Default, Clone)]
 pub struct ModelBases {
-    names: std::collections::HashSet<String>,
+    names: crate::det::HashSet<String>,
 }
 
 impl ModelBases {
     pub fn new() -> Self {
-        let mut names = std::collections::HashSet::new();
+        let mut names = crate::det::HashSet::default();
         names.insert("ApplicationRecord".to_string());
         names.insert("ActiveRecord::Base".to_string());
         // Rails' Action Text abstract base (`ActionText::Record <
@@ -3116,7 +3116,7 @@ pub fn ingest_concern_class_method_spans(
     // Framework identity must not depend on which declarations survive
     // library-shape ingestion. This walk records binding barriers only;
     // it neither evaluates constants nor executes class bodies.
-    let mut shadows = HashSet::new();
+    let mut shadows = HashSet::default();
     framework_shadow_scopes(&root, &mut shadows);
     (out, shadows.into_iter().map(|scope| ClassId(Symbol::from(scope.join("::")))).collect())
 }
@@ -3585,7 +3585,7 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
 /// that includes `T::Props` — flattening that by hand at the sidecar
 /// would be the app asserting something it did not write.
 fn includes_t_props(id: &ClassId, includes: &HashMap<ClassId, Vec<ClassId>>) -> bool {
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     let mut stack = vec![id.clone()];
     while let Some(current) = stack.pop() {
         if !seen.insert(current.0.as_str().to_string()) {

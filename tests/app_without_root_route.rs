@@ -4,7 +4,7 @@
 //! build` refused the call and the ruby tree raised NoMethodError on
 //! its first request (#165).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

@@ -24,7 +24,7 @@
 //! against its re-typed trees, reports each difference, and fails the
 //! analysis if there was one: the oracle for the skip rule.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::DeclarationId;
@@ -417,7 +417,7 @@ impl Incremental {
                 kept
             });
         }
-        let mut param_prints = HashMap::with_capacity(params.len());
+        let mut param_prints = HashMap::with_capacity_and_hasher(params.len(), Default::default());
         for ((c, m), tys) in params {
             let key = (c.clone(), m.clone());
             let now = tys_print(tys);

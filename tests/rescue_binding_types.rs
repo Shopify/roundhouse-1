@@ -6,7 +6,7 @@
 //! off `e`. Binding `e` as plain `StandardError` in those cases turned
 //! every `e.metric_value` into a `send_dispatch_failed`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

@@ -23,7 +23,7 @@
 //! An unknown gem that claims the name is attributed by
 //! `attribution::attribute_unknown_gems`, like any dispatch failure.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
@@ -52,7 +52,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     // includes is too: mastodon's `Authorization` concern includes
     // `Pundit::Authorization`, where `verify_authorized` lives.
     let opaque_module = |root: &ClassId| {
-        let mut seen: HashSet<&ClassId> = HashSet::new();
+        let mut seen: HashSet<&ClassId> = HashSet::default();
         let mut stack = vec![root];
         while let Some(m) = stack.pop() {
             if !seen.insert(m) {
@@ -199,7 +199,7 @@ fn defines_dynamically(item: &ControllerBodyItem) -> bool {
 /// run on its own: the same source the body typer resolves a bare call
 /// in an action against, so a filter target and a call agree.
 fn framework_methods(app: &App) -> HashSet<Symbol> {
-    let mut classes = HashMap::new();
+    let mut classes = HashMap::default();
     super::registry::controllers::register(&mut classes, app, &[]);
     classes
         .get(&ClassId(Symbol::from("ActionController::Base")))

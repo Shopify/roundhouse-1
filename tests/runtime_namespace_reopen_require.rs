@@ -12,7 +12,7 @@
 //! `app/models/net/http.rb:1: uninitialized constant Net (NameError)`
 //! and the lobsters ruby lanes were red for ten days.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby::emit_library;
@@ -40,7 +40,7 @@ end
 
 #[test]
 fn a_reopen_inside_a_runtime_namespace_requires_the_runtime_file_its_header_reads() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"body\", null: false\n  end\nend\n".to_vec(),

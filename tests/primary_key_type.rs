@@ -8,7 +8,7 @@
 //! type now decides, per model; the RUNTIME write path (insert's
 //! `last_insert_rowid`) is the half that stays ledgered.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, Severity};
@@ -17,7 +17,7 @@ use roundhouse::ty::Ty;
 use roundhouse::Symbol;
 
 fn app(schema: &str, model: &str, controller: &str) -> (roundhouse::App, Analyzer) {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), schema.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/widget.rb"), model.as_bytes().to_vec());
     tree.insert(
@@ -275,7 +275,7 @@ fn a_uuid_foreign_key_uses_a_string_sentinel() {
   end
 end
 "#;
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), schema.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/widget.rb"), b"class Widget < ApplicationRecord\n  has_many :parts\nend\n".to_vec());
     tree.insert(PathBuf::from("app/models/part.rb"), b"class Part < ApplicationRecord\n  belongs_to :widget\nend\n".to_vec());

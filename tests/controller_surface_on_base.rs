@@ -11,7 +11,7 @@
 //! nothing knew — with a diagnostic carrying no span, so it could not
 //! even be located in the source.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

@@ -24,7 +24,8 @@
 use crate::app::App;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+use crate::det::HashSet;
 
 pub fn apply_fused_independent_rewrites(app: &mut App) {
     let skip_exclude = super::exclude_predicate::app_defines_exclude(app);
@@ -134,7 +135,7 @@ pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
         .collect();
     let sti_names = super::sti_is_a::subclass_type_names(app);
     let contracts = super::controller_class_render::call_contracts(app);
-    let none = HashSet::new();
+    let none = HashSet::default();
 
     for model in &mut app.models {
         for item in &mut model.body {
@@ -358,14 +359,14 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
 fn rewrite_mid_node(
     e: &mut Expr,
     enclosing: Option<&crate::ident::ClassId>,
-    helpers: &std::collections::HashSet<String>,
-    path_params: &std::collections::HashMap<String, Vec<String>>,
+    helpers: &crate::det::HashSet<String>,
+    path_params: &crate::det::HashMap<String, Vec<String>>,
     position_path: bool,
     enum_map: &super::enum_symbols::EnumMap,
     json_map: &super::has_json::HasJsonColumns,
-    sole_includer: &std::collections::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
-    by_model: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
-    readers: &std::collections::HashMap<crate::ident::ClassId, std::collections::HashSet<Symbol>>,
+    sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
+    by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    readers: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
 ) {
     if !helpers.is_empty() {
         super::route_format_suffix::rewrite_node(e, helpers);
@@ -392,8 +393,8 @@ fn rewrite_mid_node(
 fn apply_route_url_followups(
     target: &mut Expr,
     position_path: bool,
-    path_params: &std::collections::HashMap<String, Vec<String>>,
-    helpers: &std::collections::HashSet<String>,
+    path_params: &crate::det::HashMap<String, Vec<String>>,
+    helpers: &crate::det::HashSet<String>,
 ) {
     if position_path {
         super::route_url_options::rewrite_position_node(target, path_params);

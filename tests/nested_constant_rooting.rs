@@ -17,7 +17,7 @@
 //! body meant the outer one. A body that really does mean the nested
 //! constant is untouched.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

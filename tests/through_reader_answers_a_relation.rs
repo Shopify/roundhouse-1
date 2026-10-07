@@ -24,7 +24,7 @@
 //! `Relation#preloaded`, which seeds the loaded-records memo when the
 //! flag is set and is a no-op when it is not.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

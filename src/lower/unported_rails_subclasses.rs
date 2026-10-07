@@ -21,7 +21,7 @@
 //! the pass order, so no later pass ledgers residue for a body that is
 //! not going to emit.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -33,7 +33,7 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
     // Each doomed class → the base at the top of its chain. A fixpoint
     // because `library_classes` is in file order, and a subclass's file
     // can sort before its parent's.
-    let mut doomed: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut doomed: HashMap<Symbol, Symbol> = HashMap::default();
     loop {
         let mut grew = false;
         for lc in &app.library_classes {

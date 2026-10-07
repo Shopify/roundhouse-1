@@ -26,7 +26,7 @@
 //! (`only: Bot::WebhookJob`) are rewritten to the string at compile
 //! time by `lower::job_test_only`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::app::App;

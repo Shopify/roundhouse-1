@@ -223,7 +223,7 @@ fn a_reopened_filter_macro_uses_its_latest_definition() {
 fn unsupported_filter_macro_keeps_its_inventory_identity_and_whole_body() {
     use roundhouse::ingest::survey;
 
-    let tree: std::collections::HashMap<_, _> = [
+    let tree: roundhouse::det::HashMap<_, _> = [
         (
             "app/controllers/concerns/authentication.rb",
             r#"

@@ -6,7 +6,7 @@
 //! closes over the index. The shared lowerer flattens the Enumerator
 //! chain; this pin checks the emitted Ruby, not IR alone.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -20,7 +20,7 @@ end
 "#;
 
 fn emit_lib(src: &str, stem: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

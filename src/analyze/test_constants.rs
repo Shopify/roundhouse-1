@@ -24,7 +24,7 @@
 //!   of the same name is found first from the test's modules, or is
 //!   reopened by the hoist (`Shop::Late` for `module Shop`, `Late`).
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::sync::OnceLock;
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
@@ -57,7 +57,7 @@ pub(crate) fn declared_namespaces(text: &str) -> HashSet<String> {
             self.enter(node.constant_path().location().as_slice(), node.body());
         }
     }
-    let mut declared = Declared(Vec::new(), HashSet::new());
+    let mut declared = Declared(Vec::new(), HashSet::default());
     let parsed = ruby_prism::parse(text.as_bytes());
     if parsed.errors().next().is_none() {
         ruby_prism::Visit::visit(&mut declared, &parsed.node());

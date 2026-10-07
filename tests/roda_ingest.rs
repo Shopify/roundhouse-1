@@ -343,11 +343,11 @@ fn seeds_ingest_normalized() {
 /// test/, no README.
 #[test]
 fn ingests_from_in_memory_tree() {
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let fixture = Path::new("fixtures/roda-blog");
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     for rel in [
         "app.rb",
         "config.ru",

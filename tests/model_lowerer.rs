@@ -1051,7 +1051,7 @@ end
 #[test]
 fn concern_included_do_dsl_splices_into_including_models() {
     use roundhouse::ingest::ingest_app_from_tree;
-    use std::collections::HashMap;
+    use roundhouse::det::HashMap;
     use std::path::PathBuf;
 
     let tree: HashMap<PathBuf, Vec<u8>> = [
@@ -1417,8 +1417,8 @@ fn collect_untyped_lowered(
 /// full ClassId and a last-segment alias so the body-typer's
 /// Const-path resolver finds it.
 fn build_class_info_extras(lcs: &[LibraryClass]) -> Vec<(ClassId, roundhouse::analyze::ClassInfo)> {
-    use std::collections::HashMap;
-    let mut grouped: HashMap<ClassId, roundhouse::analyze::ClassInfo> = HashMap::new();
+    use roundhouse::det::HashMap;
+    let mut grouped: HashMap<ClassId, roundhouse::analyze::ClassInfo> = HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = class_info_from_library_class(lc);

@@ -538,7 +538,7 @@ fn assign_class_ids(specs: &mut [ParamsSpec]) {
     // Backstop: one controller declaring two different lists for the
     // same resource would qualify to the same name. Rare enough that a
     // positional suffix is a better answer than another naming rule.
-    let mut taken: std::collections::HashSet<ClassId> = std::collections::HashSet::new();
+    let mut taken: crate::det::HashSet<ClassId> = crate::det::HashSet::default();
     for spec in specs.iter_mut() {
         if taken.insert(spec.class_id.clone()) {
             continue;
@@ -2061,14 +2061,14 @@ pub fn rewrite_typed_bracket_to_field(expr: &Expr, specs: &ParamsSpecs) -> Expr 
 
 pub(crate) fn permitted_field_tys(
     specs: &ParamsSpecs,
-) -> std::collections::HashMap<ClassId, std::collections::HashMap<String, Ty>> {
+) -> crate::det::HashMap<ClassId, crate::det::HashMap<String, Ty>> {
     use crate::ty::Ty;
-    let mut permitted_fields: std::collections::HashMap<
+    let mut permitted_fields: crate::det::HashMap<
         ClassId,
-        std::collections::HashMap<String, Ty>,
-    > = std::collections::HashMap::new();
+        crate::det::HashMap<String, Ty>,
+    > = crate::det::HashMap::default();
     for spec in specs.iter() {
-        let mut set = std::collections::HashMap::new();
+        let mut set = crate::det::HashMap::default();
         for f in &spec.fields {
             set.insert(f.as_str().to_string(), field_ty(spec, f));
         }
@@ -2079,7 +2079,7 @@ pub(crate) fn permitted_field_tys(
 
 pub(crate) fn rewrite_typed_bracket_to_field_in_place(
     expr: &mut Expr,
-    permitted_fields: &std::collections::HashMap<ClassId, std::collections::HashMap<String, crate::ty::Ty>>,
+    permitted_fields: &crate::det::HashMap<ClassId, crate::det::HashMap<String, crate::ty::Ty>>,
 ) -> bool {
     crate::lower::controller_to_library::util::map_expr_mut(expr, &|e| {
         try_rewrite_typed_bracket(e, permitted_fields)
@@ -2088,7 +2088,7 @@ pub(crate) fn rewrite_typed_bracket_to_field_in_place(
 
 fn try_rewrite_typed_bracket(
     e: &Expr,
-    permitted_fields: &std::collections::HashMap<ClassId, std::collections::HashMap<String, crate::ty::Ty>>,
+    permitted_fields: &crate::det::HashMap<ClassId, crate::det::HashMap<String, crate::ty::Ty>>,
 ) -> Option<Expr> {
     use crate::ty::Ty;
     let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else {

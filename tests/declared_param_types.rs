@@ -1,6 +1,6 @@
 //! A parameter's declared type versus what call sites were seen to pass.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

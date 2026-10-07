@@ -10,7 +10,7 @@
 //! four of campfire's controller tests died on `wrong number of
 //! arguments (given 0, expected 1)`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

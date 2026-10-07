@@ -26,7 +26,7 @@
 //! every ivar the concern assigns read `@redirect_uri has no known
 //! type` in the controller.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

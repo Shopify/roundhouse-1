@@ -5,7 +5,7 @@
 //! `^(Writer) -> void` function type (every call on the block variable
 //! was then a dispatch on a proc).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

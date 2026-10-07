@@ -8,7 +8,7 @@
 //! `RouteHelpers.query_suffix`. Before, the merge hid the literal and
 //! the whole hash reached `link_to` — a NoMethodError at render.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

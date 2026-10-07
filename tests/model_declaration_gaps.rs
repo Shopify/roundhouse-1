@@ -3,7 +3,7 @@
 //! the currently recognized declaration fixtures, not runtime support
 //! or a claim that every unknown class-body statement is reported.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{Analyzer, attribution::attribute_ingest_gaps, diagnose};

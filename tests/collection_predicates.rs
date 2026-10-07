@@ -7,7 +7,7 @@
 //! `any?`/`none?` but neither of these, so each failed dispatch as
 //! "no known method `intersect?` on Array[String]" / "`all?` on
 //! Hash[String, bool]".
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

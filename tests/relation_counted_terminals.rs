@@ -12,7 +12,7 @@
 //! `parsed.to_html.split.first(words * 2)` is the shape a receiver-blind
 //! rename would corrupt.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

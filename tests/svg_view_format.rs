@@ -19,7 +19,7 @@
 //!      terminal-free and got an UNGUARDED tail — raising over the
 //!      response its helper had just produced.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -31,7 +31,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 /// No `show.html.erb` — only the svg one, which is campfire's shape and
 /// what makes gate 3 bite.
 fn app() -> roundhouse::App {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/user.rb"),
@@ -126,7 +126,7 @@ fn a_helper_response_guards_the_synthesized_tail() {
 /// whole point: only the SYNTHESIZED tail changed.
 #[test]
 fn an_action_with_no_template_heads_no_content() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/user.rb"),

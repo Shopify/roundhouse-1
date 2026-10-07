@@ -4,7 +4,7 @@
 //! dumper qualifies every table in `schema.rb`. Nothing else in the app
 //! uses the qualifier, so the model must meet its table by the bare name.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -17,7 +17,7 @@ const APPLICATION_CONTROLLER: &str = "class ApplicationController < ActionContro
 /// The spinel tree for a small app: the two base classes plus `files`.
 #[allow(dead_code)]
 fn spinel(files: &[(&str, &str)]) -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("app/models/application_record.rb"), APPLICATION_RECORD.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/controllers/application_controller.rb"),

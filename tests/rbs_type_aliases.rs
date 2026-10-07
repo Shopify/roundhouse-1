@@ -6,7 +6,7 @@
 //! so the method was typed as nothing. Shopify core declares about 360
 //! of them and uses them in some 940 signatures.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

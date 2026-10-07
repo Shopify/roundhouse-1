@@ -2,7 +2,7 @@
 //! `default:` / block defaults, and ActiveRecord `serialize` JSON
 //! coders — general Rails spellings, abstract overlays.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodReceiver, ModelBodyItem};

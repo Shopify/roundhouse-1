@@ -18,7 +18,7 @@
 //! `left_joins` undefined on the class, which is a NoMethodError on
 //! the page that calls the scope.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -48,7 +48,7 @@ end
 "#;
 
 fn emitted() -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/user.rb"), USER.as_bytes().to_vec());
     let mut app = ingest_app_from_tree(tree).expect("ingest");

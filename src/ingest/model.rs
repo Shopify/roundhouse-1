@@ -31,7 +31,7 @@ use super::{IngestError, IngestResult};
 /// campfire's `app/models/push.rb` is four lines and exists solely for
 /// this: without it `Push::Subscription` reads `subscriptions`, and its
 /// table is `push_subscriptions`.
-pub type TablePrefixes = std::collections::HashMap<String, String>;
+pub type TablePrefixes = crate::det::HashMap<String, String>;
 
 mod enum_constants;
 pub(in crate::ingest) use enum_constants::EnumConstants;
@@ -43,7 +43,7 @@ pub(in crate::ingest) use enum_constants::EnumConstants;
 pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     let result = super::prism::parse(source, file);
     let root = result.node();
-    let mut out = TablePrefixes::new();
+    let mut out = TablePrefixes::default();
     for (scope, module) in super::util::find_all_modules_with_scope(&root) {
         let Some(name_path) = super::util::module_name_path(&module) else {
             continue;
@@ -1413,12 +1413,12 @@ enum EnumStored {
 #[derive(Default)]
 pub(super) struct ClassConsts {
     /// `NAME = "x"`, `NAME = :x`, `NAME = 3`, `NAME = OTHER`.
-    scalars: std::collections::HashMap<String, Literal>,
+    scalars: crate::det::HashMap<String, Literal>,
     /// `NAME = %i[…]` / `{ … }`, as the mapping an enum would build.
-    mappings: std::collections::HashMap<String, Vec<(String, EnumStored)>>,
+    mappings: crate::det::HashMap<String, Vec<(String, EnumStored)>>,
     /// `NAME = %i[…]` / `%w[…]` — the bare labels, for the idioms that
     /// derive a mapping from them (`NAME.index_by(&:to_s)`).
-    labels: std::collections::HashMap<String, Vec<String>>,
+    labels: crate::det::HashMap<String, Vec<String>>,
 }
 
 impl ClassConsts {

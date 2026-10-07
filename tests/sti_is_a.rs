@@ -13,7 +13,7 @@
 //! predicate that says an open room is not open is worse than a build
 //! that stops.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

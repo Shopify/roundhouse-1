@@ -29,7 +29,7 @@
 //! as a placeholder, emit the branch target, then rewrite the offset
 //! once the target position is known.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::bytecode::format::{Op, Program, StrId, SymId, UserFn, UserFnId};
 use crate::expr::{BoolOpKind, Expr, ExprNode, LValue, Literal};
@@ -69,7 +69,7 @@ impl Walker {
             string_pool: Vec::new(),
             symbol_pool: Vec::new(),
             code: Vec::new(),
-            locals: HashMap::new(),
+            locals: HashMap::default(),
             next_slot: 0,
             user_fns: Vec::new(),
             saved_states: Vec::new(),

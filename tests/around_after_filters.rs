@@ -12,7 +12,7 @@
 //! ActiveSupport's order: arounds nest in declaration order (first is
 //! outermost), afters run in REVERSE declaration order after the action.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

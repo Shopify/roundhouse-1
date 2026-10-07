@@ -8,7 +8,7 @@
 //! on Float?". `Money`/`MoneyBag` are gem classes roundhouse does not
 //! model, so the honest type is gradual.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

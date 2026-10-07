@@ -18,7 +18,7 @@
 //!   Without it the chain went unresolved and the shared direct-fk
 //!   reader stayed, querying a `user_id` column messages does not have.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

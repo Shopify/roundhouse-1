@@ -12,6 +12,7 @@ pub mod bytecode;
 pub mod catalog;
 pub mod database;
 pub mod diagnostic;
+pub mod det;
 pub mod dialect;
 pub mod effect;
 pub mod emit;

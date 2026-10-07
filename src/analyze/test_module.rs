@@ -1,5 +1,5 @@
 //! Canonical typing of original test scopes, shared with test emission.
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use super::{Analyzer, ClassInfo, ConstScope, Ctx, extract_ivar_assignments};
 use crate::App;
@@ -103,7 +103,7 @@ impl Analyzer {
                 constants: constants.clone(),
                 ..Ctx::default()
             };
-            let mut own_constants = HashMap::new();
+            let mut own_constants = HashMap::default();
             for (name, value) in &mut module.constants {
                 let ty = self.body_typer().analyze_expr(value, &ctx);
                 own_constants.insert(name.clone(), ty);

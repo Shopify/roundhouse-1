@@ -121,7 +121,7 @@ pub(super) fn controller_shim_method_param_ty(method: &str, idx: usize) -> Optio
 /// SelfRef-recv dispatch in `emit_send` to pad missing trailing args
 /// with synth defaults — Ruby `head :sym` (no kwargs) calls the same
 /// underlying shape as `head :sym, content_type: ...`, but Rust needs
-/// the explicit `HashMap::new()` to satisfy the shim's fixed arity.
+/// the explicit `HashMap::default()` to satisfy the shim's fixed arity.
 /// Keep in lockstep with the shim text in `rust.rs::emit` and the
 /// per-index `controller_shim_method_param_ty` table above.
 pub(super) fn controller_shim_arity(method: &str) -> Option<usize> {

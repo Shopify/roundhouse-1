@@ -18,7 +18,7 @@
 //! mapping: `initialize`, `update`/`update!`, and `[]=`. A column that
 //! is not an enum keeps its plain `Cast`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

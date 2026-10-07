@@ -6,7 +6,7 @@
 //! each failed dispatch ("no known method `ascii_only?` on String") on
 //! a value that is unambiguously a String.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

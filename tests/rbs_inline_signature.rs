@@ -5,7 +5,7 @@
 //! parameters were untyped and every read of the ivar reported
 //! `ivar_unresolved`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

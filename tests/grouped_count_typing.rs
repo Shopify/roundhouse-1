@@ -14,7 +14,7 @@
 //! and the METHOD the lowering emits are checked together, because the
 //! bug was the two disagreeing.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

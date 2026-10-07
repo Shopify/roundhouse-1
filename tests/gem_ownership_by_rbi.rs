@@ -7,7 +7,7 @@ use roundhouse::gem_boundary::GemBoundary;
 use roundhouse::gems::{gem_owning_constant_with, GemCensus, Lockfile};
 use roundhouse::ingest::rbi::load_gem_boundary;
 use roundhouse::vfs::Vfs;
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 const LOCK: &str = "\

@@ -5,7 +5,7 @@
 //! it declares on every path. campfire's searches controller is the
 //! shape: `.last(100)` in one branch, `Message.none` in the other.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

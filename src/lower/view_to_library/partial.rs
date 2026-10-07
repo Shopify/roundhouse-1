@@ -265,7 +265,7 @@ fn partial_extra_args(ctx: &ViewCtx, module: &str, method: &str) -> Vec<Expr> {
     // gets one fewer arg here → arity mismatch. The dir-singular exclusion
     // applies only to convention-inferred (non-strict) partials.
     let strict = ctx.strict_locals.get(&key);
-    let declared: std::collections::HashSet<&str> = strict
+    let declared: crate::det::HashSet<&str> = strict
         .map(|ps| ps.iter().map(|p| p.name.as_str()).collect())
         .unwrap_or_default();
     let is_strict = strict.is_some();
@@ -609,7 +609,7 @@ fn partial_extra_named_args(
     let record_name = singularize(&snake_case(last_segment(module)));
     let key = (module.to_string(), method.to_string());
     let strict = ctx.strict_locals.get(&key);
-    let declared: std::collections::HashSet<&str> = strict
+    let declared: crate::det::HashSet<&str> = strict
         .map(|ps| ps.iter().map(|p| p.name.as_str()).collect())
         .unwrap_or_default();
     let is_strict = strict.is_some();

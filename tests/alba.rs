@@ -1,5 +1,5 @@
 //! A bounded Alba 4 source-property contract, distinct from hash-backed input.
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -24,7 +24,7 @@ fn assert_typed(expr: &roundhouse::Expr) {
 }
 
 fn app(source: &str) -> roundhouse::App {
-    ingest_app_from_tree(HashMap::from([
+    ingest_app_from_tree(HashMap::from_iter([
         (
             PathBuf::from("app/lib/resources.rb"),
             source.as_bytes().to_vec(),
@@ -148,7 +148,7 @@ fn unsupported_declarations_are_rejected_not_silently_partially_lowered() {
         "one :author, resource: (raise('receiver evaluated'))::AuthorResource",
     ] {
         let source = SOURCE.replace("attributes :title", declaration);
-        let result = ingest_app_from_tree(HashMap::from([(
+        let result = ingest_app_from_tree(HashMap::from_iter([(
             PathBuf::from("app/lib/resources.rb"),
             source.into_bytes(),
         )]));
@@ -179,7 +179,7 @@ fn hidden_reopens_cannot_disappear_from_the_contract() {
         "$resource &&= ArticleResource",
         "resources = [ArticleResource]; resources.first.class_eval { def to_h; {}; end }",
     ] {
-        let result = ingest_app_from_tree(HashMap::from([
+        let result = ingest_app_from_tree(HashMap::from_iter([
             (
                 PathBuf::from("app/lib/resources.rb"),
                 SOURCE.as_bytes().to_vec(),
@@ -322,7 +322,7 @@ fn constructor_reader_evidence_requires_unmodified_required_parameters() {
 fn unused_resources_leave_unresolved_library_constants_reported() {
     let source = SOURCE.split("class SurveyProbe").next().unwrap().to_owned()
         + "\nclass Unrelated; def call; UnknownVendor.unknown; end; end\n";
-    let mut app = ingest_app_from_tree(HashMap::from([(
+    let mut app = ingest_app_from_tree(HashMap::from_iter([(
         PathBuf::from("app/lib/resources.rb"),
         source.into_bytes(),
     )]))
@@ -379,7 +379,7 @@ fn view_only_constructors_are_checked_without_another_callers_evidence() {
         "unknown_source",
         "AlbaArticle.new(7, 'Syn', AlbaAuthor.new(9, 'Ada'))",
     ] {
-        let mut tree = HashMap::from([
+        let mut tree = HashMap::from_iter([
             (
                 PathBuf::from("app/lib/resources.rb"),
                 source.as_bytes().to_vec(),
@@ -422,7 +422,7 @@ fn dynamic_constant_parents_cannot_be_erased_before_admission() {
             "include (raise('evaluated'))::Alba::Resource",
         ),
     ] {
-        let result = ingest_app_from_tree(HashMap::from([(
+        let result = ingest_app_from_tree(HashMap::from_iter([(
             PathBuf::from("app/lib/resources.rb"),
             SOURCE.replace(literal, dynamic).into_bytes(),
         )]));

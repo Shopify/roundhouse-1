@@ -1,6 +1,6 @@
 //! String conversions without shared runtime preserve named unsupported diagnostics.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

@@ -44,7 +44,7 @@
 //! class ingest left out of the IR ([`App::dropped_files`]), it gains
 //! the definition's file and the gap that failed it.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
@@ -169,11 +169,11 @@ impl<'a> DroppedDefinitions<'a> {
             .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
             .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
             .collect();
-        let mut drops: HashMap<&str, &DroppedFile> = HashMap::new();
+        let mut drops: HashMap<&str, &DroppedFile> = HashMap::default();
         for drop in &app.dropped_files {
             drops.entry(drop.file.as_str()).or_insert(drop);
         }
-        let mut by_name = HashMap::new();
+        let mut by_name = HashMap::default();
         for (i, source) in app.sources.iter().enumerate() {
             let Some(drop) = drops.get(source.path.as_str()).copied() else { continue };
             let file = FileId(i as u32 + 1);
@@ -258,7 +258,7 @@ struct AttributionCtx<'a> {
 
 impl<'a> AttributionCtx<'a> {
     fn build(app: &'a App, gaps: &'a [IngestError]) -> Self {
-        let mut gap_by_path: HashMap<&str, String> = HashMap::new();
+        let mut gap_by_path: HashMap<&str, String> = HashMap::default();
         for gap in gaps {
             let (IngestError::Unsupported { file, .. } | IngestError::Parse { file, .. }) = gap
             else {
@@ -270,7 +270,7 @@ impl<'a> AttributionCtx<'a> {
             });
         }
 
-        let mut tainted_files: HashMap<FileId, &str> = HashMap::new();
+        let mut tainted_files: HashMap<FileId, &str> = HashMap::default();
         for (i, src) in app.sources.iter().enumerate() {
             if let Some((path, _)) = gap_by_path.get_key_value(src.path.as_str()) {
                 tainted_files.insert(FileId(i as u32 + 1), path);
@@ -280,7 +280,7 @@ impl<'a> AttributionCtx<'a> {
         // Class taint by defining file. A class's file is where its first
         // real-span body lands — models/controllers/library classes all
         // ingest single-file in Rails convention.
-        let mut class_file: HashMap<ClassId, FileId> = HashMap::new();
+        let mut class_file: HashMap<ClassId, FileId> = HashMap::default();
         for c in &app.controllers {
             let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
             if let Some(f) = first_real_file(&bodies) {
@@ -307,7 +307,7 @@ impl<'a> AttributionCtx<'a> {
         let own_taint = |id: &ClassId| -> Option<&str> {
             class_file.get(id).and_then(|f| tainted_files.get(f)).copied()
         };
-        let mut tainted_classes: HashMap<ClassId, &str> = HashMap::new();
+        let mut tainted_classes: HashMap<ClassId, &str> = HashMap::default();
         for id in class_file.keys() {
             if let Some(p) = own_taint(id) {
                 tainted_classes.insert(id.clone(), p);
@@ -326,7 +326,7 @@ impl<'a> AttributionCtx<'a> {
                 continue;
             }
             let mut walk = Some(&c.name);
-            let mut seen: HashSet<&ClassId> = HashSet::new();
+            let mut seen: HashSet<&ClassId> = HashSet::default();
             while let Some(id) = walk {
                 if !seen.insert(id) {
                     break;
@@ -339,7 +339,7 @@ impl<'a> AttributionCtx<'a> {
             }
         }
 
-        let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::new();
+        let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
         for v in &app.views {
             if let Some(f) = first_real_file(&[&v.body]) {
                 view_by_file.entry(f).or_insert(&v.name);
@@ -506,7 +506,7 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
     // Pass 2: ivars assigned from an attributed site, per controller
     // (its own actions and filters), then the reads of those ivars in
     // the controller's views and its own file.
-    let mut ivar_gem: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::new();
+    let mut ivar_gem: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::default();
     for c in &app.controllers {
         for a in c.actions() {
             collect_gem_ivars(&a.body, &sites, |name, gem| {
@@ -517,13 +517,13 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
     if ivar_gem.is_empty() {
         return;
     }
-    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::new();
+    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
     for v in &app.views {
         if let Some(f) = first_real_file(&[&v.body]) {
             view_by_file.entry(f).or_insert(&v.name);
         }
     }
-    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::new();
+    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::default();
     for c in &app.controllers {
         let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
         if let Some(f) = first_real_file(&bodies) {

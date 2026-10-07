@@ -227,11 +227,11 @@ pub(super) fn try_recv_typed_method(
                     let v = emit_expr(&args[1]);
                     if module_singleton_thread_local() {
                         return Some(format!(
-                            "{{ {slot}.with(|__s| __s.borrow_mut().get_or_insert_with(std::collections::HashMap::new).insert(({k}).to_string(), ({v}).to_string())); }}"
+                            "{{ {slot}.with(|__s| __s.borrow_mut().get_or_insert_with(crate::det::HashMap::default).insert(({k}).to_string(), ({v}).to_string())); }}"
                         ));
                     }
                     return Some(format!(
-                        "{{ {slot}.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(({k}).to_string(), ({v}).to_string()); }}"
+                        "{{ {slot}.lock().unwrap().get_or_insert_with(crate::det::HashMap::default).insert(({k}).to_string(), ({v}).to_string()); }}"
                     ));
                 }
             }
@@ -490,7 +490,7 @@ pub(super) fn try_recv_typed_method(
             }
             // Coerce the default against the receiver's value Ty so a
             // `{}` Hash literal default against `HashMap<String, Value>`
-            // renders as `Value::Object(...)`, not bare `HashMap::new()`
+            // renders as `Value::Object(...)`, not bare `HashMap::default()`
             // (which trips E0308 at the unwrap_or slot).
             let default_s = if let Some(crate::ty::Ty::Hash { value: rv, .. }) =
                 r.ty.as_ref().map(peel_nil)

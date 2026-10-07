@@ -37,7 +37,7 @@
 //! `dig:`, connections, a field block holding more than `argument`s,
 //! and other options that move where the value comes from.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{
     GraphqlField, GraphqlObjectType, GraphqlResolution, LibraryClass, MethodDef, MethodReceiver,
@@ -97,8 +97,8 @@ pub(super) fn lower_graphql_types(app: &mut crate::App) {
 
     // Resolver and mutation classes first: a field that names one takes
     // its value, and its declared `type`, from what is read here.
-    let mut modeled: HashMap<ClassId, ResolverModel> = HashMap::new();
-    let mut unmodeled: HashMap<ClassId, &str> = HashMap::new();
+    let mut modeled: HashMap<ClassId, ResolverModel> = HashMap::default();
+    let mut unmodeled: HashMap<ClassId, &str> = HashMap::default();
     let mut synthesized_sources: Vec<(
         ClassId,
         String,
@@ -174,7 +174,7 @@ pub(super) fn lower_graphql_types(app: &mut crate::App) {
                 nullable,
             },
         );
-        synthesized_sources.push((class_id.clone(), source, HashMap::new(), synthesized, None));
+        synthesized_sources.push((class_id.clone(), source, HashMap::default(), synthesized, None));
     }
 
     // A type that another object type extends is a base (`BaseObject`,
@@ -292,7 +292,7 @@ pub(super) fn lower_graphql_types(app: &mut crate::App) {
             source.push_str(" def self.__gql_root\n  new(nil)\n end\n");
             synthesized.push(Symbol::from("__gql_root"));
         }
-        let mut spans = HashMap::new();
+        let mut spans = HashMap::default();
         for (field, body) in &fields {
             let GraphqlResolution::Value { method } = &field.resolution else {
                 continue;
@@ -411,7 +411,7 @@ impl<'a> Ctx<'a> {
     /// Ruby looks a method up in.
     fn chain(&self, class: &ClassId) -> Vec<&'a LibraryClass> {
         let mut out = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut cursor = Some(class.clone());
         while let Some(c) = cursor {
             let Some(&i) = self.by_name.get(&c) else {
@@ -1128,7 +1128,7 @@ fn descendants_of(
         .iter()
         .filter(|c| !c.is_module)
         .filter(|c| {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let mut cursor = parents.get(&c.name).cloned().flatten();
             while let Some(p) = cursor {
                 if bases.contains(&p.0.as_str()) {

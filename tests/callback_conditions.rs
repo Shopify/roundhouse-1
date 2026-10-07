@@ -6,7 +6,7 @@
 //! `instance_exec`s it with `self` the record); a Symbol is the predicate
 //! method called on the record.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;
