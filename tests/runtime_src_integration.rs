@@ -826,7 +826,13 @@ fn every_runtime_method_body_concretely_typed() {
     // payload, with `filter_payload:` choosing whether that untyped
     // payload is filtered. What it bought: a subscriber that mutates its
     // context no longer changes what the next one sees, as in native Core.
-    const CEILING: usize = 490;
+    //
+    // 490 -> 495 with origin/main (merged 2026-10-07):
+    // `ActionController::RoutingError#initialize` adds 2: its
+    // `super(message)` is gradual, as in `ParameterMissing`.
+    // `Timeout.timeout` (Spinel port for Campfire tip) adds 3: Pattern D
+    // block/return gradual after `sec: Integer | Float` — polymorphic yield.
+    const CEILING: usize = 495;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

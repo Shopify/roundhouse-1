@@ -31,12 +31,20 @@
 # deflater/splice.rs):
 #   * the fragment cache notes each large fragment it hands out during the
 #     request (Recorder, prepended onto the overlay's Rails::MemoryStore);
-#   * each fragment is deflated ONCE, raw, with no preset dictionary so the
-#     piece is valid wherever it lands, SYNC_FLUSHed to a byte boundary and
-#     kept with its CRC-32 in a WeakKeyMap (keys are not held alive: a
-#     replaced fragment's piece goes with it);
-#   * per request only the text between fragments is deflated, at
-#     BEST_SPEED, with the real preceding 32 KB as its dictionary;
+#   * each fragment is deflated once per (predecessor chain, glue), raw,
+#     SYNC_FLUSHed to a byte boundary, with the run's preceding bytes (up
+#     to deflate's 32 KB window) as its preset dictionary — consecutive
+#     messages share HTML, and without that dictionary a room of parts is
+#     ~4× larger than a whole-page gzip. Kept with its CRC-32 in a
+#     WeakKeyMap (keys are not held alive: a replaced fragment's piece
+#     goes with it). A piece is only reused when the same predecessors
+#     (by identity) and the same glue precede it, so a wrong-body hit is
+#     refused even when CSRF in the layout varies;
+#   * short glue (≤ MAX_GLUE) between consecutive fragments travels with
+#     the second when it holds no recorded request token; token-bearing
+#     or longer gaps go through splice_text and start a new run;
+#   * per request only the text between runs is deflated, at BEST_SPEED,
+#     with the real preceding 32 KB as its dictionary;
 #   * the pieces are framed as one gzip member: header, pieces, a final
 #     empty block, CRC-32 (crc32_combine) and length.
 # Fragments are FOUND in the final body (byteindex, in recording order)
@@ -55,6 +63,7 @@
 # block: random base64 does not compress. Correctness never depends on
 # finding every token: a run is looked up by its bytes, so a run holding
 # an unnoticed token just misses and is deflated, as before.
+require "weakref"
 require "zlib"
 
 module GzipCache
@@ -148,6 +157,12 @@ module GzipCache
   SPLICE_MIN = 1024
   # Deflate's window, and so the most preset dictionary that can matter.
   WINDOW = 32 * 1024
+  # At most this much text between two fragments travels with the second
+  # (ports' MAX_GLUE). More is layout: a new run, no predecessor dict.
+  MAX_GLUE = 256
+  # Pieces kept per fragment, one per predecessor chain seen (room page,
+  # older page, search results) — same bound as the ports.
+  PIECES_PER_FRAGMENT = 4
   # Text pieces shorter than this go out as stored (uncompressed) deflate
   # blocks. Between consecutive fragments (search results, a message list)
   # the text is a few bytes of glue, and a Deflate per piece spent its time
@@ -158,14 +173,33 @@ module GzipCache
   # A final, empty, fixed-Huffman block: ends the deflate stream after
   # pieces that each end on a non-final SYNC_FLUSH block.
   FINAL_BLOCK = "\x03\x00".b.freeze
+  EMPTY = "".b.freeze
   SPLICE_OK = Zlib.respond_to?(:crc32_combine) && defined?(ObjectSpace::WeakKeyMap) ? true : false
 
+  # JRuby's zlib can splice raw deflate pieces but rejects a preset
+  # dictionary on a raw stream. A dictionary improves compression only;
+  # independent pieces still inflate correctly without it. Probe once,
+  # using a disposable stream rather than a failed request's compressor.
+  RAW_DICTIONARY_OK = SPLICE_OK && begin
+    probe = Zlib::Deflate.new(Zlib::BEST_SPEED, -Zlib::MAX_WBITS)
+    begin
+      probe.set_dictionary("roundhouse")
+      true
+    rescue Zlib::StreamError
+      false
+    ensure
+      probe.close
+    end
+  end
+
+  # frag -> list of [chain, glue, deflated, crc]. Chain names the
+  # predecessors (and their glue) the piece was deflated against.
   @pieces = SPLICE_OK ? ObjectSpace::WeakKeyMap.new : nil
   @pieces_mutex = Mutex.new
   # The last fragment looked up and its entry. The cache hands a view the
   # same frozen String until a record changes, so most lookups are this
   # one: an identity check instead of WeakKeyMap hashing ~400 KB (4.6% of
-  # the room page).
+  # the room page). Entry shape matches a @pieces variant.
   @last_piece = nil
   # The last splice: [fragments, texts, gzip]. A page that comes back with
   # the same text around the same fragments (one with no per-request token)
@@ -237,16 +271,35 @@ module GzipCache
     out << GZIP_HEADER
     crc = 0
     pos = 0
-    texts.each_with_index do |text, k|
-      crc = splice_text(out, raw, pos, text, crc, tokens) unless text.empty?
-      pos += text.bytesize
+    # `found` is [offset, frag, ...]; pair index `k` matches `frags[k]`.
+    run_start = 0
+    k = 0
+    while k < frags.length
+      text = texts[k]
       frag = frags[k]
-      next if frag.nil?
-      piece, piece_crc = fragment_piece(frag)
-      out << piece
-      crc = Zlib.crc32_combine(crc, piece_crc, frag.bytesize)
-      pos += frag.bytesize
+      # Fold short glue into the next fragment only when it holds no
+      # recorded request token. A token in the glue would be part of the
+      # piece key, so every CSRF change would miss and re-deflate the
+      # whole glue+fragment (and burn a PIECES_PER_FRAGMENT slot). Leave
+      # token-bearing glue on splice_text (stored block) instead.
+      if k > 0 && text.bytesize <= MAX_GLUE && token_cuts(text, tokens).nil?
+        piece, piece_crc = fragment_piece(frag, text, found, k, run_start, pos, raw)
+        out << piece
+        crc = Zlib.crc32_combine(crc, piece_crc, text.bytesize + frag.bytesize)
+        pos += text.bytesize + frag.bytesize
+      else
+        crc = splice_text(out, raw, pos, text, crc, tokens) unless text.empty?
+        pos += text.bytesize
+        run_start = pos
+        piece, piece_crc = fragment_piece(frag, EMPTY, found, k, run_start, pos, raw)
+        out << piece
+        crc = Zlib.crc32_combine(crc, piece_crc, frag.bytesize)
+        pos += frag.bytesize
+      end
+      k += 1
     end
+    tail = texts[frags.length]
+    crc = splice_text(out, raw, pos, tail, crc, tokens) unless tail.nil? || tail.empty?
     out << FINAL_BLOCK
     out << [crc, raw.bytesize & 0xffffffff].pack("VV")
     out.freeze
@@ -400,32 +453,117 @@ module GzipCache
     list << token
   end
 
-  # A fragment's piece and CRC-32, deflated the first time it is seen.
-  def self.fragment_piece(frag)
+  # A fragment's piece and CRC-32 for glue + frag, deflated against the
+  # run's preceding bytes (up to WINDOW) as dictionary. `found` is the
+  # flat [offset, frag, ...] locate built; `k` is this fragment's pair
+  # index; `at` is where glue (or the fragment, when glue is empty) starts
+  # in `raw`. Variants are keyed by predecessor chain + glue so a piece
+  # compressed after A is never served after B (wrong-body refusal).
+  def self.fragment_piece(frag, glue, found, k, run_start, at, raw)
+    dict_start = at - WINDOW > run_start ? at - WINDOW : run_start
+    # Without raw dictionaries every chain deflates the same; keep one
+    # variant per glue (dict_start == at → empty chain, no dict).
+    dict_start = at unless RAW_DICTIONARY_OK
+    glue_key = glue.empty? ? EMPTY : glue
     hit = @pieces_mutex.synchronize do
       last = @last_piece
-      if !last.nil? && last[0].equal?(frag)
-        last[1]
+      if !last.nil? && last[0].equal?(frag) && last[1] == glue_key &&
+          same_chain?(last[2][0], found, k, dict_start, raw)
+        last[2]
       else
-        e = @pieces[frag]
-        @last_piece = [frag, e].freeze unless e.nil?
-        e
+        found_e = nil
+        list = @pieces[frag]
+        unless list.nil?
+          list.each do |e|
+            next unless e[1] == glue_key && same_chain?(e[0], found, k, dict_start, raw)
+            @last_piece = [frag, e[1], e].freeze
+            found_e = e
+            break
+          end
+        end
+        found_e
       end
     end
-    return hit unless hit.nil?
-    entry = [raw_deflate(frag, nil, Zlib::DEFAULT_COMPRESSION).freeze, Zlib.crc32(frag)].freeze
+    return [hit[2], hit[3]] unless hit.nil?
+
+    data = glue.empty? ? frag : glue.b + frag
+    dict = at > dict_start ? raw.byteslice(dict_start, at - dict_start) : nil
+    deflated = raw_deflate(data, dict, Zlib::DEFAULT_COMPRESSION).freeze
+    piece_crc = Zlib.crc32(data)
+    chain = fragment_chain(found, k, dict_start, raw)
+    glue_f = glue.empty? ? EMPTY : glue.b.freeze
+    entry = [chain, glue_f, deflated, piece_crc].freeze
     @pieces_mutex.synchronize do
-      @pieces[frag] = entry
-      @last_piece = [frag, entry].freeze
+      list = @pieces[frag]
+      if list.nil?
+        list = []
+        @pieces[frag] = list
+      end
+      list.shift if list.size >= PIECES_PER_FRAGMENT
+      list << entry
+      @last_piece = [frag, glue_f, entry].freeze
     end
-    entry
+    [deflated, piece_crc]
+  end
+
+  # [fragment, glue before it, fragment, glue, ...] going back from pair
+  # `k` while those fragments end after `dict_start` — the identity the
+  # dictionary depends on, after page_parts.rb.
+  def self.fragment_chain(found, k, dict_start, raw)
+    c = []
+    j = k - 1
+    while j >= 0
+      off = found[j * 2]
+      prev = found[j * 2 + 1]
+      break if off + prev.bytesize <= dict_start
+      prev_end = j > 0 ? found[(j - 1) * 2] + found[(j - 1) * 2 + 1].bytesize : off
+      g = if off > prev_end && off > dict_start
+        raw.byteslice(prev_end, off - prev_end).b.freeze
+      else
+        EMPTY
+      end
+      # WeakRef: a WeakKeyMap value must not strongly hold a fragment
+      # that is also a map key (same fragment twice in a run, or a
+      # predecessor that is itself cached). Strong refs would pin the
+      # key after the fragment cache drops it.
+      c << WeakRef.new(prev) << g
+      j -= 1
+    end
+    c.freeze
+  end
+
+  def self.chain_pred_is?(stored, prev)
+    return false unless stored.is_a?(WeakRef)
+    stored.weakref_alive? && stored.__getobj__.equal?(prev)
+  rescue WeakRef::RefError
+    false
+  end
+
+  def self.same_chain?(chain, found, k, dict_start, raw)
+    return false if chain.nil?
+    i = 0
+    j = k - 1
+    while j >= 0
+      off = found[j * 2]
+      prev = found[j * 2 + 1]
+      break if off + prev.bytesize <= dict_start
+      return false if i >= chain.length || !chain_pred_is?(chain[i], prev)
+      prev_end = j > 0 ? found[(j - 1) * 2] + found[(j - 1) * 2 + 1].bytesize : off
+      glue_len = off > prev_end && off > dict_start ? off - prev_end : 0
+      g = chain[i + 1]
+      return false if g.bytesize != glue_len
+      return false if glue_len > 0 && raw.byteslice(prev_end, glue_len) != g
+      i += 2
+      j -= 1
+    end
+    i == chain.length
   end
 
   # Raw deflate (no zlib or gzip framing), ending byte-aligned on a
   # non-final block, so pieces concatenate into one stream.
   def self.raw_deflate(data, dict, level)
     z = Zlib::Deflate.new(level, -Zlib::MAX_WBITS)
-    z.set_dictionary(dict) unless dict.nil?
+    z.set_dictionary(dict) if RAW_DICTIONARY_OK && !dict.nil?
     s = z.deflate(data, Zlib::SYNC_FLUSH)
     z.close
     s

@@ -35,6 +35,11 @@ pub(crate) mod turbo_drive;
 pub(crate) mod turbo_frames;
 pub(crate) mod attr_parts;
 
+/// Largest `cached: true` collection that skips the store (`length > N`
+/// takes the concat-cache path). Named for the exclusive bound: length
+/// 8 is uncached, 9 is the first cached size.
+pub const MAX_UNCACHED_COLLECTION_LENGTH: i64 = 8;
+
 use crate::App;
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Param, View};
 use crate::effect::EffectSet;
@@ -830,6 +835,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
         name: module_id,
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: vec![method],
         nullable_columns: Vec::new(),

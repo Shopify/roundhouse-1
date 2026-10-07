@@ -56,6 +56,8 @@ fn generate_project(fixture_path: &Path, out: &Path) {
 // against the rust path. Until then, `real_blog_cargo_test_passes`
 // + `scripts/compare rust` carry the authoritative coverage.
 
+/// Compile the complete generated application and execute its model/runtime
+/// contracts with the actual Cargo dependency graph and packaged imports.
 #[test]
 #[ignore]
 fn real_blog_cargo_test_passes() {
@@ -106,6 +108,31 @@ fn enum_label_walks_past_the_first_label() {
 "#,
     )
     .unwrap();
+
+    // Exercise complete runtime packaging and typed byte reads through the
+    // generated Cargo project, including the real shared error implementation.
+    std::fs::write(
+        scratch.join("tests/route_path_captures.rs"),
+        r#"
+use app::router::Router;
+#[test]
+fn routed_captures_and_checked_bytes() {
+    for (input, expected) in [("abc", "abc"), ("+%2B", "++"), ("%00", "\0"), ("%2500", "%00"), ("%C3%A9", "é")] {
+        let path = format!("/echo/{input}");
+        let hit = Router::match_pattern("/echo/:value", &path, "").expect("route");
+        assert_eq!(hit["value"], expected);
+    }
+    assert_eq!(Router::capture_byte(vec![0, 255], 0), 0);
+    assert_eq!(Router::capture_byte(vec![0, 255], 1), 255);
+    for index in [-1, 1] {
+        let error = std::panic::catch_unwind(|| Router::capture_byte(vec![0], index)).expect_err("invalid offset must reject");
+        assert_eq!(error.downcast_ref::<String>().map(String::as_str), Some("FrameworkError::Argument"));
+    }
+    let error = std::panic::catch_unwind(|| Router::decode_capture("%FF")).expect_err("invalid UTF-8 must reject");
+    assert_eq!(error.downcast_ref::<String>().map(String::as_str), Some("FrameworkError::Argument"));
+}
+"#,
+    ).unwrap();
 
     let output = Command::new("cargo")
         .arg("test")
@@ -232,6 +259,53 @@ async fn articles_index_is_two_queries_not_n_plus_one() {
          \n=== stderr ===\n{}",
         scratch.display(),
         String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// A block filter and a lambda filter read `action_name`. The dispatcher
+/// then calls `assign_action_name`, and the emitted Rust controller must
+/// have that method and the `action_name` reader.
+#[test]
+#[ignore]
+fn filters_that_read_action_name_compile() {
+    let app_dir = scratch_dir("action-name-app");
+    if app_dir.exists() {
+        std::fs::remove_dir_all(&app_dir).expect("clean app copy");
+    }
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(roundhouse::fixtures::real_blog())
+        .arg(&app_dir)
+        .status()
+        .expect("copy real-blog");
+    assert!(copied.success(), "copy real-blog");
+    let controller = app_dir.join("app/controllers/articles_controller.rb");
+    let source = std::fs::read_to_string(&controller).expect("read controller");
+    let edited = source.replacen(
+        "  before_action :set_article,",
+        "  before_action { @bare = action_name }\n  \
+           before_action -> { @own = self.action_name }\n  \
+           before_action :set_article,",
+        1,
+    );
+    assert_ne!(source, edited, "the filter edit applies");
+    std::fs::write(&controller, edited).expect("write controller");
+
+    let scratch = scratch_dir("action-name");
+    generate_project(&app_dir, &scratch);
+    let output = Command::new("cargo")
+        .arg("check")
+        .arg("--quiet")
+        .current_dir(&scratch)
+        .output()
+        .expect("run cargo check");
+
+    assert!(
+        output.status.success(),
+        "cargo check failed on the emitted project at {}:\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
         String::from_utf8_lossy(&output.stderr),
     );
 }

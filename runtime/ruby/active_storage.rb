@@ -80,6 +80,68 @@ module ActiveStorage
     variable_content_types.include?(content_type)
   end
 
+  # Rails' `config.active_storage.video_preview_arguments` — the ffmpeg
+  # argv fragment after `-i <path>`. Default matches the filter the
+  # ruby-family poster reopen draws with; an initializer override
+  # (campfire adds `gte(t,5)`) is lifted onto the Application reopen
+  # at ingest. Suite pins and `Previewer.poster` both read this.
+  def self.video_preview_arguments
+    Rails.application.active_storage_video_preview_arguments
+  end
+
+  # The `-vf` filter expression peeled from `video_preview_arguments`.
+  # One Rails knob, one Application override; the poster reopen takes
+  # this alone (it already passes `-frames:v` / `-f image2`).
+  # Falls back to the framework default filter when the argv has no
+  # quoted `-vf` value — never feeds the whole argv into `-vf`.
+  def self.video_preview_vf_filter
+    args = video_preview_arguments
+    default = "select=eq(n\\,0)+eq(key\\,1)+gt(scene\\,0.015),loop=loop=-1:size=2,trim=start_frame=1"
+    # Match `-vf` as a whole option (not a prefix of `-vframes`).
+    i = 0
+    found = nil
+    while i < args.length
+      j = args.index("-vf", i)
+      if j.nil?
+        break
+      end
+      before_ok = j == 0 || args[j - 1] == " "
+      after = args[j + 3]
+      after_ok = after.nil? || after == " " || after == "'" || after == "\""
+      if before_ok && after_ok
+        found = j
+        break
+      end
+      i = j + 1
+    end
+    if found.nil?
+      return default
+    end
+    rest = args[(found + 3)..-1].to_s
+    while rest.start_with?(" ")
+      rest = rest[1..-1].to_s
+    end
+    quote = rest[0]
+    if quote != "'" && quote != "\""
+      return default
+    end
+    body = rest[1..-1].to_s
+    j = body.index(quote)
+    if j.nil?
+      return default
+    end
+    body[0...j]
+  end
+
+  # Rails' `config.active_storage.previewers` — class list used for
+  # identity checks (`assert_includes ActiveStorage.previewers, …`).
+  # Default is the video previewer only (RH does not ship PDF
+  # previewers). A VideoPreviewer → replacement map on the Application
+  # reopen (campfire: TimeLimitedVideoPreviewer) is lifted at ingest.
+  def self.previewers
+    Rails.application.active_storage_previewers
+  end
+
   # Marcel's answers for the formats a variation can name, so the
   # variant blob's `content_type` column is what Rails would write.
   def self.content_type_for_format(format)
@@ -122,6 +184,15 @@ module ActiveStorage
   def self.filename_base(filename)
     dot = filename.rindex(".")
     dot.nil? || dot == 0 ? filename : filename[0, dot].to_s
+  end
+
+  # Marcel's filename half when `attach(io:, filename:)` omits
+  # `content_type:` — the MIME registry by extension, else octet-stream.
+  # Byte sniffing stays with `ImageAnalyzer` after the bytes exist.
+  def self.content_type_for_filename(filename)
+    ext = Filename.new(filename).extension_without_delimiter
+    looked = Mime::Type.lookup_by_extension(ext)
+    looked.nil? ? "application/octet-stream" : looked.to_s
   end
 
   # Where the blob's file lives, keyed by the blob's `key` column.
@@ -186,11 +257,27 @@ module ActiveStorage
     end
   end
 
-  # The video previewer's swap point — Rails' `Previewer::VideoPreviewer`,
-  # which draws a poster frame with ffmpeg. The shared definition raises,
-  # as `Processor` does: nothing here can run a program, and answering
+  # Rails' generic Active Storage exception base (`activestorage/errors.rb`).
+  # Concrete errors hang off this so `rescue ActiveStorage::Error` matches.
+  class Error < StandardError
+  end
+
+  # Rails' `ActiveStorage::PreviewError` — raised when a previewer cannot
+  # draw a poster (ffmpeg failed, timed out, …). Apps and railties rescue
+  # or raise it; campfire's `TimeLimitedVideoPreviewer` raises it when
+  # the wall-clock limit trips. Parent is `Error`, not bare StandardError,
+  # matching Rails.
+  class PreviewError < Error
+  end
+
+  # The video previewer's swap point. Drawing is the class-side
+  # `Previewer.poster` (ffmpeg on the ruby family); Rails' instance API
+  # lives under the nested `VideoPreviewer` so an app can subclass it
+  # (`TimeLimitedVideoPreviewer < ActiveStorage::Previewer::VideoPreviewer`)
+  # without a NameError at boot. The shared `poster` raises, as
+  # `Processor` does: nothing here can run a program, and answering
   # the video's own bytes as its poster would put them in an `<img>`.
-  # The ruby family reopens it over ffmpeg
+  # The ruby family reopens `poster` over ffmpeg
   # (`runtime/spinel/active_storage_previewer.rb`), the same command
   # Rails runs; a tree without ffmpeg raises there the way Rails does.
   class Previewer
@@ -199,6 +286,14 @@ module ActiveStorage
       raise NotImplementedError,
             "ActiveStorage::Previewer.poster: no previewer on this target — " \
             "a video poster needs ffmpeg"
+    end
+
+    # Rails' `ActiveStorage::Previewer::VideoPreviewer`. This base class
+    # exists so `class TimeLimitedVideoPreviewer < …::VideoPreviewer`
+    # (and `config.active_storage.previewers` identity checks against
+    # that constant) resolve. Poster drawing on this runtime goes
+    # through `Previewer.poster`, not the Rails instance `capture` path.
+    class VideoPreviewer < Previewer
     end
   end
 
@@ -1231,8 +1326,14 @@ module ActiveStorage
     # first. Rails detaches the old blob and leaves it for a purge job;
     # there is no job here and an orphaned blob row would make
     # `attached?` answer for a file no longer attached, so the row and
-    # its bytes go with it.
+    # its bytes go with it — except when `blob` is ALREADY attached:
+    # re-attaching the same Blob must not purge its bytes.
     def attach_blob(blob)
+      load_row
+      current = @blob
+      if !(current.nil?) && current.id == blob.id
+        return nil
+      end
       purge
       ActiveRecord.adapter.insert("active_storage_attachments", {
         "name" => @name,

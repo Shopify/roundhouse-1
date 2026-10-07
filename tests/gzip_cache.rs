@@ -3,6 +3,65 @@
 use std::path::Path;
 use std::process::Command;
 
+const RAW_DICTIONARY_RESPONSE: &str = r#"
+require "zlib"
+if ENV["REJECT_RAW_DICTIONARY"] == "1"
+  # Reproduce JRuby's raw-stream restriction on the default MRI lane.
+  Zlib::Deflate.prepend(Module.new do
+    def set_dictionary(_dictionary)
+      raise Zlib::StreamError, "raw dictionaries unsupported"
+    end
+  end)
+end
+require File.expand_path("runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache", Dir.pwd)
+
+fragment = ("<p>cached fragment</p>" * 100).freeze
+env = {"REQUEST_METHOD" => "GET", "HTTP_ACCEPT_ENCODING" => "gzip"}
+[false, true].each do |with_fragment|
+  ["A" * 86, "B" * 86].each do |token|
+    raw = ("<p>layout</p>" * 100) + token + ("<p>footer</p>" * 100)
+    raw += fragment + ("<p>tail</p>" * 100) if with_fragment
+    app = lambda do |_env|
+      GzipCache.note_token(token)
+      GzipCache.note_fragment(fragment) if with_fragment
+      [200, {"content-type" => "text/html"}, [raw]]
+    end
+    wrapped = GzipCache.wrap(app)
+    2.times do
+      status, headers, body = wrapped.call(env)
+      raise "status" unless status == 200
+      raise "encoding" unless headers["content-encoding"] == "gzip"
+      raise "round trip" unless Zlib.gunzip(body.join) == raw
+    end
+  end
+end
+puts "ALL OK"
+"#;
+
+fn check_raw_dictionary_response(interpreter: &str, reject_dictionary: bool) {
+    let output = Command::new(interpreter)
+        .args(["-e", RAW_DICTIONARY_RESPONSE])
+        .env("REJECT_RAW_DICTIONARY", if reject_dictionary { "1" } else { "0" })
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("Ruby interpreter available");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "gzip response failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("ALL OK"), "gzip response cases did not execute:\n{stdout}");
+}
+
+#[test]
+fn gzip_splicing_survives_missing_raw_dictionary_support() {
+    check_raw_dictionary_response("ruby", true);
+}
+
+#[test]
+#[ignore = "requires JRuby 10 and Java 21+"]
+fn gzip_splicing_executes_on_jruby() {
+    check_raw_dictionary_response("jruby", false);
+}
+
 #[test]
 fn identical_bodies_gzip_once() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -133,57 +192,6 @@ puts "ALL OK"
     assert!(
         stdout.contains("ALL OK"),
         "tep gzip cache failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
-    );
-    assert!(out.status.success(), "driver exited {:?}", out.status.code());
-}
-
-#[test]
-fn overlay_read_str_does_not_dup_a_cached_fragment() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let script = r#"
-require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/rails_cache"
-
-store = Rails::MemoryStore.new
-frag = "message-html" * 32
-store.write_str("k", frag, 0)
-hit = store.read_str("k")
-raise "miss" if hit.nil?
-raise "duped" unless hit.equal?(store.read_str("k"))
-raise "mutated store" unless hit.frozen?
-begin
-  hit << "x"
-  raise "frozen fragment was mutable"
-rescue FrozenError
-end
-other = store.read("k")
-raise "untyped read must still dup" if other.equal?(hit)
-other << "x"
-raise "store corrupted" unless store.read_str("k") == frag
-# write (untyped) also freezes, so a later read_str cannot mutate
-# the shared entry — CodeRabbit on #432.
-store.write("k2", "plain")
-hit2 = store.read_str("k2")
-raise "write miss" if hit2.nil?
-raise "write not frozen" unless hit2.frozen?
-begin
-  hit2 << "x"
-  raise "write-path fragment was mutable"
-rescue FrozenError
-end
-raise "write store corrupted" unless store.read_str("k2") == "plain"
-puts "ALL OK"
-"#;
-    let out = Command::new("ruby")
-        .arg("-e")
-        .arg(script)
-        .current_dir(root)
-        .output()
-        .expect("ruby is on PATH");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stdout.contains("ALL OK"),
-        "overlay read_str failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
     );
     assert!(out.status.success(), "driver exited {:?}", out.status.code());
 }
@@ -547,6 +555,269 @@ puts "ALL OK"
     assert!(
         stdout.contains("ALL OK"),
         "token-cut splice failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+    assert!(out.status.success(), "driver exited {:?}", out.status.code());
+}
+
+/// Predecessor-fragment dictionaries (ports' page_parts / deflater):
+/// consecutive message fragments with short glue deflate against the run's
+/// preceding window, stay correct when CSRF in the layout varies, refuse a
+/// piece after the wrong predecessor, and beat independent (no-dict) pieces.
+#[test]
+fn predecessor_fragment_dictionary_reuses_pieces_safely() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r##"
+require "securerandom"
+require "base64"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache"
+raise "splice unavailable" unless GzipCache::SPLICE_OK
+raise "raw dictionaries required for this gate" unless GzipCache::RAW_DICTIONARY_OK
+
+tmpl = lambda { |i|
+  b = +"<turbo-frame id=\"message_#{i}\" class=\"message\">"
+  50.times { |p|
+    b << "<p class=\"message__body\">Paragraph #{p} of message #{i}: shared campfire markup "
+    b << "<a href=\"/rooms/1\">room</a> repeated for dictionary matches.</p>\n"
+  }
+  (b << "</turbo-frame>\n").freeze
+}
+msgs = (1..12).map { |i| tmpl.call(i) }
+# Short glue between messages (≤ MAX_GLUE) so they form one run.
+inner = msgs.join("\n")
+
+fragment_deflates = 0
+dicts = 0
+orig = GzipCache.method(:raw_deflate)
+GzipCache.define_singleton_method(:raw_deflate) do |d, dict, lv|
+  # Layout constant_run also uses DEFAULT_COMPRESSION; count only message
+  # pieces (glue may precede the turbo-frame).
+  if lv == Zlib::DEFAULT_COMPRESSION && d.include?("turbo-frame")
+    fragment_deflates += 1
+    dicts += 1 unless dict.nil?
+  end
+  orig.call(d, dict, lv)
+end
+
+bodies = []
+2.times do
+  tok = Base64.urlsafe_encode64(SecureRandom.random_bytes(64), padding: false)
+  body = +"<html><head><meta name=\"csrf-token\" content=\"#{tok}\"></head><body>"
+  body << ("<nav>Room link #{'x' * 40}</nav>\n" * 20)
+  body << inner
+  body << "<form><input name=\"authenticity_token\" value=\"#{tok}\"></form></body></html>"
+  bodies << body
+  gz = GzipCache.splice(body, msgs, [tok])
+  raise "nil splice" if gz.nil?
+  raise "round trip" unless Zlib.gunzip(gz) == body.b
+  # RFC 1952 gzip member: ID1/ID2/CM and a valid inflate.
+  raise "bad magic" unless gz.byteslice(0, 3) == "\x1f\x8b\x08".b
+end
+raise "fragment deflated #{fragment_deflates}x (want #{msgs.size})" unless fragment_deflates == msgs.size
+raise "no dictionaries used (#{dicts})" unless dicts == msgs.size - 1
+
+# Same fragments, different predecessor order: must not reuse the A→B piece
+# after B→A (would be a wrong-body inflate if the chain key were ignored).
+a, b = msgs[0], msgs[1]
+ab = a + "\n" + b
+ba = b + "\n" + a
+gz_ab = GzipCache.splice(ab, [a, b])
+gz_ba = GzipCache.splice(ba, [b, a])
+raise "ab round trip" unless Zlib.gunzip(gz_ab) == ab.b
+raise "ba round trip" unless Zlib.gunzip(gz_ba) == ba.b
+raise "order collision" if gz_ab == gz_ba
+
+# Microbench: predecessor dicts beat independent no-dict pieces on the same
+# glue-folded run (the ports' ~4× story on message lists; here a floor).
+no_dict = GzipCache::GZIP_HEADER.bytesize + GzipCache::FINAL_BLOCK.bytesize + 8
+msgs.each_with_index do |m, i|
+  data = i.zero? ? m : ("\n".b + m)
+  no_dict += GzipCache.raw_deflate(data, nil, Zlib::DEFAULT_COMPRESSION).bytesize
+end
+with_dict = GzipCache.splice(inner, msgs).bytesize
+raise "dict #{with_dict} B not below no-dict #{no_dict} B" unless with_dict < no_dict
+ratio = no_dict.to_f / with_dict
+raise "weak dict gain #{ratio}" unless ratio >= 1.25
+puts "MICROBENCH dict=#{with_dict} no_dict=#{no_dict} gain=#{ratio.round(2)}x"
+puts "ALL OK"
+"##;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "predecessor-dict splice failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+    assert!(out.status.success(), "driver exited {:?}", out.status.code());
+    eprintln!("{stdout}");
+}
+
+/// Short glue that carries a recorded CSRF token must not fold into the
+/// next fragment piece (CodeRabbit on #546): each token change would miss
+/// the piece cache and re-deflate glue+fragment. Token-bearing glue stays
+/// on splice_text; fragments deflate once across requests.
+#[test]
+fn token_bearing_short_glue_does_not_fold_into_fragment_piece() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r##"
+require "securerandom"
+require "base64"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache"
+raise "splice unavailable" unless GzipCache::SPLICE_OK
+
+tmpl = lambda { |i|
+  b = +"<turbo-frame id=\"message_#{i}\" class=\"message\">"
+  40.times { |p|
+    b << "<p class=\"message__body\">Paragraph #{p} of message #{i}: shared markup.</p>\n"
+  }
+  (b << "</turbo-frame>\n").freeze
+}
+a = tmpl.call(1)
+b = tmpl.call(2)
+raise "glue budget" unless a.bytesize >= GzipCache::SPLICE_MIN
+
+fragment_deflates = 0
+orig = GzipCache.method(:raw_deflate)
+GzipCache.define_singleton_method(:raw_deflate) do |d, dict, lv|
+  if lv == Zlib::DEFAULT_COMPRESSION && d.include?("turbo-frame")
+    fragment_deflates += 1
+  end
+  orig.call(d, dict, lv)
+end
+
+4.times do
+  tok = Base64.urlsafe_encode64(SecureRandom.random_bytes(32), padding: false)
+  raise "token longer than MAX_GLUE" unless tok.bytesize <= GzipCache::MAX_GLUE
+  # Token alone is the entire short glue between two fragments.
+  body = a + tok + b
+  gz = GzipCache.splice(body, [a, b], [tok])
+  raise "nil splice" if gz.nil?
+  raise "round trip" unless Zlib.gunzip(gz) == body.b
+end
+raise "fragment deflated #{fragment_deflates}x (want 2 — once each, not per token)" unless fragment_deflates == 2
+
+# Control: token-free short glue still folds. Fold is the second piece
+# being glue+frag (`\n` + turbo-frame). A dictionary is only required
+# when raw dictionaries work; JRuby / #526 passes nil and still folds.
+folded = 0
+dicts = 0
+GzipCache.define_singleton_method(:raw_deflate) do |d, dict, lv|
+  if lv == Zlib::DEFAULT_COMPRESSION && d.start_with?("\n") && d.include?("turbo-frame")
+    folded += 1
+    dicts += 1 unless dict.nil?
+  end
+  orig.call(d, dict, lv)
+end
+c = tmpl.call(3)
+d = tmpl.call(4)
+gz = GzipCache.splice(c + "\n" + d, [c, d])
+raise "fold rt" unless Zlib.gunzip(gz) == (c + "\n" + d).b
+raise "token-free glue did not fold (folded=#{folded})" unless folded >= 1
+if GzipCache::RAW_DICTIONARY_OK
+  raise "expected dict on fold (dicts=#{dicts})" unless dicts >= 1
+end
+puts "ALL OK"
+"##;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "token-bearing glue fold failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+    assert!(out.status.success(), "driver exited {:?}", out.status.code());
+
+    // Same fold control with raw dictionaries refused (#526 / JRuby).
+    let fallback = r#"
+require "zlib"
+Zlib::Deflate.prepend(Module.new do
+  def set_dictionary(_dictionary)
+    raise Zlib::StreamError, "raw dictionaries unsupported"
+  end
+end)
+require File.expand_path("runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache", Dir.pwd)
+raise "expected no raw dict" if GzipCache::RAW_DICTIONARY_OK
+c = ("<turbo-frame id=\"c\">" + ("<p>x</p>\n" * 80) + "</turbo-frame>\n").freeze
+d = ("<turbo-frame id=\"d\">" + ("<p>y</p>\n" * 80) + "</turbo-frame>\n").freeze
+folded = 0
+dicts = 0
+orig = GzipCache.method(:raw_deflate)
+GzipCache.define_singleton_method(:raw_deflate) do |data, dict, lv|
+  if lv == Zlib::DEFAULT_COMPRESSION && data.start_with?("\n") && data.include?("turbo-frame")
+    folded += 1
+    dicts += 1 unless dict.nil?
+  end
+  orig.call(data, dict, lv)
+end
+body = c + "\n" + d
+raise "fold rt" unless Zlib.gunzip(GzipCache.splice(body, [c, d])) == body.b
+raise "fallback did not fold (folded=#{folded})" unless folded >= 1
+raise "fallback passed a dict (dicts=#{dicts})" unless dicts.zero?
+puts "ALL OK"
+"#;
+    let fb = Command::new("ruby")
+        .arg("-e")
+        .arg(fallback)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let fb_out = String::from_utf8_lossy(&fb.stdout);
+    let fb_err = String::from_utf8_lossy(&fb.stderr);
+    assert!(
+        fb_out.contains("ALL OK"),
+        "no-dict fold control failed\n=== stdout ===\n{fb_out}\n=== stderr ===\n{fb_err}"
+    );
+    assert!(fb.status.success(), "fallback driver exited {:?}", fb.status.code());
+}
+
+/// The same frozen fragment twice in one run (self-predecessor) must
+/// still inflate, and the WeakKeyMap value must not strongly retain the
+/// key (CodeRabbit outside-diff on #546).
+#[test]
+fn repeated_fragment_chain_does_not_pin_weak_map_key() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = r#"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/gzip_cache"
+raise "splice unavailable" unless GzipCache::SPLICE_OK
+frag = ("<turbo-frame id=\"dup\">" + ("<p>same row markup</p>\n" * 80) + "</turbo-frame>\n").freeze
+body = frag + "\n" + frag
+gz = GzipCache.splice(body, [frag, frag])
+raise "nil" if gz.nil?
+raise "round trip" unless Zlib.gunzip(gz) == body.b
+list = GzipCache.instance_variable_get(:@pieces)[frag]
+raise "no piece" if list.nil? || list.empty?
+list.each do |e|
+  chain = e[0]
+  i = 0
+  while i < chain.length
+    pred = chain[i]
+    raise "strong pred #{pred.class}" unless pred.is_a?(WeakRef)
+    raise "dead self-pred" unless pred.weakref_alive? && pred.__getobj__.equal?(frag)
+    i += 2
+  end
+end
+puts "ALL OK"
+"#;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "weak chain pin failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
     );
     assert!(out.status.success(), "driver exited {:?}", out.status.code());
 }

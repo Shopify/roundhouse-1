@@ -829,6 +829,19 @@ fn contract_error(
     contracts: &SourceContractIndex<'_>,
 ) -> Option<&'static str> {
     let Some(resolved) = resolved else {
+        // `super(...)` with no in-app ancestor — Campfire's
+        // `WebPush::Connections::Stages` is `extend`ed onto a
+        // `Net::HTTP` instance, so `super` lands on stdlib. We cannot
+        // verify that ABI from app source; allowing the forward is the
+        // honest alternative to residualizing a pattern RH Ruby/Spinel
+        // already emit and run. Only for a module nothing in the app
+        // mixes in: where an app class includes it, the destination is
+        // that includer's and stays unverified.
+        if matches!(&*call.node, ExprNode::Super { .. })
+            && context.is_some_and(|(owner, _)| contracts.module_without_app_includer(owner))
+        {
+            return None;
+        }
         return Some("forwarding destination's declaration cannot be verified");
     };
     if let Some(error) = declaration_error(resolved) {
@@ -1522,6 +1535,14 @@ impl<'a> SourceContractIndex<'a> {
         world.through(written, name, as_superclass, &|namespace, method| {
             self.app_reopens(namespace, method)
         })
+    }
+
+    /// A module no app fragment includes and no initializer mixes in:
+    /// whatever it is mixed into at runtime is not app source.
+    fn module_without_app_includer(&self, owner: &ClassId) -> bool {
+        self.modules.contains(owner)
+            && self.children.get(owner).is_none_or(|c| c.is_empty())
+            && !self.app.module_mixins.iter().any(|mixin| mixin.module.as_str() == owner.0.as_str())
     }
 
     /// An initializer's `Target.include(M)` / `Target.prepend(M)` names it.

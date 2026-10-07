@@ -709,6 +709,7 @@ pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
         name: ClassId(first.clone()),
         is_module: false,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
@@ -769,6 +770,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
         parent: Some(ClassId(Symbol::from(parent.join("::")))),
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: Vec::new(),
         nullable_columns: Vec::new(),
@@ -943,6 +945,10 @@ pub(super) fn library_class_and_struct_base(
     full_path.extend(name_path);
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
+    let source_parent_span = class
+        .superclass()
+        .map(|n| super::util::node_span(&n, file))
+        .unwrap_or_default();
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
@@ -1047,6 +1053,13 @@ pub(super) fn library_class_and_struct_base(
             name: owner,
             is_module: false,
             parent,
+            // Struct.new bases replace the source superclass expression;
+            // keep the source span only when the Const parent survived.
+            parent_span: if struct_members.is_some() {
+                Span::synthetic()
+            } else {
+                source_parent_span
+            },
             includes,
             methods,
             nullable_columns: Vec::new(),
@@ -1833,6 +1846,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         name: base,
         is_module: false,
         parent: None,
+        parent_span: Span::synthetic(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),
@@ -1945,6 +1959,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         name: owner,
         is_module: true,
         parent: None,
+        parent_span: Span::synthetic(),
         includes,
         methods,
         nullable_columns: Vec::new(),
@@ -4765,8 +4780,10 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 /// classifier doesn't claim, and most of what lands there really does
 /// belong to the module rather than to its includers.
 const CONCERN_MODEL_MACROS: &[&str] = &[
+    "generates_token_for",
     "has_one_attached",
     "has_rich_text",
+    "has_markdown",
     "has_secure_token",
     "has_secure_password",
     "has_json",

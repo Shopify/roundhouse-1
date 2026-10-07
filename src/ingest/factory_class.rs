@@ -292,6 +292,7 @@ fn factory_class(
         name: owner,
         is_module: false,
         parent: Some(ClassId(Symbol::from(generator))),
+        parent_span: Default::default(),
         includes: body.includes,
         methods,
         nullable_columns: Vec::new(),

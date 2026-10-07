@@ -409,6 +409,7 @@ fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
         name: ClassId(Symbol::from(name)),
         is_module: true,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods: vec![method],
         nullable_columns: Vec::new(),

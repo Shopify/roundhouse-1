@@ -1209,6 +1209,7 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
         name: spec.class_id.clone(),
         is_module: false,
         parent: None,
+        parent_span: Default::default(),
         includes: Vec::new(),
         methods,
         nullable_columns: Vec::new(),

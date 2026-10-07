@@ -613,11 +613,13 @@ jobs:
       # `scripts/campfire-test-bcrypt.rb`. A runner without the gem fails
       # those tests; a dev box that has it hides the gap.
       #
+      # rack — the built-in Cable mount control sends real Rack requests.
+      #
       # ruby-vips — pairs with libvips42 above; without the gem the vips
       # loader test dies on `cannot load such file -- vips`.
       - name: Install gems used by emitted Ruby and Campfire harness tests
         run: |
-          gem install --no-document rails-html-sanitizer sqlite3 bcrypt ruby-vips
+          gem install --no-document rails-html-sanitizer sqlite3 bcrypt rack ruby-vips
           gem install --no-document activerecord -v '~> 8.1.0'
       # Bounded build → run → free waves: every --all-targets identity still
       # goes through Cargo (lib, bins, each integration target). Finished

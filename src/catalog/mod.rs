@@ -922,6 +922,28 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::ArrayOfSym),
     },
+    // Association introspection used by Action Text / attachment macro
+    // helpers (`safe_markdown_attribute`, `with_attached_*` guards).
+    // Returns a reflection handle (or nil at runtime); the analyzer
+    // keeps the handle shape so `.klass` / presence checks type.
+    CatalogedMethod {
+        name: "reflect_on_association",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef(
+            "ActiveRecord::Reflection::AssociationReflection",
+        )),
+    },
+    // Class-level default for `has_rich_text` / `has_markdown`
+    // `strict_loading:` kwargs — a Bool reader on every AR model.
+    CatalogedMethod {
+        name: "strict_loading_by_default",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
     CatalogedMethod {
         name: "read_attribute",
         receiver: ReceiverContext::Instance,

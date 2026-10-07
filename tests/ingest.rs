@@ -358,11 +358,11 @@ end
 
 #[test]
 fn routes_recover_per_entry_under_survey() {
-    // One unknown DSL entry (`devise_for`) must not zero the table:
-    // survey mode records the gap and keeps the sibling routes;
-    // strict mode still fails loud so fixtures force recognizers.
+    // One unknown DSL entry must not zero the table: survey mode
+    // records the gap and keeps the sibling routes; strict mode still
+    // fails loud so fixtures force recognizers.
     let source = br#"Rails.application.routes.draw do
-  devise_for :users
+  use_doorkeeper
   get "/posts", to: "posts#index"
 end
 "#;
@@ -380,39 +380,341 @@ end
     let table = result.expect("survey ingest recovers");
     assert_eq!(table.entries.len(), 1, "the good route survives");
     assert!(
-        gaps.iter().any(|g| format!("{g:?}").contains("devise_for")),
-        "the devise_for gap is recorded, not silently dropped: {gaps:?}"
+        gaps.iter().any(|g| format!("{g:?}").contains("use_doorkeeper")),
+        "the unknown-DSL gap is recorded, not silently dropped: {gaps:?}"
     );
 }
 
 #[test]
-fn routes_mount_drops_as_recognized_gap() {
-    // `mount SomeEngine` is external code, never part of the
-    // transpiled app: strict ingest drops the route (the modeled
-    // truth, like `to: redirect(...)`), survey runs get a ledger
-    // line so the drop stays visible.
+fn devise_scope_and_authenticated_passthrough_nested_routes() {
     let source = br#"Rails.application.routes.draw do
-  mount Sidekiq::Web, at: "sidekiq"
-  get "/posts", to: "posts#index"
+  authenticated :user, lambda { |u| u.admin? } do
+    namespace :admin do
+      resources :users, only: [:index]
+      root to: "dashboard#show"
+    end
+  end
+  unauthenticated :user do
+    get "join", to: "registrations#new"
+  end
+  devise_scope :user do
+    get "session/otp", to: "sessions#otp"
+  end
+  authenticated :user do
+    root to: "dashboard#show", as: :user_root
+  end
 end
 "#;
-
-    let (strict, _) = roundhouse::ingest::prism::scope(|| {
-        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
-    });
-    let table = strict.expect("strict ingest tolerates mount");
-    assert_eq!(table.entries.len(), 1, "mount drops, the sibling route survives");
-
     roundhouse::ingest::survey::activate();
     let (result, _) = roundhouse::ingest::prism::scope(|| {
         roundhouse::ingest::ingest_routes(source, "config/routes.rb")
     });
     let gaps = roundhouse::ingest::survey::drain();
-    result.expect("survey ingest succeeds");
+    let table = result.expect("ingest");
     assert!(
-        gaps.iter().any(|g| format!("{g:?}").contains("mount")),
-        "the mount drop is ledgered, not silent: {gaps:?}"
+        gaps.iter().all(|g| {
+            let s = format!("{g:?}");
+            !s.contains("authenticated")
+                && !s.contains("unauthenticated")
+                && !s.contains("devise_scope")
+        }),
+        "Devise wrappers must not survey: {gaps:?}"
     );
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    assert!(
+        flat.iter().any(|r| r.path == "/admin/users" && r.as_name == "admin_users"),
+        "authenticated nested resources: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|r| r.path == "/join" && r.controller.0.as_str() == "RegistrationsController"),
+        "unauthenticated nested route: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|r| r.path == "/session/otp" && r.controller.0.as_str() == "SessionsController"),
+        "devise_scope nested route: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|r| r.as_name == "user_root"),
+        "authenticated root as: :user_root: {flat:?}"
+    );
+    assert!(
+        flat.iter().any(|r| r.path == "/admin" && r.as_name == "admin_root"),
+        "namespaced root without as: keeps admin_root: {flat:?}"
+    );
+}
+
+#[test]
+fn namespaced_root_as_applies_name_prefix() {
+    let source = br#"Rails.application.routes.draw do
+  namespace :admin do
+    root to: "dashboard#show", as: :home
+  end
+end
+"#;
+    let table = roundhouse::ingest::ingest_routes(source, "config/routes.rb").expect("ingest");
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    assert!(
+        flat.iter().any(|r| r.path == "/admin" && r.as_name == "admin_home"),
+        "namespace as: prefix on root: {flat:?}"
+    );
+    assert!(
+        !flat.iter().any(|r| r.as_name == "home"),
+        "bare home helper must not win over admin_home: {flat:?}"
+    );
+}
+
+#[test]
+fn devise_for_expands_session_and_registration_helpers() {
+    let source = br#"Rails.application.routes.draw do
+  devise_for :users,
+    controllers: {
+      registrations: "users/registrations",
+      sessions: "users/sessions"
+    }
+end
+"#;
+    roundhouse::ingest::survey::activate();
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let gaps = roundhouse::ingest::survey::drain();
+    let table = result.expect("ingest");
+    assert!(
+        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
+        "devise_for must not survey: {gaps:?}"
+    );
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let session = by_name.get("new_user_session").expect("new_user_session");
+    assert_eq!(session.path, "/users/sign_in");
+    assert_eq!(session.controller.0.as_str(), "Users::SessionsController");
+    let reg = by_name.get("new_user_registration").expect("new_user_registration");
+    assert_eq!(reg.path, "/users/sign_up");
+    assert_eq!(reg.controller.0.as_str(), "Users::RegistrationsController");
+    assert!(by_name.contains_key("destroy_user_session"));
+    assert!(by_name.contains_key("edit_user_password"));
+    assert!(by_name.contains_key("user_confirmation"));
+}
+
+#[test]
+fn devise_for_accepts_string_controller_keys() {
+    // Devise accepts string keys in `controllers:`; skipping them would
+    // silently fall back to Devise::*Controller.
+    let source = br#"Rails.application.routes.draw do
+  devise_for :users,
+    controllers: {
+      "sessions" => "users/sessions",
+      registrations: "users/registrations"
+    }
+end
+"#;
+    roundhouse::ingest::survey::activate();
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let gaps = roundhouse::ingest::survey::drain();
+    let table = result.expect("ingest");
+    assert!(
+        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
+        "string-keyed controllers must not survey: {gaps:?}"
+    );
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let session = by_name.get("new_user_session").expect("new_user_session");
+    assert_eq!(session.controller.0.as_str(), "Users::SessionsController");
+    let reg = by_name.get("new_user_registration").expect("new_user_registration");
+    assert_eq!(reg.controller.0.as_str(), "Users::RegistrationsController");
+}
+
+#[test]
+fn devise_for_rejects_unmodeled_controller_mappings() {
+    // OmniAuth (and any mapping outside the static four) must fail loud —
+    // accepting the key then emitting no routes would hide the gap.
+    let source = br#"Rails.application.routes.draw do
+  devise_for :users, controllers: { omniauth_callbacks: "users/omniauth_callbacks" }
+end
+"#;
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let err = result.expect_err("unmodeled controllers: key must fail");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("omniauth_callbacks") || msg.contains("unsupported devise_for controllers"),
+        "expected unmodeled mapping error, got: {msg}"
+    );
+}
+
+#[test]
+fn devise_for_defaults_controllers_under_devise_module() {
+    // Bare `devise_for :users` must resolve to Devise::*Controller, not
+    // top-level SessionsController (Devise::Mapping#default_controllers).
+    let source = br#"Rails.application.routes.draw do
+  devise_for :users
+end
+"#;
+    roundhouse::ingest::survey::activate();
+    let (result, _) = roundhouse::ingest::prism::scope(|| {
+        roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+    });
+    let gaps = roundhouse::ingest::survey::drain();
+    let table = result.expect("ingest");
+    assert!(
+        gaps.iter().all(|g| !format!("{g:?}").contains("devise_for")),
+        "bare devise_for must not survey: {gaps:?}"
+    );
+    let mut app = roundhouse::App::default();
+    app.routes = table;
+    let flat = roundhouse::lower::flatten_routes(&app);
+    let by_name: std::collections::HashMap<_, _> =
+        flat.iter().map(|r| (r.as_name.as_str(), r)).collect();
+    let session = by_name.get("new_user_session").expect("new_user_session");
+    assert_eq!(session.path, "/users/sign_in");
+    assert_eq!(session.controller.0.as_str(), "Devise::SessionsController");
+    let reg = by_name.get("new_user_registration").expect("new_user_registration");
+    assert_eq!(reg.controller.0.as_str(), "Devise::RegistrationsController");
+    let password = by_name.get("new_user_password").expect("new_user_password");
+    assert_eq!(password.controller.0.as_str(), "Devise::PasswordsController");
+    let confirmation = by_name.get("user_confirmation").expect("user_confirmation");
+    assert_eq!(
+        confirmation.controller.0.as_str(),
+        "Devise::ConfirmationsController"
+    );
+}
+
+/// A route omission is an error on the recovered table, not a fatal parse.
+#[test]
+fn routes_mount_diagnostic_preserves_siblings_in_every_mode() {
+    let source = br#"Rails.application.routes.draw do
+  mount Sidekiq::Web, at: "sidekiq"
+  get "/posts", to: "posts#index"
+end
+"#;
+    let strict = roundhouse::ingest::ingest_routes(source, "config/routes.rb")
+        .expect("mount diagnostics do not abort ingest");
+    assert_eq!(strict.entries.len(), 1);
+    assert_eq!(strict.diagnostics.len(), 1);
+    let diagnostic = &strict.diagnostics[0];
+    assert_eq!(diagnostic.severity, roundhouse::diagnostic::Severity::Error);
+    assert!(!diagnostic.span.is_synthetic());
+    assert_eq!(&source[diagnostic.span.start as usize..diagnostic.span.end as usize],
+        br#"mount Sidekiq::Web, at: "sidekiq""#);
+
+    roundhouse::ingest::survey::activate();
+    let result = roundhouse::ingest::ingest_routes(source, "config/routes.rb");
+    let gaps = roundhouse::ingest::survey::drain();
+    let surveyed = result.expect("survey ingest succeeds");
+    assert_eq!(surveyed.entries, strict.entries);
+    assert_eq!(surveyed.diagnostics, strict.diagnostics);
+    assert_eq!(gaps.len(), 1, "one survey ledger entry: {gaps:?}");
+}
+
+/// Draw files retain their own source attribution and share mount recovery.
+#[test]
+fn mounts_in_split_route_files_keep_the_split_file_span() {
+    let table = roundhouse::ingest::routes::ingest_routes_with_draws(
+        b"Rails.application.routes.draw do\n  draw :admin\nend\n",
+        "config/routes.rb",
+        &roundhouse::det::HashMap::from_iter([("admin".to_string(), (
+            b"mount Catalog::Engine, at: '/catalog'\nget '/ok', to: 'posts#index'\n".to_vec(),
+            "config/routes/admin.rb".to_string(),
+        ))]),
+    ).unwrap();
+    assert_eq!(table.entries.len(), 1);
+    assert_eq!(table.diagnostics.len(), 1);
+    assert_eq!(table.diagnostics[0].span.file,
+        roundhouse::ingest::sources::file_id("config/routes/admin.rb"));
+}
+
+/// A top-level draw is transparent to the fixed runtime cable mount.
+#[test]
+fn top_level_draw_preserves_runtime_cable_mount_context() {
+    let table = roundhouse::ingest::routes::ingest_routes_with_draws(
+        b"Rails.application.routes.draw do\n  draw :cable\nend\n",
+        "config/routes.rb",
+        &roundhouse::det::HashMap::from_iter([("cable".to_string(), (
+            b"mount ActionCable.server => '/cable'\n".to_vec(),
+            "config/routes/cable.rb".to_string(),
+        ))]),
+    ).unwrap();
+    assert!(table.diagnostics.is_empty(), "{table:?}");
+}
+
+/// Transparent draw/concern expansion inherits its invocation's mount scope.
+#[test]
+fn cable_mounts_inherit_draw_and_concern_scope() {
+    let draws = roundhouse::det::HashMap::from_iter([("cable".to_string(), (
+        b"mount ActionCable.server => '/cable'\n".to_vec(),
+        "config/routes/cable.rb".to_string(),
+    ))]);
+    for (body, expected) in [
+        ("draw :cable", 0),
+        ("namespace :admin do\n draw :cable\nend", 1),
+        ("concern :live do\n mount ActionCable.server => '/cable'\nend\nconcerns :live", 0),
+        ("concern :live do\n mount ActionCable.server => '/cable'\nend\nnamespace :admin do\n concerns :live\nend", 1),
+        ("concern :live do\n mount ActionCable.server => '/cable'\nend\nresources :widgets, concerns: :live", 1),
+        ("constraints id: /[0-9]+/ do\n mount ActionCable.server => '/cable'\nend", 1),
+        ("authenticated :user do\n mount ActionCable.server => '/cable'\nend", 1),
+        ("unauthenticated :user do\n mount ActionCable.server => '/cable'\nend", 1),
+        ("devise_scope :user do\n mount ActionCable.server => '/cable'\nend", 1),
+        ("if Rails.env.development?\n mount ActionCable.server => '/cable'\nend", 1),
+    ] {
+        let source = format!("Rails.application.routes.draw do\n{body}\nend\n");
+        let table = roundhouse::ingest::routes::ingest_routes_with_draws(
+            source.as_bytes(), "config/routes.rb", &draws,
+        ).unwrap();
+        assert_eq!(table.diagnostics.len(), expected, "{body}: {table:?}");
+        for diagnostic in &table.diagnostics {
+            let span = diagnostic.span;
+            let origin = if span.file == roundhouse::ingest::sources::file_id("config/routes/cable.rb") {
+                draws["cable"].0.as_slice()
+            } else {
+                source.as_bytes()
+            };
+            assert_eq!(&origin[span.start as usize..span.end as usize],
+                b"mount ActionCable.server => '/cable'", "{body}: located mount");
+        }
+    }
+}
+
+/// A loaded file's own draw opens a fresh mapper, then restores the caller's
+/// scope. Draw inclusion instead keeps the caller's mapper.
+#[test]
+fn loaded_route_draw_resets_and_restores_mount_scope() {
+    let loaded = b"Rails.application.routes.draw do\n mount ActionCable.server => '/cable'\n mount Catalog::Engine, at: '/catalog'\n get '/ok', to: 'posts#index'\nend\n";
+    for include in [
+        "load Rails.root.join('config/routes/cable.rb')",
+        "instance_eval(File.read(Rails.root.join('config/routes/cable.rb')))",
+    ] {
+        let source = format!("Rails.application.routes.draw do\n namespace :admin do\n  {include}\n  mount ActionCable.server => '/cable'\n end\n mount ActionCable.server => '/cable'\nend\n");
+        let table = roundhouse::ingest::routes::ingest_routes_with_draws(
+            source.as_bytes(), "config/routes.rb",
+            &roundhouse::det::HashMap::from_iter([("cable".to_string(), (
+                loaded.to_vec(), "config/routes/cable.rb".to_string(),
+            ))]),
+        ).unwrap();
+        assert_eq!(table.diagnostics.len(), 2, "{include}: {table:?}");
+        assert_eq!(table.diagnostics[0].span.file,
+            roundhouse::ingest::sources::file_id("config/routes/cable.rb"));
+        let span = table.diagnostics[0].span;
+        assert_eq!(&loaded[span.start as usize..span.end as usize],
+            b"mount Catalog::Engine, at: '/catalog'");
+        assert_eq!(table.diagnostics[1].span.file,
+            roundhouse::ingest::sources::file_id("config/routes.rb"));
+        assert!(table.entries.iter().any(|r| matches!(r,
+            roundhouse::RouteSpec::Explicit { path, .. } if path == "/ok")),
+            "the loaded sibling stays at top scope: {table:?}");
+    }
 }
 
 #[test]

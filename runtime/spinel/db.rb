@@ -108,6 +108,7 @@ module SQL
   # coercion for the -1 destructor is the spinel primitive validated in
   # spinel's test/ffi_ptr_int_literal.rb.
   ffi_func :sqlite3_bind_int64,        [:ptr, :int, :long],                   :int
+  ffi_func :sqlite3_bind_null,         [:ptr, :int],                          :int
   ffi_func :sqlite3_bind_text,         [:ptr, :int, :str, :int, :ptr],        :int
   # `sqlite3_column_type` reports the storage class of a column in the
   # current row; 5 is SQLITE_NULL. The nullable-column reads below need
@@ -341,11 +342,16 @@ end
 # before the first step), and the real stmt it promoted to when the
 # recorded prefix ran out (0 = still replaying).
 class QcCursor
-  def initialize(entry)
+  def initialize(entry, preparable)
     @entry = entry
+    @preparable = preparable
     @pos = -1
     @promoted = false
     @real_ptr = nil
+  end
+
+  def preparable
+    @preparable
   end
 
   def promoted
@@ -498,6 +504,16 @@ class DbConn
       end
       i -= 1
     end
+    prepare_owned(sql, cached)
+  end
+
+  # Reads with many SQL shapes share checkout and lease cleanup with
+  # busy-hit transient statements.
+  def prepare_uncached(sql)
+    prepare_owned(sql, false)
+  end
+
+  def prepare_owned(sql, cached)
     # `SQL.stmt_out` is ONE 8-byte out-buffer for the whole process (an
     # `ffi_buffer`, static C storage). Under parallel OS workers two
     # connections preparing at the same moment wrote their statement
@@ -652,11 +668,11 @@ class DbConn
   # The handle for `sql`: a replay handle on a hit, else the real stmt
   # (recording its rows as they are stepped, when the cache is on).
   # Returns 0 as "no replay" so `Db.prepare` can tell the two apart.
-  def qc_lookup(sql)
+  def qc_lookup(sql, preparable = true)
     return 0 if !@qc_on || sql.include?("?")
     e = @qc_by_sql[sql]
     return 0 if e.nil?
-    @qc_cursors.push(QcCursor.new(e))
+    @qc_cursors.push(QcCursor.new(e, preparable))
     @qc_cursors.length
   end
 
@@ -766,7 +782,7 @@ class DbConn
     return false if e.eof
     # The first consumer stopped before the end and this one wants more:
     # re-run the real statement and fast-forward past what was replayed.
-    ptr = prepare_cached(e.qc_sql)
+    ptr = c.preparable ? prepare_cached(e.qc_sql) : prepare_uncached(e.qc_sql)
     c.promote_to(ptr)
     n = 0
     while n < e.nrows
@@ -900,10 +916,10 @@ class DbPool
     # compile-time default nobody had written down.
     #
     # Which is why this is SET rather than left to agree by accident.
-    # The sibling shims (db_cruby.rb, db_jruby.rb) still set nothing and
-    # happen to read NORMAL today; a gem rebuilt with a different
-    # default would move them silently, and that is the shape of bug
-    # this line exists to remove.
+    # The sibling shims (db_cruby.rb, db_jruby.rb) also state
+    # synchronous=NORMAL (and WAL) explicitly; leaving it to the gem's
+    # bundled default would move them silently on a rebuild, and that
+    # is the shape of bug this line exists to remove.
     #
     # The trade is the standard WAL one and worth stating: NORMAL is
     # safe across a process crash and risks only the most recent commits
@@ -1531,6 +1547,28 @@ module Db
     ptr
   end
 
+  # Bypass statement reuse for nullable shape overflow, retaining the
+  # separate request result cache. A partial replay must promote uncached.
+  # Finalize releases the transient immediately; abandoned handles close
+  # at lease release. Outside with_connection they remain owned until
+  # Db.close, so scripts must finalize explicitly after use.
+  def self.prepare_uncached(sql)
+    # Keep shared cache keys string-typed even when the compiled program
+    # has no transient call site from which Spinel can infer this argument.
+    sql = sql.to_s
+    conn = current_conn
+    handle = conn.qc_lookup(sql, false)
+    if handle != 0
+      $stderr.puts "  CACHE " + sql if @sql_trace
+      return handle
+    end
+    record_query(sql)
+    begin_snapshot(conn)
+    ptr = conn.prepare_uncached(sql)
+    conn.qc_record(sql, ptr)
+    ptr
+  end
+
   # Query-log capture — see db_cruby.rb for the full rationale (the
   # test-side analog of Rails' `sql.active_record` SQLCounter; the one
   # instrument that can see the includes(:assoc) N+1 `compare` is blind
@@ -1756,7 +1794,7 @@ module Db
 
   # roundhouse#12 Path A.1: with caching on, "finalize" means rewind the
   # cached stmt (reset cursor + clear any bound params) so the next call
-  # reuses it. Busy-hit transients are really finalized on release.
+  # reuses it. Busy-hit and explicit uncached reads are finalized on release.
   def self.finalize(stmt)
     conn = current_conn
     if stmt.is_a?(Integer)
@@ -1777,12 +1815,41 @@ module Db
   # reset + clear_bindings'd at its previous `finalize`, so re-binding
   # here starts clean.
   def self.bind_int(stmt, idx, value)
+    # A nullable caller must not lose nil at the typed FFI integer boundary.
+    bind_int_opt(stmt, idx, value)
+  end
+
+  def self.bind_int_opt(stmt, idx, value)
     raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
-    current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_int64(stmt, idx, value))
+    if value.nil?
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_null(stmt, idx))
+    else
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_int64(stmt, idx, value))
+    end
+  end
+
+  def self.bind_text_opt(stmt, idx, value)
+    raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
+    if value.nil?
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_null(stmt, idx))
+    else
+      bind_text(stmt, idx, value)
+    end
+  end
+
+  def self.bind_bool_opt(stmt, idx, value)
+    raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
+    if value.nil?
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_null(stmt, idx))
+    else
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_int64(stmt, idx, value ? 1 : 0))
+    end
   end
 
   def self.bind_text(stmt, idx, value)
     raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
+    # This shim's inline writer uses TEXT regardless of Ruby encoding.
+    # Preserve all bytes at the FFI boundary, including embedded NULs.
     current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_text(stmt, idx, value, value.bytesize, -1))
   end
 
@@ -1790,7 +1857,11 @@ module Db
   # form and the INTEGER affinity `t.boolean` columns get.
   def self.bind_bool(stmt, idx, value)
     raise "Db.bind failed (21): cannot bind a replay cursor" if stmt.is_a?(Integer)
-    current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_int64(stmt, idx, value ? 1 : 0))
+    if value.nil?
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_null(stmt, idx))
+    else
+      current_conn.bind_checked(stmt, idx, SQL.sqlite3_bind_int64(stmt, idx, value ? 1 : 0))
+    end
   end
 
   def self.last_insert_rowid

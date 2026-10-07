@@ -30,7 +30,7 @@ use crate::det::HashMap;
 use super::{incremental, observe_into, Analyzer, ParamSite, ParamTables, UnifyScope};
 use crate::app::ParamKey;
 use crate::dialect::MethodReceiver;
-use crate::ident::ClassId;
+use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 use crate::App;
 
@@ -50,6 +50,9 @@ struct Source {
     print: Option<u64>,
     /// Placed sites, stably sorted by key.
     sites: Vec<(ParamKey, Vec<Ty>)>,
+    /// The `(receiver class, method)` pairs this source's class calls,
+    /// for `Analyzer::callers_by_target` (see [`call_targets`]).
+    callers: Vec<(ClassId, Symbol)>,
 }
 
 #[derive(Default)]
@@ -90,6 +93,30 @@ fn units(app: &App) -> Vec<Unit> {
     units.extend((0..app.views.len()).map(Unit::View));
     units.push(Unit::Seeds);
     units
+}
+
+/// The class a unit's sends are made from: `None` for views and seeds,
+/// whose sends have no owning production class.
+fn unit_class(unit: &Unit) -> Option<&ClassId> {
+    match unit {
+        Unit::Model(_, name) | Unit::Library(_, name) | Unit::Controller(_, name) => Some(name),
+        Unit::View(_) | Unit::Seeds => None,
+    }
+}
+
+/// The distinct `(receiver class, method)` pairs of a unit's raw sites,
+/// in first-seen order. A class's calls to ITSELF are dropped: when its
+/// own answer moves it is already dirty, and implicit-self sends are
+/// most of what a body contains.
+fn call_targets(caller: &ClassId, raw: &[ParamSite]) -> Vec<(ClassId, Symbol)> {
+    let mut seen: crate::det::HashSet<(&ClassId, &Symbol)> = crate::det::HashSet::default();
+    let mut out = Vec::new();
+    for (class_id, method, _, _, _) in raw {
+        if class_id != caller && seen.insert((class_id, method)) {
+            out.push((class_id.clone(), method.clone()));
+        }
+    }
+    out
 }
 
 /// The distinct keys of a key-sorted site list.
@@ -138,6 +165,13 @@ impl Analyzer {
                 for method in controller.class_methods() {
                     self.collect_send_sites(&method.body, Some(&controller.name), MethodReceiver::Class, helpers, out);
                 }
+                // A class-body macro call (`preload_site_configs %w[a], only:
+                // :show`) is the call site that types the class method.
+                for item in &controller.body {
+                    if let crate::dialect::ControllerBodyItem::ClassIvarInit { expr, .. } = item {
+                        self.collect_send_sites(expr, Some(&controller.name), MethodReceiver::Class, helpers, out);
+                    }
+                }
             }
             Unit::View(i) => {
                 if matches!(scope, UnifyScope::WithViews) {
@@ -154,11 +188,26 @@ impl Analyzer {
 
     /// Every call site `scope` covers, in walk order.
     pub(super) fn collect_param_sites(&self, app: &App, scope: UnifyScope) -> Vec<ParamSite> {
+        self.collect_param_sites_and_callers(app, scope).0
+    }
+
+    /// [`Self::collect_param_sites`], plus each class unit's
+    /// [`call_targets`].
+    pub(super) fn collect_param_sites_and_callers(
+        &self,
+        app: &App,
+        scope: UnifyScope,
+    ) -> (Vec<ParamSite>, Vec<(ClassId, Vec<(ClassId, Symbol)>)>) {
         let mut sites = Vec::new();
+        let mut callers = Vec::new();
         for unit in units(app) {
+            let from = sites.len();
             self.collect_unit_sites(app, &unit, scope, &mut sites);
+            if let Some(caller) = unit_class(&unit) {
+                callers.push((caller.clone(), call_targets(caller, &sites[from..])));
+            }
         }
-        sites
+        (sites, callers)
     }
 
     /// Bring the cached site table up to date with the current trees and
@@ -173,7 +222,7 @@ impl Analyzer {
             || cache.sources.iter().zip(&units).any(|(s, u)| s.unit != *u);
         if restart {
             cache = SiteCache {
-                sources: units.into_iter().map(|unit| Source { unit, print: None, sites: Vec::new() }).collect(),
+                sources: units.into_iter().map(|unit| Source { unit, print: None, sites: Vec::new(), callers: Vec::new() }).collect(),
                 placement,
                 ..SiteCache::default()
             };
@@ -193,6 +242,7 @@ impl Analyzer {
             walked += 1;
             let mut raw = Vec::new();
             self.collect_unit_sites(app, &source.unit, scope, &mut raw);
+            source.callers = unit_class(&source.unit).map(|caller| call_targets(caller, &raw)).unwrap_or_default();
             let mut sites = self.place_param_sites(raw, &tables.shapes, &tables.defined, &mut placed);
             sites.sort_by(|a, b| a.0.cmp(&b.0));
             source.print = print;
@@ -226,6 +276,11 @@ impl Analyzer {
             }
         }
         drop(collect);
+        for source in &cache.sources {
+            if let Some(caller) = unit_class(&source.unit) {
+                self.record_callers(caller, &source.callers);
+            }
+        }
         let _apply = crate::timings::begin("unify: apply");
         for key in &affected {
             let mut entry: Option<Vec<Ty>> = None;
