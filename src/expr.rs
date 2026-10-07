@@ -73,7 +73,7 @@ pub fn is_self_binding(expr: &Expr) -> bool {
 /// path on the emitted file's own directory. Then `File.expand_path("../..",
 /// __FILE__)` still names the app root, and the same relative walk
 /// reaches the files carried there. Other targets emit the literal.
-pub const SOURCE_FILE_PATH: u64 = 1 << 12;
+pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
@@ -1507,6 +1507,25 @@ pub fn desugar_op_assign(
 
 #[cfg(test)]
 mod tests {
+    /// Two lanes once both took bit 12 (`ERASED_KEYWORD_SPLAT`,
+    /// `SOURCE_FILE_PATH`); each cross-target decision is its own bit,
+    /// clear of the Rust emitter's 0 and 1.
+    #[test]
+    fn decision_bits_are_distinct() {
+        let bits = [
+            RESOLVED_CLASS_REF, RESOLVED_DATA_FACTORY, GENERATED_CONST_REF, CLASS_OBJECT_VALUE,
+            RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
+            SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
+        ];
+        let mut seen = 0u64;
+        for bit in bits {
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "bit {} is taken twice", bit.trailing_zeros());
+            assert!(bit > 0b11 && bit < 1 << 32);
+            seen |= bit;
+        }
+    }
+
     use super::*;
     use crate::ident::VarId;
     use crate::span::FileId;
