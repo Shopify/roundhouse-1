@@ -206,3 +206,4 @@ end
     );
     assert!(gaps[0].contains("lib/tracing/railtie.rb:3"), "{gaps:?}");
 }
+

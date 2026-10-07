@@ -117,3 +117,4 @@ fn railtie_initializers(lc: &crate::dialect::LibraryClass) -> Vec<(String, Span)
         })
         .collect()
 }
+

@@ -3038,6 +3038,10 @@ fn ruby_family_files(
     } else {
         gem_facades
     };
+    let gem_facades = match flavor {
+        RubyFlavor::CRuby => format!("{gem_facades}{}", gem_source_dependency_block(app)),
+        RubyFlavor::JRuby => gem_facades,
+    };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {
             *content = gem_facades.clone();
@@ -3242,6 +3246,219 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
             })
         })
         .collect()
+}
+
+/// What the gems the app carries as source (`gem_sources:`, compiled
+/// with the app) require from the gem home as they load, in load order:
+/// `(native, framework)`. Bundler.require loads a gem's entry file
+/// (`lib/<name>.rb`), which runs every `require` at load level (the file's
+/// top level, a class or module body, a branch of an `if`/`unless`/`begin`
+/// there; not a method or block body), and through each require that
+/// lands in the gem's own compiled lib, that file's. A file reached only
+/// through `autoload` is not followed: it loads on reference, and so does
+/// its compiled copy.
+///
+/// The emitted files do not carry a bare gem require (the load list's
+/// job), so without this a gem source's own dependencies never loaded:
+/// opentelemetry-shopify 1.22.0's `require 'opentelemetry/sdk'` and the
+/// 22 others in lib/opentelemetry/shopify.rb, whose constants Core's
+/// 00_tracing.rb initializer reads at boot.
+///
+/// `framework` holds the Rails features among them (`rails`,
+/// `active_support/...`, ...): this tree's runtime ports answer those, and
+/// requiring the real ones would load Rails over the ports. A semian
+/// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
+pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
+    use std::collections::{HashMap, HashSet};
+    let Some(lock) = app.gem_lock.as_ref() else { return (Vec::new(), Vec::new()) };
+    let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
+    // `<root>/<gem dir>/lib/<name>.rb`, the dir `<name>` or `<name>-<version>`.
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for name in &lock.in_repo {
+        let tail = format!("/lib/{name}.rb");
+        for source in &app.sources {
+            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
+            let gem_dir = dir.rsplit('/').next().unwrap_or("");
+            let versioned = gem_dir
+                .strip_prefix(name.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.strip_prefix('-').is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())));
+            if versioned {
+                entries.push((source.path.clone(), format!("{dir}/lib/")));
+            }
+        }
+    }
+    let framework_feature = |feature: &str| {
+        feature == "rails"
+            || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
+                .iter()
+                .any(|prefix| feature.starts_with(prefix))
+    };
+    let mut native: Vec<String> = Vec::new();
+    let mut framework: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (entry, lib) in entries {
+        let mut stack = vec![entry];
+        let mut order: Vec<String> = Vec::new();
+        while let Some(path) = stack.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Some(text) = by_path.get(path.as_str()) else { continue };
+            let mut nested: Vec<String> = Vec::new();
+            for (kind, feature) in load_level_requires(text.as_bytes()) {
+                let target = if kind == "require_relative" {
+                    let base = Path::new(&path).parent().unwrap_or(Path::new(""));
+                    normalize_rb_path(&base.join(&feature))
+                } else {
+                    let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                    format!("{lib}{rb}")
+                };
+                if by_path.contains_key(target.as_str()) {
+                    nested.push(target);
+                } else if kind == "require" {
+                    order.push(feature);
+                }
+            }
+            // Depth-first in source order: a nested file's requires run
+            // where its require statement does.
+            stack.extend(nested.into_iter().rev());
+            for feature in order.drain(..) {
+                let list = if framework_feature(&feature) { &mut framework } else { &mut native };
+                if !list.contains(&feature) && !SEMIAN_PORT_FEATURES.iter().any(|(f, _)| *f == feature) {
+                    list.push(feature);
+                }
+            }
+        }
+    }
+    (native, framework)
+}
+
+/// `a/b/../c.rb` → `a/c.rb`, with `.rb` added when absent.
+fn normalize_rb_path(path: &Path) -> String {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => parts.push(other.as_os_str()),
+        }
+    }
+    let joined: PathBuf = parts.iter().collect();
+    let mut out = joined.to_string_lossy().into_owned();
+    if !out.ends_with(".rb") {
+        out.push_str(".rb");
+    }
+    out
+}
+
+/// `("require" | "require_relative", feature)` for each string-literal
+/// require that runs when `source` loads (see [`gem_source_dependencies`]).
+fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
+    fn walk<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>) {
+        for node in nodes {
+            if let Some(call) = node.as_call_node() {
+                let name = call.name();
+                let name = std::str::from_utf8(name.as_slice()).unwrap_or("");
+                let kind = match name {
+                    "require" => "require",
+                    "require_relative" => "require_relative",
+                    _ => continue,
+                };
+                if call.receiver().is_some() {
+                    continue;
+                }
+                let Some(args) = call.arguments() else { continue };
+                let args: Vec<_> = args.arguments().iter().collect();
+                if let [arg] = args.as_slice() {
+                    if let Some(s) = arg.as_string_node() {
+                        out.push((kind, String::from_utf8_lossy(s.unescaped()).into_owned()));
+                    }
+                }
+            } else if let Some(n) = node.as_module_node() {
+                walk(body_nodes(n.body()), out);
+            } else if let Some(n) = node.as_class_node() {
+                walk(body_nodes(n.body()), out);
+            } else if let Some(n) = node.as_if_node() {
+                walk(stmts(n.statements()), out);
+                if let Some(sub) = n.subsequent() {
+                    match sub.as_else_node() {
+                        Some(e) => walk(stmts(e.statements()), out),
+                        None => walk(vec![sub], out),
+                    }
+                }
+            } else if let Some(n) = node.as_unless_node() {
+                walk(stmts(n.statements()), out);
+                if let Some(e) = n.else_clause() {
+                    walk(stmts(e.statements()), out);
+                }
+            } else if let Some(n) = node.as_begin_node() {
+                walk(stmts(n.statements()), out);
+                let mut rescue = n.rescue_clause();
+                while let Some(r) = rescue {
+                    walk(stmts(r.statements()), out);
+                    rescue = r.subsequent();
+                }
+            }
+        }
+    }
+    fn stmts<'pr>(s: Option<ruby_prism::StatementsNode<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+        s.map(|s| s.body().iter().collect()).unwrap_or_default()
+    }
+    fn body_nodes<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+        match body {
+            Some(b) => match b.as_statements_node() {
+                Some(s) => s.body().iter().collect(),
+                None => vec![b],
+            },
+            None => Vec::new(),
+        }
+    }
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    walk(program.statements().body().iter().collect(), &mut out);
+    out
+}
+
+/// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
+/// guarded: a gem source's dependency is a dependency of the app, and
+/// its absence is a boot failure, as under Bundler. Each require is
+/// checked for loading Rails itself (a gem in the gem home under
+/// `activesupport-*`, `railties-*`, ...): Rails' own code cannot run
+/// over this tree's ports, so that is error[gem_requires_rails], at
+/// boot, naming the feature.
+fn gem_source_dependency_block(app: &App) -> String {
+    let (native, framework) = gem_source_dependencies(app);
+    if native.is_empty() && framework.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n# What the gems carried as source (compiled with the app) require from\n\
+         # the gem home as they load (`project::gem_source_dependencies`).\n",
+    );
+    if !framework.is_empty() {
+        let names: Vec<String> = framework.iter().map(|f| format!("{f:?}")).collect();
+        out.push_str(&format!(
+            "# Their Rails features are this tree's runtime ports, not required: {}.\n",
+            names.join(", ")
+        ));
+    }
+    if native.is_empty() {
+        return out;
+    }
+    let names: Vec<String> = native.iter().map(|f| format!("{f:?}")).collect();
+    out.push_str(&format!("[{}].each do |feature|\n", names.join(", ")));
+    out.push_str(
+        "  loaded = $LOADED_FEATURES.size\n  \
+         require feature\n  \
+         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d}) }\n  \
+         raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
+         end\n",
+    );
+    out
 }
 
 /// The boot-time registration of each `ActiveSupport.on_load` block the

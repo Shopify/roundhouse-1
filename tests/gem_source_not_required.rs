@@ -43,3 +43,40 @@ fn without_gem_sources_the_gem_stays_on_the_list() {
     let (dir, _) = app("").emit(BuildTarget::Ruby);
     assert!(guarded_list(&dir).contains("\"opentelemetry-shopify\""));
 }
+
+/// A gem source's own dependencies load from the gem home, as its entry
+/// file's load-level requires (and those of the compiled files they
+/// reach) would load them: opentelemetry-shopify 1.22.0's
+/// `require 'opentelemetry/sdk'` and its siblings. A Rails feature is the
+/// runtime's port and is named, not required; a file reached only by
+/// `autoload`, or a require inside a method, is not load-time.
+#[test]
+fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
+    let (dir, _) = app("gem_sources:\n  opentelemetry-shopify: vendor/gems/opentelemetry-shopify-1.22.0\n")
+        .write(
+            "vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry-shopify.rb",
+            "require 'opentelemetry/shopify'\nrequire 'opentelemetry/shopify/railtie' if defined?(Rails)\n",
+        )
+        .write(
+            "vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify.rb",
+            "require 'opentelemetry/sdk'\nrequire 'forwardable'\nrequire 'opentelemetry/shopify/version'\n\nmodule OtelShim\n  require 'opentelemetry-common'\n  autoload :Lazy, 'opentelemetry/shopify/lazy'\n\n  def self.on?\n    require 'only/when/called'\n    true\n  end\nend\n",
+        )
+        .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify/version.rb", "require_relative '../../deep/dep'\nmodule OtelShim\n  VERSION = '1'\nend\n")
+        .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/deep/dep.rb", "require 'json'\nmodule Deep\nend\n")
+        .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify/lazy.rb", "require 'stackprof'\nmodule OtelShim\n  module Lazy\n  end\nend\n")
+        .write(
+            "vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify/railtie.rb",
+            "require 'active_support/parameter_filter'\nmodule OtelShim\n  class Railtie < Rails::Railtie\n  end\nend\n",
+        )
+        .emit(BuildTarget::Ruby);
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
+    let block = facades
+        .lines()
+        .find(|l| l.starts_with("[\"opentelemetry/sdk\""))
+        .unwrap_or_else(|| panic!("{facades}"));
+    assert_eq!(block, r#"["opentelemetry/sdk", "forwardable", "opentelemetry-common", "json"].each do |feature|"#, "{facades}");
+    assert!(facades.contains(r#"Their Rails features are this tree's runtime ports, not required: "active_support/parameter_filter"."#), "{facades}");
+    assert!(facades.contains("error[gem_requires_rails]"), "{facades}");
+    // After the gems that tree loads natively.
+    assert!(facades.find("require gem_name").unwrap() < facades.find(block).unwrap());
+}
