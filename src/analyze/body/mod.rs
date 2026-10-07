@@ -671,8 +671,32 @@ impl<'a> BodyTyper<'a> {
                         && !matches!(id.0.as_str(), "Integer" | "Float" | "Symbol" | "Rational" | "Complex" | "NilClass" | "TrueClass" | "FalseClass"));
                 (class_object || instance) && !self.owns_operator(r.ty.as_ref(), method, class_object)
             }
+            // `Module.new` / `Class.new(Parent)` answer a fresh module or
+            // class, unless the app overrides `new` on them.
+            ExprNode::Send { recv: Some(r), method, .. }
+                if method.as_str() == "new"
+                    && matches!(&*r.node, ExprNode::Const { path } if matches!(path.as_slice(), [n] if matches!(n.as_str(), "Module" | "Class")))
+                    && self.is_class_object(r, ctx) =>
+            {
+                !self.owns_operator(r.ty.as_ref(), method, true)
+            }
             _ => false,
         }
+    }
+
+    /// An instance method of a class that descends from `Module` (Core's
+    /// `class MethodTimingRecorder < Module`) runs with a module as self:
+    /// every instance of such a class is a module, whichever subclass.
+    fn self_is_module_instance(&self, ctx: &Ctx) -> bool {
+        if ctx.class_side { return false; }
+        let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return false };
+        let mut current = self.classes().get(id).and_then(|c| c.parent_id().cloned());
+        for _ in 0..32 {
+            let Some(id) = current else { break };
+            if matches!(id.0.as_str(), "Module" | "Class") { return true; }
+            current = self.classes().get(&id).and_then(|c| c.parent_id().cloned());
+        }
+        false
     }
 
     fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
@@ -1667,6 +1691,8 @@ impl<'a> BodyTyper<'a> {
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
                 let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
+                    || (recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                        && send::is_module_protocol(method) && self.self_is_module_instance(ctx))
                     || send::is_module_query_on_module_value(method, recv_ty.as_ref());
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
