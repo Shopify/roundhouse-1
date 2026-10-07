@@ -20,7 +20,7 @@ prefix = sys.argv[1]
 GROUP = re.compile(r'(?P<ind>[ \t]*)(?P<pub>pub(?:\([^)]*\))? )?use std::collections::\{(?P<items>[^}]*)\};')
 def fix_group(m):
     items = [i.strip() for i in m.group('items').split(',') if i.strip()]
-    ours = [i for i in items if i in ('HashMap', 'HashSet')]
+    ours = [i for i in items if i.split()[0] in ('HashMap', 'HashSet')]
     if not ours:
         return m.group(0)
     rest = [i for i in items if i not in ours]
@@ -45,9 +45,11 @@ def with_capacity(s, tf):
     return ''.join(out)
 ALIAS = re.compile(r'\btype\s+(\w+)\s*(?:<[^=]*>)?\s*=\s*(?:[\w:]*::)?Hash(?:Map|Set)\s*<')
 names = {'HashMap', 'HashSet'}
+RENAME = re.compile(r'\bHash(?:Map|Set)\s+as\s+(\w+)')
 paths = [p for p in sys.argv[2:] if not p.endswith('src/det.rs')]
 for path in paths:
-    names |= set(ALIAS.findall(open(path).read()))
+    text = open(path).read()
+    names |= set(ALIAS.findall(text)) | set(RENAME.findall(text))
 NAMES = '(?:' + '|'.join(sorted(names)) + ')'
 for path in paths:
     s = open(path).read()
