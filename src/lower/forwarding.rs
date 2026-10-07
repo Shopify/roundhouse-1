@@ -25,6 +25,7 @@ pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
                 for arg in args {
                     if let ExprNode::KeywordSplat { value } = &mut *arg.node {
                         *arg = std::mem::replace(value, super::typing::nil_lit());
+                        arg.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
                     }
                 }
             }

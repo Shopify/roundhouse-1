@@ -53,6 +53,12 @@ pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 10;
 /// every other target refuses it at emit unless it models the name.
 pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 
+/// A source `**value` call argument that the shared keyword lowering made
+/// positional (`lower::forwarding`, legacy policy) for targets without
+/// keyword arguments. The Ruby emitter writes the splat back: in Ruby 3 a
+/// positional Hash does not bind keyword parameters.
+pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
