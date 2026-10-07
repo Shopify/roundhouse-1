@@ -7226,12 +7226,12 @@ impl ConstantReaderIndex {
 /// view emits in `emit_with_assertions` run outside it and, without
 /// these, walked every library class per emitted class
 /// (`constant_readers`) and scanned them per constant reference.
-pub(super) struct LookupIndexes<'a> {
+pub(crate) struct LookupIndexes<'a> {
     _readers: ConstantReaderIndexGuard<'a>,
     _names: NameIndexGuard<'a>,
 }
 
-pub(super) fn install_lookup_indexes(app: &App) -> LookupIndexes<'_> {
+pub(crate) fn install_lookup_indexes(app: &App) -> LookupIndexes<'_> {
     LookupIndexes { _readers: ConstantReaderIndex::install(app), _names: NameIndex::install(app) }
 }
 
