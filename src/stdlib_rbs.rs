@@ -71,6 +71,24 @@ pub(crate) fn value_type(name: &str) -> Option<&'static Arc<Ty>> {
     index().values.get(name)
 }
 
+/// Whether a vendored class declaration includes `module`, as written
+/// (`Gem::Version` includes `Comparable`). Read once per process.
+pub(crate) fn declares_include(class: &str, module: &str) -> bool {
+    static INCLUDES: OnceLock<HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>>> = OnceLock::new();
+    INCLUDES
+        .get_or_init(|| {
+            let mut out: HashMap<crate::ident::ClassId, Vec<crate::ident::ClassId>> = HashMap::default();
+            for (_, text) in documents() {
+                for (class, modules) in crate::rbs::parse_app_includes(text).unwrap_or_default() {
+                    out.entry(class).or_default().extend(modules);
+                }
+            }
+            out
+        })
+        .get(&crate::ident::ClassId(crate::ident::Symbol::from(class)))
+        .is_some_and(|modules| modules.iter().any(|m| m.0.as_str() == module))
+}
+
 /// Rubydex's RBS indexer skips `class Queue = Thread::Queue`. The same
 /// aliases as a Ruby document, in their lexical scopes, so the resolver
 /// declares them.

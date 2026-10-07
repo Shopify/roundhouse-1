@@ -566,7 +566,9 @@ impl<'a> BodyTyper<'a> {
         let ty = self.compute(expr, ctx);
         expr.ty = Some(ty.clone());
         expr.decisions &= !crate::expr::CLASS_OBJECT_VALUE;
-        if self.is_class_object(expr, ctx) { expr.decisions |= crate::expr::CLASS_OBJECT_VALUE; }
+        if self.is_class_object(expr, ctx) || self.is_class_of_value(expr, ctx) {
+            expr.decisions |= crate::expr::CLASS_OBJECT_VALUE;
+        }
         diagnostic::detect_diagnostic(expr);
         ty
     }
@@ -787,6 +789,22 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    /// `x.class` is a class object as a VALUE: `x.class < Base` is
+    /// Module#<, answered on whatever class `x` has at run time. Not
+    /// identity evidence: `is_class_object` still refuses Module protocol
+    /// (`Probe.new.class.define_method`) on it.
+    fn is_class_of_value(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        match &*expr.node {
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "class" && args.is_empty() =>
+            {
+                !matches!(r.ty, None | Some(Ty::Var { .. }))
+                    && !self.owns_operator(r.ty.as_ref(), method, self.is_class_object(r, ctx))
+            }
+            _ => false,
+        }
+    }
+
     /// An instance method of a class that descends from `Module` (Core's
     /// `class MethodTimingRecorder < Module`) runs with a module as self:
     /// every instance of such a class is a module, whichever subclass.
@@ -813,12 +831,19 @@ impl<'a> BodyTyper<'a> {
                 && variants.iter().all(|ty| self.owns_operator(Some(ty), method, class_object)),
             Some(Ty::Class { id, .. }) => {
                 let mut current = Some(id);
+                // Comparable defines the four orderings on `<=>`: an app
+                // value class, or a vendored one (`Gem::Version`) the
+                // registry does not model.
+                let ordering = !class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=");
                 for _ in 0..32 {
                     let Some(id) = current else { break };
-                    let Some(class) = self.classes().get(id) else { break };
+                    let Some(class) = self.classes().get(id) else {
+                        return ordering && crate::stdlib_rbs::declares_include(id.0.as_str(), "Comparable");
+                    };
                     let own = if class_object { class.has_class_method(method) } else { class.has_instance_method(method) };
                     if own { return true; }
                     if !class_object && class.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) { return true; }
+                    if ordering && class.includes.iter().any(|m| m.0.as_str() == "Comparable") { return true; }
                     current = class.parent_id();
                 }
                 false
