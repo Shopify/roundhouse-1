@@ -2907,6 +2907,27 @@ fn rehome_carried(
     item
 }
 
+/// The attribute a `cattr_*`/`mattr_*` expansion's class-side writer
+/// (`def self.x=(value) = @x = value`) is for. With no `default:` the
+/// expansion seeds nothing, so a model's `self.x = []` beside the
+/// declaration (its own, or a concern's `included do`) is known by this.
+fn cattr_class_writer(method: &crate::dialect::MethodDef) -> Option<Symbol> {
+    use crate::expr::{ExprNode, LValue};
+    // Generated, not authored: an app's own `def self.x=` beside a
+    // class-body `self.x += 1` stays the reported drop it was.
+    if method.receiver != crate::dialect::MethodReceiver::Class
+        || !method.name_span.is_synthetic()
+        || method.kind != crate::dialect::AccessorKind::AttributeWriter
+    {
+        return None;
+    }
+    let base = method.name.as_str().strip_suffix('=')?;
+    let [param] = method.params.as_slice() else { return None };
+    let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*method.body.node else { return None };
+    let reads_param = matches!(&*value.node, ExprNode::Var { name, .. } if *name == param.name);
+    (name.as_str() == base && reads_param).then(|| Symbol::from(base))
+}
+
 /// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a
 /// `class_attribute` declares: the class's own, one an included concern
 /// carried in, or an ancestor's. A write through the class-side writer,
@@ -2924,7 +2945,14 @@ fn claim_class_attribute_writes(app: &mut App) {
     let bodies = app
         .models
         .iter()
-        .map(|m| (m.name.clone(), m.parent.clone(), super::class_attribute::declared_names(&m.body)))
+        .map(|m| {
+            let mut names = super::class_attribute::declared_names(&m.body);
+            names.extend(m.body.iter().filter_map(|item| match item {
+                ModelBodyItem::Method { method, .. } => cattr_class_writer(method),
+                _ => None,
+            }));
+            (m.name.clone(), m.parent.clone(), names)
+        })
         .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| {
             let names = lc
                 .class_ivar_initializers
