@@ -104,15 +104,6 @@ fn ingest_multi_write(
         Some(rest) => rest,
     };
     if !mw.rights().is_empty() {
-        // The desugar below indexes the RHS directly. Ruby instead calls
-        // to_ary (or wraps a scalar); collection dispatch alone does not
-        // prove those coercion semantics. Only literal arrays are verified.
-        if mw.value().as_array_node().is_none() {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "post-rest multi-write requires an array literal RHS; to_ary coercion is not modeled".into(),
-            });
-        }
         // Receiver/index expressions on an assignment LHS run BEFORE the
         // RHS in Ruby. This desugar only preserves variable targets; do not
         // accept the new post-rest shape with a different evaluation order.
@@ -137,17 +128,28 @@ fn ingest_multi_write(
     // rest flag through ~15 MultiAssign consumers. The Seq ends in the
     // temp read so the whole expression's value is the RHS array —
     // matching Ruby, where `(a, *b = arr)` evaluates to `arr`.
-    let stem = format!("__mw_{}", span.start);
-    let mut name = stem.clone();
-    let mut suffix = 0;
-    while super::sources::generated_local_is_reserved(&mw.location(), &name) {
-        suffix += 1;
-        name = format!("{stem}_{suffix}");
-    }
-    let tmp = Symbol::from(name);
-    let tmp_read = || {
-        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: tmp.clone() })
+    let fresh = |stem: String| {
+        let mut name = stem.clone();
+        let mut suffix = 0;
+        while super::sources::generated_local_is_reserved(&mw.location(), &name) {
+            suffix += 1;
+            name = format!("{stem}_{suffix}");
+        }
+        Symbol::from(name)
     };
+    let value_tmp = fresh(format!("__mw_{}", span.start));
+    // Ruby destructures what `Array.try_convert` gives (rb_check_array_type:
+    // an Array as is, else `to_ary`, private or method_missing included,
+    // with a TypeError when it answers a non-Array), and wraps any other
+    // value as `[value]`; `*a, b = "x"` binds `b = "x"`, and a Hash is
+    // wrapped, not `to_a`'d. An array literal is already an Array, so it
+    // is indexed directly. The expression's value stays the original RHS.
+    let coerce = mw.value().as_array_node().is_none();
+    let tmp = if coerce { fresh(format!("__mw_{}_a", span.start)) } else { value_tmp.clone() };
+    let var_read = |name: &Symbol| {
+        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() })
+    };
+    let tmp_read = || var_read(&tmp);
     let int_lit = |v: i64| {
         Expr::new(span, ExprNode::Lit { value: Literal::Int { value: v } })
     };
@@ -178,10 +180,36 @@ fn ingest_multi_write(
     exprs.push(Expr::new(
         span,
         ExprNode::Assign {
-            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: tmp.clone() },
+            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: value_tmp.clone() },
             value,
         },
     ));
+    if coerce {
+        // Synthetic: the core class this desugar names, not a constant
+        // the source wrote (a source span would ask the source index).
+        let array_const = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("Array")] });
+        let converted = send(array_const, "try_convert", vec![var_read(&value_tmp)]);
+        let wrapped = Expr::new(
+            span,
+            ExprNode::Array { elements: vec![var_read(&value_tmp)], style: crate::expr::ArrayStyle::Brackets },
+        );
+        let coerced = Expr::new(
+            span,
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left: converted,
+                right: wrapped,
+            },
+        );
+        exprs.push(Expr::new(
+            span,
+            ExprNode::Assign {
+                target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: tmp.clone() },
+                value: coerced,
+            },
+        ));
+    }
     for (i, target) in targets.into_iter().enumerate() {
         let read = index_read(int_lit(i as i64));
         exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
@@ -215,7 +243,7 @@ fn ingest_multi_write(
         });
         exprs.push(Expr::new(span, ExprNode::Assign { target, value: read }));
     }
-    exprs.push(tmp_read());
+    exprs.push(var_read(&value_tmp));
     Ok(ExprNode::Seq { exprs })
 }
 
@@ -249,8 +277,27 @@ fn ingest_statement_list(
                 expr.leading_blank_line = true;
             }
         }
-        exprs.push(expr);
         prev_end = Some(child.location().end_offset());
+        // A splat multi-write statement desugars to a Seq of assignments
+        // (`ingest_multi_write`). Splice them into this list: a Seq is no
+        // scope in Ruby, and the body typer threads bindings only through
+        // the statements of one list, so a nested Seq left `leaf` in
+        // `*parents, leaf = path.split(".")` untyped for what follows.
+        // Only the last statement's value is read; elsewhere the trailing
+        // read of the RHS temporary is dropped.
+        if child.as_multi_write_node().is_some() && matches!(&*expr.node, ExprNode::Seq { .. }) {
+            let leading_blank_line = expr.leading_blank_line;
+            let ExprNode::Seq { exprs: mut parts } = *expr.node else { unreachable!() };
+            if !std::ptr::eq(child, nodes.last().unwrap()) && parts.len() > 1 {
+                parts.pop();
+            }
+            if let Some(first) = parts.first_mut() {
+                first.leading_blank_line |= leading_blank_line;
+            }
+            exprs.extend(parts);
+            continue;
+        }
+        exprs.push(expr);
     }
     Ok(exprs)
 }
