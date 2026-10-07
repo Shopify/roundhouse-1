@@ -6784,19 +6784,61 @@ pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
 }
 
 /// The gems `lock` resolves that the CRuby tree's Bundler.require
-/// (`LOCK_GATED_REQUIRES`) loads, with every spec they depend on: the
-/// dependency closure loads too (stripe's, or shopify_session's
-/// identity gems), so its constants run as the gems'.
+/// (`LOCK_GATED_REQUIRES`) loads, with the specs they depend on that
+/// requiring them loads too (shopify_session's jwt), so their constants
+/// run as the gems'. A lockfile dependency alone is not a load:
+/// payment_service_client depends on cusco but autoloads it, and cusco
+/// requires Rails. So the walk follows only `LOCK_GATED_DEPENDENCIES`.
 pub(crate) fn lock_loaded_gems(lock: &crate::gems::Lockfile) -> std::collections::BTreeSet<String> {
     let mut loaded = std::collections::BTreeSet::new();
     let mut stack: Vec<&str> = LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
     while let Some(gem) = stack.pop() {
         if loaded.insert(gem.to_string()) {
-            stack.extend(lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str));
+            stack.extend(
+                lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
+                    .filter(|dep| LOCK_GATED_DEPENDENCIES.contains(dep)),
+            );
         }
     }
     loaded
 }
+
+/// The gems, outside `LOCK_GATED_REQUIRES`, that requiring its entries
+/// was seen to load: each entry required in its own process against
+/// Core's pinned gem home, with the runtime's Rails modules defined
+/// (`LOCK_GATED_REQUIRES` describes the probe), and the gem directories
+/// in `$LOADED_FEATURES` read back. 127 of the 232 lockfile-only
+/// dependencies; the rest, Rails and the Rails-dependent gems among them,
+/// were not loaded. Artifact: runs/rails-free-probe/observed-deps.txt
+/// (core-transpile).
+const LOCK_GATED_DEPENDENCIES: [&str; 127] = [
+    "async-pool", "aws-eventstream", "aws-partitions", "aws-sdk-core", "aws-sdk-kms", "aws-sigv4",
+    "base64", "bigdecimal", "builder", "cgi", "console", "css_parser", "dalli", "date", "debug",
+    "dnsruby", "dry-configurable", "dry-core", "dry-inflector", "dry-initializer", "dry-logic",
+    "dry-schema", "erb", "ethon", "event_stream_parser", "exiftool", "faraday-multipart",
+    "faraday-net_http", "ffi", "fiber-annotation", "fiber-local", "fiber-storage", "gapic-common",
+    "google-cloud-ai_platform-v1", "google-cloud-bigquery", "google-cloud-bigtable",
+    "google-cloud-bigtable-admin-v2", "google-cloud-bigtable-v2",
+    "google-cloud-certificate_manager", "google-cloud-certificate_manager-v1", "google-cloud-core",
+    "google-cloud-data_catalog-lineage", "google-cloud-data_catalog-lineage-v1",
+    "google-cloud-dataplex", "google-cloud-dataplex-v1", "google-cloud-env", "google-cloud-errors",
+    "google-cloud-location", "google-cloud-run-v2", "google-cloud-spanner",
+    "google-cloud-spanner-admin-database-v1", "google-cloud-spanner-admin-instance-v1",
+    "google-cloud-spanner-v1", "google-cloud-storage", "google-cloud-workflows-executions-v1",
+    "google-iam-v1", "google-logging-utils", "google-protobuf", "googleapis-common-protos-types",
+    "googleauth", "graphql-schema_comparator", "hamster", "htmlentities", "io-console",
+    "io-endpoint", "io-event", "io-stream", "jmespath", "json_rpc_handler", "jwt", "logger",
+    "matrix", "maxmind-db", "mime-types", "mime-types-data", "monoplex", "msgpack", "multi_json",
+    "multipart-post", "murmurhash3", "net-http", "net-http-persistent", "net-protocol", "net-smtp",
+    "net-ssh", "nokogiri", "opentelemetry-api", "opentelemetry-common",
+    "opentelemetry-helpers-sql", "opentelemetry-instrumentation-base", "opentelemetry-registry",
+    "opentelemetry-semantic_conventions", "os", "ostruct", "pdf-core", "pp", "prettyprint",
+    "promise.rb", "protoc-gen-twirp_ruby", "protocol-hpack", "protocol-http", "protocol-http1",
+    "protocol-http2", "psych", "racc", "red-flatbuffers", "redis-client", "rexml", "rgeo",
+    "rgeo-geojson", "ruby-rc4", "rubyzip", "securerandom", "shellwords", "signet",
+    "sorbet-runtime", "ssrf_filter", "statsd-instrument", "strscan", "timeout", "ttfunk", "twirp",
+    "typhoeus", "tzinfo", "uri", "zeitwerk", "zlib",
+];
 
 /// The test framework the CRuby test process runs on: real Minitest
 /// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the
@@ -6988,7 +7030,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
 /// integration fires there too. These gems are compiled as app code
 /// through `gem_sources:` or their constants are refused by name
 /// (construct `gem_requires_rails`); they are never required natively. Verdicts: docs/RUNTIME_GEMS.md
-/// (core-transpile). The first ten were read by hand; the rest are the
+/// (core-transpile). The first nine were read by hand; the rest are the
 /// probe's findings for the remaining default-group entries
 /// (`LOCK_GATED_REQUIRES` describes the probe).
 const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
@@ -6998,7 +7040,6 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),
     ("opentelemetry-shopify", "it requires its railtie, and with it `active_support/parameter_filter`, when Rails is defined"),
     ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
-    ("opentelemetry-common", "only opentelemetry-shopify requires it"),
     ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
@@ -9438,6 +9479,7 @@ mod tests {
             assert!(gem_port_files(gem).is_none(), "{gem} has a runtime port");
             assert!(!ruby_tree_loads_gem(gem), "{gem} is loaded by every CRuby tree");
             assert!(!LOCK_GATED_REQUIRES.iter().any(|(_, g)| g == gem), "{gem} is Bundler.required");
+            assert!(!LOCK_GATED_DEPENDENCIES.contains(gem), "{gem} is loaded by a Bundler.required gem");
         }
         for (name, file) in [
             ("Semian", "runtime/semian.rb"),
