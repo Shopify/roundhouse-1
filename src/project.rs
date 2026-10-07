@@ -5397,6 +5397,43 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         body.push_str("    ].freeze,\n");
     }
     body.push_str("  }.freeze\n");
+    // Each loader's `eager_load_dir` directories: per source file under
+    // it, its file program when it has one (which loads its declarations
+    // and runs the rest of the file), else its declarations.
+    body.push_str("  # Zeitwerk loader constant => directory (relative to its root) => the files `eager_load_dir` loads\n  EAGER_DIRS = {\n");
+    for loader in app.zeitwerk_loaders.iter().filter(|l| !l.eager_dirs.is_empty()) {
+        write!(body, "    {:?} => {{\n", loader.constant).unwrap();
+        for dir in &loader.eager_dirs {
+            let mut anchors: Vec<String> = Vec::new();
+            for source in &dir.sources {
+                let program = app
+                    .file_programs
+                    .iter()
+                    .find(|p| p.source == *source)
+                    .map(|p| crate::emit::ruby::file_program_anchor(app, p))
+                    .filter(|anchor| files.iter().any(|(path, _)| *path == format!("app/{anchor}.rb")));
+                match program {
+                    Some(anchor) => anchors.push(anchor),
+                    None => anchors.extend(
+                        app.library_class_files
+                            .iter()
+                            .filter(|(file, _)| file == source)
+                            .flat_map(|(_, names)| names.iter().map(|c| anchor_of(c)))
+                            .filter(|a| models.iter().any(|(m, _)| m == a)),
+                    ),
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            anchors.retain(|a| seen.insert(a.clone()));
+            write!(body, "      {:?} => [\n", dir.dir).unwrap();
+            for anchor in &anchors {
+                write!(body, "        {anchor:?},\n").unwrap();
+            }
+            body.push_str("      ].freeze,\n");
+        }
+        body.push_str("    }.freeze,\n");
+    }
+    body.push_str("  }.freeze\n");
     body.push_str(AUTOLOAD_RUNTIME);
 
     // The environment's `config.eager_load`, as the app wrote it. Rails'
@@ -5593,6 +5630,22 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
     def eager_load(force: false)
       @files.each { |file| require RoundhouseAutoload.path(file) }
+      nil
+    end
+
+    # `eager_load_dir`, compiled: `namespace` is the directory's, which
+    # Zeitwerk walks from the root namespace. An undefined segment (an
+    # autoload counts as defined) makes it a no-op; else the directory's
+    # files load, each referenced into loading as Zeitwerk does.
+    def eager_load_dir(namespace, dir, own = nil)
+      path = []
+      namespace.split("::").inject(Object) do |mod, cname|
+        path << cname
+        return nil unless mod.const_defined?(cname, false)
+        return nil if own == path.join("::") && mod.autoload?(cname, false)
+        mod.const_get(cname, false)
+      end
+      EAGER_DIRS.fetch(@name, {}).fetch(dir, []).each { |file| require RoundhouseAutoload.path(file) }
       nil
     end
   end

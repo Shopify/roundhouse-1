@@ -385,6 +385,15 @@ fn program_items(
         if stmt.as_constant_write_node().is_some() && !in_branch && !*guarded {
             continue;
         }
+        // A Zeitwerk loader the file holds (`LOADER =` above, or a
+        // local): its calls are applied statically or kept on the
+        // compiled handle (`ingest::zeitwerk`).
+        if !in_branch && !*guarded {
+            if let Some(item) = super::zeitwerk::file_loader_statement(stmt, file) {
+                out.extend(item);
+                continue;
+            }
+        }
         if let Some(call) = stmt.as_call_node() {
             let name = constant_id_str(&call.name());
             if call.receiver().is_none() && matches!(name, "require" | "require_relative") {
@@ -838,11 +847,13 @@ fn file_level_constants(
             }
             continue;
         }
-        out.push((
-            Symbol::from(constant_id_str(&cw.name())),
-            ingest_expr(&cw.value(), file)?,
-            after_declarations,
-        ));
+        // `LOADER = Zeitwerk::Loader.for_gem_extension(GraphQL)`: the
+        // compiled handle (`ingest::zeitwerk`).
+        let value = match super::zeitwerk::loader_constant(&cw, &ClassId(Symbol::from("")), file) {
+            Some(handle) => handle,
+            None => ingest_expr(&cw.value(), file)?,
+        };
+        out.push((Symbol::from(constant_id_str(&cw.name())), value, after_declarations));
     }
     Ok(out)
 }

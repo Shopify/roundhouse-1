@@ -820,6 +820,23 @@ pub struct ZeitwerkLoader {
     /// ignored path, or every file when it is never set up): carried,
     /// but neither autoloaded nor eager-loaded.
     pub ignored: Vec<crate::ident::ClassId>,
+    /// The directories its `eager_load_dir` names, in call order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eager_dirs: Vec<ZeitwerkEagerDir>,
+}
+
+/// A directory a Zeitwerk loader's `eager_load_dir` loads
+/// (`ingest::zeitwerk`): what the handle requires when the directory's
+/// namespace is defined.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ZeitwerkEagerDir {
+    /// Relative to the loader's root (`shopify/patches`), the key the
+    /// call site names.
+    pub dir: String,
+    /// The managed files under it, as ingested, sorted.
+    pub sources: Vec<String>,
+    /// The classes those files define.
+    pub classes: Vec<crate::ident::ClassId>,
 }
 
 /// A railtie or engine class the app carries ([`App::railties`]).
