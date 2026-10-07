@@ -344,6 +344,7 @@ impl<'a> BodyTyper<'a> {
                 | "to_h" => Some(vec![(**elem).clone()]),
                 "each_with_index" | "with_index" => Some(vec![(**elem).clone(), Ty::Int]),
                 "each_slice" | "each_cons" => Some(vec![recv_ty.clone()]),
+                "with_object" => Some(vec![(**elem).clone(), Ty::Untyped]),
                 "sort_by!" | "select!" | "reject!" | "keep_if" | "delete_if" => Some(vec![(**elem).clone()]),
                 _ => None,
             },
@@ -2571,7 +2572,8 @@ pub(super) fn array_method(method: &Symbol, elem: &Ty, block_ret: Option<&Ty>) -
         },
         "tally" => Ty::Hash { key: Box::new(elem.clone()), value: Box::new(Ty::Int) },
         // Fold/accumulate — result type depends on the block/seed (untracked).
-        "inject" | "reduce" | "each_with_object" => Ty::Untyped,
+        // `with_object` is the enumerator's `each_with_object` (`each_cons(2).with_object([])`).
+        "inject" | "reduce" | "each_with_object" | "with_object" => Ty::Untyped,
         "to_sentence" => Ty::Str,
         // `Array#to_h { |elem| [k, v] }` — block returns a [k, v]
         // tuple; result is Hash<k, v>. We approximate as Hash<elem, elem>

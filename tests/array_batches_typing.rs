@@ -39,3 +39,10 @@ fn a_chained_enumerator_yields_batches() {
     assert!(text.contains("no known method `xxx` on Array[Integer]"), "{text}");
     assert!(!text.contains("no known method `each_slice`"), "{text}");
 }
+
+#[test]
+fn the_enumerator_folds_with_an_object() {
+    let text = check("with_object", "    ids.each_cons(2).with_object([]) { |pair, acc| pair.www }");
+    assert!(text.contains("no known method `www` on Array[Integer]"), "{text}");
+    assert!(!text.contains("no known method `with_object`"), "{text}");
+}
