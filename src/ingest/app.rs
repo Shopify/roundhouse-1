@@ -566,7 +566,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             if let Some(classes) =
                                 survey::unwrap_or_drop_file(ingest_library_classes(&source, &path_str))?
                             {
-                                let nested = nested_under(&outer, classes);
+                                let nested = beside_model(&outer, classes, &model_bases);
                                 let (concern_items, concern_enum_decls) =
                                     ingest_concern_model_items_with_constants(
                                         &source, &path_str, &enum_constants,
@@ -749,7 +749,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             }
                         };
                         if let Some(classes) = classes {
-                            let nested = nested_under(&outer, classes);
+                            let nested = beside_model(&outer, classes, &model_bases);
                             let mut names: Vec<crate::ident::ClassId> = nested.iter().map(|c| c.name.clone()).collect();
                             names.push(outer.clone());
                             support_classes.push((entry.clone(), names));
@@ -6262,6 +6262,86 @@ fn nested_under(
 ) -> Vec<crate::dialect::LibraryClass> {
     let prefix = format!("{}::", outer.0.as_str());
     classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
+}
+
+/// The classes a MODEL's file declares besides the model, which its own
+/// ingest takes only the model from: the classes nested in the model's
+/// body ([`nested_under`]), the namespaces the model is written in, and
+/// whatever else those namespace bodies declare.
+///
+/// `module Inventory; module RestockCalculationSchema; NO_RESTOCK_TYPE =
+/// "no_restock"; class RestockRequest; include ActiveModel::Validations`
+/// is Core's restock_calculation_schema.rb. The include makes the file a
+/// (tableless) model, and keeping only the classes nested in the model
+/// lost the wrapper module and with it every constant, method and plain
+/// class its body declares: `NO_RESTOCK_TYPE` was "constant not
+/// supported" everywhere it was read, the model's own `validates …, in:
+/// RESTOCK_TYPES` included. A file the library path ingests registers
+/// the same modules, so the model file now does as well; reopens of one
+/// namespace across files merge as they always have.
+///
+/// Not carried: a wrapping CLASS (`module Shipping; class Box; class
+/// Measurement < ApplicationRecord`). It is a reopen of a class defined
+/// elsewhere, most often a model (`Shipping::Box`), and a library class
+/// of a model's name owns the model's emitted file and writes over it:
+/// the tree checked clean and the model lost its persistence at
+/// runtime. It declares nothing to lose, either: a wrapping class whose
+/// body holds anything but class and module declarations is the file's
+/// primary class (`primary_class_with_scope`), and the file is not a
+/// model file. Nor another class here that is a model itself (an AR
+/// descendant or an ActiveModel includer), and what it nests: the model
+/// pass reads one model per file, and registering it as a plain class
+/// would misstate it.
+fn beside_model(
+    outer: &crate::ident::ClassId,
+    classes: Vec<crate::dialect::LibraryClass>,
+    bases: &super::library_class::ModelBases,
+) -> Vec<crate::dialect::LibraryClass> {
+    let model_shaped = |c: &crate::dialect::LibraryClass| {
+        if c.is_module {
+            return false;
+        }
+        let active_model = c.includes.iter().any(|inc| {
+            let inc = inc.0.as_str().trim_start_matches("::");
+            inc == "ActiveModel::Validations" || inc == "ActiveModel::Model"
+        });
+        let record = c.parent.as_ref().is_some_and(|parent| {
+            let parent = parent.0.as_str().trim_start_matches("::");
+            let path: Vec<String> = parent.split("::").map(str::to_string).collect();
+            let mut scope: Vec<String> = c.name.0.as_str().split("::").map(str::to_string).collect();
+            scope.pop();
+            bases.contains(parent) || bases.contains(&bases.resolve_superclass(&scope, &path))
+        });
+        active_model || record
+    };
+    let other_models: Vec<String> = classes
+        .iter()
+        .filter(|c| c.name != *outer && model_shaped(c))
+        .map(|c| c.name.0.as_str().to_string())
+        .collect();
+    let outer_name = outer.0.as_str();
+    classes
+        .into_iter()
+        .filter(|c| {
+            let name = c.name.0.as_str();
+            if name == outer_name {
+                return false;
+            }
+            // What the model nests is kept whatever it is; of the
+            // namespaces it is written in, the modules.
+            let is_ancestor = outer_name.strip_prefix(name).is_some_and(|rest| rest.starts_with("::"));
+            let is_nested = name.strip_prefix(outer_name).is_some_and(|rest| rest.starts_with("::"));
+            if is_nested {
+                return true;
+            }
+            if is_ancestor {
+                return c.is_module;
+            }
+            !other_models.iter().any(|m| {
+                name == m || name.strip_prefix(m.as_str()).is_some_and(|rest| rest.starts_with("::"))
+            })
+        })
+        .collect()
 }
 
 /// The support roots to walk for library classes: every `app/*`
