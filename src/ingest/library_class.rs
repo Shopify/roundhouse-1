@@ -4748,6 +4748,15 @@ fn carries_to_includer(item: &crate::dialect::ModelBodyItem) -> bool {
     use crate::expr::ExprNode;
     let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
     match &*expr.node {
+        // A state-machine DSL block is a declaration gap the concern's
+        // own ingest records (`state-machine DSL block … is not
+        // modeled`); splicing it would hand each includer an unsupported
+        // item and report it again there.
+        ExprNode::Send { recv: None, method, block: Some(_), .. }
+            if matches!(method.as_str(), "aasm" | "state_machine") =>
+        {
+            false
+        }
         ExprNode::Send { recv: None, method, .. } => !matches!(
             method.as_str(),
             "private"
