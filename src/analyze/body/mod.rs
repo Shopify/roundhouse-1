@@ -484,6 +484,21 @@ impl<'a> BodyTyper<'a> {
         self.typed_constants.and_then(|values| values.get(declaration))
     }
 
+    /// The nearest superclass of the enclosing class whose modeled
+    /// constant table has `name`.
+    fn inherited_constant_owner(&self, ctx: &Ctx, name: &Symbol) -> Option<ClassId> {
+        let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
+        let mut class = self.classes().get(id)?.parent.clone()?;
+        for _ in 0..32 {
+            let info = self.classes().get(&class)?;
+            if info.constants.contains_key(name) {
+                return Some(class);
+            }
+            class = info.parent.clone()?;
+        }
+        None
+    }
+
     /// The gem whose RBI is the only declaration of the constant `path`
     /// names: the class or module itself, else a value its owner assigns.
     /// With it, whether an emitted tree loads that gem.
@@ -1147,8 +1162,20 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                     // An unresolved source reference may still name an
-                    // exact modeled external class (for example Time).
-                    Some(None) => exact_modeled_class(path),
+                    // exact modeled external class (for example Time), or
+                    // a bare constant Ruby finds on a modeled ancestor
+                    // the source index cannot see (`REQUEST_TIME` in a
+                    // subclass of shopify_metrics' `RequestMetrics`,
+                    // whose RBI declares it): read at its full name.
+                    Some(None) => {
+                        if let [name] = path.as_slice()
+                            && let Some(owner) = self.inherited_constant_owner(ctx, name)
+                        {
+                            let full = ClassId(Symbol::from(format!("{}::{}", owner.0, name).as_str()));
+                            qualify_resolved_path(path, &full);
+                        }
+                        exact_modeled_class(path)
+                    }
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
                     // A stored class-body local (ingest `BodyLocal`) is
