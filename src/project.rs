@@ -3647,10 +3647,15 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// `active_support/...`, ...): this tree's runtime ports answer those, and
 /// requiring the real ones would load Rails over the ports. A semian
 /// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
-pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
+///
+/// The third list names the native features every require of which sits
+/// in a `begin` that rescues LoadError (graphql-shopify 0.20.3's
+/// `begin require "shopify-cloud" rescue LoadError end`): the source runs
+/// on without them, so the load does too.
+pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, Vec<String>) {
     use crate::det::{HashMap, HashSet};
     if app.gem_lock.is_none() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
     // `<root>/<name>-<version>/lib/<name>.rb`: a gem source is the
@@ -3674,6 +3679,8 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
     let mut native: Vec<String> = Vec::new();
     let mut framework: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::default();
+    let mut optional: HashSet<String> = HashSet::default();
+    let mut required: HashSet<String> = HashSet::default();
     for (entry, lib) in entries {
         let mut stack = vec![entry];
         let mut order: Vec<String> = Vec::new();
@@ -3693,7 +3700,12 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
                 };
                 if by_path.contains_key(target.as_str()) {
                     nested.push(target);
-                } else if kind == "require" && !compiled_feature(&feature) {
+                } else if (kind == "require" || kind == "optional_require") && !compiled_feature(&feature) {
+                    if kind == "require" {
+                        required.insert(feature.clone());
+                    } else {
+                        optional.insert(feature.clone());
+                    }
                     order.push(feature);
                 }
             }
@@ -3708,7 +3720,9 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
             }
         }
     }
-    (native, framework)
+    let optional: Vec<String> =
+        native.iter().filter(|f| optional.contains(f.as_str()) && !required.contains(f.as_str())).cloned().collect();
+    (native, framework, optional)
 }
 
 /// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
@@ -3763,15 +3777,38 @@ fn normalize_rb_path(path: &Path) -> String {
     out
 }
 
-/// `("require" | "require_relative", feature)` for each string-literal
-/// require that runs when `source` loads (see [`gem_source_dependencies`]).
+/// `("require" | "optional_require" | "require_relative", feature)` for
+/// each string-literal require that runs when `source` loads (see
+/// [`gem_source_dependencies`]). An `optional_require` is a `require` in
+/// the body of a `begin` with a rescue clause naming LoadError (or its
+/// ancestors ScriptError and Exception).
 fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
+    fn rescues_load_error(n: &ruby_prism::BeginNode<'_>) -> bool {
+        let mut rescue = n.rescue_clause();
+        while let Some(r) = rescue {
+            let names_it = r.exceptions().iter().any(|e| {
+                e.as_constant_read_node().is_some_and(|c| {
+                    matches!(std::str::from_utf8(c.name().as_slice()), Ok("LoadError" | "ScriptError" | "Exception"))
+                })
+            });
+            if names_it {
+                return true;
+            }
+            rescue = r.subsequent();
+        }
+        false
+    }
     fn walk<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>) {
+        walk_in(nodes, out, false)
+    }
+    fn walk_in<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>, guarded: bool) {
+        let walk = |nodes, out: &mut Vec<(&'static str, String)>| walk_in(nodes, out, guarded);
         for node in nodes {
             if let Some(call) = node.as_call_node() {
                 let name = call.name();
                 let name = std::str::from_utf8(name.as_slice()).unwrap_or("");
                 let kind = match name {
+                    "require" if guarded => "optional_require",
                     "require" => "require",
                     "require_relative" => "require_relative",
                     _ => continue,
@@ -3804,7 +3841,7 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
                     walk(stmts(e.statements()), out);
                 }
             } else if let Some(n) = node.as_begin_node() {
-                walk(stmts(n.statements()), out);
+                walk_in(stmts(n.statements()), out, guarded || rescues_load_error(&n));
                 let mut rescue = n.rescue_clause();
                 while let Some(r) = rescue {
                     walk(stmts(r.statements()), out);
@@ -3892,7 +3929,7 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
 /// `bundler/gems/rails-<revision>`) is error[gem_requires_rails], raised
 /// at boot.
 fn gem_source_dependency_block(app: &App) -> String {
-    let (all_native, framework) = gem_source_dependencies(app);
+    let (all_native, framework, optional) = gem_source_dependencies(app);
     let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
     let owned_by_path_gem = |feature: &str| {
         in_repo.iter().any(|name| {
@@ -3926,7 +3963,8 @@ fn gem_source_dependency_block(app: &App) -> String {
     if native.is_empty() {
         return out;
     }
-    let names: Vec<String> = native.iter().map(|f| format!("{f:?}")).collect();
+    let names: Vec<String> =
+        native.iter().map(|f| format!("[{f:?}, {}]", optional.contains(f))).collect();
     let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
     out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
     out.push_str(
@@ -3943,7 +3981,8 @@ fn gem_source_dependency_block(app: &App) -> String {
          nil\n\
          end\n",
     );
-    out.push_str(&format!("[{}].each do |feature|\n", names.join(", ")));
+    // `optional`: the source rescues LoadError around the require.
+    out.push_str(&format!("[{}].each do |feature, optional|\n", names.join(", ")));
     out.push_str(
         "  spec = Gem::Specification.find_by_path(feature)\n  \
          if spec && __rh_compiled_gems.include?(spec.name)\n    \
@@ -3955,7 +3994,11 @@ fn gem_source_dependency_block(app: &App) -> String {
          next\n  \
          end\n  \
          loaded = $LOADED_FEATURES.size\n  \
+         begin\n    \
          require feature\n  \
+         rescue LoadError\n    \
+         raise unless optional\n  \
+         end\n  \
          rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
          end\n",

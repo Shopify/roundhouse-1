@@ -140,7 +140,7 @@ const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "a
 /// feature walk reads.
 pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
     let Some(lock) = app.gem_lock.as_ref() else { return };
-    let (features, _) = crate::project::gem_source_dependencies(app);
+    let (features, _, _) = crate::project::gem_source_dependencies(app);
     if features.is_empty() {
         return;
     }

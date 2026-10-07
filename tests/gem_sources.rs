@@ -68,3 +68,21 @@ fn a_gem_source_outside_the_app_is_refused() {
         assert!(error.to_string().contains("gem_sources entry \"widget\""), "{error}");
     }
 }
+
+/// graphql-shopify 0.20.3 requires shopify-cloud inside
+/// `begin ... rescue LoadError end` and runs on without it. The boot's
+/// load of the gem source's dependencies keeps that rescue for that
+/// require, and only for it.
+#[test]
+fn a_gem_sources_rescued_require_stays_optional() {
+    const WIDGET: &str = "require \"set\"\nbegin\n  require \"rh_absent_optional_feature\"\nrescue LoadError\nend\nrequire \"widget/answer\"\n\nmodule Widget\n  def self.answer\n    Answer.new.value\n  end\nend\n";
+    let app = || widget_app(CARRIED).write("vendor/gems/widget-1.0.0/lib/widget.rb", WIDGET);
+    let (emitted, errors) = app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(emitted.join("runtime/gem_facades.rb")).unwrap();
+    assert!(
+        facades.contains("[[\"set\", false], [\"rh_absent_optional_feature\", true]].each do |feature, optional|"),
+        "{facades}"
+    );
+    app().run_test("test/models/oracle_test.rb").assert_passes();
+}
