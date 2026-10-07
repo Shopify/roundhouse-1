@@ -81,6 +81,9 @@ pub(crate) struct ConstResolver {
     /// Every name `has_source_namespace` answers yes for, gathered once
     /// from `files`: the question used to scan every file's answers.
     source_namespaces: HashSet<Box<str>>,
+    /// Each source namespace that others are nested in by name, with
+    /// those nested ones (`A` to `A::B` and `A::B::C`).
+    nested_namespaces: HashMap<Box<str>, Vec<Box<str>>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -410,7 +413,22 @@ impl ConstResolver {
                 source_namespaces.insert(target.clone());
             }
         }
-        Self { files, stdlib_namespaces, superclasses, source_namespaces, source_fingerprint: source_fingerprint(sources) }
+        let mut nested_namespaces: HashMap<Box<str>, Vec<Box<str>>> = HashMap::default();
+        for name in &source_namespaces {
+            for (at, _) in name.match_indices("::") {
+                if source_namespaces.contains(&name[..at]) {
+                    nested_namespaces.entry(Box::from(&name[..at])).or_default().push(name.clone());
+                }
+            }
+        }
+        Self {
+            files,
+            stdlib_namespaces,
+            superclasses,
+            source_namespaces,
+            nested_namespaces,
+            source_fingerprint: source_fingerprint(sources),
+        }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -491,6 +509,12 @@ impl ConstResolver {
     /// runtime namespace to it under a name a source class defines.
     pub(crate) fn has_source_namespace(&self, name: &str) -> bool {
         self.source_namespaces.contains(name)
+    }
+
+    /// The source classes and modules declared inside the source class
+    /// or module `name` (`A::B` and `A::B::C` for `A`).
+    pub(crate) fn nested_source_namespaces(&self, name: &str) -> &[Box<str>] {
+        self.nested_namespaces.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Whether Ruby's signatures declare this class or module (a declared

@@ -1058,7 +1058,21 @@ impl<'a> BodyTyper<'a> {
                             Some(alias) if self.classes().contains_key(alias.as_ref()) => alias.as_ref().clone(),
                             _ => class.as_ref().clone(),
                         };
-                        if self.classes().contains_key(&id) || *runtime {
+                        // A source module that only nests other
+                        // declarations (`module AuditTrail` holding
+                        // `Trail` and `Step`) models no class of its own,
+                        // yet is the module the read returns: emitted,
+                        // its modeled nested classes open it. One whose
+                        // nested declarations are all unmodeled (a class
+                        // an ingest gap dropped, with its contents) stays
+                        // unknown.
+                        let namespace_only = !*stdlib
+                            && self.const_resolver.as_ref().is_some_and(|r| {
+                                r.nested_source_namespaces(id.0.as_str())
+                                    .iter()
+                                    .any(|nested| self.classes().contains_key(&ClassId(Symbol::from(nested.as_ref()))))
+                            });
+                        if self.classes().contains_key(&id) || *runtime || namespace_only {
                             if *stdlib && !self.classes().contains_key(&id) {
                                 expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
                             }
