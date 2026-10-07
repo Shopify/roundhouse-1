@@ -418,14 +418,8 @@ impl ConstResolver {
         self.files.get(index as usize)?.as_ref()
     }
 
-    /// Every constant (fully qualified) `file` declares: its classes and
-    /// modules, and its assigned constants and aliases.
-    pub(crate) fn namespaces_declared_in(&self, file: FileId) -> impl Iterator<Item = &str> {
-        self.file(file).into_iter().flat_map(|file| file.namespace_definitions.iter().map(|name| name.as_ref()))
-    }
-
-    /// `namespaces_declared_in` less the aliases: `Alias = Bar` names
-    /// `Bar`'s class, not one `file` makes.
+    /// Every class or module (fully qualified) `file` declares, less the
+    /// aliases: `Alias = Bar` names `Bar`'s class, not one `file` makes.
     pub(crate) fn receivers_declared_in(&self, file: FileId) -> impl Iterator<Item = &str> {
         self.file(file).into_iter().flat_map(|file| {
             file.namespace_definitions
@@ -467,20 +461,6 @@ impl ConstResolver {
         match self.reference(span, path)?? {
             ResolvedConstant::Namespace { class, .. } => Some(class),
             ResolvedConstant::Value { .. } => None,
-        }
-    }
-
-    /// The fully qualified declaration a reference resolves to, whether a
-    /// namespace or a value.
-    pub(crate) fn declaration_name(&self, span: Span, path: &[Symbol]) -> Option<&str> {
-        match self.reference(span, path)?? {
-            ResolvedConstant::Namespace { class, .. } => Some(class.0.as_str()),
-            ResolvedConstant::Value { declaration, .. } => self
-                .files
-                .iter()
-                .flatten()
-                .find_map(|file| file.constant_classes.get(declaration))
-                .map(|name| name.0.as_str()),
         }
     }
 

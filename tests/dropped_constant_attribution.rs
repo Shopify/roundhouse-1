@@ -1,9 +1,11 @@
 //! A class that the app's own sources define but survey-mode ingest
-//! dropped surfaces at every reference as a `constant` refusal. The
-//! refusal stays an error, since the reference cannot compile, and
-//! names the definition's file and the gap that failed the file's class
-//! ingest. A gap that ingest absorbed, leaving the class in the IR, is
-//! never named.
+//! dropped surfaces at every reference as a `constant` refusal. That
+//! refusal is the gap's shadow: a coverage note (as in
+//! gap_cascade_attribution, upstream's policy) that names the
+//! definition's file and the gap that failed the file's class ingest,
+//! while the gap itself stays an error. A gap that ingest absorbed,
+//! leaving the class in the IR, is never named, and an undefined constant
+//! stays an error.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -42,21 +44,29 @@ fn check(files: &[(&str, &str)]) -> Vec<Diagnostic> {
     diags
 }
 
-fn constant_refusal<'a>(diags: &'a [Diagnostic], name: &str) -> &'a Diagnostic {
+fn constant_refusal<'a>(diags: &'a [Diagnostic], name: &str, severity: Severity) -> &'a Diagnostic {
     let d = diags
         .iter()
         .find(|d| matches!(&d.kind,
             DiagnosticKind::Unsupported { construct, detail, .. }
                 if construct.as_str() == "constant" && detail == name))
         .unwrap_or_else(|| panic!("no constant refusal for {name}: {diags:#?}"));
-    assert_eq!(d.severity, Severity::Error, "{}", d.message);
+    assert_eq!(d.severity, severity, "{}", d.message);
     d
+}
+
+fn gap_error(diags: &[Diagnostic]) {
+    assert!(
+        diags.iter().any(|d| d.severity == Severity::Error
+            && matches!(&d.kind, DiagnosticKind::IngestUnsupported { detail } if detail == VISIBILITY_GAP)),
+        "the gap itself stays an error: {diags:#?}"
+    );
 }
 
 fn dropped(written: &str, name: &str, file: &str, gap: &str) -> String {
     format!(
-        "constant not supported (all targets): {written} — dropped by ingest gap: \
-         {name} is defined in {file} but was not compiled: {gap}"
+        "constant not supported (all targets): {written} — likely roundhouse coverage, \
+         not an app error (ingest gap in {file}: {name} was not compiled: {gap})"
     )
 }
 
@@ -73,24 +83,25 @@ fn reference_to_a_gap_dropped_class_names_its_file_and_gap() {
             "module Stores\n  class User\n    def go\n      LocalStore.new.reset\n    end\n\n    def limit\n      [Stores::LocalStore::LIMIT, TOP_LIMIT]\n    end\n\n    def missing\n      NoSuchStore.new\n    end\n  end\nend\n",
         ),
     ]);
+    gap_error(&diags);
     let file = "app/lib/stores/local_store.rb";
     // The written name resolves lexically to the nested declaration.
     assert_eq!(
-        constant_refusal(&diags, "LocalStore").message,
+        constant_refusal(&diags, "LocalStore", Severity::Info).message,
         dropped("LocalStore", "Stores::LocalStore", file, VISIBILITY_GAP)
     );
     // Constants that the dropped file assigns, nested or top-level.
     assert_eq!(
-        constant_refusal(&diags, "Stores::LocalStore::LIMIT").message,
+        constant_refusal(&diags, "Stores::LocalStore::LIMIT", Severity::Info).message,
         dropped("Stores::LocalStore::LIMIT", "Stores::LocalStore::LIMIT", file, VISIBILITY_GAP)
     );
     assert_eq!(
-        constant_refusal(&diags, "TOP_LIMIT").message,
+        constant_refusal(&diags, "TOP_LIMIT", Severity::Info).message,
         dropped("TOP_LIMIT", "TOP_LIMIT", file, VISIBILITY_GAP)
     );
     // A constant nothing defines is not attributed to the gap.
     assert_eq!(
-        constant_refusal(&diags, "NoSuchStore").message,
+        constant_refusal(&diags, "NoSuchStore", Severity::Error).message,
         "constant not supported (all targets): NoSuchStore"
     );
 }
@@ -109,7 +120,7 @@ fn the_named_gap_is_the_one_that_failed_the_file() {
         ("app/lib/user.rb", "class User\n  def go\n    LocalStore.new.reset\n  end\nend\n"),
     ]);
     assert_eq!(
-        constant_refusal(&diags, "LocalStore").message,
+        constant_refusal(&diags, "LocalStore", Severity::Info).message,
         dropped("LocalStore", "LocalStore", "app/lib/local_store.rb", VISIBILITY_GAP)
     );
 }
@@ -128,7 +139,7 @@ fn a_gap_that_kept_the_class_is_not_named() {
     ]);
     for name in ["Settings::A", "Settings::B"] {
         assert_eq!(
-            constant_refusal(&diags, name).message,
+            constant_refusal(&diags, name, Severity::Error).message,
             format!("constant not supported (all targets): {name}")
         );
     }
