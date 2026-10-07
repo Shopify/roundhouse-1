@@ -49,7 +49,8 @@ fn without_gem_sources_the_gem_stays_on_the_list() {
 /// reach) would load them: opentelemetry-shopify 1.22.0's
 /// `require 'opentelemetry/sdk'` and its siblings. A Rails feature is the
 /// runtime's port and is named, not required; a file reached only by
-/// `autoload`, or a require inside a method, is not load-time.
+/// `autoload`, or a require inside a method, is not load-time; a feature
+/// compiled elsewhere (the app's lib/oracle.rb) is not the gem home's.
 #[test]
 fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     let (dir, _) = app("gem_sources:\n  opentelemetry-shopify: vendor/gems/opentelemetry-shopify-1.22.0\n")
@@ -59,7 +60,7 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
         )
         .write(
             "vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify.rb",
-            "require 'opentelemetry/sdk'\nrequire 'forwardable'\nrequire 'opentelemetry/shopify/version'\n\nmodule OtelShim\n  require 'opentelemetry-common'\n  autoload :Lazy, 'opentelemetry/shopify/lazy'\n\n  def self.on?\n    require 'only/when/called'\n    true\n  end\nend\n",
+            "require 'opentelemetry/sdk'\nrequire 'forwardable'\nrequire 'oracle'\nrequire 'opentelemetry/shopify/version'\n\nmodule OtelShim\n  require 'opentelemetry-common'\n  autoload :Lazy, 'opentelemetry/shopify/lazy'\n\n  def self.on?\n    require 'only/when/called'\n    true\n  end\nend\n",
         )
         .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify/version.rb", "require_relative '../../deep/dep'\nmodule OtelShim\n  VERSION = '1'\nend\n")
         .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/deep/dep.rb", "require 'json'\nmodule Deep\nend\n")

@@ -3304,7 +3304,10 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
     use std::collections::{HashMap, HashSet};
     let Some(lock) = app.gem_lock.as_ref() else { return (Vec::new(), Vec::new()) };
     let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
-    // `<root>/<gem dir>/lib/<name>.rb`, the dir `<name>` or `<name>-<version>`.
+    // `<root>/<name>-<version>/lib/<name>.rb`: a gem source is the
+    // released gem, vendored at its version. (A lockfile PATH gem is in
+    // `in_repo` too, but it is the app's own code, required as the app
+    // requires it.)
     let mut entries: Vec<(String, String)> = Vec::new();
     for name in &lock.in_repo {
         let tail = format!("/lib/{name}.rb");
@@ -3313,12 +3316,20 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
             let gem_dir = dir.rsplit('/').next().unwrap_or("");
             let versioned = gem_dir
                 .strip_prefix(name.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.strip_prefix('-').is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())));
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
             if versioned {
                 entries.push((source.path.clone(), format!("{dir}/lib/")));
             }
         }
     }
+    // A feature some compiled lib answers (another gem source's, a path
+    // gem's, the app's `lib/`): compiled, so not the gem home's.
+    let compiled_feature = |feature: &str| {
+        let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+        let tail = format!("/lib/{rb}");
+        app.sources.iter().any(|s| s.path.ends_with(&tail) || s.path == format!("lib/{rb}"))
+    };
     let framework_feature = |feature: &str| {
         feature == "rails"
             || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
@@ -3347,7 +3358,7 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
                 };
                 if by_path.contains_key(target.as_str()) {
                     nested.push(target);
-                } else if kind == "require" {
+                } else if kind == "require" && !compiled_feature(&feature) {
                     order.push(feature);
                 }
             }
