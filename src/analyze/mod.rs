@@ -131,6 +131,10 @@ pub struct Analyzer {
     /// includers (see `fold_host_surfaces`). Kept out of what the
     /// concern fold copies back down, and rewritten every round.
     host_folded: HashMap<ClassId, BTreeSet<Symbol>>,
+    /// The AR instance names each model concern was lent from the
+    /// catalog (`registry::library`). Like `host_folded`, they are the
+    /// includer's surface, so no fold copies them on.
+    catalog_lent: HashMap<ClassId, BTreeSet<Symbol>>,
     /// Library modules only ever `extend`ed onto a class or module
     /// object, whose instance methods are typed class side
     /// (`extension_modules`).
@@ -1104,7 +1108,7 @@ impl Analyzer {
         // Library classes (route-helper/Singleton includes, superclass links),
         // ActionMailer classes, ActiveJob classes, and Sidekiq workers —
         // see `registry::library`.
-        registry::library::register(&mut classes, app, &route_helper_names);
+        let catalog_lent = registry::library::register(&mut classes, app, &route_helper_names);
 
         // A helper object built from a YAML table
         // (`WebUrlHelpers = Factory.create(YAML.load_file(…)["paths"])`):
@@ -1261,6 +1265,7 @@ impl Analyzer {
             adapter,
             concern_folded: HashMap::default(),
             host_folded: HashMap::default(),
+            catalog_lent,
             extension_modules: extension_modules::extension_only_modules(app),
             refined_action_bindings: HashMap::default(),
             inquirers: inquiry::inquirer_methods(app),
@@ -5183,7 +5188,13 @@ impl Analyzer {
                     continue;
                 }
                 let Some(module) = self.classes.get(&m) else { continue };
-                let inst = module.instance_methods.clone();
+                // Names lent to the module (by the host fold, or the AR
+                // catalog for a model concern) belong to its includers'
+                // instances, not to a class extending it.
+                let mut inst = module.instance_methods.clone();
+                for lent in [self.host_folded.get(&m), self.catalog_lent.get(&m)].into_iter().flatten() {
+                    inst.retain(|name, _| !lent.contains(name));
+                }
                 for n in module.includes.clone() {
                     if seen.insert(n.clone()) {
                         queue.push(n);
@@ -5213,8 +5224,9 @@ impl Analyzer {
                 // What the host fold lent the module is the includers'
                 // own surface; copying it back down would only hand an
                 // includer a stale answer about itself.
+                // Likewise the AR names the catalog lent a model concern.
                 let mut inst = cls.instance_methods.clone();
-                if let Some(lent) = self.host_folded.get(&lc.name) {
+                for lent in [self.host_folded.get(&lc.name), self.catalog_lent.get(&lc.name)].into_iter().flatten() {
                     inst.retain(|name, _| !lent.contains(name));
                 }
                 Some((lc.name.clone(), (inst, cls.class_methods.clone(), cls.includes.clone())))

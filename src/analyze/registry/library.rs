@@ -9,11 +9,14 @@ use crate::App;
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
+/// Returns, per module, the AR instance names it was lent from the
+/// catalog (see `model_concerns` below) and does not define itself.
 pub(in crate::analyze) fn register(
     classes: &mut HashMap<ClassId, ClassInfo>,
     app: &App,
     route_helper_names: &[String],
-) {
+) -> HashMap<ClassId, std::collections::BTreeSet<Symbol>> {
+    let mut catalog_lent: HashMap<ClassId, std::collections::BTreeSet<Symbol>> = HashMap::default();
     // Library classes: non-model classes living under app/models/
     // (e.g. specialized has_many proxies). Register each as a known
     // class so references like `ArticleCommentsProxy.new(self)` from
@@ -60,14 +63,26 @@ pub(in crate::analyze) fn register(
         // Only catalog entries that carry a return type: an entry with
         // `return_kind: None` is not neutral — it lands in the same
         // place an unknown name does.
+        // These names are the includer's surface, not the module's: the
+        // folds keep them out of what they copy on to other includers
+        // and extenders. A model's `include Kernel` lends Kernel
+        // `errors`, and every other class including Kernel is no model.
         if lc.is_module && model_concerns.contains(&lc.name) {
+            let defined = |name: &str| {
+                lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Instance && m.name.as_str() == name)
+            };
             for entry in crate::catalog::AR_CATALOG {
                 if entry.receiver != crate::catalog::ReceiverContext::Instance {
                     continue;
                 }
                 let Some(kind) = entry.return_kind else { continue };
-                if let Some(ty) = ar_instance_ty(kind) {
-                    cls.instance_methods.entry(Symbol::from(entry.name)).or_insert(ty);
+                if let Some(ty) = ar_instance_ty(kind)
+                    && let std::collections::hash_map::Entry::Vacant(slot) = cls.instance_methods.entry(Symbol::from(entry.name))
+                {
+                    slot.insert(ty);
+                    if !defined(entry.name) {
+                        catalog_lent.entry(lc.name.clone()).or_default().insert(Symbol::from(entry.name));
+                    }
                 }
             }
         }
@@ -397,6 +412,7 @@ pub(in crate::analyze) fn register(
             }
         }
     }
+    catalog_lent
 }
 
 /// The type an AR instance method answers when the receiver is a
