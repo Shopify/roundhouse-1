@@ -7748,7 +7748,7 @@ pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
 /// Ruby is never loaded (`CRUBY_EXTENSION_GEMS`). A name a port file
 /// declares (`Semian::TimeoutError`) runs as the port's, not as the
 /// gem's, so a ported gem is never in `RAILS_DEPENDENT_GEMS`; a name only
-/// the gem's RBI declares (`Semian::NetHTTP`) is refused as a port gap.
+/// the gem's RBI declares (`Semian::Redis`) is refused as a port gap.
 /// Not ports in this sense: concurrent.rb and web_push.rb stand in for
 /// loaded gems on Spinel only, and typed_store.rb and
 /// global_id_locator.rb back lowered DSLs, not the gems' constants.
@@ -10110,10 +10110,12 @@ mod tests {
             ("::Semian::SyscallError", "runtime/semian.rb"),
             ("Semian::ActiveRecordPostgreSQLAdapter", "runtime/semian_activerecord_postgresql_adapter.rb"),
             ("ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::CircuitOpenError", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            ("Semian::NetHTTP", "runtime/semian_net_http.rb"),
+            ("Semian::Adapter", "runtime/semian_adapter.rb"),
         ] {
             assert_eq!(gem_port_file("semian", name), Some(file), "{name}");
         }
-        for name in ["Semian::NetHTTP", "Semian::Redis", "Semian::Resource::<Resource>"] {
+        for name in ["Semian::Redis", "Semian::Resource::<Resource>"] {
             assert_eq!(gem_port_file("semian", name), None, "{name}");
         }
         assert_eq!(gem_port_file("dalli", "Dalli"), None);

@@ -1,10 +1,10 @@
 //! A gem the app carries as source (`gem_sources:` in roundhouse.yml) is
 //! compiled with the app, so runtime/gem_facades.rb must not require the
-//! installed copy too. Shopify Core's opentelemetry-shopify 1.22.0 is on
-//! the guarded list for the trees that load it natively; carried as a gem
-//! source, the native copy loaded first and defined its constants
-//! `private_constant`, and the compiled reopen's qualified reads of them
-//! raised NameError at boot.
+//! installed copy too. (Shopify Core's opentelemetry-shopify 1.22.0 was on
+//! the guarded list; carried as a gem source, the native copy loaded
+//! first and defined its constants `private_constant`, and the compiled
+//! reopen's qualified reads of them raised NameError at boot.) Its own
+//! dependencies do load from the gem home, as Bundler would load them.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -30,18 +30,21 @@ fn guarded_list(dir: &std::path::Path) -> String {
 
 #[test]
 fn a_gem_source_is_not_also_required_from_the_gem_home() {
-    let (dir, _) = app("gem_sources:\n  opentelemetry-shopify: vendor/gems/opentelemetry-shopify-1.22.0\n")
+    // rotp is on the guarded list (`project::GEM_REQUIRES`); carried as a
+    // gem source, it is the compiled copy alone.
+    let (dir, _) = app("gem_sources:\n  rotp: vendor/gems/rotp-6.3.0\n")
+        .write("vendor/gems/rotp-6.3.0/lib/rotp.rb", "module ROTP\n  def self.on?\n    true\n  end\nend\n")
         .emit(BuildTarget::Ruby);
     let list = guarded_list(&dir);
-    assert!(!list.contains("\"opentelemetry-shopify\""), "{list}");
+    assert!(!list.contains("\"rotp\""), "{list}");
     // The rest of the list is untouched.
-    assert!(list.contains("\"rotp\""), "{list}");
+    assert!(list.contains("\"bcrypt\""), "{list}");
 }
 
 #[test]
 fn without_gem_sources_the_gem_stays_on_the_list() {
     let (dir, _) = app("").emit(BuildTarget::Ruby);
-    assert!(guarded_list(&dir).contains("\"opentelemetry-shopify\""));
+    assert!(guarded_list(&dir).contains("\"rotp\""));
 }
 
 /// A gem source's own dependencies load from the gem home, as its entry

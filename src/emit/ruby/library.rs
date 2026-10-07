@@ -6669,7 +6669,7 @@ impl Drop for NameIndexGuard<'_> {
 
 impl NameIndex {
     fn install(app: &App) -> NameIndexGuard<'_> {
-        let mut library_classes: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut library_classes: HashMap<String, Vec<usize>> = HashMap::default();
         for (j, lc) in app.library_classes.iter().enumerate() {
             library_classes.entry(lc.name.0.as_str().to_string()).or_default().push(j);
         }

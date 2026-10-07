@@ -11,7 +11,7 @@
 //! declaration changed per round, for as many rounds as there are
 //! constants).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};
