@@ -8821,15 +8821,24 @@ fn carries_active_support_messages(files: &[(String, String)]) -> bool {
 /// `ActiveModel::Type::Value`, a `< ActiveRecord::Type::Value` subclass.
 const ACTIVE_MODEL_TYPE_NAMES: &[&str] = &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError"];
 
+/// The runtime methods that build the port's type objects
+/// (`connection.rb`'s `type_for_attribute` / `attribute_types`): an app
+/// that asks a model for one needs the classes as much as one naming them.
+const ACTIVE_MODEL_TYPE_METHODS: &[&str] = &["type_for_attribute", "attribute_types"];
+
 /// True where the app's own emitted code (not the runtime, not a test
 /// body) names a namespace the type port declares, in any position a
-/// constant takes (`mentions_messages_constant`).
+/// constant takes (`mentions_messages_constant`), or calls a method that
+/// answers its types.
 fn carries_active_model_type(files: &[(String, String)]) -> bool {
     files.iter().any(|(path, content)| {
         path.ends_with(".rb")
             && !path.starts_with("runtime/")
             && !path.starts_with("test/")
-            && ACTIVE_MODEL_TYPE_NAMES.iter().any(|name| mentions_messages_constant(content, name))
+            && ACTIVE_MODEL_TYPE_NAMES
+                .iter()
+                .chain(ACTIVE_MODEL_TYPE_METHODS)
+                .any(|name| mentions_messages_constant(content, name))
     })
 }
 
@@ -10509,7 +10518,7 @@ mod tests {
         let files = vec![
             ("runtime/active_record/connection.rb".to_string(), "# ActiveModel::Type::Integer serializes\nActiveRecord::Type::Integer.new\n".to_string()),
             ("test/models/schema_test.rb".to_string(), "ActiveRecord::Type::String.new\n".to_string()),
-            ("app/models/b.rb".to_string(), "# ActiveRecord::Type::Text.new\nActiveRecord::Types\nFoo::ActiveModel::Type::Value\nMyActiveRecord::Type\n".to_string()),
+            ("app/models/b.rb".to_string(), "# ActiveRecord::Type::Text.new\nActiveRecord::Types\nFoo::ActiveModel::Type::Value\nMyActiveRecord::Type\nx.type_for_attributes\nself.schema_attribute_types_x\n".to_string()),
         ];
         assert!(!carries_active_model_type(&files), "runtime, test bodies, comments, longer and nested names");
         for use_site in [
@@ -10518,6 +10527,8 @@ mod tests {
             "x = y #: ActiveModel::Type::DateTime\n",
             "rescue ActiveModel::RangeError\n",
             "TYPES = [ActiveRecord::Type::Text, ActiveModel::Type::Boolean]\n",
+            "type = self.class.type_for_attribute(name)\n",
+            "Widget.attribute_types.each_key { |k| p k }\n",
         ] {
             let mut with = files.clone();
             with.push(("components/x/lib/schema.rb".to_string(), use_site.to_string()));

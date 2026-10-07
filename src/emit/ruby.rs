@@ -21,6 +21,7 @@ use crate::lower::controller::body::FormatBreadth;
 const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
+mod attribute_api;
 pub(crate) mod expr;
 mod library;
 mod rbs;
@@ -366,6 +367,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // User on campfire's room page, for records that only answer a name.
     // LAST, after every pass that reads or writes `@<assoc>_cache` by name.
     crate::lower::lazy_model_state::apply(&mut lcs, app);
+    // String names on `[]`/`[]=`, the class body's `abstract_class`
+    // write and the per-model `schema_column_types` table the runtime's
+    // `type_for_attribute` reads (no-op for a model with no table).
+    attribute_api::apply(&mut lcs, app);
 }
 
 fn emit_model_classes(

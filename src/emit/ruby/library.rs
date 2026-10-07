@@ -6415,32 +6415,41 @@ fn emit_library_class_decl_inner(
     // class extends a base we don't model at all. See
     // `replays_foreign_class_body`. After the constants (a captured
     // call may reference one) and before the methods.
-    if replays_foreign_class_body(lc, app) {
-        for call in &lc.unknown_calls {
-            for line in super::emit_expr(call).lines() {
-                if line.is_empty() {
-                    writeln!(s).unwrap();
-                } else {
-                    writeln!(s, "{body_pad}{line}").unwrap();
-                }
-            }
-        }
-        if !lc.unknown_calls.is_empty() && !lc.methods.is_empty() {
-            writeln!(s).unwrap();
-        }
+    //
+    // Finite class-side initialization (`class_ivar_initializers`) is
+    // lowered IR, not replay of a framework DSL. Each assignment runs
+    // once on this class object; unset subclasses deliberately keep
+    // their ivar absent. A replayed call and a body ivar write keep
+    // their source order (`@registry = {}` then `register :x`), so the
+    // two interleave by source position when every one has a real span.
+    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app) {
+        lc.unknown_calls.iter().collect()
     } else {
         for call in &lc.unknown_calls {
             report_dropped_class_body_call(lc, call);
         }
+        Vec::new()
+    };
+    let mut body_effects: Vec<&Expr> = replayed.iter().copied().chain(lc.class_ivar_initializers.iter()).collect();
+    let real_span = |e: &&Expr| e.span != crate::span::Span::synthetic();
+    if !replayed.is_empty()
+        && !lc.class_ivar_initializers.is_empty()
+        && body_effects.iter().all(real_span)
+        && body_effects.windows(2).all(|w| w[0].span.file == w[1].span.file)
+    {
+        body_effects.sort_by_key(|e| e.span.start);
     }
-
-    // Finite class-side initialization is lowered IR, not replay of a
-    // framework DSL. Each assignment runs once on this class object;
-    // unset subclasses deliberately keep their ivar absent.
-    for init in &lc.class_ivar_initializers {
-        for line in super::emit_expr(init).lines() {
-            writeln!(s, "{body_pad}{line}").unwrap();
+    for effect in &body_effects {
+        for line in super::emit_expr(effect).lines() {
+            if line.is_empty() {
+                writeln!(s).unwrap();
+            } else {
+                writeln!(s, "{body_pad}{line}").unwrap();
+            }
         }
+    }
+    if !replayed.is_empty() && !lc.methods.is_empty() {
+        writeln!(s).unwrap();
     }
 
     let mut first = true;

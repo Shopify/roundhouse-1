@@ -231,6 +231,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("member?", Ty::Bool), ("key", str_or_nil()), ("delete", str_or_nil()),
         ("keys", str_arr()), ("values", str_arr()),
         ("to_h", Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) }),
+        ("to_hash", Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) }),
         ("replace", Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) }),
     ], &[]);
     // `Pathname` — `Rails.root.join(...)` territory. The path-returning
