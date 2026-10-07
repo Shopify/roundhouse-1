@@ -22,7 +22,8 @@
 //! equal CRuby's. `Money.new` then raises "unknown format: 'iso4217'":
 //! the gem registers each converter with a file-level
 //! `Money::Converters.register(…)` call, which the tree does not run
-//! (reported as "file-level call not supported"). Analysis also still
+//! (reported as `file_statement_unsupported`, as is `deprecations.rb`'s
+//! file-level `Money.class_eval do … end`). Analysis also still
 //! refuses `Money::Helpers::DECIMAL_ZERO`, `Float::EPSILON`, `Rational`,
 //! a keyword splat passed to `super`, and the probe's `as_json`.
 

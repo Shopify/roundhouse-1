@@ -7,6 +7,10 @@
 //! namespace reopen replaced the whole body, and no diagnostic was
 //! reported. The emitted tree must print the same lines, in the same
 //! order, as CRuby loading the authored files.
+//!
+//! A method two of the files both define is another matter: Ruby keeps
+//! the def of the file it loads last, and the merge's walk order is not
+//! shown to be that order, so it is reported.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -30,10 +34,6 @@ const FILES: &[(&str, &str)] = &[
     "ReopenCash(#{value}) v#{VERSION}"
   end
   alias_method :to_s, :label
-
-  def kind
-    "first"
-  end
 end
 "##,
     ),
@@ -63,6 +63,10 @@ end
   end
 
   def kind
+    "early"
+  end
+
+  def kind
     "later"
   end
 end
@@ -78,7 +82,7 @@ puts "comparable kept: #{a < ReopenCash.new(4)}"
 puts "constant from another file: #{ReopenCash::VERSION}"
 puts "nested from another file: #{ReopenCash::Part.of(a)}"
 puts "method from another file: #{a.doubled.value}"
-puts "later def wins: #{a.kind}"
+puts "later def in one file wins: #{a.kind}"
 "##;
 
 fn native_lines() -> Vec<String> {
@@ -104,7 +108,7 @@ fn a_class_reopened_across_files_keeps_every_body_as_in_cruby() {
         "comparable kept: true",
         "nested from another file: part of 3",
         "method from another file: 6",
-        "later def wins: later",
+        "later def in one file wins: later",
     ] {
         assert!(expected.iter().any(|line| line == probe), "native control lacks {probe:?}: {expected:#?}");
     }
@@ -133,4 +137,23 @@ fn the_reopens_emit_as_one_class_body() {
     for piece in ["def initialize(value)", "def doubled", "VERSION = \"1.2\"", "alias_method :to_s, :label"] {
         assert!(emitted.contains(piece), "{piece:?} missing from the emitted class:\n{emitted}");
     }
+}
+
+/// Two files define the same method: which one Ruby keeps depends on
+/// the load order, so the later def is a warning at its site. The
+/// same-file `kind` redefinition follows source order and is not.
+#[test]
+fn a_method_two_reopening_files_define_is_a_warning() {
+    let mut source = roundhouse::det::HashMap::default();
+    for (path, text) in FILES {
+        source.insert(std::path::PathBuf::from(*path), text.as_bytes().to_vec());
+    }
+    let late = "class ReopenCash\n  def label\n    \"other file\"\n  end\nend\n";
+    source.insert(std::path::PathBuf::from("app/services/reopen_cash_zz.rb"), late.as_bytes().to_vec());
+    let app = roundhouse::ingest::ingest_app_from_tree(source).expect("ingest the reopens");
+    let diagnostics = roundhouse::analyze::diagnose(&app);
+    let reported: Vec<_> = diagnostics.iter().filter(|d| d.message.contains("method redefined across reopened files")).collect();
+    assert_eq!(reported.len(), 1, "only label, and not the same-file kind: {reported:#?}");
+    assert!(reported[0].message.contains("`label`"), "{reported:#?}");
+    assert_eq!(reported[0].severity, roundhouse::diagnostic::Severity::Warning);
 }

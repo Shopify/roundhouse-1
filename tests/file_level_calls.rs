@@ -32,9 +32,10 @@ fn a_file_level_call_is_reported_at_its_site() {
     let (_tree, errors) = emit_and_run::real_blog()
         .write("app/services/file_level_registry.rb", SOURCE)
         .emit(BuildTarget::Ruby);
-    let reported: Vec<&String> = errors.iter().filter(|e| e.contains("file-level call not supported")).collect();
+    let reported: Vec<&String> = errors.iter().filter(|e| e.contains("file-level call `")).collect();
     assert_eq!(reported.len(), 1, "exactly the register call: {errors:#?}");
-    assert!(reported[0].contains("`FileLevelRegistry.register`"), "{reported:#?}");
+    assert!(reported[0].contains("`FileLevelRegistry.register` does not run in the emitted app"), "{reported:#?}");
+    assert!(reported[0].contains("classes, modules and constants are carried"), "{reported:#?}");
     let start = SOURCE.find("FileLevelRegistry.register").unwrap();
     assert!(reported[0].contains(&format!("start: {start}, ")), "the span is the call's own: {reported:#?}");
 }

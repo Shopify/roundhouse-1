@@ -243,6 +243,9 @@ fn diagnostic_signature(d: &roundhouse::analyze::Diagnostic) -> (String, String)
         DiagnosticKind::InitializerUnsupported { construct, .. } => {
             ("InitializerUnsupported".into(), construct.as_str().to_string())
         }
+        DiagnosticKind::FileStatementUnsupported { construct, .. } => {
+            ("FileStatementUnsupported".into(), construct.as_str().to_string())
+        }
         DiagnosticKind::IngestRefused { detail } => ("IngestRefused".into(), detail.clone()),
         DiagnosticKind::IngestUnsupported { detail } => {
             ("IngestUnsupported".into(), detail.clone())

@@ -2160,7 +2160,7 @@ end
             && lc.origin.is_none();
         !(bodiless && model_names.contains(lc.name.0.as_str()))
     });
-    merge_library_class_reopens(&mut app.library_classes);
+    app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes);
 
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
@@ -2300,12 +2300,15 @@ fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
 /// without it, `Money::Converters.for(:iso4217)` raises "unknown
 /// format". Ingest carries the file's declarations and constants but
 /// no other statement, and these calls used to be dropped with no
-/// diagnostic. Each one is now reported at its own site.
+/// diagnostic. Each one is now a gap at its own site
+/// (`App::file_statement_gaps`).
 ///
 /// Not reported: a receiverless `require` / `require_relative` /
 /// `load` / `autoload`, since loading files is the emitted tree's own
 /// job, and `ActiveSupport.on_load`, which `on_load_reopen` reads and
-/// reports for itself.
+/// reports for itself. LIMITATION: only a statement that is itself a
+/// call is reported. A top-level `begin`/`if` wrapping calls, or a
+/// local variable write, is still dropped without a diagnostic.
 fn report_file_level_calls(source: &[u8], path: &str, app: &mut App) {
     let result = ruby_prism::parse(source);
     let root = result.node();
@@ -2335,12 +2338,10 @@ fn report_file_level_calls(source: &[u8], path: &str, app: &mut App) {
             start: location.start_offset() as u32,
             end: location.end_offset() as u32,
         };
-        app.ingest_drops.push(crate::app::IngestDrop {
-            span,
-            message: format!(
-                "file-level call not supported (all targets): `{shown}` outside every class runs when Ruby loads the file, and the emitted tree does not run it"
-            ),
-        });
+        let text = &source[location.start_offset()..location.end_offset()];
+        let first_line = String::from_utf8_lossy(text).lines().next().unwrap_or_default().trim().to_string();
+        let detail: String = first_line.chars().take(160).collect();
+        app.file_statement_gaps.push(crate::app::InitializerGap { span, construct: shown, detail });
     }
 }
 
@@ -4216,7 +4217,13 @@ fn map_enum_labels(app: &mut App) {
 /// A group is left alone when Ruby itself would refuse it or the IR
 /// cannot express one body: a class reopened as a module, two
 /// different superclasses, or a synthesized origin.
-fn merge_library_class_reopens(classes: &mut Vec<LibraryClass>) {
+///
+/// Walk order is not always Ruby's load order. Returned is how many
+/// declarations each merged class came from, which the analysis keeps
+/// counting as fragments where the order matters.
+fn merge_library_class_reopens(
+    classes: &mut Vec<LibraryClass>,
+) -> crate::det::HashMap<crate::ident::ClassId, usize> {
     let mut members: crate::det::HashMap<crate::ident::ClassId, Vec<usize>> = crate::det::HashMap::default();
     for (index, lc) in classes.iter().enumerate() {
         members.entry(lc.name.clone()).or_default().push(index);
@@ -4229,15 +4236,17 @@ fn merge_library_class_reopens(classes: &mut Vec<LibraryClass>) {
             && parents.all(|p| Some(p) == parent)
     };
     let mut absorbed: crate::det::HashMap<usize, usize> = crate::det::HashMap::default();
-    for group in members.values() {
+    let mut merged: crate::det::HashMap<crate::ident::ClassId, usize> = crate::det::HashMap::default();
+    for (name, group) in &members {
         if group.len() > 1 && mergeable(group) {
+            merged.insert(name.clone(), group.len());
             for &later in &group[1..] {
                 absorbed.insert(later, group[0]);
             }
         }
     }
     if absorbed.is_empty() {
-        return;
+        return merged;
     }
     let mut slots: Vec<Option<LibraryClass>> = std::mem::take(classes).into_iter().map(Some).collect();
     for index in 0..slots.len() {
@@ -4266,6 +4275,7 @@ fn merge_library_class_reopens(classes: &mut Vec<LibraryClass>) {
         target.top_level_constants.extend(reopen.top_level_constants);
     }
     *classes = slots.into_iter().flatten().collect();
+    merged
 }
 
 /// Resolve a controller's relative superclass against Ruby's lexical

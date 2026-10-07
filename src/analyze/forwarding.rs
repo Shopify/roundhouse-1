@@ -1170,6 +1170,14 @@ impl<'a> SourceContractIndex<'a> {
             index.add_methods(&class.name, class.methods.iter(), false);
             index.virtual_owners.push(&class.name);
         }
+        // A class ingest merged from several declarations is still that
+        // many fragments here: their relative load order, which decides
+        // a redefinition or a late include, is not verified.
+        for (name, declarations) in &app.library_class_reopens {
+            if class_owners.contains(name) {
+                *index.fragments.entry(name.clone()).or_default() += declarations.saturating_sub(1);
+            }
+        }
         for model in &app.models {
             index.add_fragment(
                 &model.name,
