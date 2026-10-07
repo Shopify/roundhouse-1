@@ -26,6 +26,8 @@
 mod alba;
 mod cycles;
 mod incremental;
+mod setup_scan;
+mod site_cache;
 mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
@@ -166,6 +168,133 @@ pub struct Analyzer {
     /// What each library class's last typing read; lets the library
     /// pass skip classes none of whose reads changed (see `incremental`).
     incremental: incremental::Incremental,
+    /// [`Self::param_shapes`] and [`Self::defined_methods`]: functions
+    /// of the app's `def`s, which the fixpoint does not change, so they
+    /// are built once per [`Self::analyze`] rather than every round.
+    /// `ROUNDHOUSE_INCREMENTAL=check` rebuilds and compares each use.
+    param_tables: Option<std::sync::Arc<ParamTables>>,
+    /// Placed call sites per source tree, across rounds (see `site_cache`).
+    site_cache: site_cache::SiteCache,
+    /// Constant value typings across passes (`build_constant_registry`).
+    const_memo: ConstMemo,
+    /// Per-library-class method body returns (`harvest_method_returns`).
+    return_cache: Vec<Option<ReturnsAt>>,
+    /// Per-library-class hits of the library setup's tree scans.
+    setup_scan: setup_scan::SetupScan,
+    /// Library-class constant initializer typings across passes.
+    init_memo: Vec<(ClassId, Vec<Option<InitTyping>>)>,
+}
+
+/// One library class's method body returns, as `method_return_ty` read
+/// them from the trees print `print`, each with the registry's class
+/// count at the read.
+struct ReturnsAt {
+    name: ClassId,
+    print: u64,
+    returns: Vec<(usize, Option<Ty>)>,
+}
+
+/// One library-class constant initializer's last typing: what it read,
+/// when, and the tree print it left. Typing is a function of the tree,
+/// the class, and the registry reads it notes, so a tree that is as that
+/// typing left it, and that the typing did not move, types to itself
+/// again while none of the reads changed.
+struct InitTyping {
+    name: Symbol,
+    tick: u64,
+    deps: Vec<u64>,
+    /// `incremental::expr_print` after the typing.
+    tree: u64,
+    /// Whether the typing left the tree as it found it.
+    settled: bool,
+}
+
+/// The last executed `build_constant_registry` pass, kept for the next.
+#[derive(Default)]
+struct ConstMemo {
+    /// (name, declaration) per entry; another list starts over.
+    identity: Vec<(Symbol, Option<DeclarationId>)>,
+    /// Executed passes so far.
+    pass: u64,
+    /// Per round: the maps that round of the last executed pass read.
+    maps: Vec<(HashMap<Symbol, Ty>, IdentityHashMap<DeclarationId, Ty>)>,
+    /// Per round, per value: its latest typing at that round.
+    typings: Vec<Vec<Option<ConstTyping>>>,
+    /// The last pass's whole answer, before the generated entries.
+    whole: Option<ConstWhole>,
+}
+
+struct ConstTyping {
+    /// `incremental::expr_print` of the value before and after the typing.
+    input: u64,
+    output: u64,
+    /// The incremental tick the typing ran at.
+    tick: u64,
+    /// The last pass that typed or kept it; the round's maps in `maps`
+    /// are that pass's only when this is the last executed pass.
+    seen: u64,
+    deps: Vec<u64>,
+    ty: Ty,
+    /// The value as the typing left it.
+    tree: Expr,
+}
+
+/// The constant-read keys whose answers differ between two rounds' maps.
+fn const_answers_moved(
+    old_map: &HashMap<Symbol, Ty>,
+    old_resolved: &IdentityHashMap<DeclarationId, Ty>,
+    map: &HashMap<Symbol, Ty>,
+    resolved: &IdentityHashMap<DeclarationId, Ty>,
+) -> crate::det::HashSet<u64> {
+    let mut moved = crate::det::HashSet::default();
+    for (name, ty) in map {
+        if old_map.get(name) != Some(ty) {
+            moved.insert(body::DepKey::ConstName(name).hash64());
+        }
+    }
+    for name in old_map.keys() {
+        if !map.contains_key(name) {
+            moved.insert(body::DepKey::ConstName(name).hash64());
+        }
+    }
+    for (id, ty) in resolved {
+        if old_resolved.get(id) != Some(ty) {
+            moved.insert(body::DepKey::Constant(id).hash64());
+        }
+    }
+    for id in old_resolved.keys() {
+        if !resolved.contains_key(id) {
+            moved.insert(body::DepKey::Constant(id).hash64());
+        }
+    }
+    moved
+}
+
+/// `IdentityHashMap`'s hasher builder is not `Clone`.
+fn clone_identity_map(map: &IdentityHashMap<DeclarationId, Ty>) -> IdentityHashMap<DeclarationId, Ty> {
+    let mut out = IdentityHashMap::default();
+    out.reserve(map.len());
+    out.extend(map.iter().map(|(id, ty)| (*id, ty.clone())));
+    out
+}
+
+/// One `build_constant_registry` run: every registry read any of its
+/// typings made, and the maps its rounds settled on. The rounds are a
+/// function of the values' trees and those reads, so a pass whose trees
+/// and reads are all as they were settles on the same maps.
+struct ConstWhole {
+    tick: u64,
+    inputs: Vec<u64>,
+    reads: Vec<u64>,
+    map: HashMap<Symbol, Ty>,
+    resolved: IdentityHashMap<DeclarationId, Ty>,
+}
+
+/// The def-side tables call-site placement reads.
+#[derive(PartialEq)]
+struct ParamTables {
+    shapes: HashMap<ParamKey, Vec<ParamShape>>,
+    defined: BTreeSet<ParamKey>,
 }
 
 /// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
@@ -1039,6 +1168,12 @@ impl Analyzer {
             recursive_methods: Self::find_recursive_methods(app),
             fixpoint_rounds: FixpointRounds::default(),
             incremental: incremental::Incremental::new(incremental::Mode::from_env()),
+            param_tables: None,
+            site_cache: Default::default(),
+            const_memo: Default::default(),
+            init_memo: Vec::new(),
+            setup_scan: Default::default(),
+            return_cache: Vec::new(),
         }
     }
 
@@ -1092,6 +1227,13 @@ impl Analyzer {
     /// the refined registry. Iterates to a fixed point (capped; see
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
+        self.param_tables = None;
+        self.site_cache = Default::default();
+        self.const_memo = Default::default();
+        self.init_memo = Vec::new();
+        self.setup_scan = Default::default();
+        self.return_cache = Vec::new();
+        self.incremental = incremental::Incremental::new(self.incremental.mode);
         // An unresolvable include is a load-time error, not an open method
         // surface. Keep it in the class-body ledger even when no method is called.
         for class in &mut app.library_classes {
@@ -1215,11 +1357,10 @@ impl Analyzer {
                 fixpoint_debug::report(&format!("production round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
             let _sig = crate::timings::begin(format_args!("round {round}: compare signature"));
-            if self.inference_matches(&prev_sig) {
+            if !self.refresh_inference_sig(&mut prev_sig) {
                 self.fixpoint_rounds.production = Some(round + 1);
                 break;
             }
-            prev_sig = self.capture_inference_sig();
             drop(_sig);
             // Re-type the whole app with the refined registry. Idempotent
             // BodyTyper means a second pass simply resolves dispatches
@@ -1299,11 +1440,10 @@ impl Analyzer {
             if fixpoint_debug::enabled() {
                 fixpoint_debug::report(&format!("test round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
-            if self.inference_matches(&prev_sig) {
+            if !self.refresh_inference_sig(&mut prev_sig) {
                 self.fixpoint_rounds.tests = Some(round + 1);
                 break;
             }
-            prev_sig = self.capture_inference_sig();
         }
         if fixpoint_debug::enabled() {
             fixpoint_debug::report("absorb entry vs production", &production_sig, &self.capture_inference_sig());
@@ -1348,11 +1488,10 @@ impl Analyzer {
                 if fixpoint_debug::enabled() {
                     fixpoint_debug::report(&format!("absorb round {round} ({})", cycles.round_summary(self, &absorb_sig)), &absorb_sig, &self.capture_inference_sig());
                 }
-                if self.inference_matches(&absorb_sig) {
+                if !self.refresh_inference_sig(&mut absorb_sig) {
                     self.fixpoint_rounds.absorb = Some(round + 1);
                     break;
                 }
-                absorb_sig = self.capture_inference_sig();
             }
         } else {
             self.fixpoint_rounds.absorb = Some(0);
@@ -1755,9 +1894,12 @@ impl Analyzer {
     /// The rounds continue until no value changes, so `B = A` can use
     /// the value of `A` from the round before.
     fn build_constant_registry(
-        &self,
+        &mut self,
         app: &App,
     ) -> (HashMap<Symbol, Ty>, IdentityHashMap<DeclarationId, Ty>) {
+        // Stamp what the registry changed since the last pass: a value
+        // whose first typing read none of it is typed as it was.
+        self.incremental.sync(&self.classes, &self.inferred_params, &self.typed_constants);
         // Ingest can move a constant to another IR owner: a file-level
         // constant goes to the first class of its file. The declaration
         // ID comes from the source position, not from the owner.
@@ -1766,26 +1908,30 @@ impl Analyzer {
         };
         // (defining class, last-segment name, Rubydex ID, value,
         // eligible for the production generated-expression fallback).
-        let mut entries: Vec<(Ty, Symbol, Option<DeclarationId>, Expr, bool)> = Vec::new();
-        let mut push_const = |self_ty: Ty, expr: &Expr| {
-            if let ExprNode::Assign { target: LValue::Const { path }, value } = &*expr.node {
-                if let Some(last) = path.last() {
-                    let id = declaration_id(last, value);
-                    entries.push((self_ty, last.clone(), id, value.clone(), true));
-                }
+        let mut entries: Vec<(Ty, Symbol, Option<DeclarationId>, &Expr, bool)> = Vec::new();
+        fn const_assign(expr: &Expr) -> Option<(&Symbol, &Expr)> {
+            match &*expr.node {
+                ExprNode::Assign { target: LValue::Const { path }, value } => path.last().map(|last| (last, value)),
+                _ => None,
             }
-        };
+        }
         for model in &app.models {
             for item in &model.body {
                 if let ModelBodyItem::Unknown { expr, .. } = item {
-                    push_const(Ty::Class { id: model.name.clone(), args: vec![] }, expr);
+                    if let Some((last, value)) = const_assign(expr) {
+                        let self_ty = Ty::Class { id: model.name.clone(), args: vec![] };
+                        entries.push((self_ty, last.clone(), declaration_id(last, value), value, true));
+                    }
                 }
             }
         }
         for controller in &app.controllers {
             for item in &controller.body {
                 if let ControllerBodyItem::Unknown { expr, .. } = item {
-                    push_const(Ty::Class { id: controller.name.clone(), args: vec![] }, expr);
+                    if let Some((last, value)) = const_assign(expr) {
+                        let self_ty = Ty::Class { id: controller.name.clone(), args: vec![] };
+                        entries.push((self_ty, last.clone(), declaration_id(last, value), value, true));
+                    }
                 }
             }
         }
@@ -1803,7 +1949,7 @@ impl Analyzer {
         for lc in &app.library_classes {
             for (name, value) in &lc.constants {
                 let self_ty = Ty::Class { id: lc.name.clone(), args: vec![] };
-                entries.push((self_ty, name.clone(), declaration_id(name, value), value.clone(), true));
+                entries.push((self_ty, name.clone(), declaration_id(name, value), value, true));
             }
         }
         // Original source tests use the same DeclarationId contract.
@@ -1815,7 +1961,7 @@ impl Analyzer {
             {
                 for (name, value) in constants {
                     let self_ty = Ty::Class { id: owner.clone(), args: vec![] };
-                    entries.push((self_ty, name.clone(), declaration_id(name, value), value.clone(), false));
+                    entries.push((self_ty, name.clone(), declaration_id(name, value), value, false));
                 }
             }
         }
@@ -1831,6 +1977,52 @@ impl Analyzer {
         // `changed_at` holds, per read key, the version that last
         // changed its answer.
         let mode = self.incremental.mode;
+        let on = mode != incremental::Mode::Off;
+        // Across passes: a round's typing of a value is a function of the
+        // value's tree, the registry reads it notes, and the constant
+        // answers of that round's maps. The last executed pass's typing
+        // of a value at the same round is kept when its tree and outer
+        // reads are as they were and the round's maps answer its
+        // constant reads as they did then.
+        let tick = self.incremental.tick();
+        let mut memo = std::mem::take(&mut self.const_memo);
+        if on {
+            let identity: Vec<(Symbol, Option<DeclarationId>)> =
+                entries.iter().map(|(_, name, id, _, _)| (name.clone(), *id)).collect();
+            if memo.identity != identity {
+                memo = ConstMemo { identity, ..ConstMemo::default() };
+            }
+        }
+        let inputs: Vec<u64> = if on {
+            entries.iter().map(|(_, _, _, value, _)| incremental::expr_print(value)).collect()
+        } else {
+            Vec::new()
+        };
+        let kept_whole = memo
+            .whole
+            .as_ref()
+            .filter(|w| on && w.inputs == inputs && self.incremental.unchanged_since(&w.reads, w.tick))
+            .map(|w| (w.map.clone(), clone_identity_map(&w.resolved)));
+        let skip_rounds = kept_whole.is_some() && mode == incremental::Mode::On;
+        // The pass whose typings and maps `memo` holds as current.
+        let previous_pass = memo.pass;
+        if !skip_rounds {
+            memo.pass += 1;
+        }
+        let pass = memo.pass;
+        let mut all_reads: Vec<u64> = Vec::new();
+        let mut kept_typings = 0usize;
+        /// A value's tree as this pass last left it.
+        enum Cur {
+            /// Not typed yet: the source.
+            Source,
+            /// `memo.typings[round][index]`'s tree.
+            Kept(usize),
+            /// Typed with no memo (`ROUNDHOUSE_INCREMENTAL=0`).
+            Owned(Expr),
+        }
+        let mut cur: Vec<Cur> = (0..entries.len()).map(|_| Cur::Source).collect();
+        let mut new_maps: Vec<(HashMap<Symbol, Ty>, IdentityHashMap<DeclarationId, Ty>)> = Vec::new();
         let mut last: Vec<Option<(usize, Vec<u64>, Ty)>> = vec![None; entries.len()];
         let mut changed_at: HashMap<u64, usize> = HashMap::default();
         let (mut typed, mut clean_count, mut mismatches) = (0usize, 0usize, 0usize);
@@ -1840,8 +2032,28 @@ impl Analyzer {
         // it is typed. A cycle (`A = B`, `B = A`) never types and stays
         // unknown, and the read reports it. The bound also stops values
         // that change on each round.
+        if let (true, Some((kept_map, kept_resolved))) = (skip_rounds, &kept_whole) {
+            map = kept_map.clone();
+            resolved = clone_identity_map(kept_resolved);
+        }
         for version in 0..=entries.len() {
+            if skip_rounds {
+                break;
+            }
             rounds += 1;
+            // The constant reads this round answers differently than the
+            // last pass's same round (`None`: that pass had no such round).
+            let answers_moved: Option<crate::det::HashSet<u64>> = if on {
+                memo.maps.get(version).map(|(old_map, old_resolved)| const_answers_moved(old_map, old_resolved, &map, &resolved))
+            } else {
+                None
+            };
+            if on {
+                new_maps.push((map.clone(), clone_identity_map(&resolved)));
+                if memo.typings.len() <= version {
+                    memo.typings.push((0..entries.len()).map(|_| None).collect());
+                }
+            }
             let mut next: HashMap<Symbol, Ty> = HashMap::default();
             let mut next_resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
             let shared = body::ConstScope::global(map.clone());
@@ -1850,14 +2062,38 @@ impl Analyzer {
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
-            for (index, (self_ty, name, id, value, production)) in entries.iter_mut().enumerate() {
-                let clean = last[index].as_ref().filter(|(at, reads, _)| {
-                    reads.iter().all(|k| changed_at.get(k).is_none_or(|v| v <= at))
-                });
-                let reused = clean.map(|(_, _, ty)| ty.clone());
-                clean_count += usize::from(reused.is_some());
-                let ty = if let (Some(ty), incremental::Mode::On) = (&reused, mode) {
+            for (index, (self_ty, name, id, source, production)) in entries.iter().enumerate() {
+                let clean = last[index]
+                    .as_ref()
+                    .filter(|(at, reads, _)| reads.iter().all(|k| changed_at.get(k).is_none_or(|v| v <= at)))
+                    .map(|(_, _, ty)| ty.clone());
+                clean_count += usize::from(clean.is_some());
+                let input = match &cur[index] {
+                    Cur::Source => inputs.get(index).copied().unwrap_or(0),
+                    Cur::Kept(round) => memo.typings[*round][index].as_ref().map_or(0, |t| t.output),
+                    Cur::Owned(_) => 0,
+                };
+                let kept = on
+                    && clean.is_none()
+                    && answers_moved.as_ref().is_some_and(|moved| {
+                        memo.typings[version][index].as_ref().is_some_and(|t| {
+                            t.seen == previous_pass
+                                && t.input == input
+                                && self.incremental.unchanged_since(&t.deps, t.tick)
+                                && !t.deps.iter().any(|d| moved.contains(d))
+                        })
+                    });
+                let ty = if let (Some(ty), incremental::Mode::On) = (&clean, mode) {
                     ty.clone()
+                } else if kept && mode == incremental::Mode::On {
+                    let t = memo.typings[version][index].as_mut().expect("a kept typing");
+                    t.seen = pass;
+                    let (reads, ty) = (t.deps.clone(), t.ty.clone());
+                    cur[index] = Cur::Kept(version);
+                    kept_typings += 1;
+                    all_reads.extend_from_slice(&reads);
+                    last[index] = Some((version, reads, ty.clone()));
+                    ty
                 } else {
                     let ctx = Ctx {
                         self_ty: Some(self_ty.clone()),
@@ -1870,20 +2106,55 @@ impl Analyzer {
                         in_view: false, class_side: false,
                     };
                     let deps = body::DepRecorder::default();
-                    let ty = typer.clone().with_deps(&deps).analyze_expr(value, &ctx);
+                    let mut value = match std::mem::replace(&mut cur[index], Cur::Source) {
+                        Cur::Source => (*source).clone(),
+                        Cur::Kept(round) => memo.typings[round][index].as_ref().expect("a kept typing").tree.clone(),
+                        Cur::Owned(value) => value,
+                    };
+                    let ty = typer.clone().with_deps(&deps).analyze_expr(&mut value, &ctx);
                     typed += 1;
-                    if let (Some(old), incremental::Mode::Check) = (&reused, mode) {
-                        if *old != ty {
-                            mismatches += 1;
-                            if mismatches <= 40 {
-                                eprintln!(
-                                    "roundhouse-incremental-check: constant {} round {version}: kept {old:?}, typed {ty:?}",
-                                    name.as_str()
-                                );
+                    if mode == incremental::Mode::Check {
+                        if let Some(old) = &clean {
+                            if *old != ty {
+                                mismatches += 1;
+                                if mismatches <= 40 {
+                                    eprintln!(
+                                        "roundhouse-incremental-check: constant {} round {version}: kept {old:?}, typed {ty:?}",
+                                        name.as_str()
+                                    );
+                                }
+                            }
+                        }
+                        if kept {
+                            let t = memo.typings[version][index].as_ref().expect("a kept typing");
+                            if t.ty != ty || t.tree != value {
+                                mismatches += 1;
+                                if mismatches <= 40 {
+                                    eprintln!(
+                                        "roundhouse-incremental-check: constant {} round {version}: the last pass's typing differs from the re-typed one",
+                                        name.as_str()
+                                    );
+                                }
                             }
                         }
                     }
-                    last[index] = Some((version, deps.take(), ty.clone()));
+                    let reads = deps.take();
+                    all_reads.extend_from_slice(&reads);
+                    if on {
+                        memo.typings[version][index] = Some(ConstTyping {
+                            input,
+                            output: incremental::expr_print(&value),
+                            tick,
+                            seen: pass,
+                            deps: reads.clone(),
+                            ty: ty.clone(),
+                            tree: value,
+                        });
+                        cur[index] = Cur::Kept(version);
+                    } else {
+                        cur[index] = Cur::Owned(value);
+                    }
+                    last[index] = Some((version, reads, ty.clone()));
                     ty
                 };
                 if matches!(ty, Ty::Var { .. }) {
@@ -1935,9 +2206,29 @@ impl Analyzer {
             map = next;
             resolved = next_resolved;
         }
+        if on && !skip_rounds {
+            if let Some((kept_map, kept_resolved)) = &kept_whole {
+                if *kept_map != map || *kept_resolved != resolved {
+                    mismatches += 1;
+                    eprintln!("roundhouse-incremental-check: the kept constant maps differ from this pass's rounds");
+                }
+            }
+            memo.maps = new_maps;
+            all_reads.sort_unstable();
+            all_reads.dedup();
+            memo.whole = Some(ConstWhole {
+                tick,
+                inputs,
+                reads: all_reads,
+                map: map.clone(),
+                resolved: clone_identity_map(&resolved),
+            });
+        }
+        self.const_memo = memo;
         crate::timings::note(format_args!(
-            "constants ({mode:?}): {} values, {rounds} rounds, typed {typed}, clean {clean_count}, check mismatches {mismatches}",
-            entries.len()
+            "constants ({mode:?}): {} values, {rounds} rounds, typed {typed}, clean {clean_count}, {kept_typings} typings kept from the last pass, kept whole {}, check mismatches {mismatches}",
+            entries.len(),
+            kept_whole.is_some()
         ));
         assert!(
             mismatches == 0,
@@ -1988,21 +2279,86 @@ impl Analyzer {
             self.build_constant_registry(app)
         });
         self.typed_constants = resolved_values;
+        // Stamp the constant values and bare-name fallback this pass
+        // changed, before the initializers below read them.
+        self.incremental.sync_constants(&self.typed_constants, &fallback);
         let global_constants = body::ConstScope::global(fallback);
         // Type the actual initializer trees, not only registry clones.
         // Their lexical class references become load-time dependencies
         // when a source file's nested declarations emit into separate files.
-        for class in &mut app.library_classes {
+        let initializers_span = crate::timings::begin("typing: constant initializers");
+        let mode = self.incremental.mode;
+        let mut init_memo = std::mem::take(&mut self.init_memo);
+        if init_memo.len() != app.library_classes.len()
+            || init_memo.iter().zip(&app.library_classes).any(|((name, consts), lc)| *name != lc.name || consts.len() != lc.constants.len())
+        {
+            init_memo = app
+                .library_classes
+                .iter()
+                .map(|lc| (lc.name.clone(), (0..lc.constants.len()).map(|_| None).collect()))
+                .collect();
+        }
+        let (mut init_typed, mut init_clean, mut init_mismatches) = (0usize, 0usize, 0usize);
+        // Per library class: whether this phase moved one of its
+        // initializer trees. The library pass below is the only other
+        // writer of library-class trees inside the fixpoint, so a class
+        // this phase left alone still has the trees its last library
+        // typing recorded.
+        let mut init_moved: Vec<bool> = vec![false; app.library_classes.len()];
+        for ((class, (_, memos)), moved) in app.library_classes.iter_mut().zip(init_memo.iter_mut()).zip(init_moved.iter_mut()) {
             let ctx = Ctx {
                 self_ty: Some(Ty::Class { id: class.name.clone(), args: vec![] }),
                 constants: global_constants.clone(),
                 class_side: true,
                 ..Ctx::default()
             };
-            for (_, value) in &mut class.constants {
-                self.body_typer().analyze_expr(value, &ctx);
+            for ((name, value), memo) in class.constants.iter_mut().zip(memos.iter_mut()) {
+                if mode == incremental::Mode::Off {
+                    self.body_typer().analyze_expr(value, &ctx);
+                    continue;
+                }
+                let before = incremental::expr_print(value);
+                let clean = memo.as_ref().is_some_and(|m| {
+                    m.name == *name && m.settled && m.tree == before && self.incremental.unchanged_since(&m.deps, m.tick)
+                });
+                if clean {
+                    init_clean += 1;
+                    if mode == incremental::Mode::On {
+                        continue;
+                    }
+                }
+                let deps = body::DepRecorder::default();
+                self.body_typer().with_deps(&deps).analyze_expr(value, &ctx);
+                init_typed += 1;
+                let after = incremental::expr_print(value);
+                if clean && after != before {
+                    init_mismatches += 1;
+                    if init_mismatches <= 40 {
+                        eprintln!(
+                            "roundhouse-incremental-check: constant initializer {}::{} typed differently than its kept tree",
+                            class.name.0.as_str(),
+                            name.as_str()
+                        );
+                    }
+                }
+                *memo = Some(InitTyping {
+                    name: name.clone(),
+                    tick: self.incremental.tick(),
+                    deps: deps.take(),
+                    tree: after,
+                    settled: after == before,
+                });
+                *moved |= after != before;
             }
         }
+        self.init_memo = init_memo;
+        crate::timings::note(format_args!(
+            "constant initializers ({mode:?}): typed {init_typed}, clean {init_clean}, check mismatches {init_mismatches}"
+        ));
+        assert!(
+            init_mismatches == 0,
+            "ROUNDHOUSE_INCREMENTAL=check: {init_mismatches} constant initializers the incremental pass would keep typed differently"
+        );
         // Controller→view ivar channel: as each action is analyzed, we harvest
         // the ivars it sets and key them by the view that action renders.
         // When we reach the view pass below, the view's Ctx is seeded from
@@ -2076,8 +2432,11 @@ impl Analyzer {
         // Parent links and concern-module tables are cloned once in
         // `analyze` and reused every round — they do not depend on the
         // refined registry.
+        drop(initializers_span);
 
-        self.analyze_class_configuration(&mut app.controllers);
+        crate::timings::phase("typing: class configuration", || {
+            self.analyze_class_configuration(&mut app.controllers)
+        });
 
         // Models do not read `controller_ivar_env`. Type and harvest
         // each one before controllers so a round carries model returns
@@ -3270,6 +3629,7 @@ impl Analyzer {
         // Identify mailers by parent chain up front; the harvest itself
         // rides the library-class typing loop below, after each method
         // body has been typed once.
+        let library_setup_span = crate::timings::begin("typing: library setup");
         let mailer_names: crate::det::HashSet<ClassId> = {
             let parent_of: HashMap<&ClassId, Option<&ClassId>> = app
                 .library_classes
@@ -3301,37 +3661,9 @@ impl Analyzer {
                 .collect()
         };
 
-        let concern_ivar_env =
-            concern_ivar_env_of(app, &controller_ivar_env, &module_includes);
-
-        // A `CurrentAttributes` ivar is written from OUTSIDE the class,
-        // through the class-level forwarder `ingest::current_attributes`
-        // synthesizes (`Current.session = session`). The syntactic
-        // harvest below reads the class's OWN methods, where the only
-        // write it can see is the generated `def session=(value); @session
-        // = value; end` — a parameter with no type. So the whole class
-        // was shapeless, and campfire routes essentially every
-        // per-request read through it: `Current.user.rooms`, and every
-        // ivar downstream of one, landed unresolved.
-        //
-        // Survey the app for those writes and let their VALUE types be
-        // the seed. This is evidence, not convention: the type is
-        // whatever the app actually assigns.
-        let current_attribute_writes: HashMap<ClassId, HashMap<Symbol, Ty>> = {
-            let targets: crate::det::HashSet<&ClassId> =
-                app.current_attribute_classes.iter().collect();
-            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
-            if !targets.is_empty() {
-                let mut collect = |body: &crate::expr::Expr| {
-                    collect_const_attr_writes(body, &targets, &mut out);
-                };
-                crate::lower::for_each_hook_body_ref(app, &mut collect);
-                for view in &app.views {
-                    collect(&view.body);
-                }
-            }
-            out
-        };
+        let concern_ivar_env = crate::timings::phase("library setup: concern ivar env", || {
+            concern_ivar_env_of(app, &controller_ivar_env, &module_includes)
+        });
 
         // A concern's methods RUN ON THE INCLUDER. Typed against the
         // module's own registry, `sessions.pluck(:ip_address)` in
@@ -3347,7 +3679,7 @@ impl Analyzer {
         // own view: a body typed against one includer would be wrong
         // for the others, and a union `self` is a poly cliff on every
         // send.
-        let sole_includer = app.sole_includer_of_modules();
+        let sole_includer = crate::timings::phase("library setup: sole includers", || app.sole_includer_of_modules());
 
         // Parameterized mailers: `ProductMailer.with(product: self,
         // subscriber: subscriber).in_stock` makes `params[:product]` a
@@ -3356,17 +3688,81 @@ impl Analyzer {
         // call site's kwargs (typed by the pass that walked the caller;
         // the fixpoint re-runs this with refined types) into one row
         // per mailer, union per key across sites.
-        let mailer_with_params = harvest_mailer_with_params(app, &mailer_names);
+        let scans_span = crate::timings::begin("library setup: tree scans");
+        // A `CurrentAttributes` ivar is written from OUTSIDE the class,
+        // through the class-level forwarder `ingest::current_attributes`
+        // synthesizes (`Current.session = session`). The syntactic
+        // harvest below reads the class's OWN methods, where the only
+        // write it can see is the generated `def session=(value); @session
+        // = value; end` — a parameter with no type. So the whole class
+        // was shapeless, and campfire routes essentially every
+        // per-request read through it: `Current.user.rooms`, and every
+        // ivar downstream of one, landed unresolved.
+        //
+        // Survey the app for those writes and let their VALUE types be
+        // the seed. This is evidence, not convention: the type is
+        // whatever the app actually assigns.
+        let full_attribute_writes = |app: &App| -> HashMap<ClassId, HashMap<Symbol, Ty>> {
+            let targets: crate::det::HashSet<&ClassId> =
+                app.current_attribute_classes.iter().collect();
+            let mut out: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+            if !targets.is_empty() {
+                let mut collect = |body: &crate::expr::Expr| {
+                    collect_const_attr_writes(body, &targets, &mut out);
+                };
+                crate::lower::for_each_hook_body_ref(app, &mut collect);
+                for view in &app.views {
+                    collect(&view.body);
+                }
+            }
+            out
+        };
+        let (mailer_with_params, current_attribute_writes) = if self.incremental.mode == incremental::Mode::Off {
+            (harvest_mailer_with_params(app, &mailer_names), full_attribute_writes(app))
+        } else {
+            // A library class's trees are as its last library typing
+            // recorded them unless the initializer phase above moved them.
+            let prints: Vec<Option<u64>> = app
+                .library_classes
+                .iter()
+                .enumerate()
+                .map(|(i, lc)| if init_moved[i] { None } else { self.incremental.trees_of(i, &lc.name) })
+                .collect();
+            let targets: crate::det::HashSet<&ClassId> = app.current_attribute_classes.iter().collect();
+            let mut scan = std::mem::take(&mut self.setup_scan);
+            let (mailer_with_params, current_attribute_writes, walked) =
+                scan.scan(app, &prints, &mailer_names, &targets);
+            self.setup_scan = scan;
+            crate::timings::note(format_args!(
+                "library setup scans: walked {walked} of {} library classes",
+                app.library_classes.len()
+            ));
+            if self.incremental.mode == incremental::Mode::Check {
+                assert!(
+                    mailer_with_params == harvest_mailer_with_params(app, &mailer_names),
+                    "ROUNDHOUSE_INCREMENTAL=check: the kept mailer `.with` scan differs from a full scan"
+                );
+                assert!(
+                    current_attribute_writes == full_attribute_writes(app),
+                    "ROUNDHOUSE_INCREMENTAL=check: the kept current-attribute write scan differs from a full scan"
+                );
+            }
+            (mailer_with_params, current_attribute_writes)
+        };
+        drop(scans_span);
         let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::default();
 
+        drop(library_setup_span);
         let _typing_library = crate::timings::begin("typing: library");
         self.incremental.begin_pass(
             &self.classes,
             &self.inferred_params,
             &self.typed_constants,
             app.library_classes.len(),
+            app.models.iter().map(|model| &model.name),
         );
         let mode = self.incremental.mode;
+        let mut print_time = std::time::Duration::ZERO;
         for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 let created = !self.classes.contains_key(&lc.name);
@@ -3387,7 +3783,24 @@ impl Analyzer {
             // so it is typed every pass.
             let concern_env_here = concern_ivar_env.get(&lc.name);
             let writes_here = current_attribute_writes.get(&lc.name);
-            let trees_before = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
+            let print_start = std::time::Instant::now();
+            let recorded = self.incremental.trees_of(index, &lc.name).filter(|_| !init_moved[index]);
+            let trees_before = match (mode, recorded) {
+                (incremental::Mode::Off, _) => 0,
+                (incremental::Mode::On, Some(trees)) => trees,
+                _ => {
+                    let now = incremental::trees_print(lc);
+                    if recorded.is_some_and(|trees| trees != now) {
+                        self.incremental.pass.mismatched += 1;
+                        eprintln!(
+                            "roundhouse-incremental-check: library class {} trees moved since its last typing outside the library pass",
+                            lc.name.0.as_str()
+                        );
+                    }
+                    now
+                }
+            };
+            print_time += print_start.elapsed();
             let clean = !mailer_names.contains(&lc.name)
                 && self.incremental.is_clean(index, &lc.name, &self_id, trees_before, concern_env_here, writes_here);
             if clean {
@@ -3563,7 +3976,9 @@ impl Analyzer {
                     self.incremental.report_mismatch(&kept, lc);
                 }
             }
+            let print_start = std::time::Instant::now();
             let trees_after = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
+            print_time += print_start.elapsed();
             self.incremental.record(
                 index,
                 &lc_name,
@@ -3576,6 +3991,7 @@ impl Analyzer {
             );
         }
         self.incremental.end_pass();
+        crate::timings::note(format_args!("library pass trees prints: {:.2}s", print_time.as_secs_f64()));
         drop(_typing_library);
 
         if !type_views_and_tests {
@@ -4077,6 +4493,54 @@ impl Analyzer {
         }
     }
 
+    /// Bring `sig` to what [`Self::capture_inference_sig`] would capture
+    /// now, copying only the tables that differ; whether any did (the
+    /// negation of [`Self::inference_matches`]).
+    fn refresh_inference_sig(&self, sig: &mut InferenceSig) -> bool {
+        let mut changed = false;
+        for (id, cls) in &self.classes {
+            for (table, now) in [
+                (&mut sig.instance, &cls.instance_methods),
+                (&mut sig.class_methods, &cls.class_methods),
+            ] {
+                match table.get_mut(id) {
+                    Some(before) if before == now => {}
+                    Some(before) => {
+                        before.clone_from(now);
+                        changed = true;
+                    }
+                    None => {
+                        table.insert(id.clone(), now.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if sig.instance.len() != self.classes.len() || sig.class_methods.len() != self.classes.len() {
+            sig.instance.retain(|id, _| self.classes.contains_key(id));
+            sig.class_methods.retain(|id, _| self.classes.contains_key(id));
+            changed = true;
+        }
+        for (key, tys) in &self.inferred_params {
+            match sig.params.get_mut(key) {
+                Some(before) if before == tys => {}
+                Some(before) => {
+                    before.clone_from(tys);
+                    changed = true;
+                }
+                None => {
+                    sig.params.insert(key.clone(), tys.clone());
+                    changed = true;
+                }
+            }
+        }
+        if sig.params.len() != self.inferred_params.len() {
+            sig.params.retain(|key, _| self.inferred_params.contains_key(key));
+            changed = true;
+        }
+        changed
+    }
+
     fn inference_matches(&self, prev: &InferenceSig) -> bool {
         if self.classes.len() != prev.instance.len() || self.inferred_params != prev.params {
             return false;
@@ -4194,13 +4658,65 @@ impl Analyzer {
     }
 
     fn harvest_method_returns(&mut self, app: &App, harvest_tests: bool) {
+        let returns_span = crate::timings::begin("harvest: returns");
         for model in &app.models {
             self.harvest_one_model(model);
         }
-        for lc in &app.library_classes {
+        // A library method's body return is a function of its typed
+        // body and of which classes the registry has (a class-constant
+        // tail): kept per class with the trees print it was read at and,
+        // per method, the registry's class count then. No class leaves
+        // the registry, so an equal count is the same class set.
+        let mode = self.incremental.mode;
+        let mut cache = std::mem::take(&mut self.return_cache);
+        if cache.len() != app.library_classes.len() {
+            cache = (0..app.library_classes.len()).map(|_| None).collect();
+        }
+        let (mut kept_returns, mut read_returns) = (0usize, 0usize);
+        for (index, lc) in app.library_classes.iter().enumerate() {
             let class_id = &lc.name;
-            for method in &lc.methods {
-                let ret = self.method_return_ty(class_id, method);
+            let print = if mode == incremental::Mode::Off { None } else { self.incremental.trees_of(index, class_id) };
+            let slot = &mut cache[index];
+            let valid = print.is_some()
+                && slot.as_ref().is_some_and(|kept: &ReturnsAt| {
+                    kept.name == *class_id && Some(kept.print) == print && kept.returns.len() == lc.methods.len()
+                });
+            if !valid {
+                *slot = print.map(|print| ReturnsAt { name: class_id.clone(), print, returns: Vec::new() });
+            }
+            for (at, method) in lc.methods.iter().enumerate() {
+                let classes_now = self.classes.len();
+                let kept = slot
+                    .as_ref()
+                    .filter(|_| valid)
+                    .map(|kept| &kept.returns[at])
+                    .filter(|(classes, _)| *classes == classes_now);
+                let ret = match (kept, mode) {
+                    (Some((_, ret)), incremental::Mode::On) => {
+                        kept_returns += 1;
+                        ret.clone()
+                    }
+                    _ => {
+                        read_returns += 1;
+                        let ret = self.method_return_ty(class_id, method);
+                        if let Some((_, old)) = kept {
+                            assert!(
+                                *old == ret,
+                                "ROUNDHOUSE_INCREMENTAL=check: {}#{} kept return {old:?} differs from its body's {ret:?}",
+                                class_id.0.as_str(),
+                                method.name.as_str()
+                            );
+                        }
+                        if let Some(slot) = slot.as_mut() {
+                            if valid {
+                                slot.returns[at] = (classes_now, ret.clone());
+                            } else {
+                                slot.returns.push((classes_now, ret.clone()));
+                            }
+                        }
+                        ret
+                    }
+                };
                 let ret = self.widen_recursive_return(class_id, method, ret);
                 let target = match method.receiver {
                     crate::dialect::MethodReceiver::Instance => {
@@ -4219,6 +4735,10 @@ impl Analyzer {
                 Self::register_method_return(target, &method.name, ret.as_ref());
             }
         }
+        self.return_cache = cache;
+        crate::timings::note(format_args!(
+            "harvest returns ({mode:?}): {kept_returns} library returns kept, {read_returns} read"
+        ));
         if harvest_tests {
             for module in &app.test_modules {
                 for method in &module.helpers {
@@ -4265,8 +4785,10 @@ impl Analyzer {
                 Self::insert_inferred_return(target, &action.name, body_ty);
             }
         }
+        drop(returns_span);
 
-        self.harvest_block_value_methods(app);
+        crate::timings::phase("harvest: block values", || self.harvest_block_value_methods(app));
+        let _folds = crate::timings::begin("harvest: folds");
         self.fold_concern_surfaces(app);
         self.fold_host_surfaces(app);
         self.fold_extended_modules(app);
@@ -4848,7 +5370,6 @@ impl Analyzer {
         // The refined round strictly dominates the one before it, so
         // the earlier observation has nothing to contribute.
         self.inferred_params.clear();
-        let helpers = &app.helper_method_index;
         // A CALLEE'S KEYWORD PARAMETER IS NOT ITS KWARGS HASH. The
         // fourth slot carries a call's trailing `kwargs: true` entries
         // by NAME so they can be placed on the keyword params they
@@ -4859,44 +5380,15 @@ impl Analyzer {
         // description of the argument list that disagrees with the
         // `def`. campfire's `next_involvement_for` emitted exactly
         // that, and spinel gave the param an `sp_SymPolyHash *`.
-        let mut sites: Vec<ParamSite> = Vec::new();
         let shapes_span = crate::timings::begin("unify: shapes");
-        let params_by_method = Self::param_shapes(app);
-        let defined = Self::defined_methods(app);
+        let tables = self.param_tables(app);
         drop(shapes_span);
-        let collect_span = crate::timings::begin("unify: collect");
-        for model in &app.models {
-            for method in model.methods() {
-                self.collect_send_sites(&method.body, Some(&model.name), method.receiver, helpers, &mut sites);
-            }
-            for scope_item in model.scopes() {
-                self.collect_send_sites(&scope_item.body, Some(&model.name), MethodReceiver::Class, helpers, &mut sites);
-            }
+        if self.incremental.mode == incremental::Mode::Off {
+            let sites = crate::timings::phase("unify: collect", || self.collect_param_sites(app, scope));
+            crate::timings::phase("unify: apply", || self.apply_param_sites(sites, &tables.shapes, &tables.defined));
+        } else {
+            self.apply_param_sites_incrementally(app, scope, &tables);
         }
-        for lc in &app.library_classes {
-            for method in &lc.methods {
-                self.collect_send_sites(&method.body, Some(&lc.name), method.receiver, helpers, &mut sites);
-            }
-        }
-        for controller in &app.controllers {
-            for action in controller.actions() {
-                self.collect_send_sites(&action.body, Some(&controller.name), MethodReceiver::Instance, helpers, &mut sites);
-            }
-            for method in controller.class_methods() {
-                self.collect_send_sites(&method.body, Some(&controller.name), MethodReceiver::Class, helpers, &mut sites);
-            }
-        }
-        if matches!(scope, UnifyScope::WithViews) {
-            for view in &app.views {
-                self.collect_send_sites(&view.body, None, MethodReceiver::Instance, helpers, &mut sites);
-            }
-            if let Some(seeds) = &app.seeds {
-                self.collect_send_sites(seeds, None, MethodReceiver::Instance, helpers, &mut sites);
-            }
-        }
-        drop(collect_span);
-
-        crate::timings::phase("unify: apply", || self.apply_param_sites(sites, &params_by_method, &defined));
         // Production signatures keep their production callers' shape.
         // Fold before adding test-owned observations: a same-named test
         // helper must not feed an included production concern either.
@@ -4917,10 +5409,9 @@ impl Analyzer {
 
     fn overlay_test_params(&mut self, app: &App) {
         let helpers = &app.helper_method_index;
-        let params_by_method = Self::param_shapes(app);
-        let defined = Self::defined_methods(app);
+        let tables = self.param_tables(app);
         let test_sites = self.collect_test_param_sites(app, helpers);
-        self.apply_param_sites(test_sites, &params_by_method, &defined);
+        self.apply_param_sites(test_sites, &tables.shapes, &tables.defined);
     }
 
     fn collect_test_param_sites(
@@ -4953,33 +5444,64 @@ impl Analyzer {
         params_by_method: &HashMap<ParamKey, Vec<ParamShape>>,
         defined: &BTreeSet<ParamKey>,
     ) {
+        let mut placed = HashMap::default();
+        for (key, arg_tys) in self.place_param_sites(sites, params_by_method, defined, &mut placed) {
+            observe_param_site(&mut self.inferred_params, key, arg_tys);
+        }
+    }
+
+    /// Each site as the key its observation is recorded under and the
+    /// argument types placed on that `def`'s slots, in site order.
+    /// `placed` memoizes where a written (class, method, side) lands: that
+    /// depends only on the def tables and the class chain, so it is
+    /// resolved once per key rather than once per site (the walk
+    /// allocates per hop).
+    fn place_param_sites<'t>(
+        &self,
+        sites: Vec<ParamSite>,
+        params_by_method: &'t HashMap<ParamKey, Vec<ParamShape>>,
+        defined: &BTreeSet<ParamKey>,
+        placed: &mut HashMap<ParamKey, (ClassId, MethodReceiver, Option<&'t Vec<ParamShape>>)>,
+    ) -> Vec<(ParamKey, Vec<Ty>)> {
+        let mut out = Vec::with_capacity(sites.len());
         for (class_id, method, side, arg_tys, kw_tys) in sites {
-            // The written side is the default; a chain that defines the
-            // name only on the other side is the method Ruby reaches
-            // (`extend self` modules, `self.class.m` from an instance).
-            let (class_id, definer, side) = match self.inherited_param_owner(defined, &class_id, &method, side) {
-                Some((owner, definer)) => (owner, definer, side),
+            let written = (class_id, method, side);
+            let (class_id, side, shapes) = match placed.get(&written) {
+                Some(hit) => hit.clone(),
                 None => {
-                    let other = match side {
-                        MethodReceiver::Instance => MethodReceiver::Class,
-                        MethodReceiver::Class => MethodReceiver::Instance,
+                    let (class_id, method, side) = &written;
+                    let side = *side;
+                    // The written side is the default; a chain that
+                    // defines the name only on the other side is the
+                    // method Ruby reaches (`extend self` modules,
+                    // `self.class.m` from an instance).
+                    let (owner, definer, side) = match self.inherited_param_owner(defined, class_id, method, side) {
+                        Some((owner, definer)) => (owner, definer, side),
+                        None => {
+                            let other = match side {
+                                MethodReceiver::Instance => MethodReceiver::Class,
+                                MethodReceiver::Class => MethodReceiver::Instance,
+                            };
+                            match self.inherited_param_owner(defined, class_id, method, other) {
+                                Some((owner, definer)) => (owner, definer, other),
+                                None => (class_id.clone(), class_id.clone(), side),
+                            }
+                        }
                     };
-                    match self.inherited_param_owner(defined, &class_id, &method, other) {
-                        Some((owner, definer)) => (owner, definer, other),
-                        None => (class_id.clone(), class_id, side),
-                    }
+                    // Placed by the shape of the `def` the call reaches.
+                    // For a module's method the site stays keyed to the
+                    // includer (the concern fold moves it), but the
+                    // includer has no `def` of its own: without the
+                    // module's shape a call's keywords stayed one Hash in
+                    // the first slot.
+                    let shapes = params_by_method.get(&(definer, method.clone(), side));
+                    let resolved = (owner, side, shapes);
+                    placed.insert(written.clone(), resolved.clone());
+                    resolved
                 }
             };
-            // Placed by the shape of the `def` the call reaches. For a
-            // module's method the site stays keyed to the includer (the
-            // concern fold moves it), but the includer has no `def` of
-            // its own: without the module's shape a call's keywords
-            // stayed one Hash in the first slot.
-            let arg_tys = match Self::site_shape(
-                params_by_method.get(&(definer, method.clone(), side)),
-                &arg_tys,
-                &kw_tys,
-            ) {
+            let method = written.1;
+            let arg_tys = match Self::site_shape(shapes, &arg_tys, &kw_tys) {
                 SitePlacement::Shape(shape) => Self::place_keyword_args(shape, arg_tys, kw_tys),
                 // The positionals before the group are still evidence;
                 // the group itself binds nowhere we can name.
@@ -4991,16 +5513,27 @@ impl Analyzer {
                     arg_tys
                 }
             };
-            let arity = arg_tys.len();
-            let entry = self
-                .inferred_params
-                .entry((class_id.clone(), method.clone(), side))
-                .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
-            if entry.len() < arity {
-                entry.resize(arity, Ty::Var { var: crate::ident::TyVar(0) });
+            out.push(((class_id, method, side), arg_tys));
+        }
+        out
+    }
+
+    fn param_tables(&mut self, app: &App) -> std::sync::Arc<ParamTables> {
+        let fresh = || ParamTables { shapes: Self::param_shapes(app), defined: Self::defined_methods(app) };
+        match &self.param_tables {
+            Some(tables) => {
+                if self.incremental.mode == incremental::Mode::Check {
+                    assert!(
+                        **tables == fresh(),
+                        "ROUNDHOUSE_INCREMENTAL=check: the app's def shapes changed during analysis"
+                    );
+                }
+                tables.clone()
             }
-            for (slot, observed) in entry.iter_mut().zip(arg_tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+            None => {
+                let tables = std::sync::Arc::new(fresh());
+                self.param_tables = Some(tables.clone());
+                tables
             }
         }
     }
@@ -6617,6 +7150,27 @@ fn block_filter_gates(call: &Expr) -> (Vec<Symbol>, Vec<Symbol>) {
         }
     }
     (only, except)
+}
+
+/// Unify one placed call site into `table`: a key's first site sets its
+/// arity (slots start as `Var`, no evidence), a longer later site
+/// extends it.
+fn observe_param_site(table: &mut HashMap<ParamKey, Vec<Ty>>, key: ParamKey, arg_tys: Vec<Ty>) {
+    let arity = arg_tys.len();
+    let entry = table
+        .entry(key)
+        .or_insert_with(|| (0..arity).map(|_| Ty::Var { var: crate::ident::TyVar(0) }).collect());
+    observe_into(entry, arg_tys);
+}
+
+fn observe_into(entry: &mut Vec<Ty>, arg_tys: Vec<Ty>) {
+    if entry.len() < arg_tys.len() {
+        entry.resize(arg_tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
+    }
+    for (slot, observed) in entry.iter_mut().zip(arg_tys) {
+        let before = std::mem::replace(slot, Ty::Untyped);
+        *slot = unify_param_ty(before, observed);
+    }
 }
 
 /// Unify a stored param type with a freshly observed argument type.

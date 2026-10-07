@@ -203,18 +203,26 @@ fn structure_print(info: &ClassInfo) -> u64 {
 
 /// What typing wrote into a library class's trees: every expression's
 /// type, decision bits and diagnostic.
-pub(super) fn trees_print(lc: &LibraryClass) -> u64 {
-    fn walk(h: &mut Mix, e: &Expr) {
-        match &e.ty {
-            Some(t) => hash_ty(h, t),
-            None => h.write_u8(0),
-        }
-        h.write_u64(e.decisions);
-        if let Some(d) = &e.diagnostic {
-            h.write(format!("{d:?}").as_bytes());
-        }
-        e.node.for_each_child(&mut |c| walk(h, c));
+fn walk(h: &mut Mix, e: &Expr) {
+    match &e.ty {
+        Some(t) => hash_ty(h, t),
+        None => h.write_u8(0),
     }
+    h.write_u64(e.decisions);
+    if let Some(d) = &e.diagnostic {
+        h.write(format!("{d:?}").as_bytes());
+    }
+    e.node.for_each_child(&mut |c| walk(h, c));
+}
+
+/// [`trees_print`] of one expression.
+pub(super) fn expr_print(e: &Expr) -> u64 {
+    let mut h = mix();
+    walk(&mut h, e);
+    h.finish()
+}
+
+pub(super) fn trees_print(lc: &LibraryClass) -> u64 {
     let mut h = mix();
     for e in &lc.class_ivar_initializers {
         walk(&mut h, e);
@@ -231,6 +239,80 @@ pub(super) fn trees_print(lc: &LibraryClass) -> u64 {
         walk(&mut h, &m.body);
     }
     h.finish()
+}
+
+/// Stamp what changed in one class's entry since `prints` saw it.
+fn sync_class(
+    prints: &mut Prints,
+    id: &ClassId,
+    info: &ClassInfo,
+    first: bool,
+    stamp: &mut impl FnMut(DepKey<'_>),
+) {
+    let (inst, cls, structure) = match prints.classes.get_mut(id) {
+        Some(entry) => entry,
+        None => {
+            // A class new since the last pass: its entry, and every
+            // method an earlier read found missing.
+            if !first {
+                stamp(DepKey::Class(id));
+                stamp(DepKey::AllInstance(id));
+                for m in info.instance_methods.keys() {
+                    stamp(DepKey::Instance(id, m));
+                }
+                for m in info.class_methods.keys() {
+                    stamp(DepKey::ClassMethod(id, m));
+                }
+            }
+            prints.classes.insert(
+                id.clone(),
+                (
+                    TablePrint { whole: table_print(&info.instance_methods), methods: None },
+                    TablePrint { whole: table_print(&info.class_methods), methods: None },
+                    structure_print(info),
+                ),
+            );
+            return;
+        }
+    };
+    for (print, table, instance_side) in
+        [(inst, &info.instance_methods, true), (cls, &info.class_methods, false)]
+    {
+        let whole = table_print(table);
+        if whole == print.whole {
+            continue;
+        }
+        let key = |m| if instance_side { DepKey::Instance(id, m) } else { DepKey::ClassMethod(id, m) };
+        if instance_side {
+            stamp(DepKey::AllInstance(id));
+        }
+        let now = TablePrint::per_method(table);
+        match &print.methods {
+            Some(before) => {
+                for (m, t) in &now {
+                    if before.get(m) != Some(t) {
+                        stamp(key(m));
+                    }
+                }
+                for m in before.keys() {
+                    if !now.contains_key(m) {
+                        stamp(key(m));
+                    }
+                }
+            }
+            // The table's first change: which methods it had is not
+            // kept, so stamp the class entry. Every method read
+            // goes through the class entry, so this covers them.
+            None => stamp(DepKey::Class(id)),
+        }
+        print.whole = whole;
+        print.methods = Some(now);
+    }
+    let now = structure_print(info);
+    if now != *structure {
+        stamp(DepKey::Class(id));
+        *structure = now;
+    }
 }
 
 /// One method table as the last pass saw it: the whole-table hash, and
@@ -297,6 +379,8 @@ pub(super) struct Incremental {
     /// Registry read ([`DepKey::hash64`]) → tick of its last change.
     changed: IdentityHashMap<u64, u64>,
     prints: Option<Prints>,
+    /// The bare-name constant fallback as the last sync saw it.
+    const_names: Option<HashMap<Symbol, u64>>,
     memo: Vec<Option<Memo>>,
     pub(super) pass: PassStats,
     passes: usize,
@@ -310,6 +394,7 @@ impl Incremental {
             tick: 0,
             changed: IdentityHashMap::default(),
             prints: None,
+            const_names: None,
             memo: Vec::new(),
             pass: PassStats::default(),
             passes: 0,
@@ -322,92 +407,55 @@ impl Incremental {
         self.pass.changed_keys += 1;
     }
 
-    /// Stamp every registry entry that differs from the snapshot the last
-    /// pass left. Call before the pass types anything.
-    pub(super) fn begin_pass(
+    /// Start a library pass: stamp the registry entries that differ from
+    /// the snapshot the last sync left. Since that sync the typing passes
+    /// before the library pass wrote only the entries of `written` (the
+    /// model harvest) and the constants ([`Self::sync_constants`]).
+    pub(super) fn begin_pass<'w>(
         &mut self,
         classes: &HashMap<ClassId, ClassInfo>,
         params: &HashMap<crate::app::ParamKey, Vec<Ty>>,
         constants: &IdentityHashMap<DeclarationId, Ty>,
         classes_in_app: usize,
+        written: impl Iterator<Item = &'w ClassId>,
     ) {
         self.pass = PassStats::default();
-        self.tick += 1;
         if self.memo.len() != classes_in_app {
             self.memo.resize_with(classes_in_app, || None);
         }
+        self.sync_written(classes, params, constants, written);
+    }
+
+    /// The current tick: a typing recorded now is older than every
+    /// change [`Self::sync`] or [`Self::note_write`] stamps later.
+    pub(super) fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Whether none of `reads` changed after tick `at`.
+    pub(super) fn unchanged_since(&self, reads: &[u64], at: u64) -> bool {
+        reads.iter().all(|d| self.changed.get(d).is_none_or(|t| *t <= at))
+    }
+
+    /// Stamp every registry entry that differs from the snapshot the last
+    /// sync left, at a new tick.
+    pub(super) fn sync(
+        &mut self,
+        classes: &HashMap<ClassId, ClassInfo>,
+        params: &HashMap<crate::app::ParamKey, Vec<Ty>>,
+        constants: &IdentityHashMap<DeclarationId, Ty>,
+    ) {
+        self.tick += 1;
         if self.mode == Mode::Off {
             return;
         }
+        let _span = crate::timings::begin("incremental: sync registry");
         let first = self.prints.is_none();
         let mut prints = self.prints.take().unwrap_or_default();
         let mut stamps: Vec<u64> = Vec::new();
         let mut stamp = |key: DepKey<'_>| stamps.push(key.hash64());
         for (id, info) in classes {
-            let (inst, cls, structure) = match prints.classes.get_mut(id) {
-                Some(entry) => entry,
-                None => {
-                    // A class new since the last pass: its entry, and every
-                    // method an earlier read found missing.
-                    if !first {
-                        stamp(DepKey::Class(id));
-                        stamp(DepKey::AllInstance(id));
-                        for m in info.instance_methods.keys() {
-                            stamp(DepKey::Instance(id, m));
-                        }
-                        for m in info.class_methods.keys() {
-                            stamp(DepKey::ClassMethod(id, m));
-                        }
-                    }
-                    prints.classes.insert(
-                        id.clone(),
-                        (
-                            TablePrint { whole: table_print(&info.instance_methods), methods: None },
-                            TablePrint { whole: table_print(&info.class_methods), methods: None },
-                            structure_print(info),
-                        ),
-                    );
-                    continue;
-                }
-            };
-            for (print, table, instance_side) in
-                [(inst, &info.instance_methods, true), (cls, &info.class_methods, false)]
-            {
-                let whole = table_print(table);
-                if whole == print.whole {
-                    continue;
-                }
-                let key = |m| if instance_side { DepKey::Instance(id, m) } else { DepKey::ClassMethod(id, m) };
-                if instance_side {
-                    stamp(DepKey::AllInstance(id));
-                }
-                let now = TablePrint::per_method(table);
-                match &print.methods {
-                    Some(before) => {
-                        for (m, t) in &now {
-                            if before.get(m) != Some(t) {
-                                stamp(key(m));
-                            }
-                        }
-                        for m in before.keys() {
-                            if !now.contains_key(m) {
-                                stamp(key(m));
-                            }
-                        }
-                    }
-                    // The table's first change: which methods it had is not
-                    // kept, so stamp the class entry. Every method read
-                    // goes through the class entry, so this covers them.
-                    None => stamp(DepKey::Class(id)),
-                }
-                print.whole = whole;
-                print.methods = Some(now);
-            }
-            let now = structure_print(info);
-            if now != *structure {
-                stamp(DepKey::Class(id));
-                *structure = now;
-            }
+            sync_class(&mut prints, id, info, first, &mut stamp);
         }
         if prints.classes.len() != classes.len() {
             prints.classes.retain(|id, _| {
@@ -456,6 +504,97 @@ impl Incremental {
         }
     }
 
+    /// [`Self::sync`] for a pass that can only have written the entries
+    /// of `written` (and created them) since the last sync: stamps those
+    /// classes' changes at a new tick. `ROUNDHOUSE_INCREMENTAL=check` runs
+    /// the full sync after it and fails if that finds anything more.
+    pub(super) fn sync_written<'w>(
+        &mut self,
+        classes: &HashMap<ClassId, ClassInfo>,
+        params: &HashMap<crate::app::ParamKey, Vec<Ty>>,
+        constants: &IdentityHashMap<DeclarationId, Ty>,
+        written: impl Iterator<Item = &'w ClassId>,
+    ) {
+        if self.mode == Mode::Off || self.prints.is_none() {
+            self.sync(classes, params, constants);
+            return;
+        }
+        self.tick += 1;
+        let _span = crate::timings::begin("incremental: sync written classes");
+        let mut prints = self.prints.take().expect("checked");
+        let mut stamps: Vec<u64> = Vec::new();
+        let mut stamp = |key: DepKey<'_>| stamps.push(key.hash64());
+        for id in written {
+            if let Some(info) = classes.get(id) {
+                sync_class(&mut prints, id, info, false, &mut stamp);
+            }
+        }
+        self.prints = Some(prints);
+        self.pass.changed_keys += stamps.len();
+        for key in stamps {
+            self.changed.insert(key, self.tick);
+        }
+        if self.mode == Mode::Check {
+            let before = self.pass.changed_keys;
+            self.sync(classes, params, constants);
+            let missed = self.pass.changed_keys - before;
+            assert!(
+                missed == 0,
+                "ROUNDHOUSE_INCREMENTAL=check: a full registry sync found {missed} changes outside the written classes"
+            );
+        }
+    }
+
+    /// Stamp, at a new tick, the constant values and the bare-name
+    /// constant fallback ([`DepKey::ConstName`]) that differ from the last
+    /// sync: `build_constant_registry` changes them after the sync it
+    /// starts with, and the constant initializers read them before the
+    /// library pass syncs again.
+    pub(super) fn sync_constants(
+        &mut self,
+        constants: &IdentityHashMap<DeclarationId, Ty>,
+        names: &HashMap<Symbol, Ty>,
+    ) {
+        self.tick += 1;
+        if self.mode == Mode::Off {
+            return;
+        }
+        let mut stamps: Vec<u64> = Vec::new();
+        if let Some(prints) = self.prints.as_mut() {
+            let mut constant_prints = IdentityHashMap::default();
+            for (id, ty) in constants {
+                let now = ty_print(ty);
+                if prints.constants.get(id) != Some(&now) {
+                    stamps.push(DepKey::Constant(id).hash64());
+                }
+                constant_prints.insert(*id, now);
+            }
+            for id in prints.constants.keys() {
+                if !constant_prints.contains_key(id) {
+                    stamps.push(DepKey::Constant(id).hash64());
+                }
+            }
+            prints.constants = constant_prints;
+        }
+        let now: HashMap<Symbol, u64> = names.iter().map(|(n, t)| (n.clone(), ty_print(t))).collect();
+        if let Some(before) = &self.const_names {
+            for (n, p) in &now {
+                if before.get(n) != Some(p) {
+                    stamps.push(DepKey::ConstName(n).hash64());
+                }
+            }
+            for n in before.keys() {
+                if !now.contains_key(n) {
+                    stamps.push(DepKey::ConstName(n).hash64());
+                }
+            }
+        }
+        self.const_names = Some(now);
+        for key in stamps {
+            self.changed.insert(key, self.tick);
+        }
+    }
+
     /// A registry write inside the pass (a mailer's `params` row): later
     /// classes in this pass see it, earlier ones next pass.
     pub(super) fn note_write(&mut self, class: &ClassId, method: &Symbol, created: bool) {
@@ -498,6 +637,15 @@ impl Incremental {
             let clip = |s: &str| s.get(from..).map(|s| s.chars().take(1400).collect::<String>()).unwrap_or_default();
             eprintln!("roundhouse-incremental-check:   kept: ...{}", clip(&a));
             eprintln!("roundhouse-incremental-check:   now:  ...{}", clip(&b));
+        }
+    }
+
+    /// [`trees_print`] of library class `index` as its last typing left
+    /// it, when that typing was recorded under `name`.
+    pub(super) fn trees_of(&self, index: usize, name: &ClassId) -> Option<u64> {
+        match self.memo.get(index) {
+            Some(Some(memo)) if memo.name == *name => Some(memo.trees),
+            _ => None,
         }
     }
 
@@ -566,5 +714,38 @@ impl Incremental {
             self.passes, self.mode
         ));
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A class-method change is stamped when the instance table is
+    /// unchanged: each table is compared on its own.
+    #[test]
+    fn a_class_table_change_is_stamped_behind_an_unchanged_instance_table() {
+        let id = ClassId(Symbol::from("Widget"));
+        let mut info = ClassInfo::default();
+        info.instance_methods.insert(Symbol::from("name"), Ty::Str);
+        info.class_methods.insert(Symbol::from("build"), Ty::Nil);
+        let mut classes = HashMap::default();
+        classes.insert(id.clone(), info);
+        let params = HashMap::default();
+        let constants = IdentityHashMap::default();
+
+        let mut inc = Incremental::new(Mode::On);
+        inc.sync(&classes, &params, &constants);
+        let at = inc.tick();
+        classes.get_mut(&id).unwrap().class_methods.insert(Symbol::from("build"), Ty::Int);
+        inc.sync_written(&classes, &params, &constants, std::iter::once(&id));
+        // The table's first change stamps the class entry.
+        assert!(!inc.unchanged_since(&[DepKey::Class(&id).hash64()], at));
+
+        let at = inc.tick();
+        classes.get_mut(&id).unwrap().class_methods.insert(Symbol::from("build"), Ty::Str);
+        inc.sync(&classes, &params, &constants);
+        assert!(!inc.unchanged_since(&[DepKey::ClassMethod(&id, &Symbol::from("build")).hash64()], at));
+        assert!(inc.unchanged_since(&[DepKey::Instance(&id, &Symbol::from("name")).hash64()], at));
     }
 }
