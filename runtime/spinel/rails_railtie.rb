@@ -1,0 +1,529 @@
+# frozen_string_literal: true
+
+# `require "rails/railtie"` on the PostgreSQL CRuby tree: Rails::Railtie,
+# Rails::Initializable and Rails::Railtie::Configuration of railties
+# 8.2.0.alpha (Shopify/rails 5813559f, lib/rails/railtie.rb,
+# initializable.rb, railtie/configuration.rb, gem_version.rb), ported
+# over this tree's runtime. runtime/features/rails/railtie.rb answers the
+# feature, so a gem's optional Rails integration (hashie 5.0.0's
+# `require 'rails/railtie' if defined?(::Rails)`) defines its railtie
+# against this class, never the railties checkout (whose files are off
+# $LOAD_PATH, runtime/git_gems.rb).
+#
+# Rails runs every railtie's initializers inside `Application#initialize!`
+# (config/environment.rb), between its Bootstrap and Finisher groups. The
+# tree's boot.rb stands in for both groups; it calls
+# `Rails::Railtie.run_initializers_of_railties(app)` before the app's
+# code loads (`require_relative "app/models"`), which tsorts the railties'
+# initializers among the Bootstrap and Finisher names as
+# Rails::Initializable::Collection does and runs the `:default` group,
+# with the Bootstrap and Finisher hooks a railtie can register on
+# (`:before_initialize`, `to_prepare`, `:after_initialize`) at their names.
+#
+# Not ported, and refused where used: Rails::Engine (no
+# rails/engine feature), `config.app_middleware` operations (the tree has
+# no middleware stack a gem's railtie can join; each recorded operation is
+# error[gem_railtie_middleware_not_applied] when the railties run).
+# `rake_tasks`/`console`/`runner`/`generators`/`server` blocks are
+# recorded as Rails records them; Rails runs them only under those
+# commands, never in a test process, and so does this tree.
+require "tsort"
+require_relative "active_support_ordered_options"
+
+module Rails
+  # railties/lib/rails/gem_version.rb.
+  module VERSION
+    MAJOR = 8
+    MINOR = 2
+    TINY  = 0
+    PRE   = "alpha"
+
+    STRING = [MAJOR, MINOR, TINY, PRE].compact.join(".").freeze
+  end
+
+  def self.gem_version
+    Gem::Version.new(VERSION::STRING)
+  end
+
+  def self.version
+    VERSION::STRING
+  end
+
+  module Initializable
+    def self.included(base) # :nodoc:
+      base.extend ClassMethods
+    end
+
+    class Initializer
+      attr_reader :name, :block, :before, :after
+
+      def initialize(name, context, before:, after:, group: nil, &block)
+        @group = group || :default
+        @name, @before, @after, @context, @block = name, before, after, context, block
+      end
+
+      def belongs_to?(group)
+        @group == group || @group == :all
+      end
+
+      def run(*args)
+        @context.instance_exec(*args, &block)
+      end
+
+      def bind(context)
+        return self if @context
+        Initializer.new(@name, context, before:, after:, group: @group, &block)
+      end
+
+      def context_class
+        @context.class
+      end
+    end
+
+    class Collection
+      include Enumerable
+      include TSort
+
+      def initialize(initializers = nil)
+        @order = Hash.new { |hash, key| hash[key] = Set.new }
+        @resolve = Hash.new { |hash, key| hash[key] = Set.new }
+        @collection = []
+        concat(initializers) if initializers
+      end
+
+      # `delegate_missing_to :@collection`.
+      def method_missing(name, ...)
+        return super unless @collection.respond_to?(name)
+        @collection.public_send(name, ...)
+      end
+
+      def respond_to_missing?(name, include_private = false)
+        @collection.respond_to?(name) || super
+      end
+
+      def freeze
+        return self if frozen?
+
+        @order.default_proc = nil
+        @resolve.default_proc = nil
+        @order.freeze
+        @resolve.freeze
+        @collection.freeze
+        super
+      end
+
+      def to_a
+        @collection
+      end
+
+      def last
+        @collection.last
+      end
+
+      def each(&block)
+        @collection.each(&block)
+      end
+
+      alias :tsort_each_node :each
+      def tsort_each_child(initializer, &block)
+        @order[initializer.name].each do |name|
+          @resolve[name].each(&block)
+        end
+      end
+
+      def +(other)
+        dup.concat(other.to_a)
+      end
+
+      def <<(initializer)
+        @collection << initializer
+        @order[initializer.before] << initializer.name if initializer.before
+        @order[initializer.name] << initializer.after if initializer.after
+        @resolve[initializer.name] << initializer
+        self
+      end
+
+      def push(*initializers)
+        initializers.each(&method(:<<))
+        self
+      end
+
+      alias_method(:append, :push)
+
+      def concat(*initializer_collections)
+        initializer_collections.each do |initializers|
+          initializers.each(&method(:<<))
+        end
+        self
+      end
+
+      def has?(name)
+        @resolve.key?(name)
+      end
+    end
+
+    def run_initializers(group = :default, *args)
+      return if instance_variable_defined?(:@ran)
+      initializers.tsort_each do |initializer|
+        initializer.run(*args) if initializer.belongs_to?(group)
+      end
+      @ran = true
+    end
+
+    def initializers
+      @initializers ||= self.class.initializers_for(self)
+    end
+
+    module ClassMethods
+      def initializers
+        @initializers ||= Collection.new
+      end
+
+      def initializers_chain
+        initializers = Collection.new
+        ancestors.reverse_each do |klass|
+          next unless klass.respond_to?(:initializers)
+          initializers = initializers + klass.initializers
+        end
+        initializers
+      end
+
+      def initializers_for(binding)
+        Collection.new(initializers_chain.map { |i| i.bind(binding) })
+      end
+
+      def initializer(name, opts = {}, &blk)
+        raise ArgumentError, "A block must be passed when defining an initializer" unless blk
+        opts[:after] ||= initializers.last&.name unless initializers.has?(opts[:before])
+        initializers << Initializer.new(
+          name, nil, before: opts[:before], after: opts[:after], group: opts[:group], &blk
+        )
+      end
+    end
+  end
+
+  class Railtie
+    include Initializable
+
+    ABSTRACT_RAILTIES = %w(Rails::Railtie Rails::Engine Rails::Application).freeze
+
+    # Rails::Application::Bootstrap's and Finisher's initializer names,
+    # in their order (railties 8.2.0.alpha application/bootstrap.rb and
+    # finisher.rb). The tree's boot has done the work of each by the
+    # time the railties run, so they run nothing here; they are in the
+    # collection so a railtie's `before:`/`after:` naming one orders as
+    # in Rails.
+    BOOTSTRAP_INITIALIZERS = %i[
+      load_environment_hook load_active_support set_eager_load initialize_logger
+      initialize_error_reporter initialize_event_reporter initialize_cache
+      setup_once_autoloader bootstrap_hook
+    ].freeze
+    FINISHER_INITIALIZERS = %i[
+      add_generator_templates setup_main_autoloader setup_default_session_store
+      build_middleware_stack define_main_app_helper add_to_prepare_blocks
+      run_prepare_callbacks eager_load! finisher_hook configure_executor_for_concurrency
+      add_internal_routes set_routes_reloader_hook set_clear_dependencies_hook enable_yjit
+    ].freeze
+
+    @@not_run = 0
+
+    class << self
+      private :new
+
+      # `delegate :config, to: :instance`.
+      def config(...)
+        instance.config(...)
+      end
+
+      # ActiveSupport::DescendantsTracker on Ruby >= 3.1 is Class#subclasses.
+      def subclasses
+        super.reject(&:abstract_railtie?).sort
+      end
+
+      def rake_tasks(&blk)
+        register_block_for(:rake_tasks, &blk)
+      end
+
+      def console(&blk)
+        register_block_for(:load_console, &blk)
+      end
+
+      def runner(&blk)
+        register_block_for(:runner, &blk)
+      end
+
+      def generators(&blk)
+        register_block_for(:generators, &blk)
+      end
+
+      def server(&blk)
+        register_block_for(:server, &blk)
+      end
+
+      def abstract_railtie?
+        ABSTRACT_RAILTIES.include?(name)
+      end
+
+      def railtie_name(name = nil)
+        @railtie_name = name.to_s if name
+        @railtie_name ||= generate_railtie_name(self.name)
+      end
+
+      def instance
+        @instance ||= new
+      end
+
+      def configure(&block)
+        instance.configure(&block)
+      end
+
+      def <=>(other) # :nodoc:
+        load_index <=> other.load_index
+      end
+
+      def inherited(subclass)
+        subclass.increment_load_index
+        super
+      end
+
+      # Application#initialize!'s railtie part: Bootstrap's names, every
+      # railtie's initializers in load order, Finisher's names, tsorted
+      # and run for the `:default` group with the application as the
+      # argument (Rails::Initializable#run_initializers). Of the Bootstrap
+      # and Finisher work, the part a railtie registers into runs at its
+      # Rails name: `:bootstrap_hook` runs the `:before_initialize` load
+      # hooks, `:run_prepare_callbacks` the `to_prepare` blocks and
+      # `:finisher_hook` the `:after_initialize` load hooks.
+      def run_initializers_of_railties(app)
+        return if defined?(@@ran_railties)
+        @@ran_railties = true
+        work = {
+          bootstrap_hook: -> { ActiveSupport.run_load_hooks(:before_initialize, app) },
+          add_to_prepare_blocks: -> { Configuration.refuse_app_middleware! },
+          run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
+          finisher_hook: -> { ActiveSupport.run_load_hooks(:after_initialize, app) },
+        }
+        collection = Initializable::Collection.new
+        add = lambda do |names|
+          previous = nil
+          names.each do |name|
+            step = work[name]
+            collection << Initializable::Initializer.new(name, app, before: nil, after: previous, group: :all) { step&.call }
+            previous = name
+          end
+        end
+        add.(BOOTSTRAP_INITIALIZERS)
+        subclasses.each { |railtie| collection.concat(railtie.instance.initializers) }
+        add.(FINISHER_INITIALIZERS)
+        collection.tsort_each do |initializer|
+          next unless initializer.belongs_to?(:default)
+          if initializer.context_class == app.class
+            initializer.run(app)
+          else
+            not_run_unless_it_runs("#{initializer.context_class.name} initializer #{initializer.name.inspect}") { initializer.run(app) }
+          end
+        end
+        warn "roundhouse: #{@@not_run} gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])" if @@not_run > 0
+      end
+
+      # A railtie's initializer or hook that needs Rails this tree does
+      # not port (ActionController's internals, Rails::Engine, app config
+      # the runtime does not answer) does not run: boot names it,
+      # error[gem_railtie_not_run], and goes on, as the Bundler.require
+      # list names a gem it cannot load.
+      def not_run_unless_it_runs(what) # :nodoc:
+        yield
+      rescue StandardError, LoadError, NotImplementedError => e
+        @@not_run += 1
+        site = e.backtrace&.find { |line| !line.include?(__FILE__) && !line.include?("active_support_lazy_load_hooks") }
+        warn "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)} (#{site})"
+        nil
+      end
+
+      # A LoadError for a file of one of the app's own gems: this tree
+      # carries the gem compiled, and the gem home's copy is registered
+      # as loaded but not loaded (runtime/gem_facades.rb,
+      # RH_COMPILED_GEM_COPIES), so a native gem cannot load it over the
+      # compiled one.
+      def compiled_copy_note(e) # :nodoc:
+        return "" unless e.is_a?(LoadError) && e.path && defined?(::RH_COMPILED_GEM_COPIES)
+        spec = Gem::Specification.find_by_path(e.path)
+        return "" unless spec && ::RH_COMPILED_GEM_COPIES.key?(spec.name)
+        " (error[compiled_gem_native_copy]: #{e.path.inspect} is a file of the #{spec.name} gem this tree carries compiled; the gem home's #{spec.name}-#{spec.version} is not loaded over it)"
+      end
+
+      protected
+        attr_reader :load_index
+
+        def increment_load_index
+          @@load_counter ||= 0
+          @load_index = (@@load_counter += 1)
+        end
+
+      private
+        # ActiveSupport::Inflector.underscore without the acronym table
+        # (the tree has no Inflector acronyms).
+        def generate_railtie_name(string)
+          word = string.to_s.gsub("::", "/")
+          word = word.gsub(/(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z\d])(?=[A-Z])/, "_")
+          word.tr("-", "_").downcase.tr("/", "_")
+        end
+
+        def respond_to_missing?(name, _)
+          return super if abstract_railtie?
+
+          instance.respond_to?(name) || super
+        end
+
+        def method_missing(name, ...)
+          if !abstract_railtie? && instance.respond_to?(name)
+            instance.public_send(name, ...)
+          else
+            super
+          end
+        end
+
+        def register_block_for(type, &blk)
+          var_name = "@#{type}"
+          blocks = instance_variable_defined?(var_name) ? instance_variable_get(var_name) : instance_variable_set(var_name, [])
+          blocks << blk if blk
+          blocks
+        end
+    end
+
+    def railtie_name
+      self.class.railtie_name
+    end
+
+    def initialize # :nodoc:
+      if self.class.abstract_railtie?
+        raise "#{self.class.name} is abstract, you cannot instantiate it directly."
+      end
+    end
+
+    def configure(&block) # :nodoc:
+      instance_eval(&block)
+    end
+
+    def config
+      @config ||= Railtie::Configuration.new
+    end
+
+    def inspect
+      "#<#{self.class.name}>"
+    end
+
+    class Configuration
+      def initialize
+        @@options ||= {}
+      end
+
+      def self.eager_load_namespaces # :nodoc:
+        @@eager_load_namespaces ||= []
+      end
+
+      def eager_load_namespaces
+        @@eager_load_namespaces ||= []
+      end
+
+      def watchable_files
+        @@watchable_files ||= []
+      end
+
+      def watchable_dirs
+        @@watchable_dirs ||= {}
+      end
+
+      # Rails::Configuration::MiddlewareStackProxy records the operations
+      # and merges them into the application's stack. This tree has no
+      # stack for them; boot names each one (`refuse_app_middleware!`).
+      def app_middleware
+        @@app_middleware ||= MiddlewareStackProxy.new
+      end
+
+      def self.refuse_app_middleware! # :nodoc:
+        return unless defined?(@@app_middleware)
+        @@app_middleware.operations.each do |operation, args|
+          warn "roundhouse: error[gem_railtie_middleware_not_applied]: config.app_middleware.#{operation}(#{args.map(&:inspect).join(", ")}) from a gem's railtie is not applied: the tree has no middleware stack a railtie joins"
+        end
+      end
+
+      def before_configuration(&block)
+        ActiveSupport.on_load(:before_configuration, yield: true, &Configuration.guarded("before_configuration", block))
+      end
+
+      def before_eager_load(&block)
+        ActiveSupport.on_load(:before_eager_load, yield: true, &Configuration.guarded("before_eager_load", block))
+      end
+
+      def before_initialize(&block)
+        ActiveSupport.on_load(:before_initialize, yield: true, &Configuration.guarded("before_initialize", block))
+      end
+
+      def after_initialize(&block)
+        ActiveSupport.on_load(:after_initialize, yield: true, &Configuration.guarded("after_initialize", block))
+      end
+
+      def after_routes_loaded(&block)
+        ActiveSupport.on_load(:after_routes_loaded, yield: true, &Configuration.guarded("after_routes_loaded", block))
+      end
+
+      def to_prepare_blocks
+        @@to_prepare_blocks ||= []
+      end
+
+      def to_prepare(&blk)
+        to_prepare_blocks << Configuration.guarded("to_prepare", blk) if blk
+      end
+
+      # The hook a railtie registers, run under
+      # `Railtie.not_run_unless_it_runs` (error[gem_railtie_not_run]).
+      def self.guarded(kind, block) # :nodoc:
+        return block if block.nil?
+        site = block.source_location&.join(":")
+        proc { |*args| Railtie.not_run_unless_it_runs("config.#{kind} hook (#{site})") { block.call(*args) } }
+      end
+
+      def respond_to?(name, include_private = false)
+        super || @@options.key?(name.to_sym)
+      end
+
+      private
+        def actual_method?(key)
+          !@@options.key?(key) && respond_to?(key)
+        end
+
+        def method_missing(name, *args, &blk)
+          if name.end_with?("=")
+            key = name[0..-2].to_sym
+            if actual_method?(key)
+              raise NoMethodError.new("Cannot assign to `#{key}`, it is a configuration method")
+            end
+
+            @@options[key] = args.first
+          elsif @@options.key?(name)
+            @@options[name]
+          else
+            super
+          end
+        end
+
+      # railties/lib/rails/configuration.rb's MiddlewareStackProxy: the
+      # recording half.
+      class MiddlewareStackProxy
+        attr_reader :operations
+
+        def initialize
+          @operations = []
+        end
+
+        %i[insert_before insert insert_after swap use delete move_before move move_after unshift].each do |operation|
+          define_method(operation) do |*args, &block|
+            @operations << [operation, args]
+            self
+          end
+        end
+      end
+    end
+  end
+end

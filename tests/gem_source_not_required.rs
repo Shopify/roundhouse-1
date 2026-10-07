@@ -81,8 +81,11 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     assert_eq!(block, r#"["opentelemetry/sdk", "forwardable", "opentelemetry-common", "json"].each do |feature|"#, "{facades}");
     assert!(facades.contains(r#"Their Rails features are this tree's runtime ports, not required: "active_support/parameter_filter"."#), "{facades}");
     assert!(facades.contains("error[gem_requires_rails]"), "{facades}");
-    // After the gems that tree loads natively.
-    assert!(facades.find("require gem_name").unwrap() < facades.find(block).unwrap());
+    // Before the Bundler.require list, where Bundler would require the
+    // gem source: Core's Gemfile loads panama_client "before anything
+    // else that may require grpc", and its grpc_fork_safety raises once
+    // GRPC is loaded (the list's opentelemetry-instrumentation-grpc does).
+    assert!(facades.find(block).unwrap() < facades.find("require gem_name").unwrap(), "{facades}");
     // A path gem's file the tree does not carry compiled is named, not
     // loaded from the gem home; so is a gem source's (by the gem home's
     // spec that owns it), and a feature whose gem depends on Rails.
@@ -111,4 +114,62 @@ fn a_git_gem_in_a_gem_sources_closure_is_activated() {
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
     assert!(facades.starts_with("require_relative \"git_gems\"\n"), "{facades}");
     assert!(facades.contains(r#"["grpc_fork_safety"].each do |feature|"#), "{facades}");
+}
+
+/// Core's Rails is the Shopify fork, a `GIT` source, so runtime/git_gems.rb
+/// activates its checkout for the gems that depend on it — but Rails' own
+/// files must not load over the runtime ports. hashie (a dependency of a
+/// gem source) runs `require 'rails/railtie' if defined?(::Rails)`, rescuing
+/// LoadError; with the checkout on $LOAD_PATH it loaded the real railties,
+/// and actionpack-xml_parser then the real ActionDispatch, which raised
+/// "Session is not a module" against the runtime's port.
+#[test]
+fn the_rails_git_checkout_activates_but_its_files_do_not_load() {
+    let lock = "GIT\n  remote: https://github.com/Shopify/rails.git\n  revision: 5813559f4aedd8f37cb8af46fcb24f64ec3d6e7f\n  specs:\n    activesupport (8.2.0.alpha)\n    railties (8.2.0.alpha)\n      activesupport (= 8.2.0.alpha)\n\nGIT\n  remote: https://github.com/Shopify/grpc.git\n  revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  specs:\n    grpc (1.85.0.dev)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    panama_client (3.2.3)\n      grpc\n      railties\n\nDEPENDENCIES\n  activesupport!\n  grpc!\n  panama_client\n  railties!\n";
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ngem_sources:\n  panama_client: vendor/gems/panama_client-3.2.3\n")
+        .write("Gemfile.lock", lock)
+        .write("vendor/gems/panama_client-3.2.3/lib/panama_client.rb", "require 'grpc'\nmodule PanamaClient\nend\n")
+        .write("lib/oracle.rb", "class Oracle\n  def ask\n    PanamaClient\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    let git = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems.rb");
+    assert!(git.contains(r#"["railties", "rails-5813559f4aed""#), "{git}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
+    assert!(facades.contains("|/bundler/gems/rails-\\h+/}"), "the Rails-load check knows the checkout: {facades}");
+
+    // The loader against a gem dir laid out as Bundler installs git gems.
+    let gems = dir.join("tmp-gem-home");
+    let spec = |name: &str, version: &str, deps: &str| {
+        format!("Gem::Specification.new do |s|\n  s.name = {name:?}\n  s.version = {version:?}\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\n{deps}end\n")
+    };
+    let rails = gems.join("bundler/gems/rails-5813559f4aed");
+    for (component, deps) in [("activesupport", ""), ("railties", "  s.add_dependency \"activesupport\", \"= 8.2.0.alpha\"\n")] {
+        std::fs::create_dir_all(rails.join(component).join("lib")).unwrap();
+        std::fs::write(rails.join(component).join(format!("{component}.gemspec")), spec(component, "8.2.0.alpha", deps)).unwrap();
+    }
+    std::fs::create_dir_all(rails.join("railties/lib/rails")).unwrap();
+    std::fs::write(rails.join("railties/lib/rails/railtie.rb"), "module Rails; class Railtie; end; end\n").unwrap();
+    std::fs::create_dir_all(rails.join("activesupport/lib")).unwrap();
+    std::fs::write(rails.join("activesupport/lib/active_support.rb"), "module ActiveSupport; REAL = true; end\n").unwrap();
+    let grpc = gems.join("bundler/gems/grpc-d5dd2a32be6b");
+    std::fs::create_dir_all(grpc.join("lib")).unwrap();
+    std::fs::write(grpc.join("grpc.gemspec"), spec("grpc", "1.85.0.dev", "")).unwrap();
+    std::fs::write(grpc.join("lib/grpc.rb"), "module GRPC; FROM = __FILE__; end\n").unwrap();
+    let script = "require_relative 'runtime/git_gems'\n\
+        module Rails; end\n\
+        begin\n  require 'rails/railtie' if defined?(::Rails)\n  puts 'railtie loaded'\nrescue LoadError\n  puts 'railtie skipped'\nend\n\
+        begin\n  require 'active_support'\n  puts 'active_support loaded'\nrescue LoadError\n  puts 'active_support skipped'\nend\n\
+        puts Gem.loaded_specs['railties'].version\n\
+        require 'grpc'\nputs GRPC::FROM\n";
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &gems)
+        .env("GEM_HOME", &gems)
+        .args(["-e", script])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("railtie skipped\nactive_support skipped\n8.2.0.alpha\n"), "{stdout}");
+    assert!(stdout.contains("bundler/gems/grpc-d5dd2a32be6b/lib/grpc.rb"), "{stdout}");
 }

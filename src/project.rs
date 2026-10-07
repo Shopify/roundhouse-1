@@ -3000,7 +3000,13 @@ fn ruby_family_files(
              # one name.)\n\
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
-             {}{}",
+             {}{}{}",
+            // Before the Bundler.require list: a gem source's own
+            // dependencies load where Bundler requires the gem, and Core's
+            // Gemfile requires panama_client "before anything else that may
+            // require grpc" (its grpc_fork_safety raises once GRPC is
+            // loaded; the list's opentelemetry-instrumentation-grpc loads it).
+            format!("{}{}", compiled_gem_native_copies_block(app), gem_source_dependency_block(app)),
             gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
@@ -3050,10 +3056,6 @@ fn ruby_family_files(
         format!("{gem_facades}require_relative \"active_model_type\"\n")
     } else {
         gem_facades
-    };
-    let gem_facades = match flavor {
-        RubyFlavor::CRuby => format!("{gem_facades}{}", gem_source_dependency_block(app)),
-        RubyFlavor::JRuby => gem_facades,
     };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {
@@ -3174,6 +3176,54 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ),
         ));
     }
+    // Rails::Railtie (railties 8.2.0.alpha), the feature `rails/railtie`
+    // answers on this tree: a gem's optional railtie (hashie 5.0.0's
+    // `require 'rails/railtie' if defined?(::Rails)`) defines against
+    // the port, and boot runs its initializers where
+    // Application#initialize! would, before the app's code loads.
+    let railtie = crate::runtime_files::read_to_string("runtime/spinel/rails_railtie.rb")
+        .map_err(|e| format!("read Rails::Railtie runtime: {e}"))?;
+    files.push(("runtime/rails_railtie.rb".into(), railtie));
+    let ordered_options = crate::runtime_files::read_to_string("runtime/spinel/active_support_ordered_options.rb")
+        .map_err(|e| format!("read ActiveSupport::OrderedOptions runtime: {e}"))?;
+    files.push(("runtime/active_support_ordered_options.rb".into(), ordered_options));
+    // `require "rails"` (bugsnag 5.5's railtie): Rails is the runtime's,
+    // already loaded by boot.rb, with the Railtie port.
+    files.push((
+        "runtime/features/rails.rb".into(),
+        "# `require \"rails\"` on this tree: railties' Rails, the runtime ports\n\
+         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie\n\
+         # (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../rails_railtie\"\n"
+            .into(),
+    ));
+    files.push((
+        "runtime/features/rails/railtie.rb".into(),
+        "# `require \"rails/railtie\"` on this tree: railties' Rails::Railtie,\n\
+         # ported (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../../rails_railtie\"\n"
+            .into(),
+    ));
+    // useragent 0.16.11 and platform_agent 1.0.1 are runtime/user_agent.rb
+    // on every target. A native require of the gems (gem_facades.rb's
+    // `require "useragent"` for Shopify Core's secure_headers gem source)
+    // loaded the gem's files over the port, redefining UserAgent's
+    // constants and mixing the gem's methods into the port's classes.
+    if files.iter().any(|(p, _)| p == "runtime/user_agent.rb") {
+        for feature in ["useragent", "user_agent", "platform_agent"] {
+            files.push((
+                format!("runtime/features/{feature}.rb"),
+                format!(
+                    "# `require {feature:?}` on this tree: useragent 0.16.11 and\n\
+                     # platform_agent 1.0.1, ported (runtime/user_agent.rb).\n\
+                     # runtime/gem_facades.rb puts this directory first on the load path.\n\
+                     require_relative \"../user_agent\"\n"
+                ),
+            ));
+        }
+    }
     let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
@@ -3207,7 +3257,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             content.insert_str(
                 0,
                 "require_relative \"active_support_lazy_load_hooks\"\n\
-                 # semian's features answer from the runtime ports (runtime/features).\n\
+                 # semian's, rails/railtie's and useragent's features answer from the runtime\n\
+                 # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
             // Where Bundler.require would have loaded them: with the gems.
@@ -3222,6 +3273,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
+            let models = "require_relative \"app/models\"\n";
+            let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
+            content.insert_str(
+                at,
+                "# Application#initialize!: the gems' railties' initializers, in\n\
+                 # Rails' order, before the app's code loads (runtime/rails_railtie.rb).\n\
+                 require_relative \"runtime/rails_railtie\"\n\
+                 Rails::Railtie.run_initializers_of_railties(Rails.application)\n",
+            );
             content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
             content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
@@ -3492,6 +3552,45 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
     out
 }
 
+/// runtime/gem_facades.rb's registration of the app's own gems (the
+/// lock's in-repo gems, compiled into this tree) as loaded. The gem home
+/// can carry its own copy of one (paquito-1.0.2 next to Core's paquito),
+/// and a native gem requiring it (shopify_session's railtie initializer
+/// requires shopify_session/rack, whose coder.rb requires "paquito")
+/// loaded that copy, redefining the compiled gem's constants under it.
+/// Each copy is entered in `Gem.loaded_specs` without activation (no
+/// dependencies, nothing on $LOAD_PATH), so a gem depending on it
+/// resolves, and a copy already activated (a git gem's dependency) has
+/// its files taken off $LOAD_PATH. Requiring a file of one raises
+/// LoadError; `RH_COMPILED_GEM_COPIES` lets runtime/rails_railtie.rb name
+/// it (error[compiled_gem_native_copy]).
+fn compiled_gem_native_copies_block(app: &App) -> String {
+    let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
+    if in_repo.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
+    format!(
+        "\n# The app's own gems are compiled into this tree; the gem home's copy\n\
+         # of one is registered as loaded, not loaded, so a native gem's\n\
+         # require of it cannot load it over the compiled one\n\
+         # (`project::compiled_gem_native_copies_block`).\n\
+         RH_COMPILED_GEM_COPIES = [{}].filter_map do |name|\n  \
+         if (spec = Gem.loaded_specs[name])\n    \
+         paths = spec.full_require_paths\n    \
+         $LOAD_PATH.reject! {{ |path| paths.include?(path) }}\n  \
+         else\n    \
+         spec = Gem::Specification.find_all_by_name(name).max_by(&:version)\n    \
+         next unless spec\n    \
+         Gem.loaded_specs[name] = spec\n    \
+         spec.activated = true\n  \
+         end\n  \
+         [name, spec.version.to_s]\n\
+         end.to_h.freeze\n",
+        names.join(", ")
+    )
+}
+
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
 /// guarded: a gem source's dependency is a dependency of the app, and
 /// its absence is a boot failure, as under Bundler.
@@ -3508,7 +3607,9 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
 /// - a feature whose gem depends on a Rails gem (error[gem_requires_rails]):
 ///   Rails' own code cannot run over this tree's ports.
 /// A require that loads Rails anyway (a gem in the gem home under
-/// `activesupport-*`, ...) is error[gem_requires_rails], raised at boot.
+/// `activesupport-*`, ..., or the Rails git checkout
+/// `bundler/gems/rails-<revision>`) is error[gem_requires_rails], raised
+/// at boot.
 fn gem_source_dependency_block(app: &App) -> String {
     let (all_native, framework) = gem_source_dependencies(app);
     let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
@@ -3574,7 +3675,7 @@ fn gem_source_dependency_block(app: &App) -> String {
          end\n  \
          loaded = $LOADED_FEATURES.size\n  \
          require feature\n  \
-         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d}) }\n  \
+         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
          end\n",
     );
@@ -6945,7 +7046,6 @@ const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
     ("json", "json"),
     ("bootsnap", "bootsnap"),
     ("tzinfo/data", "tzinfo-data"),
-    ("actionpack-xml_parser", "actionpack-xml_parser"),
     ("csv", "csv"),
     ("gda", "gda"),
     ("redis", "redis"),
@@ -7666,6 +7766,7 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
     ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
+    ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("gurgel", "requiring it loads 2 Rails framework files"),
     ("globalid", "requiring it loads 39 Rails framework files"),
@@ -7983,6 +8084,11 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
 /// `runtime/gem_facades.rb` requires it before its guarded requires. A
 /// missing checkout is a warning naming the gem, source and revision: the
 /// guarded require would otherwise swallow it as a quiet LoadError.
+/// The gems of the Rails repository, as a Ruby `%w[]` literal: their git
+/// checkout activates (`runtime/git_gems.rb`) but none of their files
+/// load, since the runtime ports stand in for them.
+const RAILS_REPOSITORY_GEMS_RUBY: &str = "%w[rails railties activesupport activemodel activerecord activejob activestorage actionpack actionview actioncable actionmailer actionmailbox actiontext]";
+
 fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
     let Some(lock) = lock else { return };
     // The needed gems' whole dependency closure, not only the needed gems
@@ -8024,8 +8130,19 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
            # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).\n  \
            spec.extension_dir = File.join(File.dirname(dir), \"extensions\", Gem::Platform.local.to_s,\n    \
              Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join(\"-\"))\n  \
-           spec.activate\n\
-         end\n"
+           spec.activate\n  \
+           # Rails' own components are activated, so a gem that depends on\n  \
+           # one resolves, but their files are taken off $LOAD_PATH: Rails'\n  \
+           # code cannot run over this tree's runtime ports (the ports\n  \
+           # answer for Rails). A gem's optional Rails integration then\n  \
+           # sees a LoadError, as it would without Rails — hashie's\n  \
+           # `require 'rails/railtie' if defined?(::Rails)` loaded the real\n  \
+           # railties, and actionpack-xml_parser then the real ActionDispatch.\n  \
+           next unless {rails}.include?(name)\n  \
+           paths = spec.full_require_paths\n  \
+           $LOAD_PATH.reject! {{ |path| paths.include?(path) }}\n\
+         end\n",
+        rails = RAILS_REPOSITORY_GEMS_RUBY
     );
     files.push(("runtime/git_gems.rb".to_string(), body));
     let facades = &mut files[idx].1;

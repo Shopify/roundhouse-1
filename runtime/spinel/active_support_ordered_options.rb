@@ -1,0 +1,187 @@
+# frozen_string_literal: true
+
+# activesupport 8.2.0.alpha (Shopify/rails 5813559f)
+# lib/active_support/ordered_options.rb, verbatim but for its
+# `require "active_support/core_ext/object/blank"` (the runtime's
+# active_support_ext answers `presence`). CRuby-only: required by
+# runtime/rails_railtie.rb, as railties' rails/railtie.rb loads it
+# (through rails/configuration), and a gem's railtie names it in its body
+# (graphql 2.6.11 `config.graphql = ActiveSupport::OrderedOptions.new`).
+module ActiveSupport
+  # Ordered Options
+  # ===============
+  #
+  # `OrderedOptions` inherits from `Hash` and provides dynamic accessor methods.
+  #
+  # With a `Hash`, key-value pairs are typically managed like this:
+  #
+  # ```
+  # h = {}
+  # h[:boy] = 'John'
+  # h[:girl] = 'Mary'
+  # h[:boy]  # => 'John'
+  # h[:girl] # => 'Mary'
+  # h[:dog]  # => nil
+  # ```
+  #
+  # Using `OrderedOptions`, the above code can be written as:
+  #
+  # ```
+  # h = ActiveSupport::OrderedOptions.new
+  # h.boy = 'John'
+  # h.girl = 'Mary'
+  # h.boy  # => 'John'
+  # h.girl # => 'Mary'
+  # h.dog  # => nil
+  # ```
+  #
+  # To raise an exception when the value is blank, append a
+  # bang to the key name, like:
+  #
+  # ```
+  # h.dog! # => raises KeyError: :dog is blank
+  # ```
+  #
+  class OrderedOptions < Hash
+    alias_method :_get, :[] # preserve the original #[] method
+    protected :_get # make it protected
+
+    def []=(key, value)
+      super(key.to_sym, value)
+    end
+
+    def [](key)
+      super(key.to_sym)
+    end
+
+    def dig(key, *identifiers)
+      super(key.to_sym, *identifiers)
+    end
+
+    def method_missing(method, *args)
+      if method.end_with?("=")
+        self[method.name.chomp("=")] = args.first
+      elsif method.end_with?("!")
+        name_string = method.name.chomp("!")
+        self[name_string].presence || raise(KeyError.new(":#{name_string} is blank"))
+      else
+        self[method.name]
+      end
+    end
+
+    def respond_to_missing?(name, include_private)
+      true
+    end
+
+    def extractable_options?
+      true
+    end
+
+    def inspect
+      "#<#{self.class.name} #{super}>"
+    end
+  end
+
+  # Inheritable Options
+  # ===================
+  #
+  # `InheritableOptions` provides a constructor to build an OrderedOptions
+  # hash inherited from another hash.
+  #
+  # Use this if you already have some hash and you want to create a new one based on it.
+  #
+  # ```
+  # h = ActiveSupport::InheritableOptions.new({ girl: 'Mary', boy: 'John' })
+  # h.girl # => 'Mary'
+  # h.boy  # => 'John'
+  # ```
+  #
+  # If the existing hash has string keys, call Hash#symbolize_keys on it.
+  #
+  # ```
+  # h = ActiveSupport::InheritableOptions.new({ 'girl' => 'Mary', 'boy' => 'John' }.symbolize_keys)
+  # h.girl # => 'Mary'
+  # h.boy  # => 'John'
+  # ```
+  class InheritableOptions < OrderedOptions
+    def initialize(parent = nil)
+      @parent = parent
+      if @parent.kind_of?(OrderedOptions)
+        # use the faster _get when dealing with OrderedOptions
+        super() { |h, k| @parent._get(k) }
+      elsif @parent
+        super() { |h, k| @parent[k] }
+      else
+        super()
+        @parent = {}
+      end
+    end
+
+    def freeze
+      return self if frozen?
+
+      @own_keys = own_keys.dup.freeze
+      self.default_proc = nil
+      @parent.freeze
+      replace(to_h)
+      super
+    end
+
+    def to_h
+      @parent.to_h.merge(self)
+    end
+
+    def ==(other)
+      other.is_a?(Hash) && to_h == other.to_h
+    end
+
+    def inspect
+      "#<#{self.class.name} #{to_h.inspect}>"
+    end
+
+    def to_s
+      to_h.to_s
+    end
+
+    def pretty_print(pp)
+      pp.pp_hash(to_h)
+    end
+
+    def key?(key)
+      super || @parent.key?(key)
+    end
+
+    alias_method :_own_keys, :keys
+    private :_own_keys
+
+    def keys
+      @parent.keys | super
+    end
+
+    def overridden?(key)
+      !!(@parent && @parent.key?(key) && own_key?(key.to_sym))
+    end
+
+    def inheritable_copy
+      self.class.new(self)
+    end
+
+    def to_a
+      entries
+    end
+
+    def each(&block)
+      to_h.each(&block)
+      self
+    end
+
+    private
+      def own_key?(key)
+        own_keys.include?(key.to_sym)
+      end
+
+      def own_keys
+        @own_keys || _own_keys
+      end
+  end
+end
