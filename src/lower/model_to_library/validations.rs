@@ -441,6 +441,53 @@ fn validation_rule_to_calls(attr: &Symbol, rule: &ValidationRule, attr_ty: Optio
             };
             vec![guarded]
         }
+        // `validates_with K, opts` → `K.new(opts).validate(self)`, under
+        // the same Symbol `if:` / `unless:` guards as `validate :m`.
+        // Rails builds the instance once, when the class body runs; here
+        // it is built per validation run, so check_validity! raises at
+        // the first `valid?` rather than at load.
+        ValidationRule::With { validator, options, if_method, unless_method } => {
+            let s = Span::synthetic();
+            let bare = |m: &Symbol| {
+                Expr::new(
+                    s,
+                    ExprNode::Send { recv: None, method: m.clone(), args: Vec::new(), block: None, parenthesized: false },
+                )
+            };
+            let options = options.clone().unwrap_or_else(|| {
+                Expr::new(s, ExprNode::Hash { entries: Vec::new(), kwargs: false })
+            });
+            let instance = Expr::new(
+                s,
+                ExprNode::Send {
+                    recv: Some(validator.clone()),
+                    method: Symbol::from("new"),
+                    args: vec![options],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            let call = Expr::new(
+                s,
+                ExprNode::Send {
+                    recv: Some(instance),
+                    method: Symbol::from("validate"),
+                    args: vec![Expr::new(s, ExprNode::SelfRef)],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            let nil = || Expr::new(s, ExprNode::Lit { value: Literal::Nil });
+            let guarded = match unless_method {
+                Some(c) => Expr::new(s, ExprNode::If { cond: bare(c), then_branch: nil(), else_branch: call }),
+                None => call,
+            };
+            let guarded = match if_method {
+                Some(c) => Expr::new(s, ExprNode::If { cond: bare(c), then_branch: guarded, else_branch: nil() }),
+                None => guarded,
+            };
+            vec![guarded]
+        }
         ValidationRule::Uniqueness { .. } => {
             // Not yet exercised by real-blog; lands when a fixture forces the issue.
             Vec::new()

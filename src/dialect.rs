@@ -497,6 +497,18 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unless_method: Option<Symbol>,
     },
+    /// `validates_with Validator, opts`: `validator` is the class
+    /// constant as written, `options` the options hash passed to its
+    /// `new` (every option, conditions included, as Rails passes them).
+    With {
+        validator: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<Expr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_method: Option<Symbol>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unless_method: Option<Symbol>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -197,6 +197,10 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
         ValidationRule::Custom { method, .. } => {
             out.push(Check::Custom { method: method.clone() });
         }
+        // The validator class is a Ruby-family runtime port
+        // (runtime/spinel/active_model_validator.rb); the check tables
+        // have no shape for it.
+        ValidationRule::With { .. } => {}
     }
 }
 

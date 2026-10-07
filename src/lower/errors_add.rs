@@ -12,7 +12,13 @@
 //! `self` (a model adding to its own errors during validation) or on
 //! another expression (`record.errors.add(...)` from a controller —
 //! lobsters' duplicate-comment guard). The rewrite keeps the receiver,
-//! so both land on the same accumulator. A dynamic (non-symbol) field
+//! so both land on the same accumulator. A local or parameter field
+//! (an EachValidator's `record.errors.add(attribute, "msg")`) grounds
+//! to `attribute.to_s == "base" ? "msg" : "#{ActiveSupport.humanize(
+//! attribute.to_s)} msg"`, the same text evaluated at run time. A
+//! Symbol message is an error type: the count-free entries of Rails'
+//! default en.yml (`:blank` → "can't be blank", `:taken`, ...) bake to
+//! their text. Any other field expression, error type or option set
 //! still joins the residue ledger — the accumulator is an
 //! `Array[String]`, which has no `add`, so on strict targets each such
 //! site is a named per-target gap rather than a silent compile error
@@ -30,6 +36,7 @@ use crate::app::App;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
+use crate::ty::Ty;
 
 /// Rewrite self-receiver `errors.add` sends across every hook body.
 /// Returns the residue ledger: recognizable `errors.add` sites left
@@ -88,14 +95,19 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     if !recognized {
         return;
     }
-    let matches = matches!(
-        &*expr.node,
-        ExprNode::Send { args, .. }
-            if !args.is_empty()
-                && args.len() <= 2
-                && matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } })
-    );
-    if !matches {
+    // The field: a Symbol literal is baked at lower time; a local or
+    // parameter (`errors.add(attribute, …)` in an EachValidator's
+    // `validate_each`) is humanized at run time. Anything else stays
+    // residue: the field would be evaluated twice.
+    let field_kind = match &*expr.node {
+        ExprNode::Send { args, .. } if !args.is_empty() && args.len() <= 2 => match &*args[0].node {
+            ExprNode::Lit { value: Literal::Sym { .. } } => Some(true),
+            ExprNode::Var { .. } => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(static_field) = field_kind else {
         let reason = match &*expr.node {
             ExprNode::Send { args, .. }
                 if args.first().is_some_and(
@@ -107,15 +119,12 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         };
         diags.push(residue(expr, reason));
         return;
-    }
+    };
     let span = expr.span;
     let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
     let ExprNode::Send { recv, args, .. } = node else { unreachable!() };
     let mut args = args.into_iter();
     let field_expr = args.next().expect("checked non-empty");
-    let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
-        unreachable!()
-    };
     let mut msg = args.next().map(fold_str_concat);
     // Rails' options spelling: `errors.add(:field, message: "…")`.
     // The kwargs hash IS the message carrier — unwrap a sole
@@ -134,8 +143,25 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
             unreachable!()
         };
         msg = Some(fold_str_concat(entries.into_iter().next().unwrap().1));
-    } else if matches!(msg.as_ref().map(|m| &*m.node), Some(ExprNode::Hash { .. })) {
-        diags.push(residue(expr, "unrecognized arg shape"));
+    }
+    // A Symbol message is an error TYPE, which Rails translates
+    // (`errors.add(attr, :blank)` reads "can't be blank"). The
+    // count-free entries of activemodel's and activerecord's default
+    // en.yml bake to their text; any other type stays residue.
+    let symbol_type = match msg.as_ref().map(|m| &*m.node) {
+        Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.clone()),
+        _ => None,
+    };
+    let translated = symbol_type.as_ref().and_then(|t| default_error_message(t.as_str()));
+    let unrecognized = matches!(msg.as_ref().map(|m| &*m.node), Some(ExprNode::Hash { .. }))
+        || (symbol_type.is_some() && translated.is_none());
+    if unrecognized {
+        let reason = if symbol_type.is_some() {
+            "error type without a default message"
+        } else {
+            "unrecognized arg shape"
+        };
+        diags.push(residue(&Expr::new(span, ExprNode::Seq { exprs: vec![] }), reason));
         *expr.node = ExprNode::Send {
             recv,
             method: Symbol::from("add"),
@@ -145,38 +171,74 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         };
         return;
     }
-    let humanized = super::model_to_library::validations::humanize(field.as_str());
-    let message: Expr = if field.as_str() == "base" {
-        // :base attaches the message to the record, not a field.
-        msg.unwrap_or_else(|| {
-            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: "is invalid".into() } })
-        })
-    } else {
-        match msg {
-            Some(m) => match &*m.node {
-                ExprNode::Lit { value: Literal::Str { value } } => Expr::new(
-                    span,
-                    ExprNode::Lit {
-                        value: Literal::Str { value: format!("{humanized} {value}") },
-                    },
-                ),
-                _ => Expr::new(
-                    span,
-                    ExprNode::StringInterp {
-                        parts: vec![
-                            InterpPart::Text { value: format!("{humanized} ") },
-                            InterpPart::Expr { expr: m },
-                        ],
-                    },
-                ),
-            },
-            None => Expr::new(
-                span,
-                ExprNode::Lit {
-                    value: Literal::Str { value: format!("{humanized} is invalid") },
+    if let Some(text) = translated {
+        msg = Some(str_lit(span, text));
+    }
+    let message: Expr = if static_field {
+        let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
+            unreachable!()
+        };
+        let humanized = super::model_to_library::validations::humanize(field.as_str());
+        if field.as_str() == "base" {
+            // :base attaches the message to the record, not a field.
+            msg.unwrap_or_else(|| str_lit(span, "is invalid"))
+        } else {
+            match msg {
+                Some(m) => match &*m.node {
+                    ExprNode::Lit { value: Literal::Str { value } } => {
+                        str_lit(span, &format!("{humanized} {value}"))
+                    }
+                    _ => Expr::new(
+                        span,
+                        ExprNode::StringInterp {
+                            parts: vec![
+                                InterpPart::Text { value: format!("{humanized} ") },
+                                InterpPart::Expr { expr: m },
+                            ],
+                        },
+                    ),
                 },
-            ),
+                None => str_lit(span, &format!("{humanized} is invalid")),
+            }
         }
+    } else {
+        // `attribute.to_s == "base" ? msg : "#{ActiveSupport.humanize(
+        // attribute.to_s)} #{msg}"`: Rails' full message is the bare
+        // message on :base and "<human attribute name> <message>"
+        // otherwise. The field is a local, so reading it twice is free.
+        let msg = msg.unwrap_or_else(|| str_lit(span, "is invalid"));
+        let field_s = typed(
+            span,
+            ExprNode::Send { recv: Some(field_expr.clone()), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false },
+            Ty::Str,
+        );
+        let is_base = typed(
+            span,
+            ExprNode::Send { recv: Some(field_s.clone()), method: Symbol::from("=="), args: vec![str_lit(span, "base")], block: None, parenthesized: false },
+            Ty::Bool,
+        );
+        let human = typed(
+            span,
+            ExprNode::Send {
+                recv: Some(typed(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }, Ty::Class { id: crate::ident::ClassId(Symbol::from("ActiveSupport")), args: vec![] })),
+                method: Symbol::from("humanize"),
+                args: vec![field_s],
+                block: None,
+                parenthesized: true,
+            },
+            Ty::Str,
+        );
+        let tail = match &*msg.node {
+            ExprNode::Lit { value: Literal::Str { value } } => InterpPart::Text { value: format!(" {value}") },
+            _ => InterpPart::Expr { expr: msg.clone() },
+        };
+        let mut parts = vec![InterpPart::Expr { expr: human }];
+        if matches!(tail, InterpPart::Expr { .. }) {
+            parts.push(InterpPart::Text { value: " ".into() });
+        }
+        parts.push(tail);
+        let full = typed(span, ExprNode::StringInterp { parts }, Ty::Str);
+        typed(span, ExprNode::If { cond: is_base, then_branch: msg, else_branch: full }, Ty::Str)
     };
     // `<<` returns the accumulator it appends to (Array#<< / the errors
     // collection), so the synthesized send's result type is the
@@ -193,4 +255,39 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         parenthesized: false,
     };
     expr.ty = recv_ty;
+}
+
+fn str_lit(span: crate::span::Span, value: &str) -> Expr {
+    typed(span, ExprNode::Lit { value: Literal::Str { value: value.to_string() } }, Ty::Str)
+}
+
+fn typed(span: crate::span::Span, node: ExprNode, ty: Ty) -> Expr {
+    let mut e = Expr::new(span, node);
+    e.ty = Some(ty);
+    e
+}
+
+/// The count-free messages of activemodel 8.2.0.alpha's
+/// lib/active_model/locale/en.yml and activerecord's
+/// lib/active_record/locale/en.yml (`required`, `taken`), by error type.
+/// `confirmation` interpolates the attribute and the length/number
+/// types a count, so they are not here.
+fn default_error_message(error_type: &str) -> Option<&'static str> {
+    Some(match error_type {
+        "inclusion" => "is not included in the list",
+        "exclusion" => "is reserved",
+        "invalid" => "is invalid",
+        "accepted" => "must be accepted",
+        "empty" => "can't be empty",
+        "blank" => "can't be blank",
+        "present" => "must be blank",
+        "password_too_long" => "is too long",
+        "not_a_number" => "is not a number",
+        "not_an_integer" => "must be an integer",
+        "odd" => "must be odd",
+        "even" => "must be even",
+        "required" => "must exist",
+        "taken" => "has already been taken",
+        _ => return None,
+    })
 }
