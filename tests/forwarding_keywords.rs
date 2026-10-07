@@ -320,15 +320,26 @@ fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
         .run_ruby("s = ProbeStore.new; s.send(:write_entry, 'k', ActiveSupport::Cache::Entry.new(7)); puts s.send(:read_entry, 'k').value");
     run.assert_passes();
     assert_eq!(run.stdout, "7\n");
+    // The method's own block, passed on: what the implicit pass does.
+    let source = "class Probe < StandardError; def initialize(&blk); options={}; super(**options, &blk); end; end";
+    native_result(source, "puts Probe.new.message", "Probe\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe.rb", source).run_ruby("puts Probe.new.message");
+    run.assert_passes();
+    assert_eq!(run.stdout, "Probe\n");
     // Not shown to reach a native ABI, so refused as an ordinary super:
     // the runtime's Logger is no port; a class with no recorded
     // superclass; a relative superclass name an app class could mean;
-    // the app reopening a core ancestor with the method.
+    // the app reopening a core ancestor with the method; a block the
+    // emitted `super` would not pass.
     for source in [
         "class Probe < Logger; def add(severity, message = nil, progname = nil, **options); super(severity, message, progname, **options); end; end",
         "class Probe; def initialize; options={}; super(**options); end; end",
         "module Shop; class Base; end; end; module Shop; class Probe < Base; def initialize; options={}; super(**options); end; end; end; class Base; end",
         "class Object; def probe_hook(**o); o.size; end; end; class Probe < StandardError; def probe_hook; options={}; super(**options); end; end",
+        // A block the IR's `super` does not carry: a literal one, or a
+        // block parameter the method reassigns.
+        "class Probe < StandardError; def initialize; options={}; super(**options) { 1 }; end; end",
+        "class Probe < StandardError; def initialize(&blk); blk = proc { 2 }; options={}; super(**options, &blk); end; end",
     ] {
         let (_, errors) = emit_and_run::real_blog()
             .write("app/lib/probe.rb", source)

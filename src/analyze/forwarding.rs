@@ -900,7 +900,90 @@ fn super_leaves_source(
         return false;
     };
     enclosing.receiver == MethodReceiver::Instance
+        && super_block_is_carried(contracts.app, enclosing, e)
         && contracts.super_leaves_source(owner, &enclosing.name)
+}
+
+/// `ExprNode::Super` holds no block: ingest keeps neither `super(…) { … }`,
+/// nor `super(…, &other)`, nor a zsuper's literal block. Kept as written,
+/// the Ruby tree's `super` then passes the method's own block implicitly,
+/// which is the source's binding only when the source passes no block, or
+/// passes the method's own block parameter, never reassigned (or `&`).
+/// Read from the source text of the `super`, re-parsed inside a `def`.
+fn super_block_is_carried(app: &App, enclosing: &MethodDef, e: &Expr) -> bool {
+    if e.span.is_synthetic() {
+        return false;
+    }
+    let Some(source) = (e.span.file.0 as usize)
+        .checked_sub(1)
+        .and_then(|i| app.sources.get(i))
+    else {
+        return false;
+    };
+    let Some(text) = source.text.get(e.span.start as usize..e.span.end as usize) else {
+        return false;
+    };
+    if !text.trim_start().starts_with("super") {
+        return false;
+    }
+    let block = ["(...)", "(*, **, &)"].iter().find_map(|params| {
+        let wrapped = format!("def __rh_super_probe{params}\n{text}\nend\n");
+        let parsed = ruby_prism::parse(wrapped.as_bytes());
+        if parsed.errors().next().is_some() {
+            return None;
+        }
+        let body = parsed.node().as_program_node()?.statements().body().iter().next()?;
+        let def = body.as_def_node()?;
+        let statement = def.body()?.as_statements_node()?.body().iter().next()?;
+        if let Some(zsuper) = statement.as_forwarding_super_node() {
+            return Some(zsuper.block().map(|_| None));
+        }
+        let call = statement.as_super_node()?;
+        Some(call.block().map(|block| {
+            let argument = block.as_block_argument_node()?;
+            Some(match argument.expression() {
+                None => None,
+                // Outside its method a local reads as a bare call.
+                Some(value) => Some(match value.as_local_variable_read_node() {
+                    Some(local) => String::from_utf8_lossy(local.name().as_slice()).into_owned(),
+                    None => {
+                        let call = value.as_call_node()?;
+                        if call.receiver().is_some() || call.arguments().is_some() || call.block().is_some() {
+                            return None;
+                        }
+                        String::from_utf8_lossy(call.name().as_slice()).into_owned()
+                    }
+                }),
+            })
+        }))
+    });
+    match block {
+        // Not one `super` statement as read.
+        None => false,
+        Some(None) => true,
+        // A literal block, or `&` of something else than a local.
+        Some(Some(None)) => false,
+        // `&`: the method's anonymous block.
+        Some(Some(Some(None))) => enclosing.has_anonymous_block,
+        Some(Some(Some(Some(name)))) => {
+            enclosing.block_param.as_ref().is_some_and(|p| p.name.as_str() == name)
+                && !assigns(&enclosing.body, &Symbol::from(name.as_str()))
+        }
+    }
+}
+
+fn assigns(e: &Expr, name: &Symbol) -> bool {
+    let here = match &*e.node {
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n == name,
+        ExprNode::MultiAssign { targets, .. } => targets
+            .iter()
+            .any(|t| matches!(t, LValue::Var { name: n, .. } if n == name)),
+        _ => false,
+    };
+    let mut found = here;
+    e.node.for_each_child(&mut |c| found = found || assigns(c, name));
+    found
 }
 
 pub(crate) fn keyword_refusal(span: Span, policy: KeywordPolicy) -> Diagnostic {
