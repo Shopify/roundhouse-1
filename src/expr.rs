@@ -538,8 +538,17 @@ pub enum ExprNode {
     /// or `super(args...)` (args = Some(vec)). Distinct from Send with
     /// an implicit receiver because the dispatch target is the parent
     /// class's method, not the current one.
+    ///
+    /// `block` is the block the source passes, in the same slot shape
+    /// as `Send::block`: a `Lambda` for a literal `{ }`/`do end`, any
+    /// other expression for `&expr` (a `Var` for `&blk`, `__blk` for an
+    /// anonymous `&`, `Lit::Nil` for `&nil`). `None` means the source
+    /// passes no block, so Ruby's super hands on the method's own block
+    /// implicitly — which a `Some` must never be rewritten to.
     Super {
         args: Option<Vec<Expr>>,
+        #[serde(default)]
+        block: Option<Expr>,
     },
     /// `next` inside an iterator block. `value` is `None` for bare
     /// `next`, `Some(expr)` for `next val`. Divergent control flow
@@ -846,11 +855,14 @@ impl ExprNode {
                 f(fallback);
             }
             ExprNode::Return { value } => f(value),
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, block } => {
                 if let Some(args) = args {
                     for a in args {
                         f(a);
                     }
+                }
+                if let Some(b) = block {
+                    f(b);
                 }
             }
             ExprNode::Next { value } | ExprNode::Break { value } => {
@@ -1052,11 +1064,14 @@ impl ExprNode {
                 f(fallback);
             }
             ExprNode::Return { value } => f(value),
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, block } => {
                 if let Some(args) = args {
                     for a in args {
                         f(a);
                     }
+                }
+                if let Some(b) = block {
+                    f(b);
                 }
             }
             ExprNode::Next { value } | ExprNode::Break { value } => {

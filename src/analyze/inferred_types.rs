@@ -150,11 +150,14 @@ fn collect_types_expr(e: &Expr, out: &mut Vec<(crate::span::Span, crate::ty::Ty)
         }
         ExprNode::Raise { value } => collect_types_expr(value, out),
         ExprNode::Return { value } => collect_types_expr(value, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, block } => {
             if let Some(args) = args {
                 for a in args {
                     collect_types_expr(a, out);
                 }
+            }
+            if let Some(b) = block {
+                collect_types_expr(b, out);
             }
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {

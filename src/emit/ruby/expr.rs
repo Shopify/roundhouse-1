@@ -467,13 +467,29 @@ fn emit_node(n: &ExprNode) -> String {
                 format!("return {}", paren_multiline(emit_expr(value)))
             }
         }
-        ExprNode::Super { args } => match args {
-            None => "super".to_string(),
-            Some(args) => {
-                let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
-                format!("super({})", args_s.join(", "))
+        ExprNode::Super { args, block } => {
+            let base = match args {
+                None => "super".to_string(),
+                Some(args) => {
+                    let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
+                    format!("super({})", args_s.join(", "))
+                }
+            };
+            match block {
+                None => base,
+                // A zsuper takes only a literal block; `emit_do_block`
+                // would turn a forward on bare `super` into `super(&b)`,
+                // which passes no arguments.
+                Some(b) if args.is_none() && !matches!(&*b.node, ExprNode::Lambda { .. }) => {
+                    crate::emit::diagnostics::report_unsupported(
+                        crate::span::Span::synthetic(), "ruby", "implicit-argument super with a forwarded block",
+                        "Ruby source has no such form; `super(&b)` would pass no arguments",
+                    );
+                    base
+                }
+                Some(b) => emit_do_block(&base, b),
             }
-        },
+        }
         ExprNode::Next { value } => match value {
             None => "next".to_string(),
             Some(v) => format!("next {}", paren_multiline(emit_expr(v))),

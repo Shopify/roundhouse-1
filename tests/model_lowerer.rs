@@ -1358,7 +1358,7 @@ fn collect_untyped_lowered(
         ExprNode::Return { value } => {
             collect_untyped_lowered(value, &format!("{path}/return.value"), out)
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for (i, a) in args.iter().enumerate() {
                     collect_untyped_lowered(a, &format!("{path}/super.arg[{i}]"), out);

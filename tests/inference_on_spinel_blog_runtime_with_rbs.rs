@@ -178,7 +178,7 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
         ExprNode::Return { value } => {
             collect_untyped(value, &format!("{path}/return.value"), out)
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for (i, a) in args.iter().enumerate() {
                     collect_untyped(a, &format!("{path}/super.arg[{i}]"), out);

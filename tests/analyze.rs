@@ -682,7 +682,7 @@ fn action_aggregate_equals_subtree_fold() {
             }
             ExprNode::Raise { value } => fold(value, acc),
             ExprNode::Return { value } => fold(value, acc),
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, .. } => {
                 if let Some(args) = args {
                     for a in args {
                         fold(a, acc);
@@ -1023,7 +1023,7 @@ fn collect_ivar_reads(expr: &roundhouse::expr::Expr, out: &mut Vec<(Symbol, Opti
         }
         ExprNode::Raise { value } => collect_ivar_reads(value, out),
         ExprNode::Return { value } => collect_ivar_reads(value, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args {
                     collect_ivar_reads(a, out);
@@ -1228,7 +1228,7 @@ fn collect_bare_name_sends(
         }
         ExprNode::Raise { value } => collect_bare_name_sends(value, out),
         ExprNode::Return { value } => collect_bare_name_sends(value, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args {
                     collect_bare_name_sends(a, out);

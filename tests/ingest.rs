@@ -1610,7 +1610,7 @@ fn defined_extended_targets_ingest_and_round_trip() {
             "defined?(Widget)" => assert!(matches!(&*operand.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["Widget"])),
             "defined?(Widget::Kind)" => assert!(matches!(&*operand.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>() == ["Widget", "Kind"])),
             "defined?(widget.kind)" => assert!(matches!(&*operand.node, ExprNode::Send { recv: Some(_), method, .. } if method.as_str() == "kind")),
-            _ => assert!(matches!(&*operand.node, ExprNode::Super { args: None })),
+            _ => assert!(matches!(&*operand.node, ExprNode::Super { args: None, .. })),
         }
         let emitted = emit_expr(&expr);
         assert_eq!(emit_expr(&parse(&emitted)), emitted);

@@ -31,7 +31,7 @@ fn rewrite(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut rewrite);
     let span = expr.span;
     let only_arg = match &mut *expr.node {
-        ExprNode::Super { args: Some(args) } if args.len() == 1 => {
+        ExprNode::Super { args: Some(args), block: None } if args.len() == 1 => {
             match &mut *args[0].node {
                 ExprNode::Hash { entries, .. } if entries.len() == 1 => {
                     let (k, v) = &mut entries[0];

@@ -148,11 +148,14 @@ impl super::Analyzer {
 
             ExprNode::Return { value } => self.visit_effects(value, ctx, out),
 
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, block } => {
                 if let Some(args) = args {
                     for a in args {
                         self.visit_effects(a, ctx, out);
                     }
+                }
+                if let Some(b) = block {
+                    self.visit_effects(b, ctx, out);
                 }
             }
 

@@ -380,7 +380,7 @@ fn find_only_call(stmts: &[&Expr]) -> Option<usize> {
         };
         match &*value.node {
             ExprNode::Send { recv: None, method, .. } => method.as_str() == "_as_json_only",
-            ExprNode::Super { args: Some(_) } => true,
+            ExprNode::Super { args: Some(_), block: None } => true,
             _ => false,
         }
     })
@@ -393,7 +393,7 @@ fn only_arg_local(stmt: &Expr) -> Option<Symbol> {
     };
     let arg = match &*value.node {
         ExprNode::Send { args, .. } if args.len() == 1 => &args[0],
-        ExprNode::Super { args: Some(args) } if args.len() == 1 => &args[0],
+        ExprNode::Super { args: Some(args), block: None } if args.len() == 1 => &args[0],
         _ => return None,
     };
     // `super(only: attrs)` hands over a one-entry kwarg Hash; the

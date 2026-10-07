@@ -1485,7 +1485,7 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
             collect_class_refs(fallback, out);
         }
         ExprNode::Return { value } => collect_class_refs(value, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args {
                     collect_class_refs(a, out);
@@ -1766,8 +1766,9 @@ fn rewrite_free(e: &Expr) -> Expr {
             end: end.as_ref().map(rewrite_free),
             exclusive: *exclusive,
         },
-        ExprNode::Super { args } => ExprNode::Super {
+        ExprNode::Super { args, block } => ExprNode::Super {
             args: args.as_ref().map(|v| v.iter().map(rewrite_free).collect()),
+            block: block.as_ref().map(rewrite_free),
         },
         ExprNode::Cast { value, target_ty } => ExprNode::Cast {
             value: rewrite_free(value),
@@ -1858,12 +1859,15 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
             block: block.as_ref().map(|b| rewrite(b, super_method)),
             parenthesized: *parenthesized,
         },
-        ExprNode::Super { args } => match super_method {
+        ExprNode::Super { args, block } => match super_method {
             None => {
                 let rewritten_args: Option<Vec<Expr>> = args
                     .as_ref()
                     .map(|v| v.iter().map(|a| rewrite(a, None)).collect());
-                ExprNode::Super { args: rewritten_args }
+                ExprNode::Super {
+                    args: rewritten_args,
+                    block: block.as_ref().map(|b| rewrite(b, None)),
+                }
             }
             Some(super_method) => {
                 let super_recv = Expr::new(

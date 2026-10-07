@@ -1149,6 +1149,9 @@ pub struct AssocRegistry {
     /// Declining leaves the pre-existing NoMethodError-on-Array, which is
     /// loud and locatable. Wrong rows are neither.
     has_many_unseedable: crate::det::HashSet<(ClassId, Symbol)>,
+    /// The association names in `has_many_unseedable`, for the
+    /// owner-less question `is_unseedable(None, _)` asks.
+    has_many_unseedable_names: crate::det::HashSet<Symbol>,
     /// `(association name, extension method)` for every `has_many :x do
     /// def m … end end` in the app. The model lowerer FLATTENS those onto
     /// the owner as `<assoc>_<method>` instance methods
@@ -1201,7 +1204,10 @@ impl AssocRegistry {
     /// ambiguous name still qualifies (the rewriter may resolve it
     /// from the owner's type).
     fn is_has_many_name(&self, name: &Symbol) -> bool {
-        self.has_many_fk.keys().any(|(_, a)| a == name)
+        // `has_many_by_name` gains a key exactly when `has_many_fk` gains
+        // an entry under that name (`build_assoc_registry`), so this is
+        // the same answer without scanning every has_many per call.
+        self.has_many_by_name.contains_key(name)
     }
     fn has_many_by_name(&self, assoc: &Symbol) -> Option<&(ClassId, Symbol)> {
         self.has_many_by_name.get(assoc).and_then(|o| o.as_ref())
@@ -1218,7 +1224,7 @@ impl AssocRegistry {
     fn is_unseedable(&self, owner: Option<&ClassId>, assoc: &Symbol) -> bool {
         match owner {
             Some(m) => self.has_many_unseedable.contains(&(m.clone(), assoc.clone())),
-            None => self.has_many_unseedable.iter().any(|(_, a)| a == assoc),
+            None => self.has_many_unseedable_names.contains(assoc),
         }
     }
 }
@@ -1332,6 +1338,7 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
                         || scope.as_ref().is_some_and(|s| !scope_is_row_preserving(s))
                     {
                         reg.has_many_unseedable.insert((m.name.clone(), name.clone()));
+                        reg.has_many_unseedable_names.insert(name.clone());
                     }
                     let t = reg.table_for(target);
                     reg.join_tails.insert(

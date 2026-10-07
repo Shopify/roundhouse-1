@@ -328,8 +328,9 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
         ExprNode::Return { value } => ExprNode::Return {
             value: rewrite_expr(value, registry, class_name),
         },
-        ExprNode::Super { args: Some(args) } => ExprNode::Super {
-            args: Some(args.iter().map(|a| rewrite_expr(a, registry, class_name)).collect()),
+        ExprNode::Super { args, block } => ExprNode::Super {
+            args: args.as_ref().map(|args| args.iter().map(|a| rewrite_expr(a, registry, class_name)).collect()),
+            block: block.as_ref().map(|b| rewrite_expr(b, registry, class_name)),
         },
         ExprNode::Next { value: Some(v) } => ExprNode::Next {
             value: Some(rewrite_expr(v, registry, class_name)),

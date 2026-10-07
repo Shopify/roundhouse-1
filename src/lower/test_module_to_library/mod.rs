@@ -706,7 +706,7 @@ fn build_library_class(
         .collect();
     if native_assertions {
         if let Some(callbacks) = &tm.setup {
-            let parent = Expr::new(callbacks.span, ExprNode::Super { args: Some(vec![]) });
+            let parent = Expr::new(callbacks.span, ExprNode::Super { args: Some(vec![]), block: None });
             let body = prepend_setup(&parent, callbacks);
             let body = crate::lower::controller_to_library::rewrites::rewrite_route_helpers(
                 &body, &helper_shadows, route_id_segments);

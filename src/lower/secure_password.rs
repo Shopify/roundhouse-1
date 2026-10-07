@@ -520,7 +520,9 @@ fn super_in_a_block(e: &Expr, in_block: bool) -> bool {
 fn super_to_helper(e: &mut Expr, helper: &Symbol, params: &[Symbol]) -> usize {
     let mut count = 0;
     e.node.for_each_child_mut(&mut |c| count += super_to_helper(c, helper, params));
-    let ExprNode::Super { args } = &*e.node else { return count };
+    let ExprNode::Super { args, block } = &*e.node else { return count };
+    // The block the source passes goes to the helper as written.
+    let block = block.clone();
     // A bare `super` forwards the writer's parameter, which the helper
     // takes as its String plaintext.
     let args = args.clone().unwrap_or_else(|| {
@@ -537,7 +539,7 @@ fn super_to_helper(e: &mut Expr, helper: &Symbol, params: &[Symbol]) -> usize {
         recv: Some(sp_expr(ExprNode::SelfRef)),
         method: helper.clone(),
         args,
-        block: None,
+        block,
         parenthesized: true,
     };
     count + 1

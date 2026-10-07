@@ -40,6 +40,10 @@ require "monitor"
 require "openssl"
 require "zlib"
 require "cgi/escape"
+# Store#instrument publishes cache_<operation>.active_support through
+# ActiveSupport::Notifications, as native activesupport does. Every
+# Ruby-family tree carries the port beside this file.
+require_relative "active_support_notifications"
 
 module ActiveSupport
   # Execution-scoped state (isolated_execution_state.rb): per thread by

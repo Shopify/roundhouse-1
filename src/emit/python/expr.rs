@@ -196,7 +196,7 @@ pub(super) fn body_contains_yield(body: &Expr) -> bool {
             value.as_ref().is_some_and(body_contains_yield)
         }
         ExprNode::Splat { value } => body_contains_yield(value),
-        ExprNode::Super { args } => args
+        ExprNode::Super { args, .. } => args
             .as_ref()
             .is_some_and(|v| v.iter().any(body_contains_yield)),
         ExprNode::BoolOp { left, right, .. } => {
@@ -951,7 +951,7 @@ pub(super) fn emit_expr(e: &Expr) -> String {
         // method's own args implicitly) can't be reconstructed here without
         // the param list, so it stays a degrade until a degrade-free target
         // needs it.
-        ExprNode::Super { args: Some(args) } => {
+        ExprNode::Super { args: Some(args), .. } => {
             let method = SUPER_METHOD
                 .with(|c| c.borrow().clone())
                 .unwrap_or_else(|| "__init__".to_string());

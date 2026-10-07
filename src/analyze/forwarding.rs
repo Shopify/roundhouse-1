@@ -16,6 +16,8 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
 
+mod external;
+
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let contracts = SourceContractIndex::new(app);
@@ -69,7 +71,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                         .any(|d| &d.model == owner && d.method == method.name))
             {
                 Some("full forwarding cannot use the relation-threading argument ABI")
-            } else if contracts.unretained().contains(&method.name_span) {
+            } else if contracts.unretained(&method.name_span) {
                 Some("model method synthesis does not preserve this source declaration")
             } else {
                 None
@@ -83,9 +85,9 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 ));
             }
         }
-        walk(app, &contracts, owner, method, &method.body, &mut out);
+        walk(app, &contracts, owner, method, &method.body, &mut out, false);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            walk(app, &contracts, owner, method, default, &mut out);
+            walk(app, &contracts, owner, method, default, &mut out, false);
         }
     }
     out.extend(keyword_splats_into_nameless_rest(app, &contracts));
@@ -181,7 +183,7 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         out: &mut Vec<Diagnostic>,
     ) {
         let enclosing = context.map(|(_, m)| m);
-        if matches!(&*e.node, ExprNode::Super { args: None })
+        if matches!(&*e.node, ExprNode::Super { args: None, .. })
             && !runtime_super
             && enclosing.is_some_and(|m| selectors.contains(&m.name) && m.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest))
         {
@@ -199,7 +201,7 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         };
         let (reaches, args) = match &*e.node {
             ExprNode::Send { method, args, .. } => (named(method), args.as_slice()),
-            ExprNode::Super { args: Some(args) } => (enclosing.is_some_and(|m| named(&m.name)), args.as_slice()),
+            ExprNode::Super { args: Some(args), .. } => (enclosing.is_some_and(|m| named(&m.name)), args.as_slice()),
             _ => (false, [].as_slice()),
         };
         // A reified method reaches callers (`yield`, `&block`) no
@@ -580,9 +582,10 @@ fn walk(
     enclosing: &MethodDef,
     e: &Expr,
     out: &mut Vec<Diagnostic>,
+    in_block: bool,
 ) {
     let forwards_keywords = match &*e.node {
-        ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => args
+        ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args), .. } => args
             .iter()
             .any(|a| matches!(&*a.node, ExprNode::ForwardKeywords)),
         _ => false,
@@ -595,7 +598,7 @@ fn walk(
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
-            || contracts.unretained().contains(&enclosing.name_span)
+            || contracts.unretained(&enclosing.name_span)
             || !contracts.verified(owner)
         {
             Some("anonymous keyword forwarding source declaration cannot be verified")
@@ -613,7 +616,7 @@ fn walk(
     }
     let forwards = match &*e.node {
         ExprNode::Send { args, .. } => has_forwarding(args),
-        ExprNode::Super { args } => args
+        ExprNode::Super { args, .. } => args
             .as_ref()
             .map_or(enclosing.params.iter().any(|p| p.forwarding), |a| {
                 has_forwarding(a)
@@ -625,7 +628,11 @@ fn walk(
             Some("forwarding source has an unrepresented parameter declaration")
         } else if !enclosing.params.iter().any(|p| p.forwarding) {
             Some("forwarding call has no preserved forwarding declaration")
-        } else if native_core_destination(app, e) {
+        } else if native_core_destination(app, e)
+            || super_leaves_source(contracts, Some((owner, enclosing)), e, in_block)
+        {
+            // The packet reaches code the app does not define, which the
+            // Ruby family binds natively against `...` as written.
             None
         } else {
             contract_error(
@@ -645,7 +652,10 @@ fn walk(
         }
     }
     e.node
-        .for_each_child(&mut |c| walk(app, contracts, owner, enclosing, c, out));
+        .for_each_child(&mut |c| {
+            let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+            walk(app, contracts, owner, enclosing, c, out, in_block)
+        });
 }
 
 /// `recv.m(...)` where `recv` is typed as a Ruby core value (a Hash,
@@ -690,7 +700,7 @@ fn keyword_contract_error(
     if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
         return Some("forwarding destination has flattened keyword parameters");
     }
-    if contracts.unretained().contains(&method.name_span) {
+    if contracts.unretained(&method.name_span) {
         return Some("model method synthesis does not preserve this source declaration");
     }
     let Ok(destinations) = virtual_destinations(contracts, context, call) else {
@@ -701,7 +711,7 @@ fn keyword_contract_error(
             !accepts_keywords(candidate)
                 || candidate.unsupported_formals.is_some()
                 || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
-                || contracts.unretained().contains(&candidate.name_span)
+                || contracts.unretained(&candidate.name_span)
         })
     {
         return Some("forwarding destination has no verified keyword parameter ABI");
@@ -824,7 +834,7 @@ fn contract_error(
     if let Some(error) = declaration_error(resolved) {
         return Some(error);
     }
-    if contracts.unretained().contains(&resolved.0.name_span) {
+    if contracts.unretained(&resolved.0.name_span) {
         return Some("model method synthesis does not preserve this source declaration");
     }
     // A self-send in a base method dispatches on the actual subclass.
@@ -835,7 +845,7 @@ fn contract_error(
     };
     for candidate in candidates {
         if declaration_error(candidate).is_some()
-            || contracts.unretained().contains(&candidate.0.name_span)
+            || contracts.unretained(&candidate.0.name_span)
         {
             return Some("forwarding self-dispatch may reach an unpreserved subclass contract");
         }
@@ -867,6 +877,33 @@ pub(crate) enum KeywordPolicy {
     Legacy,
     Refuse,
     RefuseOrdinarySuper,
+    /// An ordinary `super(…, **value)` whose lookup leaves the app's
+    /// declarations for a method with the native argument ABI
+    /// (`super_leaves_source`): kept as written, which the Ruby family
+    /// binds natively; the other targets refuse it like
+    /// `RefuseOrdinarySuper`.
+    NativeSuper,
+}
+
+/// `SourceContractIndex::super_leaves_source` for a `super` written
+/// directly in an instance method's body. Inside a block it is not shown
+/// which method the `super` belongs to: `define_method` and its kin make
+/// a block a method body, and a block can be captured and passed on.
+fn super_leaves_source(
+    contracts: &SourceContractIndex<'_>,
+    context: Option<(&ClassId, &MethodDef)>,
+    e: &Expr,
+    in_block: bool,
+) -> bool {
+    let (false, ExprNode::Super { .. }, Some((owner, enclosing))) = (in_block, &*e.node, context)
+    else {
+        return false;
+    };
+    // The block the source passes is in the IR (`ExprNode::Super::block`)
+    // and the Ruby tree writes it as written, so no block shape needs a
+    // refusal here.
+    enclosing.receiver == MethodReceiver::Instance
+        && contracts.super_leaves_source(owner, &enclosing.name)
 }
 
 pub(crate) fn keyword_refusal(span: Span, policy: KeywordPolicy) -> Diagnostic {
@@ -914,10 +951,11 @@ fn keyword_calls_with_index(
         e: &Expr,
         plans: &mut HashMap<Span, KeywordPolicy>,
         fallback: bool,
+        in_block: bool,
     ) {
         let args = match &*e.node {
             ExprNode::Send { args, .. } => Some(args.as_slice()),
-            ExprNode::Super { args: Some(args) } => Some(args.as_slice()),
+            ExprNode::Super { args: Some(args), .. } => Some(args.as_slice()),
             _ => None,
         };
         if args.is_some_and(|a| {
@@ -932,9 +970,13 @@ fn keyword_calls_with_index(
                 if matches!(&*e.node, ExprNode::Super { .. })
                     && destination(app, contracts, context, e).is_none()
                 {
-                    // An absent full selector does not prove that erasing **
-                    // matches an external parent's native keyword ABI.
-                    KeywordPolicy::RefuseOrdinarySuper
+                    if super_leaves_source(contracts, context, e, in_block) {
+                        KeywordPolicy::NativeSuper
+                    } else {
+                        // An absent full selector does not prove that erasing
+                        // ** matches an external parent's native keyword ABI.
+                        KeywordPolicy::RefuseOrdinarySuper
+                    }
                 } else {
                     KeywordPolicy::Legacy
                 }
@@ -946,6 +988,12 @@ fn keyword_calls_with_index(
                     } else {
                         KeywordPolicy::Refuse
                     }
+                } else if resolved.is_none()
+                    && super_leaves_source(contracts, context, e, in_block)
+                {
+                    // No full forwarder is reached: the lookup leaves the
+                    // app's declarations.
+                    KeywordPolicy::NativeSuper
                 } else if resolved.is_none()
                     || virtual_destinations(contracts, context, e).map_or(true, |v| {
                         v.iter().any(|(m, _)| m.params.iter().any(|p| p.forwarding))
@@ -969,8 +1017,10 @@ fn keyword_calls_with_index(
                 })
                 .or_insert(policy);
         }
-        e.node
-            .for_each_child(&mut |c| visit(app, contracts, context, c, plans, fallback));
+        let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+        e.node.for_each_child(&mut |c| {
+            visit(app, contracts, context, c, plans, fallback, in_block)
+        });
     }
     let mut plans = HashMap::default();
     for (owner, method) in methods(app) {
@@ -981,6 +1031,7 @@ fn keyword_calls_with_index(
             &method.body,
             &mut plans,
             false,
+            false,
         );
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
             visit(
@@ -990,11 +1041,12 @@ fn keyword_calls_with_index(
                 default,
                 &mut plans,
                 false,
+                false,
             );
         }
     }
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| {
-        visit(app, contracts, None, e, &mut plans, true)
+        visit(app, contracts, None, e, &mut plans, true, false)
     });
     plans
 }
@@ -1127,7 +1179,13 @@ struct SourceContractIndex<'a> {
     virtual_owners: Vec<&'a ClassId>,
     full_selectors: HashSet<Symbol>,
     app: &'a App,
-    unretained: OnceCell<HashSet<Span>>,
+    /// Names declared as a `module` in some fragment.
+    modules: HashSet<ClassId>,
+    /// Names whose methods are not all source declarations: models and
+    /// controllers (synthesized readers, actions, relation entry points)
+    /// and library classes a lowering generated.
+    synthesized: HashSet<ClassId>,
+    unretained: OnceCell<Unretained<'a>>,
     /// Reverse lookup edges: the fragments naming a class as their
     /// superclass or including it as a module.
     children: HashMap<ClassId, Vec<ClassId>>,
@@ -1152,6 +1210,8 @@ impl<'a> SourceContractIndex<'a> {
             virtual_owners: Vec::new(),
             full_selectors: HashSet::default(),
             app,
+            modules: HashSet::default(),
+            synthesized: HashSet::default(),
             unretained: OnceCell::new(),
             children: HashMap::default(),
             owner_positions: HashMap::default(),
@@ -1162,6 +1222,12 @@ impl<'a> SourceContractIndex<'a> {
         let mut class_owners = HashSet::default();
         for class in classes(app) {
             class_owners.insert(class.name.clone());
+            if class.is_module {
+                index.modules.insert(class.name.clone());
+            }
+            if class.origin.is_some() {
+                index.synthesized.insert(class.name.clone());
+            }
             index.add_fragment(
                 &class.name,
                 class.parent.as_ref(),
@@ -1170,6 +1236,10 @@ impl<'a> SourceContractIndex<'a> {
             index.add_methods(&class.name, class.methods.iter(), false);
             index.virtual_owners.push(&class.name);
         }
+        index.synthesized.extend(app.models.iter().map(|m| m.name.clone()));
+        index.synthesized.extend(app.controllers.iter().map(|c| c.name.clone()));
+        // Test classes are lowered into generated test methods.
+        index.synthesized.extend(app.test_modules.iter().map(|t| t.name.clone()));
         for model in &app.models {
             index.add_fragment(
                 &model.name,
@@ -1253,50 +1323,235 @@ impl<'a> SourceContractIndex<'a> {
         self.includes.get(owner).map_or(&[], Vec::as_slice)
     }
 
-    /// Spans of model source contracts that model synthesis does not
-    /// preserve. Computed on first use: it synthesizes every model that
-    /// inherits a full or forwarded-to selector, and a walk that never
-    /// reaches a full destination never asks. Synthesis runs in its own
-    /// diagnostic scope, so computing it later changes nothing else.
-    fn unretained(&self) -> &HashSet<Span> {
-        self.unretained.get_or_init(|| {
-            if self.full_selectors.is_empty() {
-                return HashSet::default();
+    /// Is the source contract declared at `span` one that model synthesis
+    /// does not preserve? A model's own forwarding method counts when the
+    /// synthesized class drops its contract; a method a model inherits
+    /// under a selector some packet is sent to (a full selector, or one a
+    /// forwarding send names) counts when a synthesized override drops it.
+    ///
+    /// Answered per span: only the models that declare `span` or reach its
+    /// declaring class through superclass/include edges can contribute, and
+    /// only those are synthesized, once each. The answer is the one a survey
+    /// of every model would give for that span. Synthesis runs in its own
+    /// diagnostic scope, so asking later changes nothing else.
+    fn unretained(&self, span: &Span) -> bool {
+        if self.full_selectors.is_empty() {
+            return false;
+        }
+        let survey = self.unretained.get_or_init(|| Unretained::new(self));
+        survey.queries.set(survey.queries.get() + 1);
+        if let Some(&known) = survey.answers.borrow().get(span) {
+            return known;
+        }
+        let answer = self.unretained_span(survey, span);
+        survey.answers.borrow_mut().insert(*span, answer);
+        answer
+    }
+
+    fn unretained_span(&self, survey: &Unretained<'a>, span: &Span) -> bool {
+        for &(position, source) in survey.own.get(span).into_iter().flatten() {
+            if survey.synthesis.drops_own(position, source) {
+                return true;
             }
-            // Ordinary inherited contracts matter only when a packet is sent
-            // to them. Looking up every unrelated selector for every model
-            // makes large-app transpilation quadratic in the source inventory.
-            let mut names = self.full_selectors.clone();
-            fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
-                if let ExprNode::Send { method, args, .. } = &*e.node
-                    && has_forwarding(args)
+        }
+        let Some(declared) = survey.declared.get(span) else {
+            return false;
+        };
+        let names = survey.names.get_or_init(|| self.forwarded_selectors());
+        for (owner, source) in declared {
+            if !names.contains(&source.name) {
+                continue;
+            }
+            // Lookup from a model reaches `owner` only along the edges
+            // `children` reverses; the walk below keeps the models whose
+            // lookup actually resolves to this declaration.
+            let mut reached: HashSet<&ClassId> = HashSet::default();
+            reached.insert(owner);
+            let mut pending = vec![owner];
+            while let Some(node) = pending.pop() {
+                for child in self.children.get(node).into_iter().flatten() {
+                    if reached.insert(child) {
+                        pending.push(child);
+                    }
+                }
+            }
+            let mut positions: Vec<usize> = reached
+                .into_iter()
+                .flat_map(|class| survey.models_named.get(class).into_iter().flatten().copied())
+                .collect();
+            positions.sort_unstable();
+            for position in positions {
+                let model = &self.app.models[position];
+                let Some((found, _)) = self.declaration(
+                    &model.name,
+                    &source.name,
+                    source.receiver,
+                    &mut HashSet::default(),
+                ) else {
+                    continue;
+                };
+                if std::ptr::eq(found, *source)
+                    && !model.methods().any(|own| std::ptr::eq(own, found))
+                    && survey.synthesis.drops_inherited(position, source)
                 {
-                    names.insert(method.clone());
-                    if method.as_str() == "new" {
-                        names.insert(Symbol::from("initialize"));
-                    }
-                }
-                e.node.for_each_child(&mut |child| collect(child, names));
-            }
-            for (_, method) in methods(self.app) {
-                collect(&method.body, &mut names);
-                for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-                    collect(default, &mut names);
+                    return true;
                 }
             }
-            crate::lower::model_to_library::unretained_model_contracts(self.app, |model| {
-                let mut inherited = Vec::new();
-                for name in &names {
-                    for receiver in [MethodReceiver::Instance, MethodReceiver::Class] {
-                        if let Some((method, _)) = self.declaration(
-                            &model.name, name, receiver, &mut HashSet::default(),
-                        ) && !model.methods().any(|own| std::ptr::eq(own, method)) {
-                            inherited.push(method);
-                        }
-                    }
+        }
+        false
+    }
+
+    /// Selectors a packet may be sent to: every full (`...`) selector, and
+    /// every selector a forwarding send names (`new` also reaches
+    /// `initialize`). Ordinary inherited contracts matter only for these;
+    /// looking up every unrelated selector would make the question
+    /// quadratic in the source inventory.
+    fn forwarded_selectors(&self) -> HashSet<Symbol> {
+        let _span = crate::timings::begin("forwarding unretained: selectors");
+        let mut names = self.full_selectors.clone();
+        fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
+            if let ExprNode::Send { method, args, .. } = &*e.node
+                && has_forwarding(args)
+            {
+                names.insert(method.clone());
+                if method.as_str() == "new" {
+                    names.insert(Symbol::from("initialize"));
                 }
-                inherited
-            })
+            }
+            e.node.for_each_child(&mut |child| collect(child, names));
+        }
+        for (_, method) in methods(self.app) {
+            collect(&method.body, &mut names);
+            for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
+                collect(default, &mut names);
+            }
+        }
+        names
+    }
+
+    /// Does an explicit `super` in `owner`'s instance method `name` leave
+    /// the app's declarations altogether? Then its destination is code
+    /// the app does not define (a framework port, a gem, Ruby's core),
+    /// which the Ruby family binds natively against the call as written.
+    ///
+    /// Shown only for a class (a module's `super` continues in whatever
+    /// includes it), whose whole superclass/include hierarchy is single-
+    /// fragment (`verified`), where no class or module on that hierarchy
+    /// declares `name`, and none of it is a model, a controller or a
+    /// generated class: their methods are not all source declarations, so
+    /// an absent declaration does not show an absent method.
+    /// Does an ordinary `super` in instance method `name` of `owner` reach,
+    /// past every app declaration, a method whose argument ABI is the
+    /// native one (`external`)? The app part of the lookup must hold
+    /// source declarations only, none of them `name`; a class with no
+    /// recorded superclass (none written, or an expression) and a name
+    /// that could resolve to something nested are unknown.
+    fn super_leaves_source(&self, owner: &ClassId, name: &Symbol) -> bool {
+        if self.modules.contains(owner) || !self.verified(owner) {
+            return false;
+        }
+        if self
+            .ancestors(owner, name, MethodReceiver::Instance, &mut HashSet::default())
+            .is_some()
+        {
+            return false;
+        }
+        let mut seen = HashSet::default();
+        seen.insert(owner);
+        self.super_after(owner, name.as_str(), &mut seen) == external::Step::Bound
+    }
+
+    /// The lookup after `node`'s own methods: its includes, last first,
+    /// then its superclass.
+    fn super_after<'s>(&'s self, node: &'s ClassId, name: &str, seen: &mut HashSet<&'s ClassId>) -> external::Step {
+        if self.mixed_into(node) {
+            return external::Step::Refuse;
+        }
+        for module in self.includes(node).iter().rev() {
+            match self.super_through(module, name, false, seen) {
+                external::Step::Continue => {}
+                step => return step,
+            }
+        }
+        if self.modules.contains(node) {
+            return external::Step::Continue;
+        }
+        match self.parent(node) {
+            Some(parent) => match self.super_through(parent, name, true, seen) {
+                external::Step::Continue => external::Step::Refuse,
+                step => step,
+            },
+            None => external::Step::Refuse,
+        }
+    }
+
+    fn super_through<'s>(
+        &'s self,
+        node: &'s ClassId,
+        name: &str,
+        as_superclass: bool,
+        seen: &mut HashSet<&'s ClassId>,
+    ) -> external::Step {
+        if !seen.insert(node) {
+            return external::Step::Continue;
+        }
+        let world = external::world();
+        let written = node.0.as_str();
+        if self.fragments.contains_key(node) {
+            // A reopened runtime or core namespace continues outside the
+            // app; not followed.
+            if self.synthesized.contains(node)
+                || world.runtime_declares(written)
+                || world.stdlib_declares(written)
+            {
+                return external::Step::Refuse;
+            }
+            return self.super_after(node, name, seen);
+        }
+        if world.shadowed(written) || self.app_shadows(written) {
+            return external::Step::Refuse;
+        }
+        world.through(written, name, as_superclass, &|namespace, method| {
+            self.app_reopens(namespace, method)
+        })
+    }
+
+    /// An initializer's `Target.include(M)` / `Target.prepend(M)` names it.
+    fn mixed_into(&self, node: &ClassId) -> bool {
+        self.app.module_mixins.iter().any(|mixin| mixin.target.as_str() == node.0.as_str())
+    }
+
+    /// Some app class or module is named `…::written`: a relative written
+    /// superclass or include may mean it.
+    fn app_shadows(&self, written: &str) -> bool {
+        let suffix = format!("::{written}");
+        self.fragments.keys().any(|name| name.0.as_str().ends_with(&suffix))
+    }
+
+    /// The app declares instance method `method` on core `namespace`
+    /// (reopening it, through a module it includes there, or through an
+    /// initializer mixin naming it).
+    fn app_reopens(&self, namespace: &str, method: &str) -> bool {
+        let method = Symbol::from(method);
+        let id = ClassId(Symbol::from(namespace));
+        // An unverified reopening (several fragments) is not read: it may.
+        if self.fragments.contains_key(&id)
+            && (!self.verified(&id)
+                || self
+                    .declaration(&id, &method, MethodReceiver::Instance, &mut HashSet::default())
+                    .is_some())
+        {
+            return true;
+        }
+        self.app.module_mixins.iter().any(|mixin| {
+            mixin.target.as_str() == namespace && {
+                let module = ClassId(mixin.module.clone());
+                !self.fragments.contains_key(&module)
+                    || !self.verified(&module)
+                    || self
+                        .declaration(&module, &method, MethodReceiver::Instance, &mut HashSet::default())
+                        .is_some()
+            }
         })
     }
 
@@ -1435,5 +1690,64 @@ impl<'a> SourceContractIndex<'a> {
                     })
                     .flatten()
             })
+    }
+}
+
+/// What `SourceContractIndex::unretained` needs to answer per span: where
+/// each source contract is declared, and the synthesis of the models asked
+/// about so far.
+struct Unretained<'a> {
+    synthesis: crate::lower::model_to_library::ModelSynthesis<'a>,
+    /// Own forwarding methods by span, with the model's position.
+    own: HashMap<Span, Vec<(usize, &'a MethodDef)>>,
+    /// Indexed declarations by span, with their owner.
+    declared: HashMap<Span, Vec<(ClassId, &'a MethodDef)>>,
+    /// `forwarded_selectors`, computed when an inherited candidate is first
+    /// asked about.
+    names: OnceCell<HashSet<Symbol>>,
+    /// Model positions by name.
+    models_named: HashMap<ClassId, Vec<usize>>,
+    answers: RefCell<HashMap<Span, bool>>,
+    queries: std::cell::Cell<usize>,
+}
+
+impl<'a> Unretained<'a> {
+    fn new(index: &SourceContractIndex<'a>) -> Self {
+        let _span = crate::timings::begin("forwarding unretained: index");
+        let app = index.app;
+        let mut own: HashMap<Span, Vec<(usize, &'a MethodDef)>> = HashMap::default();
+        let mut models_named: HashMap<ClassId, Vec<usize>> = HashMap::default();
+        for (position, model) in app.models.iter().enumerate() {
+            models_named.entry(model.name.clone()).or_default().push(position);
+            for method in model.methods().filter(|m| m.params.iter().any(|p| p.forwarding)) {
+                own.entry(method.name_span).or_default().push((position, method));
+            }
+        }
+        let mut declared: HashMap<Span, Vec<(ClassId, &'a MethodDef)>> = HashMap::default();
+        for ((owner, _), (method, _)) in index.instance.iter().chain(index.class.iter()) {
+            declared.entry(method.name_span).or_default().push((owner.clone(), *method));
+        }
+        Unretained {
+            synthesis: crate::lower::model_to_library::ModelSynthesis::new(app),
+            own,
+            declared,
+            names: OnceCell::new(),
+            models_named,
+            answers: RefCell::default(),
+            queries: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Drop for Unretained<'_> {
+    fn drop(&mut self) {
+        crate::timings::note(&format!(
+            "forwarding unretained: {} asks, {} spans, {} of {} models built in {:.2}s",
+            self.queries.get(),
+            self.answers.borrow().len(),
+            self.synthesis.models_built(),
+            self.models_named.values().map(Vec::len).sum::<usize>(),
+            self.synthesis.time_spent().as_secs_f64(),
+        ));
     }
 }

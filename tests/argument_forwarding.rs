@@ -1112,3 +1112,33 @@ fn a_keyword_splat_whose_receiver_lookup_cannot_reach_a_nameless_rest_is_admitte
         assert!(refused(source, vendored), "{source}");
     }
 }
+
+#[test]
+fn full_forwarding_super_out_of_the_app_runs_as_written() {
+    // `def m(...); super; end` in a class whose lookup leaves the app's
+    // declarations (StandardError#initialize, BasicObject#method_missing)
+    // is written as the source wrote it and binds natively. In a module the
+    // destination depends on the includer, so it stays refused.
+    let source = "class Probe < StandardError; def initialize(...); super; end; def method_missing(name, ...); name == :shout ? \"loud\" : super; end; def respond_to_missing?(n, p = false) = n == :shout || super; end";
+    let script = "puts Probe.new(\"kept\").message; puts Probe.new.shout; begin; Probe.new.other(1, k: 2); rescue NoMethodError => e; puts e.name; end";
+    let expected = "kept\nloud\nother\n";
+    native_result(source, script, expected);
+    let errors: Vec<_> = diagnose(&analyzed(source))
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error && d.message.contains("full argument forwarding"))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/probe.rb", source)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+
+    let module = "module Loud; def initialize(...); super; end; end; class Probe < StandardError; include Loud; end";
+    native_result(module, "puts Probe.new(\"kept\").message", "kept\n");
+    let errors: Vec<_> = diagnose(&analyzed(module))
+        .into_iter()
+        .filter(|d| d.severity == Severity::Error && d.message.contains("full argument forwarding"))
+        .collect();
+    assert!(!errors.is_empty(), "a module's super is not shown to leave the app");
+}

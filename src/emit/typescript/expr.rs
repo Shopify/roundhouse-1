@@ -1245,7 +1245,7 @@ pub(super) fn js_expr(e: &Expr) -> Js {
             // expression.
             iife(e.span, vec![return_stmt(Some(js_expr(value)))])
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             // Ruby's `super` forwards to the parent class's same-named
             // method. TS requires `super.methodName(...)`, which needs
             // enclosing-method context that this emitter doesn't carry.

@@ -2348,7 +2348,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
     // Do not forward explicit attrs to a parent's possibly different enum mapping.
     stmts.push(Expr::new(
         Span::synthetic(),
-        ExprNode::Super { args: Some(Vec::new()) },
+        ExprNode::Super { args: Some(Vec::new()), block: None },
     ));
 
     for col in &table.columns {

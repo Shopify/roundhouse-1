@@ -121,31 +121,47 @@ fn instance_keyword_normalization_uses_the_effective_last_definition() {
 
 #[test]
 fn unknown_ordinary_super_abi_is_not_mislabeled_as_full_forwarding() {
-    for (extra, relevant_full_selector) in [
-        ("", false),
-        ("class Other; def unrelated(...); 11; end; end", false),
-        ("class Other; def initialize(...); end; end", true),
+    // A class's own `super(**options)` whose lookup leaves the app's
+    // declarations (here into StandardError) is written as the source
+    // wrote it, and the Ruby tree binds it as Ruby does, empty packet
+    // included. Simply restoring Legacy would emit super(options),
+    // changing Ruby's empty-keyword semantics: the message becomes "{}".
+    // A full forwarder elsewhere is not on this lookup, so it changes
+    // nothing.
+    for extra in [
+        "",
+        "class Other; def unrelated(...); 11; end; end",
+        "class Other; def initialize(...); end; end",
     ] {
-        let source = format!("class Probe < StandardError; def initialize; options={{}}; super(**options); end; end; {extra}");
-        let script = "puts Probe.new.message";
-        native_result(&source, script, "Probe\n");
-        let run = emit_and_run::real_blog()
-            .write("app/lib/probe.rb", &source)
-            .run_ruby(script);
-        if relevant_full_selector {
-            assert!(
-                run.errors.iter().any(|e| e.contains("keyword producer")),
-                "{:?}; actual={}; stderr={}",
-                run.errors,
-                run.stdout,
-                run.stderr
-            );
-        } else {
-            // Simply restoring Legacy would emit super(options), changing
-            // Ruby's empty-keyword semantics: the message becomes "{}".
-            assert!(run.errors.iter().any(|e| e.contains("ordinary super") && e.contains("argument ABI")), "{:?}", run.errors);
-            assert!(!run.errors.iter().any(|e| e.contains("full forwarding")), "{:?}", run.errors);
+        for options in ["{}", "{tag: 1}"] {
+            let source = format!("class Probe < StandardError; def initialize; options={options}; super(**options); end; end; {extra}");
+            let script = "puts Probe.new.message";
+            let native = Command::new("ruby")
+                .args(["-e", &format!("{source}; {script}")])
+                .output()
+                .unwrap();
+            assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+            let run = emit_and_run::real_blog()
+                .write("app/lib/probe.rb", &source)
+                .run_ruby(script);
+            run.assert_passes();
+            assert_eq!(run.stdout, String::from_utf8_lossy(&native.stdout), "{source}");
         }
+    }
+    // Not shown to leave the app's declarations, so still refused as an
+    // ordinary super, never as full forwarding: a module's `super`
+    // continues in its includer, and inside a block it is not shown
+    // which method the `super` belongs to.
+    for source in [
+        "module Mixin; def initialize; options={}; super(**options); end; end; class Probe < StandardError; include Mixin; end",
+        "class Probe < StandardError; def initialize; options={}; [1].each { super(**options) }; end; end",
+    ] {
+        native_result(source, "puts Probe.new.message", "Probe\n");
+        let run = emit_and_run::real_blog()
+            .write("app/lib/probe.rb", source)
+            .run_ruby("puts Probe.new.message");
+        assert!(run.errors.iter().any(|e| e.contains("ordinary super") && e.contains("argument ABI")), "{source}: {:?}", run.errors);
+        assert!(!run.errors.iter().any(|e| e.contains("full forwarding")), "{:?}", run.errors);
     }
 }
 
@@ -289,4 +305,64 @@ fn keyword_producer_modifier_keeps_operand_grouping() {
         .run_ruby("puts Probe.run");
     run.assert_passes();
     assert_eq!(run.stdout, "11\n");
+}
+
+#[test]
+fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
+    // A signature port's method is the native declaration (its parity
+    // test holds it to activesupport), so the Ruby tree binds
+    // `super(key, **options)` into MemoryStore's as Ruby would.
+    // Through the public API, which instruments every operation through
+    // ActiveSupport::Notifications: the same events native activesupport
+    // publishes (tests/support/rails_oracle.rb's copy, run below).
+    let source = "class ProbeStore < ActiveSupport::Cache::MemoryStore; def write_entry(key, entry, **options); options = options.merge(unless_exist: false); super(key, entry, **options); end; end";
+    let script = "events = []; ActiveSupport::Notifications.subscribe(/cache_/) { |name, *, payload| events << [name, payload[:key]] }; s = ProbeStore.new; s.write('k', 7); p s.read('k'); s.fetch('j') { 3 }; p events";
+    let oracle = std::env::temp_dir().join(format!("rh-cache-oracle-{}.rb", std::process::id()));
+    std::fs::write(&oracle, format!(
+        "require_relative {:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\nrequire \"active_support/cache\"\nrequire \"active_support/cache/memory_store\"\nrequire \"active_support/notifications\"\n{source}\n{script}\n",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle"),
+    )).unwrap();
+    let native = Command::new("ruby").arg(&oracle).output().unwrap();
+    let _ = std::fs::remove_file(&oracle);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(expected.contains("cache_write.active_support"), "{expected}");
+    let run = emit_and_run::real_blog()
+        .write("app/lib/probe_store.rb", source)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    // The method's own block, passed on: what the implicit pass does.
+    let source = "class Probe < StandardError; def initialize(&blk); options={}; super(**options, &blk); end; end";
+    native_result(source, "puts Probe.new.message", "Probe\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe.rb", source).run_ruby("puts Probe.new.message");
+    run.assert_passes();
+    assert_eq!(run.stdout, "Probe\n");
+    // The block the super writes is the one bound, whatever it is: a
+    // literal block, or a block parameter the method reassigns.
+    let source = "class Probe < Array; def sum; options={}; super(**options) { |x| x * 2 }; end; def map(&blk); blk = proc { |x| x + 1 }; options={}; super(**options, &blk); end; end";
+    let script = "p Probe.new([1, 2, 3]).sum; p Probe.new([1, 2, 3]).map { |x| x * 5 }";
+    native_result(source, script, "12\n[2, 3, 4]\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe.rb", source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "12\n[2, 3, 4]\n");
+    // Not shown to reach a native ABI, so refused as an ordinary super:
+    // the runtime's Logger is no port; a class with no recorded
+    // superclass; a relative superclass name an app class could mean;
+    // the app reopening a core ancestor with the method.
+    for source in [
+        "class Probe < Logger; def add(severity, message = nil, progname = nil, **options); super(severity, message, progname, **options); end; end",
+        "class Probe; def initialize; options={}; super(**options); end; end",
+        "module Shop; class Base; end; end; module Shop; class Probe < Base; def initialize; options={}; super(**options); end; end; end; class Base; end",
+        "class Object; def probe_hook(**o); o.size; end; end; class Probe < StandardError; def probe_hook; options={}; super(**options); end; end",
+    ] {
+        let (_, errors) = emit_and_run::real_blog()
+            .write("app/lib/probe.rb", source)
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(
+            errors.iter().any(|e| e.contains("ordinary super") && e.contains("argument ABI")),
+            "{source}: {errors:?}"
+        );
+        assert!(!errors.iter().any(|e| e.contains("full forwarding")), "{errors:?}");
+    }
 }

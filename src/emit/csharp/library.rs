@@ -1220,7 +1220,7 @@ fn body_has_yield(e: &Expr) -> bool {
 }
 
 fn find_super_args(e: &Expr) -> Option<Vec<String>> {
-    if let ExprNode::Super { args } = &*e.node {
+    if let ExprNode::Super { args, .. } = &*e.node {
         return Some(
             args.as_ref().map(|a| a.iter().map(emit_expr).collect()).unwrap_or_default(),
         );

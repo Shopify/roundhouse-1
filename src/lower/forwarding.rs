@@ -17,7 +17,7 @@ pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
     fn project(e: &mut Expr, plans: &crate::det::HashMap<crate::span::Span, KeywordPolicy>) {
         if plans.get(&e.span) == Some(&KeywordPolicy::Legacy) {
             let args = match &mut *e.node {
-                ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => Some(args),
+                ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args), .. } => Some(args),
                 _ => None,
             };
             if let Some(args) = args {
