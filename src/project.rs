@@ -3128,6 +3128,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             files.push((emitted.to_string(), text));
         }
     }
+    let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
     // adapter-load point `DatabaseConfiguration.configure!` fires.
@@ -3151,6 +3152,22 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 && line.contains("LogSubscriber::TestHelper"))
     });
     for (path, content) in files.iter_mut() {
+        // Before any gem loads. Rails defines `ActiveSupport.on_load`
+        // before Bundler.require, and a gem may register a hook as it
+        // loads (semian 0.28.3 lib/semian.rb:443, paquito.rb:60, guarded
+        // by `if defined?(ActiveSupport)`). The hooks file depends on
+        // nothing, so it goes first.
+        if path == "runtime/gem_facades.rb" {
+            content.insert_str(0, "require_relative \"active_support_lazy_load_hooks\"\n");
+            // Where Bundler.require would have loaded them: with the gems.
+            for (feature, stem) in &port_requires {
+                content.push_str(&format!(
+                    "\n# `require {feature:?}`, which the app's code (or a gem source) makes at load:\n\
+                     # semian's own file, ported over runtime/semian.rb, never the gem's.\n\
+                     require_relative {stem:?}\n"
+                ));
+            }
+        }
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
@@ -3182,6 +3199,38 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         }
     }
     Ok(())
+}
+
+/// `require` features of semian 0.28.3 that a runtime port answers on the
+/// PostgreSQL CRuby tree, with the port's stem under `runtime/`. The gem's
+/// own files cannot load there: each begins `require "semian"`, whose
+/// lib/semian.rb redefines `Semian` over the port and registers
+/// `ActiveSupport.on_load(:active_record) { require "semian/rails" }`.
+/// (`semian/activerecord_postgresql_adapter` is not here: it is installed
+/// from its load hook, `ingest::on_load_hooks::RUNTIME_PORTS`.)
+pub const SEMIAN_PORT_FEATURES: &[(&str, &str)] = &[("semian/net_http", "semian_net_http")];
+
+/// The [`SEMIAN_PORT_FEATURES`] some ingested file requires at its top
+/// level (a statement in column 0, as opentelemetry-shopify 1.22.0's
+/// exporters/otlp.rb:4 `require 'semian/net_http'`). That require runs as
+/// the file loads, and the emitted file does not carry it (a bare gem
+/// require is the load list's job), so runtime/gem_facades.rb loads the
+/// port with the gems, where Bundler.require would have loaded it.
+fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
+    SEMIAN_PORT_FEATURES
+        .iter()
+        .copied()
+        .filter(|(feature, _)| {
+            let forms = [format!("require \"{feature}\""), format!("require '{feature}'")];
+            app.sources.iter().any(|source| {
+                source.text.contains(feature)
+                    && source.text.lines().any(|line| {
+                        let code = line.split(" #").next().unwrap_or(line).trim_end();
+                        forms.iter().any(|form| code == form)
+                    })
+            })
+        })
+        .collect()
 }
 
 /// The boot-time registration of each `ActiveSupport.on_load` block the
@@ -5745,6 +5794,7 @@ fn spinel_files_with_assertions(
     // so is the semian port that wraps that driver's adapter.
     files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
         && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
+        && p != "runtime/semian_adapter.rb" && p != "runtime/semian_net_http.rb"
         && p != "runtime/active_support_lazy_load_hooks.rb"
         && p != "runtime/active_support_backtrace_cleaner.rb");
 
@@ -7307,7 +7357,11 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[(
     "semian",
     &[
         ("runtime/spinel/semian.rb", "runtime/semian.rb"),
+        // lib/semian/adapter.rb, which both adapters share.
+        ("runtime/spinel/semian_adapter.rb", "runtime/semian_adapter.rb"),
         ("runtime/spinel/semian_activerecord_postgresql_adapter.rb", "runtime/semian_activerecord_postgresql_adapter.rb"),
+        // `require "semian/net_http"`.
+        ("runtime/spinel/semian_net_http.rb", "runtime/semian_net_http.rb"),
     ],
 )];
 

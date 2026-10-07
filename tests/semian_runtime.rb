@@ -7,7 +7,9 @@
 #                                                 (tests/support/rails_oracle.rb)
 #                                                 + semian/rails + semian/activerecord_postgresql_adapter
 #   ruby tests/semian_runtime.rb emitted adapter  the tree's Db + PostgreSQLAdapter + the port
-#   ruby tests/semian_runtime.rb compare core|adapter
+#   ruby tests/semian_runtime.rb native net_http  the gem: require "semian/net_http"
+#   ruby tests/semian_runtime.rb emitted net_http the port (runtime/spinel/semian_net_http.rb)
+#   ruby tests/semian_runtime.rb compare core|adapter|net_http
 #
 # Each mode prints one observation per line; `compare` requires native and
 # emitted equal, the core part once per SEMIAN_* environment. The adapter
@@ -54,6 +56,14 @@ if MODE == "compare"
     stdout, stderr, status = Open3.capture3(RailsOracle.core_gems_env, RbConfig.ruby, __FILE__, "emitted", "unsupported")
     abort "emitted unsupported: #{stderr}" unless status.success?
     puts stdout
+  end
+  if PART == "net_http"
+    # The port never loads the gem's Ruby over itself: only its extension.
+    probe = "require_relative #{File.expand_path("../runtime/spinel/semian_net_http", __dir__).inspect}; " \
+      "puts $LOADED_FEATURES.grep(%r{/gems/semian-[^/]+/lib/}).map { |f| f[%r{/gems/semian-[^/]+/(lib/.*)}, 1] }"
+    stdout, stderr, status = Open3.capture3(RbConfig.ruby, "-e", probe)
+    abort "emitted net_http load probe: #{stderr}" unless status.success?
+    puts "gem files loaded by the port: #{stdout.split.inspect}"
   end
   puts "Native semian 0.28.3 and the emitted semian port agree on #{PART} (#{lines} observations)"
   exit
@@ -514,7 +524,167 @@ def run_adapter(side)
   end
 end
 
+# --- the net_http part ------------------------------------------------------
+#
+# semian/net_http over CRuby's Net::HTTP, against a local HTTP server
+# started here (127.0.0.1, its own port) and a closed port.
+
+# Answers GET /ok (200), /boom (500) and /slow (200 after 0.3 s), one
+# request per connection.
+def start_http_server
+  server = TCPServer.new("127.0.0.1", 0)
+  Thread.new do
+    loop do
+      client = server.accept
+      Thread.new(client) do |socket|
+        request_line = socket.gets.to_s
+        while (line = socket.gets) && line != "\r\n"; end
+        path = request_line.split[1]
+        status, body = case path
+        when "/boom" then ["500 Internal Server Error", "boom"]
+        when "/slow" then sleep 0.3; ["200 OK", "slow"]
+        else ["200 OK", "ok"]
+        end
+        socket.write("HTTP/1.1 #{status}\r\nContent-Type: text/plain\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+      rescue IOError, SystemCallError
+        nil
+      ensure
+        socket.close rescue nil
+      end
+    end
+  end
+  server.addr[1]
+end
+
+def http_resource(name)
+  Semian.resources[name] || Semian.resources[name.to_sym]
+end
+
+def get(port, path, **options)
+  http = Net::HTTP.new("127.0.0.1", port, **options)
+  http.open_timeout = 2
+  http.read_timeout = 2
+  response = http.request(Net::HTTP::Get.new(path))
+  "#{response.code} #{response.body}"
+end
+
+def run_net_http
+  install_observers
+  port = start_http_server
+  down = closed_port
+  NORMALIZERS << [/\b#{port}\b/, "PORT"] << [/\b#{down}\b/, "DOWN"]
+  configs = {}
+  show("prepended") { Net::HTTP.ancestors.take_while { |m| m != Net::HTTP }.map(&:name) }
+  show("class methods") { Net::HTTP.singleton_class.ancestors.first.name }
+  show("protocol error is adapter error") { Net::ProtocolError.include?(Semian::AdapterError) }
+  show("error classes") { [Net::SemianError, Net::ResourceBusyError, Net::CircuitOpenError].map { |c| [c.name, c.superclass.name] } }
+  show("adapter errors") { [Semian::NetHTTP::ResourceBusyError, Semian::NetHTTP::CircuitOpenError].map(&:name) }
+  show("default errors") { Semian::NetHTTP::DEFAULT_ERRORS.map(&:name) }
+  show("default errors frozen") { Semian::NetHTTP::DEFAULT_ERRORS.frozen? }
+  show("exceptions") { Semian::NetHTTP.exceptions == Semian::NetHTTP::DEFAULT_ERRORS }
+
+  show("unconfigured get") { get(port, "/ok") }
+  show("unconfigured disabled") { Net::HTTP.new("127.0.0.1", port).disabled? }
+  show("unconfigured options") { Net::HTTP.new("127.0.0.1", port).raw_semian_options }
+  flush("unconfigured")
+
+  show("configure") { (Semian::NetHTTP.semian_configuration = ->(host, p) { configs[[host, p]] }).lambda? }
+  show("configure again") { Semian::NetHTTP.semian_configuration = ->(*) { nil } }
+  show("configuration callable") { Semian::NetHTTP.semian_configuration.respond_to?(:call) }
+
+  configs[["127.0.0.1", port]] = { name: "ok", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 2, error_timeout: 10 }
+  http = Net::HTTP.new("127.0.0.1", port)
+  show("identifier") { http.semian_identifier }
+  show("disabled") { http.disabled? }
+  show("options") { http.raw_semian_options }
+  show("options are a copy") { http.raw_semian_options.equal?(configs[["127.0.0.1", port]]) }
+  show("configured get") { get(port, "/ok") }
+  show("configured get twice") { get(port, "/ok") }
+  show("resource") { http_resource("nethttp_ok").class.name }
+  show("resource tickets") { http_resource("nethttp_ok").tickets }
+  flush("configured")
+
+  show("opted out disabled") { Net::HTTP.new("127.0.0.1", port, semian: false).disabled? }
+  show("opted out get") { get(port, "/ok", semian: false) }
+  show("opted out enabled ivar") { Net::HTTP.new("127.0.0.1", port, semian: false).instance_variable_get(:@semian_enabled) }
+  flush("opted out")
+
+  configs[["127.0.0.1", down]] = { name: "down", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 2, error_timeout: 10 }
+  3.times do |i|
+    show("down #{i}") { get(down, "/ok") }
+  end
+  show("down circuit") { [http_resource("nethttp_down").closed?, http_resource("nethttp_down").open?] }
+  begin
+    get(down, "/ok")
+  rescue Net::CircuitOpenError => error
+    show("down error identifier") { error.semian_identifier }
+    show("down error cause") { error.cause&.class&.name }
+  end
+  flush("down")
+
+  configs[["127.0.0.1", port]] = { name: "servererr", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 1,
+                                   error_timeout: 10, open_circuit_server_errors: true }
+  show("server error get") { get(port, "/boom") }
+  show("server error after") { get(port, "/ok") }
+  begin
+    get(port, "/ok")
+  rescue Net::CircuitOpenError => error
+    show("server error cause") { error.cause }
+  end
+  flush("server error")
+
+  configs[["127.0.0.1", port]] = { name: "plain500", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 1, error_timeout: 10 }
+  show("plain 500") { get(port, "/boom") }
+  show("plain 500 then ok") { get(port, "/ok") }
+  flush("plain 500")
+
+  configs[["127.0.0.1", port]] = { name: "busy", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 3, error_timeout: 10 }
+  show("busy warm") { get(port, "/ok") }
+  show("busy") { http_resource("nethttp_busy").acquire { get(port, "/ok") } }
+  flush("busy")
+
+  configs[["127.0.0.1", port]] = { name: "timeout", tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 1, error_timeout: 10 }
+  show("read timeout") do
+    http = Net::HTTP.new("127.0.0.1", port)
+    http.read_timeout = 0.05
+    http.request(Net::HTTP::Get.new("/slow")).code
+  end
+  show("read timeout opened") { http_resource("nethttp_timeout").open? }
+  flush("timeout")
+
+  configs[["127.0.0.1", port]] = { name: "dynamic", dynamic: true, tickets: 1, timeout: 0, success_threshold: 1, error_threshold: 3, error_timeout: 10 }
+  dynamic = Net::HTTP.new("127.0.0.1", port)
+  show("dynamic get") { dynamic.request(Net::HTTP::Get.new("/ok")).code }
+  show("dynamic options cleared") { dynamic.instance_variable_get(:@raw_semian_options) }
+  show("dynamic resource memoized") { dynamic.instance_variable_get(:@semian_resource) }
+  flush("dynamic")
+
+  show("resource timeout") do
+    h = Net::HTTP.new("127.0.0.1", port)
+    h.read_timeout = 7
+    h.open_timeout = 8
+    inside = h.with_resource_timeout(0.5) { [h.read_timeout, h.open_timeout] }
+    [inside, h.read_timeout, h.open_timeout]
+  end
+
+  show("exceptions extended") do
+    Semian::NetHTTP.exceptions += [ArgumentError]
+    Semian::NetHTTP.exceptions.last.name
+  end
+  show("exceptions reset") { Semian::NetHTTP.reset_exceptions == Semian::NetHTTP::DEFAULT_ERRORS }
+  show("resources") { Semian.resources.keys.map(&:to_s).sort }
+  Semian.destroy_all_resources
+  flush("end")
+end
+
 case [MODE, PART]
+when ["native", "net_http"]
+  gem "semian", "0.28.3"
+  require "semian/net_http"
+  run_net_http
+when ["emitted", "net_http"]
+  require_relative "../runtime/spinel/semian_net_http"
+  run_net_http
 when ["native", "core"]
   RailsOracle.activate(semian: "0.28.3")
   require "semian"
@@ -530,5 +700,5 @@ when ["native", "adapter"]
 when ["emitted", "adapter"]
   run_adapter(EmittedSide)
 else
-  abort "usage: ruby tests/semian_runtime.rb native|emitted|compare core|adapter"
+  abort "usage: ruby tests/semian_runtime.rb native|emitted|compare core|adapter|net_http"
 end

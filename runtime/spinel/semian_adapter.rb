@@ -1,0 +1,95 @@
+# frozen_string_literal: true
+
+# semian 0.28.3 lib/semian/adapter.rb, verbatim, over the port of
+# lib/semian.rb (semian.rb beside this file). Shared by the two adapters
+# the PostgreSQL tree carries: semian_activerecord_postgresql_adapter.rb
+# and semian_net_http.rb. The gem file's own `require "semian"` is the
+# require_relative below, so the gem's lib/semian.rb never loads over the
+# port.
+require_relative "semian"
+
+module Semian
+  module Adapter
+    def semian_identifier
+      raise NotImplementedError, "Semian adapters must implement a `semian_identifier` method"
+    end
+
+    def semian_resource
+      return @semian_resource if @semian_resource
+
+      case semian_options
+      when false
+        @semian_resource = UnprotectedResource.new(semian_identifier)
+      when nil
+        Semian.logger.info("Semian is not configured for #{self.class.name}: #{semian_identifier}")
+        @semian_resource = UnprotectedResource.new(semian_identifier)
+      else
+        options = semian_options.dup
+        options.delete(:name)
+        options[:consumer] = self
+        options[:exceptions] ||= []
+        options[:exceptions] += resource_exceptions
+        resource = ::Semian.retrieve_or_register(semian_identifier, **options)
+
+        @semian_resource = resource unless options.fetch(:dynamic, false)
+
+        resource
+      end
+    end
+
+    def clear_semian_resource
+      @semian_resource = nil
+    end
+
+    private
+
+    def acquire_semian_resource(scope:, adapter:, &block)
+      return yield if resource_already_acquired?
+
+      semian_resource.acquire(scope: scope, adapter: adapter, resource: self) do
+        mark_resource_as_acquired(&block)
+      end
+    rescue ::Semian::OpenCircuitError => error
+      last_error = semian_resource.circuit_breaker.last_error
+      message = "#{error.message} caused by #{last_error&.message}"
+      last_error = nil unless last_error.is_a?(Exception) # Net::HTTPServerError is not an exception
+      raise self.class::CircuitOpenError.new(semian_identifier, message), cause: last_error
+    rescue ::Semian::BaseError => error
+      raise self.class::ResourceBusyError.new(semian_identifier, error.message)
+    rescue *resource_exceptions => error
+      error.semian_identifier = semian_identifier if error.respond_to?(:semian_identifier=)
+      raise
+    end
+
+    def semian_options
+      return @semian_options if defined? @semian_options
+
+      options = raw_semian_options
+
+      symbolized_options = options && options.transform_keys(&:to_sym) # rubocop:disable Style/SafeNavigation
+      symbolized_options.tap do
+        @semian_options = symbolized_options if !symbolized_options || !symbolized_options.fetch(:dynamic, false)
+      end
+    end
+
+    def raw_semian_options
+      raise NotImplementedError, "Semian adapters must implement a `raw_semian_options` method"
+    end
+
+    def resource_exceptions
+      raise NotImplementedError, "Semian adapters must implement a `resource_exceptions` method"
+    end
+
+    def resource_already_acquired?
+      @resource_acquired
+    end
+
+    def mark_resource_as_acquired
+      previous = @resource_acquired
+      @resource_acquired = true
+      yield
+    ensure
+      @resource_acquired = previous
+    end
+  end
+end
