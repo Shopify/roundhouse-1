@@ -4763,10 +4763,11 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
             continue;
         }
         let indent = line.len() - trimmed.len();
-        if lines.is_empty()
-            && indent == 0
-            && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative "))
-        {
+        // Top-level requires are load-time deps, not constants: the leading
+        // ones, and those between the halves of a class body the emitter
+        // split around a cycle (`emit_library_class_decl_inner`: close,
+        // require what the rest needs, reopen).
+        if indent == 0 && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative ")) {
             continue;
         }
         lines.push((indent, trimmed));
@@ -4826,7 +4827,14 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
             }
             continue;
         }
-        if at.len() != 2 || at[1] != "end" {
+        // One block, or the same header reopened after a split.
+        fn header_name(t: &str) -> Option<&str> {
+            t.strip_prefix("module ").or_else(|| t.strip_prefix("class ")).map(|r| r.split([' ', '<']).next().unwrap_or(""))
+        }
+        if at.len() < 2
+            || at.len() % 2 != 0
+            || !at.chunks(2).all(|p| p[1] == "end" && header_name(p[0]).is_some() && header_name(p[0]) == header_name(at[0]))
+        {
             return None;
         }
     }
@@ -10240,6 +10248,21 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A class body the emitter split around a cycle (close, require,
+    /// reopen) still names one constant, so it autoloads rather than
+    /// loading at boot. Core's IntlValuePropV2Modifier loaded at boot this
+    /// way and read Markets::DefaultMarkets, which native's lazy test boot
+    /// never loads.
+    #[test]
+    fn split_class_body_is_still_autoloaded() {
+        let split = "require_relative \"base\"\n\nmodule Billing\n  class Modifier < Base\n    A = 1\n  end\nend\n\nrequire_relative \"modifier/arm\"\n\nmodule Billing\n  class Modifier < Base\n    B = Arm\n  end\nend\n";
+        let chain = autoload_primary("models/billing/modifier", split).expect("split body autoloads");
+        assert_eq!(chain, vec![("Billing".to_string(), true), ("Modifier".to_string(), false)]);
+        // A different constant at the top level is still two constants.
+        let two = "module Billing\n  class Modifier\n  end\nend\nrequire_relative \"x\"\nmodule Other\nend\n";
+        assert!(autoload_primary("models/billing/modifier", two).is_none());
+    }
 
     /// A gem the tree loads or a runtime port stands in for is never
     /// refused as Rails-dependent, and a port answers for the names it
