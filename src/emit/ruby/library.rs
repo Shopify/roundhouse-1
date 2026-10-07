@@ -6343,6 +6343,17 @@ fn emit_library_class_decl_inner(
     open_header(&mut s);
 
     for inc in &lc.includes {
+        // An include analysis refused (error[gem_requires_rails]): the
+        // module is only the RBI of a gem no tree loads, so the source's
+        // include fails here, by name, as a NotImplementedError (a
+        // ScriptError, past an app's `rescue => e`), where Ruby would
+        // raise a bare NameError.
+        if let Some(refused) = app.gem_boundary.refused_include(&lc.name, inc) {
+            let text = format!("roundhouse: error[gem_requires_rails]: {}", refused.detail);
+            let quoted = text.replace('\\', "\\\\").replace('\'', "\\'");
+            writeln!(s, "{body_pad}::Kernel.raise(::NotImplementedError, '{quoted}')").unwrap();
+            continue;
+        }
         writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
     }
     if !lc.includes.is_empty() && !lc.methods.is_empty() {
