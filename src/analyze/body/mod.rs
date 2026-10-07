@@ -312,44 +312,6 @@ pub(crate) fn lexical_class(
 /// enclosing scope of `scope` first, and its own type is read in the
 /// scope that declares it. Bounded, so an alias cycle stays a class.
 pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) -> Ty {
-    fn expand(ty: &Ty, scope: &str, classes: Classes<'_>, depth: u8) -> Ty {
-        match ty {
-            Ty::Class { id, args } if args.is_empty() => {
-                if depth < 8 && let Some((owner, aliased)) = type_alias(id, scope, classes) {
-                    return expand(&aliased, &owner, classes, depth + 1);
-                }
-                ty.clone()
-            }
-            Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(|t| expand(t, scope, classes, depth)).collect() },
-            Ty::Array { elem } => Ty::Array { elem: Box::new(expand(elem, scope, classes, depth)) },
-            Ty::Hash { key, value } => Ty::Hash {
-                key: Box::new(expand(key, scope, classes, depth)),
-                value: Box::new(expand(value, scope, classes, depth)),
-            },
-            Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(|t| expand(t, scope, classes, depth)).collect() },
-            Ty::Union { variants } => union_many(variants.iter().map(|t| expand(t, scope, classes, depth)).collect()),
-            other => other.clone(),
-        }
-    }
-    fn type_alias(written: &ClassId, scope: &str, classes: Classes<'_>) -> Option<(String, Ty)> {
-        let (prefix, name) = match written.0.as_str().rsplit_once("::") {
-            Some((prefix, name)) => (prefix.trim_start_matches("::"), name),
-            None => ("", written.0.as_str()),
-        };
-        let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
-        loop {
-            let owner = parts.iter().copied().chain((!prefix.is_empty()).then_some(prefix)).collect::<Vec<_>>().join("::");
-            if !owner.is_empty()
-                && let Some(info) = classes.get(&ClassId(Symbol::from(owner.as_str())))
-                && let Some(aliased) = info.type_aliases.get(&Symbol::from(name))
-            {
-                return Some((owner, aliased.clone()));
-            }
-            if parts.pop().is_none() {
-                return None;
-            }
-        }
-    }
     let has_class = std::cell::Cell::new(false);
     ty.map_class_ids(&|id| {
         has_class.set(true);
@@ -358,7 +320,96 @@ pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) ->
     if !has_class.get() {
         return ty.clone();
     }
-    expand(ty, scope, classes, 0)
+    expand_type_aliases_by(
+        ty,
+        scope,
+        &|owner, name| classes.get(owner).and_then(|info| info.type_aliases.get(name).cloned()),
+        &|id, _| id.clone(),
+        true,
+    )
+}
+
+/// [`expand_type_aliases`] over any alias table: `alias(owner, name)` is the
+/// type `owner::name = T.type_alias { ... }` names, and `class(id, scope)`
+/// resolves a class name that is not an alias, read in `scope` (the alias's
+/// own scope inside an expanded alias). Recurses through signatures too.
+/// `normalize` joins a union an alias expanded into the analyzer's lattice
+/// (a cast's type); without it a union keeps its written arms (a declared
+/// signature, read as written).
+pub(crate) fn expand_type_aliases_by(
+    ty: &Ty,
+    scope: &str,
+    alias: &dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
+    class: &dyn Fn(&ClassId, &str) -> ClassId,
+    normalize: bool,
+) -> Ty {
+    struct Expand<'a> {
+        alias: &'a dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
+        class: &'a dyn Fn(&ClassId, &str) -> ClassId,
+        normalize: bool,
+    }
+    impl Expand<'_> {
+        fn ty(&self, ty: &Ty, scope: &str, depth: u8) -> Ty {
+            match ty {
+                Ty::Class { id, args } if args.is_empty() => {
+                    if depth < 8 && let Some((owner, aliased)) = self.find(id, scope) {
+                        return self.ty(&aliased, &owner, depth + 1);
+                    }
+                    Ty::Class { id: (self.class)(id, scope), args: Vec::new() }
+                }
+                Ty::Class { id, args } => Ty::Class {
+                    id: (self.class)(id, scope),
+                    args: args.iter().map(|t| self.ty(t, scope, depth)).collect(),
+                },
+                Ty::Array { elem } => Ty::Array { elem: Box::new(self.ty(elem, scope, depth)) },
+                Ty::Hash { key, value } => Ty::Hash {
+                    key: Box::new(self.ty(key, scope, depth)),
+                    value: Box::new(self.ty(value, scope, depth)),
+                },
+                Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(|t| self.ty(t, scope, depth)).collect() },
+                Ty::Record { row } => Ty::Record {
+                    row: crate::ty::Row {
+                        fields: row.fields.iter().map(|(name, t)| (name.clone(), self.ty(t, scope, depth))).collect(),
+                        rest: row.rest.clone(),
+                    },
+                },
+                Ty::Union { variants } => {
+                    let arms: Vec<Ty> = variants.iter().map(|t| self.ty(t, scope, depth)).collect();
+                    if self.normalize { union_many(arms) } else { Ty::Union { variants: arms } }
+                }
+                Ty::Fn { params, block, ret, effects } => Ty::Fn {
+                    params: params
+                        .iter()
+                        .map(|p| crate::ty::Param { name: p.name.clone(), ty: self.ty(&p.ty, scope, depth), kind: p.kind.clone() })
+                        .collect(),
+                    block: block.as_ref().map(|b| Box::new(self.ty(b, scope, depth))),
+                    ret: Box::new(self.ty(ret, scope, depth)),
+                    effects: effects.clone(),
+                },
+                other => other.clone(),
+            }
+        }
+
+        fn find(&self, written: &ClassId, scope: &str) -> Option<(String, Ty)> {
+            let (prefix, name) = match written.0.as_str().rsplit_once("::") {
+                Some((prefix, name)) => (prefix.trim_start_matches("::"), name),
+                None => ("", written.0.as_str()),
+            };
+            let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+            loop {
+                let owner = parts.iter().copied().chain((!prefix.is_empty()).then_some(prefix)).collect::<Vec<_>>().join("::");
+                if !owner.is_empty()
+                    && let Some(aliased) = (self.alias)(&ClassId(Symbol::from(owner.as_str())), &Symbol::from(name))
+                {
+                    return Some((owner, aliased));
+                }
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    Expand { alias, class, normalize }.ty(ty, scope, 0)
 }
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so

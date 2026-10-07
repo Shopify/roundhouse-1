@@ -1158,16 +1158,37 @@ impl Analyzer {
 
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
-        // which is only knowable once every class is registered.
+        // which is only knowable once every class is registered. A name
+        // may also be a sorbet type alias from any file
+        // (`StorefrontCarts::OperationResultType`, or `OperationResultType`
+        // inside `StorefrontCarts::Repository`): the sig reader resolves
+        // only its own file's aliases, so the rest expand here, found the
+        // way a cast finds them and read in the scope that declares them.
+        // Every alias counts, including those of a module that holds only
+        // aliases (no class, so not in `ClassInfo::type_aliases`).
+        let mut alias_table: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+        for (owner, name, value) in &app.sorbet_type_aliases {
+            if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(value) {
+                alias_table.entry(owner.clone()).or_default().insert(name.clone(), aliased);
+            }
+        }
         let resolved: Vec<(ClassId, Symbol, Ty, Ty)> = app
             .rbs_signatures
             .iter()
             .flat_map(|(class_id, methods)| {
-                methods.iter().map(|(name, ty)| {
-                    let scoped = ty.map_class_ids(&|id| {
-                        body::lexical_class(id, class_id.0.as_str(), body::Classes::new(&classes, None))
-                            .unwrap_or_else(|| id.clone())
-                    });
+                let classes = &classes;
+                let alias_table = &alias_table;
+                methods.iter().map(move |(name, ty)| {
+                    let scoped = body::expand_type_aliases_by(
+                        ty,
+                        class_id.0.as_str(),
+                        &|owner, name| alias_table.get(owner).and_then(|m| m.get(name)).cloned(),
+                        &|id, scope| {
+                            body::lexical_class(id, scope, body::Classes::new(classes, None))
+                                .unwrap_or_else(|| id.clone())
+                        },
+                        false,
+                    );
                     (class_id.clone(), name.clone(), ty.clone(), scoped)
                 })
             })
