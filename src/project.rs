@@ -1294,6 +1294,15 @@ pub fn target_files(
             );
         }
     }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
+        // The CRuby tree writes these calls as written; elsewhere the
+        // erased `**` and reified methods are not shown to reach `*` so.
+        for d in crate::analyze::nameless_rest_refusals_off_ruby(app) {
+            if let crate::diagnostic::DiagnosticKind::Unsupported { construct, detail, .. } = d.kind {
+                crate::emit::diagnostics::report_unsupported(d.span, target.as_str(), construct, detail);
+            }
+        }
+    }
     // A keyword parameter is carried by the ruby family and by nothing
     // else yet. No other emitter reads `Param::keyword`, so a `def`
     // that declares one renders POSITIONALLY while its call site
@@ -1390,6 +1399,9 @@ pub fn target_files(
     }
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
         report_unloaded_gem_constants(app, target);
+    }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Roda) {
+        report_unsupported_block_captures(app, target);
     }
 
     // Blog is the verbatim Rails source — it ships `db/seeds.rb` and is
@@ -2660,6 +2672,30 @@ fn ruby_family_runtime_files(
         crate::runtime_files::read_to_string("runtime/spinel/module_delegate.rb")
             .map_err(|e| format!("read runtime/spinel/module_delegate.rb: {e}"))?,
     ));
+    // `Rails.configuration` / `Rails.application.config` answering the
+    // lifted config keys (see the file's header): computed-name dispatch,
+    // so ruby-family only, and required beside module_delegate below.
+    files.push((
+        "runtime/rails_configuration.rb".to_string(),
+        crate::runtime_files::read_to_string("runtime/spinel/rails_configuration.rb")
+            .map_err(|e| format!("read runtime/spinel/rails_configuration.rb: {e}"))?,
+    ));
+    // ActiveSupport::Cache (Store, Entry, Coder, LocalCache, MemoryStore,
+    // NullStore) with IsolatedExecutionState and Digest, ported from
+    // activesupport 8.1.4 (see the file's header; tests/cache_runtime.rb
+    // holds it to native ActiveSupport). Marshal, Monitor, Zlib and
+    // computed-name dispatch, so ruby-family only, and carried only where
+    // the app's own code names one of its namespaces: an app that
+    // subclasses MemoryStore (Core's TestCacheStore) needs the real class.
+    let carries_cache = carries_active_support_cache(&files);
+    if carries_cache {
+        files.push((
+            "runtime/active_support_cache.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_cache.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_cache.rb: {e}"))?,
+        ));
+        drop_harness_memory_store(&mut files)?;
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2711,6 +2747,7 @@ fn ruby_family_runtime_files(
              # commonmark-java Markly shim — from the same list, minus that\n\
              # one name.)\n\
              require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
              {}{}",
             gem_require_block(&[]),
             WEB_PUSH_STUB_REOPEN
@@ -2734,12 +2771,18 @@ fn ruby_family_runtime_files(
                  # than carrying a second copy.\n\
                  {}\
                  require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
                 gem_require_block(&["markly"]),
                 WEB_PUSH_STUB_REOPEN
             )
         }
+    };
+    let gem_facades = if carries_cache {
+        format!("{gem_facades}require_relative \"active_support_cache\"\n")
+    } else {
+        gem_facades
     };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {
@@ -2789,6 +2832,9 @@ fn ruby_family_runtime_files(
     // base's eagerly-rewritten one at dedupe) and strips routes.rb's eager
     // controller-require header.
     apply_controller_dispatch(&mut files, app, true);
+    // Lazy flavor of the models aggregator: autoload on reference unless
+    // the environment's `config.eager_load` says otherwise.
+    apply_models_autoload(&mut files, app);
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
@@ -3826,6 +3872,274 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
     }
 }
 
+/// The constant an emitted `app/models/*.rb` file defines, when it
+/// defines exactly one, with the keyword that opened each segment
+/// (`module Podding` / `module Database` / `module Config` →
+/// `Podding::Database::Config`, all modules).
+///
+/// The emitter names each file after its class (`underscore` of the
+/// full name), so the constant is the prefix of the file's leading
+/// `module`/`class` chain whose underscored name is the file's own path
+/// (`anchor`, `models/podding/database/config`). It must also be the only
+/// thing the file defines above its body: every enclosing level holds
+/// just the next level's block. A second class beside it, a constant on
+/// an outer namespace, a top-level statement, or a file whose name
+/// matches no chain prefix all return `None`, because loading the file
+/// on reference to one constant would leave the rest undefined until
+/// then. Those files keep loading at boot.
+fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> {
+    let stem = anchor.strip_prefix("models/")?;
+    // Significant lines below the leading requires: (indent, text).
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if lines.is_empty()
+            && indent == 0
+            && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative "))
+        {
+            continue;
+        }
+        lines.push((indent, trimmed));
+    }
+    // The leading chain: headers at indent 0, 2, 4, … on consecutive lines.
+    let mut chain: Vec<(String, bool)> = Vec::new();
+    for (indent, text) in &lines {
+        let header = text
+            .strip_prefix("module ")
+            .map(|rest| (rest, true))
+            .or_else(|| text.strip_prefix("class ").map(|rest| (rest, false)));
+        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else { break };
+        let name = rest.split([' ', '<']).next().unwrap_or("");
+        // `class << self`, `class A::B` (says nothing about `A`), and a
+        // one-line `class X; end` are not a chain to follow.
+        if name.is_empty() || name.contains("::") || name.contains(';') || rest.contains(';')
+            || !name.starts_with(|c: char| c.is_ascii_uppercase())
+        {
+            break;
+        }
+        chain.push((name.to_string(), is_module));
+    }
+    let depth = (1..=chain.len()).find(|&n| {
+        let full = chain[..n].iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        crate::naming::underscore(&full) == stem
+    })?;
+    // Every level above the constant's body holds only the next block:
+    // at indent 2k, exactly that level's header and its `end`.
+    for level in 0..depth {
+        let at: Vec<&str> = lines.iter().filter(|(i, _)| *i == 2 * level).map(|(_, t)| *t).collect();
+        if at.len() != 2 || at[1] != "end" {
+            return None;
+        }
+    }
+    chain.truncate(depth);
+    Some(chain)
+}
+
+/// The CRuby/JRuby `app/models.rb`: Rails' autoloader, generated.
+///
+/// Rails loads an app file when its constant is first referenced, unless
+/// `config.eager_load` is true for the environment, in which case the
+/// `eager_load!` finisher loads every file at boot. Core sets it to
+/// `BootLib.test_eager_load?` in test.rb: lazy locally, eager on main
+/// and in full CI. The eager aggregator `apply_models_aggregator` writes
+/// required every carried file at boot, so a file Rails would never
+/// load — a load-time gap in a Podding file database.yml never touches
+/// — stopped boot.
+///
+/// Here every file whose single constant `autoload_primary` can name is
+/// registered with `Module#autoload` under its namespace, Zeitwerk's
+/// model: a namespace registers its children when it is defined
+/// (`Module#const_added`), an intermediate namespace no file defines is
+/// an implicit module, and a constant already defined at boot (a reopen
+/// of a runtime class) loads its file then. The environment's
+/// `config.eager_load` expression is emitted as app code and evaluated
+/// at boot; when true every file loads, in the same order as the eager
+/// aggregator, so every load-time error still surfaces. Nothing is
+/// dropped: a file is only loaded later, never omitted. The spinel tree
+/// keeps the eager aggregator (AOT resolves the whole require graph).
+fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    let mut models: Vec<(String, String)> = files
+        .iter()
+        .filter(|(p, _)| p.starts_with("app/models/") && p.ends_with(".rb"))
+        .map(|(p, c)| {
+            let anchor = p.strip_prefix("app/").unwrap_or(p).strip_suffix(".rb").unwrap_or(p).to_string();
+            (anchor, c.clone())
+        })
+        .collect();
+    models.sort();
+
+    // namespace ("Object" for the top level) -> child -> (file, written as module)
+    #[derive(Default)]
+    struct Child {
+        file: Option<String>,
+        all_module: bool,
+        seen: bool,
+    }
+    let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
+    let mut boot_files: Vec<&str> = Vec::new();
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    for (anchor, content) in &models {
+        let Some(chain) = autoload_primary(anchor, content) else {
+            boot_files.push(anchor);
+            continue;
+        };
+        let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        // Two files that both define the same constant cannot both be its
+        // autoload; the second loads at boot, as before.
+        if claimed.contains_key(&full) {
+            boot_files.push(anchor);
+            continue;
+        }
+        claimed.insert(full, anchor.clone());
+        let mut parent = String::from("Object");
+        let last = chain.len() - 1;
+        for (i, (segment, is_module)) in chain.iter().enumerate() {
+            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
+            if !child.seen {
+                child.all_module = true;
+                child.seen = true;
+            }
+            child.all_module &= *is_module;
+            if i == last {
+                child.file = Some(anchor.clone());
+            }
+            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
+        }
+    }
+
+    let mut body = String::from(
+        "# Loads the model/support classes under app/models/ the way Rails'\n\
+         # autoloader does. Generated from the emitted tree (see\n\
+         # apply_models_autoload). Each file still requires its own\n\
+         # LOAD-time deps (superclass, includes, class-body constants).\n\
+         # A file that defines one constant loads when that constant is\n\
+         # first referenced; the rest load at boot. When the environment's\n\
+         # `config.eager_load` is true every file loads at boot, as Rails'\n\
+         # `eager_load!` does.\n\
+         module RoundhouseAutoload\n\
+         \x20 ROOT = __dir__\n\
+         \x20 # namespace => [[constant, file (nil: implicit module), written as module], ...]\n\
+         \x20 NAMESPACES = {\n",
+    );
+    for (namespace, children) in &namespaces {
+        write!(body, "    {namespace:?} => [").unwrap();
+        for (i, (name, child)) in children.iter().enumerate() {
+            if i > 0 {
+                body.push_str(", ");
+            }
+            let file = child.file.as_ref().map_or("nil".to_string(), |f| format!("{f:?}"));
+            write!(body, "[:{name}, {file}, {}]", child.all_module).unwrap();
+        }
+        body.push_str("],\n");
+    }
+    body.push_str("  }.freeze\n");
+    let list = |names: &mut dyn Iterator<Item = &str>| -> String {
+        names.map(|n| format!("    {n:?},\n")).collect()
+    };
+    write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().copied())).unwrap();
+    write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut models.iter().map(|(a, _)| a.as_str()))).unwrap();
+    body.push_str(AUTOLOAD_RUNTIME);
+
+    // The environment's `config.eager_load`, as the app wrote it. Rails'
+    // default for an environment that leaves it nil is
+    // `!config.reloading_enabled?` (railties 8.1.4 bootstrap.rb:19-29),
+    // true unless the environment enables reloading.
+    body.push_str("  def self.eager_load?\n");
+    if app.eager_load.is_empty() {
+        body.push_str("    true\n  end\nend\n\n");
+    } else {
+        body.push_str("    case Rails.env.to_s\n");
+    }
+    for setting in &app.eager_load {
+        write!(body, "    when {:?}\n", setting.env).unwrap();
+        match &setting.value {
+            Ok(expr) => write!(body, "      {}\n", crate::emit::ruby::expr::emit_expr(expr)).unwrap(),
+            Err(reason) => write!(
+                body,
+                "      raise {:?}\n",
+                format!("roundhouse: config.eager_load not supported (all targets): {reason}")
+            )
+            .unwrap(),
+        }
+    }
+    if !app.eager_load.is_empty() {
+        body.push_str("    else\n      true\n    end\n  end\nend\n\n");
+    }
+    body.push_str(
+        "RoundhouseAutoload.register(Object)\n\
+         RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n\
+         RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n",
+    );
+
+    if let Some((_, content)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
+        *content = body;
+    } else {
+        files.push(("app/models.rb".to_string(), body));
+    }
+}
+
+/// The registration half of the generated `app/models.rb`
+/// ([`apply_models_autoload`]).
+const AUTOLOAD_RUNTIME: &str = r##"
+  MODULE_NAME = Module.instance_method(:name)
+
+  def self.path(file)
+    File.expand_path("#{file}.rb", ROOT)
+  end
+
+  # Register `mod`'s children: an autoload for each file, an implicit
+  # module for a namespace only other files open. A child already
+  # defined (a runtime class the app reopens) loads its file now, after
+  # its siblings are registered, since nothing will reference it into
+  # loading.
+  def self.register(mod)
+    key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
+    entries = NAMESPACES[key] or return
+    defined = []
+    entries.each do |name, file, written_module|
+      if mod.const_defined?(name, false)
+        defined << [name, file] unless mod.autoload?(name, false)
+      elsif file
+        mod.autoload(name, path(file))
+      elsif written_module
+        mod.const_set(name, Module.new)
+      end
+    end
+    defined.each do |name, file|
+      require path(file) if file
+      child = mod.const_get(name, false)
+      register(child) if child.is_a?(Module)
+    end
+  end
+
+  def self.eager_load!
+    ALL_FILES.each { |file| require path(file) }
+  end
+
+  # A namespace defined by its own file, or by `const_set` above,
+  # registers its children as it is defined.
+  module ConstAdded
+    def const_added(name)
+      super
+      owner = equal?(Object) ? nil : RoundhouseAutoload::MODULE_NAME.bind_call(self)
+      return if !equal?(Object) && owner.nil?
+      key = owner ? "#{owner}::#{name}" : name.to_s
+      return unless RoundhouseAutoload::NAMESPACES.key?(key)
+      return if autoload?(name, false)
+      child = const_get(name, false)
+      RoundhouseAutoload.register(child) if child.is_a?(Module)
+    end
+  end
+  Module.prepend(ConstAdded)
+"##;
+
 /// Replace the scaffold `main.rb`'s blog-hardcoded
 /// `instantiate_controller` (`:articles`/`:comments` only) with a
 /// dispatch generated from the app's own route table — one
@@ -4201,6 +4515,29 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
             );
         }
     }
+}
+
+/// A block's or lambda's own block parameter (`|*args, &blk|`) is
+/// emitted by the CRuby-compatible Ruby emitter and refused on every
+/// other target, whose block and closure lowerings have no slot for it:
+/// dropping the binding would let the body read an outer local of the
+/// same name, or nothing.
+fn report_unsupported_block_captures(app: &App, target: BuildTarget) {
+    // A block's Lambda has a synthetic span; the call it is attached
+    // to is the nearest sited ancestor.
+    fn visit(target: BuildTarget, expr: &crate::expr::Expr, sited: crate::span::Span) {
+        let sited = if expr.span.file.0 == 0 { sited } else { expr.span };
+        if let crate::expr::ExprNode::Lambda { block_param: Some(name), .. } = &*expr.node {
+            emit::diagnostics::report_unsupported(
+                sited,
+                target.as_str(),
+                "block_capture",
+                format!("the block parameter `&{name}` of a block or lambda is not lowered for {}", target.as_str()),
+            );
+        }
+        expr.node.for_each_child(&mut |child| visit(target, child, sited));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(target, expr, expr.span));
 }
 
 /// A constant only a gem's RBI declares (`StatsD`) runs on the CRuby
@@ -4936,6 +5273,15 @@ fn spinel_files_with_assertions(
     // `delegate` is lowered at ingest. Injected only by
     // `ruby_runtime_files` / `jruby_runtime_files`.
     files.retain(|(p, _)| p != "runtime/module_delegate.rb");
+    // And for `rails_configuration.rb` (`Rails.configuration`), for the
+    // same reason: computed-name dispatch, pushed back by the two
+    // ruby-family forks only. A tree without it refuses the read
+    // (`report_unsupported_runtime_reads`).
+    files.retain(|(p, _)| p != "runtime/rails_configuration.rb");
+    // And for `active_support_cache.rb` (ActiveSupport::Cache): Marshal,
+    // Monitor and computed-name dispatch, pushed back by the two
+    // ruby-family forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -6589,6 +6935,49 @@ fn trim_gemfile(content: &str, has_js: bool, has_cable: bool) -> String {
 /// character or colon rules out `HashSet` and `Foo::Set`. Whole-line
 /// comments are skipped: the cookie jar explains a `Set.new` rewrite in
 /// one, and that is not a use.
+/// The namespaces runtime/spinel/active_support_cache.rb declares that an
+/// app reaches by name.
+const ACTIVE_SUPPORT_CACHE_NAMES: &[&str] = &[
+    "ActiveSupport::Cache",
+    "ActiveSupport::IsolatedExecutionState",
+    "ActiveSupport::Digest",
+];
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a namespace the cache port declares. A test body's
+/// `ActiveSupport::Cache::MemoryStore.new` alone is the harness's
+/// (`drop_harness_memory_store`), so tests do not count.
+fn carries_active_support_cache(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_SUPPORT_CACHE_NAMES.iter().any(|name| names_constant(content, name))
+    })
+}
+
+/// The Ruby-family test harness answers `ActiveSupport::Cache::MemoryStore.new`
+/// with the store `Rails.cache` is (`test/test_helper.rb`), for a test
+/// that swaps a memory store in and has no MemoryStore otherwise. A tree
+/// that carries the real one drops that reopen: its `self.new` would be
+/// inherited by every subclass (Core's `TestCacheStore.new` would build
+/// a `Rails::MemoryStore`), and `MemoryStore.new(size: n)` would not
+/// take its options.
+fn drop_harness_memory_store(files: &mut [(String, String)]) -> Result<(), String> {
+    const REOPEN: &str = "module ActiveSupport\n  module Cache\n    class MemoryStore\n      def self.new\n        Rails.cache.class.new\n      end\n    end\n  end\nend\n";
+    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
+        return Ok(());
+    };
+    if helper.matches(REOPEN).count() != 1 {
+        return Err("drop_harness_memory_store: expected one ActiveSupport::Cache::MemoryStore reopen in test/test_helper.rb".into());
+    }
+    *helper = helper.replace(
+        REOPEN,
+        "# (ActiveSupport::Cache::MemoryStore is runtime/active_support_cache.rb's\n# on this tree; the harness's stand-in is dropped.)\n",
+    );
+    Ok(())
+}
+
 fn names_constant(src: &str, konst: &str) -> bool {
     // Most files never mention this name. Reject those with the optimized
     // substring search before walking/decoding every line of the runtime.
@@ -6624,9 +7013,12 @@ fn names_constant(src: &str, konst: &str) -> bool {
         let mut i = 0;
         while let Some(off) = line[i..].find(konst) {
             let at = i + off;
-            let head_ok = at == 0
-                || !matches!(b[at - 1],
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b':');
+            let ident = |c: u8| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+            // `::Name` is the top-level `Name`; `Outer::Name` is not.
+            let top_level = at >= 2
+                && &b[at - 2..at] == b"::"
+                && (at == 2 || !(ident(b[at - 3]) || b[at - 3] == b':'));
+            let head_ok = at == 0 || top_level || !(ident(b[at - 1]) || b[at - 1] == b':');
             let tail = at + konst.len();
             let tail_ok = matches!(b.get(tail), Some(b'.' | b'[' | b'('))
                 || (b.get(tail) == Some(&b':') && b.get(tail + 1) == Some(&b':'));
@@ -7959,6 +8351,33 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache port rides along where app code (not a test body)
+    /// names its namespaces, and the harness's MemoryStore stand-in,
+    /// whose `self.new` every subclass would inherit, is dropped then.
+    #[test]
+    fn an_app_naming_active_support_cache_carries_the_port_and_drops_the_stand_in() {
+        let helper = crate::runtime_files::read_to_string("runtime/spinel/test/test_helper.rb").unwrap();
+        let subclass = "class TestCacheStore < ::ActiveSupport::Cache::MemoryStore\nend\n";
+        let mut files = vec![
+            ("test/test_helper.rb".to_string(), helper.clone()),
+            ("test/models/cache_test.rb".to_string(), "ActiveSupport::Cache::MemoryStore.new\n".to_string()),
+        ];
+        assert!(!carries_active_support_cache(&files), "a test body's read is the harness's");
+        files.push(("app/models/test_cache_store.rb".to_string(), subclass.to_string()));
+        assert!(carries_active_support_cache(&files));
+        files.push((
+            "app/models/ttl.rb".to_string(),
+            "x = ActiveSupport::IsolatedExecutionState[:k]\n".to_string(),
+        ));
+        assert!(carries_active_support_cache(&files[2..]));
+
+        drop_harness_memory_store(&mut files).unwrap();
+        let dropped = &files[0].1;
+        assert!(!dropped.contains("Rails.cache.class.new"), "{dropped}");
+        assert_eq!(dropped.len() < helper.len(), true);
+        assert!(drop_harness_memory_store(&mut files).is_err(), "a second drop finds no stand-in");
+    }
 
     #[test]
     fn bundled_constant_gate_covers_auxiliary_emitted_roots() {

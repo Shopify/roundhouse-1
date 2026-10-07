@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use roundhouse::analyze::{Analyzer, diagnose};
+use roundhouse::analyze::{Analyzer, diagnose, nameless_rest_refusals_off_ruby};
 use roundhouse::diagnostic::Severity;
 use roundhouse::ingest::ingest_app_from_tree;
 
@@ -996,8 +996,9 @@ fn runtime_full_declarations_refuse_both_entry_paths_and_project_legacy_keywords
 }
 
 /// The ordinary `**value` lowering passes the hash positionally, so a
-/// splat that can reach an admitted nameless rest is refused by `check`
-/// itself, before lowering, for a send and for a `super`.
+/// splat that can reach an admitted nameless rest is refused off the
+/// CRuby tree (whose emitter writes the splat back), before lowering,
+/// for a send and for a `super`. `check` itself no longer refuses it.
 #[test]
 fn a_keyword_splat_into_a_nameless_rest_is_refused_before_lowering() {
     for source in [
@@ -1006,10 +1007,14 @@ fn a_keyword_splat_into_a_nameless_rest_is_refused_before_lowering() {
         "class Probe; def m(*); 7; end; def go(h); [1, m(**h)]; end; end",
     ] {
         let app = analyzed(source);
-        let errors: Vec<_> = diagnose(&app).into_iter().filter(|d| d.severity == Severity::Error).collect();
+        let errors: Vec<_> = nameless_rest_refusals_off_ruby(&app).into_iter().filter(|d| d.severity == Severity::Error).collect();
         assert!(
             errors.iter().any(|d| d.message.contains("keyword splat into an anonymous positional rest")),
             "{source}: {errors:?}"
+        );
+        assert!(
+            !diagnose(&app).iter().any(|d| d.message.contains("keyword splat into an anonymous positional rest")),
+            "{source}: the CRuby tree writes the splat back"
         );
     }
 }
@@ -1023,7 +1028,7 @@ fn a_keyword_splat_whose_exact_destination_has_no_nameless_rest_is_admitted() {
     const REST: &str = "class Loose; def initialize(*); end; end; ";
     let refused = |source: &str| {
         let app = analyzed(source);
-        diagnose(&app)
+        nameless_rest_refusals_off_ruby(&app)
             .into_iter()
             .any(|d| d.severity == Severity::Error && d.message.contains("keyword splat into an anonymous positional rest"))
     };
@@ -1075,7 +1080,7 @@ fn a_keyword_splat_whose_receiver_lookup_cannot_reach_a_nameless_rest_is_admitte
         }
         let mut app = ingest_app_from_tree(tree).expect("ingest synthetic forwarding source");
         Analyzer::new(&app).analyze(&mut app);
-        diagnose(&app)
+        nameless_rest_refusals_off_ruby(&app)
             .into_iter()
             .any(|d| d.severity == Severity::Error && d.message.contains("keyword splat into an anonymous positional rest"))
     };

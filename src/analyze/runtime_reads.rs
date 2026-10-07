@@ -24,6 +24,8 @@ use crate::App;
 const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_notifications.rb", "runtime/active_support_notifications.rb"),
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
+    ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
+    ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
 ];
 
 /// Each gated namespace and the finished-tree file that declares it.
@@ -54,12 +56,18 @@ pub(crate) struct RuntimeRead {
     pub in_test: bool,
 }
 
-/// The `ActiveSupport` singleton methods the reporters file defines that
-/// answer no gated class (`ActiveSupport.filter_parameters`): the
-/// namespace each needs is the file's `ParameterFilter`.
-const UNTYPED_SINGLETONS: &[(&str, &str)] = &[
-    ("filter_parameters", "ActiveSupport::ParameterFilter"),
-    ("filter_parameters=", "ActiveSupport::ParameterFilter"),
+/// Singleton methods a gated runtime file defines that the registry
+/// types as no gated class, by receiver, method and the namespace each
+/// needs: `ActiveSupport.filter_parameters` needs the reporters file's
+/// `ParameterFilter`, and `Rails.configuration` (Untyped, so the config
+/// keys chained off it type gradually) needs rails_configuration.rb's
+/// `Rails::Configuration`. A lifted key's read was rewritten to
+/// `Rails.application.<key>` before this survey, so what is left is a
+/// read only that file answers.
+const UNTYPED_SINGLETONS: &[(&str, &str, &str)] = &[
+    ("ActiveSupport", "filter_parameters", "ActiveSupport::ParameterFilter"),
+    ("ActiveSupport", "filter_parameters=", "ActiveSupport::ParameterFilter"),
+    ("Rails", "configuration", "Rails::Configuration"),
 ];
 
 fn written(path: &[crate::ident::Symbol]) -> String {
@@ -86,8 +94,8 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
                     let receiver = written(path);
                     let needs = class_name(&expr.ty).filter(|name| gated(name)).map(str::to_string).or_else(|| {
                         UNTYPED_SINGLETONS.iter()
-                            .find(|(m, _)| receiver == "ActiveSupport" && *m == method.as_str())
-                            .map(|(_, name)| name.to_string())
+                            .find(|(r, m, _)| receiver == *r && *m == method.as_str())
+                            .map(|(_, _, name)| name.to_string())
                     });
                     if let Some(name) = needs {
                         out.push(RuntimeRead { span: expr.span, name, shown: format!("{receiver}.{}", method.as_str()), in_test });
@@ -171,9 +179,15 @@ mod tests {
             ("ActiveSupport::ErrorReporter", "runtime/active_support_reporters.rb"),
             ("ActiveSupport::ParameterFilter", "runtime/active_support_reporters.rb"),
             ("ActiveSupport::ExecutionContext", "runtime/active_support_reporters.rb"),
+            ("Rails::Configuration", "runtime/rails_configuration.rb"),
+            ("ActiveSupport::Cache::MemoryStore", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache::Strategy::LocalCache", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_cache.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }
         assert!(!names.contains_key("ActiveSupport"), "{names:?}");
+        assert!(!names.contains_key("Rails"), "{names:?}");
+        assert!(!names.contains_key("Rails::Application"), "{names:?}");
     }
 }

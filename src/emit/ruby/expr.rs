@@ -21,6 +21,45 @@ thread_local! {
     /// see the comment there. Off everywhere else, so ordinary app and
     /// library bodies keep reading the way they always have.
     static IN_CORE_CLASS_REOPEN: Cell<bool> = const { Cell::new(false) };
+    /// The emitted path (relative to the output root) of the file being
+    /// rendered. A `SOURCE_FILE_PATH` literal anchors on it; `None`
+    /// outside a per-file emit, where the literal is written as is.
+    static EMITTED_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` while emitting the file that lands at `out_path` (relative
+/// to the output root), restoring the previous setting after.
+pub(super) fn with_emitted_file<R>(out_path: &std::path::Path, f: impl FnOnce() -> R) -> R {
+    let prev = EMITTED_FILE.with(|c| c.replace(Some(out_path.to_path_buf())));
+    let r = f();
+    EMITTED_FILE.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+/// `__FILE__` / `__dir__` from a source file the Ruby family emits
+/// elsewhere. Ruby answers the loaded file's absolute path, so this is
+/// the source's app-relative path resolved from the emitted file's own
+/// directory: `app/models/boot_lib.rb` carrying
+/// `components/x/lib/boot_lib.rb` writes
+/// `File.expand_path("../../components/x/lib/boot_lib.rb", __dir__)`.
+/// The app root maps to the output root, so walks up from `__FILE__`
+/// land on the files carried there, whatever the process's cwd.
+fn source_file_path(e: &Expr) -> Option<String> {
+    if e.decisions & crate::expr::SOURCE_FILE_PATH == 0 {
+        return None;
+    }
+    let ExprNode::Lit { value: Literal::Str { value } } = &*e.node else { return None };
+    if std::path::Path::new(value).is_absolute() {
+        return None;
+    }
+    let out = EMITTED_FILE.with(|c| c.borrow().clone())?;
+    let ups = out.parent().map_or(0, |d| d.components().count());
+    let rel = format!("{}{}", "../".repeat(ups), value);
+    Some(format!(
+        "File.expand_path({}, __dir__)",
+        emit_node(&ExprNode::Lit { value: Literal::Str { value: rel } })
+    ))
 }
 
 /// Run `f` while emitting a core-class reopen's body (or not). The
@@ -57,6 +96,9 @@ pub fn emit_expr(e: &Expr) -> String {
             // expressions retain their effects through the ordinary emitter.
             return emit_send_base(recv.as_ref(), method, args, *parenthesized);
         }
+    }
+    if let Some(path) = source_file_path(e) {
+        return path;
     }
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));
@@ -329,7 +371,7 @@ fn emit_node(n: &ExprNode) -> String {
             format!("{} {} {}", emit_lvalue(target), op.as_ruby(), emit_expr(value))
         }
         ExprNode::Yield { args } => {
-            let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+            let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
             // Parenthesized: `html << yield x` does not parse bare.
             if args_s.is_empty() { "yield".to_string() } else { format!("yield({})", args_s.join(", ")) }
         }
@@ -1381,7 +1423,7 @@ fn is_setter_method(m: &str) -> bool {
 /// body; `do … end` spans multiple lines when the body has newlines.
 pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     use crate::expr::BlockStyle;
-    let ExprNode::Lambda { params, rest_param, body, block_style, .. } = &*block.node else {
+    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = &*block.node else {
         // A non-Lambda block expression is a Proc FORWARD (`&block` —
         // ingest lowers the block-pass arg to a bare Var in the block
         // slot). Rendering it as a literal `{ block }` block made the
@@ -1408,6 +1450,10 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
     if let Some(r) = rest_param {
         ps.push(format!("*{r}"));
+    }
+    // `|*args, &blk|`: the block's own block parameter, last.
+    if let Some(b) = block_param {
+        ps.push(format!("&{b}"));
     }
     let params_str = if ps.is_empty() {
         String::new()

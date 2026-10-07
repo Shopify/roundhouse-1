@@ -61,7 +61,8 @@ pub fn ingest_library_classes(
     let root = result.node();
     let mut out = Vec::new();
     for (scope, class) in find_all_classes_with_scope(&root) {
-        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)?;
+        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)
+            .map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
         if let Some(base) = struct_base {
@@ -79,9 +80,10 @@ pub fn ingest_library_classes(
         {
             continue;
         }
-        out.push(library_class_from_module_node_with_scope(
-            &module, &scope, file,
-        )?);
+        out.push(
+            library_class_from_module_node_with_scope(&module, &scope, file)
+                .map_err(|err| super::error_site::at(err, &module.as_node()))?,
+        );
     }
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
@@ -1176,20 +1178,20 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// Lowerings that copy the parameters into a generated method (job and
 /// mailer wrappers) refuse it themselves.
 ///
-/// Nothing but a block may accompany the `*`. Every argument a call
-/// passes, its keywords lowered to a trailing positional hash included,
-/// then lands in the rest, where no body can read it, as Ruby does for
-/// a method that accepts no keywords. That holds however the call
-/// reaches the method (`method_missing`, a reified or dispatched method,
-/// a block), so no call site has to be found. Any other parameter could
-/// bind that hash (a required positional takes the caller's hash object
-/// where Ruby passes a copy), and the paths that reach a method unnamed
-/// are open-ended, so those stay refused.
+/// Any other parameter may accompany it (`def script(subcommand, *)`,
+/// `def m(*, **)`, `def m(a, *, k: 1)`): with a rest in the signature
+/// ingest keeps the keyword group as keywords, so the def is written as
+/// the source wrote it. The CRuby tree writes every call's keywords and
+/// keyword splats as written too (`ERASED_KEYWORD_SPLAT`), so a call
+/// binds the positionals and the rest as native Ruby does, however it
+/// reaches the method. The other targets do not show that and refuse
+/// the declaration (`project.rs`), and name the reified and keyword-splat
+/// calls that reach it (`analyze::forwarding::OFF_RUBY_FAMILY`).
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
             && m.receiver == MethodReceiver::Instance
-            && matches!(m.params.as_slice(), [only] if only.is_nameless_rest())
+            && m.params.iter().any(|p| p.is_nameless_rest())
         {
             m.unsupported_formals = None;
         }
@@ -1651,6 +1653,7 @@ fn walk_decl_body_with_visibility<'pr>(
     };
 
     let statements = flatten_statements(b);
+    let mut body_locals: Vec<BodyLocal> = Vec::new();
     let has_class_methods = statements.iter().any(|stmt| stmt.as_module_node()
         .is_some_and(|m| module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()])));
     for statement in statements {
@@ -1725,6 +1728,21 @@ fn walk_decl_body_with_visibility<'pr>(
                     continue;
                 }
             }
+        }
+        // A local of the class body (`build = ->(parts) { … }`), read by
+        // the constants and class-level calls after it. See
+        // `BodyLocal`.
+        if let Some(lw) = stmt.as_local_variable_write_node() {
+            let mut local = body_local(&lw, file)?;
+            if let Some(earlier) = body_locals.iter_mut().find(|l: &&mut BodyLocal| l.name == local.name) {
+                earlier.value = Err("is assigned more than once".to_string());
+                continue;
+            }
+            if let Ok(value) = &mut local.value {
+                substitute_body_locals(value, &body_locals, file)?;
+            }
+            body_locals.push(local);
+            continue;
         }
         // Class-level constant `NAME = <expr>` (e.g. `STORIES_PER_PAGE = 25`).
         if let Some(cw) = stmt.as_constant_write_node() {
@@ -2229,8 +2247,188 @@ fn walk_decl_body_with_visibility<'pr>(
         }
     }
 
+    if !body_locals.is_empty() {
+        for (_, value) in &mut out.constants {
+            substitute_body_locals(value, &body_locals, file)?;
+        }
+        for call in &mut out.unknown_calls {
+            substitute_body_locals(call, &body_locals, file)?;
+        }
+        for init in &mut out.class_initializers {
+            substitute_body_locals(init, &body_locals, file)?;
+        }
+    }
+
     out.finalize_classvars(&class_attributes, has_class_attr_default, file)?;
     Ok(out)
+}
+
+/// A local variable of a class or module body.
+///
+/// Ruby evaluates the body top to bottom in one scope, so
+///
+/// ```ruby
+/// module SqlHelper
+///   build_union_regexp = ->(parts) { Regexp.union(parts.map { … }) }
+///   READ_QUERY = build_union_regexp.call(READ_VERBS)
+/// ```
+///
+/// builds `READ_QUERY` by calling the lambda the line above bound. The
+/// IR keeps a body's constants and class-level calls, not its statement
+/// sequence, so the local has nowhere to live; each read of it is
+/// replaced by its value instead. That is the same program only for a
+/// value whose identity and creation no reader can observe:
+///
+/// * a lambda literal that closes over nothing (no read of an outer
+///   local), read only as the receiver of `.call` — every reader calls
+///   a lambda with the same body and no captured state;
+/// * an immediate literal (Integer, Float, Symbol, true, false, nil).
+///
+/// Anything else (`client = Client.new`, a string a reader might mutate,
+/// a lambda passed as a value, a local assigned twice) is refused by
+/// name at its first read rather than dropped: before this, the write
+/// vanished and the reads were bare method calls, a NameError at load.
+/// A local nothing kept reads stays as it was, outside the IR.
+struct BodyLocal {
+    name: Symbol,
+    /// The value each read becomes, or why a read cannot keep its scope.
+    value: Result<Expr, String>,
+    lambda: bool,
+}
+
+fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> IngestResult<BodyLocal> {
+    let name = Symbol::from(constant_id_str(&lw.name()));
+    let value = lw.value();
+    let lambda_body = if value.as_lambda_node().is_some() {
+        true
+    } else if let Some(call) = value.as_call_node() {
+        call.receiver().is_none()
+            && matches!(constant_id_str(&call.name()), "lambda" | "proc")
+            && call.arguments().is_none()
+            && call.block().is_some_and(|b| b.as_block_node().is_some())
+    } else {
+        false
+    };
+    if lambda_body {
+        struct Outer {
+            depth: u32,
+            name: Option<String>,
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Outer {
+            fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+                if node.depth() >= self.depth && self.name.is_none() {
+                    self.name = Some(constant_id_str(&node.name()).to_string());
+                }
+            }
+            fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+                if node.depth() >= self.depth && self.name.is_none() {
+                    self.name = Some(constant_id_str(&node.name()).to_string());
+                }
+                ruby_prism::visit_local_variable_write_node(self, node);
+            }
+            fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+                self.depth += 1;
+                ruby_prism::visit_block_node(self, node);
+                self.depth -= 1;
+            }
+            fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+                self.depth += 1;
+                ruby_prism::visit_lambda_node(self, node);
+                self.depth -= 1;
+            }
+        }
+        let mut outer = Outer { depth: 0, name: None };
+        ruby_prism::Visit::visit(&mut outer, &value);
+        if let Some(captured) = outer.name {
+            return Ok(BodyLocal { name, value: Err(format!("is a lambda that closes over `{captured}`")), lambda: true });
+        }
+        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: true });
+    }
+    let immediate = value.as_integer_node().is_some()
+        || value.as_float_node().is_some()
+        || value.as_symbol_node().is_some()
+        || value.as_true_node().is_some()
+        || value.as_false_node().is_some()
+        || value.as_nil_node().is_some();
+    if immediate {
+        return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: false });
+    }
+    Ok(BodyLocal {
+        name,
+        value: Err("holds a value that is not a closure-free lambda or an immediate literal".to_string()),
+        lambda: false,
+    })
+}
+
+/// Replace each read of a body local in `expr` by its value (see
+/// [`BodyLocal`]). A block that rebinds the name as a parameter shadows
+/// it for its body.
+fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> IngestResult<()> {
+    fn walk(expr: &mut Expr, locals: &[BodyLocal], shadowed: &[Symbol], file: &str) -> IngestResult<()> {
+        let local = |name: &Symbol| {
+            locals.iter().find(|l| &l.name == name).filter(|_| !shadowed.contains(name))
+        };
+        // The read is the refusal's site.
+        let span = expr.span;
+        let sited = |err: IngestError| {
+            super::error_site::note(&err, span.start as usize, span.end as usize);
+            err
+        };
+        let opaque = |l: &BodyLocal, why: &str| sited(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "class-body local `{}` {why}; the constants reading it cannot keep its scope",
+                l.name.as_str()
+            ),
+        });
+        if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *expr.node {
+            if method.as_str() == "call" {
+                if let ExprNode::Var { name, .. } = &*recv.node {
+                    if let Some(l) = local(name) {
+                        match &l.value {
+                            Ok(value) if l.lambda => *recv = value.clone(),
+                            Err(why) => return Err(opaque(l, why)),
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        if let ExprNode::Var { name, .. } = &*expr.node {
+            if let Some(l) = local(name) {
+                let value = match &l.value {
+                    Ok(value) => value,
+                    Err(why) => return Err(opaque(l, why)),
+                };
+                if l.lambda {
+                    return Err(sited(IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!(
+                            "class-body lambda `{}` is read other than as the receiver of `.call`; \
+                             the constants reading it cannot keep its scope",
+                            l.name.as_str()
+                        ),
+                    }));
+                }
+                *expr = value.clone();
+                return Ok(());
+            }
+        }
+        let mut inner: Vec<Symbol> = shadowed.to_vec();
+        if let ExprNode::Lambda { params, rest_param, block_param, .. } = &*expr.node {
+            inner.extend(params.iter().cloned());
+            inner.extend(rest_param.iter().cloned());
+            inner.extend(block_param.iter().cloned());
+        }
+        let mut result = Ok(());
+        expr.node.for_each_child_mut(&mut |child| {
+            if result.is_ok() {
+                result = walk(child, locals, &inner, file);
+            }
+        });
+        result
+    }
+    walk(expr, locals, &[], file)
 }
 
 /// Only declared cattr/mattr reads use the existing class-ivar approximation.

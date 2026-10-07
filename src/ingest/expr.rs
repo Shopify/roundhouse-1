@@ -19,7 +19,7 @@ pub fn ingest_expr(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // substitute a `Literal::Nil` placeholder so the surrounding
     // ingester keeps going. Errors are recorded into the per-thread
     // collector for the post-run punch list. See `survey.rs`.
-    match ingest_expr_strict(node, file) {
+    match ingest_expr_strict(node, file).map_err(|err| super::error_site::at(err, node)) {
         Ok(e) => Ok(e),
         Err(err) if super::survey::is_active() => {
             super::survey::record(&err);
@@ -477,6 +477,14 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     ))
 }
 
+/// A string literal naming this source file's own location (`__FILE__`,
+/// `__dir__`), app-root relative and flagged `SOURCE_FILE_PATH`.
+fn source_file_path_lit(span: Span, path: String) -> Expr {
+    let mut lit = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: path } });
+    lit.decisions |= crate::expr::SOURCE_FILE_PATH;
+    lit
+}
+
 fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // Byte offsets into the text registered for `file` (the exact text
     // prism is parsing). FileId(0) when the entry point didn't
@@ -542,6 +550,22 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_call_node().is_some() => {
             let c = n.as_call_node().unwrap();
             let method = constant_id_str(&c.name()).to_string();
+            // `__dir__` is `File.dirname` of the loaded file's absolute
+            // path: the same static fact as `__FILE__` below, one level
+            // up. Flagged the same way so the target anchors it on the
+            // emitted file's location.
+            if method == "__dir__"
+                && c.receiver().is_none()
+                && c.arguments().is_none()
+                && c.block().is_none()
+            {
+                let rel = super::sources::relative_path(file);
+                let dir = match std::path::Path::new(&rel).parent() {
+                    Some(d) if !d.as_os_str().is_empty() => d.to_string_lossy().into_owned(),
+                    _ => ".".to_string(),
+                };
+                return Ok(source_file_path_lit(span, dir));
+            }
             let args: Vec<Expr> = if let Some(a) = c.arguments() {
                 ingest_forwardable_arguments(&a, file)?
             } else {
@@ -934,8 +958,13 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         // emitted program. A read of `__FILE__` types as `Str` like any
         // other string literal, so `File.expand_path('..', __FILE__)`
         // and friends type-check through it for free.
+        //
+        // The literal carries `SOURCE_FILE_PATH`: Ruby's `__FILE__` is
+        // the loaded file's absolute path, independent of cwd, so a
+        // target that relocates the file rewrites it against its own
+        // emitted location (see the flag).
         n if n.as_source_file_node().is_some() => {
-            ExprNode::Lit { value: Literal::Str { value: super::sources::relative_path(file) } }
+            return Ok(source_file_path_lit(span, super::sources::relative_path(file)));
         }
         // `__LINE__` uses this parse's bytes, not an older registration of
         // the same filename. ERB later translates it to the template line.
@@ -1061,7 +1090,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            refuse_block_capture(l.parameters(), file)?;
+            let block_param = block_capture(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
@@ -1073,14 +1102,27 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { rest_param, params, block_param, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
             let args: Vec<Expr> = if let Some(a) = y.arguments() {
                 a.arguments()
                     .iter()
-                    .map(|arg| ingest_expr(&arg, file))
+                    .map(|arg| {
+                        let mut value = ingest_expr(&arg, file)?;
+                        // `yield(**h)` ingests as the positional hash every
+                        // target but Ruby passes. Mark it so the Ruby
+                        // emitter writes the splat back: a block or method
+                        // object taking keywords binds none from a
+                        // positional Hash in Ruby 3.
+                        if arg.as_keyword_hash_node().is_some_and(|hash| {
+                            hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some())
+                        }) {
+                            value.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
+                        }
+                        Ok(value)
+                    })
                     .collect::<IngestResult<_>>()?
             } else {
                 vec![]
@@ -1886,10 +1928,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_while_node().is_some() => {
             let w = n.as_while_node().unwrap();
             if w.is_begin_modifier() {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "`begin … end while` (do-while) form not yet supported".into(),
-                });
+                return Ok(Expr::new(span, do_loop(w.statements(), &w.predicate(), false, file)?));
             }
             let cond = ingest_expr(&w.predicate(), file)?;
             let body = match w.statements() {
@@ -1909,10 +1948,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_until_node().is_some() => {
             let u = n.as_until_node().unwrap();
             if u.is_begin_modifier() {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "`begin … end until` (do-until) form not yet supported".into(),
-                });
+                return Ok(Expr::new(span, do_loop(u.statements(), &u.predicate(), true, file)?));
             }
             let cond = ingest_expr(&u.predicate(), file)?;
             let body = match u.statements() {
@@ -2838,7 +2874,7 @@ fn ingest_call_block(
             // standalone-lambda-vs-attached-block distinction is lost,
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
-                refuse_block_capture(lam.parameters(), file)?;
+                let block_param = block_capture(lam.parameters(), file)?;
                 let params = block_param_names(lam.parameters());
                 let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
@@ -2849,7 +2885,7 @@ fn ingest_call_block(
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+                    ExprNode::Lambda { rest_param, params, block_param, body, block_style },
                 )));
             }
             // Any other proc-valued expression is evaluated once and passed as the block.
@@ -2905,7 +2941,7 @@ fn ingest_call_block(
 /// hands this the same `BlockNode` shape one level deeper (inside the
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
-    refuse_block_capture(b.parameters(), file)?;
+    let block_param = block_capture(b.parameters(), file)?;
     let params = block_param_names(b.parameters());
     let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
@@ -2916,7 +2952,7 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+        ExprNode::Lambda { rest_param, params, block_param, body, block_style },
     ))
 }
 
@@ -2946,6 +2982,91 @@ fn try_ingest_method_ref(
     )))
 }
 
+/// `begin … end while cond` / `begin … end until cond`: the body runs
+/// once before the first test (Ruby's do-while; a plain `while`
+/// modifier on a non-`begin` statement tests first). Lowered to
+///
+/// ```ruby
+/// while true
+///   body
+///   break unless cond   # `break if cond` for `until`
+/// end
+/// ```
+///
+/// which keeps the enclosing local scope (a `loop do` block would make
+/// the body's first assignments block-local) and, like the source,
+/// evaluates to nil. A `next` or `redo` aimed at the loop itself is
+/// refused: in the source `next` goes to the test, and here it would
+/// skip it.
+fn do_loop(
+    statements: Option<ruby_prism::StatementsNode<'_>>,
+    predicate: &Node<'_>,
+    until: bool,
+    file: &str,
+) -> IngestResult<ExprNode> {
+    let form = if until { "until" } else { "while" };
+    if let Some(statements) = &statements {
+        if let Some(jump) = loop_level_jump(&statements.as_node()) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "`{jump}` in a `begin … end {form}` body: it would skip the loop test the source runs"
+                ),
+            });
+        }
+    }
+    let body = match statements {
+        Some(s) => ingest_expr(&s.as_node(), file)?,
+        None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+    };
+    let cond = ingest_expr(predicate, file)?;
+    let nil = || Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+    let brk = Expr::new(Span::synthetic(), ExprNode::Break { value: None });
+    let test = if until {
+        ExprNode::If { cond, then_branch: brk, else_branch: nil() }
+    } else {
+        ExprNode::If { cond, then_branch: nil(), else_branch: brk }
+    };
+    let test = Expr::new(Span::synthetic(), test);
+    let body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![body, test] });
+    let always = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } });
+    Ok(ExprNode::While { cond: always, body, until_form: false })
+}
+
+/// A `next` or `redo` in `node` that targets the loop `node` is the
+/// body of, rather than a block, lambda, method or loop inside it.
+fn loop_level_jump(node: &Node<'_>) -> Option<&'static str> {
+    use ruby_prism::Visit;
+    struct Jumps(Option<&'static str>);
+    impl<'pr> Visit<'pr> for Jumps {
+        fn visit_next_node(&mut self, _: &ruby_prism::NextNode<'pr>) {
+            self.0.get_or_insert("next");
+        }
+        fn visit_redo_node(&mut self, _: &ruby_prism::RedoNode<'pr>) {
+            self.0.get_or_insert("redo");
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+            // The predicate is outside the inner loop's body.
+            self.visit(&node.predicate());
+        }
+        fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+            self.visit(&node.predicate());
+        }
+        fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+            self.visit(&node.collection());
+        }
+    }
+    let mut jumps = Jumps(None);
+    jumps.visit(node);
+    jumps.0
+}
+
 /// Classify a block's `opening_loc` bytes as `{` (brace form) or `do`.
 /// Prism always populates this location with the source-literal opener.
 fn block_style_from_opening(bytes: &[u8]) -> crate::expr::BlockStyle {
@@ -2957,18 +3078,25 @@ fn block_style_from_opening(bytes: &[u8]) -> crate::expr::BlockStyle {
     }
 }
 
-/// Authored block captures are not retained by the Lambda ingest below.
-/// Refuse before dropping a binding that could shadow an outer local.
-fn refuse_block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<()> {
-    if params_node.and_then(|node| node.as_block_parameters_node())
-        .and_then(|node| node.parameters()).is_some_and(|params| params.block().is_some())
-    {
-        return Err(IngestError::Unsupported {
+/// A block's or lambda's own block parameter (`|*args, &blk|`,
+/// `->(&blk)`), kept on the `Lambda` so the binding shadows an outer
+/// local of the same name and the emitted block still receives the
+/// block it is called with. An anonymous `&` has no name to keep.
+fn block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Option<Symbol>> {
+    let Some(block) = params_node
+        .and_then(|node| node.as_block_parameters_node())
+        .and_then(|node| node.parameters())
+        .and_then(|params| params.block())
+    else {
+        return Ok(None);
+    };
+    match block.name() {
+        Some(name) => Ok(Some(Symbol::from(constant_id_str(&name)))),
+        None => Err(IngestError::Unsupported {
             file: file.into(),
-            message: "block parameter capture requires preserved Lambda signature semantics".into(),
-        });
+            message: "anonymous block parameter `&` in a block or lambda signature".into(),
+        }),
     }
-    Ok(())
 }
 
 fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {

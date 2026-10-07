@@ -184,10 +184,16 @@ impl<'a> BodyTyper<'a> {
         block: &Expr,
     ) -> Ctx {
         let mut new_ctx = outer.clone();
-        let ExprNode::Lambda { params, .. } = &*block.node else {
+        let ExprNode::Lambda { params, block_param, .. } = &*block.node else {
             return new_ctx;
         };
         for name in params { new_ctx.class_objects.remove(name); }
+        // `|…, &blk|` binds the block the yield passes (a Proc, or nil),
+        // shadowing any outer local of that name.
+        if let Some(name) = block_param {
+            new_ctx.class_objects.remove(name);
+            new_ctx.local_bindings.insert(name.clone(), Ty::Untyped);
+        }
         super::forget_class_object_writes(block, &mut new_ctx);
         // `form_with model: product do |form|` / `form_for @product do
         // |f|`: the builder is parameterized by the record the form is

@@ -37,6 +37,7 @@ pub(crate) mod test_harness_calls;
 pub mod test_helper_connection;
 mod database_identity;
 mod initializer_coverage;
+mod ingest_coverage;
 mod fixture_entries;
 mod body;
 mod class_configuration;
@@ -61,6 +62,7 @@ mod inferred_types;
 pub mod inquiry;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
+pub use forwarding::nameless_rest_refusals_off_ruby;
 pub use diagnostics::{diagnose, diagnose_with_coverage, unknown_receiver_sends, UnknownReceiverSend};
 
 pub use body::{BodyTyper, ClassInfo, ConstScope, Ctx};
