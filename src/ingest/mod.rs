@@ -58,6 +58,7 @@ pub(crate) mod sorbet_check;
 pub mod sources;
 pub mod type_ascription;
 pub mod initializers;
+mod initializer_constants;
 pub mod sql_functions;
 pub mod structure_sql;
 pub mod survey;

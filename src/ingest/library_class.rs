@@ -186,7 +186,7 @@ fn library_classes(
 
 /// The `LibraryClassOrigin::FileConstants` holder of a file whose
 /// first constant is `first`.
-fn file_constants_holder(first: &Symbol) -> LibraryClass {
+pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
     LibraryClass {
         top_level_constants: Vec::new(),
         name: ClassId(first.clone()),
@@ -267,7 +267,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
 /// collected by `walk_decl_body`.
 /// Puts a file's top-level constants ahead of `host`'s own and names
 /// them in its `top_level_constants`. See [`LibraryClass::top_level_constants`].
-fn carry_file_constants(host: &mut LibraryClass, constants: Vec<(Symbol, Expr, bool)>) {
+pub(super) fn carry_file_constants(host: &mut LibraryClass, constants: Vec<(Symbol, Expr, bool)>) {
     if constants.is_empty() {
         return;
     }

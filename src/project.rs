@@ -3131,7 +3131,46 @@ fn ruby_family_files(
     } else {
         files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
     }
+    apply_initializer_constants(&mut files, app)?;
     Ok(files)
+}
+
+/// Define the constants boot initializers assign at their top level
+/// (`ingest::initializer_constants`) where Rails does: each engine's,
+/// then the app's `config/initializers` run in `load_config_initializers`
+/// order, after the gems' railtie initializers (the `:boot` phase
+/// `apply_postgres_bootstrap` inserts ahead of the same anchor) and
+/// before Finisher sets up the app's autoloader. Each holder file is
+/// required once, in that order; the models aggregator's later
+/// `require_relative` of the same file is a no-op.
+fn apply_initializer_constants(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+    if app.initializer_constants.is_empty() {
+        return Ok(());
+    }
+    let mut block = String::from(
+        "# The constants the boot initializers assign at their top level, in\n\
+         # Rails' load_config_initializers order (engines, then the app).\n",
+    );
+    for constants in &app.initializer_constants {
+        let stem = format!("app/models/{}", crate::naming::underscore(constants.holder.0.as_str()));
+        let emitted = format!("{stem}.rb");
+        let names = constants.names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+        if !files.iter().any(|(p, _)| *p == emitted) {
+            return Err(format!(
+                "initializer constants: {names} (from {}) has no emitted {emitted}",
+                constants.file
+            ));
+        }
+        block.push_str(&format!("# {names}: {}\nrequire_relative {stem:?}\n", constants.file));
+    }
+    let boot = files
+        .iter_mut()
+        .find(|(p, _)| p == "boot.rb")
+        .ok_or("initializer constants: the tree has no boot.rb")?;
+    let models = "require_relative \"app/models\"\n";
+    let at = boot.1.find(models).ok_or("initializer constants: missing app/models require in boot.rb")?;
+    boot.1.insert_str(at, &block);
+    Ok(())
 }
 
 /// Configure the selected PostgreSQL backend at both ordinary Ruby entry
