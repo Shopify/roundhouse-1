@@ -38,6 +38,17 @@ end
 TestBase.prepend(RoundhouseMinitestAssertions)
 
 module RoundhouseTestRunner
+  # Whether a test file's driver runs: when the file is the program
+  # (`ruby test/models/x_test.rb`), or when the program is not an emitted
+  # test file (a loader, such as rake's, that requires each one). A
+  # subclass's file requires its parent's; the parent's own run is its
+  # own file's, as Minitest runs a class once (the subclass's driver lists
+  # the tests it inherits).
+  def self.drive?(file)
+    program = File.expand_path($PROGRAM_NAME)
+    program == File.expand_path(file) || !program.end_with?("_test.rb")
+  end
+
   def self.capture(errors, phase)
     yield
   rescue NoMemoryError, SignalException, SystemExit

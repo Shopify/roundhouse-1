@@ -1766,6 +1766,7 @@ end
                 unwrap_or_record(ingest_test_files(&source, &helper_rb.display().to_string()))?
             {
                 for mut tm in tms.into_iter().filter(|tm| tm.parent.is_some()) {
+                    tm.source_file = Some("test/test_helper.rb".to_string());
                     splice_test_helpers(&mut tm, &shared_test_helpers);
                     app.test_modules.push(tm);
                 }
@@ -1779,6 +1780,7 @@ end
             unwrap_or_record(ingest_test_files(&source, &entry.display().to_string()))?
         {
             for mut tm in tms {
+                tm.source_file = Some(entry.strip_prefix(dir).unwrap_or(&entry).display().to_string());
                 splice_test_helpers(&mut tm, &shared_test_helpers);
                 if let Some(case_setup) = &test_case_setup {
                     splice_test_case_setup(&mut tm, case_setup);

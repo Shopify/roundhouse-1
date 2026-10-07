@@ -6882,6 +6882,7 @@ fn is_app_class(name: &str, app: &App) -> bool {
             .library_classes
             .iter()
             .any(|c| c.name.0.as_str() == name && !c.is_module)
+        || app.test_modules.iter().any(|t| t.name.0.as_str() == name)
 }
 
 /// The declared superclass of an app class named by a namespace
@@ -6893,10 +6894,17 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
     if let Some(c) = app.controllers.iter().find(|c| c.name.0.as_str() == name) {
         return c.parent.clone();
     }
-    app.library_classes
+    if let Some(c) = app.library_classes.iter().find(|c| c.name.0.as_str() == name && !c.is_module) {
+        return c.parent.clone();
+    }
+    // A test class nesting another (`PermissionGeneratorTest::
+    // ValidateInitialTest`) reopens with the parent its own file
+    // declares, after the emit's base rewrite.
+    app.test_modules
         .iter()
-        .find(|c| c.name.0.as_str() == name && !c.is_module)
-        .and_then(|c| c.parent.clone())
+        .find(|t| t.name.0.as_str() == name)
+        .and_then(|t| t.parent.as_ref())
+        .map(super::emitted_test_parent)
 }
 
 /// The app class a written superclass names, looked up from the child's
