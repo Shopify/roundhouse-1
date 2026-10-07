@@ -5941,6 +5941,50 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         expr.node.for_each_child(&mut |child| visit(app, target, files, child));
     }
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, files, expr));
+    // `include Semian::AdapterError`: analysis resolved a module only a
+    // gem's runtime port declares, and the class body raises NameError at
+    // load wherever the finished tree lacks the port file. A module the
+    // app or a gem's RBI declares resolved before the port was consulted
+    // and is not gated here.
+    let declared = |name: &str| app.library_classes.iter().any(|c| c.name.0.as_str() == name)
+        || app.models.iter().any(|m| m.name.0.as_str() == name)
+        || app.gem_boundary.gem_of(name).is_some();
+    let mut includes: Vec<(crate::span::Span, String, String)> = Vec::new();
+    for class in &app.library_classes {
+        for included in &class.includes {
+            includes.push((crate::span::Span::synthetic(), class.name.0.to_string(), included.0.to_string()));
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let crate::expr::ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if !matches!(method.as_str(), "include" | "extend" | "prepend") {
+                continue;
+            }
+            for arg in args {
+                if let crate::expr::ExprNode::Const { path } = &*arg.node {
+                    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    includes.push((expr.span, model.name.0.to_string(), name));
+                }
+            }
+        }
+    }
+    for (span, owner, name) in includes {
+        let name = name.trim_start_matches("::");
+        if declared(name) {
+            continue;
+        }
+        let Some((gem, port)) = gem_port_declaring(name) else { continue };
+        let detail = if target != BuildTarget::Ruby {
+            format!("{owner} includes {name}, declared by the {gem} gem's runtime port {port}, which the {} tree does not carry", target.as_str())
+        } else if !app.gem_boundary.loads(gem) && !files.iter().any(|(p, _)| p == port) {
+            format!("{owner} includes {name}, declared by the {gem} gem's runtime port {port}, which only the PostgreSQL CRuby tree carries")
+        } else {
+            continue;
+        };
+        emit::diagnostics::report_unsupported(span, target.as_str(), "include", detail);
+    }
 }
 
 /// A read of a name only the Ruby-family runtime declares
@@ -8368,6 +8412,14 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
         .get(gem)?
         .get(name.trim_start_matches("::"))
         .copied()
+}
+
+/// The gem, and the finished-tree port file, of the runtime port that
+/// declares `name` (`Semian::AdapterError`, from either spelling): the
+/// name an app may `include` though no RBI or loaded gem source names
+/// it, since the port, not the gem, is what the tree runs.
+pub(crate) fn gem_port_declaring(name: &str) -> Option<(&'static str, &'static str)> {
+    gem_ports().find_map(|(gem, _)| gem_port_file(gem, name).map(|file| (*gem, file)))
 }
 
 /// `gem_sources`: the gems carried as source (`gem_source_entries`). They
