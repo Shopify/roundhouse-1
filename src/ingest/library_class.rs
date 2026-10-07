@@ -434,6 +434,7 @@ pub(super) fn library_class_and_struct_base(
         class_initializers,
         visibility_overrides,
     } = walk_decl_body(class.body(), &owner, file, false)?;
+    let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
     // :name, String` IS the constructor and the reader. Lower it into
@@ -1316,6 +1317,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
     let DeclBody { includes, methods, constants, unknown_calls, class_initializers, .. } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
         top_level_constants: Vec::new(),
         name: owner,
@@ -1330,6 +1332,58 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_ivar_initializers: class_initializers,
         visibility_overrides: Vec::new(),
     })
+}
+
+/// A class or module body's own instance-variable writes (`@registry =
+/// {} #: Hash[String, bool]`, Core's ModelUuidColumns), appended to the
+/// body's class-side initializers. They set the ivar on the class or
+/// module object itself, which its `def self.` methods then read; the
+/// walk used to drop them without a word, so the first `@registry << x`
+/// met nil.
+///
+/// The emitted body writes them after its constants, so a constant the
+/// source wrote after one of them and whose value reads an instance
+/// variable is refused rather than reordered. A class that replays its
+/// DSL interleaves the replayed calls with these writes by source
+/// position (`emit::ruby::library`). Writes inside `class << self`,
+/// blocks and methods are not this body's and stay where they are.
+fn with_class_body_ivar_writes(
+    mut initializers: Vec<Expr>,
+    body: Option<ruby_prism::Node<'_>>,
+    file: &str,
+) -> IngestResult<Vec<Expr>> {
+    let Some(body) = body else { return Ok(initializers) };
+    let mut seen_write = false;
+    for stmt in flatten_statements(body) {
+        if stmt.as_instance_variable_write_node().is_some()
+            || stmt.as_instance_variable_or_write_node().is_some()
+        {
+            initializers.push(ingest_expr(&stmt, file)?);
+            seen_write = true;
+            continue;
+        }
+        if !seen_write {
+            continue;
+        }
+        if let Some(constant) = stmt.as_constant_write_node() {
+            if reads_instance_variable(&ingest_expr(&constant.value(), file)?) {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "a constant reading an instance variable after a class-level instance-variable write requires source-order initialization".into(),
+                });
+            }
+        }
+    }
+    Ok(initializers)
+}
+
+fn reads_instance_variable(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Ivar { .. }) {
+        return true;
+    }
+    let mut hit = false;
+    expr.node.for_each_child(&mut |child| hit = hit || reads_instance_variable(child));
+    hit
 }
 
 /// Walk a class or module body, collecting `include` directives and

@@ -3894,8 +3894,18 @@ impl Analyzer {
                 constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
             };
 
+            // The initializers run in order on the class object, so one
+            // reads the ivars the ones before it wrote (`@sample_rate =
+            // 0.10` then `@count = (1.0 / @sample_rate).to_i`). Their
+            // bindings stay out of the instance-side `class_ctx`.
+            let mut initializer_ctx = class_ctx.clone();
             for initializer in &mut lc.class_ivar_initializers {
-                self.body_typer().with_deps(&deps).analyze_expr(initializer, &class_ctx);
+                self.body_typer().with_deps(&deps).analyze_expr(initializer, &initializer_ctx);
+                if matches!(&*initializer.node, ExprNode::Assign { target: LValue::Ivar { .. }, .. }
+                    | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. })
+                {
+                    extract_ivar_assignments(initializer, &mut initializer_ctx.ivar_bindings);
+                }
             }
             for (_, value) in &mut lc.constants {
                 if self.data_factories.contains_key(&value.span) {
