@@ -576,6 +576,14 @@ pub struct App {
     /// `delegate :add_error, to: :asset`) reaches the target.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ruby_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
+    /// The `(...)` forwarders of the instance-side `delegate`
+    /// declarations `ingest::delegate` declines for the strict targets:
+    /// the class calls the name with arguments, or a zero-arg forwarder
+    /// would mis-arity an admitted `def m(a, *)`. The declaration stays
+    /// in `unknown_calls` and the IR has no method; the Ruby emit adds
+    /// these, as Rails defines them.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ruby_declined_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
     /// The instance methods `ingest::class_eval_macro` added to a library
     /// class for a class-body call to a macro that writes them with a
     /// `class_eval` heredoc (Core's ComplexStruct `attribute :value,
@@ -1286,6 +1294,7 @@ impl App {
             concern_spliced_class_methods: HashMap::default(),
             class_methods_carrier_splices: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
+            ruby_declined_delegate_forwarders: HashMap::default(),
             class_eval_macro_expansions: HashMap::default(),
             concern_model_items: HashMap::default(),
             current_attribute_classes: Vec::new(),

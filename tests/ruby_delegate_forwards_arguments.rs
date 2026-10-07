@@ -71,3 +71,49 @@ fn a_delegated_instance_method_forwards_its_arguments_as_rails_does() {
     run.assert_passes();
     assert_eq!(run.stdout, expected);
 }
+
+/// A delegated name the declaring class calls WITH arguments is declined
+/// for the strict targets (no argument forwarding there), so ingest
+/// leaves the declaration in `unknown_calls`. The Ruby target has no such
+/// gap: it gets the `(...)` forwarder Rails generates.
+const CALLER: &str = r#"module Kit
+  class Caller
+    attr_reader :asset
+
+    delegate :add_error, :key, to: :asset
+
+    def initialize(asset)
+      @asset = asset
+    end
+
+    def warn!
+      add_error("w", 3, level: :warn)
+    end
+  end
+end
+"#;
+
+const CALLER_SCRIPT: &str = r#"c = Kit::Caller.new(Kit::Asset.new)
+p [c.warn!, c.add_error("e") { "b" }, c.key, c.asset.errors]
+p Kit::Caller.instance_method(:add_error).arity
+"#;
+
+#[test]
+fn a_declined_delegate_forwards_its_arguments_on_ruby() {
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!(
+            "require \"active_support/core_ext/module/delegation\"\n{ASSET}\n{CALLER}\n{CALLER_SCRIPT}"
+        ))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "[1, 2, \"k\", [[\"w\", [3], :warn, nil], [\"e\", [], :error, \"b\"]]]\n-1\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    let run = emit_and_run::empty_app()
+        .write("app/models/kit/asset.rb", ASSET)
+        .write("app/models/kit/caller.rb", CALLER)
+        .run_ruby(CALLER_SCRIPT);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+}
