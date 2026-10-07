@@ -6327,7 +6327,15 @@ fn gem_require_block(exclude: &[&str]) -> String {
         .map(|g| format!("{g:?}"))
         .collect();
     let mut out = format!("[{}].each do |gem_name|\n", names.join(", "));
-    out.push_str("  begin\n    require gem_name\n  rescue LoadError\n    nil\n  end\nend\n");
+    // Quiet only when the gem itself is absent. A LoadError for another
+    // feature is the gem failing part way (a C extension's own
+    // `rb_require`, which RubyGems cannot activate a gem for), and is
+    // named rather than swallowed.
+    out.push_str(
+        "  begin\n    require gem_name\n  rescue LoadError => e\n    \
+         warn \"roundhouse: require #{gem_name.inspect} failed: #{e.message}\" unless e.path.nil? || e.path == gem_name\n    \
+         nil\n  end\nend\n",
+    );
     out
 }
 
@@ -6568,6 +6576,61 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
         }
     }
     apply_git_gem_load_paths(files, &needed, lock);
+    apply_locked_bundled_gems(files, lock);
+}
+
+/// Ruby's bundled gems: the gems that left the default set (Ruby 4.0's
+/// `Gem::BUNDLED_GEMS::SINCE`). Under Bundler an app has the ones its
+/// lock names on the load path from the start. Plain RubyGems puts one
+/// there only when a Ruby-level `require` activates it, and a C
+/// extension's own `rb_require` bypasses that: trilogy's cext requires
+/// "bigdecimal" and fails with "cannot load such file" although
+/// bigdecimal is installed.
+const RUBY_BUNDLED_GEMS: [&str; 23] = [
+    "racc", "abbrev", "base64", "bigdecimal", "csv", "drb", "getoptlong", "mutex_m", "nkf", "observer",
+    "resolv-replace", "rinda", "syslog", "ostruct", "pstore", "rdoc", "win32ole", "fiddle", "logger",
+    "benchmark", "irb", "reline", "tsort",
+];
+
+/// So runtime/bundled_gems.rb activates the bundled gems the lock pins,
+/// at the pinned version, as Bundler.setup would, and runtime/gem_facades.rb
+/// requires it first. A pinned version that is not installed is left to
+/// RubyGems' default resolution, as before.
+fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
+    let Some(lock) = lock else { return };
+    let entries: String = RUBY_BUNDLED_GEMS
+        .iter()
+        .filter_map(|gem| {
+            let version = lock.version_of(gem)?;
+            // A platform spec (`1.1.8-x86_64-linux`) is pinned by its version.
+            let version = version.split('-').next().unwrap_or(version);
+            Some(format!("  [{gem:?}, {version:?}],\n"))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let body = format!(
+        "# Ruby's bundled gems the app's Gemfile.lock pins, activated at that\n\
+         # version the way Bundler.setup puts them on the load path. A C\n\
+         # extension's own rb_require (trilogy's cext requires \"bigdecimal\")\n\
+         # finds only what is already there. Written by\n\
+         # `project.rs::apply_locked_bundled_gems`.\n\
+         [\n{entries}].each do |name, version|\n  \
+           next if Gem.loaded_specs.key?(name)\n  \
+           begin\n    \
+             gem name, \"= #{{version}}\"\n  \
+           rescue Gem::LoadError\n    \
+             nil\n  \
+           end\n\
+         end\n"
+    );
+    files.push(("runtime/bundled_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"bundled_gems\"") {
+        facades.insert_str(0, "require_relative \"bundled_gems\"\n");
+    }
 }
 
 /// The CRuby tree runs as plain `ruby` on the gem home's GEM_PATH, with no

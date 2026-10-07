@@ -333,3 +333,70 @@ fn the_platform_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
         );
     }
 }
+
+/// Core's trilogy: its C extension requires "bigdecimal" with its own
+/// `rb_require`, which RubyGems cannot activate a gem for, so on plain
+/// RubyGems it fails although bigdecimal is installed. The bundled gems
+/// the lock pins are activated at the pinned version first, as
+/// Bundler.setup puts them on the load path, and a guarded require that
+/// fails part way names the missing feature instead of swallowing it.
+#[test]
+fn the_locked_bundled_gems_are_on_the_load_path_and_a_partial_gem_load_is_named() {
+    let lock = LOCK.replace("    dalli (3.2.9)\n", "    csv (9.0.0)\n    dalli (3.2.9)\n");
+    let (dir, errors) = boot_app().write("Gemfile.lock", &lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(facades.starts_with("require_relative \"bundled_gems\"\n"), "{facades}");
+    let pins = std::fs::read_to_string(dir.join("runtime/bundled_gems.rb")).expect("bundled_gems");
+    assert!(pins.contains("[\"csv\", \"9.0.0\"]"), "{pins}");
+    assert!(!pins.contains("dalli"), "only bundled gems: {pins}");
+
+    // A gem home holding csv at the pinned and a newer version, and a
+    // dalli whose entry requires a feature no gem provides.
+    let home = dir.join("tmp-bundled-gem-home");
+    for version in ["9.0.0", "9.1.0"] {
+        let lib = home.join(format!("gems/csv-{version}/lib"));
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("csv.rb"), format!("CSV_FROM = {version:?}\n")).unwrap();
+    }
+    std::fs::create_dir_all(home.join("gems/dalli-3.2.9/lib")).unwrap();
+    std::fs::write(home.join("gems/dalli-3.2.9/lib/dalli.rb"), "require \"roundhouse_no_such_feature\"\n").unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    for (name, version) in [("csv", "9.0.0"), ("csv", "9.1.0"), ("dalli", "3.2.9")] {
+        std::fs::write(
+            home.join(format!("specifications/{name}-{version}.gemspec")),
+            format!("Gem::Specification.new do |s|\n  s.name = {name:?}\n  s.version = {version:?}\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\nend\n"),
+        )
+        .unwrap();
+    }
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &home)
+        .env("GEM_HOME", &home)
+        .args([
+            "-e",
+            "require_relative 'runtime/bundled_gems'; p Gem.loaded_specs['csv'].version.to_s; \
+             p $LOAD_PATH.include?(File.join(Gem.loaded_specs['csv'].full_gem_path, 'lib')); p defined?(CSV_FROM); \
+             require 'csv'; p CSV_FROM",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["\"9.0.0\"", "true", "nil", "\"9.0.0\""], "{stdout}");
+
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &home)
+        .env("GEM_HOME", &home)
+        .args(["-e", "require_relative 'runtime/gem_facades'"])
+        .output()
+        .expect("ruby");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("roundhouse: require \"dalli\" failed: cannot load such file -- roundhouse_no_such_feature"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("require \"bcrypt\""), "an absent gem stays quiet: {stderr}");
+}
