@@ -2359,6 +2359,7 @@ fn database_configuration_source(app: &App, yml: &crate::database::DatabaseYml) 
 # config/database.yml by runtime/database_configurations.rb. Holds no
 # credentials: the endpoint is ROUNDHOUSE_DATABASE_URL, read at boot.
 require_relative "database_configurations"
+require_relative "active_support_lazy_load_hooks"
 
 module DatabaseConfiguration
   PATH = {path}
@@ -2392,6 +2393,14 @@ module DatabaseConfiguration
 
   def self.configure!
     @configurations, @primary = resolve
+    # Active Record loads the adapter class here (establish_connection ->
+    # resolve_pool_config -> db_config.validate! -> adapter_class), and the
+    # adapter file ends with run_load_hooks (activerecord 8.1.4
+    # postgresql_adapter.rb:1210): once per process, before any connection.
+    unless @adapter_loaded
+      @adapter_loaded = true
+      ActiveSupport.run_load_hooks(:active_record_postgresqladapter, ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+    end
     Db.configure_database("primary", DatabaseConfigurations.connection_entry(@primary, ENV["ROUNDHOUSE_DATABASE_URL"]))
     ActiveRecord.adapter = PostgresAdapter
     Schema.statements.each {{ |sql| Db.exec(sql) }}
@@ -2837,6 +2846,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read {stem} runtime: {e}"))?;
         files.push((format!("runtime/{stem}.rb"), source));
     }
+    // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
+    // initializer hooks boot registers (`load_hook_registrations`) and the
+    // adapter-load point `DatabaseConfiguration.configure!` fires.
+    let hooks = crate::runtime_files::read_to_string("runtime/spinel/active_support_lazy_load_hooks.rb")
+        .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
+    files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
+    let registrations = load_hook_registrations(app);
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
@@ -2852,7 +2868,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
-            content.push_str("\nrequire_relative \"runtime/database_configuration\"\n");
+            content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
+            content.push_str(&registrations);
+            content.push_str("require_relative \"runtime/database_configuration\"\n");
         }
         if path == "test/test_helper.rb" {
             *content = content.replace("../runtime/sqlite_adapter", "../runtime/postgres_adapter");
@@ -2877,6 +2895,30 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         }
     }
     Ok(())
+}
+
+/// The boot-time registration of each `ActiveSupport.on_load` block the
+/// app's initializers declare (`ingest::on_load_hooks`), in boot order.
+/// Rails registers them as each initializer runs, after the app's code
+/// is loadable; the emitted boot.rb does it after app/models. The block
+/// runs under `class_eval` on the hook's base, so `self` there is the
+/// base the lifted method takes.
+fn load_hook_registrations(app: &App) -> String {
+    if app.load_hooks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's `ActiveSupport.on_load` initializer blocks, registered in\n\
+         # boot order; each body was lifted onto the Application reopen\n\
+         # (ingest::on_load_hooks).\n",
+    );
+    for hook in &app.load_hooks {
+        out.push_str(&format!(
+            "# {}\nActiveSupport.on_load(:{}) {{ Rails.application.{}(self) }}\n",
+            hook.file, hook.hook, hook.method
+        ));
+    }
+    out
 }
 
 /// Gems the PostgreSQL CRuby tree carries on disk but never loads: a
@@ -4920,7 +4962,8 @@ fn spinel_files_with_assertions(
     // projects, never included by the generic runtime directory walk, and
     // so is the semian port that wraps that driver's adapter.
     files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
-        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb");
+        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
+        && p != "runtime/active_support_lazy_load_hooks.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance

@@ -39,6 +39,7 @@ pub mod thread_mattr;
 pub mod model;
 mod delegated_type;
 mod model_macros;
+pub mod on_load_hooks;
 pub mod on_load_reopen;
 pub mod prism;
 pub mod rbi;

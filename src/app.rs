@@ -339,6 +339,11 @@ pub struct App {
     /// `initializer_unsupported` error by `analyze::initializer_coverage`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_gaps: Vec<InitializerGap>,
+    /// `ActiveSupport.on_load(:hook)` blocks of boot initializers, lifted
+    /// onto the Application reopen in boot order
+    /// (`ingest::on_load_hooks`); the emitted boot registers each one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_hooks: Vec<LoadHook>,
     /// SQL functions an initializer registers on every SQLite
     /// connection (`raw_connection.create_function("regexp", 2) do …`,
     /// `create_aggregate("stddev", 1) do step … finalize … end`).
@@ -641,6 +646,18 @@ pub struct InitializerGap {
     pub detail: String,
 }
 
+/// One `ActiveSupport.on_load(:hook)` block of a boot initializer, lifted
+/// to `Rails.application.<method>(base)`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoadHook {
+    /// The hook name (`active_record_postgresqladapter`).
+    pub hook: String,
+    /// The method on the Application reopen holding the block's body.
+    pub method: String,
+    /// The initializer it came from.
+    pub file: String,
+}
+
 /// `prepend` inserts AHEAD of the target in the lookup chain, `include`
 /// behind it. The distinction is the whole point of campfire's
 /// `RoomStreamsAreAuthorized`, whose `subscribed` calls `super` — as an
@@ -817,6 +834,7 @@ impl App {
             initializer_filters: Vec::new(),
             initializer_files: Vec::new(),
             initializer_gaps: Vec::new(),
+            load_hooks: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
             concern_filters: HashMap::new(),

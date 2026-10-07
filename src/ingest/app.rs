@@ -1299,6 +1299,25 @@ end
                 }
             }
         }
+        // `ActiveSupport.on_load(:active_record_postgresqladapter)` in a
+        // boot initializer: the hook fires when the PostgreSQL adapter
+        // loads, so only a PostgreSQL program runs it (`on_load_hooks`).
+        let postgresql = declared_database_adapter(vfs, dir)
+            .ok()
+            .flatten()
+            .is_some_and(|(adapter, _)| adapter == "postgresql");
+        if postgresql {
+            let load_path: Vec<PathBuf> = std::iter::once(dir.join("lib"))
+                .chain(path_gems.iter().map(|gem| gem.join("lib")))
+                .collect();
+            app.load_hooks.extend(super::on_load_hooks::lift(
+                vfs,
+                &boot_initializers,
+                &load_path,
+                &loaded_support,
+                &mut methods,
+            ));
+        }
         if !methods.is_empty() {
             app.rails_application = Some(crate::dialect::LibraryClass {
                 name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),

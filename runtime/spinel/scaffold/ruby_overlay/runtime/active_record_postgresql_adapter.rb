@@ -16,6 +16,36 @@ module ActiveRecord
     class PostgreSQLAdapter < Connection
       include Db::ConnectionLifecycle
 
+      # activerecord 8.1.4 postgresql_adapter.rb:105,
+      # `class_attribute :create_unlogged_tables, default: false`: class
+      # reader/writer/predicate inherited by subclasses until one assigns,
+      # and the instance reader/predicate. Rails reads it in
+      # PostgreSQL::TableDefinition#initialize (schema_definitions.rb:241)
+      # for `create_table`. This runtime creates tables only from the
+      # compiled schema (Schema.statements), never through create_table,
+      # so the value is held and readable but changes no DDL. The
+      # per-instance writer is not ported.
+      class << self
+        attr_writer :create_unlogged_tables
+
+        def create_unlogged_tables
+          return @create_unlogged_tables if instance_variable_defined?(:@create_unlogged_tables)
+          superclass.respond_to?(:create_unlogged_tables) ? superclass.create_unlogged_tables : false
+        end
+
+        def create_unlogged_tables?
+          !!create_unlogged_tables
+        end
+      end
+
+      def create_unlogged_tables
+        self.class.create_unlogged_tables
+      end
+
+      def create_unlogged_tables?
+        !!create_unlogged_tables
+      end
+
       def adapter_name
         "PostgreSQL"
       end
