@@ -269,7 +269,11 @@ fn ingest_statement_list(
                 exprs.push(binding);
             }
         }
-        let mut expr = ingest_expr(child, file)?;
+        let mut expr = match ingest_expr(child, file) {
+            Ok(expr) => expr,
+            Err(err @ IngestError::Unsupported { .. }) => refused_statement(child, file, &err),
+            Err(err) => return Err(err),
+        };
         if let Some(pe) = prev_end {
             let from = pe - block_start;
             let to = child_start - block_start;
@@ -300,6 +304,27 @@ fn ingest_statement_list(
         exprs.push(expr);
     }
     Ok(exprs)
+}
+
+/// A statement whose ingest failed, kept as a refusal at its own site:
+/// a `nil` carrying [`DiagnosticKind::IngestRefused`], which the Ruby
+/// emitter renders as a `NotImplementedError` raise and `check` reports
+/// as `ingest_unsupported` at the innermost construct that failed. The
+/// statements around it, and the method, file and app holding it, are
+/// ingested as usual, so one construct no longer drops a whole file.
+/// Statement granularity: the refused construct may sit inside the
+/// statement (`x = refused`), and the statement is the smallest unit
+/// whose omission leaves the rest of the body meaningful.
+///
+/// [`DiagnosticKind::IngestRefused`]: crate::diagnostic::DiagnosticKind::IngestRefused
+fn refused_statement(stmt: &Node<'_>, file: &str, err: &IngestError) -> Expr {
+    let loc = stmt.location();
+    let (start, end) = super::error_site::of(err).unwrap_or((loc.start_offset(), loc.end_offset()));
+    let span = Span { file: super::sources::file_id(file), start: start as u32, end: end as u32 };
+    let IngestError::Unsupported { message, .. } = err else { unreachable!("only Unsupported is refused") };
+    let mut expr = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused { detail: message.clone() });
+    expr
 }
 
 /// The argument a sorbet-runtime assertion evaluates to, when `node`

@@ -941,7 +941,7 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
 
     let files: &[(&str, &str)] = &[
         // A backtick command (`XStringNode`) — an expression roundhouse
-        // doesn't model, so it aborts strict ingest.
+        // doesn't model. Strict ingest refuses its statement at its site.
         (
             "app/controllers/widgets_controller.rb",
             "class WidgetsController < ApplicationController\n  def index\n    @out = `echo hi`\n  end\nend\n",
@@ -958,10 +958,18 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
             .collect()
     };
 
-    // Strict mode (default): the unsupported construct aborts ingest.
+    // Strict mode (default): the statement holding the unsupported
+    // construct is refused at its own site (it raises if reached) and
+    // the rest of the app is ingested; it no longer aborts the ingest.
+    let strict = ingest_app_from_tree(tree()).expect("strict ingest keeps going past a refused statement");
+    let refusals: Vec<_> = roundhouse::analyze::diagnose(&strict)
+        .into_iter()
+        .filter(|d| d.code() == "ingest_unsupported")
+        .collect();
+    assert_eq!(refusals.len(), 1, "one refusal at the backtick statement: {refusals:?}");
     assert!(
-        ingest_app_from_tree(tree()).is_err(),
-        "expected strict ingest to abort on the unsupported backtick command"
+        matches!(refusals[0].kind, roundhouse::diagnostic::DiagnosticKind::IngestRefused { .. }),
+        "{refusals:?}"
     );
 
     // Survey mode: ingest recovers to a best-effort App and records every

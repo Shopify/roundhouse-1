@@ -83,6 +83,16 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
             });
             }
         }
+        // A statement ingest refused at its site raises there, so it is
+        // reported wherever it sits, like the stubs above.
+        if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &expr.diagnostic {
+            out.push(Diagnostic {
+                span: expr.span,
+                severity: Diagnostic::default_severity(kind),
+                kind: kind.clone(),
+                message: Diagnostic::stub_text(kind),
+            });
+        }
         if matches!(&expr.diagnostic,
             Some(DiagnosticKind::Unsupported { .. }))
         {
@@ -110,6 +120,20 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     for model in &app.models {
         for item in &model.body {
             if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                // A refused statement inside a class-body block
+                // (`included do … end`, a callback block).
+                fn refusals(e: &Expr, out: &mut Vec<Diagnostic>) {
+                    if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &e.diagnostic {
+                        out.push(Diagnostic {
+                            span: e.span,
+                            severity: Diagnostic::default_severity(kind),
+                            kind: kind.clone(),
+                            message: Diagnostic::stub_text(kind),
+                        });
+                    }
+                    e.node.for_each_child(&mut |child| refusals(child, out));
+                }
+                refusals(expr, &mut out);
                 if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
                     if construct.as_str() == "include" {
                         out.push(Diagnostic::unsupported(expr.span, None, "include", detail.clone()));
@@ -359,6 +383,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             DiagnosticKind::InitializerUnsupported { .. } => Diagnostic::stub_text(kind),
             // Produced by `ingest_coverage::diagnose` as a returned list.
             DiagnosticKind::IngestUnsupported { .. } => Diagnostic::stub_text(kind),
+            // Stamped by `ingest_statement_list` on a refused statement.
+            DiagnosticKind::IngestRefused { .. } => Diagnostic::stub_text(kind),
         };
         out.push(Diagnostic {
             span: expr.span,

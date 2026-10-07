@@ -73,6 +73,7 @@ impl Diagnostic {
             DiagnosticKind::GraphqlNullableField { .. } => "graphql_nullable_field",
             DiagnosticKind::InitializerUnsupported { .. } => "initializer_unsupported",
             DiagnosticKind::IngestUnsupported { .. } => "ingest_unsupported",
+            DiagnosticKind::IngestRefused { .. } => "ingest_unsupported",
         }
     }
 
@@ -257,6 +258,9 @@ impl Diagnostic {
             DiagnosticKind::IngestUnsupported { detail } => format!(
                 "{detail}; ingest left this file's classes, modules and constants out of the emitted app"
             ),
+            DiagnosticKind::IngestRefused { detail } => {
+                format!("{detail}; this statement was not ingested and raises NotImplementedError if reached")
+            }
         }
     }
 
@@ -562,4 +566,11 @@ pub enum DiagnosticKind {
     /// Default severity `Error`: code the emitted app silently lacks is
     /// not a faithful compile.
     IngestUnsupported { detail: String },
+    /// A statement inside a body (method, block, branch) that ingest
+    /// cannot represent, kept as a refusal AT ITS SITE: the statement
+    /// becomes a `nil` carrying this kind, which the Ruby emitter renders
+    /// as a `NotImplementedError` raise, and everything around it is
+    /// ingested as usual (`ingest::expr::ingest_statement_list`). Reported
+    /// under the same `ingest_unsupported` code as a dropped file.
+    IngestRefused { detail: String },
 }

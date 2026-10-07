@@ -197,7 +197,7 @@ end
 }
 
 #[test]
-fn nested_library_failures_still_abort_strict_model_ingestion() {
+fn nested_library_failures_are_refused_at_their_site() {
     let result = ingest_app_from_tree(tree(&[(
         "app/models/workspace.rb",
         r#"class Workspace < ApplicationRecord
@@ -209,10 +209,14 @@ fn nested_library_failures_still_abort_strict_model_ingestion() {
 end
 "#,
     )]));
-    assert!(
-        result.is_err(),
-        "the original nested library error must survive"
-    );
+    // The failing statement is refused at its own site (it raises when
+    // `broken` runs) and reported; the model and its concern stay in.
+    let app = result.expect("a refused statement keeps the model");
+    let refusals: Vec<_> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .filter(|d| d.code() == "ingest_unsupported")
+        .collect();
+    assert_eq!(refusals.len(), 1, "the original nested library error must survive: {refusals:?}");
 }
 
 #[test]

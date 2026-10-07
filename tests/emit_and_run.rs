@@ -8007,7 +8007,8 @@ fn a_jump_that_stays_inside_an_assertion_block_runs_as_written() {
 }
 
 /// A nested destructuring target is refused by name at ingest rather
-/// than lowered with its block's assertions dropped.
+/// than lowered with its block's assertions dropped: its statement is a
+/// refusal at its own site, which raises when the test reaches it.
 #[test]
 fn a_nested_destructuring_target_is_refused_by_name() {
     let tree = [
@@ -8018,8 +8019,10 @@ fn a_nested_destructuring_target_is_refused_by_name() {
     .into_iter()
     .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
     .collect();
-    let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
-    assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("a refused statement keeps its test");
+    let ir = format!("{:?}", app.test_modules);
+    assert!(ir.contains("IngestRefused { detail: \"unsupported multi-write target"), "{ir}");
+    assert!(!ir.contains("assert_equal"), "the refused statement's block is not lowered: {ir}");
 }
 
 const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(*, &blk)\n    blk ? blk.call : :none\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(*rest)\n    [rest.size, super(rest.first)]\n  end\nend\n";
