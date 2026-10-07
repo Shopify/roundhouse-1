@@ -5652,6 +5652,9 @@ const GEM_REQUIRES: &[&str] = &[
     "opentelemetry-shopify",
     "magellan-ruby",
     "shopify-money",
+    "shopify/adt",
+    "elastic_search/shopify",
+    "graphql",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5946,7 +5949,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 51] = [
+    const RUNTIME_GEMS: [(Marker, &str); 54] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6105,6 +6108,13 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // `if defined?(ActiveRecord)`). RubyMoney's money gem defines the
         // same `Money`, so this row is in `LOCK_GATED_GEMS`.
         (Marker::Constant("Money"), "shopify-money"),
+        // Bundler.required by Core and loaded natively without Rails:
+        // Shopify::Adt's Optional, the search client and graphql-ruby's
+        // query AST (`GraphQL::Language::Nodes`). Not kafka-shopify or
+        // graphql-client: each loads ActiveSupport when required.
+        (Marker::Constant("Shopify::Adt"), "shopify-adt"),
+        (Marker::Constant("ElasticSearch::Shopify"), "elasticsearch-shopify"),
+        (Marker::Constant("GraphQL"), "graphql"),
         // Core's tracing. opentelemetry-shopify is the Bundler.required
         // entry and loads the API, SDK and the instrumentations below;
         // each gem whose RBI declares a constant Core names is its own
