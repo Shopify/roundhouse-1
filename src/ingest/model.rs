@@ -195,9 +195,13 @@ pub(super) fn ingest_model_with_enum_constants(
         let class_consts = ClassConsts::collect(&stmts, file);
         let resolve_constant = |node: &Node<'_>| enum_constants.resolve(node, &enum_owners);
         for statement in stmts {
-            let definition = visibility::definition(&statement).map(|d| d.as_node());
+            // `private attr_reader :x` declares like `attr_reader :x`; the
+            // visibility pass already gave the generated methods the marker's.
+            let definition = visibility::definition(&statement)
+                .map(|d| d.as_node())
+                .or_else(|| visibility::wrapped_declaration(&statement).map(|c| c.as_node()));
             let stmt = definition.as_ref().unwrap_or(&statement);
-            if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+            if definition.is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
                 prev_end = Some(statement.location().end_offset());
                 continue;
             }

@@ -1999,9 +1999,13 @@ fn walk_decl_body_with_visibility<'pr>(
             reject_conditional_accessor(&statement, file)?;
             continue;
         }
-        let definition = visibility::definition(&statement).map(|d| d.as_node());
+        // `private attr_reader :x` declares like `attr_reader :x`; the
+        // visibility pass already gave the generated methods the marker's.
+        let definition = visibility::definition(&statement)
+            .map(|d| d.as_node())
+            .or_else(|| visibility::wrapped_declaration(&statement).map(|c| c.as_node()));
         let stmt = definition.as_ref().unwrap_or(&statement);
-        if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+        if definition.is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
             // Only bare instance-visibility markers end Ruby's module_function
             // mode. Named and inline forms don't change that lexical mode.
             let call = statement.as_call_node().unwrap();
