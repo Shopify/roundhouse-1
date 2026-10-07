@@ -91,6 +91,9 @@ require_relative "runtime/active_support_time_parsing"
 require_relative "runtime/active_support_core_ext"
 # type_toolkit's `not_nil!` (Kernel / NilClass reopen, CRuby overlay only).
 require_relative "runtime/type_toolkit"
+# sorbet-runtime's T.let / T.cast / T.bind / T.assert_type! check, which
+# ingest lowers those calls to (CRuby overlay only).
+require_relative "runtime/sorbet_runtime_check"
 # Blank-predicate helper for receivers `src/lower/blank.rs` had no static
 # type to ground on. CRuby could serve those sites through the core_ext
 # reopen above; it now takes the same lowered call every other

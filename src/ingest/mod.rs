@@ -54,6 +54,7 @@ pub mod schema;
 pub mod sequel_migration;
 pub mod sequel_model;
 pub mod sorbet_sig;
+pub(crate) mod sorbet_check;
 pub mod sources;
 pub mod type_ascription;
 pub mod initializers;
