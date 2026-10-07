@@ -827,7 +827,15 @@ impl<'a> BodyTyper<'a> {
                     Some(None) => exact_modeled_class(path),
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
-                    None if indexed_source && generated => exact_modeled_class(path),
+                    // A stored class-body local (ingest `BodyLocal`) is
+                    // read by its unique hidden name, which only the
+                    // app-wide registry answers.
+                    None if indexed_source && generated => match path.as_slice() {
+                        [name] if name.as_str().starts_with(crate::ingest::library_class::BODY_LOCAL_CONSTANT_PREFIX) => {
+                            self.global_constant(ctx, name).cloned().unwrap_or_else(unknown)
+                        }
+                        _ => exact_modeled_class(path),
+                    },
                     None if indexed_source => unknown(),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A

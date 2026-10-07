@@ -6388,6 +6388,11 @@ fn emit_library_class_decl_inner(
                 }
                 None => writeln!(s, "{body_pad}{} = nil", cname.as_str()).unwrap(),
             }
+            // A stored class-body local stays out of `constants` and
+            // `Foo::NAME`, as the local was (ingest `BodyLocal`).
+            if cname.as_str().starts_with(crate::ingest::library_class::BODY_LOCAL_CONSTANT_PREFIX) {
+                writeln!(s, "{body_pad}private_constant :{}", cname.as_str()).unwrap();
+            }
         }
     };
     match &split {
