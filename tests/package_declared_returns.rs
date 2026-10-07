@@ -144,7 +144,9 @@ fn a_root_app_methods_inline_signature_still_bounds_its_return() {
 }
 
 /// `roundhouse check --continue` on a package whose `registry.rb` fails
-/// class ingest and declares a signature.
+/// class ingest and declares a signature. The failure is a foreign
+/// singleton class (`class << Object.new`), which ingest still refuses;
+/// a class-body local no longer is one (stored in a private constant).
 fn check_with_dropped_registry() -> String {
     let root = std::env::temp_dir().join(format!("roundhouse-package-sigs-dropped-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -159,7 +161,7 @@ fn check_with_dropped_registry() -> String {
         ("components/payments/package.yml", "enforce_dependencies: true\n"),
         (
             "components/payments/app/lib/payments/registry.rb",
-            "module Payments\n  module Registry\n    store = Object.new\n    DEFAULT = store\n\n    #: -> String\n    def self.label\n      \"registry\"\n    end\n\n    def self.size\n      1\n    end\n  end\nend\n",
+            "module Payments\n  module Registry\n    class << Object.new\n    end\n    DEFAULT = 1\n\n    #: -> String\n    def self.label\n      \"registry\"\n    end\n\n    def self.size\n      1\n    end\n  end\nend\n",
         ),
         (
             "components/payments/app/services/payments/reader.rb",
@@ -185,7 +187,7 @@ fn a_dropped_files_signatures_do_not_register_its_class() {
     // to register `Payments::Registry` with only `label`, so the read
     // reported a missing `size` instead of the ingest gap.
     let text = check_with_dropped_registry();
-    assert!(text.contains("error[ingest_unsupported]: class-body local `store`"), "{text}");
+    assert!(text.contains("error[ingest_unsupported]: visibility of a foreign or nested singleton class is not modeled"), "{text}");
     assert!(
         text.contains("dropped by ingest gap: Payments::Registry is defined in"),
         "the reference names the gap:\n{text}"
