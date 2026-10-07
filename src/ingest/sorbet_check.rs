@@ -412,22 +412,38 @@ fn str_lit(span: Span, value: &str) -> Expr {
 /// that read it, and a check naming it is refused as an unknown constant.
 /// `project` drops the carried alias off the CRuby / JRuby trees, which
 /// refuse every check that could read it.
+///
+/// A generic's type parameter (`OkType = type_member(:out)`, shopify-adt's
+/// `ResultWrapper`) is read the same way, as the type a `sig` naming it
+/// may assume: the `fixed:` type when it declares one, else `T.untyped`,
+/// which is also what sorbet-runtime checks for it (nothing).
 pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
     let Some(call) = value.as_call_node() else { return Ok(None) };
-    if constant_id_str(&call.name()) != "type_alias" || !call.receiver().is_some_and(|r| is_t(&r)) || call.arguments().is_some() {
-        return Ok(None);
-    }
-    let Some(body) = call
-        .block()
-        .and_then(|b| b.as_block_node())
-        .and_then(|b| b.body())
-        .and_then(|b| b.as_statements_node())
-    else {
-        return Ok(None);
+    let ty = if matches!(constant_id_str(&call.name()), "type_member" | "type_template") && call.receiver().is_none() {
+        match type_parameter_fixed(&call) {
+            Some(fixed) => match read_type(&fixed, file)? {
+                Ok(ty) => ty,
+                Err(_) => return Ok(None),
+            },
+            None => SorbetType::Untyped,
+        }
+    } else {
+        if constant_id_str(&call.name()) != "type_alias" || !call.receiver().is_some_and(|r| is_t(&r)) || call.arguments().is_some() {
+            return Ok(None);
+        }
+        let Some(body) = call
+            .block()
+            .and_then(|b| b.as_block_node())
+            .and_then(|b| b.body())
+            .and_then(|b| b.as_statements_node())
+        else {
+            return Ok(None);
+        };
+        let statements: Vec<Node<'_>> = body.body().iter().collect();
+        let [ty] = statements.as_slice() else { return Ok(None) };
+        let Ok(ty) = read_type(ty, file)? else { return Ok(None) };
+        ty
     };
-    let statements: Vec<Node<'_>> = body.body().iter().collect();
-    let [ty] = statements.as_slice() else { return Ok(None) };
-    let Ok(ty) = read_type(ty, file)? else { return Ok(None) };
     let loc = value.location();
     let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
     let block = Expr::new(
@@ -444,6 +460,20 @@ pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<E
         span,
         ExprNode::Send { recv: Some(helper()), method: Symbol::from("type_alias"), args: Vec::new(), block: Some(block), parenthesized: false },
     )))
+}
+
+/// The `X` of `type_member { { fixed: X } }`; `None` for a parameter
+/// without one (bounds only, or no block).
+fn type_parameter_fixed<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
+    let body = call.block()?.as_block_node()?.body()?.as_statements_node()?;
+    let statements: Vec<Node<'pr>> = body.body().iter().collect();
+    let [hash] = statements.as_slice() else { return None };
+    let hash = hash.as_hash_node()?;
+    hash.elements().iter().find_map(|element| {
+        let assoc = element.as_assoc_node()?;
+        let key = assoc.key().as_symbol_node()?;
+        (key.unescaped() == b"fixed").then(|| assoc.value())
+    })
 }
 
 /// The static type a carried alias (`alias_value`) names, read back from
