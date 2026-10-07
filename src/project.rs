@@ -2987,7 +2987,13 @@ fn ruby_family_files(
              # one name.)\n\
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
-             {}{}",
+             {}{}{}",
+            // Before the Bundler.require list: a gem source's own
+            // dependencies load where Bundler requires the gem, and Core's
+            // Gemfile requires panama_client "before anything else that may
+            // require grpc" (its grpc_fork_safety raises once GRPC is
+            // loaded; the list's opentelemetry-instrumentation-grpc loads it).
+            gem_source_dependency_block(app),
             gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
@@ -3037,10 +3043,6 @@ fn ruby_family_files(
         format!("{gem_facades}require_relative \"active_model_type\"\n")
     } else {
         gem_facades
-    };
-    let gem_facades = match flavor {
-        RubyFlavor::CRuby => format!("{gem_facades}{}", gem_source_dependency_block(app)),
-        RubyFlavor::JRuby => gem_facades,
     };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {

@@ -81,8 +81,11 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     assert_eq!(block, r#"["opentelemetry/sdk", "forwardable", "opentelemetry-common", "json"].each do |feature|"#, "{facades}");
     assert!(facades.contains(r#"Their Rails features are this tree's runtime ports, not required: "active_support/parameter_filter"."#), "{facades}");
     assert!(facades.contains("error[gem_requires_rails]"), "{facades}");
-    // After the gems that tree loads natively.
-    assert!(facades.find("require gem_name").unwrap() < facades.find(block).unwrap());
+    // Before the Bundler.require list, where Bundler would require the
+    // gem source: Core's Gemfile loads panama_client "before anything
+    // else that may require grpc", and its grpc_fork_safety raises once
+    // GRPC is loaded (the list's opentelemetry-instrumentation-grpc does).
+    assert!(facades.find(block).unwrap() < facades.find("require gem_name").unwrap(), "{facades}");
     // A path gem's file the tree does not carry compiled is named, not
     // loaded from the gem home; so is a gem source's (by the gem home's
     // spec that owns it), and a feature whose gem depends on Rails.
