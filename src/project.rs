@@ -3994,9 +3994,11 @@ fn load_hook_registrations(app: &App) -> String {
          # (ingest::on_load_hooks).\n",
     );
     for hook in &app.load_hooks {
+        // Root-relative, so the tree does not depend on where the app was.
+        let file = Path::new(&hook.file).strip_prefix(&app.root).map_or(hook.file.clone(), |rel| rel.display().to_string());
         out.push_str(&format!(
             "# {}\nActiveSupport.on_load(:{}) {{ Rails.application.{}(self) }}\n",
-            hook.file, hook.hook, hook.method
+            file, hook.hook, hook.method
         ));
     }
     out
