@@ -3,7 +3,7 @@
 //! `--allow-unsupported` could not help, because the refusal was an
 //! `Err` and not a diagnostic (NEXUS_BUGS.md B5).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::diagnostic::{Diagnostic, Severity};
@@ -20,7 +20,7 @@ const EMPTY_POST_TEST: &str =
 /// The spinel tree for a small posts app plus `files`, with the
 /// diagnostics that the emit pushed.
 fn spinel(files: &[(&str, &str)]) -> (Result<Vec<(String, String)>, String>, Vec<Diagnostic>) {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     for (path, content) in [
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),

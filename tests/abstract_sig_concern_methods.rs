@@ -22,7 +22,7 @@
 //! An abstract method is not copied into the includer, and a `sig` on a
 //! non-abstract concern method also describes the spliced copy.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

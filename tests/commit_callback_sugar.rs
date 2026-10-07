@@ -12,7 +12,7 @@
 //! spans TWO lifecycle events; mapping it onto the bare `after_commit`
 //! would also fire it on destroy, the one event Rails excludes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

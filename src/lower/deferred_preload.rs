@@ -21,7 +21,7 @@
 //! run the group's preload. Ruby-family only, applied at emit like
 //! `lazy_model_state`: the strict targets keep eager loading.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::dialect::{LibraryClass, MethodReceiver};
 use crate::expr::{Expr, ExprNode};

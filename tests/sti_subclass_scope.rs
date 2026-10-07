@@ -12,7 +12,7 @@
 //! speaks — `Room.where(type: "Rooms::Open")` — rather than a
 //! per-subclass copy of the Relation API on every target.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

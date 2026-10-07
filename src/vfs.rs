@@ -11,7 +11,8 @@
 //! Directories are derived from file paths: a path is "a directory" iff
 //! some other path starts with it. There's no separate directory entry.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 

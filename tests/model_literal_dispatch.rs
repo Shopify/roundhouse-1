@@ -1,7 +1,7 @@
 //! Literal model reflection is grounded only when both the dispatcher
 //! and target are proven to be Rails' public generated surface.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -218,7 +218,7 @@ fn generated_visibility_changes_keep_dispatch_reflective() {
         ("has_many :comments", "private :comments", "self.public_send(:comments)", "self.comments"),
         ("scope :recent, -> { order(:id) }", "private_class_method :recent", "Article.public_send(:recent)", "Article.recent"),
     ] {
-        let files = HashMap::from([
+        let files = HashMap::from_iter([
             (PathBuf::from("db/schema.rb"), b"ActiveRecord::Schema.define do\n  create_table :articles do |t|; t.string :title; end\nend\n".to_vec()),
             (PathBuf::from("app/models/article.rb"), format!(
                 "class Article < ApplicationRecord\n  {declaration}\n  {visibility}\nend\n"

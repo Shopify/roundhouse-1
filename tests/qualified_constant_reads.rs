@@ -2,7 +2,7 @@
 //! site, not by the body's inferred `self` class or a same-suffix registry
 //! entry. Qualified enum members and classes must retain their declaration
 //! owner, while names outside that lexical scope stay unresolved.
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};
@@ -268,7 +268,7 @@ fn ingested_source_apps_refuse_ir_only_mode_after_source_table_loss() {
 
 #[test]
 fn an_empty_source_project_needs_no_source_index() {
-    let app = ingest_app_from_tree(HashMap::new()).expect("empty project ingests");
+    let app = ingest_app_from_tree(HashMap::default()).expect("empty project ingests");
     assert!(app.sources.is_empty());
     assert!(!app.source_index_required);
     roundhouse::analyze::Analyzer::new(&app);

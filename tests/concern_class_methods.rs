@@ -12,7 +12,7 @@
 //! `module_function :x`, `class << self` — are not, and after ingest's
 //! flatten all four look identical.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

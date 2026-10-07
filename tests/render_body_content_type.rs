@@ -12,7 +12,7 @@
 //! Asserted on the EMITTED TEXT rather than on the helper, because
 //! "which entry survives" is a property of the rendered hash.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

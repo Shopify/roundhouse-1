@@ -16,7 +16,7 @@
 //! The seed is exactly `where(fk => owner.id)`, so any declaration it
 //! cannot reproduce must DECLINE rather than answer with wrong rows.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -94,7 +94,7 @@ pub(super) fn push_schema_methods(
         model,
         &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
     );
-    let mut demanded: Option<std::collections::HashSet<Symbol>> = None;
+    let mut demanded: Option<crate::det::HashSet<Symbol>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
         if model.enums.contains_key(&col.name) {
@@ -2111,9 +2111,9 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
 /// sometimes on another model's record. A controller or view calling
 /// `<col>_changed?` is not seen; that is a runtime NoMethodError, the
 /// state every such call was in before this synthesis existed.
-fn model_body_names(models: &[Model]) -> std::collections::HashSet<Symbol> {
+fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
     use crate::dialect::ModelBodyItem;
-    fn walk(e: &Expr, out: &mut std::collections::HashSet<Symbol>) {
+    fn walk(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
         match &*e.node {
             ExprNode::Send { method, .. } => {
                 out.insert(method.clone());
@@ -2125,7 +2125,7 @@ fn model_body_names(models: &[Model]) -> std::collections::HashSet<Symbol> {
         }
         e.node.for_each_child(&mut |c| walk(c, out));
     }
-    let mut out = std::collections::HashSet::new();
+    let mut out = crate::det::HashSet::default();
     for model in models {
         for item in &model.body {
             match item {

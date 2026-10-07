@@ -20,7 +20,7 @@
 //! Each test has a NEGATIVE twin where one exists, because a gate that
 //! only asserts a clean ledger passes with the fix taken out.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

@@ -4,7 +4,7 @@
 //! `T.must(self.order)` was typed as a `Relation[Refund]`, so every
 //! following `order.line_items` / `order.id` was a send_dispatch_failed.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

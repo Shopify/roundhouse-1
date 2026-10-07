@@ -4,7 +4,7 @@
 //! `class << self`, so callers of `Token.from_token(...)` lost the
 //! declared `Result` and everything read off it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

@@ -22,7 +22,7 @@ const EPOCH_INITIALIZER: &str =
 /// A model whose one method body is `<expr>`, plus whatever extra files
 /// the case needs.
 fn app_with(body: &str, extra: Vec<(&str, &str)>) -> App {
-    let mut tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = vec![(
+    let mut tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = vec![(
         std::path::PathBuf::from("app/models/thing.rb"),
         format!("class Thing < ApplicationRecord\n  def stamp\n    {body}\n  end\nend\n")
             .as_bytes()
@@ -203,7 +203,7 @@ fn the_no_argument_form_is_left_alone() {
 /// take the rewrite on their own way out.
 #[test]
 fn a_direct_helpers_body_is_lowered_too() {
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = vec![
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = vec![
         (
             std::path::PathBuf::from("config/routes.rb"),
             b"Rails.application.routes.draw do\n  resources :things, only: :show\n  \

@@ -1,6 +1,6 @@
 //! Anonymous keyword forwarding retains provenance, not a capturable local.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::Param;

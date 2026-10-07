@@ -11,7 +11,7 @@
 //! declares a non-slug `id` segment `Int`, so a plain model's record
 //! converts with `.id` while a slug model's uses `.to_param`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

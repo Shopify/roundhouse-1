@@ -6,7 +6,7 @@
 //! Ingest once only knew barewords and ivars and dropped
 //! the whole file on any other operand.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

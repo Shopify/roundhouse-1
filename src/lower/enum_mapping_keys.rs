@@ -1,5 +1,5 @@
 // Not a plain Hash read: Rails' `Model.statuses` is indifferent-access, so a Symbol key reads the String label it names.
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};

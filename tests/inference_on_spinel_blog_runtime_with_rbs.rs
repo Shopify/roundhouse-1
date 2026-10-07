@@ -21,7 +21,7 @@
 //! below is the parse_methods_with_rbs_in_ctx flow recreated for the
 //! library_class shape).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -242,7 +242,7 @@ fn seed_ivars_for_class(
     methods: &[roundhouse::dialect::MethodDef],
     rbs_ivars: &HashMap<ClassId, HashMap<Symbol, Ty>>,
 ) -> HashMap<Symbol, Ty> {
-    let mut flow: HashMap<Symbol, Ty> = HashMap::new();
+    let mut flow: HashMap<Symbol, Ty> = HashMap::default();
     for method in methods {
         roundhouse::analyze::extract_ivar_assignments(&method.body, &mut flow);
     }
@@ -348,8 +348,8 @@ fn build_class_registry() -> (
         entries.push(Path::new(dep).to_path_buf());
     }
 
-    let mut sigs: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
-    let mut ivars: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut sigs: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
+    let mut ivars: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
     for path in entries {
         let source = fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("read {}: {e}", path.display())
@@ -382,8 +382,8 @@ fn build_class_registry() -> (
 fn registry_with_unique_aliases(
     sigs: &HashMap<ClassId, HashMap<Symbol, Ty>>,
 ) -> HashMap<ClassId, ClassInfo> {
-    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::new();
-    let mut aliases: HashMap<ClassId, Option<ClassId>> = HashMap::new();
+    let mut registry: HashMap<ClassId, ClassInfo> = HashMap::default();
+    let mut aliases: HashMap<ClassId, Option<ClassId>> = HashMap::default();
     for (class_id, methods) in sigs {
         let entry = registry.entry(class_id.clone()).or_default();
         entry.instance_methods = methods.clone();
@@ -484,7 +484,7 @@ fn qualified_runtime_signatures_seed_contexts_and_results() {
             .find(|(_, lc)| lc.name.0.as_str() == class)
             .expect("runtime class");
         let method = lc.methods.iter().find(|m| m.name.as_str() == method).unwrap();
-        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::new());
+        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::default());
         assert_eq!(
             ctx.local_bindings.get(&Symbol::new(name)),
             Some(&expected),
@@ -539,7 +539,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
     for (_, lc) in &mut classes {
         let lc_name = lc.name.clone();
         for method in &mut lc.methods {
-            let empty: HashMap<Symbol, Ty> = HashMap::new();
+            let empty: HashMap<Symbol, Ty> = HashMap::default();
             let ctx = build_method_ctx(&lc_name, method, &sigs, &empty);
             typer.analyze_expr(&mut method.body, &ctx);
         }
@@ -548,7 +548,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // Harvest ivars per ClassId across every stem (Base spans base.rb
     // + connection.rb). Union-merge so a later stem cannot wipe
     // initialize's writes. Overlay from parsed RBS `@ivar` decls.
-    let mut ivars_by_class: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::new();
+    let mut ivars_by_class: HashMap<ClassId, HashMap<Symbol, Ty>> = HashMap::default();
     for (_, lc) in &classes {
         let seeded = seed_ivars_for_class(&lc.name, &lc.methods, &rbs_ivars);
         merge_ivar_maps(ivars_by_class.entry(lc.name.clone()).or_default(), seeded);
@@ -565,7 +565,7 @@ fn untyped_subexpressions_with_rbs_baseline() {
 
     // Walk every method body, collect untyped sub-expressions, and
     // tally per-file (per-source .rb) plus an overall total.
-    let mut by_file: HashMap<String, usize> = HashMap::new();
+    let mut by_file: HashMap<String, usize> = HashMap::default();
     let mut all_untyped: Vec<String> = Vec::new();
     for (stem, lc) in &classes {
         for method in &lc.methods {

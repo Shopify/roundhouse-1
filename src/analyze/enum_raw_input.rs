@@ -6,7 +6,7 @@ use crate::{App, ClassId, Expr, ExprNode, Symbol};
 use crate::diagnostic::Diagnostic;
 use crate::dialect::MethodReceiver;
 use crate::ty::Ty;
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     if app.models.iter().all(|model| model.enums.is_empty()) {
@@ -36,7 +36,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 };
                 if let Some(id) = receiver {
                     if app.models.iter().any(|m| &m.name == id && m.enums.contains_key(&Symbol::from(column)))
-                        && !source_method(app, id, method, &mut HashSet::new())
+                        && !source_method(app, id, method, &mut HashSet::default())
                     {
                         out.push(Diagnostic::unsupported(expr.span, None, "enum_before_type_cast",
                             format!("{}#{} requires original enum assignment inputs, which are not modeled; a stored-value reader is not equivalent", id.0, method)));

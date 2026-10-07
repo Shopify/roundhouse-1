@@ -14,7 +14,7 @@
 //! write on `self` fell out without even the diagnostic a dropped
 //! receiverless call gets.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

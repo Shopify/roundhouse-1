@@ -11,7 +11,7 @@
 //! rows nothing removed is the same duplicate-row bug the per-model
 //! truncate list exists to prevent.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::shared::schema_sql::render_schema_statements;

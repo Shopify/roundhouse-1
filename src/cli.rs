@@ -265,7 +265,7 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
     // away by becoming one of these was reclassified, not fixed.
     // A known receiver's unresolved send is already an error where
     // `diagnose` covers the body; only the uncovered sites count here.
-    let diagnosed: std::collections::HashSet<_> =
+    let diagnosed: crate::det::HashSet<_> =
         diags.iter().map(|d| (d.span.file, d.span.start, d.span.end)).collect();
     let unknown_sends: Vec<_> = crate::analyze::unknown_receiver_sends(&app, analyzer.class_registry())
         .into_iter()

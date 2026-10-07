@@ -7,7 +7,7 @@
 //! generated one through `super`. An emitted tree has none of it, and a
 //! statically-resolved target cannot follow `method_missing` at all.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

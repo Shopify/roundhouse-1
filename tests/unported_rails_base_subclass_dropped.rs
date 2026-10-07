@@ -13,7 +13,7 @@
 //! that run the analyzer without the lowerings (`check`, LSP, MCP)
 //! still type the mailbox's `process` like any other method.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby::emit_library;

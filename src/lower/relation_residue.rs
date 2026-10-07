@@ -35,7 +35,7 @@
 //! is not folded and is correctly counted: it lowers to a call on the
 //! runtime `ActiveRecord::Relation` (`__rel.limit(10)`).
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::app::App;

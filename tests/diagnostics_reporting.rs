@@ -40,7 +40,7 @@ fn diagnose_on_app_with_incompatible_binop_returns_one_diagnostic() {
 
     // Hand-run the body-typer to populate .ty and detect the
     // Incompatible add annotation.
-    let classes = std::collections::HashMap::new();
+    let classes = roundhouse::det::HashMap::default();
     let typer = BodyTyper::new(&classes);
     typer.analyze_expr(&mut body, &Ctx::default());
     app.seeds = Some(body);

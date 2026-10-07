@@ -8,7 +8,7 @@
 //!
 //! The native anonymous contract preserves positionals, keywords and blocks.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -399,8 +399,8 @@ func main() {\n\
         // Build variadic-ctor registry. Transitive closure: a class is
         // variadic if its `initialize` has trailing-optional/variadic
         // params, OR (no own initialize) its parent is variadic.
-        let mut variadic_ctors: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut variadic_ctors: crate::det::HashSet<String> =
+            crate::det::HashSet::default();
         loop {
             let before = variadic_ctors.len();
             for lc in units.iter().flat_map(|u| u.classes.iter())
@@ -453,8 +453,8 @@ func main() {\n\
         // sanitized form "ActiveRecordBase"), then walk every LC
         // adding classes whose parent is already in the set. Fixed
         // point.
-        let mut ar_chain: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut ar_chain: crate::det::HashSet<String> =
+            crate::det::HashSet::default();
         ar_chain.insert("ActiveRecordBase".to_string());
         loop {
             let before = ar_chain.len();
@@ -787,7 +787,7 @@ fn emit_v2_test_compat(app: &App) -> EmittedFile {
     // `RouteHelpers_articles_path()`. Walk the flat route list and
     // produce one shim per Rails route_helper name (`as_name`).
     let flat = crate::lower::flatten_routes(app);
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     for route in &flat {
         let as_name = route.as_name.as_str();
         if as_name.is_empty() {

@@ -44,7 +44,7 @@
 //! refused statement as its own `initializer_unsupported` gap with the
 //! reason. The rest of the hook runs without it.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 use std::path::{Path, PathBuf};
 
 use ruby_prism::Node;

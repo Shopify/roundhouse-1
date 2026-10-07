@@ -13,7 +13,7 @@
 //! which is why they ride a channel of their own rather than becoming
 //! `EmittedFile`s with a widened content type.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -27,7 +27,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 const NOT_UTF8: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x80, 0xC3];
 
 fn app_with(extra: Vec<(&str, Vec<u8>)>) -> roundhouse::App {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/thing.rb"),

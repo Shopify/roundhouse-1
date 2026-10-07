@@ -2,7 +2,7 @@
 //! `Hash[String, String]`: it answers `id`, `options`, `loaded?`, and
 //! whatever an app mixes onto it (core's `session.essential`).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

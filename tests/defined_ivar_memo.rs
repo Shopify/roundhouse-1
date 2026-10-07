@@ -3,7 +3,7 @@
 //! the flag after the value lands. campfire's `Opengraph::Location`
 //! memoises a nullable `parsed_url` and `resolved_ip` this way.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

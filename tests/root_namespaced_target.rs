@@ -6,7 +6,7 @@
 //! an undefined local, raising NameError on every `GET /`. The explicit
 //! verb form (`get "up" => "rails/health#show"`) already named the class.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -18,7 +18,7 @@ const APPLICATION_CONTROLLER: &str = "class ApplicationController < ActionContro
 const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table \"widgets\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n";
 
 fn spinel(routes: &str) -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     for (path, content) in [
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),

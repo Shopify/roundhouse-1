@@ -16,7 +16,7 @@
 //!   `Comment.new(story_id: ms.id)` instead of calling `build` on an
 //!   Array.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

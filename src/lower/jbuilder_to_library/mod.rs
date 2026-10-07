@@ -98,8 +98,8 @@ pub fn lower_jbuilder_to_library_classes(
     // Merge: caller extras + framework runtime stubs + the jbuilder LCs
     // themselves (so `Views::Articles.article_json` resolves when
     // referenced from `Views::Articles.index_json`).
-    let mut classes: std::collections::HashMap<ClassId, crate::analyze::ClassInfo> =
-        std::collections::HashMap::new();
+    let mut classes: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
     for (id, info) in extras {
         classes.insert(id, info);
     }
@@ -146,8 +146,8 @@ pub fn lower_jbuilder_to_library_classes(
         }
     }
 
-    let empty_ivars: std::collections::HashMap<Symbol, crate::ty::Ty> =
-        std::collections::HashMap::new();
+    let empty_ivars: crate::det::HashMap<Symbol, crate::ty::Ty> =
+        crate::det::HashMap::default();
     for lc in &mut lcs {
         for method in &mut lc.methods {
             crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
@@ -217,7 +217,7 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
     let rewritten = rewrite_ivars_to_locals(&view.body);
 
     let arg_columns = if arg_name.is_empty() {
-        std::collections::HashMap::new()
+        crate::det::HashMap::default()
     } else {
         columns_for_arg(&arg_name, dir, is_partial, stem, app)
     };
@@ -384,8 +384,8 @@ fn jbuilder_method_parts(
 }
 
 fn type_method_body_solo(method: &mut MethodDef) {
-    let mut classes: std::collections::HashMap<ClassId, crate::analyze::ClassInfo> =
-        std::collections::HashMap::new();
+    let mut classes: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
     insert_framework_stubs(&mut classes);
     let typer = crate::analyze::BodyTyper::new(&classes);
     let mut ctx = crate::analyze::Ctx::default();
@@ -424,7 +424,7 @@ struct Ctx {
     /// model (e.g. layouts, untyped fixtures). Used to route
     /// temporal columns through their storage text (see
     /// `temporal_column_json`) rather than the generic `encode_value`.
-    arg_columns: std::collections::HashMap<Symbol, crate::schema::ColumnType>,
+    arg_columns: crate::det::HashMap<Symbol, crate::schema::ColumnType>,
     /// Names declared by `direct :name do |…| … end`, without the
     /// `_path`/`_url` suffix. A direct helper's block parameter is
     /// whatever the CALLER hands it — campfire's `direct
@@ -432,14 +432,14 @@ struct Ctx {
     /// and `user.updated_at`, so it wants the RECORD — where a resource
     /// member helper wants the `:id` segment. `rewrite_path_arg_local`
     /// asks this before appending `.id`.
-    direct_helpers: std::collections::HashSet<String>,
+    direct_helpers: crate::det::HashSet<String>,
     /// Every model class the app declares. A route-helper argument
     /// whose last reader NAMES one is a record standing where an id
     /// belongs, and the app's own model list is the evidence — the
     /// alternative is the type, and the ruby emit lowers each jbuilder
     /// template SOLO, with only framework stubs registered, so
     /// `boost.message.room` has no type to ask.
-    models: std::collections::HashSet<String>,
+    models: crate::det::HashSet<String>,
     /// Counter for the method's synthesized collection locals
     /// (`__col0`, `__col1`, …), shared by every clone of the template's
     /// `Ctx` so two collection blocks never bind the same name.
@@ -1869,9 +1869,9 @@ fn columns_for_arg(
     is_partial: bool,
     stem: &str,
     app: &App,
-) -> std::collections::HashMap<Symbol, crate::schema::ColumnType> {
-    let mut out: std::collections::HashMap<Symbol, crate::schema::ColumnType> =
-        std::collections::HashMap::new();
+) -> crate::det::HashMap<Symbol, crate::schema::ColumnType> {
+    let mut out: crate::det::HashMap<Symbol, crate::schema::ColumnType> =
+        crate::det::HashMap::default();
     // Index views' arg is the plural collection (`articles`), not a
     // single record. Per-row column lookups don't apply — the
     // extract! inside the partial handles those instead.

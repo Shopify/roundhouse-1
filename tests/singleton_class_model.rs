@@ -20,7 +20,7 @@
 //!   their entire class-side API and every call into it was a
 //!   `send_dispatch_failed`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodReceiver, ModelBodyItem};

@@ -24,7 +24,7 @@
 //! `Rc<EmitCtx>`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::ty::{Param, Ty};
 

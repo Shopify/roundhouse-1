@@ -15,7 +15,7 @@
 //! body with them, and the ordinal rewrite runs there — after typing,
 //! not in the pre-typing walk over `app.test_modules`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

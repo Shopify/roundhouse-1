@@ -6,7 +6,7 @@
 //! exercised through the public emit pipeline on a minimal app carrying
 //! the exact lobsters shape that failed.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

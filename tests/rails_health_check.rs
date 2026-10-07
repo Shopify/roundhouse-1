@@ -6,7 +6,7 @@
 //! concurrent appends there do not conflict (same harness); the native
 //! Spinel half is in tests/spinel_toolchain.rs.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::diagnostic::Severity;

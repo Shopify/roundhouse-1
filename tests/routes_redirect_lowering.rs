@@ -10,7 +10,7 @@
 //! thing — a controller action calling `redirect_to`, which every
 //! target already serves — so no emitter learns a new route kind.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -180,7 +180,7 @@ fn engine_routes_stay_explicit_gaps() {
     let mounted = app_with("  mount Sidekiq::Web, at: \"/sidekiq\"\n");
     assert!(!format!("{:?}", mounted.routes.entries).contains("Sidekiq"));
     let err = ingest_app_from_tree({
-        let mut tree = std::collections::HashMap::new();
+        let mut tree = roundhouse::det::HashMap::default();
         tree.insert(std::path::PathBuf::from("config/routes.rb"), b"Rails.application.routes.draw do\n  use_doorkeeper\nend\n".to_vec());
         tree.insert(std::path::PathBuf::from("app/controllers/application_controller.rb"), b"class ApplicationController < ActionController::Base\nend\n".to_vec());
         tree

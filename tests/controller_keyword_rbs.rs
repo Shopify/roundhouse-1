@@ -9,7 +9,7 @@
 //! method argument given a String, which no conversion keeps in its
 //! sp_SymPolyHash * slot").
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -66,7 +66,7 @@ end
 /// The spinel tree for a small app: the base classes, a `widgets`
 /// table, a root route and the controller above.
 fn spinel() -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     for (path, content) in [
         ("app/models/application_record.rb", APPLICATION_RECORD),
         ("app/controllers/application_controller.rb", APPLICATION_CONTROLLER),

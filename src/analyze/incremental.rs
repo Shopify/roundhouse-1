@@ -24,7 +24,7 @@
 //! against its re-typed trees, reports each difference, and fails the
 //! analysis if there was one: the oracle for the skip rule.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::DeclarationId;
@@ -252,7 +252,9 @@ impl TablePrint {
 struct Prints {
     /// (instance table, class-method table, structure) per class.
     classes: HashMap<ClassId, (TablePrint, TablePrint, u64)>,
-    params: HashMap<(ClassId, Symbol), u64>,
+    /// Keyed by side too; a reader's `DepKey::Params` names only the
+    /// class and method, so a change on either side stamps it.
+    params: HashMap<crate::app::ParamKey, u64>,
     constants: IdentityHashMap<DeclarationId, u64>,
 }
 
@@ -325,7 +327,7 @@ impl Incremental {
     pub(super) fn begin_pass(
         &mut self,
         classes: &HashMap<ClassId, ClassInfo>,
-        params: &HashMap<(ClassId, Symbol), Vec<Ty>>,
+        params: &HashMap<crate::app::ParamKey, Vec<Ty>>,
         constants: &IdentityHashMap<DeclarationId, Ty>,
         classes_in_app: usize,
     ) {
@@ -417,18 +419,19 @@ impl Incremental {
                 kept
             });
         }
-        let mut param_prints = HashMap::with_capacity(params.len());
-        for ((c, m), tys) in params {
-            let key = (c.clone(), m.clone());
+        let mut param_prints = HashMap::with_capacity_and_hasher(params.len(), Default::default());
+        for (key, tys) in params {
+            let (c, m, _) = key;
+            let key = key.clone();
             let now = tys_print(tys);
             if !first && prints.params.get(&key) != Some(&now) {
                 stamp(DepKey::Params(c, m));
             }
             param_prints.insert(key, now);
         }
-        for (c, m) in prints.params.keys() {
-            if !param_prints.contains_key(&(c.clone(), m.clone())) {
-                stamp(DepKey::Params(c, m));
+        for key in prints.params.keys() {
+            if !param_prints.contains_key(key) {
+                stamp(DepKey::Params(&key.0, &key.1));
             }
         }
         prints.params = param_prints;

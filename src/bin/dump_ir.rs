@@ -441,8 +441,8 @@ fn lower_all(app: &roundhouse::App) -> Vec<LibraryClass> {
 }
 
 fn build_class_info_extras(lcs: &[LibraryClass]) -> Vec<(ClassId, roundhouse::analyze::ClassInfo)> {
-    use std::collections::HashMap;
-    let mut grouped: HashMap<ClassId, roundhouse::analyze::ClassInfo> = HashMap::new();
+    use roundhouse::det::HashMap;
+    let mut grouped: HashMap<ClassId, roundhouse::analyze::ClassInfo> = HashMap::default();
     for lc in lcs {
         let info = grouped.entry(lc.name.clone()).or_default();
         let from = class_info_from_library_class(lc);

@@ -4,7 +4,7 @@
 //! (runtime/ruby/active_support_reporters.rb, compared against
 //! activesupport 8.1.4 by tests/reporters_runtime.rb).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

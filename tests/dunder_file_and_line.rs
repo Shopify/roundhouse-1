@@ -5,7 +5,7 @@
 //! notion of "this file", and the parse's line index covers the node's
 //! byte offset), and Spinel needs a literal here regardless.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::expr::{ExprNode, Literal};
@@ -83,7 +83,7 @@ fn file_literals_are_relative_to_the_real_root_without_changing_source_ids() {
     for root in ["/tmp/myapp", "/tmp/lib/repo", "relative/myapp"] {
         let root = PathBuf::from(root);
         let path = root.join("app/services/file_probe.rb");
-        let vfs = MapVfs::new([(path.clone(), b"class FileProbe\n FILE = __FILE__\nend\n".to_vec())].into());
+        let vfs = MapVfs::new(roundhouse::det::HashMap::from_iter([(path.clone(), b"class FileProbe\n FILE = __FILE__\nend\n".to_vec())]));
         let app = ingest_app_with_vfs(&vfs, &root).expect("ingest at an explicit root");
         let class = app.library_classes.iter().find(|c| c.name.0.as_str() == "FileProbe").unwrap();
         assert!(matches!(&*class.constants[0].1.node, ExprNode::Lit { value: Literal::Str { value } } if value == "app/services/file_probe.rb"));
@@ -116,8 +116,8 @@ fn failed_app_ingest_does_not_relocate_a_later_standalone_file_literal() {
     use roundhouse::ingest::{ingest_app_with_vfs, ingest_library_classes, sources};
     use roundhouse::vfs::MapVfs;
     let root = PathBuf::from("/tmp/failed_app");
-    let vfs = MapVfs::new([(root.join("roundhouse.yml"),
-        b"test_paths: [../outside]".to_vec())].into());
+    let vfs = MapVfs::new(roundhouse::det::HashMap::from_iter([(root.join("roundhouse.yml"),
+        b"test_paths: [../outside]".to_vec())]));
     let error = ingest_app_with_vfs(&vfs, &root).expect_err("invalid app-relative test root");
     assert!(error.to_string().contains("test_paths"));
     let path = root.join("app/services/fresh.rb");
@@ -133,10 +133,10 @@ fn roda_file_literals_keep_the_registered_root_during_route_ingest() {
     use roundhouse::ingest::ingest_app_with_vfs;
     use roundhouse::vfs::MapVfs;
     let root = PathBuf::from("/tmp/roda");
-    let vfs = MapVfs::new([
+    let vfs = MapVfs::new(roundhouse::det::HashMap::from_iter([
         (root.join("config.ru"), b"run App.app".to_vec()),
         (root.join("app.rb"), b"class App < Roda\n route do |r|\n r.root { __FILE__ }\n end\nend\n".to_vec()),
-    ].into());
+    ]));
     let app = ingest_app_with_vfs(&vfs, &root).expect("detected Roda app ingests");
     fn collect(expr: &roundhouse::expr::Expr, paths: &mut Vec<String>) {
         if let ExprNode::Lit { value: Literal::Str { value } } = &*expr.node

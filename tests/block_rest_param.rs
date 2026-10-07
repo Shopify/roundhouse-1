@@ -21,7 +21,7 @@
 //! invisible in exactly the same way. That is why this asserts on the
 //! EMIT and not on the ingest.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

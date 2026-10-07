@@ -15,7 +15,7 @@
 //! query — and the caller's own attributes ride on the OUTSIDE of the
 //! merge, because Rails assigns them after the scope's.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

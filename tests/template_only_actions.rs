@@ -5,7 +5,7 @@
 //! `before_action` feeds the template and every target has an action to
 //! route to. `tests/emit_and_run.rs` pins that the emitted app serves it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

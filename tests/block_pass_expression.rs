@@ -10,7 +10,7 @@
 //! and with it every call other files make into it) rather than one
 //! statement.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

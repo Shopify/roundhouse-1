@@ -4,7 +4,7 @@
 //! reader must have the declared collection's analyzed type before `.new`
 //! becomes `.build`.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::dialect::{Association, MethodReceiver, ModelBodyItem};
@@ -19,7 +19,7 @@ pub fn apply_association_new_lowering(app: &mut App) {
         .models
         .iter()
         .map(|model| {
-            let mut overrides: HashSet<Symbol> = HashSet::new();
+            let mut overrides: HashSet<Symbol> = HashSet::default();
             for item in &model.body {
                 match item {
                     ModelBodyItem::Method { method, .. }

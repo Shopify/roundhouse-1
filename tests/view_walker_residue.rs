@@ -14,7 +14,7 @@
 //! `users/list.html.erb`) emitted `io << ""` and rendered blank, with
 //! nothing anywhere reporting it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::diagnostic::DiagnosticKind;

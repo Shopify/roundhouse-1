@@ -5,7 +5,7 @@
 //! SSL_FAILED, SSL_EXTERNAL = SSL_STATES.map(&:freeze)` in its class body.
 //! The target was refused, and the refusal dropped the whole model.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

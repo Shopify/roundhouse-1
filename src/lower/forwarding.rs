@@ -15,7 +15,7 @@ pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
             diagnostics.push(keyword_refusal(*span, *policy));
         }
     }
-    fn project(e: &mut Expr, plans: &std::collections::HashMap<crate::span::Span, KeywordPolicy>) {
+    fn project(e: &mut Expr, plans: &crate::det::HashMap<crate::span::Span, KeywordPolicy>) {
         if plans.get(&e.span) == Some(&KeywordPolicy::Legacy) {
             let args = match &mut *e.node {
                 ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => Some(args),

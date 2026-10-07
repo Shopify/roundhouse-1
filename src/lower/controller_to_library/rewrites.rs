@@ -4,7 +4,8 @@
 //! `synthesize_implicit_render` so the synthesized symbol-form render
 //! shows up here as a plain `Send`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 
 use crate::dialect::Action;
 use crate::expr::{ArrayStyle, Expr, ExprNode, LValue, Literal};
@@ -2048,7 +2049,7 @@ fn sym_or_str_arg(arg: &Expr) -> Option<String> {
 
 pub(super) fn rewrite_redirect_to(
     expr: &Expr,
-    route_helpers: &std::collections::HashMap<String, Vec<bool>>,
+    route_helpers: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     map_expr(expr, &|e| match &*e.node {
         ExprNode::Send { recv: None, method, args, block, .. }
@@ -2304,7 +2305,7 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
 pub fn rewrite_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Expr {
     let expr = &strip_url_helpers_receiver(expr);
     map_expr(expr, &|e| match &*e.node {
@@ -2470,7 +2471,7 @@ pub fn rewrite_route_helpers(
 pub fn route_helper_query_splat_index(
     method: &str,
     args: &[Expr],
-    id_segments: &std::collections::HashMap<String, Vec<bool>>,
+    id_segments: &crate::det::HashMap<String, Vec<bool>>,
 ) -> Option<usize> {
     let dispatch = method
         .strip_suffix("_url")

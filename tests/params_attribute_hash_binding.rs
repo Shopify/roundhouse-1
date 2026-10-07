@@ -22,7 +22,7 @@
 //! site, the runtime's `create(attrs)` for the hash site), and rewriting
 //! it would trade a typed factory for a bag.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

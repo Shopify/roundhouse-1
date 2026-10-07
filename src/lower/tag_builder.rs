@@ -90,7 +90,7 @@ use crate::ident::{ClassId, Symbol};
 use crate::lower::view_to_library::attr_parts::{append_attr_parts, string_interp};
 use crate::lower::view_to_library::turbo_frames;
 use crate::lower::view_to_library::{lit_str, view_helpers_call};
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 /// HELPER METHOD BODIES ONLY — views are deliberately not walked.
 ///
@@ -110,7 +110,7 @@ pub fn apply_tag_builder_lowering(
     // For `turbo_frame_tag`'s record test — the same snake-singular set
     // the view lowering's `ViewCtx` carries, built here because a hook
     // body has no view context.
-    let models: std::collections::HashSet<String> = app
+    let models: crate::det::HashSet<String> = app
         .models
         .iter()
         .map(|m| crate::naming::snake_case(m.name.0.as_str()))
@@ -125,7 +125,7 @@ pub fn apply_tag_builder_lowering(
     // on (`sti_scope` has run by this point in the pipeline). A
     // polymorphic URL names its route through the record's CLASS, and
     // for an STI base the class is a runtime question.
-    let sti_stems: std::collections::HashMap<String, Vec<String>> = app
+    let sti_stems: crate::det::HashMap<String, Vec<String>> = app
         .models
         .iter()
         .filter(|m| !m.sti_subclass_names.is_empty())
@@ -184,7 +184,7 @@ fn classes_owning_tag(app: &App, registry: &HashMap<ClassId, ClassInfo>) -> Hash
     let has_tag = |class: &ClassId| {
         // Self, then app ancestors (includes and parents), each once.
         let mut stack = vec![class];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(c) = stack.pop() {
             if !app_classes.contains(c) || !seen.insert(c) {
                 continue;
@@ -371,9 +371,9 @@ fn is_tag_helper(recv: &Expr) -> bool {
 fn rewrite(
     expr: &mut Expr,
     own_tag: bool,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
     diags: &mut Vec<Diagnostic>,
 ) {
     expr.node.for_each_child_mut(&mut |child| {
@@ -637,9 +637,9 @@ fn rewrite_button_to_block(expr: &mut Expr) -> bool {
 /// would be a second, independently-maintained copy of that rule.
 fn polymorphic_route_call(
     url: &Expr,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
 ) -> Option<Expr> {
     let ExprNode::Array { elements, .. } = &*url.node else {
         return None;
@@ -763,9 +763,9 @@ fn polymorphic_route_call(
 /// rather than guessed at.
 fn rewrite_link_to_block(
     expr: &mut Expr,
-    models: &std::collections::HashSet<String>,
-    helpers: &std::collections::HashSet<String>,
-    sti_stems: &std::collections::HashMap<String, Vec<String>>,
+    models: &crate::det::HashSet<String>,
+    helpers: &crate::det::HashSet<String>,
+    sti_stems: &crate::det::HashMap<String, Vec<String>>,
     diags: &mut Vec<Diagnostic>,
 ) -> bool {
     let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*expr.node else {
@@ -908,7 +908,7 @@ fn rewrite_legacy_tag(expr: &mut Expr, diags: &mut Vec<Diagnostic>) -> bool {
     true
 }
 
-fn rewrite_turbo_frame_tag(expr: &mut Expr, models: &std::collections::HashSet<String>) -> bool {
+fn rewrite_turbo_frame_tag(expr: &mut Expr, models: &crate::det::HashSet<String>) -> bool {
     let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
         return false;
     };
@@ -1140,7 +1140,7 @@ mod tests {
         )
     }
 
-    fn set(names: &[&str]) -> std::collections::HashSet<String> {
+    fn set(names: &[&str]) -> crate::det::HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
     /// `inspect` into every room page's nav.
     /// No STI in play for most of these — the empty map is the plain
     /// (non-dispatching) shape.
-    fn no_sti() -> std::collections::HashMap<String, Vec<String>> {
+    fn no_sti() -> crate::det::HashMap<String, Vec<String>> {
         Default::default()
     }
 
@@ -1293,7 +1293,7 @@ mod tests {
     /// arm — ending in the base helper.
     #[test]
     fn an_sti_base_dispatches_on_its_subclass_stems() {
-        let mut sti = std::collections::HashMap::new();
+        let mut sti = crate::det::HashMap::default();
         sti.insert(
             "room".to_string(),
             vec!["rooms_open".to_string(), "rooms_closed".to_string()],
@@ -1334,7 +1334,7 @@ mod tests {
     /// a route, the plain base call comes back with no dispatch at all.
     #[test]
     fn a_routeless_subclass_folds_into_the_base_arm() {
-        let mut sti = std::collections::HashMap::new();
+        let mut sti = crate::det::HashMap::default();
         sti.insert("room".to_string(), vec!["rooms_open".to_string()]);
         let call = polymorphic_route_call(
             &array(vec![sym("edit"), ivar("room")]),

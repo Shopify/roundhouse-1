@@ -2,7 +2,7 @@
 //! AssociationProxy spelling flattened onto Roundhouse's synthesized
 //! flag (see `lower::assoc_loaded`).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

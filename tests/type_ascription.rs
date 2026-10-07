@@ -6,7 +6,7 @@
 //! `@preview_token` reported `ivar_unresolved` although the source states
 //! the type outright.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

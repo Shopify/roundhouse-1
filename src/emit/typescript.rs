@@ -140,7 +140,7 @@ pub fn emit_with_profile(
     app: &App,
     profile: &crate::profile::DeploymentProfile,
 ) -> Vec<EmittedFile> {
-    use std::collections::HashSet;
+    use crate::det::HashSet;
     let extern_names: Vec<&'static str> = profile.adapter().async_seed_methods().to_vec();
     let async_set: HashSet<crate::ident::Symbol> = extern_names
         .iter()
@@ -509,8 +509,8 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
         // sites — both app-marked names (`Article#comments` whose
         // body calls `Comment.where(...)`) and runtime-marked names
         // (`Base#save`, `Base#is_valid`, `Base#destroy`).
-        let mut all_async_names: std::collections::HashSet<crate::ident::Symbol> =
-            std::collections::HashSet::new();
+        let mut all_async_names: crate::det::HashSet<crate::ident::Symbol> =
+            crate::det::HashSet::default();
         for class in &all_classes {
             for method in &class.methods {
                 if method.is_async {
@@ -633,9 +633,9 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // (conservative: a dead predicate's body can keep a runtime method
     // alive, never the reverse). Row/proxy classes in `model_lcs`
     // aren't in the map and pass through unchanged.
-    let shakeable_by_model: std::collections::HashMap<
+    let shakeable_by_model: crate::det::HashMap<
         crate::ident::ClassId,
-        std::collections::HashSet<crate::ident::Symbol>,
+        crate::det::HashSet<crate::ident::Symbol>,
     > = app
         .models
         .iter()
@@ -687,7 +687,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
     // these marks, the inheritance-driven flips on (e.g.)
     // `Base#instantiate` would be lost between the global pass
     // and the per-file emit.
-    let runtime_async_marks: std::collections::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+    let runtime_async_marks: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
         runtime_seed_classes
             .iter()
             .flat_map(|c| {
@@ -1694,7 +1694,7 @@ pub(super) fn js_library_class(
     };
 
     let mut fields: Vec<(String, String, bool, bool, crate::span::Span)> = Vec::new();
-    let mut field_names_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut field_names_seen: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in &class.methods {
         if is_attr_reader(m) {
             // A temporal reader emits as a `Date` getter (below), not a
@@ -1874,7 +1874,7 @@ pub(super) fn js_library_class(
     // ivar (`def persisted?; @persisted; end`) are subsumed by the
     // field; callers reading `record.persisted?` sanitize to
     // `record.persisted` and get the field directly.
-    let mut sanitized_seen: std::collections::HashSet<String> =
+    let mut sanitized_seen: crate::det::HashSet<String> =
         field_names_seen.clone();
     for m in &class.methods {
         let raw = m.name.as_str();
@@ -2358,7 +2358,7 @@ fn js_class_member(
     // Set enclosing-method parameter names so the await-wrap site
     // can suppress wrapping bare Sends whose name shadows a param
     // (e.g. view function `_form(article)` referencing `article`).
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         m.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || {
         if is_constructor {
@@ -2498,7 +2498,7 @@ pub(super) fn js_library_function(
     // bare Sends emit as plain function calls (resolved against
     // imports), and `super` doesn't apply since there's no inheritance.
     let rewritten = crate::emit::typescript::library::rewrite_for_free_function(&func.body);
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         func.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || expr::js_body(&rewritten, &ret_ty));
 
@@ -2799,7 +2799,7 @@ pub fn emit_method(m: &crate::dialect::MethodDef) -> String {
         })
         .collect();
 
-    let param_set: std::collections::HashSet<crate::ident::Symbol> =
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
         m.params.iter().map(|p| p.name.clone()).collect();
     let body = expr::with_method_params(param_set, || expr::js_body(&m.body, ret));
 

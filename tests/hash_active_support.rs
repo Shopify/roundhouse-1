@@ -3,7 +3,7 @@
 //! Controllers reach for these on request and config hashes; each was a
 //! `send_dispatch_failed` because the Hash table stopped at core Ruby.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

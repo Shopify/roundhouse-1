@@ -4,7 +4,7 @@
 //! Overlays on tiny-blog and real-blog — not a named-app special case.
 //! Dynamic names and `public_send` stay unexpanded or uncollapsed.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodReceiver, ModelBodyItem};

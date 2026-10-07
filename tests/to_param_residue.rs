@@ -7,7 +7,7 @@
 //! `true`, an Integer and a Hash — and spinel's dispatch for the name had
 //! arms for the app's records only, so every anonymous story list 500'd.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

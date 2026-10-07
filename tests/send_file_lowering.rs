@@ -25,7 +25,7 @@
 //! as "buffer is not in a known format": the image library's complaint,
 //! naming nothing about the response.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

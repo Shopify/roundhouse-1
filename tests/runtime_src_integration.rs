@@ -471,8 +471,8 @@ fn every_runtime_method_body_is_fully_typed() {
     // cross-class method dispatch resolves during body-typing (e.g.,
     // RecordInvalid#initialize calls `record.errors.join(...)`, which
     // requires Base#errors to be known).
-    let mut class_registry: std::collections::HashMap<ClassId, ClassInfo> =
-        std::collections::HashMap::new();
+    let mut class_registry: roundhouse::det::HashMap<ClassId, ClassInfo> =
+        roundhouse::det::HashMap::default();
     // The Db primitive shim's contract — connection.rb calls
     // `Db.prepare`/`step?`/`column_*` directly (same pre-seed the
     // production pipelines get via `seed_well_known_classes` /
@@ -489,8 +489,8 @@ fn every_runtime_method_body_is_fully_typed() {
     // Per-class include lists, accumulated across all .rbs files.
     // Key: short class id (last segment); Value: list of short module
     // ids the class includes.
-    let mut includes_by_class: std::collections::HashMap<ClassId, Vec<ClassId>> =
-        std::collections::HashMap::new();
+    let mut includes_by_class: roundhouse::det::HashMap<ClassId, Vec<ClassId>> =
+        roundhouse::det::HashMap::default();
     let mut missing_rbs: Vec<String> = Vec::new();
 
     let short_id = |class_id: &ClassId| {
@@ -705,10 +705,10 @@ fn every_runtime_method_body_is_fully_typed() {
 #[test]
 fn every_runtime_method_body_concretely_typed() {
     let stems = runtime_ruby_stems();
-    let mut class_registry: std::collections::HashMap<ClassId, ClassInfo> =
-        std::collections::HashMap::new();
-    let mut includes_by_class: std::collections::HashMap<ClassId, Vec<ClassId>> =
-        std::collections::HashMap::new();
+    let mut class_registry: roundhouse::det::HashMap<ClassId, ClassInfo> =
+        roundhouse::det::HashMap::default();
+    let mut includes_by_class: roundhouse::det::HashMap<ClassId, Vec<ClassId>> =
+        roundhouse::det::HashMap::default();
 
     let short_id = |class_id: &ClassId| {
         let last = class_id
@@ -763,8 +763,8 @@ fn every_runtime_method_body_concretely_typed() {
     }
 
     let mut total_gradual: usize = 0;
-    let mut by_file: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut by_file: roundhouse::det::HashMap<String, usize> =
+        roundhouse::det::HashMap::default();
     for stem in &stems {
         let ruby_path = Path::new("runtime/ruby").join(format!("{stem}.rb"));
         let rbs_path = Path::new("runtime/ruby").join(format!("{stem}.rbs"));

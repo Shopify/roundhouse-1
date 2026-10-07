@@ -12,7 +12,7 @@
 //! controller chains. Guarded chains stay whole and run on the runtime
 //! `ActiveRecord::Relation`; fully-liftable chains keep materializing.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

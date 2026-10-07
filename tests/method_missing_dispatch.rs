@@ -6,7 +6,7 @@
 //! `UrlHelpers` send at runtime) and `UrlHelpers` itself (its class-side
 //! `include Rails.application.routes.url_helpers`) are the two shapes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

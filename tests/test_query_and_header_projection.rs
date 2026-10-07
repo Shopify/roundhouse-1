@@ -16,7 +16,7 @@
 //!   lowercased. Reads only; a controller's `headers["X"] = …` is
 //!   the app's.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

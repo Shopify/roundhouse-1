@@ -802,7 +802,7 @@ fn view_from_create_view(
 /// direct-projection case is distinguishable without a full SQL parser.
 fn view_columns_from_sql(sql: &str, tables: &IndexMap<Symbol, Table>) -> Vec<Column> {
     let mut columns = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::det::HashSet::default();
     let toks: Vec<&str> = sql.split_whitespace().collect();
     for i in 1..toks.len() {
         if !toks[i].eq_ignore_ascii_case("as") {

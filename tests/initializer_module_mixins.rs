@@ -30,7 +30,7 @@
 //! particular construct is the worse failure of the two. campfire's
 //! OTHER prepend, onto the `WebPush::Request` gem class, is that case.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

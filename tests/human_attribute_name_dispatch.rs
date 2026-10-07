@@ -6,7 +6,7 @@
 //! dispatch failure. On a real Rails 8 app (Telescope, 255 models/views)
 //! this single missing entry accounted for 359 of 836 error diagnostics.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

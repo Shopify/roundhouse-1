@@ -17,7 +17,7 @@
 //! unfoldable one IS, and the count is per chain HEAD rather than per
 //! link.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::diagnostic::{Diagnostic, Severity};

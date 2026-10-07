@@ -183,8 +183,8 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         // the vocabulary is closed by construction) and stamp them as
         // the partial's strict-locals row, the same fixed-signature
         // channel a Rails `<%# locals: (…) %>` header feeds.
-        let mut part_locals: std::collections::HashMap<String, Vec<Symbol>> =
-            std::collections::HashMap::new();
+        let mut part_locals: crate::det::HashMap<String, Vec<Symbol>> =
+            crate::det::HashMap::default();
         for (erb_path, engine) in read_erb_files(vfs, &views_dir)? {
             let source = vfs.read_to_string(&erb_path)?;
             let rel = erb_path
@@ -1352,7 +1352,7 @@ fn same_simple_recv(a: &Expr, b: &Expr) -> bool {
 /// the partial's strict-locals signature.
 fn rewrite_part_to_render(
     expr: &mut Expr,
-    part_locals: &mut std::collections::HashMap<String, Vec<Symbol>>,
+    part_locals: &mut crate::det::HashMap<String, Vec<Symbol>>,
 ) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite_part_to_render(c, part_locals));

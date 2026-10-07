@@ -22,7 +22,7 @@
 //! `Tagging.belongs_to :story`) must keep its writer and its
 //! single-hop join byte-for-byte.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

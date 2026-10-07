@@ -18,7 +18,7 @@
 //! answer for an assign that controller never made is nil — which is
 //! exactly what reading an unassigned ivar gives.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

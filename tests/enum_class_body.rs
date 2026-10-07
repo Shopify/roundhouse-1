@@ -6,7 +6,7 @@
 //! predicates, bang writers, and the plural mapping. Overlays on
 //! tiny-blog and real-blog — not a named-app special case.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::dialect::{MethodReceiver, ModelBodyItem};

@@ -8,7 +8,7 @@
 //! for nil when anonymous). Model callback conditions were already
 //! walked; controller filter conditions were not.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

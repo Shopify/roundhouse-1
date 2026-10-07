@@ -1,6 +1,6 @@
 //! Defaults are constructor inputs, not validating writes or fixture data.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::expr::Literal;

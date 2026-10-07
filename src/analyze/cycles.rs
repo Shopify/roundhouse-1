@@ -46,7 +46,7 @@
 //! levels above the limit keep their precise types. A slot that stops
 //! growing, or grows only within the limit, is untouched.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
@@ -61,7 +61,7 @@ enum Slot {
     Class(ClassId, Symbol),
     /// The whole parameter vector, held as a `Ty::Tuple` and joined
     /// position by position.
-    Params(ClassId, Symbol),
+    Params(crate::app::ParamKey),
 }
 
 /// Values a slot took in earlier rounds of the same loop. Bounded: a
@@ -237,9 +237,9 @@ impl Analyzer {
         match slot {
             Slot::Instance(c, m) => self.classes.get(c)?.instance_methods.get(m).cloned(),
             Slot::Class(c, m) => self.classes.get(c)?.class_methods.get(m).cloned(),
-            Slot::Params(c, m) => self
+            Slot::Params(key) => self
                 .inferred_params
-                .get(&(c.clone(), m.clone()))
+                .get(key)
                 .map(|v| Ty::Tuple { elems: v.clone() }),
         }
     }
@@ -256,9 +256,9 @@ impl Analyzer {
                     cls.class_methods.insert(m.clone(), ty);
                 }
             }
-            Slot::Params(c, m) => {
+            Slot::Params(key) => {
                 if let Ty::Tuple { elems } = ty {
-                    self.inferred_params.insert((c.clone(), m.clone()), elems);
+                    self.inferred_params.insert(key.clone(), elems);
                 }
             }
         }
@@ -288,11 +288,11 @@ impl Analyzer {
                 }
             }
         }
-        for ((c, m), tys) in &self.inferred_params {
-            let b = prev.params.get(&(c.clone(), m.clone()));
+        for (key, tys) in &self.inferred_params {
+            let b = prev.params.get(key);
             if b != Some(tys) {
                 out.push((
-                    Slot::Params(c.clone(), m.clone()),
+                    Slot::Params(key.clone()),
                     b.map(|v| Ty::Tuple { elems: v.clone() }),
                     Ty::Tuple { elems: tys.clone() },
                 ));
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn params_join_position_by_position() {
-        let slot = Slot::Params(ClassId(Symbol::from("A")), Symbol::from("m"));
+        let slot = Slot::Params((ClassId(Symbol::from("A")), Symbol::from("m"), crate::dialect::MethodReceiver::Instance));
         let var = Ty::Var { var: TyVar(0) };
         let a = Ty::Tuple { elems: vec![Ty::Nil, Ty::Int] };
         let b = Ty::Tuple { elems: vec![union_of(var.clone(), Ty::Nil), Ty::Int] };

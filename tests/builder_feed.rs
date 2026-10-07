@@ -7,7 +7,7 @@
 //! snapshot used a format-agnostic `rss.erb`, and `.builder` templates
 //! were skipped outright.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

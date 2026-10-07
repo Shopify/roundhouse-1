@@ -74,7 +74,7 @@ pub(crate) fn value_narrowing_coercion(narrowed: &crate::ty::Ty) -> Option<&'sta
 /// Synthesize a default-value Rust expression for a missing arg
 /// position. Mirrors the Ruby default-arg semantics for the
 /// shapes the lowerer-synthesized constructors use (`attrs = {}`
-/// → `HashMap::new()`).
+/// → `HashMap::default()`).
 /// Render a `dialect::Param.default` Expr as a Rust literal string,
 /// when the default is shaped simply enough to round-trip. Handles
 /// Ruby's common kwarg-default shapes (`length: 30`,
@@ -105,7 +105,7 @@ pub(crate) fn render_param_default_literal(expr: &crate::expr::Expr) -> Option<S
             _ => None,
         },
         ExprNode::Hash { entries, .. } if entries.is_empty() => {
-            Some("std::collections::HashMap::new()".to_string())
+            Some("crate::det::HashMap::default()".to_string())
         }
         ExprNode::Array { elements, .. } if elements.is_empty() => {
             Some("vec![]".to_string())
@@ -117,7 +117,7 @@ pub(crate) fn render_param_default_literal(expr: &crate::expr::Expr) -> Option<S
 pub(crate) fn synth_default_for_ty(ty: &crate::ty::Ty) -> Option<String> {
     use crate::ty::Ty;
     match ty {
-        Ty::Hash { .. } => Some("std::collections::HashMap::new()".to_string()),
+        Ty::Hash { .. } => Some("crate::det::HashMap::default()".to_string()),
         Ty::Array { .. } => Some("vec![]".to_string()),
         // `Ty::Str` / `Ty::Sym` at param positions emits as `&str` in
         // rust (see `method::rust_param_ty`), so the missing-arg

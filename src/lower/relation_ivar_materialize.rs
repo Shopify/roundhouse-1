@@ -40,7 +40,7 @@
 //! `@bots = Current.account.bots` in the app for no reader that needs
 //! it.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::dialect::ControllerBodyItem;
@@ -50,7 +50,7 @@ use crate::ty::Ty;
 
 pub fn apply_relation_ivar_materialize(app: &mut App) {
     for controller in &mut app.controllers {
-        let mut ivars: HashMap<Symbol, Ty> = HashMap::new();
+        let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
         for item in &controller.body {
             if let ControllerBodyItem::Action { action, .. } = item {
                 crate::analyze::extract_ivar_assignments(&action.body, &mut ivars);

@@ -14,7 +14,7 @@
 //! The bang form on a NAMED receiver stays put: the new hash cannot
 //! stand in for a mutation someone reads back.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

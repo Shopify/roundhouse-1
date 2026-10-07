@@ -27,12 +27,12 @@ pub struct Signatures {
     /// expected to provide the implementation. The orphan check
     /// skips them so a base-class RBS can carry the contract
     /// without an empty `def` shim on the Ruby side.
-    pub abstract_methods: std::collections::HashSet<Symbol>,
+    pub abstract_methods: crate::det::HashSet<Symbol>,
 }
 
 /// Parse RBS source and extract method signatures.
 pub fn parse_signatures(source: &str) -> Result<Signatures, String> {
-    parse_signatures_with_aliases(source, &AliasTable::new())
+    parse_signatures_with_aliases(source, &AliasTable::default())
 }
 
 /// Inline comments inherit already-resolved aliases from their lexical scope.
@@ -80,12 +80,12 @@ pub(crate) fn parse_signatures_with_aliases(
 /// the distinction can be recovered later when it matters.
 pub fn parse_app_signatures(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>, String> {
+) -> Result<crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
     let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
-    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::default());
 
     for decl in decls {
         walk_decl(&decl, None, &top_aliases, &mut out)?;
@@ -99,12 +99,12 @@ pub fn parse_app_signatures(
 /// `ExprNode::Ivar` / `Ctx::ivar_bindings` keys.
 pub fn parse_app_ivars(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>, String> {
+) -> Result<crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
     let decls: Vec<Node<'_>> = signature.declarations().iter().collect();
-    let top_aliases = resolve_aliases(&decls, None, &AliasTable::new());
+    let top_aliases = resolve_aliases(&decls, None, &AliasTable::default());
 
     for decl in decls {
         walk_ivars(&decl, None, &top_aliases, &mut out)?;
@@ -126,10 +126,10 @@ pub fn parse_app_ivars(
 /// since RBS resolves them lexically.
 pub fn parse_app_includes(
     source: &str,
-) -> Result<std::collections::HashMap<ClassId, Vec<ClassId>>, String> {
+) -> Result<crate::det::HashMap<ClassId, Vec<ClassId>>, String> {
     let signature = parse(source)?;
-    let mut out: std::collections::HashMap<ClassId, Vec<ClassId>> =
-        std::collections::HashMap::new();
+    let mut out: crate::det::HashMap<ClassId, Vec<ClassId>> =
+        crate::det::HashMap::default();
     for decl in signature.declarations().iter() {
         walk_includes(&decl, None, &mut out)?;
     }
@@ -139,7 +139,7 @@ pub fn parse_app_includes(
 fn walk_includes(
     decl: &Node<'_>,
     parent: Option<&str>,
-    out: &mut std::collections::HashMap<ClassId, Vec<ClassId>>,
+    out: &mut crate::det::HashMap<ClassId, Vec<ClassId>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
@@ -162,7 +162,7 @@ fn walk_includes(
 fn collect_class_includes<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
-    out: &mut std::collections::HashMap<ClassId, Vec<ClassId>>,
+    out: &mut crate::det::HashMap<ClassId, Vec<ClassId>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     for member in members {
@@ -219,7 +219,7 @@ fn walk_decl(
     decl: &Node<'_>,
     parent: Option<&str>,
     aliases: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
@@ -243,7 +243,7 @@ fn walk_ivars(
     decl: &Node<'_>,
     parent: Option<&str>,
     aliases: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     match decl {
         Node::Class(class) => {
@@ -267,7 +267,7 @@ fn collect_class_ivars<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
     outer: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     let members: Vec<Node<'a>> = members.collect();
@@ -312,7 +312,7 @@ fn collect_class_methods<'a, I: Iterator<Item = Node<'a>>>(
     members: I,
     class_name: &str,
     outer: &AliasTable,
-    out: &mut std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+    out: &mut crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
 ) -> Result<(), String> {
     let class_id = ClassId(Symbol::new(class_name));
     let members: Vec<Node<'a>> = members.collect();
@@ -767,7 +767,7 @@ struct TyCtx<'a> {
 }
 
 /// `type name = ...` declarations in scope, keyed by the name as written.
-pub(crate) type AliasTable = std::collections::HashMap<String, Ty>;
+pub(crate) type AliasTable = crate::det::HashMap<String, Ty>;
 
 fn ty_from_node(node: &Node<'_>, ctx: TyCtx<'_>) -> Result<Ty, String> {
     match node {
@@ -1377,7 +1377,7 @@ pub(crate) fn declared_names(source: &str) -> Result<DeclaredNames, String> {
     }
     let signature = parse(source)?;
     let mut out = DeclaredNames::default();
-    walk(signature.declarations().iter().collect(), None, &mut Vec::new(), &AliasTable::new(), &mut out);
+    walk(signature.declarations().iter().collect(), None, &mut Vec::new(), &AliasTable::default(), &mut out);
     Ok(out)
 }
 
@@ -1789,7 +1789,7 @@ end
     /// Helper: pull the return-type ClassId for a single-method
     /// `(class_name, method_name)` pair from a multi-class app sigs map.
     fn return_class_id(
-        out: &std::collections::HashMap<ClassId, std::collections::HashMap<Symbol, Ty>>,
+        out: &crate::det::HashMap<ClassId, crate::det::HashMap<Symbol, Ty>>,
         class_path: &str,
         method: &str,
     ) -> Option<String> {

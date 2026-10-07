@@ -4,7 +4,7 @@
 //! that calls `super` (raise if unset). Core has dozens of `Current`
 //! classes; each namespace's reads must resolve to its own.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

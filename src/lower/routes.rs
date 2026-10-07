@@ -145,8 +145,8 @@ pub fn standard_resource_actions() -> &'static [(&'static str, HttpMethod, &'sta
 /// generate no helper and are skipped. When two routes share an
 /// `as_name` (a resources index and create), the first wins — they
 /// describe the same path template.
-pub fn helper_id_segments(app: &App) -> std::collections::HashMap<String, Vec<bool>> {
-    let mut out: std::collections::HashMap<String, Vec<bool>> = std::collections::HashMap::new();
+pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
+    let mut out: crate::det::HashMap<String, Vec<bool>> = crate::det::HashMap::default();
     for r in flatten_routes(app) {
         if !r.named || r.as_name.is_empty() {
             continue;

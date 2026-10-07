@@ -1376,7 +1376,7 @@ pub(super) fn form_param_ref_name(e: &Expr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
     use std::rc::Rc;
 
     fn kw(entries: Vec<(&str, Expr)>) -> Expr {

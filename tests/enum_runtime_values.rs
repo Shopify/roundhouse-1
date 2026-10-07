@@ -17,7 +17,7 @@
 //! elsewhere. Ingest used to refuse every one, dropping the declaration,
 //! and with it every `record.archived?` / `Model.archived` call site.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

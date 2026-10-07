@@ -9,7 +9,7 @@
 //! in the IR and undone downstream; only the emitted string says which
 //! (the lesson `tests/core_class_reopen_keeps_self.rs` records).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -25,7 +25,7 @@ end
 /// Ingest a one-file library class beside a `Room` model and return
 /// the emitted Ruby for it.
 fn emit_lib(src: &str, stem: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

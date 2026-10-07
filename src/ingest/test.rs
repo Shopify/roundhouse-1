@@ -174,7 +174,7 @@ fn refuse_unreached_test_classes(root: &Node<'_>, reached: &[ScopedClass<'_>], f
     }
     let mut classes = Classes(Vec::new());
     classes.visit(root);
-    let reached: std::collections::HashSet<usize> =
+    let reached: crate::det::HashSet<usize> =
         reached.iter().map(|(_, c)| c.location().start_offset()).collect();
     for (offset, name) in classes.0 {
         if reached.contains(&offset) {
@@ -1154,7 +1154,7 @@ end
 /// parent keeps its written path.
 pub(super) fn resolve_test_parents(app: &mut crate::App) {
     let resolver = app.const_resolver.for_sources(&app.sources);
-    let defined: std::collections::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
+    let defined: crate::det::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
     for tm in &mut app.test_modules {
         let (Some(span), Some(parent)) = (tm.parent_span, &tm.parent) else { continue };
         let path: Vec<Symbol> = parent.0.as_str().split("::").map(Symbol::from).collect();

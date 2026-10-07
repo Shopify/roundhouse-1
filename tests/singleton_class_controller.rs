@@ -9,7 +9,7 @@
 //! view (26864 notes off application_controller.rb alone). `def self.x`
 //! was worse: it was filed as an instance ACTION named `x`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

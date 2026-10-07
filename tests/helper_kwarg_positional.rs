@@ -14,7 +14,7 @@
 //! `id:`/`class:` against a `**attributes` helper — mean a hash, and
 //! are left alone by construction.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -24,7 +24,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
     create_table :rooms do |t|\n    t.string :name\n  end\nend\n";
 
 fn emit(helper: &str, view: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),
@@ -98,7 +98,7 @@ fn a_splat_helper_keeps_its_hash() {
 /// handed WebMock the HASH: "URI should be a String … Got: Hash".
 #[test]
 fn a_test_classs_own_helper_gets_the_same_repair() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),
@@ -163,7 +163,7 @@ fn an_unknown_key_declines() {
 /// description:)` is the shape.
 #[test]
 fn a_skipped_keyword_takes_its_own_default() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),
@@ -217,7 +217,7 @@ end
 }
 
 fn emit_models(files: &[(&str, &str)], keep: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

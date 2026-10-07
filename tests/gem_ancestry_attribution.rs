@@ -1,7 +1,7 @@
 //! Missing methods on an app class can originate in an unmodeled gem
 //! mixed into its ancestors. Attribution is a coverage heuristic, not typing.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{

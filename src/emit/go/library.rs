@@ -37,11 +37,11 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
     // registry) still triggers Q1 wiring on AR::Base itself.
     // Subclasses come through `emit_library_class_with_registry` from
     // `emit_overlay_files` with the transitive-closure set.
-    let mut ar_chain = std::collections::HashSet::new();
+    let mut ar_chain = crate::det::HashSet::default();
     ar_chain.insert("ActiveRecordBase".to_string());
     emit_library_class_with_registry(
         class,
-        &std::collections::HashSet::new(),
+        &crate::det::HashSet::default(),
         &ar_chain,
     )
 }
@@ -56,8 +56,8 @@ pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
 /// its `initialize` MethodDef has a trailing-optional param.
 pub fn emit_library_class_with_registry(
     class: &LibraryClass,
-    variadic_ctors: &std::collections::HashSet<String>,
-    ar_chain: &std::collections::HashSet<String>,
+    variadic_ctors: &crate::det::HashSet<String>,
+    ar_chain: &crate::det::HashSet<String>,
 ) -> Result<String, String> {
     // Module-singleton shape: a Ruby `module X` whose body is just
     // `class << self; attr_accessor :slot; end` (and/or `def self.foo`
@@ -353,8 +353,8 @@ fn emit_ar_class_method_wrappers(name: &str) -> String {
 fn collect_self_methods(
     methods: &[crate::dialect::MethodDef],
     fields: &[Field],
-) -> std::rc::Rc<std::collections::HashSet<String>> {
-    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+) -> std::rc::Rc<crate::det::HashSet<String>> {
+    let mut set: crate::det::HashSet<String> = crate::det::HashSet::default();
     for m in methods {
         if !matches!(m.receiver, MethodReceiver::Instance) {
             continue;
@@ -1016,7 +1016,7 @@ pub fn format_module_ivar(owner: &str, name: &str, value: &Expr) -> String {
 fn emit_method(
     class_name: &str,
     m: &MethodDef,
-    self_methods: &std::rc::Rc<std::collections::HashSet<String>>,
+    self_methods: &std::rc::Rc<crate::det::HashSet<String>>,
     is_ar_class: bool,
 ) -> String {
     let (params, optional_unpack) = render_params_with_unpack(m);
@@ -1056,8 +1056,8 @@ fn emit_method(
     let ctx = EmitCtx {
         class_name: Some(class_name.to_string()),
         in_class_method: matches!(m.receiver, MethodReceiver::Class),
-        var_renames: std::collections::HashMap::new(),
-        declared: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
+        var_renames: crate::det::HashMap::default(),
+        declared: std::rc::Rc::new(std::cell::RefCell::new(crate::det::HashSet::default())),
         void_method: returns_void,
         in_module_singleton: false,
         self_methods: Some(std::rc::Rc::clone(self_methods)),
@@ -1515,8 +1515,8 @@ fn emit_module_singleton_method(class_name: &str, m: &MethodDef) -> String {
     let ctx = EmitCtx {
         class_name: Some(class_name.to_string()),
         in_class_method: true,
-        var_renames: std::collections::HashMap::new(),
-        declared: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
+        var_renames: crate::det::HashMap::default(),
+        declared: std::rc::Rc::new(std::cell::RefCell::new(crate::det::HashSet::default())),
         void_method: returns_void,
         in_module_singleton: true,
         // Module-singleton has no instance methods; nothing to put

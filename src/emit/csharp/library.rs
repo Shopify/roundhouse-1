@@ -18,7 +18,8 @@
 //! classification maps drive lookup only (see `expr.rs`).
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::HashSet;
 use std::path::PathBuf;
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
@@ -162,8 +163,8 @@ pub fn emit_test_class(
     }
 
     register_params_for(&class_name, &lc.methods);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
 
     // Body-only ivars (e.g. `@article` assigned in `setup`) → properties so
     // reads in the test methods resolve.
@@ -202,7 +203,7 @@ pub fn emit_test_class(
     // Property registry so `self.@article` reads emit as a property name.
     let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
     set_instance_props(instance_props);
-    let prop_ty_map: std::collections::HashMap<String, Ty> =
+    let prop_ty_map: crate::det::HashMap<String, Ty> =
         inferred_ivar_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     set_instance_prop_types(prop_ty_map);
     set_current_class(&class_name);
@@ -298,10 +299,10 @@ fn homogeneous_lit_type<'a>(mut elems: impl Iterator<Item = &'a Expr>) -> &'stat
 
 /// Render a Ruby `module X` (a set of class methods) as a C# `static class`.
 pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
-    set_instance_prop_types(std::collections::HashMap::new());
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let name = methods
         .first()
         .and_then(|m| m.enclosing_class.as_ref())
@@ -332,7 +333,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         return emit_static_class(lc, &class_name);
     }
 
-    super::expr::set_object_tl_fields(HashSet::new());
+    super::expr::set_object_tl_fields(HashSet::default());
 
     // Temporal (Date/DateTime/Time) columns: a reader whose return type is
     // `DateTimeOffset` (`Ty::Time`). These must NOT collapse into an
@@ -449,7 +450,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
     // emits as a private renamed field (`_errors`) that every `@ivar`
     // reference rewrites to. The method keeps the public name.
     let methods_set = instance_method_names(lc);
-    let ivar_renames: std::collections::HashMap<String, String> = body_ivars
+    let ivar_renames: crate::det::HashMap<String, String> = body_ivars
         .keys()
         .filter(|n| methods_set.contains(*n))
         .map(|n| (n.clone(), format!("_{n}")))
@@ -504,7 +505,7 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
         .cloned()
         .collect();
     set_instance_props(instance_props);
-    let mut prop_ty_map: std::collections::HashMap<String, Ty> =
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
         prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
     for (n, t) in &inferred_ivar_types {
         prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
@@ -621,12 +622,12 @@ pub fn emit_library_class(lc: &LibraryClass) -> String {
 /// A Ruby `module` → C# `static class`. Class-level `attr_accessor` (from
 /// `class << self`) collapses to a static property.
 fn emit_static_class(lc: &LibraryClass, class_name: &str) -> String {
-    set_instance_prop_types(std::collections::HashMap::new());
+    set_instance_prop_types(crate::det::HashMap::default());
     // `self` in a module function is the static class itself.
     set_current_class(class_name);
-    super::expr::set_object_tl_fields(HashSet::new());
-    set_instance_props(HashSet::new());
-    set_ivar_renames(std::collections::HashMap::new());
+    super::expr::set_object_tl_fields(HashSet::default());
+    set_instance_props(HashSet::default());
+    set_ivar_renames(crate::det::HashMap::default());
     let accessor_props = class_accessor_props(&lc.methods);
     // `partial` so a hand-written C# runtime file can add native overloads to a
     // transpiled module (e.g. `JsonBuilder.EncodeDatetime(DateTimeOffset?)` in
@@ -780,7 +781,7 @@ fn member_name(m: &MethodDef) -> String {
 }
 
 fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for m in &lc.methods {
         if m.receiver != MethodReceiver::Instance {
             continue;

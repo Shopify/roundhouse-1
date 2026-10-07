@@ -3,7 +3,7 @@
 //! so an association the includer declares resolves inside the concern
 //! — and `lower::class_body_new` binds a class-side bare `new` to it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

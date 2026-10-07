@@ -20,7 +20,7 @@
 //! no relation left to chain: "undefined method 'active' for an
 //! instance of Array", from a method whose source says `User.all`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -339,7 +339,7 @@ pub(super) fn emit_send(
         // fixed arity. `controller_shim_arity` reports the declared
         // count; `controller_shim_method_param_ty` gives the Ty per
         // index. `synth_default_for_ty` produces the literal
-        // (`HashMap::new()` for trailing opts). Without this padding,
+        // (`HashMap::default()` for trailing opts). Without this padding,
         // 1-arg `self.head(:not_found)` sites trip E0061 once the shim
         // signature gains the kwargs param to absorb 2-arg calls.
         if let Some(arity) = dispatch::controller_shim_arity(&effective_method) {
@@ -401,7 +401,7 @@ pub(super) fn emit_send(
                     // default (e.g. Ruby `omission: "..."`) when the
                     // collected registry has one for this position;
                     // otherwise fall back to the Ty-only default
-                    // (Hash → `HashMap::new()`, Str → `""`, etc.).
+                    // (Hash → `HashMap::default()`, Str → `""`, etc.).
                     // The source-level path is what gets Rails'
                     // `truncate(text, length: 100)` to render
                     // `...`-suffixed output instead of mid-word
@@ -680,8 +680,8 @@ fn unpack_trailing_kwargs(
     // Index the Hash literal's entries by key-name. Accept both Symbol
     // and String literal keys (Ruby kwargs surface either way through
     // the parser depending on call shape).
-    let mut by_name: std::collections::HashMap<String, &Expr> =
-        std::collections::HashMap::new();
+    let mut by_name: crate::det::HashMap<String, &Expr> =
+        crate::det::HashMap::default();
     for (k, v) in entries.iter() {
         let name = match &*k.node {
             ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),

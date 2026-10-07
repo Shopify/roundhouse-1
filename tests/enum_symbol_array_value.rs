@@ -10,7 +10,7 @@
 //! empty user list, which reads as a missing feature rather than a
 //! wrong query.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

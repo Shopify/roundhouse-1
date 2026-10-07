@@ -18,7 +18,7 @@
 //!    fine while a controller's own inlinable filters are all declared
 //!    before its non-inlinable ones, and wrong the moment they are not.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

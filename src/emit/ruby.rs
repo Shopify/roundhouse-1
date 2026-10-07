@@ -473,7 +473,7 @@ pub fn emit_lowered_routes(app: &App) -> EmittedFile {
     // LoadError at boot on the ruby lane and a build abort on spinel.
     // Skipping it keeps Rails' laziness: the route still dispatches,
     // and it fails where Rails fails it.
-    let defined: std::collections::HashSet<&str> =
+    let defined: crate::det::HashSet<&str> =
         app.controllers.iter().map(|c| c.name.0.as_str()).collect();
     // The same holds for the base: a model-only app (a component with
     // no controllers) has no application_controller to require.
@@ -598,10 +598,10 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
     // action (gets implicit render + process_action dispatch) only if a
     // route reaches it. Lets base-controller helper/filter methods keep
     // their return value instead of being clobbered by a synthesized render.
-    let mut routed: std::collections::HashMap<
+    let mut routed: crate::det::HashMap<
         crate::ident::ClassId,
-        std::collections::HashSet<crate::ident::Symbol>,
-    > = std::collections::HashMap::new();
+        crate::det::HashSet<crate::ident::Symbol>,
+    > = crate::det::HashMap::default();
     for r in crate::lower::flatten_routes(app) {
         routed.entry(r.controller).or_default().insert(r.action);
     }
@@ -980,7 +980,7 @@ pub fn emit_with_assertions(
     // `DELETE FROM` rather than a synthesized `_adapter_truncate`:
     // there is no model to synthesize it onto, and a virtual table has
     // no AUTOINCREMENT sequence to reset.
-    let modelled: std::collections::HashSet<&str> =
+    let modelled: crate::det::HashSet<&str> =
         app.models.iter().map(|m| m.table.0.as_str()).collect();
     for (name, _table) in &app.schema.tables {
         if !modelled.contains(name.as_str()) {
@@ -1141,10 +1141,10 @@ pub fn emit_with_assertions(
         // silently replace the first. A namespaced class whose stem
         // is taken spells its `::` as `__` instead — decided from the
         // whole set, so the outcome does not depend on emit order.
-        let stem_counts: std::collections::HashMap<String, usize> = test_lowered
+        let stem_counts: crate::det::HashMap<String, usize> = test_lowered
             .iter()
             .map(|l| test_file_stem(l.test_class.name.0.as_str()))
-            .fold(std::collections::HashMap::new(), |mut m, s| {
+            .fold(crate::det::HashMap::default(), |mut m, s| {
                 *m.entry(s).or_insert(0) += 1;
                 m
             });
@@ -1170,7 +1170,7 @@ pub fn emit_with_assertions(
         // already taken takes the next free `_<n>` suffix, in module
         // order (authored files sorted, classes in source order).
         let out_paths: Vec<PathBuf> = {
-            let mut taken: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            let mut taken: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
             test_lowered
                 .iter()
                 .map(|l| {
@@ -1191,7 +1191,7 @@ pub fn emit_with_assertions(
         // test_helper.rb: `class Sqlite3QueryHelperTest <
         // SqliteTestCompat::TestCase`). Its file has to be loaded first:
         // the first file that declares it.
-        let mut test_paths: std::collections::HashMap<&str, PathBuf> = std::collections::HashMap::new();
+        let mut test_paths: crate::det::HashMap<&str, PathBuf> = crate::det::HashMap::default();
         for (l, path) in test_lowered.iter().zip(&out_paths) {
             test_paths.entry(l.test_class.name.0.as_str()).or_insert_with(|| path.clone());
         }
@@ -1210,7 +1210,7 @@ pub fn emit_with_assertions(
                     .collect()
             };
             let mut names = own(lc);
-            let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+            let mut seen: crate::det::HashSet<String> = names.iter().cloned().collect();
             let mut current = lc.parent.clone();
             for _ in 0..32 {
                 let Some(parent) = current.take() else { break };
@@ -1234,7 +1234,7 @@ pub fn emit_with_assertions(
             names
         };
         let mut index: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
-        let test_parents: std::collections::HashSet<&str> = test_lowered
+        let test_parents: crate::det::HashSet<&str> = test_lowered
             .iter()
             .filter_map(|l| l.test_class.parent.as_ref().map(|p| p.0.as_str()))
             .collect();

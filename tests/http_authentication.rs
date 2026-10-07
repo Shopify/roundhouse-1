@@ -7,7 +7,7 @@
 //! on the first request. A filter calling the `or_request` form also got no
 //! halting check, so the action ran after the 401 challenge.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

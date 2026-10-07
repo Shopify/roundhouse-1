@@ -13,7 +13,7 @@
 //! ledger line, never a silently empty route table.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 use ruby_prism::Node;
@@ -29,7 +29,7 @@ use super::util::{
 use super::{IngestError, IngestResult};
 
 pub fn ingest_routes(source: &[u8], file: &str) -> IngestResult<RouteTable> {
-    ingest_routes_with_draws(source, file, &HashMap::new())
+    ingest_routes_with_draws(source, file, &HashMap::default())
 }
 
 /// `draws` maps a route-file key to the split file Rails loads into the
@@ -43,7 +43,7 @@ pub fn ingest_routes_with_draws(
     file: &str,
     draws: &HashMap<String, (Vec<u8>, String)>,
 ) -> IngestResult<RouteTable> {
-    ingest_routes_with_dsl(source, file, draws, &HashSet::new())
+    ingest_routes_with_dsl(source, file, draws, &HashSet::default())
 }
 
 /// [`ingest_routes_with_draws`] plus the block-taking methods an app
@@ -63,7 +63,7 @@ pub fn ingest_routes_with_dsl(
     let cx = Ctx {
         draws,
         wrappers: block_wrappers,
-        concerns: RefCell::new(HashMap::new()),
+        concerns: RefCell::new(HashMap::default()),
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
     };
@@ -1263,7 +1263,7 @@ fn run_concerns(
 /// an unknown name drops its route exactly as before.
 mod eval {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use crate::det::HashMap;
 
     use ruby_prism::Node;
 
@@ -1283,7 +1283,7 @@ mod eval {
     }
 
     pub(super) fn push_frame() {
-        FRAMES.with(|f| f.borrow_mut().push(HashMap::new()));
+        FRAMES.with(|f| f.borrow_mut().push(HashMap::default()));
     }
 
     pub(super) fn pop_frame() {

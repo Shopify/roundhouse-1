@@ -4,7 +4,8 @@
 //! and the app/helpers fold), and the `ActionDispatch::Flash::FlashHash`
 //! class. Extracted verbatim from `Analyzer::with_adapter`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::expr::{ExprNode, Literal};

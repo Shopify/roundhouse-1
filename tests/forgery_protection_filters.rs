@@ -10,7 +10,7 @@
 //! decided who they are. `PwaController` opts out with
 //! `skip_forgery_protection`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

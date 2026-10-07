@@ -7,7 +7,7 @@
 //! test's literal becomes an explicit `ActiveRecord::Relation.new(User)`
 //! filtered by exactly `[david.id, kevin.id]`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

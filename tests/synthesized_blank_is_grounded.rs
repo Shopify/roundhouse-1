@@ -34,7 +34,7 @@
 //! it does not run. These tests go through `emit_lowered_models`, which
 //! is what actually ships.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

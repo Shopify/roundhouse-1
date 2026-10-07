@@ -16,7 +16,7 @@
 //! carrying one keeps its pre-existing behaviour (unsupported-DSL
 //! ledger) rather than being promoted.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

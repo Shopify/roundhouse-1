@@ -234,7 +234,7 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
         {
             let inner_raw = emit_expr(value);
             return format!(
-                "{inner_raw}.into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<std::collections::HashMap<String, serde_json::Value>>()"
+                "{inner_raw}.into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<crate::det::HashMap<String, serde_json::Value>>()"
             );
         }
     }
@@ -246,7 +246,7 @@ pub(crate) fn coerce_arg_for_param_ty(arg: &Expr, param_ty: &crate::ty::Ty) -> S
                 || matches!(&*arg.node, ExprNode::Hash { .. })
             {
                 return format!(
-                    "{raw}.into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<std::collections::HashMap<String, serde_json::Value>>()"
+                    "{raw}.into_iter().map(|(k, v)| (k.to_string(), serde_json::Value::from(v))).collect::<crate::det::HashMap<String, serde_json::Value>>()"
                 );
             }
         }
@@ -673,7 +673,7 @@ pub(crate) fn coerce_arg_for_field_ty(arg: &Expr, field_ty: &crate::ty::Ty) -> S
                     );
                 if value_is_value_shaped {
                     return format!(
-                        "{raw}.as_object().cloned().unwrap_or_default().into_iter().collect::<std::collections::HashMap<String, serde_json::Value>>()"
+                        "{raw}.as_object().cloned().unwrap_or_default().into_iter().collect::<crate::det::HashMap<String, serde_json::Value>>()"
                     );
                 }
             }

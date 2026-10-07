@@ -1,6 +1,6 @@
 //! Library-class Data factories retain their declaration identity and lexical owner.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::Analyzer;

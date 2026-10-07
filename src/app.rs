@@ -10,7 +10,8 @@
 //! local types, view ivar contexts, render edges — so lowerers and
 //! IDE consumers read them instead of re-deriving.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use crate::det::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,14 @@ pub struct HelperConnection {
     /// body or `begin`, or in a method.
     pub top_level: bool,
 }
+
+/// Which `def` a call-site parameter observation belongs to: the
+/// class, the method name, and the side it is defined on. A class
+/// method and an instance method of the same name (`def self.call` /
+/// `def call`, every service object) are different methods with
+/// different parameters; keyed by (class, name) alone, each one's
+/// call sites typed the other's params.
+pub type ParamKey = (ClassId, Symbol, crate::dialect::MethodReceiver);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct App {
@@ -161,7 +170,7 @@ pub struct App {
     /// analyzer's own table: (declaring class, method) → positional
     /// param types, `Ty::Var` where no call site contributed.
     #[serde(skip)]
-    pub inferred_method_params: HashMap<(ClassId, Symbol), Vec<Ty>>,
+    pub inferred_method_params: HashMap<ParamKey, Vec<Ty>>,
     /// Source files the text pipeline cannot represent — every emitted
     /// file's content is a `String`, so an app's images, fonts and
     /// binary test fixtures were silently dropped on the floor. Carried
@@ -754,8 +763,9 @@ impl App {
     /// body items, a library class's `includes`.
     pub fn sole_includer_of_modules(
         &self,
-    ) -> std::collections::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
-        use std::collections::{BTreeMap, BTreeSet, HashMap};
+    ) -> crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId> {
+        use std::collections::{BTreeMap, BTreeSet};
+        use crate::det::HashMap;
         let modules: BTreeSet<&crate::ident::ClassId> = self
             .library_classes
             .iter()
@@ -763,7 +773,7 @@ impl App {
             .map(|lc| &lc.name)
             .collect();
         if modules.is_empty() {
-            return HashMap::new();
+            return HashMap::default();
         }
         // Every class's DIRECT includes, modules included (for the
         // transitive walk).
@@ -798,7 +808,7 @@ impl App {
             let ids = crate::analyze::controller_includes(controller);
             direct.entry(controller.name.clone()).or_default().extend(ids);
         }
-        let mut includers: HashMap<crate::ident::ClassId, BTreeSet<crate::ident::ClassId>> = HashMap::new();
+        let mut includers: HashMap<crate::ident::ClassId, BTreeSet<crate::ident::ClassId>> = HashMap::default();
         for (id, includes) in &direct {
             if modules.contains(id) || includes.is_empty() {
                 continue;
@@ -847,22 +857,22 @@ impl App {
             seeds: None,
             importmap: None,
             stylesheets: Vec::new(),
-            rbs_signatures: HashMap::new(),
-            rbs_includes: HashMap::new(),
+            rbs_signatures: HashMap::default(),
+            rbs_includes: HashMap::default(),
             gem_lock: None,
             gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),
             test_helper_connections: Vec::new(),
             test_helper_connection_blockers: Vec::new(),
-            inferred_method_params: HashMap::new(),
-            helper_method_index: HashMap::new(),
+            inferred_method_params: HashMap::default(),
+            helper_method_index: HashMap::default(),
             view_visible_controller_methods: BTreeSet::new(),
             generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
             load_hook_class_macros: Vec::new(),
-            partial_local_types: HashMap::new(),
-            view_ivar_types: HashMap::new(),
+            partial_local_types: HashMap::default(),
+            view_ivar_types: HashMap::default(),
             html_safe_methods: BTreeSet::new(),
             time_formats: BTreeMap::new(),
             module_mixins: Vec::new(),
@@ -874,16 +884,16 @@ impl App {
             eager_load: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,
-            concern_filters: HashMap::new(),
+            concern_filters: HashMap::default(),
             graphql_types: Vec::new(),
             graphql_signatures: Vec::new(),
-            concern_spliced_actions: HashMap::new(),
-            concern_spliced_class_methods: HashMap::new(),
-            concern_model_items: HashMap::new(),
+            concern_spliced_actions: HashMap::default(),
+            concern_spliced_class_methods: HashMap::default(),
+            concern_model_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
-            render_edges: HashMap::new(),
-            view_feeders: HashMap::new(),
-            controller_resolutions: HashMap::new(),
+            render_edges: HashMap::default(),
+            view_feeders: HashMap::default(),
+            controller_resolutions: HashMap::default(),
             sources: Vec::new(),
             const_resolver: Default::default(),
             dropped_files: Vec::new(),

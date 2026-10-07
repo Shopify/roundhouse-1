@@ -31,7 +31,7 @@
 use crate::dialect::LibraryClass;
 use crate::expr::{Arm, Expr, ExprNode, InterpPart, LValue, Literal, RescueClause};
 use crate::ty::{ParamKind, Ty};
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 /// (ClassName, method_name) → param_tys. ClassName is the last segment
 /// of the LC's name (e.g. `ViewHelpers` for `ActionView::ViewHelpers`)
@@ -79,7 +79,7 @@ pub fn insert_ty_coercions_with_extras(
 }
 
 fn build_registry_from(lcs: &[&LibraryClass]) -> CalleeRegistry {
-    let mut out: CalleeRegistry = HashMap::new();
+    let mut out: CalleeRegistry = HashMap::default();
     for lc in lcs {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();
@@ -136,7 +136,7 @@ fn build_registry_from(lcs: &[&LibraryClass]) -> CalleeRegistry {
 }
 
 fn build_registry(lcs: &[LibraryClass]) -> CalleeRegistry {
-    let mut out: CalleeRegistry = HashMap::new();
+    let mut out: CalleeRegistry = HashMap::default();
     for lc in lcs {
         let raw = lc.name.0.as_str();
         let class_name = raw.rsplit("::").next().unwrap_or(raw).to_string();

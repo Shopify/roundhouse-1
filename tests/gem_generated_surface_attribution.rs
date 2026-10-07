@@ -2,7 +2,7 @@
 //! State machines are the first generator fixtures, not a new public
 //! attribution pass. Names remain unresolved; emit is unchanged.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::attribution::{attribute_ingest_gaps, attribute_unknown_gems};

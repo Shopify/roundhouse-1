@@ -24,7 +24,7 @@
 //! `true` — a correct fold of an incorrect type. Stripping nil here (as
 //! the controller-wide ivar seed does) signed everyone in.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

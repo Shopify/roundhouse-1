@@ -1,6 +1,7 @@
 //! Diagnostic-only ancestry evidence. Never adds types or emitted methods.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use crate::det::{HashMap, HashSet};
 
 use crate::app::App;
 use crate::gems::{GemCensus, gems_owning_constant_with};
@@ -40,7 +41,7 @@ pub(super) struct GemAncestry {
 
 impl GemAncestry {
     pub(super) fn new(app: &App) -> Self {
-        let mut edges: HashMap<ClassId, Vec<AncestryEdge>> = HashMap::new();
+        let mut edges: HashMap<ClassId, Vec<AncestryEdge>> = HashMap::default();
         let mut add = |id: &ClassId, parent: Option<&ClassId>, includes: Vec<ClassId>| {
             let entry = edges.entry(id.clone()).or_default();
             entry.extend(
@@ -75,10 +76,10 @@ impl GemAncestry {
         }
         let mut ancestry = Self {
             edges,
-            generated: HashMap::new(),
-            concern_extensions: HashMap::new(),
-            constant_bindings: HashSet::new(),
-            uncertain_generated_owners: HashSet::new(),
+            generated: HashMap::default(),
+            concern_extensions: HashMap::default(),
+            constant_bindings: HashSet::default(),
+            uncertain_generated_owners: HashSet::default(),
         };
         // Include-only reopens may be omitted, and modeled class mixins may
         // be consumed. Supplement literal source includes without replacing
@@ -396,7 +397,7 @@ impl GemAncestry {
 
     fn class_gem<'a>(&self, id: &ClassId, census: &'a GemCensus, declares: &dyn Fn(&str, &str) -> Option<bool>) -> GemClaim<'a> {
         let mut pending = vec![id.clone()];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut candidates = BTreeMap::new();
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {
@@ -464,9 +465,9 @@ impl GemAncestry {
         lock: &crate::gems::Lockfile,
     ) -> Option<(&'static str, ClassId)> {
         let mut pending = vec![receiver.clone()];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut found: Option<(&'static str, ClassId)> = None;
-        let mut occurrences = HashMap::new();
+        let mut occurrences = HashMap::default();
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {
                 continue;
@@ -524,7 +525,7 @@ impl GemAncestry {
     /// module included by the declaration or by a different receiver.
     fn descends_from(&self, receiver: &ClassId, ancestor: &str) -> bool {
         let mut pending = vec![receiver.clone()];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut found = false;
         while let Some(id) = pending.pop() {
             if !seen.insert(id.clone()) {

@@ -9,7 +9,7 @@
 //! refused by name. With no blocks this is plain Ruby overriding, as in
 //! Rails.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::diagnostic::Diagnostic;
 use crate::dialect::{MethodDef, TestModule};

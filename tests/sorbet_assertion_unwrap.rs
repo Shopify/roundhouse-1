@@ -12,7 +12,7 @@
 //! signature seed is a separate question with its own policy, and this
 //! has to land without answering it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

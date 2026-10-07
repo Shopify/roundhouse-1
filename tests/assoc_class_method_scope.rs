@@ -20,7 +20,7 @@
 //! an association grows the parameter, so an app that never writes the
 //! shape emits exactly what it emitted before.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

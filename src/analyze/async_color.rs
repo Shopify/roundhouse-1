@@ -14,7 +14,7 @@
 //! `&[]`), so `seed_from_adapter` mutates nothing and emit output
 //! is unchanged. That's Gate 1 from `project_async_coloring_plan.md`.
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::adapter::DatabaseAdapter;
 use crate::dialect::{AccessorKind, LibraryClass, LibraryFunction, MethodDef};
@@ -308,10 +308,10 @@ pub fn find_sync_slot_violations(classes: &[LibraryClass]) -> Vec<SyncSlotViolat
 /// names (`ActiveRecord::Base`) and bare names (`Base`) that lowerers
 /// produce for parent links.
 fn inheritance_async_marks(classes: &[LibraryClass]) -> Vec<(usize, Symbol)> {
-    let mut by_full: std::collections::HashMap<&ClassId, usize> =
-        std::collections::HashMap::new();
-    let mut by_last: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut by_full: crate::det::HashMap<&ClassId, usize> =
+        crate::det::HashMap::default();
+    let mut by_last: crate::det::HashMap<String, usize> =
+        crate::det::HashMap::default();
     for (i, c) in classes.iter().enumerate() {
         by_full.insert(&c.name, i);
         let raw = c.name.0.as_str();
@@ -329,8 +329,8 @@ fn inheritance_async_marks(classes: &[LibraryClass]) -> Vec<(usize, Symbol)> {
     };
 
     // children_of[parent_idx] = list of class_idx whose parent is parent_idx.
-    let mut children_of: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut children_of: crate::det::HashMap<usize, Vec<usize>> =
+        crate::det::HashMap::default();
     for (i, c) in classes.iter().enumerate() {
         if let Some(pid) = c.parent.as_ref() {
             if let Some(p_idx) = resolve_parent(pid) {
@@ -349,8 +349,8 @@ fn inheritance_async_marks(classes: &[LibraryClass]) -> Vec<(usize, Symbol)> {
         method.name.as_str() == "initialize"
     };
 
-    let mut out: std::collections::HashSet<(usize, Symbol)> =
-        std::collections::HashSet::new();
+    let mut out: crate::det::HashSet<(usize, Symbol)> =
+        crate::det::HashSet::default();
 
     for (i, class) in classes.iter().enumerate() {
         for method in &class.methods {
@@ -386,8 +386,8 @@ fn inheritance_async_marks(classes: &[LibraryClass]) -> Vec<(usize, Symbol)> {
             // all transitive descendants and mark sync overrides
             // async. The walk visits each node at most once via the
             // visited set.
-            let mut visited: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
+            let mut visited: crate::det::HashSet<usize> =
+                crate::det::HashSet::default();
             let mut stack = chain_roots;
             while let Some(idx) = stack.pop() {
                 if !visited.insert(idx) {
@@ -409,7 +409,7 @@ fn inheritance_async_marks(classes: &[LibraryClass]) -> Vec<(usize, Symbol)> {
 }
 
 fn collect_async_method_names(classes: &[LibraryClass]) -> HashSet<Symbol> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for class in classes {
         for method in &class.methods {
             if method.is_async {

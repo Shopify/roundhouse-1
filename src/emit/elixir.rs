@@ -283,7 +283,7 @@ pub fn emit_overlay_files(app: &App) -> Vec<EmittedFile> {
                 &specs,
             );
         expr::register_modules(model_lcs.iter());
-        let model_names: std::collections::HashSet<String> =
+        let model_names: crate::det::HashSet<String> =
             app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
 
         // Build the view layer (RouteHelpers + Importmap + per-resource
@@ -738,7 +738,7 @@ fn inject_module_attr(content: &str, attr_line: &str) -> String {
 /// becomes a visible `# emit_library_class FAILED` sentinel rather than
 /// a silently-dropped file, so `mix compile` surfaces the gap.
 fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>) {
-    emit_library_lc_with_duals(lc, out, &std::collections::HashSet::new());
+    emit_library_lc_with_duals(lc, out, &crate::det::HashSet::default());
 }
 
 /// Like [`emit_library_lc`], but seeds the functionalize pass with
@@ -749,7 +749,7 @@ fn emit_library_lc(lc: crate::dialect::LibraryClass, out: &mut Vec<EmittedFile>)
 fn emit_library_lc_with_duals(
     lc: crate::dialect::LibraryClass,
     out: &mut Vec<EmittedFile>,
-    external_duals: &std::collections::HashSet<String>,
+    external_duals: &crate::det::HashSet<String>,
 ) {
     for class in
         crate::lower::functionalize::functionalize_with_external_duals(vec![lc], external_duals)
@@ -870,7 +870,7 @@ fn materialize_controller_inherited(
     ctrl: &mut crate::dialect::LibraryClass,
     base: &[crate::dialect::MethodDef],
 ) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         ctrl.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = ctrl.name.0.clone();
     let mut inherited: Vec<crate::dialect::MethodDef> = base
@@ -886,7 +886,7 @@ fn materialize_controller_inherited(
 }
 
 fn materialize_inherited(model: &mut crate::dialect::LibraryClass, base: &[crate::dialect::MethodDef]) {
-    let defined: std::collections::HashSet<String> =
+    let defined: crate::det::HashSet<String> =
         model.methods.iter().map(|m| m.name.as_str().to_string()).collect();
     let owner = model.name.0.clone();
     // `find_by`/`where` are dropped because Elixir rewrites their call

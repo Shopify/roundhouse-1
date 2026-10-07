@@ -13,7 +13,7 @@
 //! parameter gets a fresh local, on models, controllers, library
 //! classes and test helpers.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::App;

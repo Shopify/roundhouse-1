@@ -75,14 +75,14 @@ fn hook_method(name: &str) -> Option<&'static str> {
 }
 
 pub fn apply_sti_subclass_callbacks(app: &mut App) {
-    let models: std::collections::HashSet<ClassId> =
+    let models: crate::det::HashSet<ClassId> =
         app.models.iter().map(|m| m.name.clone()).collect();
     // The type stamp asks a NARROWER question than the callback fold:
     // `Gadget < Widget` on a `widgets` table with no inheritance column
     // is plain Ruby inheritance, not STI, and stamping it would write a
     // column that does not exist. `sti_bases` is the one authority on
     // which subclasses are STI ones — it is what checks for the column.
-    let sti: std::collections::HashSet<ClassId> =
+    let sti: crate::det::HashSet<ClassId> =
         crate::lower::sti_bases(app).into_keys().collect();
     for lc in &mut app.library_classes {
         // An STI subclass is a library class whose parent IS a model.

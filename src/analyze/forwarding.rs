@@ -3,7 +3,7 @@
 //! flattened; model named rest/block declarations are not fully retained.
 //! Do not silently forward into those approximations or an unknown callee.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::diagnostic::Diagnostic;
@@ -56,7 +56,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 Some(
                     "full declarations of this method overlap an ingest-time call rewrite whose source dispatch is not retained",
                 )
-            } else if !contracts.verified_hierarchy(owner, &mut HashSet::new()) {
+            } else if !contracts.verified_hierarchy(owner, &mut HashSet::default()) {
                 Some("forwarding declarations in reopened class fragments are not verified")
             } else if method.receiver == MethodReceiver::Class
                 && app.models.iter().any(|m| &m.name == owner)
@@ -147,7 +147,7 @@ fn off_ruby_family(d: &Diagnostic) -> bool {
 /// lowered app, where a legacy `**value` is a positional marked
 /// `ERASED_KEYWORD_SPLAT`.
 pub fn nameless_rest_refusals_off_ruby(app: &App) -> Vec<Diagnostic> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     keyword_splats_into_nameless_rest_with_index(app, &SourceContractIndex::new(app))
         .into_iter()
         .filter(off_ruby_family)
@@ -396,9 +396,9 @@ impl<'a> RestReach<'a> {
         let rests = methods(app)
             .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
             .collect();
-        let mut module: HashMap<&ClassId, bool> = HashMap::new();
-        let mut synthesized = HashSet::new();
-        let mut constants = HashSet::new();
+        let mut module: HashMap<&ClassId, bool> = HashMap::default();
+        let mut synthesized = HashSet::default();
+        let mut constants = HashSet::default();
         for class in classes(app) {
             *module.entry(&class.name).or_insert(false) |= class.is_module;
             if matches!(
@@ -507,7 +507,7 @@ impl<'a> RestReach<'a> {
         let mut names = Vec::new();
         let mut open = false;
         let mut pending = vec![receiver.clone()];
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         while let Some(node) = pending.pop() {
             if !seen.insert(node.clone()) {
                 continue;
@@ -597,7 +597,7 @@ fn walk(
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
             || contracts.unretained.contains(&enclosing.name_span)
-            || !contracts.verified_hierarchy(owner, &mut HashSet::new())
+            || !contracts.verified_hierarchy(owner, &mut HashSet::default())
         {
             Some("anonymous keyword forwarding source declaration cannot be verified")
         } else {
@@ -775,7 +775,7 @@ fn destination<'a>(
                 owner,
                 &enclosing.name,
                 enclosing.receiver,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             )
         }
         _ => None,
@@ -878,12 +878,12 @@ fn virtual_destinations<'a>(
     let mut candidates = Vec::new();
     for child in
         contracts.virtual_owners.iter().copied().filter(|child| {
-            *child != owner && descends(contracts, child, owner, &mut HashSet::new())
+            *child != owner && descends(contracts, child, owner, &mut HashSet::default())
         })
     {
         // Completeness depends on the descendant's entire reachable lookup
         // chain, including reopened included modules.
-        if !contracts.verified_hierarchy(child, &mut HashSet::new()) {
+        if !contracts.verified_hierarchy(child, &mut HashSet::default()) {
             return Err(
                 "forwarding virtual dispatch through reopened fragments cannot be verified",
             );
@@ -996,7 +996,7 @@ fn keyword_calls_with_index(
         e.node
             .for_each_child(&mut |c| visit(app, contracts, context, c, plans, fallback));
     }
-    let mut plans = HashMap::new();
+    let mut plans = HashMap::default();
     for (owner, method) in methods(app) {
         visit(
             app,
@@ -1090,7 +1090,7 @@ fn constructed_instance(
                     class,
                     &Symbol::from("new"),
                     MethodReceiver::Class,
-                    &mut HashSet::new(),
+                    &mut HashSet::default(),
                 )
                 .is_none()
     };
@@ -1156,16 +1156,16 @@ struct SourceContractIndex<'a> {
 impl<'a> SourceContractIndex<'a> {
     fn new(app: &'a App) -> Self {
         let mut index = Self {
-            parents: HashMap::new(),
-            includes: HashMap::new(),
-            fragments: HashMap::new(),
-            instance: HashMap::new(),
-            class: HashMap::new(),
+            parents: HashMap::default(),
+            includes: HashMap::default(),
+            fragments: HashMap::default(),
+            instance: HashMap::default(),
+            class: HashMap::default(),
             virtual_owners: Vec::new(),
-            full_selectors: HashSet::new(),
-            unretained: HashSet::new(),
+            full_selectors: HashSet::default(),
+            unretained: HashSet::default(),
         };
-        let mut class_owners = HashSet::new();
+        let mut class_owners = HashSet::default();
         for class in classes(app) {
             class_owners.insert(class.name.clone());
             index.add_fragment(
@@ -1233,7 +1233,7 @@ impl<'a> SourceContractIndex<'a> {
                 for name in &names {
                     for receiver in [MethodReceiver::Instance, MethodReceiver::Class] {
                         if let Some((method, _)) = index.declaration(
-                            &model.name, name, receiver, &mut HashSet::new(),
+                            &model.name, name, receiver, &mut HashSet::default(),
                         ) && !model.methods().any(|own| std::ptr::eq(own, method)) {
                             inherited.push(method);
                         }
@@ -1305,7 +1305,7 @@ impl<'a> SourceContractIndex<'a> {
         receiver: MethodReceiver,
         seen: &mut HashSet<ClassId>,
     ) -> Option<(&'a MethodDef, bool)> {
-        if !self.verified_hierarchy(owner, &mut HashSet::new()) || !seen.insert(owner.clone()) {
+        if !self.verified_hierarchy(owner, &mut HashSet::default()) || !seen.insert(owner.clone()) {
             return None;
         }
         let declarations = match receiver {
@@ -1342,7 +1342,7 @@ impl<'a> SourceContractIndex<'a> {
         name: &Symbol,
         receiver: MethodReceiver,
     ) -> Option<(&'a MethodDef, bool)> {
-        self.declaration(owner, name, receiver, &mut HashSet::new())
+        self.declaration(owner, name, receiver, &mut HashSet::default())
             .or_else(|| {
                 (name.as_str() == "new" && receiver == MethodReceiver::Class)
                     .then(|| {
@@ -1350,7 +1350,7 @@ impl<'a> SourceContractIndex<'a> {
                             owner,
                             &Symbol::from("initialize"),
                             MethodReceiver::Instance,
-                            &mut HashSet::new(),
+                            &mut HashSet::default(),
                         )
                     })
                     .flatten()

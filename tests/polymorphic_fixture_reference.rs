@@ -17,7 +17,7 @@
 //! Writing only the id half would be worse than writing neither: a row
 //! keyed to the right id under no type belongs to every model at once.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

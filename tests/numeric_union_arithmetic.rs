@@ -19,7 +19,7 @@
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 
 fn binops(model: &str) -> Vec<String> {
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
         (
             "app/models/application_record.rb",
             "class ApplicationRecord < ActiveRecord::Base\nend\n",

@@ -8,7 +8,7 @@
 //! `lower::as_json_poro` writes it down for the classes an app actually
 //! renders as JSON.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -20,7 +20,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 /// A tableless class under `app/models/` (which is where a Rails app
 /// puts an `ActiveModel::Model`), plus a controller that renders it.
 fn emit_with(controller: &str, model: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),
@@ -48,7 +48,7 @@ fn emit_with(controller: &str, model: &str) -> String {
 /// The same tree, the CONTROLLER's emit — where the `render json:` site
 /// itself lands.
 fn controller_emit_with(controller: &str, model: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/room.rb"),

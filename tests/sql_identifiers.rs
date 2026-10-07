@@ -1,7 +1,7 @@
 //! Physical SQL names come from schema/Model.table metadata, not Ruby
 //! identifiers. These tests do not widen literal self.table_name admission.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,7 +35,7 @@ const CASES: &[(&str, &str, &str)] = &[
 ];
 
 fn app() -> roundhouse::App {
-    let mut tree = HashMap::new();
+    let mut tree = HashMap::default();
     let mut schema = String::from("ActiveRecord::Schema.define do\n");
     let mut seeds = String::new();
     tree.insert(

@@ -33,7 +33,7 @@
 //!   body) is a gap of its own: no survey walks that file.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use ruby_prism::Node;
@@ -46,7 +46,7 @@ use crate::vfs::Vfs;
 use super::util::{class_name_path, constant_id_str, flatten_statements, module_name_path};
 
 thread_local! {
-    static CONSUMED: RefCell<HashMap<String, Vec<(usize, usize)>>> = RefCell::new(HashMap::new());
+    static CONSUMED: RefCell<HashMap<String, Vec<(usize, usize)>>> = RefCell::new(HashMap::default());
     static REFUSED: RefCell<Vec<Refusal>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -309,7 +309,7 @@ pub(super) fn engines_in_initializer_order<V: Vfs + ?Sized>(
         dir,
         load_path,
         engines: &engines,
-        visited: HashSet::new(),
+        visited: HashSet::default(),
         reached: Vec::new(),
     };
     walk.file(&dir.join("config/application.rb"));

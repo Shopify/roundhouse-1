@@ -8,7 +8,7 @@
 //! `Result` — ~90 calls of `.ok_value` / `.error?` / `.ok?` failed
 //! "on Result". The gem's surface is cataloged (catalog/gems.rs).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

@@ -9,7 +9,7 @@
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 
 fn app_from(files: &[(&str, &str)]) -> roundhouse::App {
-    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = files
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = files
         .iter()
         .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
         .collect();

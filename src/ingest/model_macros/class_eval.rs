@@ -6,7 +6,7 @@
 //! [`crate::ingest::model::ingest_model_body_items`]. Dynamic
 //! `class_eval` and unknown interpolations stay unexpanded.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{MethodDef, ModelBodyItem};
 use crate::ident::ClassId;
@@ -24,7 +24,7 @@ pub(super) fn expand(
     owner: &ClassId,
 ) -> Option<Expansion> {
     let bindings = bindings(def, args)?;
-    let mut idents = HashMap::new();
+    let mut idents = HashMap::default();
     for (k, v) in &bindings {
         idents.insert(
             k.as_str().to_string(),

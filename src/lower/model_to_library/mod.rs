@@ -31,7 +31,7 @@ pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub mod row;
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Model, Param};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -198,7 +198,7 @@ pub fn lower_models_to_library_classes_unfolding(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
 ) -> Vec<LibraryClass> {
     lower_models_inner(models, schema, extra_class_infos, params_specs, unfolded, Materialization::Emit).0
 }
@@ -208,7 +208,7 @@ pub(crate) fn lower_models_inner(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
     materialization: Materialization<'_>,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     lower_models_inner_for_dialect(models, schema, extra_class_infos, params_specs,
@@ -222,12 +222,12 @@ pub(crate) fn lower_models_inner_for_dialect(
     schema: &Schema,
     extra_class_infos: Vec<(ClassId, crate::analyze::ClassInfo)>,
     params_specs: &crate::lower::controller_to_library::params::ParamsSpecs,
-    unfolded: &std::collections::HashSet<(ClassId, Symbol)>,
+    unfolded: &crate::det::HashSet<(ClassId, Symbol)>,
     materialization: Materialization<'_>,
     dialect: crate::lower::arel::SqlDialect,
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
-    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
+    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     for model in models {
         let methods = build_methods_for_dialect(model, models, schema, params_specs, dialect);
         let table = schema.tables.get(&model.table.0);
@@ -416,9 +416,9 @@ pub fn class_info_from_library_class(lc: &LibraryClass) -> crate::analyze::Class
     // shouldn't add `()` to such calls since the field is read as
     // a property. Reclassify those Method entries as AttributeReader
     // so the typer treats them like field accesses.
-    let mut ivar_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    fn collect_ivars(e: &crate::expr::Expr, out: &mut std::collections::HashSet<String>) {
+    let mut ivar_names: crate::det::HashSet<String> =
+        crate::det::HashSet::default();
+    fn collect_ivars(e: &crate::expr::Expr, out: &mut crate::det::HashSet<String>) {
         match &*e.node {
             ExprNode::Assign { target: LValue::Ivar { name }, value } => {
                 out.insert(name.as_str().to_string());
@@ -508,7 +508,7 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
         build_methods(model, std::slice::from_ref(model), schema, &Default::default());
     let table = schema.tables.get(&model.table.0);
     let class_info = build_class_info(model, &methods, table);
-    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::new();
+    let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
     classes.insert(model.name.clone(), class_info);
     // Register Row classes so `<Model>.from_row(r)` / `<Model>Row.from_raw(h)`
     // calls inside the model body type correctly. The synthesized Row
@@ -940,7 +940,7 @@ pub(crate) fn unretained_model_contracts<'a>(
     crate::emit::diagnostics::scope(|| {
         let mut specs = crate::lower::controller_to_library::params::collect_specs(&app.controllers);
         specs.mark_file_fields(&app.models);
-        let mut missing = HashSet::new();
+        let mut missing = HashSet::default();
         for model in &app.models {
             let inherited = inherited(model);
             if inherited.is_empty()
@@ -1244,7 +1244,7 @@ pub(crate) fn push_scope_methods(
     methods: &mut Vec<MethodDef>,
     model: &Model,
     scopes: &crate::lower::scope_chain::ScopeRegistry,
-    models_set: &std::collections::HashSet<ClassId>,
+    models_set: &crate::det::HashSet<ClassId>,
     assocs: &crate::lower::scope_chain::AssocRegistry,
 ) {
     use crate::dialect::{AccessorKind, ModelBodyItem, Param};
@@ -1365,7 +1365,7 @@ pub(crate) fn push_scope_methods(
 pub(crate) fn push_scope_variants(
     methods: &mut Vec<MethodDef>,
     model_name: &ClassId,
-    registered: &std::collections::HashMap<Symbol, Vec<crate::dialect::Param>>,
+    registered: &crate::det::HashMap<Symbol, Vec<crate::dialect::Param>>,
 ) {
     use crate::dialect::{AccessorKind, Param};
     use crate::lower::scope_chain::{delegable_name, scope_variant_name, DelegableShape};
@@ -1565,7 +1565,7 @@ pub(crate) fn build_class_info(
     // `/rooms/#<Room:0x000000010…>`. Uses the analyzer's own seed rule
     // rather than a second copy of it.
     {
-        let scope_names: std::collections::HashSet<Symbol> =
+        let scope_names: crate::det::HashSet<Symbol> =
             model.scopes().map(|s| s.name.clone()).collect();
         for scope in model.scopes() {
             info.class_methods.entry(scope.name.clone()).or_insert_with(|| {
@@ -2350,7 +2350,8 @@ pub(crate) fn nullable_column_names(table: Option<&Table>) -> Vec<Symbol> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, path::PathBuf};
+    use crate::det::HashMap;
+    use std::path::PathBuf;
 
     fn app(model_body: &str) -> crate::App {
         let files = [
@@ -2422,7 +2423,7 @@ mod tests {
             parent.params[0].default.as_mut().unwrap().ty = Some(Ty::Hash {
                 key: Box::new(Ty::Sym), value: Box::new(Ty::Str),
             });
-            let classes = HashMap::from([
+            let classes = HashMap::from_iter([
                 (ClassId(Symbol::from("Article")), article_info(&app, &methods)),
             ]);
             let probe = methods.iter_mut().find(|m| m.name.as_str() == "probe").unwrap();

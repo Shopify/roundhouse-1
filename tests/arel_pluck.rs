@@ -19,7 +19,7 @@
 //! Array — the right number over a whole-row fetch. lobsters'
 //! `InvitationRequest.verified_count` is that site.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -34,7 +34,7 @@
 //! Hash[Sym, Str]]` without calling itself) is untouched: the widening
 //! needs both the call cycle and the self-embedding.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode};
@@ -66,7 +66,7 @@ pub(super) fn recursive_methods<'a>(
             out
         })
         .collect();
-    let mut recursive = HashSet::new();
+    let mut recursive = HashSet::default();
     for (start, m) in methods.iter().enumerate() {
         // Reachability back to `start`; classes have few methods, and
         // this runs once per analysis, not per round.

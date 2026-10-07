@@ -94,7 +94,7 @@ fn splatted_attr_accessor_registers_reader_and_writer() {
 #[test]
 fn as_json_poro_stamps_the_ivars_it_reads() {
     let mut app = app_with_card();
-    apply_as_json_synthesis(&mut app, &std::collections::HashMap::new());
+    apply_as_json_synthesis(&mut app, &roundhouse::det::HashMap::default());
     let offenders: Vec<String> = diagnose(&app)
         .into_iter()
         .map(|d| d.to_string())

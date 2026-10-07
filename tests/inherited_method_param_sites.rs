@@ -4,7 +4,7 @@
 //! Ruby's lookup order, so a base class's method that only subclasses
 //! call gets its parameter types.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

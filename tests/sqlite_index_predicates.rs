@@ -6,7 +6,7 @@
 //! predicate both engines read alike is rendered, and nothing is
 //! reported.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::analyze::{Analyzer, Severity};
@@ -26,7 +26,7 @@ end
 
 #[test]
 fn a_unique_predicate_sqlite_cannot_run_is_named_in_a_warning() {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/monitor_scan.rb"),

@@ -25,7 +25,7 @@
 //! story link), the `options` Hash became the title (`/s/x/{anchor: …}`),
 //! and the controller's `{anchor: a}` became the anchor.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

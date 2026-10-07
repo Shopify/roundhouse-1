@@ -26,6 +26,7 @@
 //!   `Gateway#to_entity` is a keyword-only instance method plus a
 //!   class method that takes a positional (`RolloutTreatmentRecord`).
 use roundhouse::analyze::Analyzer;
+use roundhouse::dialect::MethodReceiver;
 use roundhouse::ingest::ingest_app_from_tree;
 use roundhouse::{App, ClassId, Symbol, Ty};
 use std::path::PathBuf;
@@ -240,10 +241,10 @@ fn size(ty: &Ty) -> usize {
     }
 }
 
-fn params<'a>(app: &'a App, class: &str, method: &str) -> &'a [Ty] {
+fn params<'a>(app: &'a App, class: &str, method: &str, side: MethodReceiver) -> &'a [Ty] {
     app.inferred_method_params
-        .get(&(ClassId(Symbol::from(class)), Symbol::from(method)))
-        .unwrap_or_else(|| panic!("{class}#{method} has inferred params"))
+        .get(&(ClassId(Symbol::from(class)), Symbol::from(method), side))
+        .unwrap_or_else(|| panic!("{class} {method} ({side:?}) has inferred params"))
 }
 
 fn contains_hash(ty: &Ty) -> bool {
@@ -278,7 +279,7 @@ fn a_recursive_return_is_widened_at_the_recursion_point() {
 #[test]
 fn when_class_arms_narrow_so_the_recursive_param_collects_every_arm() {
     let (app, _) = analyzed();
-    let [param] = params(&app, "TreePrinter", "fix") else { panic!("one param") };
+    let [param] = params(&app, "TreePrinter", "fix", MethodReceiver::Instance) else { panic!("one param") };
     let Ty::Union { variants } = param else { panic!("{param:?}") };
     // Root: Hash; Hash arm: its keys (Sym) and values (Array); Array arm:
     // its elements (Int, String). Every round sees all of them.
@@ -295,32 +296,57 @@ fn a_keyword_only_one_def_declares_picks_that_def() {
     let (app, _) = analyzed();
     // `bucket:` exists only on the singleton: shop, filename, mime_type,
     // bucket, each typed by its keyword, never by the whole kwargs Hash.
-    let p = params(&app, "ImageAttachment", "build_target");
+    let p = params(&app, "ImageAttachment", "build_target", MethodReceiver::Class);
     assert_eq!(p.len(), 4, "{p:?}");
     assert_eq!(&p[1..], &[Ty::Str, Ty::Str, Ty::Str], "{p:?}");
-    let ext = params(&app, "File", "extname");
+    let ext = params(&app, "File", "extname", MethodReceiver::Class);
     assert!(!ext.iter().any(contains_hash), "{ext:?}");
 }
 
 #[test]
 fn instance_and_class_defs_of_one_name_never_feed_a_slot_its_own_hash() {
     let (app, _) = analyzed();
-    for method in ["limit?", "to_entity"] {
-        let p = params(&app, "Gateway", method);
-        let total: usize = p.iter().map(size).sum();
-        assert!(total <= 12, "Gateway#{method}: {p:?}");
-        // `limit?` passes only keywords; no slot sees the kwargs group.
-        if method == "limit?" {
-            assert!(!p.iter().any(contains_hash), "Gateway#{method}: {p:?}");
+    for side in [MethodReceiver::Instance, MethodReceiver::Class] {
+        for method in ["limit?", "to_entity"] {
+            let p = params(&app, "Gateway", method, side);
+            let total: usize = p.iter().map(size).sum();
+            assert!(total <= 12, "Gateway {method} ({side:?}): {p:?}");
+            // `limit?` passes only keywords; no slot sees the kwargs group.
+            if method == "limit?" {
+                assert!(!p.iter().any(contains_hash), "Gateway {method} ({side:?}): {p:?}");
+            }
         }
     }
+}
+
+#[test]
+fn instance_and_class_defs_of_one_name_keep_their_own_params() {
+    let (app, _) = analyzed();
+    // `self.class.limit?(shop_id: 1, ids:, extra:)` reaches the class
+    // method: three slots, the first an Int. The instance `limit?` is
+    // called with `ids:` only.
+    let class_side = params(&app, "Gateway", "limit?", MethodReceiver::Class);
+    assert_eq!(class_side.len(), 3, "{class_side:?}");
+    assert_eq!(class_side[0], Ty::Int, "{class_side:?}");
+    let instance_side = params(&app, "Gateway", "limit?", MethodReceiver::Instance);
+    assert_eq!(instance_side.len(), 2, "{instance_side:?}");
+    assert!(matches!(&instance_side[0], Ty::Array { .. }), "{instance_side:?}");
+    // `Gateway.to_entity(self, …)` passes the instance positionally;
+    // the keyword-only instance def has no positional slot for it.
+    let class_side = params(&app, "Gateway", "to_entity", MethodReceiver::Class);
+    assert!(
+        matches!(&class_side[0], Ty::Class { id, .. } if id.0.as_str() == "Gateway"),
+        "{class_side:?}"
+    );
+    let instance_side = params(&app, "Gateway", "to_entity", MethodReceiver::Instance);
+    assert!(!instance_side.iter().any(|t| matches!(t, Ty::Class { .. })), "{instance_side:?}");
 }
 
 #[test]
 fn a_return_that_feeds_its_own_argument_settles_on_the_join_of_its_cycle() {
     let a = analyzed_full();
     assert!(a.rounds.production.is_some_and(|n| n <= 8), "{:?}", a.rounds);
-    let [param] = params(&a.app, "PaymentGateway", "without_killswitched_wallets") else {
+    let [param] = params(&a.app, "PaymentGateway", "without_killswitched_wallets", MethodReceiver::Instance) else {
         panic!("one param")
     };
     // The settled type admits every state of the cycle: the precise

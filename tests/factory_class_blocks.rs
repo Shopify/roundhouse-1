@@ -12,7 +12,7 @@
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -317,7 +317,7 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
         ),
     ] {
         survey::activate();
-        let result = ingest_app_from_tree(HashMap::from([(
+        let result = ingest_app_from_tree(HashMap::from_iter([(
             PathBuf::from("app/lib/x.rb"),
             source.as_bytes().to_vec(),
         )]));

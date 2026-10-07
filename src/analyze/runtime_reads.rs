@@ -11,7 +11,7 @@
 //! the name, before code naming it is emitted, as it does a test body's
 //! harness names (`test_constants`).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::expr::{Expr, ExprNode};
@@ -49,7 +49,7 @@ pub(crate) fn ruby_family_runtime_names() -> &'static HashMap<String, &'static s
                 super::test_constants::declared_namespaces(&text)
             })
             .collect();
-        let mut names = HashMap::new();
+        let mut names = HashMap::default();
         for (source, emitted) in RUBY_FAMILY_RUNTIME {
             let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
             for name in super::test_constants::declared_namespaces(&text) {
@@ -115,7 +115,7 @@ fn runtime_aliases() -> &'static HashMap<String, String> {
             }
         }
         let names = ruby_family_runtime_names();
-        let mut aliases = Aliases(Vec::new(), HashMap::new());
+        let mut aliases = Aliases(Vec::new(), HashMap::default());
         for (source, _) in RUBY_FAMILY_RUNTIME {
             let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
             let parsed = ruby_prism::parse(text.as_bytes());

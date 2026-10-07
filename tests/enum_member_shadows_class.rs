@@ -9,7 +9,7 @@
 //! `ApiClient.find` / `.where` / `.find_by` calls failed dispatch
 //! "on GiftCard::SourceType".
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

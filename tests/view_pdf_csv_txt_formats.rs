@@ -7,7 +7,7 @@
 //! same allow-list `.svg.erb` / `.json.erb` already ride, and lower
 //! the same way: `<action>_<format>`, beside the html template.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

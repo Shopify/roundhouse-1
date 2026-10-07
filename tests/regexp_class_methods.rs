@@ -2,7 +2,7 @@
 //! side that string-building code reaches for. The registry carried only
 //! instance methods, so each was `no known method on Regexp`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

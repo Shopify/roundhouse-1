@@ -3,7 +3,7 @@
 //! target DSL replay, or asserted types. Source validation is necessary because
 //! library capture can omit conditionals and failed expression ingests.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::dialect::{LibraryClass, LibraryClassOrigin};
 use crate::expr::Expr;
@@ -235,7 +235,7 @@ fn collect_resource_declarations(
     sources: &[crate::span::SourceFile],
     resources: &HashSet<ClassId>,
 ) -> IngestResult<HashMap<ClassId, ResourceDecl>> {
-    let mut declarations = HashMap::new();
+    let mut declarations = HashMap::default();
     for source in sources {
         // Mutation-only files must be included, not merely declaration files.
         if !resources
@@ -247,7 +247,7 @@ fn collect_resource_declarations(
         let parsed = ruby_prism::parse(source.text.as_bytes());
         let mut guard = SourceGuard {
             resources,
-            counts: HashMap::new(),
+            counts: HashMap::default(),
             mutation: None,
         };
         ruby_prism::Visit::visit(&mut guard, &parsed.node());
@@ -258,7 +258,7 @@ fn collect_resource_declarations(
                 "resource mutation or alias outside its declaration",
             ));
         }
-        let mut direct = HashMap::new();
+        let mut direct = HashMap::default();
         if let Some(program) = parsed.node().as_program_node() {
             for stmt in program.statements().body().iter() {
                 let Some(node) = stmt.as_class_node() else {
@@ -372,7 +372,7 @@ fn validate_resource_graph(
     resources: &HashSet<ClassId>,
     declarations: &HashMap<ClassId, ResourceDecl>,
 ) -> IngestResult<HashMap<ClassId, Vec<Field>>> {
-    let mut flattened = HashMap::new();
+    let mut flattened = HashMap::default();
     for id in resources {
         let Some(decl) = declarations.get(id) else {
             return Err(IngestError::Unsupported {
@@ -392,7 +392,7 @@ fn validate_resource_graph(
             ));
         }
         let mut chain = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut cursor = Some(id);
         while let Some(current) = cursor {
             if !seen.insert(current.clone()) {

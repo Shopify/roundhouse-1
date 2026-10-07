@@ -9,7 +9,7 @@
 //! Exception` and returns `""`, so a missing `fragment` drew every
 //! message with an EMPTY body and no error anywhere.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

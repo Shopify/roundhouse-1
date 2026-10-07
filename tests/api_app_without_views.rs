@@ -4,7 +4,7 @@
 //! `views/comments/_comment` and the rest of the blog's views. The tree
 //! has none of them, so `spin build` stopped at the first one (#164).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

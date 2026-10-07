@@ -5,7 +5,7 @@
 //! into the generic `enum :x mapping must be an array or hash literal`
 //! ledger message. `enum_label_values` now accepts both shapes.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::expr::{ExprNode, Literal};

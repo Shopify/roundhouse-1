@@ -3,7 +3,7 @@
 //! `include` as the bare form, and the marker it records is what makes
 //! `::UrlHelpers.<route>_url` resolve.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -14,7 +14,7 @@ fn self_include_of_the_route_url_helpers_is_the_route_helper_surface() {
     // `self`, one line down from a type-assertion comment. That is the
     // same `include` as the bare form, and the marker it records is what
     // makes `::UrlHelpers.<route>_url` resolve.
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("app/models/url_helpers.rb"),
         br#"module UrlHelpers

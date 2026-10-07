@@ -232,7 +232,7 @@ end
 fn bundled_constant_gate_follows_aliases_but_not_app_defined_classes() {
     for app_defines_class in [false, true] {
         let source = "class ProbesController < ActionController::Base\n  Timeout = Net::OpenTimeout\n  def index\n    Timeout\n  end\nend\n";
-        let mut tree: std::collections::HashMap<_, _> = [
+        let mut tree: roundhouse::det::HashMap<_, _> = [
             (PathBuf::from("config/routes.rb"), b"Rails.application.routes.draw do\nend\n".to_vec()),
             (PathBuf::from("app/controllers/probes_controller.rb"), source.as_bytes().to_vec()),
         ].into_iter().collect();

@@ -20,7 +20,7 @@
 //! writes all three of its declarations inside a concern's `included
 //! do`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

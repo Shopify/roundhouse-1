@@ -21,7 +21,7 @@
 //! first draft of these tests asserted against that list alone and
 //! passed under both ablations.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

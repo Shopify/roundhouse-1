@@ -30,7 +30,7 @@ pub mod local_accumulation;
 pub mod mutation_to_struct_return;
 pub mod while_to_recursion;
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode, LValue, Literal};
@@ -41,7 +41,7 @@ use crate::ty::Ty;
 /// rewritten in place or expanded into several methods (e.g. a loop
 /// method → an entry + a recursive helper).
 pub fn functionalize(classes: Vec<LibraryClass>) -> Vec<LibraryClass> {
-    functionalize_with_external_duals(classes, &std::collections::HashSet::new())
+    functionalize_with_external_duals(classes, &crate::det::HashSet::default())
 }
 
 /// Like [`functionalize`], but seeds each class's dual-return registry
@@ -54,7 +54,7 @@ pub fn functionalize(classes: Vec<LibraryClass>) -> Vec<LibraryClass> {
 /// tuple (always truthy → invalid records still redirect).
 pub fn functionalize_with_external_duals(
     classes: Vec<LibraryClass>,
-    external_duals: &std::collections::HashSet<String>,
+    external_duals: &crate::det::HashSet<String>,
 ) -> Vec<LibraryClass> {
     classes
         .into_iter()
@@ -103,7 +103,7 @@ pub fn functionalize_with_external_duals(
 /// become `Enum.empty?(record.errors)` — the analyzer doesn't type
 /// these ivars in library mode.
 fn collect_field_types(methods: &[crate::dialect::MethodDef]) -> HashMap<String, Ty> {
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let hash_ty = || Ty::Hash { key: Box::new(Ty::Untyped), value: Box::new(Ty::Untyped) };
     let array_ty = || Ty::Array { elem: Box::new(Ty::Untyped) };
     for m in methods {

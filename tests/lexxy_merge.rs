@@ -10,7 +10,7 @@
 //!   Rails mixes in (the class's namesake and its `include`s);
 //! * chained attachment builders and `render_action_text_attachment`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

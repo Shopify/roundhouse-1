@@ -8,7 +8,7 @@
 //! Observe before ingest returns: source-shaped check/editor consumers
 //! deliberately do not run the real post-lowering pipeline themselves.
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::App;
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Model};
@@ -35,7 +35,7 @@ fn ivars(expr: &Expr, out: &mut HashSet<(Span, Symbol)>) {
 }
 
 fn generated_ivars(expr: &Expr, source: &HashSet<(Span, Symbol)>, out: &mut HashSet<Symbol>) {
-    let mut nodes = HashSet::new();
+    let mut nodes = HashSet::default();
     ivars(expr, &mut nodes);
     // Backfilled generated spans are real too. Compare actual original
     // ivar occurrences, not merely FileId or an ivar-name blacklist.
@@ -85,7 +85,7 @@ pub(crate) fn occupied_surfaces(
     requested: &HashSet<ClassId>,
 ) -> HashMap<ClassId, Option<HashSet<Symbol>>> {
     let models: HashMap<_, _> = app.models.iter().map(|m| (m.name.clone(), m)).collect();
-    let mut selected = HashSet::new();
+    let mut selected = HashSet::default();
     let mut pending: Vec<_> = requested.iter().cloned().collect();
     while let Some(id) = pending.pop() {
         if !selected.insert(id.clone()) {
@@ -112,7 +112,7 @@ fn observe(
     // including permit collection. Preserve original whole-app demand.
     let (surfaces, _) = crate::emit::diagnostics::scope(|| {
         let mut probe = app.clone();
-        let mut source_ivars = HashSet::new();
+        let mut source_ivars = HashSet::default();
         crate::lower::for_each_hook_body(&mut probe, &mut |body| ivars(body, &mut source_ivars));
         // Faithful lookup is essential: removing a local accessor here
         // could select an inherited reader of a different type and hide
@@ -123,7 +123,7 @@ fn observe(
             &probe,
             super::Materialization::AccessorProbe(selected),
         );
-        let mut surfaces = HashMap::new();
+        let mut surfaces = HashMap::default();
         collect_surfaces(&classes, &models, &source_ivars, &mut surfaces);
         // Late producers can also yield to user overrides. Observe a
         // generated-only vector and an independent source-bearing one:
@@ -158,11 +158,11 @@ fn inherit_surfaces(
             "../../../runtime/ruby/active_record/base.rb"
         ))
         .expect("framework Base method bodies must ingest");
-        let mut base = HashSet::new();
+        let mut base = HashSet::default();
         for method in methods {
             if method.receiver == MethodReceiver::Instance {
                 base.insert(method.name.clone());
-                generated_ivars(&method.body, &HashSet::new(), &mut base);
+                generated_ivars(&method.body, &HashSet::default(), &mut base);
             }
         }
         base
@@ -170,8 +170,8 @@ fn inherit_surfaces(
     // Every includer also inherits its ancestors' generated ownership.
     // Read the unmerged sets so traversal order cannot affect admission.
     let own = surfaces.clone();
-    let mut models = HashMap::new();
-    let mut ambiguous = HashSet::new();
+    let mut models = HashMap::default();
+    let mut ambiguous = HashSet::default();
     for model in &app.models {
         if models.insert(model.name.clone(), model).is_some() {
             ambiguous.insert(model.name.clone());
@@ -180,7 +180,7 @@ fn inherit_surfaces(
     for model in models.values().filter(|m| requested.contains(&m.name)) {
         let occupied = surfaces.get_mut(&model.name).unwrap();
         occupied.extend(base.iter().cloned());
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut parent = model.parent.as_ref();
         while let Some(id) = parent {
             if !seen.insert(id.clone()) {
@@ -300,12 +300,12 @@ mod tests {
         ]);
         let requested = [ClassId(Symbol::from("Message"))].into_iter().collect();
         let actual = occupied_surfaces(&input, &requested);
-        let mut source_ivars = HashSet::new();
+        let mut source_ivars = HashSet::default();
         crate::lower::for_each_hook_body(&mut input, &mut |body| ivars(body, &mut source_ivars));
         crate::session::analyze_and_lower(&mut input);
         let models = input.models.iter().map(|m| (m.name.clone(), m)).collect();
         let mut emitted = production_classes(&input);
-        let mut expected = HashMap::new();
+        let mut expected = HashMap::default();
         collect_surfaces(&emitted, &models, &source_ivars, &mut expected);
         crate::emit::ruby::apply_model_lowering(&mut emitted, &input);
         collect_surfaces(&emitted, &models, &source_ivars, &mut expected);

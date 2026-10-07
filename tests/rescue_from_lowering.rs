@@ -14,7 +14,7 @@
 //! head :not_found }` over an avatar URL carrying a signed id, and with
 //! the handler gone the signature error was a 500.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

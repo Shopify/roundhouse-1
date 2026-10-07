@@ -11,7 +11,7 @@
 //! Only a key still EQUAL to the concern-derived default moves; an
 //! explicit `foreign_key:` differs from it and is left as written.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

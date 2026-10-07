@@ -17,7 +17,7 @@
 //!     was MISSING it. Minitest's own runner rescues Exception here for
 //!     the same reason.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

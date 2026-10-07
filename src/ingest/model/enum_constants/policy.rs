@@ -74,7 +74,7 @@ impl EnumConstants {
                 .filter(|(_, v)| matches!(v, EnumConstant::Sorbet { .. }))
                 .map(|(name, _)| name.clone())
                 .collect();
-            let mut aliased = std::collections::HashSet::new();
+            let mut aliased = crate::det::HashSet::default();
             for fact in &facts {
                 let SourceFact::Use { subject, context } = fact else {
                     continue;

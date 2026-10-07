@@ -91,7 +91,7 @@
 //! bundle, this one for the subset that names a keyword, and campfire's
 //! two call sites are both in the correct subset.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -128,22 +128,22 @@ pub fn apply_kwrest_forward_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// Full `Param`s rather than names: this pass needs the flattening marks
 /// and the declared defaults, not just the arity.
 fn helper_signatures(app: &App) -> HashMap<Symbol, Vec<Param>> {
-    let mut out: HashMap<Symbol, Vec<Param>> = HashMap::new();
+    let mut out: HashMap<Symbol, Vec<Param>> = HashMap::default();
     // The FIRST library class of a name, and the FIRST method of a name
     // in it, as the linear `find`s this replaced answered, indexed once:
     // a scan per helper was |helpers| * |classes| on full Core.
-    let mut class_index: HashMap<&crate::ident::ClassId, usize> = HashMap::new();
+    let mut class_index: HashMap<&crate::ident::ClassId, usize> = HashMap::default();
     for (i, lc) in app.library_classes.iter().enumerate() {
         class_index.entry(&lc.name).or_insert(i);
     }
     let mut method_index: HashMap<usize, HashMap<&Symbol, &crate::dialect::MethodDef>> =
-        HashMap::new();
+        HashMap::default();
     for (name, owner) in &app.helper_method_index {
         let Some(&ci) = class_index.get(owner) else {
             continue;
         };
         let methods = method_index.entry(ci).or_insert_with(|| {
-            let mut by_name = HashMap::new();
+            let mut by_name = HashMap::default();
             for m in &app.library_classes[ci].methods {
                 by_name.entry(&m.name).or_insert(m);
             }

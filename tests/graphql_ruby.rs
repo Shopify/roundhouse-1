@@ -7,7 +7,7 @@
 //! the schema's root down, and `check` reports a field with nothing
 //! behind it and a `null: false` field that can be nil.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

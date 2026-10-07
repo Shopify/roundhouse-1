@@ -13,7 +13,7 @@
 //! single-column SELECT. Both are spelled `owner.name`, so nothing
 //! syntactic tells them apart.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

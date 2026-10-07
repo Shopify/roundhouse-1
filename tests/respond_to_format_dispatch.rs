@@ -14,7 +14,7 @@
 //! asserting through DISPATCH rather than against the registry map keeps
 //! the test on the behavior an app would hit.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

@@ -13,7 +13,7 @@
 //! tests that asserted on the result passed anyway, because nothing
 //! else checked that the object had been filled in.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

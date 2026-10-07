@@ -15,7 +15,7 @@
 //! but not class methods, so `for_presentation` stayed a bare method
 //! call and `joins(:story)` reached the runtime unresolved (a raise).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

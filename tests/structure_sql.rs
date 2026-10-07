@@ -4,7 +4,7 @@
 //! `docs/data/schema-routes-seeds.md` for how this fits alongside the
 //! schema.rb / migration-fold sources.
 
-use std::collections::{HashMap, HashSet};
+use roundhouse::det::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use roundhouse::ingest::structure_sql::ingest_structure_sql;

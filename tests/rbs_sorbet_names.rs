@@ -12,7 +12,7 @@
 //! The tests observe the type through the one thing a real type does
 //! that an unknown class does not: a call to a method it lacks fails.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

@@ -12,7 +12,7 @@
 //! assigns) cost the app its own builder methods too. The builder and the
 //! model are independent — either one alone is worth binding.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer};

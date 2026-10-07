@@ -29,7 +29,7 @@
 //! Only the assertions the inliner reaches are checked: the same
 //! children it descends into (`for_each_rewritten_child`).
 
-use std::collections::HashSet;
+use crate::det::HashSet;
 
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
@@ -134,7 +134,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for module in &app.test_modules {
         let own = |name: &str| module.defines_instance_method(&app.test_modules, name);
-        let mut walk = Walk { own: &own, seen: HashSet::new(), out: Vec::new() };
+        let mut walk = Walk { own: &own, seen: HashSet::default(), out: Vec::new() };
         if let Some(setup) = &module.setup {
             walk.scan(setup, true);
         }

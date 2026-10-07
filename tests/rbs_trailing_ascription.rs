@@ -1,6 +1,6 @@
 //! RBS trailing types retain typing; `#: as !nil` lowers to T.must's nil check.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};

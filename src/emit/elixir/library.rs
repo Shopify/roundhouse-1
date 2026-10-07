@@ -65,7 +65,7 @@ fn emit_class_body(class: &LibraryClass, v2_name: &str) -> Result<String, String
     // the call-site router which barewords are instance methods (thread
     // record) vs class methods / module functions (don't). `initialize`
     // is the constructor (`new`), not a threaded instance method.
-    let record_methods: std::collections::HashSet<String> = class
+    let record_methods: crate::det::HashSet<String> = class
         .methods
         .iter()
         .filter(|m| {
@@ -97,7 +97,7 @@ fn emit_class_body(class: &LibraryClass, v2_name: &str) -> Result<String, String
     // head take `status:`/`content_type:`/… as defaulted positionals, and
     // a Ruby call passes them as a single trailing options hash that must
     // be spread by name into declaration order.
-    let method_params: std::collections::HashMap<String, Vec<crate::dialect::Param>> = class
+    let method_params: crate::det::HashMap<String, Vec<crate::dialect::Param>> = class
         .methods
         .iter()
         .map(|m| (elixir_fn_name(m.name.as_str()), m.params.clone()))

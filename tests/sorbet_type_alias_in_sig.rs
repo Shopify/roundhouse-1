@@ -10,7 +10,7 @@
 //! are types, and the signatures that read them are gone by then).
 //! This is the other half: reading what they were for.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};

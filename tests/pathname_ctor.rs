@@ -10,7 +10,7 @@
 //! `<head>` of every page, so the bare call stopped the build on a line
 //! that runs on every request.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

@@ -1,6 +1,6 @@
 //! Ruby-family Makefile tests must come from app emission, not scaffold paths.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;

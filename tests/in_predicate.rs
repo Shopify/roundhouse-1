@@ -6,7 +6,7 @@
 //! tests in campfire's `opengraph_metadata_test` died on the first
 //! `content_type.in?(ALLOWED_IMAGE_CONTENT_TYPES)`.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

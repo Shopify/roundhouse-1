@@ -24,7 +24,7 @@
 //! framework Ruby; only the framework's own internal AR plumbing
 //! reaches the per-model `_adapter_*` primitives.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -680,7 +680,7 @@ mod tests {
         );
         let schema = Schema { tables };
 
-        let mut registry = HashMap::new();
+        let mut registry = HashMap::default();
         let mut comment_info = ClassInfo::default();
         comment_info.table = Some(TableRef(Symbol::from("comments")));
         registry.insert(ClassId(Symbol::from("Comment")), comment_info);

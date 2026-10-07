@@ -12,7 +12,7 @@
 //! what Rails means too: whatever consumes it expects the same thing no
 //! matter which subclass supplied it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
@@ -30,7 +30,7 @@ const PARENT: &str = "class NotesController < ApplicationController\n  \
     private\n    def note_params\n      params.require(:note).permit(:body, :tag)\n    end\nend\n";
 
 fn emit(subclass: &str) -> String {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(
         PathBuf::from("app/models/note.rb"),

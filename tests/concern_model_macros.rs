@@ -15,7 +15,7 @@
 //! attachable.variant :thumb, … end`). Variants aren't modeled; the
 //! attachment-existence half still has to expand.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

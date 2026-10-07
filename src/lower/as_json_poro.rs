@@ -72,7 +72,7 @@
 //! `as_json` is outside the two idioms or has a value with no encoding
 //! here (a nested record, a Hash).
 
-use std::collections::{HashMap, HashSet};
+use crate::det::{HashMap, HashSet};
 
 use crate::analyze::ClassInfo;
 use crate::app::App;
@@ -98,7 +98,7 @@ pub fn apply_as_json_synthesis(app: &mut App, registry: &HashMap<ClassId, ClassI
     // the pass was silently inert.
     // The classes given a writer, so the call sites below rewrite for
     // exactly those and no other.
-    let mut written: HashSet<ClassId> = HashSet::new();
+    let mut written: HashSet<ClassId> = HashSet::default();
     for model in &mut app.models {
         if !wanted.contains(&model.name) {
             continue;
@@ -431,7 +431,7 @@ fn as_json_str_method(owner: &ClassId, readers: &[Symbol]) -> MethodDef {
 /// calls plus a payload still rendered as `to_s` — two failures for one
 /// guess.
 fn json_rendered_classes(app: &App) -> HashSet<ClassId> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let known: HashSet<&ClassId> = app
         .library_classes
         .iter()

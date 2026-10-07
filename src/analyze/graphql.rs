@@ -13,7 +13,8 @@
 //!   rules out (a required `belongs_to` on a NOT NULL column with a
 //!   foreign key).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::det::HashMap;
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::dialect::{Association, GraphqlResolution, LibraryClass, MethodDef};

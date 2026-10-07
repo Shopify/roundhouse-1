@@ -5,7 +5,7 @@
 //! NoMethodError. The sidecar must say `singleton(...)`, and only for a
 //! tail made entirely of class constants.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

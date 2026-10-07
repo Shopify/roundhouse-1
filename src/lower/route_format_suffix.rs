@@ -66,8 +66,8 @@ pub fn apply_route_format_suffix_lowering(app: &mut App) {
 }
 
 /// Every `<as_name>_path` / `<as_name>_url` the app's routes define.
-pub(crate) fn route_helper_names(app: &App) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+pub(crate) fn route_helper_names(app: &App) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
     for route in super::routes::flatten_routes(app) {
         if !route.named {
             continue;
@@ -78,12 +78,12 @@ pub(crate) fn route_helper_names(app: &App) -> std::collections::HashSet<String>
     out
 }
 
-fn rewrite(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+fn rewrite(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, helpers));
     rewrite_node(expr, helpers);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &std::collections::HashSet<String>) {
+pub(crate) fn rewrite_node(expr: &mut Expr, helpers: &crate::det::HashSet<String>) {
     let ExprNode::Send { recv: None, method, args, block: None, .. } = &mut *expr.node else {
         return;
     };

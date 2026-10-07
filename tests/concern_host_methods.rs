@@ -14,7 +14,7 @@
 //!    in the other). Nothing is lent; the call stays the gradual escape
 //!    it was.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::diagnose;

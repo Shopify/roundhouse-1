@@ -11,7 +11,7 @@
 //!   rendered as the page — the partial's function with those locals,
 //!   and the layout kept (unlike `render partial:`).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

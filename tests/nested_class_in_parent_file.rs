@@ -9,14 +9,14 @@
 //! both places (`outer_header`) makes the ORDER irrelevant; it cannot
 //! make the COUNT of body-ends one.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
 
 fn emitted(files: &[(&str, &str)]) -> Vec<(String, String)> {
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(
         PathBuf::from("db/schema.rb"),
         b"ActiveRecord::Schema.define do\n  create_table \"posts\", force: :cascade do |t|\n    t.string \"body\", null: false\n  end\nend\n".to_vec(),

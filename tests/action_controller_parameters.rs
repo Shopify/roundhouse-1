@@ -10,7 +10,7 @@
 //! local had no methods at all. The hash conversions on a permitted
 //! `to_h` (`symbolize_keys`) were the same kind of gap on Hash itself.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

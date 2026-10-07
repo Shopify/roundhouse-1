@@ -17,7 +17,7 @@
 //! `lower::broadcasts::stream_name`; these tests pin the controller
 //! side's spelling of it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

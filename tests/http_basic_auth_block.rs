@@ -9,7 +9,7 @@
 //! Generalized at the lookup rather than special-cased here: a block
 //! type that names several parameters spreads them.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

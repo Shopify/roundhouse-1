@@ -468,7 +468,7 @@ fn splice_form_wrapper(
     if !args.iter().all(is_pure_read) {
         return None;
     }
-    let mut binding: std::collections::HashMap<&Symbol, &Expr> = std::collections::HashMap::new();
+    let mut binding: crate::det::HashMap<&Symbol, &Expr> = crate::det::HashMap::default();
     for (i, (name, default)) in w.params.iter().enumerate() {
         match args.get(i) {
             Some(a) => {
@@ -577,7 +577,7 @@ fn is_pure_read(e: &Expr) -> bool {
     }
 }
 
-fn substitute_vars(e: &Expr, binding: &std::collections::HashMap<&Symbol, &Expr>) -> Expr {
+fn substitute_vars(e: &Expr, binding: &crate::det::HashMap<&Symbol, &Expr>) -> Expr {
     if let ExprNode::Var { name, .. } = &*e.node {
         if let Some(replacement) = binding.get(name) {
             return (*replacement).clone();

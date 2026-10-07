@@ -11,7 +11,7 @@
 //! tree the app says so itself — `config.autoload_lib(ignore:)` is
 //! honored, with no heuristic for what merely looks like dev tooling.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

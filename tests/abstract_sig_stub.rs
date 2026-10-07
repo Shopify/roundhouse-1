@@ -12,7 +12,7 @@
 //! so `params.fetch_type(...)` failed with "no known method on nil" in
 //! every class that included the concern (and in the concern itself).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::analyze::{diagnose, DiagnosticKind};

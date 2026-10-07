@@ -21,7 +21,7 @@
 //! same undifferentiated table the `sig/**/*.rbs` reader uses, where
 //! the singleton emit path does not read it.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ident::{ClassId, Symbol};

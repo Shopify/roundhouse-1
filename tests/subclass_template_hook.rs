@@ -11,7 +11,7 @@
 //! the defining controller, the `Views::…` call on the inheritor — and
 //! the second by pinning `:json` on every route row under the scope.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::emit::ruby;

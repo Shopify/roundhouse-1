@@ -11,7 +11,7 @@
 //! A DTO nested in the class that answers it is ordinary Ruby, and it
 //! is where an app with typed value objects puts them.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
 use roundhouse::ingest::ingest_app_from_tree;

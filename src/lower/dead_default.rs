@@ -19,7 +19,7 @@
 //! already ledgers these sites (`unresolved_type` on reads of the
 //! poisoned param), so no new diagnostic is added here.
 
-use std::collections::HashMap;
+use crate::det::HashMap;
 
 use crate::analyze::ClassInfo;
 use crate::app::App;

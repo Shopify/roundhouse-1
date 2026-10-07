@@ -4,7 +4,7 @@
 //! loading the controller and every request to the spinel binary
 //! answered 500 (`undefined method 'params='`, #163).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
