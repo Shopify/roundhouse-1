@@ -62,6 +62,9 @@ struct FileAnswers {
     namespace_definitions: HashSet<Box<str>>,
     class_definitions: HashSet<Box<str>>,
     runtime_namespace_aliases: HashMap<Box<str>, Box<str>>,
+    /// Each `class X < Y` this file writes: X's full name, and the full
+    /// name of the class Ruby's lookup binds `Y` to.
+    superclasses: Vec<(Box<str>, Box<str>)>,
 }
 
 pub(crate) struct ConstResolver {
@@ -71,6 +74,9 @@ pub(crate) struct ConstResolver {
     /// Full names of the classes and modules Ruby's signatures declare,
     /// RBS class aliases included, as the graph resolved them.
     stdlib_namespaces: HashSet<Box<str>>,
+    /// The superclass every `class X < Y` across the sources binds, by
+    /// X's full name; `None` where two definitions disagree.
+    superclasses: HashMap<Box<str>, Option<Box<str>>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -378,7 +384,20 @@ impl ConstResolver {
         let files = crate::timings::phase("rubydex: answers", || collect_answers(&graph, sources));
         let stdlib_namespaces = stdlib_namespaces(&graph);
         drop(graph);
-        Self { files, stdlib_namespaces, source_fingerprint: source_fingerprint(sources) }
+        let mut superclasses: HashMap<Box<str>, Option<Box<str>>> = HashMap::default();
+        for (class, parent) in files.iter().flatten().flat_map(|file| file.superclasses.iter()) {
+            match superclasses.entry(class.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Some(parent.clone()));
+                }
+                Entry::Occupied(mut slot) => {
+                    if slot.get().as_ref() != Some(parent) {
+                        slot.insert(None);
+                    }
+                }
+            }
+        }
+        Self { files, stdlib_namespaces, superclasses, source_fingerprint: source_fingerprint(sources) }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -459,6 +478,15 @@ impl ConstResolver {
     /// resolve against.
     pub(crate) fn has_stdlib_namespace(&self, name: &str) -> bool {
         self.stdlib_namespaces.contains(name)
+    }
+
+    /// The full name of the class that `class <name> < Y` binds `Y` to,
+    /// by Ruby's lookup at the `class` keyword: `class Accounting <
+    /// Fuzzy` inside `module Parser` names `Parser::Fuzzy` when that
+    /// class exists. No answer when no source writes a superclass for
+    /// `name`, when `Y` resolves to no class, or when definitions disagree.
+    pub(crate) fn superclass(&self, name: &str) -> Option<&str> {
+        self.superclasses.get(name)?.as_deref()
     }
 
     /// The full declaration name a written constant resolves to, and
@@ -845,7 +873,9 @@ fn answer_file(
         }
         let target = graph
             .name_id_to_declaration_id(*reference.name_id())
-            .and_then(|id| resolved_constant(graph, *id, class_cache));
+            .copied()
+            .or_else(|| delegator_const_missing(graph, *reference.name_id(), 0))
+            .and_then(|id| resolved_constant(graph, id, class_cache));
         if let Some(ResolvedConstant::Value { declaration, .. }) = &target
             && graph.names().get(reference.name_id())
                 .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None))
@@ -882,6 +912,13 @@ fn answer_file(
                 let full = owner.map_or_else(|| written.to_string(), |owner| format!("{}::{}", hoisted_name(owner.name()), written.as_str()));
                 if matches!(definition, Some(Definition::Class(_) | Definition::Module(_))) {
                     answers.class_definitions.insert(full.clone().into());
+                }
+                if let Some(Definition::Class(class)) = definition
+                    && let Some(reference) = class.superclass_ref()
+                        .and_then(|id| graph.constant_references().get(id))
+                    && let Some(parent) = resolved_namespace(graph, *reference.name_id())
+                {
+                    answers.superclasses.push((full.clone().into(), hoisted_name(parent.name()).into()));
                 }
                 if let Some(Definition::ConstantAlias(alias)) = definition {
                     if let Some(target) = resolved_namespace(graph, *alias.target_name_id())
@@ -1131,6 +1168,48 @@ fn lookup_without(graph: &Graph, str_id: &StringId, nesting: Option<NameId>, ski
         Some(Declaration::Namespace(Namespace::Module(_) | Namespace::Todo(_)))
     );
     if module { ancestors(&object) } else { Lookup::Missing }
+}
+
+/// What Ruby binds an unresolved constant reference to through
+/// `Delegator.const_missing` (stdlib `delegate.rb`: `::Object.const_get(n)`).
+/// `Delegator` descends from `BasicObject`, so a top-level name written
+/// in a subclass's body (`Rational`, `Float::EPSILON` in shopify-money's
+/// `Money::Allocator < SimpleDelegator`) has no binding in the lexical
+/// scopes or the ancestors, and Rubydex rightly leaves it unresolved,
+/// yet Ruby reaches the top-level constant. Only when the chains are
+/// complete and hold no other binding; a qualified reference
+/// (`Float::EPSILON`) is answered when its owner is such a reference.
+fn delegator_const_missing(graph: &Graph, name_id: NameId, depth: u8) -> Option<DeclarationId> {
+    if depth > 8 { return None; }
+    let name = graph.names().get(&name_id)?;
+    let member = |owner: DeclarationId| {
+        let owner = graph.resolve_alias(&owner).unwrap_or(owner);
+        graph.declarations().get(&owner)?.as_namespace()?.member(name.str()).copied()
+    };
+    match name.parent_scope() {
+        ParentScope::None => {
+            let innermost = (*name.nesting())?;
+            let scope = graph.name_id_to_declaration_id(innermost)?;
+            let scope = graph.resolve_alias(scope).unwrap_or(*scope);
+            let delegator = DeclarationId::from("Delegator");
+            let descends = graph.declarations().get(&scope)
+                .and_then(Declaration::as_namespace)
+                .is_some_and(|namespace| namespace.ancestors().iter()
+                    .any(|ancestor| matches!(ancestor, Ancestor::Complete(id) if *id == delegator)));
+            let stdlib_delegator = graph.declarations().get(&delegator)
+                .is_some_and(|declaration| is_runtime_declaration(graph, declaration));
+            if !descends || !stdlib_delegator { return None; }
+            let none = DeclarationId::from("<no declaration>");
+            if !matches!(lookup_without(graph, name.str(), Some(innermost), none), Lookup::Missing) {
+                return None;
+            }
+            member(DeclarationId::from("Object"))
+        }
+        ParentScope::Some(parent) if graph.name_id_to_declaration_id(*parent).is_none() => {
+            member(delegator_const_missing(graph, *parent, depth + 1)?)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,31 @@ pub(super) fn included_block_with_defs<'pr>(call: &ruby_prism::CallNode<'pr>) ->
         .then_some(block)
 }
 
+/// `private attr_reader :a, :b` / `protected attr_writer(:split)` /
+/// `private alias_method :a, :b`: a declaration whose value (the
+/// generated names; `alias_method` returns its new name) is the marker's
+/// argument. Ruby defines the methods with the visibility in effect, then
+/// the marker changes theirs. The inner call, when its names are literal.
+pub(super) fn wrapped_declaration<'pr>(node: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = node.as_call_node()?;
+    if call.receiver().is_some()
+        || call.block().is_some()
+        || !matches!(constant_id_str(&call.name()), "public" | "protected" | "private")
+    {
+        return None;
+    }
+    let args: Vec<_> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let inner = arg.as_call_node()?;
+    let literal = inner.receiver().is_none()
+        && inner.block().is_none()
+        && matches!(constant_id_str(&inner.name()), "attr_reader" | "attr_writer" | "attr_accessor" | "alias_method")
+        && inner.arguments().is_some_and(|args| {
+            args.arguments().iter().all(|arg| symbol_or_string_value(&arg).is_some())
+        });
+    literal.then_some(inner)
+}
+
 pub(super) fn definition<'pr>(node: &Node<'pr>) -> Option<ruby_prism::DefNode<'pr>> {
     if let Some(call) = node.as_call_node() {
         if marker(&call) && call.receiver().is_none() && call.block().is_none() {
@@ -150,7 +175,7 @@ impl Visibility {
         file: &str,
     ) -> IngestResult<Vec<VisibilityOverride>> {
         let offset = statement.location().start_offset();
-        let accessor = statement.as_call_node().is_some_and(|call| {
+        let accessor = wrapped_declaration(statement).or_else(|| statement.as_call_node()).is_some_and(|call| {
             call.receiver().is_none()
                 && matches!(constant_id_str(&call.name()), "attr_reader" | "attr_writer" | "attr_accessor")
         });
@@ -271,6 +296,53 @@ impl Visibility {
         self.values.insert((*position, name), visibility);
         self.changed.insert(key);
         Ok(())
+    }
+
+    /// Record the methods an `attr_*` or `alias_method` call defines here,
+    /// and return their names. An accessor takes the visibility in
+    /// effect; an alias of a method this body defined takes the
+    /// original's. An alias of any other method defines nothing local,
+    /// but still names its new method.
+    fn declare(
+        &mut self,
+        call: &CallNode<'_>,
+        offset: usize,
+        class_side: bool,
+        default: MethodVisibility,
+        file: &str,
+    ) -> IngestResult<Vec<String>> {
+        let mut names = Vec::new();
+        let Some(args) = call.arguments() else { return Ok(names) };
+        let kind = call.name();
+        let kind = constant_id_str(&kind);
+        if kind == "alias_method" {
+            let args: Vec<_> = args.arguments().iter().collect();
+            if let [to, from] = args.as_slice() {
+                if let (Some(to), Some(from)) = (symbol_or_string_value(to), symbol_or_string_value(from)) {
+                    if let Some(positions) = self.known.get(&(class_side, from.clone())) {
+                        let visibility = self.values[&(*positions.last().unwrap(), from)];
+                        self.define(offset, to.clone(), class_side, visibility, file)?;
+                    }
+                    names.push(to);
+                }
+            }
+            return Ok(names);
+        }
+        for arg in args.arguments().iter() {
+            if let Some(attr) = symbol_or_string_value(&arg) {
+                if kind != "attr_writer" {
+                    self.define(offset, attr.clone(), class_side, default, file)?;
+                    self.accessors.insert((class_side, attr.clone()));
+                    names.push(attr.clone());
+                }
+                if kind != "attr_reader" {
+                    self.define(offset, format!("{attr}="), class_side, default, file)?;
+                    self.accessors.insert((class_side, format!("{attr}=")));
+                    names.push(format!("{attr}="));
+                }
+            }
+        }
+        Ok(names)
     }
 
     fn walk_carrier(&mut self, body: Option<Node<'_>>, file: &str) -> IngestResult<()> {
@@ -490,6 +562,13 @@ impl Visibility {
                         ));
                     }
                     inline = Some(visibility);
+                } else if let Some(inner) = wrapped_declaration(&statement) {
+                    // Defined with the visibility in effect, then changed.
+                    let span = Self::span(&statement, file);
+                    for name in self.declare(&inner, offset, class_side, default, file)? {
+                        self.change(name, class_side, visibility, span, file)?;
+                    }
+                    continue;
                 } else if let Some(args) = call.arguments() {
                     let span = Self::span(&statement, file);
                     // `private_class_method [:a, :b]` names the same methods
@@ -703,35 +782,8 @@ impl Visibility {
                 if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
                     self.walk_carrier(block.body(), file)?;
                 }
-            } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor") {
-                if let Some(args) = call.arguments() {
-                    for arg in args.arguments().iter() {
-                        if let Some(attr) = symbol_or_string_value(&arg) {
-                            if name != "attr_writer" {
-                                self.define(offset, attr.clone(), class_side, default, file)?;
-                                self.accessors.insert((class_side, attr.clone()));
-                            }
-                            if name != "attr_reader" {
-                                self.define(offset, format!("{attr}="), class_side, default, file)?;
-                                self.accessors.insert((class_side, format!("{attr}=")));
-                            }
-                        }
-                    }
-                }
-            } else if name == "alias_method" {
-                if let Some(args) = call.arguments() {
-                    let args: Vec<_> = args.arguments().iter().collect();
-                    if let [to, from] = args.as_slice() {
-                        if let (Some(to), Some(from)) =
-                            (symbol_or_string_value(to), symbol_or_string_value(from))
-                        {
-                            if let Some(positions) = self.known.get(&(class_side, from.clone())) {
-                                let visibility = self.values[&(*positions.last().unwrap(), from)];
-                                self.define(offset, to, class_side, visibility, file)?;
-                            }
-                        }
-                    }
-                }
+            } else if matches!(name, "attr_reader" | "attr_writer" | "attr_accessor" | "alias_method") {
+                self.declare(&call, offset, class_side, default, file)?;
             } else if statement.as_def_node().is_none() {
                 Self::reject_dynamic_declarations(node, file)?;
             }

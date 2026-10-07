@@ -72,6 +72,7 @@ impl Diagnostic {
             DiagnosticKind::UndefinedFilterTarget { .. } => "undefined_filter_target",
             DiagnosticKind::GraphqlNullableField { .. } => "graphql_nullable_field",
             DiagnosticKind::InitializerUnsupported { .. } => "initializer_unsupported",
+            DiagnosticKind::FileStatementUnsupported { .. } => "file_statement_unsupported",
             DiagnosticKind::IngestUnsupported { .. } => "ingest_unsupported",
             DiagnosticKind::IngestRefused { .. } => "ingest_unsupported",
         }
@@ -253,6 +254,10 @@ impl Diagnostic {
             ),
             DiagnosticKind::InitializerUnsupported { construct, detail } => format!(
                 "initializer statement `{}` does not run in the emitted app: {detail}",
+                construct.as_str()
+            ),
+            DiagnosticKind::FileStatementUnsupported { construct, detail } => format!(
+                "file-level call `{}` does not run in the emitted app: Ruby runs it when it loads the file, outside every class; the file's classes, modules and constants are carried: {detail}",
                 construct.as_str()
             ),
             DiagnosticKind::IngestUnsupported { detail } => format!(
@@ -559,6 +564,13 @@ pub enum DiagnosticKind {
     /// statement's first line. Default severity `Error`: boot behavior
     /// the emitted program silently lacks is not a faithful compile.
     InitializerUnsupported { construct: Symbol, detail: String },
+    /// A call at the top level of a support file, outside every class
+    /// and module, whose classes ingest carried. Ruby runs it when it
+    /// loads the file, and the emitted app does not
+    /// (`analyze::ingest_coverage`). `construct` is the receiver and
+    /// method (`Money::Converters.register`), `detail` the statement's
+    /// first line. Default severity `Error`.
+    FileStatementUnsupported { construct: Symbol, detail: String },
     /// A construct roundhouse cannot ingest, in a support-dir file
     /// (`lib/`, an engine's `lib/`, `app/helpers/`, …) whose library
     /// classes the isolate-tolerant walk then leaves out of the IR

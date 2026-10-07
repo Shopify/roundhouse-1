@@ -713,6 +713,22 @@ pub enum MethodVisibility {
 /// last change to a name wins, and a later local definition replaces it.
 /// The Ruby-family emitters write the declaration after the class's
 /// methods. Other targets refuse it by name rather than drop the class.
+/// `alias_method :name, :original` (or `alias name original`) of a
+/// method this class defines itself. Ingest copies the original's
+/// `MethodDef` under the new name, so analysis and every target see an
+/// ordinary method; this record says the copy IS an alias. It matters
+/// where the copy calls `super`: Ruby looks that up under the
+/// ORIGINAL name (an aliased `def self.new … super` still reaches the
+/// parent's `new`), while a plain `def name` copy would look up `name`.
+/// The Ruby-family emitters write the native alias in the copy's place;
+/// other targets refuse a copy that calls `super`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MethodAlias {
+    pub name: Symbol,
+    pub receiver: MethodReceiver,
+    pub original: Symbol,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisibilityOverride {
     pub name: Symbol,
@@ -944,6 +960,9 @@ pub struct LibraryClass {
     /// `methods`. See [`VisibilityOverride`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visibility_overrides: Vec<VisibilityOverride>,
+    /// Which of `methods` are alias copies. See [`MethodAlias`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method_aliases: Vec<MethodAlias>,
     /// The entries of `constants` that the source wrote at FILE level,
     /// outside every class and module: Ruby binds those on Object, not
     /// on this class. Ingest carries them on the file's first class so

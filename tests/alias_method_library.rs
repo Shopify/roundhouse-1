@@ -5,7 +5,10 @@
 //! (`alias_method :eql?, :==` on value objects, `alias_method
 //! :connection, :lease_connection`). A copy of the def already walked is
 //! exact, including a later redefinition of the original not reaching
-//! the alias.
+//! the alias, and it is what analysis and the other targets see. The
+//! Ruby family writes the copy as the native alias right after the
+//! original, so a `super` in it keeps the original's name
+//! (`tests/alias_super_cruby.rs`).
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -56,9 +59,10 @@ fn alias_method_copies_the_instance_method_under_the_new_name() {
 end
 "#,
     );
-    assert!(src.contains("def ==(other)"), "{src}");
-    assert!(src.contains("def eql?(other)"), "{src}");
-    assert!(!src.contains("alias_method"), "{src}");
+    let original = src.find("def ==(other)").unwrap_or_else(|| panic!("{src}"));
+    let alias = src.find("alias_method :eql?, :==").unwrap_or_else(|| panic!("{src}"));
+    assert!(original < alias, "the alias follows its original:\n{src}");
+    assert!(!src.contains("def eql?"), "the alias is native, not a copied def:\n{src}");
 }
 
 /// Inside `class << self` the alias is a class method, copied from the
@@ -104,6 +108,8 @@ fn alias_method_in_the_singleton_class_copies_the_class_method() {
 end
 "#,
     );
-    assert!(src.contains("def self.origin"), "{src}");
-    assert!(src.contains("def self.zero"), "{src}");
+    let original = src.find("def self.origin").unwrap_or_else(|| panic!("{src}"));
+    let alias = src.find("class << self\n    alias_method :zero, :origin\n  end").unwrap_or_else(|| panic!("{src}"));
+    assert!(original < alias, "the alias follows its original:\n{src}");
+    assert!(!src.contains("def self.zero"), "the alias is native, not a copied def:\n{src}");
 }

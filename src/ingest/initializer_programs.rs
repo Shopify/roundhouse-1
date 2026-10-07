@@ -416,6 +416,7 @@ fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
         unknown_calls: Vec::new(),
         class_ivar_initializers: Vec::new(),
         visibility_overrides: Vec::new(),
+        method_aliases: Vec::new(),
     }
 }
 

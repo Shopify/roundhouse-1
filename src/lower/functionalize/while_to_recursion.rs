@@ -935,6 +935,7 @@ mod tests {
 
         let methods = transform_method(find_method());
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Finder")),
             is_module: true,
@@ -1029,6 +1030,7 @@ mod tests {
 
         // Render through the real Elixir walker.
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Pat")),
             is_module: true,
@@ -1064,6 +1066,7 @@ mod tests {
         let body = seq(vec![binop_call(table, "length")]);
         let m = method("len", MethodReceiver::Class, &["table"], body);
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("L")),
             is_module: true,
@@ -1107,6 +1110,7 @@ mod tests {
         // Run the full functionalize pipeline (while→recursion, then
         // mutation-threading) and render.
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("S")),
             is_module: false,
@@ -1163,6 +1167,7 @@ mod tests {
             syn(ExprNode::SelfRef),
         ]);
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Sess")),
             is_module: false,
@@ -1243,6 +1248,7 @@ mod tests {
         );
 
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Session")),
             is_module: false,
@@ -1359,6 +1365,7 @@ mod tests {
         let out = transform_method(method("all", MethodReceiver::Class, &[], body));
         assert_eq!(out.len(), 2, "counter-less drain splits into entry + helper");
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("M")),
             is_module: true,

@@ -260,6 +260,7 @@ fn factory_class(
         });
     }
     Ok(LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: owner,
         is_module: false,

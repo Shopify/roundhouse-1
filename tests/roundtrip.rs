@@ -197,6 +197,8 @@ fn tiny_blog_round_trips() {
         sorbet_type_aliases: Vec::new(),
         initializer_constants: Vec::new(),
         railties: Vec::new(),
+        file_statement_gaps: Vec::new(),
+        library_class_reopens: Default::default(),
     };
 
     let json = serde_json::to_string_pretty(&app).expect("serialize");

@@ -2531,6 +2531,7 @@ mod tests {
 
         fn lib(name: &str) -> LibraryClass {
             LibraryClass {
+                method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: ClassId(Symbol::from(name)),
                 is_module: false,
@@ -2658,6 +2659,7 @@ mod tests {
             parenthesized: true,
         }));
         let class = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("ActionController::Base")),
             is_module: false,
@@ -2897,6 +2899,7 @@ mod tests {
             mutates_self: false,
         };
         let vh = LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from("ActionView::ViewHelpers")),
             is_module: true,

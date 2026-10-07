@@ -754,7 +754,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         loaded_support.insert(entry.clone());
                     }
                     support_classes.push((entry.clone(), classes.iter().map(|c| c.name.clone()).collect()));
-                    app.library_classes.extend(classes)
+                    app.library_classes.extend(classes);
+                    report_file_level_calls(&source, &path_str, &mut app);
                 }
                 Err(err) => drop_library_file(&mut app, &path_str, &err),
             }
@@ -1448,6 +1449,7 @@ end
         }
         if !methods.is_empty() {
             app.rails_application = Some(crate::dialect::LibraryClass {
+                method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
                 is_module: false,
@@ -2204,6 +2206,7 @@ end
             && lc.origin.is_none();
         !(bodiless && model_names.contains(lc.name.0.as_str()))
     });
+    app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes);
 
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
@@ -2318,6 +2321,7 @@ end
     crate::lower::rich_text::synthesize_record_model(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     super::test::resolve_test_parents(&mut app);
+    super::library_class::resolve_library_parents(&mut app);
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.
@@ -2361,6 +2365,57 @@ fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
         survey::record_dropped_file(err);
     } else {
         push_ingest_drop(app, path, err);
+    }
+}
+
+/// A call at the top level of a support file, outside every class and
+/// module, runs when Ruby loads the file. shopify-money's
+/// `Money::Converters.register(:iso4217, Iso4217Converter)` is one:
+/// without it, `Money::Converters.for(:iso4217)` raises "unknown
+/// format". Ingest carries the file's declarations and constants but
+/// no other statement, and these calls used to be dropped with no
+/// diagnostic. Each one is now a gap at its own site
+/// (`App::file_statement_gaps`).
+///
+/// Not reported: a receiverless `require` / `require_relative` /
+/// `load` / `autoload`, since loading files is the emitted tree's own
+/// job, and `ActiveSupport.on_load`, which `on_load_reopen` reads and
+/// reports for itself. LIMITATION: only a statement that is itself a
+/// call is reported. A top-level `begin`/`if` wrapping calls, or a
+/// local variable write, is still dropped without a diagnostic.
+fn report_file_level_calls(source: &[u8], path: &str, app: &mut App) {
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return };
+    if result.errors().next().is_some() {
+        return;
+    }
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        let method = super::util::constant_id_str(&call.name()).to_string();
+        let receiver = call.receiver();
+        if receiver.is_none() && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload") {
+            continue;
+        }
+        let receiver_path = receiver.as_ref().and_then(super::util::constant_path_of).map(|p| p.join("::"));
+        if method == "on_load" && receiver_path.as_deref() == Some("ActiveSupport") {
+            continue;
+        }
+        let shown = match &receiver_path {
+            Some(recv) => format!("{recv}.{method}"),
+            None if receiver.is_some() => format!("<expr>.{method}"),
+            None => method,
+        };
+        let location = stmt.location();
+        let span = crate::span::Span {
+            file: super::sources::file_id(path),
+            start: location.start_offset() as u32,
+            end: location.end_offset() as u32,
+        };
+        let text = &source[location.start_offset()..location.end_offset()];
+        let first_line = String::from_utf8_lossy(text).lines().next().unwrap_or_default().trim().to_string();
+        let detail: String = first_line.chars().take(160).collect();
+        app.file_statement_gaps.push(crate::app::InitializerGap { span, construct: shown, detail });
     }
 }
 
@@ -2446,6 +2501,14 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
         }
     }
     collect_config_data(vfs, dir, &dir.join("config"), app);
+    // A gem carried as source reads its own data at run time by a path
+    // under its directory (shopify-money's `Currency::Loader` opens
+    // `config/currency_iso.yml` beside `lib/`), which the emitted tree
+    // keeps: the Ruby family writes `__dir__`-relative paths against the
+    // source layout. Its Ruby is compiled; its data goes verbatim.
+    for (_, gem) in gem_source_dirs(vfs, dir).unwrap_or_default() {
+        collect_gem_data(vfs, dir, &gem, app);
+    }
     // Deterministic order: the emit is byte-compared across runs, and
     // `read_dir` order is explicitly unspecified by the trait.
     app.binary_assets.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2472,6 +2535,24 @@ fn collect_config_data<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &
             continue;
         }
         if entry.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = vfs.read(&entry) else { continue };
+        let rel = entry.strip_prefix(root).unwrap_or(&entry);
+        app.binary_assets.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+    }
+}
+
+/// A carried gem's YAML and JSON data files, at their app-relative
+/// paths. Not its Ruby (compiled) nor anything else in the gem tree.
+fn collect_gem_data<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {
+    let Ok(entries) = vfs.read_dir(dir) else { return };
+    for entry in entries {
+        if vfs.is_dir(&entry) {
+            collect_gem_data(vfs, root, &entry, app);
+            continue;
+        }
+        if !matches!(entry.extension().and_then(|e| e.to_str()), Some("yml" | "yaml" | "json")) {
             continue;
         }
         let Ok(bytes) = vfs.read(&entry) else { continue };
@@ -4317,6 +4398,82 @@ fn map_enum_labels(app: &mut App) {
         }
     }
     crate::lower::for_each_hook_body(app, &mut |expr| map_const_receiver_sites(expr, &tables));
+}
+
+/// One library class per name. Ruby has one class object per name: each
+/// `class Money … end` in another file reopens it and adds to the same
+/// body. Ingest records one `LibraryClass` per declaration, though, and
+/// each one emits to the same `app/models/<name>.rb`. Left like that,
+/// the last file written won. shopify-money opens `class Money` in about
+/// 18 files, mostly as a namespace around a nested class, and the
+/// empty reopen from the last of them replaced the 51-method body from
+/// `money.rb`. No diagnostic was reported.
+///
+/// Members are merged in walk order into the first member's position.
+/// That keeps each file's own order: a later def of a method still
+/// overrides an earlier one, and an alias still follows its original.
+/// A group is left alone when Ruby itself would refuse it or the IR
+/// cannot express one body: a class reopened as a module, two
+/// different superclasses, or a synthesized origin.
+///
+/// Walk order is not always Ruby's load order. Returned is how many
+/// declarations each merged class came from, which the analysis keeps
+/// counting as fragments where the order matters.
+fn merge_library_class_reopens(
+    classes: &mut Vec<LibraryClass>,
+) -> crate::det::HashMap<crate::ident::ClassId, usize> {
+    let mut members: crate::det::HashMap<crate::ident::ClassId, Vec<usize>> = crate::det::HashMap::default();
+    for (index, lc) in classes.iter().enumerate() {
+        members.entry(lc.name.clone()).or_default().push(index);
+    }
+    let mergeable = |group: &[usize]| {
+        let first = &classes[group[0]];
+        let mut parents = group.iter().filter_map(|&i| classes[i].parent.as_ref());
+        let parent = parents.next();
+        group.iter().all(|&i| classes[i].is_module == first.is_module && classes[i].origin.is_none())
+            && parents.all(|p| Some(p) == parent)
+    };
+    let mut absorbed: crate::det::HashMap<usize, usize> = crate::det::HashMap::default();
+    let mut merged: crate::det::HashMap<crate::ident::ClassId, usize> = crate::det::HashMap::default();
+    for (name, group) in &members {
+        if group.len() > 1 && mergeable(group) {
+            merged.insert(name.clone(), group.len());
+            for &later in &group[1..] {
+                absorbed.insert(later, group[0]);
+            }
+        }
+    }
+    if absorbed.is_empty() {
+        return merged;
+    }
+    let mut slots: Vec<Option<LibraryClass>> = std::mem::take(classes).into_iter().map(Some).collect();
+    for index in 0..slots.len() {
+        let Some(&into) = absorbed.get(&index) else { continue };
+        let reopen = slots[index].take().expect("each member is absorbed once");
+        let target = slots[into].as_mut().expect("the first member is never absorbed");
+        if target.parent.is_none() {
+            target.parent = reopen.parent;
+        }
+        for include in reopen.includes {
+            if !target.includes.contains(&include) {
+                target.includes.push(include);
+            }
+        }
+        for column in reopen.nullable_columns {
+            if !target.nullable_columns.contains(&column) {
+                target.nullable_columns.push(column);
+            }
+        }
+        target.methods.extend(reopen.methods);
+        target.class_ivar_initializers.extend(reopen.class_ivar_initializers);
+        target.constants.extend(reopen.constants);
+        target.unknown_calls.extend(reopen.unknown_calls);
+        target.visibility_overrides.extend(reopen.visibility_overrides);
+        target.method_aliases.extend(reopen.method_aliases);
+        target.top_level_constants.extend(reopen.top_level_constants);
+    }
+    *classes = slots.into_iter().flatten().collect();
+    merged
 }
 
 /// Resolve a controller's relative superclass against Ruby's lexical

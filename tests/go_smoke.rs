@@ -136,6 +136,7 @@ fn module_singleton_shape() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("ActiveRecord")),
         is_module: true,
@@ -266,6 +267,7 @@ fn module_singleton_does_not_fire_on_plain_class() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Configurable")),
         is_module: false,
@@ -396,6 +398,7 @@ fn raise_panic_peephole() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Crasher")),
         is_module: false,
@@ -504,6 +507,7 @@ fn time_now_utc_iso8601_peephole() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Clock")),
         is_module: false,
@@ -592,6 +596,7 @@ fn include_array_recv_routes_to_slices_contains() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("ColCheck")),
         is_module: false,
@@ -674,6 +679,7 @@ fn negative_index_rewrites_to_len_minus_n() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Tailer")),
         is_module: false,
@@ -845,6 +851,7 @@ fn class_reflection_rewrites() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Reflect")),
         is_module: false,
@@ -939,6 +946,7 @@ fn bare_new_in_class_method_resolves_to_constructor() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Widget")),
         is_module: false,
@@ -1091,6 +1099,7 @@ fn implicit_self_method_call_resolution() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Worker")),
         is_module: false,
@@ -1189,6 +1198,7 @@ fn each_array_block_shape() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Loop")),
         is_module: false,
@@ -1277,6 +1287,7 @@ fn each_hash_block_shape() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("HashLoop")),
         is_module: false,
@@ -1362,6 +1373,7 @@ fn map_array_block_shape() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Mapper")),
         is_module: false,
@@ -1469,6 +1481,7 @@ fn empty_body_with_nonvoid_return_synthesizes_zero_value() {
     );
 
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Stub")),
         is_module: false,
@@ -1585,6 +1598,7 @@ fn typed_empty_literals_back_propagate() {
     };
 
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("Schema")),
         is_module: false,
@@ -1876,6 +1890,7 @@ fn nil_check_to_comma_ok_rewrites_pair() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("StubFlash")),
         is_module: false,
@@ -1971,6 +1986,7 @@ fn nil_check_to_comma_ok_skips_non_hash_receiver() {
         block_param: None,
     };
     let class = LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from("StubFlash")),
         is_module: false,

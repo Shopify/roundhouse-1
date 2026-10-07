@@ -293,6 +293,36 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_has_constant_decl(m.body())
         || body_has_route_helpers_include(m.body())
         || is_marker_module(m.body())
+        || body_has_constant_receiver_call(m.body())
+}
+
+/// A body statement that calls a method on a constant, or on a
+/// constant's singleton class: `::Liquid::Include.prepend(LiquidIncludeExt)`
+/// and `Block.singleton_class.prepend(LiquidUnknownTagExt)` in Core's
+/// essentials liquid_ext.rb `module Liquid`. Ruby runs it as the body
+/// loads. A namespace module holding one surfaces as a module of its
+/// own, so the call has a body to be carried in (or reported from).
+pub(super) fn is_constant_receiver_call(call: &ruby_prism::CallNode<'_>) -> bool {
+    let mut receiver = call.receiver();
+    while let Some(node) = receiver {
+        if constant_path_segments_strs(&node).is_some() {
+            return true;
+        }
+        match node.as_call_node() {
+            Some(inner) if constant_id_str(&inner.name()) == "singleton_class" && inner.arguments().is_none() && inner.block().is_none() => {
+                receiver = inner.receiver();
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn body_has_constant_receiver_call(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body)
+        .iter()
+        .any(|stmt| stmt.as_call_node().is_some_and(|call| is_constant_receiver_call(&call)))
 }
 
 /// A module that declares nothing but itself: `module Segment; end`, or a
@@ -415,7 +445,11 @@ fn body_has_included_block(body: Option<Node<'_>>) -> bool {
 fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     for stmt in flatten_statements(body) {
-        if super::visibility::definition(&stmt).is_some() {
+        if super::visibility::definition(&stmt).is_some()
+            || super::visibility::wrapped_declaration(&stmt).is_some_and(|call| {
+                constant_id_str(&call.name()).starts_with("attr_")
+            })
+        {
             return true;
         }
         // `if ready; def hidden; end; end` is a declaration this walk

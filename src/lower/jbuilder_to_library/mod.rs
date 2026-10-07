@@ -183,6 +183,7 @@ pub fn jbuilder_signature_classes(views: &[View], app: &App) -> Vec<LibraryClass
         .map(|v| {
             let (module_id, method) = jbuilder_signature_method(v, app);
             LibraryClass {
+                method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: module_id,
                 is_module: true,
@@ -257,6 +258,7 @@ fn build_library_class(view: &View, app: &App, type_body: bool) -> LibraryClass 
     }
 
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: module_id,
         is_module: true,

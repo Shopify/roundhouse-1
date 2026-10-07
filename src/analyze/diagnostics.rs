@@ -382,6 +382,8 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             // Produced by `initializer_coverage::diagnose` as a returned list.
             DiagnosticKind::InitializerUnsupported { .. } => Diagnostic::stub_text(kind),
             // Produced by `ingest_coverage::diagnose` as a returned list.
+            DiagnosticKind::FileStatementUnsupported { .. } => Diagnostic::stub_text(kind),
+            // Produced by `ingest_coverage::diagnose` as a returned list.
             DiagnosticKind::IngestUnsupported { .. } => Diagnostic::stub_text(kind),
             // Stamped by `ingest_statement_list` on a refused statement.
             DiagnosticKind::IngestRefused { .. } => Diagnostic::stub_text(kind),

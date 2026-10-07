@@ -256,6 +256,7 @@ fn library_classes(
 /// first constant is `first`.
 pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(first.clone()),
         is_module: false,
@@ -314,6 +315,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
@@ -501,6 +503,7 @@ pub(super) fn library_class_and_struct_base(
         mut unknown_calls,
         class_initializers,
         visibility_overrides,
+        method_aliases,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
@@ -569,6 +572,7 @@ pub(super) fn library_class_and_struct_base(
     admit_nameless_rest(&mut methods);
     Ok((
         LibraryClass {
+            method_aliases,
             top_level_constants: Vec::new(),
             name: owner,
             is_module: false,
@@ -1353,6 +1357,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         block_param: None,
     });
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: base,
         is_module: false,
@@ -1442,10 +1447,11 @@ pub(super) fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, .. } =
+    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, method_aliases, .. } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
+        method_aliases,
         top_level_constants: Vec::new(),
         name: owner,
         is_module: true,
@@ -1533,6 +1539,8 @@ struct DeclBody {
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
     visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
+    /// Which `methods` are alias copies (see `MethodAlias`).
+    method_aliases: Vec<crate::dialect::MethodAlias>,
     /// An include, constant or captured class-body call came AFTER a
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
@@ -1547,6 +1555,7 @@ impl DeclBody {
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
         self.visibility_overrides.extend(other.visibility_overrides);
+        self.method_aliases.extend(other.method_aliases);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
     }
 
@@ -2045,9 +2054,13 @@ fn walk_decl_body_with_visibility<'pr>(
             reject_conditional_accessor(&statement, file)?;
             continue;
         }
-        let definition = visibility::definition(&statement).map(|d| d.as_node());
+        // `private attr_reader :x` declares like `attr_reader :x`; the
+        // visibility pass already gave the generated methods the marker's.
+        let definition = visibility::definition(&statement)
+            .map(|d| d.as_node())
+            .or_else(|| visibility::wrapped_declaration(&statement).map(|c| c.as_node()));
         let stmt = definition.as_ref().unwrap_or(&statement);
-        if stmt.as_def_node().is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
+        if definition.is_none() && statement.as_call_node().is_some_and(|c| visibility::marker(&c)) {
             // Only bare instance-visibility markers end Ruby's module_function
             // mode. Named and inline forms don't change that lexical mode.
             let call = statement.as_call_node().unwrap();
@@ -2278,6 +2291,11 @@ fn walk_decl_body_with_visibility<'pr>(
                     let mut copy = out.methods[source].clone();
                     copy.name = Symbol::from(to.as_str());
                     visibility.apply(&statement, &mut copy);
+                    out.method_aliases.push(crate::dialect::MethodAlias {
+                        name: copy.name.clone(),
+                        receiver,
+                        original: Symbol::from(from.as_str()),
+                    });
                     out.methods.push(copy);
                     continue;
                 }
@@ -2470,6 +2488,11 @@ fn walk_decl_body_with_visibility<'pr>(
                         let mut copy = out.methods[source].clone();
                         copy.name = Symbol::from(to.as_str());
                         visibility.apply(&statement, &mut copy);
+                        out.method_aliases.push(crate::dialect::MethodAlias {
+                            name: copy.name.clone(),
+                            receiver: copy.receiver,
+                            original: out.methods[source].name.clone(),
+                        });
                         out.methods.push(copy);
                     }
                     // `extend self` — the spelling campfire's
@@ -2574,6 +2597,16 @@ fn walk_decl_body_with_visibility<'pr>(
                 // subclasses at load time (`must explicitly call
                 // self.default_success = …`) rejects the emitted class
                 // outright, so the tree stops there.
+                if let Ok(e) = ingest_expr(&stmt, file) {
+                    out.unknown_calls.push(e);
+                }
+            } else if super::util::is_constant_receiver_call(&call) {
+                // `::Liquid::Include.prepend(LiquidIncludeExt)` in Core's
+                // essentials liquid_ext.rb `module Liquid`: a call on
+                // another class that the body runs as it loads. It was
+                // dropped with no diagnostic. Captured like any class-body
+                // call: replayed where the body is replayed, reported as
+                // dropped everywhere else.
                 if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
@@ -4320,6 +4353,34 @@ fn struct_member_from_expr(call: &Expr) -> Option<SorbetStructMember> {
         }
     }
     Some(SorbetStructMember { name, writable, default })
+}
+
+/// A library class's superclass as Ruby binds it, when it is a class the
+/// app declares. Ingest records the superclass as written, so `class
+/// Accounting < Fuzzy` inside `module Parser` (shopify-money's
+/// `Money::Parser::Accounting`) parented a `Fuzzy` that no class is. The
+/// subclass inherited none of `Money::Parser::Fuzzy`'s methods, and a
+/// `super(..., **options)` had no destination whose keyword ABI could be
+/// checked. Rubydex resolves the written name at the `class` keyword.
+/// This pass takes that answer only when it names a library class or a
+/// model other than the class itself, so a superclass outside the app
+/// keeps its written path.
+pub(super) fn resolve_library_parents(app: &mut crate::App) {
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let known: HashSet<ClassId> = app.library_classes.iter().map(|lc| lc.name.clone())
+        .chain(app.models.iter().map(|model| model.name.clone()))
+        .collect();
+    for lc in app.library_classes.iter_mut().filter(|lc| lc.origin.is_none()) {
+        let Some(written) = &lc.parent else { continue };
+        let Some(resolved) = resolver.superclass(lc.name.0.as_str()) else { continue };
+        if resolved == written.0.as_str().trim_start_matches("::") || resolved == lc.name.0.as_str() {
+            continue;
+        }
+        let resolved = ClassId(Symbol::from(resolved));
+        if known.contains(&resolved) {
+            lc.parent = Some(resolved);
+        }
+    }
 }
 
 /// Expand `const` / `prop` under a base whose ancestry a sidecar says

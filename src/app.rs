@@ -392,6 +392,22 @@ pub struct App {
     /// `ActiveSupport.on_load(:hook)` block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub load_hook_bases: std::collections::BTreeMap<String, String>,
+    /// Top-level calls of support files whose declarations ingest
+    /// carried (`Money::Converters.register(…)` after the class). Ruby
+    /// runs each when it loads the file, and the emitted app does not.
+    /// Each is a `file_statement_unsupported` error at the call
+    /// (`analyze::ingest_coverage`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_statement_gaps: Vec<InitializerGap>,
+    /// How many source declarations ingest merged into each library
+    /// class reopened across declarations (`class X … end` again, in
+    /// this file or another), for classes with more than one. The IR
+    /// holds one class per name; this keeps the fact that its body came
+    /// in pieces whose relative load order Ruby decides. The forwarding
+    /// contracts count them as fragments, and a method that two files
+    /// both define is reported (`analyze::ingest_coverage`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub library_class_reopens: HashMap<crate::ident::ClassId, usize>,
     /// `ActiveSupport.on_load(:hook)` blocks of boot initializers, lifted
     /// onto the Application reopen in boot order
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
@@ -1077,6 +1093,8 @@ impl App {
             framework_load_hooks: Vec::new(),
             class_load_hooks: Vec::new(),
             load_hook_bases: std::collections::BTreeMap::new(),
+            file_statement_gaps: Vec::new(),
+            library_class_reopens: HashMap::default(),
             load_hooks: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),

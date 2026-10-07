@@ -1240,6 +1240,14 @@ impl<'a> SourceContractIndex<'a> {
         index.synthesized.extend(app.controllers.iter().map(|c| c.name.clone()));
         // Test classes are lowered into generated test methods.
         index.synthesized.extend(app.test_modules.iter().map(|t| t.name.clone()));
+        // A class ingest merged from several declarations is still that
+        // many fragments here: their relative load order, which decides
+        // a redefinition or a late include, is not verified.
+        for (name, declarations) in &app.library_class_reopens {
+            if class_owners.contains(name) {
+                *index.fragments.entry(name.clone()).or_default() += declarations.saturating_sub(1);
+            }
+        }
         for model in &app.models {
             index.add_fragment(
                 &model.name,

@@ -1754,6 +1754,15 @@ impl<'a> BodyTyper<'a> {
                 {
                     return Ty::Array { elem: Box::new(unknown()) };
                 }
+                // Kernel's conversion functions answer their class, or
+                // nil under `exception: false` (core `kernel.rbs`, stdlib
+                // `bigdecimal.rbs`). As for `Array`, an app method of the
+                // name has already dispatched and wins.
+                if recv.is_none() && block.is_none() && matches!(dispatched, Ty::Var { .. }) {
+                    if let Some(ty) = kernel_conversion_ty(method, args) {
+                        return ty;
+                    }
+                }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
                 let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
@@ -4673,6 +4682,45 @@ fn is_ivar_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) ->
 /// Nil: comparing nil with a non-nil value raises, so a nil result cannot
 /// occur. A single nilable element (`[maybe].min`) or an all-nilable
 /// literal can still return nil without a comparison error.
+/// What a receiverless Kernel conversion function returns: `Integer(x)`,
+/// `Float(x)`, `String(x)`, `BigDecimal(x)`, `Rational(a, b)` and
+/// `Complex(a, b)`. With an `exception:` keyword the call can answer nil
+/// instead of raising (`Integer("x", exception: false)`); `String` takes
+/// none. Arity outside Ruby's signatures is no answer.
+fn kernel_conversion_ty(method: &Symbol, args: &[Expr]) -> Option<Ty> {
+    let (positional, keywords): (Vec<&Expr>, Vec<&Expr>) = args.iter().partition(|arg| {
+        !matches!(&*arg.node, ExprNode::Hash { kwargs: true, .. })
+    });
+    let exception = match keywords.as_slice() {
+        [] => false,
+        [hash] => match &*hash.node {
+            ExprNode::Hash { entries, .. } => {
+                let only_exception = entries.iter().all(|(key, _)| {
+                    matches!(&*key.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "exception")
+                });
+                if !only_exception || entries.is_empty() { return None; }
+                true
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let class = |name: &str| Ty::Class { id: ClassId(Symbol::from(name)), args: vec![] };
+    let (ty, arity) = match method.as_str() {
+        // `Integer(string, base)`.
+        "Integer" => (Ty::Int, 1..=2),
+        "Float" => (Ty::Float, 1..=1),
+        "String" if !exception => (Ty::Str, 1..=1),
+        // `BigDecimal(value, digits)`.
+        "BigDecimal" => (class("BigDecimal"), 1..=2),
+        "Rational" => (class("Rational"), 1..=2),
+        "Complex" => (class("Complex"), 1..=2),
+        _ => return None,
+    };
+    if !arity.contains(&positional.len()) { return None; }
+    Some(if exception { Ty::Union { variants: vec![ty, Ty::Nil] } } else { ty })
+}
+
 fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args: &[Expr]) -> Option<Ty> {
     if !matches!(method.as_str(), "min" | "max") || !args.is_empty() {
         return None;

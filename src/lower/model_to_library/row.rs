@@ -94,6 +94,7 @@ fn build_row_class(model_name: &ClassId, table: &Table) -> LibraryClass {
 
     let fields: Vec<Symbol> = table.columns.iter().map(|c| c.name.clone()).collect();
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: row_class_id,
         is_module: false,
