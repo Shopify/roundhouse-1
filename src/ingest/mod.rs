@@ -45,6 +45,7 @@ pub mod jbuilder;
 pub mod library_class;
 pub mod channel_callbacks;
 pub mod current_attributes;
+pub mod class_eval_macro;
 pub mod delegate;
 pub mod thread_mattr;
 pub mod model;

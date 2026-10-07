@@ -93,11 +93,13 @@ end
 /// forwards them with `*args, &block`, which the strict targets do not
 /// lower, and a zero-arg forwarder for a method that takes two is an
 /// arity error standing in for a NameError. campfire's
-/// `Messages::AttachmentPresentation` is exactly this shape.
+/// `Messages::AttachmentPresentation` is exactly this shape. The
+/// declaration stays in `unknown_calls` and the IR has no forwarder; only
+/// the Ruby target, which has no argument-forwarding gap, writes the
+/// `(...)` one Rails generates.
 #[test]
 fn a_delegation_called_with_arguments_is_left_alone() {
-    let out = emit(
-        r#"class Filter
+    let helper = r#"class Filter
   attr_reader :context
 
   delegate :link_to, to: :context
@@ -106,9 +108,17 @@ fn a_delegation_called_with_arguments_is_left_alone() {
     link_to "text", "/path"
   end
 end
-"#,
+"#;
+    let app = ingest_app_from_tree(tree(helper)).expect("ingest");
+    let filter = app.library_classes.iter().find(|c| c.name.0.as_str() == "Filter").expect("Filter");
+    assert!(!filter.methods.iter().any(|m| m.name.as_str() == "link_to"), "{:?}", filter.methods);
+    assert!(
+        filter.unknown_calls.iter().any(|c| matches!(&*c.node,
+            roundhouse::expr::ExprNode::Send { method, .. } if method.as_str() == "delegate")),
+        "the declaration stays visible"
     );
-    assert!(!out.contains("def link_to"), "got:\n{out}");
+    let out = emit(helper);
+    assert!(out.contains("def link_to(...)\n    context.link_to(...)\n  end"), "got:\n{out}");
 }
 
 /// DECLINED: an option this pass does not reproduce. Half-expanding a

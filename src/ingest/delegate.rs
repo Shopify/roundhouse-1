@@ -53,6 +53,11 @@
 //! (asset_cloud's includers calling `add_error(msg)`) reaches the target
 //! as it does under Rails. Declarations this pass declines stay declined
 //! there too.
+//!
+//! A declined instance-side declaration stays in `unknown_calls` for the
+//! strict targets, but the Ruby target has no argument-forwarding gap, so
+//! it gets the `(...)` forwarders Rails generates
+//! (`App::ruby_declined_delegate_forwarders`).
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -97,12 +102,15 @@ pub fn lower_delegates(app: &mut crate::App) {
         .collect();
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
-        let (methods, full) = expand_delegates_declining(lc, &nameless_rest);
+        let (methods, full, declined) = expand_delegates_declining(lc, &nameless_rest);
         if !methods.is_empty() {
             generated.push((i, methods));
         }
         if !full.is_empty() {
             app.ruby_delegate_forwarders.entry(lc.name.clone()).or_default().extend(full);
+        }
+        if !declined.is_empty() {
+            app.ruby_declined_delegate_forwarders.entry(lc.name.clone()).or_default().extend(declined);
         }
     }
     for (i, methods) in generated {
@@ -152,14 +160,19 @@ pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef>
 /// of `decline` in `unknown_calls`. The second list is the Ruby target's
 /// version of each zero-arg instance forwarder: the same method forwarding
 /// `(...)`, which is what Rails generates (see
-/// `App::ruby_delegate_forwarders`).
+/// `App::ruby_delegate_forwarders`). The third is the Ruby target's
+/// `(...)` forwarder for each declaration left in `unknown_calls` because
+/// it needs argument forwarding (`App::ruby_declined_delegate_forwarders`).
 fn expand_delegates_declining(
     lc: &mut LibraryClass,
     decline: &crate::det::HashSet<String>,
-) -> (Vec<MethodDef>, Vec<MethodDef>) {
-    let delegates = take_delegate_decls(lc, decline);
+) -> (Vec<MethodDef>, Vec<MethodDef>, Vec<MethodDef>) {
+    let mut declined = Vec::new();
+    let delegates = take_delegate_decls(lc, decline, &mut declined);
+    let declined =
+        if declined.is_empty() { Vec::new() } else { parse_forwarders(&synthesized_source(lc, &declined, true), &declined) };
     if delegates.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), declined);
     }
     let methods = parse_forwarders(&synthesized_source(lc, &delegates, false), &delegates);
     let zero_arg: Vec<&Delegation> = delegates.iter().filter(|d| forwards_zero_arg(d)).collect();
@@ -171,7 +184,7 @@ fn expand_delegates_declining(
             .filter(|m| zero_arg.iter().any(|d| d.name == m.name.as_str()))
             .collect()
     };
-    (methods, full)
+    (methods, full, declined)
 }
 
 /// The shape `synthesized_source` writes as a zero-arg forwarder: an
@@ -205,8 +218,14 @@ fn parse_forwarders(src: &str, delegates: &[Delegation]) -> Vec<MethodDef> {
 }
 
 /// Consume the declarations this pass can reproduce EXACTLY, leaving
-/// every other shape in `unknown_calls` rather than half-expanded.
-fn take_delegate_decls(lc: &mut LibraryClass, decline: &crate::det::HashSet<String>) -> Vec<Delegation> {
+/// every other shape in `unknown_calls` rather than half-expanded. A
+/// declaration of a reproducible shape left there only because it needs
+/// argument forwarding also goes to `declined`, for the Ruby target.
+fn take_delegate_decls(
+    lc: &mut LibraryClass,
+    decline: &crate::det::HashSet<String>,
+    declined: &mut Vec<Delegation>,
+) -> Vec<Delegation> {
     let called_with_args = names_called_with_arguments(lc);
     let mut out = Vec::new();
     lc.unknown_calls.retain(|call| {
@@ -268,24 +287,20 @@ fn take_delegate_decls(lc: &mut LibraryClass, decline: &crate::det::HashSet<Stri
         // `self.behavior = v` calling `behavior=` WITH an argument is
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
-        if !class_side
-            && names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str()))
-        {
-            return true;
-        }
-        if !class_side && names.iter().any(|n| decline.contains(n.as_str())) {
-            return true;
-        }
+        let needs_forwarding = !class_side
+            && (names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str()))
+                || names.iter().any(|n| decline.contains(n.as_str())));
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
+        let into = if needs_forwarding { &mut *declined } else { &mut out };
         for m in names {
             let name = if prefix {
                 format!("{}_{}", target.as_str(), m.as_str())
             } else {
                 m.as_str().to_string()
             };
-            out.push(Delegation { method: m, target: target.clone(), name, allow_nil, class_side, file: file.clone() });
+            into.push(Delegation { method: m, target: target.clone(), name, allow_nil, class_side, file: file.clone() });
         }
-        false
+        needs_forwarding
     });
     out
 }
@@ -433,7 +448,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior, :behavior=, to: :deprecator\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc, &Default::default());
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
         assert_eq!(delegates.len(), 2);
         assert!(lc.unknown_calls.is_empty(), "the declaration should be consumed");
 
@@ -456,7 +471,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior=, to: :deprecator, prefix: true\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc, &Default::default());
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
         assert_eq!(delegates.len(), 1);
         assert_eq!(delegates[0].name, "deprecator_behavior=", "prefix composes ahead of the delegated name, trailing `=` intact");
 
@@ -473,7 +488,7 @@ mod tests {
         let mut lc = library_class(
             "class Deprecation\n  attr_accessor :deprecator\n\n  delegate :behavior=, to: :deprecator, allow_nil: true\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc, &Default::default());
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
         assert_eq!(delegates.len(), 1);
         assert!(delegates[0].allow_nil);
 
@@ -503,7 +518,7 @@ mod tests {
         let mut lc = library_class(
             "class Store\n  attr_accessor :backing\n\n  delegate :[]=, to: :backing\nend\n",
         );
-        let delegates = take_delegate_decls(&mut lc, &Default::default());
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
         assert_eq!(delegates.len(), 1);
         let methods = synthesized_methods(&lc, &delegates);
         let setter = methods
@@ -563,7 +578,7 @@ mod tests {
             mutates_self: false,
         });
 
-        let delegates = take_delegate_decls(&mut lc, &Default::default());
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
         assert_eq!(
             delegates.len(),
             1,
