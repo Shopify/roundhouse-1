@@ -81,7 +81,9 @@ fn emitted_constants_match_native_ruby() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
-fn survey(source: &str) -> String {
+/// Plain `check` (no `--continue`): the refusal is an
+/// `ingest_unsupported` error at the read, not a silently dropped file.
+fn check(source: &str) -> String {
     let root = std::env::temp_dir().join(format!(
         "roundhouse-body-locals-refusal-{}-{}",
         std::process::id(),
@@ -98,7 +100,7 @@ fn survey(source: &str) -> String {
         std::fs::write(file, text).unwrap();
     }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["check", "--continue"])
+        .arg("check")
         .arg(&root)
         .output()
         .unwrap();
@@ -111,7 +113,7 @@ fn an_observable_local_is_refused_by_name() {
     for (source, reason) in [
         (
             "module Podish\n  module Registry\n    store = Object.new\n    DEFAULT = store\n  end\nend\n",
-            "class-body local `store` holds a value that is not a closure-free lambda or an immediate literal",
+            "registry.rb:4:15: error[ingest_unsupported]: class-body local `store` holds a value that is not a closure-free lambda or an immediate literal",
         ),
         (
             "module Podish\n  module Registry\n    base = 2\n    scale = ->(x) { x * base }\n    TWO = scale.call(1)\n  end\nend\n",
@@ -126,7 +128,8 @@ fn an_observable_local_is_refused_by_name() {
             "class-body local `n` is assigned more than once",
         ),
     ] {
-        let text = survey(source);
+        let text = check(source);
         assert!(text.contains(reason), "missing `{reason}` in:\n{text}");
+        assert!(text.contains("error[ingest_unsupported]"), "not an ingest_unsupported error:\n{text}");
     }
 }

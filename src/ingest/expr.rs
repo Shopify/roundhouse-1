@@ -19,7 +19,7 @@ pub fn ingest_expr(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     // substitute a `Literal::Nil` placeholder so the surrounding
     // ingester keeps going. Errors are recorded into the per-thread
     // collector for the post-run punch list. See `survey.rs`.
-    match ingest_expr_strict(node, file) {
+    match ingest_expr_strict(node, file).map_err(|err| super::error_site::at(err, node)) {
         Ok(e) => Ok(e),
         Err(err) if super::survey::is_active() => {
             super::survey::record(&err);
