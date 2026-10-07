@@ -2134,7 +2134,7 @@ fn model_body_names(models: &[Model]) -> crate::det::HashSet<Symbol> {
             match item {
                 ModelBodyItem::Method { method, .. } => walk(&method.body, &mut out),
                 ModelBodyItem::Scope { scope, .. } => walk(&scope.body, &mut out),
-                ModelBodyItem::Unknown { expr, .. } => walk(expr, &mut out),
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => walk(expr, &mut out),
                 ModelBodyItem::Callback { callback, .. } => {
                     out.extend(callback.targets.iter().cloned());
                     if let Some(c) = &callback.condition {

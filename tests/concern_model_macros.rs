@@ -261,12 +261,20 @@ fn unsupported_accessor_shapes_are_reported_only_for_includers() {
 
 /// Receiver-bearing calls and unrelated DSL keep their existing path;
 /// recognizing attr_* must not start treating arbitrary calls as macros.
+/// Each is carried to the includer as the plain class-body statement it
+/// is (Rails runs the block there), never as an accessor or a macro.
 #[test]
 fn unrelated_calls_are_not_accessor_candidates() {
+    use roundhouse::dialect::ModelBodyItem;
     for declaration in ["self.attr_accessor :scratch", "Other.attr_accessor :scratch", "unknown_macro :scratch"] {
         let source = format!("module DraftState\n  extend ActiveSupport::Concern\n  included {{ {declaration} }}\nend\n");
         let (items, enums) = roundhouse::ingest::library_class::ingest_concern_model_items(source.as_bytes(), "draft_state.rb");
-        assert!(items.is_empty(), "must not claim unrelated {declaration}: {items:?}");
+        let carried: Vec<&ModelBodyItem> = items.iter().flat_map(|(_, items)| items).collect();
+        assert!(
+            matches!(carried.as_slice(), [ModelBodyItem::Unknown { expr, .. }]
+                if &source[expr.span.start as usize..expr.span.end as usize] == declaration),
+            "must not claim unrelated {declaration}, only carry the statement: {items:?}"
+        );
         assert!(enums.is_empty());
     }
 }

@@ -2312,6 +2312,7 @@ end
     splice_concerns_into_models(&mut app);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
+    claim_class_attribute_writes(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
     qualify_model_class_method_ar_calls(&mut app);
@@ -2681,6 +2682,17 @@ fn splice_concerns_into_models(app: &mut App) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
+    // Every constant the app defines, fully qualified: a carried
+    // statement's bare constant resolves in the concern's lexical scope.
+    let mut defined: crate::det::HashSet<String> = crate::det::HashSet::default();
+    for lc in &app.library_classes {
+        defined.insert(lc.name.0.as_str().to_string());
+        for (name, _) in &lc.constants {
+            defined.insert(format!("{}::{}", lc.name.0.as_str(), name.as_str()));
+        }
+    }
+    defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
+
     for model in &mut app.models {
         // Concerns already spliced into this model. A spliced item may
         // itself be an `include` (a concern's `included do include
@@ -2725,7 +2737,11 @@ fn splice_concerns_into_models(app: &mut App) {
                 .filter(|id| spliced.insert((*id).clone()))
                 .filter_map(|id| app.concern_model_items.get(id).map(|items| (id, items)))
                 .flat_map(|(id, items)| {
-                    items.iter().map(|item| rehome_default_fk(item, id, &model_name))
+                    let class_attributes = super::class_attribute::declared_names(items);
+                    let (model_name, defined) = (&model_name, &defined);
+                    items.iter().map(move |item| {
+                        rehome_carried(rehome_default_fk(item, id, model_name), id, model_name, &class_attributes, defined)
+                    })
                 })
                 .collect();
             if items.is_empty() {
@@ -2734,6 +2750,161 @@ fn splice_concerns_into_models(app: &mut App) {
             }
             model.body.splice(i + 1..i + 1, items);
             i += 1;
+        }
+    }
+}
+
+/// A carried `included do` statement or `class_attribute` def, as it
+/// stands in the includer. A `class_attribute` def (one of the
+/// concern's `class_attributes`, synthesized) belongs to the includer,
+/// as Rails defines it there. Rails runs the
+/// block with the concern's lexical scope, so a bare constant the concern
+/// can see (`Gate` in `MutationGuard`, meaning `MutationGuard::Gate`) is
+/// written qualified; in the includer's body it would resolve elsewhere.
+fn rehome_carried(
+    mut item: crate::dialect::ModelBodyItem,
+    concern: &crate::ident::ClassId,
+    model: &crate::ident::ClassId,
+    class_attributes: &[crate::ident::Symbol],
+    defined: &crate::det::HashSet<String>,
+) -> crate::dialect::ModelBodyItem {
+    use crate::dialect::ModelBodyItem;
+    use crate::expr::{Expr, ExprNode};
+    fn qualify(e: &mut Expr, scopes: &[String], defined: &crate::det::HashSet<String>) {
+        if let ExprNode::Const { path } = &mut *e.node
+            && let Some(first) = path.first()
+            && !first.as_str().is_empty()
+        {
+            let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            if let Some(scope) = scopes.iter().find(|scope| defined.contains(&format!("{scope}::{written}"))) {
+                let mut full: Vec<crate::ident::Symbol> =
+                    scope.split("::").map(crate::ident::Symbol::from).collect();
+                full.append(path);
+                *path = full;
+            }
+            return;
+        }
+        e.node.for_each_child_mut(&mut |child| qualify(child, scopes, defined));
+    }
+    match &mut item {
+        ModelBodyItem::Method { method, .. }
+            if method.name_span.is_synthetic()
+                && class_attributes.iter().any(|n| {
+                    method.name.as_str().trim_end_matches(['=', '?']) == n.as_str()
+                }) =>
+        {
+            // A wrapped writer names its owner, the class the captured
+            // writer was bound to: the includer
+            // (`class_attribute::wrapped_writer`).
+            fn rebind(e: &mut Expr, concern: &[crate::ident::Symbol], model: &[crate::ident::Symbol]) {
+                if let ExprNode::Const { path } = &mut *e.node {
+                    if path.as_slice() == concern {
+                        *path = model.to_vec();
+                    }
+                    return;
+                }
+                e.node.for_each_child_mut(&mut |child| rebind(child, concern, model));
+            }
+            let path = |id: &crate::ident::ClassId| -> Vec<crate::ident::Symbol> {
+                id.0.as_str().split("::").map(crate::ident::Symbol::from).collect()
+            };
+            rebind(&mut method.body, &path(concern), &path(model));
+            method.enclosing_class = Some(model.0.clone())
+        }
+        ModelBodyItem::ClassBody { expr, .. } | ModelBodyItem::Unknown { expr, .. } => {
+            // Not the concern itself: the includer reaches the concern's
+            // own constants through its ancestry, as Rails does.
+            let segments: Vec<&str> = concern.0.as_str().split("::").collect();
+            let scopes: Vec<String> = (1..segments.len()).rev().map(|n| segments[..n].join("::")).collect();
+            qualify(expr, &scopes, defined);
+        }
+        _ => {}
+    }
+    item
+}
+
+/// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a
+/// `class_attribute` declares: the class's own, one an included concern
+/// carried in, or an ancestor's. A write through the class-side writer,
+/// run in the class body (`ModelBodyItem::ClassBody`, or a library
+/// class's initializers).
+fn claim_class_attribute_writes(app: &mut App) {
+    use crate::dialect::ModelBodyItem;
+    use crate::ident::ClassId;
+    // Each class's own declarations, models and library classes alike; a
+    // write may name one an ancestor declares (`ProPlan < Plan` writing
+    // `self.tier = :pro`).
+    // A class reopened in several bodies (several library classes of
+    // one name) declares the union of theirs.
+    let mut own: crate::det::HashMap<ClassId, (Option<ClassId>, Vec<Symbol>)> = crate::det::HashMap::default();
+    let bodies = app
+        .models
+        .iter()
+        .map(|m| (m.name.clone(), m.parent.clone(), super::class_attribute::declared_names(&m.body)))
+        .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| {
+            let names = lc
+                .class_ivar_initializers
+                .iter()
+                .filter_map(|e| super::class_attribute::seeded_name(e).map(Symbol::from))
+                .collect();
+            (lc.name.clone(), lc.parent.clone(), names)
+        }));
+    for (name, parent, names) in bodies {
+        let entry = own.entry(name).or_insert_with(|| (None, Vec::new()));
+        if entry.0.is_none() {
+            entry.0 = parent;
+        }
+        entry.1.extend(names);
+    }
+    let declared_for = |name: &ClassId| -> crate::det::HashSet<String> {
+        let mut declared = crate::det::HashSet::default();
+        let mut at = Some(name.clone());
+        let mut seen: Vec<ClassId> = Vec::new();
+        while let Some(id) = at.take() {
+            if seen.contains(&id) {
+                break;
+            }
+            let Some((parent, names)) = own.get(&id) else { break };
+            declared.extend(names.iter().map(|n| n.as_str().to_string()));
+            seen.push(id);
+            at = parent.clone();
+        }
+        declared
+    };
+    for model in &mut app.models {
+        let declared = declared_for(&model.name);
+        if declared.is_empty() {
+            continue;
+        }
+        for item in &mut model.body {
+            let ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else { continue };
+            if super::class_attribute::self_write(expr).is_some_and(|name| declared.contains(name)) {
+                *item = ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+        }
+    }
+    // A library class's own writes were claimed by its body walk; these
+    // name an inherited declaration. A class-side ivar write like the
+    // rest of its initializers, in source order with them.
+    for lc in &mut app.library_classes {
+        if lc.is_module {
+            continue;
+        }
+        let declared = declared_for(&lc.name);
+        if declared.is_empty() {
+            continue;
+        }
+        let (writes, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut lc.unknown_calls)
+            .into_iter()
+            .partition(|e| super::class_attribute::self_write(e).is_some_and(|name| declared.contains(name)));
+        lc.unknown_calls = rest;
+        if !writes.is_empty() {
+            lc.class_ivar_initializers.extend(writes);
+            lc.class_ivar_initializers.sort_by_key(|e| e.span.start);
         }
     }
 }
@@ -4494,7 +4665,7 @@ fn map_enum_labels(app: &mut App) {
             match item {
                 ModelBodyItem::Method { method, .. } => map_in_subtree(&mut method.body, &table),
                 ModelBodyItem::Scope { scope, .. } => map_in_subtree(&mut scope.body, &table),
-                ModelBodyItem::Unknown { expr, .. } => map_in_subtree(expr, &table),
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => map_in_subtree(expr, &table),
                 _ => {}
             }
         }
@@ -4881,7 +5052,7 @@ fn scan_type_literals(
         match item {
             ModelBodyItem::Scope { scope, .. } => visit(&scope.body),
             ModelBodyItem::Method { method, .. } => visit(&method.body),
-            ModelBodyItem::Unknown { expr, .. } => visit(expr),
+            ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => visit(expr),
             ModelBodyItem::Association { assoc, .. } => {
                 if let Association::HasMany { scope: Some(s), .. } = assoc {
                     visit(s);

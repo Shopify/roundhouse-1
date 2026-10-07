@@ -158,7 +158,7 @@ pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
                         });
                     }
                 }
-                ModelBodyItem::Unknown { expr, .. } => {
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => {
                     walk_postorder(expr, &mut |e| {
                         super::attribute_aliases::rewrite_node(e, &models, true);
                     });
@@ -228,7 +228,7 @@ pub fn apply_fused_pre_tag_rewrites(app: &mut App) {
                 crate::dialect::ModelBodyItem::Method { method, .. } => {
                     walk_postorder(&mut method.body, &mut super::sum_symbol::rewrite_node);
                 }
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => {
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => {
                     walk_postorder(expr, &mut super::sum_symbol::rewrite_node);
                 }
                 _ => {}

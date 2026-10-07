@@ -547,7 +547,9 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
 }
 
 /// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object.
+/// ivar writes emitted once on the model class object, then the body's
+/// `ModelBodyItem::ClassBody` statements in source order (class_attribute
+/// seeds, class-side writes, carried `included do` statements).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
     model
         .class_attr_defaults
@@ -561,7 +563,16 @@ fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
                 },
             )
         })
+        .chain(class_body_statements(model).cloned())
         .collect()
+}
+
+/// The model body's `ModelBodyItem::ClassBody` statements, in order.
+pub(crate) fn class_body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
+    model.body.iter().filter_map(|item| match item {
+        crate::dialect::ModelBodyItem::ClassBody { expr, .. } => Some(expr),
+        _ => None,
+    })
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -605,6 +616,46 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
 /// dynamic targets often run fine without it. The skip-list below must
 /// stay in sync with the claiming passes — each entry names the pass
 /// that consumes the shape.
+/// A short spelling of a receiver for a diagnostic: `Registry`,
+/// `relation_delegate_class(…)`, `<expression>`.
+pub(crate) fn receiver_label(recv: &Expr) -> String {
+    match &*recv.node {
+        ExprNode::Const { path } => path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
+        ExprNode::Send { recv: None, method, args, .. } if args.is_empty() => method.as_str().to_string(),
+        ExprNode::Send { recv: None, method, .. } => format!("{}(…)", method.as_str()),
+        ExprNode::Send { recv: Some(inner), method, .. } => format!("{}.{}", receiver_label(inner), method.as_str()),
+        _ => "<expression>".to_string(),
+    }
+}
+
+/// The name a dropped class-body statement is reported under: the
+/// method it calls (`include`, `Registry.register`), or the writer an
+/// attribute assignment calls (`x=`, `Registry.count=`; a `Foo.x ||= v`
+/// ingests as `Foo.x || Foo.x = v`, named by its write).
+pub(crate) fn dropped_statement_name(call: &Expr) -> String {
+    use crate::expr::LValue;
+    match &*call.node {
+        ExprNode::Send { recv, method, .. } => match recv.as_ref() {
+            None => method.as_str().to_string(),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => method.as_str().to_string(),
+            Some(r) => format!("{}.{}", receiver_label(r), method.as_str()),
+        },
+        ExprNode::Assign { target: LValue::Attr { recv, name }, .. }
+        | ExprNode::OpAssign { target: LValue::Attr { recv, name }, .. } => {
+            let written = format!("{}=", name.as_str().trim_end_matches('='));
+            if matches!(&*recv.node, ExprNode::SelfRef) {
+                written
+            } else {
+                format!("{}.{written}", receiver_label(recv))
+            }
+        }
+        ExprNode::BoolOp { right, .. } if matches!(&*right.node, ExprNode::Assign { .. }) => {
+            dropped_statement_name(right)
+        }
+        other => format!("<{}>", other.kind_str()),
+    }
+}
+
 fn report_unclaimed_unknowns(model: &Model) {
     use crate::diagnostic::{Diagnostic, Severity};
     use crate::expr::LValue;
@@ -615,19 +666,56 @@ fn report_unclaimed_unknowns(model: &Model) {
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;
         }
+        // `self.x += v`, `Registry.count ||= 0`, `Registry.x = v`: a
+        // class-body attribute write no lowering claimed (a
+        // `class_attribute` one is a `ClassBody` item).
+        let attr_write = match &*expr.node {
+            ExprNode::OpAssign { target: LValue::Attr { .. }, .. } => true,
+            ExprNode::Assign { target: LValue::Attr { recv, .. }, .. } => !matches!(&*recv.node, ExprNode::SelfRef),
+            ExprNode::BoolOp { right, .. } => matches!(&*right.node, ExprNode::Assign { target: LValue::Attr { .. }, .. }),
+            _ => false,
+        };
+        if attr_write {
+            let written = dropped_statement_name(expr);
+            let mut d = Diagnostic::unsupported(
+                expr.span,
+                None,
+                written.as_str(),
+                format!("model class-body write on `{}` not lowered; it is dropped", model.name.0.as_str()),
+            );
+            d.severity = Severity::Warning;
+            crate::emit::diagnostics::push(d);
+            continue;
+        }
         let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else {
             continue;
         };
         let name = method.as_str();
         if let Some(recv) = recv {
-            // Class-body writes are sends too, and dropping an unclaimed
-            // setting must report just like dropping a receiver-less DSL.
-            if !matches!(&*recv.node, ExprNode::SelfRef)
-                || !name.ends_with('=')
-                || matches!(name, "==" | "!=" | "<=" | ">=" | "===")
-            {
+            // A call on another object (`relation_delegate_class(
+            // ActiveRecord::Relation).include(M)`, `Registry.add(self)`):
+            // the model's emitted body replays none of these, so each is
+            // named where it is dropped.
+            if !matches!(&*recv.node, ExprNode::SelfRef) {
+                let construct = format!("{}.{name}", receiver_label(recv));
+                let detail = if receiver_label(recv) == "relation_delegate_class(…)" {
+                    format!(
+                        "`relation_delegate_class` on `{}` not lowered; the runtime has no per-model relation \
+                         class to extend, so the statement is dropped",
+                        model.name.0.as_str()
+                    )
+                } else {
+                    format!("model class-body call on `{}` not lowered; it is dropped", model.name.0.as_str())
+                };
+                let mut d = Diagnostic::unsupported(expr.span, None, construct.as_str(), detail);
+                d.severity = Severity::Warning;
+                crate::emit::diagnostics::push(d);
                 continue;
             }
+            // Class-body writes are sends too, and dropping an unclaimed
+            // setting must report just like dropping a receiver-less DSL.
+            // A `self.` call of anything else reports as the receiverless
+            // call it is.
             // Literal table settings are consumed by ingest::model's
             // explicit_class_setting; dynamic values remain unsupported.
             if matches!(name, "table_name=" | "table_name_prefix=")
@@ -2159,6 +2247,12 @@ fn type_method_body(
             for (name, ty) in self::associations::assoc_cache_ivar_bindings(m) {
                 ctx.ivar_bindings.insert(name, ty);
             }
+        }
+    }
+    if let Some(m) = model {
+        for name in crate::ingest::class_attribute::declared_names(&m.body) {
+            ctx.ivar_bindings.entry(crate::ingest::class_attribute::storage_ivar(&name)).or_insert(Ty::Untyped);
+            ctx.ivar_bindings.entry(name).or_insert(Ty::Untyped);
         }
     }
     // Opt-in to `recv: Some(SelfRef)` rewriting on bare Sends —

@@ -26,7 +26,7 @@ pub fn apply_parameterize_grounding(app: &mut App) {
                 // lowered to a hook method later, so it is still this
                 // item kind here, and skipping it left the call
                 // unresolved on spinel.
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => rewrite(expr),
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => rewrite(expr),
                 _ => {}
             }
         }

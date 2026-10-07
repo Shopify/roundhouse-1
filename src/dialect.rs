@@ -248,6 +248,21 @@ pub enum ModelBodyItem {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         leading_blank_line: bool,
     },
+    /// A statement that runs in the class body at load, carried as
+    /// written: the seed `@__class_attr_x = default` a `class_attribute`
+    /// declaration makes, a class-body write through a class-side
+    /// attribute writer (`self.x = v`), and the statements of an
+    /// ActiveSupport::Concern's `included do` block that no DSL lowering
+    /// claims (spliced into each includer after its `include`). The
+    /// model lowering emits them into the class body in this order
+    /// (`LibraryClass::class_ivar_initializers`).
+    ClassBody {
+        expr: Expr,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        leading_comments: Vec<Comment>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        leading_blank_line: bool,
+    },
 }
 
 impl ModelBodyItem {
@@ -261,7 +276,7 @@ impl ModelBodyItem {
             | Self::Callback { span, .. } => *span,
             Self::Scope { scope, .. } => scope.body.span,
             Self::Method { method, .. } => method.body.span,
-            Self::Unknown { expr, .. } => expr.span,
+            Self::Unknown { expr, .. } | Self::ClassBody { expr, .. } => expr.span,
         }
     }
 
@@ -274,7 +289,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_comments, .. }
             | Self::Callback { leading_comments, .. }
             | Self::Method { leading_comments, .. }
-            | Self::Unknown { leading_comments, .. } => leading_comments,
+            | Self::Unknown { leading_comments, .. }
+            | Self::ClassBody { leading_comments, .. } => leading_comments,
         }
     }
 
@@ -285,7 +301,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_comments, .. }
             | Self::Callback { leading_comments, .. }
             | Self::Method { leading_comments, .. }
-            | Self::Unknown { leading_comments, .. } => leading_comments,
+            | Self::Unknown { leading_comments, .. }
+            | Self::ClassBody { leading_comments, .. } => leading_comments,
         }
     }
 
@@ -296,7 +313,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_blank_line, .. }
             | Self::Callback { leading_blank_line, .. }
             | Self::Method { leading_blank_line, .. }
-            | Self::Unknown { leading_blank_line, .. } => *leading_blank_line,
+            | Self::Unknown { leading_blank_line, .. }
+            | Self::ClassBody { leading_blank_line, .. } => *leading_blank_line,
         }
     }
 
@@ -307,7 +325,8 @@ impl ModelBodyItem {
             | Self::Scope { leading_blank_line, .. }
             | Self::Callback { leading_blank_line, .. }
             | Self::Method { leading_blank_line, .. }
-            | Self::Unknown { leading_blank_line, .. } => *leading_blank_line = v,
+            | Self::Unknown { leading_blank_line, .. }
+            | Self::ClassBody { leading_blank_line, .. } => *leading_blank_line = v,
         }
     }
 }

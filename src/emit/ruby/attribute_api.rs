@@ -48,16 +48,36 @@ use crate::ty::Ty;
 
 pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
     let adapter = app.primary_database_adapter();
-    let replays: Vec<Vec<Expr>> =
+    let replays: Vec<Vec<(usize, Expr)>> =
         app.models.iter().map(|model| inherited_class_method_calls(model, lcs, app)).collect();
     for (model, replay) in app.models.iter().zip(replays) {
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else {
             continue;
         };
+        // The lowering wrote the mattr seeds, then the body's ClassBody
+        // statements; a replayed call joins those in source order.
+        let seeds = model.class_attr_defaults.len();
+        let statements = crate::lower::model_to_library::class_body_statements(model).count();
+        let in_order = lc.class_ivar_initializers.len() == seeds + statements;
+        let mut carried = if in_order {
+            lc.class_ivar_initializers.split_off(seeds).into_iter()
+        } else {
+            Vec::new().into_iter()
+        };
         if let Some(value) = crate::lower::model_to_library::markers::abstract_class_setting(model) {
             lc.class_ivar_initializers.push(abstract_class_write(value));
         }
-        lc.class_ivar_initializers.extend(replay);
+        let mut replay = replay.into_iter().peekable();
+        for (index, item) in model.body.iter().enumerate() {
+            if in_order && matches!(item, crate::dialect::ModelBodyItem::ClassBody { .. }) {
+                lc.class_ivar_initializers.extend(carried.next());
+            }
+            while let Some((_, call)) = replay.next_if(|(at, _)| *at == index) {
+                lc.class_ivar_initializers.push(call);
+            }
+        }
+        lc.class_ivar_initializers.extend(carried);
+        lc.class_ivar_initializers.extend(replay.map(|(_, call)| call));
         let Some(table) = app.schema.tables.get(&model.table.0) else {
             continue;
         };
@@ -77,16 +97,16 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
 
 /// The model body's receiverless (or `self.`) calls to a class method
 /// an ancestor defines, in source order.
-fn inherited_class_method_calls(model: &Model, lcs: &[LibraryClass], app: &App) -> Vec<Expr> {
+fn inherited_class_method_calls(model: &Model, lcs: &[LibraryClass], app: &App) -> Vec<(usize, Expr)> {
     let mut out = Vec::new();
-    for item in &model.body {
+    for (index, item) in model.body.iter().enumerate() {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
         let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
         if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
             continue;
         }
         if defines_class_method(model.parent.as_ref(), method, lcs, app) {
-            out.push(expr.clone());
+            out.push((index, expr.clone()));
         }
     }
     out

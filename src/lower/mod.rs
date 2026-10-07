@@ -1156,7 +1156,8 @@ pub(crate) fn for_each_owned_hook_body(
                 // Unrecognized class-body exprs (constant procs and
                 // friends) round-trip verbatim into the emit — their
                 // sites are just as reachable.
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => f(expr),
+                crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => f(expr),
                 // A has_many extension's methods (`has_many :memberships
                 // do def revise(…) … end end`) are app-authored bodies
                 // that the model lowering turns into ordinary methods;
@@ -1301,7 +1302,8 @@ pub(crate) fn for_each_hook_body_ref(
                         f(cond);
                     }
                 }
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => f(expr),
+                crate::dialect::ModelBodyItem::Unknown { expr, .. }
+                | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => f(expr),
                 crate::dialect::ModelBodyItem::Association {
                     assoc: crate::dialect::Association::HasMany { extension, .. },
                     ..

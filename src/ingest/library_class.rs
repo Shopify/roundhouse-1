@@ -964,12 +964,14 @@ pub(super) fn library_class_and_struct_base(
         visibility_overrides,
         method_aliases,
         conditional_definitions,
+        class_attribute_effects,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
     }
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attribute_effects);
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
     // :name, String` IS the constructor and the reader. Lower it into
@@ -1917,8 +1919,17 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_initializers,
         method_aliases,
         conditional_definitions,
+        class_attribute_effects,
         ..
     } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    // `class_attribute` is `Class#class_attribute`: a module body has
+    // none to call (a concern's `included do` block runs on the class).
+    if !class_attribute_effects.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "`class_attribute` in a module body (outside `included do`) is not modeled".into(),
+        });
+    }
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
         conditional_definitions,
@@ -1981,6 +1992,20 @@ fn with_class_body_ivar_writes(
     Ok(initializers)
 }
 
+/// Merge a class body's `class_attribute` statements into its class-side
+/// initializers by source position: each is a class ivar write (or a
+/// write through one's writer) that runs where it stood. The Ruby emit
+/// runs one that calls this class's own writer after the defs
+/// (`emit_library_class_decl_inner`'s tail effects).
+fn with_class_attribute_effects(mut initializers: Vec<Expr>, effects: Vec<Expr>) -> Vec<Expr> {
+    if effects.is_empty() {
+        return initializers;
+    }
+    initializers.extend(effects);
+    initializers.sort_by_key(|e| e.span.start);
+    initializers
+}
+
 fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
@@ -2019,6 +2044,13 @@ struct DeclBody {
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
     declaration_after_class_initializer: bool,
+    /// `class_attribute` (`ingest::class_attribute`): the names declared
+    /// so far, and the class-body statements on its storage in source
+    /// order, its seeds and `self.x = v` writes through its writers.
+    /// They are class-side ivar writes, not class-variable initializers:
+    /// `with_class_attribute_effects` merges them by source position.
+    class_attribute_names: Vec<Symbol>,
+    class_attribute_effects: Vec<Expr>,
 }
 
 impl DeclBody {
@@ -2032,6 +2064,8 @@ impl DeclBody {
         self.method_aliases.extend(other.method_aliases);
         self.conditional_definitions.extend(other.conditional_definitions);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
+        self.class_attribute_names.extend(other.class_attribute_names);
+        self.class_attribute_effects.extend(other.class_attribute_effects);
     }
 
     /// The class-body declarations an initializer must not precede.
@@ -2128,14 +2162,14 @@ impl DeclBody {
 /// any other block is searched, since it may run now. Every def counts,
 /// whatever its side, so this covers the Ruby emitter's constant deferral
 /// (`partition_deferred_constants`).
-struct OwnClassCalls<'a> {
+pub(crate) struct OwnClassCalls<'a> {
     owner: &'a str,
     leaf: &'a str,
     methods: HashSet<&'a str>,
 }
 
 impl<'a> OwnClassCalls<'a> {
-    fn new(owner: &'a ClassId, methods: &'a [MethodDef]) -> Self {
+    pub(crate) fn new(owner: &'a ClassId, methods: &'a [MethodDef]) -> Self {
         let owner = owner.0.as_str();
         OwnClassCalls {
             owner,
@@ -2144,8 +2178,8 @@ impl<'a> OwnClassCalls<'a> {
         }
     }
 
-    fn own_receiver(&self, recv: &Option<Expr>) -> bool {
-        match recv.as_ref().map(|r| &*r.node) {
+    fn own_receiver(&self, recv: Option<&Expr>) -> bool {
+        match recv.map(|r| &*r.node) {
             None | Some(ExprNode::SelfRef) => true,
             Some(ExprNode::Const { path }) => {
                 let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
@@ -2155,14 +2189,25 @@ impl<'a> OwnClassCalls<'a> {
         }
     }
 
-    fn runs(&self, expr: &Expr) -> bool {
+    pub(crate) fn runs(&self, expr: &Expr) -> bool {
         match &*expr.node {
             // A closure literal is stored; a block that runs now is
             // searched through its call below.
             ExprNode::Lambda { .. } => false,
+            // `self.x = v` / `self.x += v` calls the writer `x=` (and the
+            // compound form the reader `x`).
+            ExprNode::Assign { target: LValue::Attr { recv, name }, .. }
+            | ExprNode::OpAssign { target: LValue::Attr { recv, name }, .. }
+                if self.own_receiver(Some(recv))
+                    && (self.methods.contains(format!("{}=", name.as_str()).as_str())
+                        || matches!(&*expr.node, ExprNode::OpAssign { .. })
+                            && self.methods.contains(name.as_str())) =>
+            {
+                true
+            }
             ExprNode::Send { recv, method, args, block, .. } => {
                 let name = method.as_str();
-                if self.own_receiver(recv)
+                if self.own_receiver(recv.as_ref())
                     && (matches!(name, "new" | "allocate") || self.methods.contains(name))
                 {
                     return true;
@@ -2864,6 +2909,29 @@ fn walk_decl_body_with_visibility<'pr>(
                 message: "alias names a method this body has not defined".into(),
             });
         }
+        // `self.x += v` / `||=` / `&&=` through a `class_attribute`'s
+        // class-side reader and writer, in source order with its seed.
+        // Any other attribute op-write (`self.x += v` naming an
+        // attribute declared in another body of the class, `Foo.x ||= v`)
+        // is a captured class-body call: claimed later, replayed where
+        // the body is replayed, reported by name where it is dropped.
+        // (A `class << self` body's `self` is the singleton class; its
+        // statements keep the path they had.)
+        if !force_class_receiver
+            && (stmt.as_call_operator_write_node().is_some()
+                || stmt.as_call_or_write_node().is_some()
+                || stmt.as_call_and_write_node().is_some())
+            && let Ok(e) = ingest_expr(&stmt, file)
+        {
+            let declared = super::class_attribute::self_write(&e)
+                .is_some_and(|name| out.class_attribute_names.iter().any(|n| n.as_str() == name));
+            if declared {
+                out.class_attribute_effects.push(e);
+            } else {
+                out.unknown_calls.push(e);
+            }
+            continue;
+        }
         if let Some(call) = stmt.as_call_node() {
             // `include X` and `self.include(X)` are the same call: the
             // explicit-self spelling is how a file that must satisfy a
@@ -2916,6 +2984,30 @@ fn walk_decl_body_with_visibility<'pr>(
                         // concern's: the block keeps its lexical scope.
                         out.constants.extend(inner.constants);
                     }
+                }
+                // `class_attribute :x, …` (`ingest::class_attribute`): its
+                // defs, public whatever the surrounding visibility (Rails
+                // writes them through a string class_eval), and the seed.
+                if !force_class_receiver
+                    && let Some(decl) = super::class_attribute::parse(&call, file)
+                {
+                    for method in super::class_attribute::methods(owner, &decl) {
+                        out.methods.retain(|e| !(e.name == method.name && e.receiver == method.receiver));
+                        out.methods.push(method);
+                    }
+                    out.class_attribute_effects.extend(super::class_attribute::seeds(&decl));
+                    out.class_attribute_names.extend(decl.names);
+                    continue;
+                }
+                // `self.x = v` through a `class_attribute` writer.
+                if !force_class_receiver
+                    && call.receiver().is_some()
+                    && let Ok(e) = ingest_expr(&stmt, file)
+                    && let Some(name) = super::class_attribute::self_write(&e)
+                    && out.class_attribute_names.iter().any(|n| n.as_str() == name)
+                {
+                    out.class_attribute_effects.push(e);
+                    continue;
                 }
                 match kw {
                     "include" => {
@@ -4646,6 +4738,47 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "include",
 ];
 
+/// An ActiveSupport::Concern's `included do` statement that no DSL
+/// lowering claims, carried into each including model's class body as
+/// the includer's own statement. Not a visibility or definition
+/// statement: those shape the includer's methods, which the emitted
+/// body defines apart from its class-body statements, so they keep
+/// their refusal.
+fn carries_to_includer(item: &crate::dialect::ModelBodyItem) -> bool {
+    use crate::expr::ExprNode;
+    let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+    match &*expr.node {
+        // A state-machine DSL block is a declaration gap the concern's
+        // own ingest records (`state-machine DSL block … is not
+        // modeled`); splicing it would hand each includer an unsupported
+        // item and report it again there.
+        ExprNode::Send { recv: None, method, block: Some(_), .. }
+            if matches!(method.as_str(), "aasm" | "state_machine") =>
+        {
+            false
+        }
+        ExprNode::Send { recv: None, method, .. } => !matches!(
+            method.as_str(),
+            "private"
+                | "protected"
+                | "public"
+                | "private_class_method"
+                | "public_class_method"
+                | "module_function"
+                | "private_constant"
+                | "public_constant"
+                | "attr_reader"
+                | "attr_writer"
+                | "attr_accessor"
+                | "alias_method"
+                | "define_method"
+                | "remove_method"
+                | "undef_method"
+        ),
+        _ => true,
+    }
+}
+
 /// True when an Unknown body item is one of [`CONCERN_MODEL_MACROS`].
 /// The block form counts — `has_one_attached :avatar do |attachable|
 /// attachable.variant … end` declares variants we don't model, and the
@@ -4690,6 +4823,34 @@ fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::No
 
 /// Only blocks with a retained candidate have a per-includer refusal gate.
 /// Reuse the collector's traversal and IR recognizer, not a broader AST search.
+/// The block's `class_attribute` methods, as its class-side visibility
+/// statements leave them (`class_attribute::class_side_visibility`): a
+/// redefined writer replaced by the wrapped one, then each named
+/// class-side method protected.
+fn apply_class_side_visibility(
+    items: &mut [crate::dialect::ModelBodyItem],
+    owner: &ClassId,
+    class_side: &super::class_attribute::ClassSideVisibility,
+) {
+    use crate::dialect::{MethodReceiver, MethodVisibility, ModelBodyItem};
+    for item in items.iter_mut() {
+        let ModelBodyItem::Method { method, .. } = item else { continue };
+        if method.receiver != MethodReceiver::Class || !method.name_span.is_synthetic() {
+            continue;
+        }
+        let name = method.name.as_str().to_string();
+        if let Some((attr, param, reader)) =
+            class_side.wrapped.iter().find(|(attr, _, _)| format!("{attr}=") == name)
+            && let Some(wrapped) = super::class_attribute::wrapped_writer(owner, attr, param, reader)
+        {
+            *method = wrapped;
+        }
+        if class_side.protected.contains(&name) {
+            method.visibility = MethodVisibility::Protected;
+        }
+    }
+}
+
 pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> bool {
     let mut stmts = Vec::new();
     walk_dsl_stmts(body, &mut stmts);
@@ -4737,6 +4898,18 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
         let mut enums: Vec<ConcernEnumDecl> = Vec::new();
+        let is_concern = module.body().is_some_and(|b| flatten_statements(b).iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && call.block().is_none()
+                    && constant_id_str(&call.name()) == "extend"
+                    && call.arguments().is_some_and(|args| {
+                        args.arguments().iter().any(|arg| {
+                            constant_path_of(&arg).is_some_and(|p| p.join("::") == "ActiveSupport::Concern")
+                        })
+                    })
+            })
+        }));
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -4749,7 +4922,18 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             let mut unclaimed = false;
             let mut stmts = Vec::new();
             walk_dsl_stmts(block.body().unwrap(), &mut stmts);
+            // Class-side visibility of the block's own `class_attribute`
+            // methods: its statements are expanded onto those methods
+            // below rather than carried.
+            let class_side = if is_concern {
+                super::class_attribute::class_side_visibility(&direct, file)
+            } else {
+                None
+            };
             for inner in stmts {
+                if class_side.as_ref().is_some_and(|c| c.consumed.contains(&inner.location().start_offset())) {
+                    continue;
+                }
                 // `enum` inside `included do` belongs to every includer
                 // exactly like an association does — campfire declares
                 // `enum :role, %i[member administrator bot]` in
@@ -4791,6 +4975,12 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
+                let is_direct = direct.iter().any(|stmt| stmt.location().start_offset() == inner.location().start_offset());
+                // `class_attribute` runs on the includer: its defs and
+                // its seed are carried like the model's own declaration.
+                let class_attribute = inner
+                    .as_call_node()
+                    .is_some_and(|call| super::class_attribute::parse(&call, file).is_some());
                 match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
@@ -4799,6 +4989,11 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                                 | ModelBodyItem::Scope { .. }
                                 | ModelBodyItem::Validation { .. }
                                 | ModelBodyItem::Callback { .. } => items.push(item),
+                                ModelBodyItem::Method { .. } | ModelBodyItem::ClassBody { .. }
+                                    if class_attribute && is_direct && is_concern =>
+                                {
+                                    items.push(item)
+                                }
                                 // Block-form lifecycle callbacks
                                 // (`after_initialize do … end` —
                                 // lobsters' Token concern generates its
@@ -4821,9 +5016,21 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                                         || is_candidate(&item)
                                     {
                                         items.push(item);
-                                    } else if !matches!(&item, ModelBodyItem::Unknown { expr, .. }
+                                    } else if matches!(&item, ModelBodyItem::Unknown { expr, .. }
                                         if matches!(&*expr.node, crate::expr::ExprNode::Lit { .. }))
                                     {
+                                    } else if is_concern && is_direct && carries_to_includer(&item) {
+                                        // Rails runs the block in the
+                                        // includer's class body: carried
+                                        // there, in source order, as the
+                                        // includer's own statement. What
+                                        // the model lowering claims of it
+                                        // runs (a write through a carried
+                                        // `class_attribute`, a replayed
+                                        // inherited class-method call);
+                                        // the rest is reported there.
+                                        items.push(item);
+                                    } else {
                                         unclaimed = true;
                                     }
                                 }
@@ -4836,6 +5043,9 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                         unclaimed = true;
                     }
                 }
+            }
+            if let Some(class_side) = &class_side {
+                apply_class_side_visibility(&mut items[block_start..], &id, class_side);
             }
             // A dropped statement can alter a carried accessor's
             // visibility or definition. Defer the refusal until a

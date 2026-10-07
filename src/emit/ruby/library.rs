@@ -6843,6 +6843,17 @@ fn emit_library_class_decl_inner(
     {
         body_effects.sort_by_key(|e| e.span.start);
     }
+    // An effect that runs this class's own code (`self.x = v` through a
+    // `class_attribute` writer, a carried `included do` statement calling
+    // one) needs the defs above it, as the source had them: it and every
+    // effect after it run after the methods, keeping their order.
+    let tail_effects: Vec<&Expr> = if railtie {
+        Vec::new()
+    } else {
+        let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
+        let at = body_effects.iter().position(|e| own.runs(e)).unwrap_or(body_effects.len());
+        body_effects.split_off(at)
+    };
     // A carried railtie's body: its locals first (a statement's block
     // closes over a local an earlier statement writes), then each
     // statement under `run_body_statement`, which names one that fails
@@ -6913,6 +6924,19 @@ fn emit_library_class_decl_inner(
     for (_, inc) in positioned.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
         write_include(&mut s, inc);
+    }
+
+    if !tail_effects.is_empty() && !lc.methods.is_empty() {
+        writeln!(s).unwrap();
+    }
+    for effect in &tail_effects {
+        for line in super::emit_expr(effect).lines() {
+            if line.is_empty() {
+                writeln!(s).unwrap();
+            } else {
+                writeln!(s, "{body_pad}{line}").unwrap();
+            }
+        }
     }
 
     // Named visibility for methods without a local definition (inherited,
@@ -8317,10 +8341,7 @@ fn reopens_loaded_gem_class(lc: &LibraryClass, app: &App) -> bool {
 /// any `diagnostics::scope`), which is why the judgment happens at emit
 /// rather than where the call was captured.
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
-    let name = match &*call.node {
-        ExprNode::Send { method, .. } => method.as_str().to_string(),
-        _ => "call".to_string(),
-    };
+    let name = crate::lower::model_to_library::dropped_statement_name(call);
     crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
         "library_class_body",
         &name,

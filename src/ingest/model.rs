@@ -593,6 +593,23 @@ pub(super) fn ingest_model_body_items(
                     })
                     .collect());
             }
+            // `class_attribute :x, …` — the defs it makes, then the seed
+            // it runs where it stands (`ingest::class_attribute`).
+            if let Some(decl) = super::class_attribute::parse(&call, file) {
+                let mut out: Vec<ModelBodyItem> = super::class_attribute::methods(owner, &decl)
+                    .into_iter()
+                    .map(|method| ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false })
+                    .collect();
+                out.extend(super::class_attribute::seeds(&decl).into_iter().map(|expr| ModelBodyItem::ClassBody {
+                    expr,
+                    leading_comments: Vec::new(),
+                    leading_blank_line: false,
+                }));
+                if let Some(first) = out.first_mut() {
+                    *first.leading_comments_mut() = leading_comments;
+                }
+                return Ok(out);
+            }
             // `cattr_*` / `mattr_*` — same class-attr expansion library
             // ingest applies. Plain `attr_*` stays Unknown: concern
             // `included` blocks share this walker, and expanding those

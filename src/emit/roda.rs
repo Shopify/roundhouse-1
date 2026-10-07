@@ -368,6 +368,13 @@ fn model_for(model: &Model) -> String {
                     lines.push(format!("  # ROUNDHOUSE-TODO: unconverted: {l}"));
                 }
             }
+            // Runs in the class body as written (a class_attribute seed,
+            // a class-side writer call, a carried `included do` statement).
+            ModelBodyItem::ClassBody { expr, .. } => {
+                for l in emit_expr(expr).lines() {
+                    lines.push(format!("  {l}").trim_end().to_string());
+                }
+            }
         }
     }
 
