@@ -6891,10 +6891,15 @@ fn emit_library_class_decl_inner(
         // (`sorbet_check::mixes_in_class_methods`), is behavior every
         // body runs, whatever its base; kept in source order.
         let extensions = app_extension_calls(lc, app);
+        let prepends = app_prepend_calls(lc, app);
         let own: Vec<&Expr> = lc
             .unknown_calls
             .iter()
-            .filter(|c| crate::ingest::sorbet_check::is_mixes_in(c) || extensions.iter().any(|e| std::ptr::eq(*e, *c)))
+            .filter(|c| {
+                crate::ingest::sorbet_check::is_mixes_in(c)
+                    || extensions.iter().any(|e| std::ptr::eq(*e, *c))
+                    || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
+            })
             .collect();
         for call in &lc.unknown_calls {
             if !own.iter().any(|c| std::ptr::eq(*c, call)) && !crate::analyze::is_include_refusal(call) {
@@ -6903,6 +6908,27 @@ fn emit_library_class_decl_inner(
         }
         own
     };
+    // A replayed `prepend` whose module's `self.prepended(base)` hook
+    // reaches this class's methods is written after them, the way
+    // `hooked_include_position` places an include; the rest stay with
+    // the other replayed calls. Source order among prepends is kept.
+    let mut positioned_prepends: Vec<(usize, &Expr)> = Vec::new();
+    if !railtie {
+        for (call, modules) in app_prepend_calls(lc, app) {
+            if !replayed.iter().any(|c| std::ptr::eq(*c, call)) {
+                continue;
+            }
+            let floor = positioned_prepends.last().map(|(at, _)| *at);
+            let at = modules.iter().filter_map(|m| hooked_mixin_position(lc, m, app, "prepended")).max();
+            if let Some(at) = at.max(floor) {
+                positioned_prepends.push((at, call));
+            }
+        }
+    }
+    let replayed: Vec<&Expr> = replayed
+        .into_iter()
+        .filter(|c| !positioned_prepends.iter().any(|(_, p)| std::ptr::eq(*p, *c)))
+        .collect();
     // A replayed call the source has above an eager constant runs
     // before it, as the class body does: Core's liquid_ext.rb
     // `remove_const :SYNTAX` and then assigns the new `SYNTAX`, which
@@ -7104,6 +7130,10 @@ fn emit_library_class_decl_inner(
             write_include(&mut s, inc);
             writeln!(s).unwrap();
         }
+        for (_, call) in positioned_prepends.iter().filter(|(at, _)| *at == index) {
+            writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();
+            writeln!(s).unwrap();
+        }
         match conditional {
             Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad),
             None => write_library_method(&mut s, lc, index, &body_pad),
@@ -7113,6 +7143,10 @@ fn emit_library_class_decl_inner(
     for (_, inc) in positioned.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
         write_include(&mut s, inc);
+    }
+    for (_, call) in positioned_prepends.iter().filter(|(at, _)| *at >= lc.methods.len()) {
+        writeln!(s).unwrap();
+        writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();
     }
 
     if !tail_effects.is_empty() && !lc.methods.is_empty() {
@@ -7201,11 +7235,17 @@ fn emit_library_class_decl_inner(
 /// NameError (undefined method 'store') at load. Such an include goes
 /// right after the last method of `lc`, of either side, the hook names.
 fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Option<usize> {
+    hooked_mixin_position(lc, inc, app, "included")
+}
+
+/// `hooked_include_position` for the module's `hook` (`included`, or
+/// `prepended` for a `prepend`).
+fn hooked_mixin_position(lc: &LibraryClass, inc: &ClassId, app: &App, hook: &str) -> Option<usize> {
     let bare = |c: &ClassId| c.0.as_str().trim_start_matches("::").to_string();
     let target = bare(inc);
     let module = app.library_classes.iter().find(|m| m.is_module && bare(&m.name) == target)?;
     let hook = module.methods.iter().find(|m| {
-        m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && m.params.len() == 1
+        m.receiver == MethodReceiver::Class && m.name.as_str() == hook && m.params.len() == 1
     })?;
     let base = hook.params[0].name.clone();
     let mut called: Vec<Symbol> = Vec::new();
@@ -8062,6 +8102,53 @@ fn names_own_method(lc: &LibraryClass, call: &Expr) -> bool {
         matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
             if lc.methods.iter().any(|m| m.name == *value))
     })
+}
+
+/// `lc`'s body `prepend M, ...` calls whose every module is an app
+/// module, each with those modules' names. Native Ruby puts each `M`
+/// ahead of the class in its ancestors, so `M`'s methods run around the
+/// class's own and reach them through `super`; dropped, the wrapper
+/// silently never ran. The written path resolves the way Ruby reads it:
+/// a rooted `::M` from the top level, a relative one from `lc`'s
+/// namespace outward. A prepend naming anything else stays a reported
+/// residue.
+fn app_prepend_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<(&'a Expr, Vec<ClassId>)> {
+    let module_named = |path: &[Symbol]| -> Option<ClassId> {
+        let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        let is_module = |name: &str| app.library_classes.iter().any(|c| c.is_module && c.name.0.as_str() == name);
+        if let Some(top) = written.strip_prefix("::") {
+            return is_module(top).then(|| ClassId(Symbol::from(top)));
+        }
+        let mut scope = Some(lc.name.0.as_str());
+        while let Some(prefix) = scope {
+            let candidate = format!("{prefix}::{written}");
+            if is_module(&candidate) {
+                return Some(ClassId(Symbol::from(candidate)));
+            }
+            scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+        }
+        is_module(&written).then(|| ClassId(Symbol::from(written)))
+    };
+    lc.unknown_calls
+        .iter()
+        .filter_map(|call| {
+            let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return None };
+            if method.as_str() != "prepend" || args.is_empty() {
+                return None;
+            }
+            if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+                return None;
+            }
+            let modules: Option<Vec<ClassId>> = args
+                .iter()
+                .map(|a| match &*a.node {
+                    ExprNode::Const { path } => module_named(path),
+                    _ => None,
+                })
+                .collect();
+            modules.map(|m| (call, m))
+        })
+        .collect()
 }
 
 /// The `app_extension_calls` of a plain module or class.
