@@ -3813,6 +3813,13 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
     let mut seen: HashSet<String> = HashSet::default();
     let mut optional: HashSet<String> = HashSet::default();
     let mut required: HashSet<String> = HashSet::default();
+    // A feature a file program requires after it has run or defined
+    // something is that program's to load, where its source does:
+    // kafka-shopify's avro patch defines `Avro::AvroError` before it
+    // requires `avro/schema`, which needs it. Loading such a feature up
+    // front, ahead of the program, is not the order Ruby runs. (A
+    // require above everything else in its file loads as before.)
+    let late = late_program_requires(app);
     for (entry, lib) in entries {
         let mut stack = vec![entry];
         let mut order: Vec<String> = Vec::new();
@@ -3832,6 +3839,8 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
                 };
                 if by_path.contains_key(target.as_str()) {
                     nested.push(target);
+                } else if late.get(path.as_str()).is_some_and(|features| features.contains(&feature)) {
+                    continue;
                 } else if (kind == "require" || kind == "optional_require") && !compiled_feature(&feature) {
                     if kind == "require" {
                         required.insert(feature.clone());
@@ -3855,6 +3864,42 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
     let optional: Vec<String> =
         native.iter().filter(|f| optional.contains(f.as_str()) && !required.contains(f.as_str())).cloned().collect();
     (native, framework, optional)
+}
+
+/// Per file program (by source path), the gem-home features it
+/// requires after a statement or declaration of its own has run: the
+/// requires whose place in the file matters.
+fn late_program_requires(app: &App) -> crate::det::HashMap<&str, crate::det::HashSet<String>> {
+    use crate::app::ProgramItem;
+    let feature_of = |item: &ProgramItem| -> Option<String> {
+        match item {
+            ProgramItem::Require { feature, relative: false, .. } => Some(feature.clone()),
+            ProgramItem::Statement(expr) => match &*expr.node {
+                crate::expr::ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "require" && args.len() == 1 => {
+                    match &*args[0].node {
+                        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let mut late: crate::det::HashMap<&str, crate::det::HashSet<String>> = crate::det::HashMap::default();
+    for program in &app.file_programs {
+        let mut ran = false;
+        for item in &program.items {
+            match feature_of(item) {
+                Some(feature) if ran => {
+                    late.entry(program.source.as_str()).or_default().insert(feature);
+                }
+                Some(_) => {}
+                None => ran = !matches!(item, ProgramItem::Require { .. }) || ran,
+            }
+        }
+    }
+    late
 }
 
 /// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
