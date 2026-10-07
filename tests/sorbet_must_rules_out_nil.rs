@@ -1,6 +1,6 @@
-//! `T.must` lowers to sorbet-runtime's nil check, so its value is the
-//! argument with nil ruled out; `T.must_because` remains unsupported
-//! until its runtime semantics are shared.
+//! `T.must` and `T.must_because` lower to sorbet-runtime's nil check, so
+//! their value is the argument with nil ruled out. A `T.must_because`
+//! whose reason is not a parameterless literal block keeps its refusal.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -65,12 +65,30 @@ fn t_must_rules_nil_out() {
 }
 
 #[test]
-fn t_must_because_requires_a_shared_nil_check() {
-    let must = receivers(&action(
+fn t_must_because_rules_nil_out() {
+    // Only `bogus_after` is left, on a Line that cannot be nil; the
+    // reason block is the raised message's text (tests/non_nil_assertions_run.rs).
+    for line in [
         "T.must_because(Line.find_by(id: 1)) { \"a line\" }.bogus_after",
-    ));
-    assert!(must.iter().any(|d| d.contains("nil-check")), "{must:?}");
-    assert!(must.iter().any(|d| d.contains("Nil")), "{must:?}");
+        "T.must_because(Line.find_by(id: 1)) { \"line #{params[:id]}\" }.bogus_after",
+    ] {
+        let failed = failed_sends(&action(line));
+        assert_eq!(failed.len(), 1, "{line}: {failed:?}");
+        assert_eq!(failed[0].0, "bogus_after", "{line}: {failed:?}");
+        assert!(failed[0].1.contains("Line") && !failed[0].1.contains("Nil"), "{line}: {failed:?}");
+    }
+}
+
+#[test]
+fn t_must_because_without_a_plain_reason_block_is_refused() {
+    for line in [
+        "T.must_because(Line.find_by(id: 1)) { |x| \"a line\" }.bogus_after",
+        "T.must_because(Line.find_by(id: 1)) { next \"a line\" }.bogus_after",
+    ] {
+        let failed = failed_sends(&action(line));
+        assert!(failed.iter().any(|(construct, detail)| construct == "non-nil assertion" && detail.contains("parameterless literal block")), "{line}: {failed:?}");
+        assert!(failed.iter().any(|(_, ty)| ty.contains("Nil")), "{line}: {failed:?}");
+    }
 }
 
 #[test]

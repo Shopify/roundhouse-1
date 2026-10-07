@@ -5032,6 +5032,39 @@ fn report_unsupported_harness_calls(app: &App, target: BuildTarget, files: &[(St
     }
 }
 
+/// The nil check `ingest::expr::must_check` lowers `T.must`,
+/// `T.must_because` and `#: as !nil` to, by its shape:
+/// `if <value>.nil? then raise(TypeError.new(<sorbet's message>)) else
+/// <value> end`. Recognized by shape, not by a decision bit, because
+/// lowering rebuilds the nodes of a model method's body.
+fn is_nil_assertion_check(expr: &crate::expr::Expr) -> bool {
+    use crate::expr::{ExprNode, InterpPart, Literal};
+    let ExprNode::If { cond, then_branch, .. } = &*expr.node else { return false };
+    let ExprNode::Send { recv: Some(_), method, args, .. } = &*cond.node else { return false };
+    if method.as_str() != "nil?" || !args.is_empty() {
+        return false;
+    }
+    let ExprNode::Send { recv: None, method, args, .. } = &*then_branch.node else { return false };
+    let [error] = args.as_slice() else { return false };
+    if method.as_str() != "raise" {
+        return false;
+    }
+    let ExprNode::Send { recv: Some(class), method, args, .. } = &*error.node else { return false };
+    let [message] = args.as_slice() else { return false };
+    if method.as_str() != "new" || !matches!(&*class.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "TypeError") {
+        return false;
+    }
+    match &*message.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            value == "Passed `nil` into T.must" || value == "Passed `nil` into `#: as !nil`"
+        }
+        ExprNode::StringInterp { parts } => {
+            matches!(parts.first(), Some(InterpPart::Text { value }) if value == "Unexpected `nil` because ")
+        }
+        _ => false,
+    }
+}
+
 /// These class objects are supplied by Ruby/Spinel's bundled libraries,
 /// not by the transpiled runtimes. Recognizing them during inference
 /// must not turn a missing target implementation into a clean emit.
@@ -5120,6 +5153,19 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                     format!("`not_nil!` is type_toolkit's Kernel/NilClass extension, which only the CRuby tree carries, not {target}"),
                 );
             }
+        }
+        // The nil check of `T.must`, `T.must_because` and `#: as !nil`
+        // raises sorbet-runtime's TypeError and binds the value it tests
+        // to a generated local inside its condition. The Ruby-family
+        // trees run it as written. The others have neither: TypeScript
+        // emits that local undeclared and throws a plain Error.
+        if !matches!(target, "ruby" | "jruby" | "spinel" | "roda") && is_nil_assertion_check(expr) {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "non-nil assertion",
+                format!("the nil check `T.must`, `T.must_because` and `#: as !nil` lower to runs on the Ruby-family trees, not {target}"),
+            );
         }
         if target == "ruby" {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));

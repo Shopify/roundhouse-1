@@ -375,7 +375,60 @@ fn sorbet_assertion_is_must(node: &Node<'_>) -> bool {
 /// `if (__must_N = x).nil? then raise ... else __must_N end`, so the
 /// else side reads it with nil narrowed away. `#: as !nil` lowers to the
 /// same check (`type_ascription::ascribe_trailing`) with its own message.
+/// `project::is_nil_assertion_check` recognizes the shape, which only the
+/// Ruby-family trees run.
 pub(super) fn must_check(span: Span, value: Expr, location: &ruby_prism::Location<'_>, message: &str) -> Expr {
+    let message = Expr::new(
+        span,
+        ExprNode::Lit { value: crate::expr::Literal::Str { value: message.to_string() } },
+    );
+    must_check_raising(span, value, location, message)
+}
+
+/// `T.must_because(x) { reason }` as sorbet-runtime runs it: `T.must`'s
+/// check, whose TypeError reads "Unexpected `nil` because #{yield}". The
+/// reason block runs only on nil, in the caller's scope, so its body is
+/// the interpolated part of the raised message. `None` where the block
+/// is not a plain parameterless literal block whose body only computes a
+/// value (a `next`, `break`, `return` or `yield` in it would mean
+/// something else once inlined); the call then keeps its refusal.
+fn must_because_reason(node: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
+    let Some(block) = node.as_call_node().and_then(|call| call.block()).and_then(|b| b.as_block_node()) else {
+        return Ok(None);
+    };
+    if block.parameters().is_some() {
+        return Ok(None);
+    }
+    let lambda = ingest_block_node_as_lambda(&block, file)?;
+    let ExprNode::Lambda { body, .. } = *lambda.node else { return Ok(None) };
+    fn escapes(expr: &Expr) -> bool {
+        matches!(&*expr.node, ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Return { .. } | ExprNode::Yield { .. })
+            || {
+                let mut found = false;
+                expr.node.for_each_child(&mut |child| found = found || escapes(child));
+                found
+            }
+    }
+    if escapes(&body) {
+        return Ok(None);
+    }
+    Ok(Some(body))
+}
+
+fn must_check_because(span: Span, value: Expr, location: &ruby_prism::Location<'_>, reason: Expr) -> Expr {
+    let message = Expr::new(
+        span,
+        ExprNode::StringInterp {
+            parts: vec![
+                crate::expr::InterpPart::Text { value: "Unexpected `nil` because ".to_string() },
+                crate::expr::InterpPart::Expr { expr: reason },
+            ],
+        },
+    );
+    must_check_raising(span, value, location, message)
+}
+
+fn must_check_raising(span: Span, value: Expr, location: &ruby_prism::Location<'_>, message: Expr) -> Expr {
     let (tested, read) = match &*value.node {
         ExprNode::Var { .. } => (value.clone(), value),
         _ => {
@@ -400,10 +453,6 @@ pub(super) fn must_check(span: Span, value: Expr, location: &ruby_prism::Locatio
     let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>, parenthesized: bool| {
         Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized })
     };
-    let message = Expr::new(
-        span,
-        ExprNode::Lit { value: crate::expr::Literal::Str { value: message.to_string() } },
-    );
     let type_error = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("TypeError")] });
     let raise = send(None, "raise", vec![send(Some(type_error), "new", vec![message], true)], true);
     let cond = send(Some(tested), "nil?", Vec::new(), false);
@@ -570,6 +619,31 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     ))
 }
 
+/// A write's value with the trailing `#:` that ends the write applied
+/// once. The value ends where the write does (`n = @names.first #: as
+/// !nil`), so the write claims that offset before ingesting it: a value
+/// that reads its own trailing comment (a call, a variable read) then
+/// leaves it to the write, and a nested write ending at the same place
+/// (`a = b = x #: T`) leaves it to the outermost one.
+fn ingest_written_value(value: &Node<'_>, loc: &ruby_prism::Location<'_>, file: &str) -> IngestResult<Expr> {
+    let end = loc.end_offset();
+    let outermost = super::type_ascription::push_trailing_ascription_claim(end);
+    struct PopClaim;
+    impl Drop for PopClaim {
+        fn drop(&mut self) {
+            super::type_ascription::pop_trailing_ascription_claim();
+        }
+    }
+    let value = {
+        let _pop = PopClaim;
+        ingest_expr(value, file)
+    }?;
+    if !outermost {
+        return Ok(value);
+    }
+    Ok(super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, end), loc))
+}
+
 /// A string literal naming this source file's own location (`__FILE__`,
 /// `__dir__`), app-root relative and flagged `SOURCE_FILE_PATH`.
 fn source_file_path_lit(span: Span, path: String) -> Expr {
@@ -598,7 +672,10 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         let value = if sorbet_assertion_is_must(node) {
             must_check(span, value, &node.location(), "Passed `nil` into T.must")
         } else if sorbet_assertion_rules_out_nil(node) {
-            super::type_ascription::not_nil(value)
+            match must_because_reason(node, file)? {
+                Some(reason) => must_check_because(span, value, &node.location(), reason),
+                None => super::type_ascription::not_nil(value),
+            }
         } else {
             value
         };
@@ -1271,8 +1348,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_instance_variable_write_node().unwrap();
             let raw = constant_id_str(&w.name());
             let name = raw.strip_prefix('@').unwrap_or(raw);
-            let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
+            let value = ingest_written_value(&w.value(), &loc, file)?;
             ExprNode::Assign {
                 target: crate::expr::LValue::Ivar { name: Symbol::from(name) },
                 value,
@@ -1281,8 +1357,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_local_variable_write_node().is_some() => {
             let w = n.as_local_variable_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
-            let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
+            let value = ingest_written_value(&w.value(), &loc, file)?;
             ExprNode::Assign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 value,
@@ -1422,8 +1497,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_instance_variable_or_write_node().unwrap();
             let raw = constant_id_str(&w.name());
             let name = Symbol::from(raw.strip_prefix('@').unwrap_or(raw));
-            let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
+            let value = ingest_written_value(&w.value(), &loc, file)?;
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Ivar { name },
                 op: crate::expr::OpAssignOp::OrOr,

@@ -60,9 +60,41 @@ fn new_errors_api_requires_runtime_support() {
 
 #[test]
 fn non_nil_assertions_require_runtime_support() {
-    // `T.must` lowers to sorbet's check (tests/sorbet_must_runs.rs) and
-    // `x.not_nil!` runs on the CRuby tree (tests/not_nil_type_toolkit.rs).
-    refuses("T.must_because(1) { \"present\" }", "non-nil assertion");
+    // `T.must` and `T.must_because` with a plain reason block lower to
+    // sorbet's check (tests/non_nil_assertions_run.rs) and `x.not_nil!`
+    // runs on the CRuby tree (tests/not_nil_type_toolkit.rs). A reason
+    // block with parameters has no lowering.
+    refuses("T.must_because(1) { |x| \"present\" }", "non-nil assertion");
+}
+
+/// The nil check the three non-nil assertions lower to runs on the
+/// Ruby-family trees (tests/non_nil_assertions_run.rs runs it). Other
+/// targets refuse each site by name, rather than emitting a check that
+/// does not run there: TypeScript wrote the generated local undeclared
+/// and threw a plain Error where sorbet raises TypeError.
+#[test]
+fn non_nil_assertion_checks_are_refused_where_the_tree_cannot_run_them() {
+    for body in [
+        "title #: as !nil",
+        "Probe.find_by(id: 1) #: as !nil",
+        "T.must(Probe.find_by(id: 1))",
+        "T.must_because(Probe.find_by(id: 1)) { \"a probe\" }",
+    ] {
+        let root = probe_app(body);
+        let (ok, text) = run(&root, &["check"]);
+        assert!(ok, "check refused {body}: {text}");
+        let (ok, text) = run(&root, &["--target", "ruby"]);
+        assert!(ok, "ruby refused {body}: {text}");
+        for target in ["typescript", "rust"] {
+            let (ok, text) = run(&root, &["--target", target]);
+            assert!(!ok, "{target} accepted {body}: {text}");
+            assert!(
+                text.contains("non-nil assertion not supported") && text.contains(&format!("Ruby-family trees, not {target}")),
+                "{target} lost named refusal for {body}: {text}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

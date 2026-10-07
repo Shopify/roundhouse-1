@@ -167,6 +167,24 @@ end
 #[test]
 fn an_unimplemented_assertion_emits_a_named_refusal() {
     // A nil assertion is behavior, so it cannot become an unchecked read.
+    // A reason block with parameters has no lowering (a plain one does:
+    // `t_must_because_lowers_to_sorbets_nil_check`).
+    let emitted = emitted(
+        r#"class Gauge
+  def label(kind)
+    T.must_because(kind) { |x| "a kind" }.to_s
+  end
+end
+"#,
+        "gauge.rb",
+    );
+    assert!(emitted.contains("raise"), "got:\n{emitted}");
+    assert!(!emitted.contains("T.must_because"), "got:\n{emitted}");
+    assert!(emitted.contains("non-nil assertion"), "got:\n{emitted}");
+}
+
+#[test]
+fn t_must_because_lowers_to_sorbets_nil_check() {
     let emitted = emitted(
         r#"class Gauge
   def label(kind)
@@ -176,9 +194,10 @@ end
 "#,
         "gauge.rb",
     );
-    assert!(emitted.contains("raise"), "got:\n{emitted}");
     assert!(!emitted.contains("T.must_because"), "got:\n{emitted}");
-    assert!(emitted.contains("non-nil assertion"), "got:\n{emitted}");
+    assert!(emitted.contains("kind.nil?"), "got:\n{emitted}");
+    assert!(emitted.contains("Unexpected `nil` because #{\"a kind\"}"), "got:\n{emitted}");
+    assert!(!emitted.contains("non-nil assertion"), "got:\n{emitted}");
 }
 
 #[test]

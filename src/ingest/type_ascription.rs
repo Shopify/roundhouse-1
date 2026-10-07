@@ -223,8 +223,9 @@ pub(super) fn ascribe_trailing(
     }
 }
 
-/// `T.must_because`'s non-nil assertion carries a refusal until its
-/// reason block has an executable lowering.
+/// A `T.must_because` whose reason is not a plain literal block
+/// (`expr::must_because_reason`) carries a refusal: its reason has no
+/// executable lowering.
 pub(super) fn not_nil(value: Expr) -> Expr {
     let span = value.span;
     let mut expr = Expr::new(
@@ -240,7 +241,7 @@ pub(super) fn not_nil(value: Expr) -> Expr {
     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
         target: None,
         construct: crate::ident::Symbol::from("non-nil assertion"),
-        detail: "requires a shared nil-check implementation".into(),
+        detail: "the `T.must_because` reason is not a parameterless literal block without next/break/return/yield".into(),
     });
     expr
 }
