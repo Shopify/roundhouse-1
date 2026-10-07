@@ -262,6 +262,51 @@ pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) 
         .then(|| crate::app::FileProgram { source: file.to_string(), items })
 }
 
+/// A file carried only because a carried file `require_relative`s it
+/// (`ingest_app`'s required files): its whole top level as a file
+/// program, every declaration inline (as behind a file-level `return`),
+/// so it is defined where the require runs and is never a library class
+/// of its own that the autoloader or eager loading would load.
+pub(super) fn required_file_program(source: &[u8], file: &str) -> crate::app::FileProgram {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let mut items = Vec::new();
+    if let Some(program) = root.as_program_node() {
+        let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
+        let carried: HashSet<&str> = HashSet::default();
+        let mut guarded = true;
+        program_items(source, &statements, file, &carried, false, &mut guarded, &mut items);
+    }
+    crate::app::FileProgram { source: file.to_string(), items }
+}
+
+/// The features of a file's `require_relative "literal"` calls outside
+/// method bodies: at top level, in a class body, in a conditional or a
+/// block there.
+pub(super) fn relative_requires(source: &[u8], file: &str) -> Vec<String> {
+    use ruby_prism::Visit;
+    #[derive(Default)]
+    struct Finds(Vec<String>);
+    impl<'pr> Visit<'pr> for Finds {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none() && constant_id_str(&node.name()) == "require_relative" {
+                let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if let [one] = args.as_slice() {
+                    if let Some(s) = one.as_string_node() {
+                        self.0.push(String::from_utf8_lossy(s.unescaped()).into_owned());
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+    }
+    let result = super::prism::parse(source, file);
+    let mut finds = Finds::default();
+    finds.visit(&result.node());
+    finds.0
+}
+
 fn program_items(
     source: &[u8],
     statements: &[ruby_prism::Node<'_>],
@@ -2970,8 +3015,12 @@ fn walk_decl_body_with_visibility<'pr>(
                                 // `singleton_class.delegate(...)`, so
                                 // `ingest::delegate` expands it on the
                                 // class side instead of as instance
-                                // methods.
-                                if force_class_receiver && kw == "delegate" {
+                                // methods. An `alias_method` there whose
+                                // original this body does not define (a
+                                // mock reopening a service, Core's
+                                // domains_dobby_service_mock.rb) aliases
+                                // the class method the same way.
+                                if force_class_receiver && matches!(kw, "delegate" | "alias_method") {
                                     if let ExprNode::Send { recv: recv @ None, .. } = &mut *e.node {
                                         *recv = Some(Expr::new(
                                             e.span,

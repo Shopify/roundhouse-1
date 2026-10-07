@@ -678,6 +678,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // loaders the walk declares (`ingest::zeitwerk::resolve`).
     let mut support_classes: Vec<(PathBuf, Vec<crate::ident::ClassId>)> = Vec::new();
     drop(super::zeitwerk::drain());
+    // What the support files `require_relative`, for the files no walk
+    // reaches (below).
+    let mut relative_requires: Vec<PathBuf> = Vec::new();
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
         let sub = sub.as_str();
         let support_dir = dir.join(sub);
@@ -700,6 +703,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             }
             let Ok(source) = vfs.read(&entry) else { continue };
             let path_str = entry.display().to_string();
+            relative_requires.extend(
+                super::library_class::relative_requires(&source, &path_str)
+                    .into_iter()
+                    .filter_map(|feature| required_path(&entry, &feature)),
+            );
             // An ActiveRecord class is one wherever it lives. A
             // packwerk package under `lib/`, or an engine's models
             // reached through an autoload path, used to land here as
@@ -783,6 +791,42 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             // for the rest.
             super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
         }
+    }
+    // A file a support file `require_relative`s that no walk reaches and
+    // no app root holds: Core's engines load test helpers and mocks from
+    // `test/support` in their class body, under `if Rails.env.test?`
+    // (`require_relative "../../test/support/block_dns_resolver"` in
+    // domains/engine.rb), a directory on the load path only, never
+    // autoloaded or eager-loaded. Such a file is carried as a file
+    // program whose declarations are inline
+    // (`library_class::required_file_program`), so it defines them where
+    // the require runs and nowhere else: a mock's reopen of an app class
+    // (domains_dobby_service_mock.rb's `DomainsDobbyService`) is not
+    // merged into that class. Its own relative requires follow.
+    let app_root_dirs: Vec<PathBuf> = roots.iter().map(|r| dir.join(r)).collect();
+    let mut required_seen: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
+    let mut next = 0;
+    while next < relative_requires.len() {
+        let target = relative_requires[next].clone();
+        next += 1;
+        if !target.starts_with(dir)
+            || support_seen.contains(&target)
+            || app_root_dirs.iter().any(|root| target.starts_with(root))
+            || !required_seen.insert(target.clone())
+        {
+            continue;
+        }
+        let Ok(source) = vfs.read(&target) else { continue };
+        let path_str = target.display().to_string();
+        super::sources::register(&path_str, &String::from_utf8_lossy(&source));
+        relative_requires.extend(
+            super::library_class::relative_requires(&source, &path_str)
+                .into_iter()
+                .filter_map(|feature| required_path(&target, &feature)),
+        );
+        let program = super::library_class::required_file_program(&source, &path_str);
+        report_not_carried(&source, &program.items, &mut app);
+        app.file_programs.push(program);
     }
     app.library_class_files = support_classes
         .iter()
@@ -2396,6 +2440,26 @@ fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
     } else {
         push_ingest_drop(app, path, err);
     }
+}
+
+/// The file a `require_relative feature` in `from` loads, lexically
+/// normalized (`..` folded); `None` for an empty feature.
+fn required_path(from: &Path, feature: &str) -> Option<PathBuf> {
+    if feature.is_empty() {
+        return None;
+    }
+    let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+    let mut out = PathBuf::new();
+    for part in from.parent()?.join(rb).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 /// Each file-level statement a support file's program does not carry

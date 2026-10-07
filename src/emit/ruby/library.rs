@@ -7244,6 +7244,9 @@ struct NameIndex {
     models: crate::det::HashSet<String>,
     controllers: crate::det::HashSet<String>,
     library_classes: HashMap<String, Vec<usize>>,
+    /// Each library class => the source files that declare it
+    /// (`declared_files`).
+    declared_in: HashMap<String, Vec<u32>>,
 }
 
 thread_local! {
@@ -7270,6 +7273,7 @@ impl NameIndex {
             models: app.models.iter().map(|m| m.name.0.as_str().to_string()).collect(),
             controllers: app.controllers.iter().map(|c| c.name.0.as_str().to_string()).collect(),
             library_classes,
+            declared_in: declaring_files(app),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -7509,7 +7513,7 @@ fn runtime_reopen_anchor(name: &str) -> Option<&'static str> {
 /// A reopen of a loaded gem's class or module (`reopens_loaded_gem_class`)
 /// replays for the same reason: the receiver is the gem's own class.
 fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
-    if reopens_loaded_gem_class(lc, app) {
+    if InlineDeclaration::active() || reopens_loaded_gem_class(lc, app) {
         return true;
     }
     if lc.is_module {
@@ -7518,6 +7522,36 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
     lc.parent.as_ref().is_some_and(|p| {
         require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
     })
+}
+
+/// A declaration a file program carries inline (`ProgramItem::Inline`:
+/// one under a condition, or in a file only a `require_relative`
+/// reaches) is not analyzed or lowered, so nothing models the class-body
+/// calls the ingest left uncaptured: they are replayed as the source has
+/// them, before the methods, as for a foreign class body. A test mock
+/// reopening an app service (`class << self; alias_method :price_from_service,
+/// :price` before redefining `price`) needs its alias run.
+struct InlineDeclaration(bool);
+
+thread_local! {
+    static INLINE_DECLARATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl InlineDeclaration {
+    fn enter() -> Self {
+        InlineDeclaration(INLINE_DECLARATION.with(|slot| slot.replace(true)))
+    }
+
+    fn active() -> bool {
+        INLINE_DECLARATION.with(|slot| slot.get())
+    }
+}
+
+impl Drop for InlineDeclaration {
+    fn drop(&mut self) {
+        let previous = self.0;
+        INLINE_DECLARATION.with(|slot| slot.set(previous));
+    }
 }
 
 /// A railtie or engine the app carries (`App::railties`): its class body
@@ -7720,6 +7754,19 @@ fn rewrite_carried_loads(
     let lit = |span: crate::span::Span, value: &str| {
         Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Str { value: value.to_string() } })
     };
+    // `require_relative "../../test/support/x"` names a file beside the
+    // engine's source, which the tree does not have beside the emitted
+    // engine: resolved against the source as a file program's is.
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node {
+        if method.as_str() == "require_relative" && str_arg(args).is_some() {
+            let source = (e.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i));
+            if let Some(source) = source {
+                let rel = relative_source_path(app, &source.path).to_string();
+                rewrite_program_requires(e, app, &rel, sources);
+            }
+            return;
+        }
+    }
     let mut replacement: Option<Expr> = None;
     if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node {
         let span = e.span;
@@ -7935,6 +7982,7 @@ pub(super) fn emit_file_program(
                     }
                 }
                 ProgramItem::Inline(classes) => {
+                    let _inline = InlineDeclaration::enter();
                     for lc in classes {
                         let rendered = emit_library_class_decl(lc, app, out_path.to_path_buf());
                         lines(s, pad, &rendered.content);
@@ -8132,10 +8180,42 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
 /// the emitted tree keeps that file, at the class's own path, rather
 /// than splicing the class into the owner's. Known only when both bodies
 /// carry real spans; otherwise the nested class stays in its owner's file.
+/// The nested class's files include those that only declare it: Core's
+/// `config/test.rb` is `class Config; class Test < Config; end; end`, an
+/// empty body the owner's `config.rb` never declares. The owner's are
+/// its body's only, since such a file reopens it without adding to it.
 fn written_apart(name: &str, owner: &str, app: &App) -> bool {
-    let child = body_files(name, app);
+    let mut child = body_files(name, app);
+    child.extend(declared_files(name, app));
     let parent = body_files(owner, app);
     !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)
+}
+
+/// Each library class => the ids of the source files that declare it
+/// (`App::library_class_files`), a `class X; end` with an empty body
+/// included.
+fn declaring_files(app: &App) -> HashMap<String, Vec<u32>> {
+    let ids: HashMap<&str, u32> =
+        app.sources.iter().enumerate().map(|(i, s)| (s.path.as_str(), i as u32 + 1)).collect();
+    let mut out: HashMap<String, Vec<u32>> = HashMap::default();
+    for (source, names) in &app.library_class_files {
+        let Some(&id) = ids.get(source.as_str()) else { continue };
+        for name in names {
+            let files = out.entry(name.0.as_str().to_string()).or_default();
+            if !files.contains(&id) {
+                files.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// The source files that declare a library class, its body or not.
+fn declared_files(name: &str, app: &App) -> crate::det::HashSet<u32> {
+    match NameIndex::current(app) {
+        Some(index) => index.declared_in.get(name).map(|ids| ids.iter().copied().collect()).unwrap_or_default(),
+        None => declaring_files(app).remove(name).map(|ids| ids.into_iter().collect()).unwrap_or_default(),
+    }
 }
 
 /// The source files a library class's own body (methods, constants,
