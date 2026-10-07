@@ -9529,6 +9529,28 @@ fn require_path_for_body_const(
     if first == self_name {
         return None;
     }
+    // A qualified constant (`SecureHeaders::ClearSiteData::CACHE`,
+    // `SecureHeaders::PolicyManagement::ALL_DIRECTIVES`) is defined by
+    // the file of its longest class prefix: this file when that is this
+    // class (or one this file defines), else that class's file. Resolved
+    // by its first segment it required the namespace's file, whose body
+    // lists the nested classes and so requires their files up front: a
+    // cycle native load order does not have (secure_headers.rb requires
+    // headers/*, which require nothing back), and Ruby's circular-require
+    // warning, which Core's StrictWarning raises.
+    for n in (2..=path.len()).rev() {
+        let prefix = path[..n].join("::");
+        if !self_name.is_empty() && prefix == self_name {
+            return None;
+        }
+        if is_model_or_library_class(&prefix, app) {
+            let owner = file_owner(&prefix, app);
+            if owner == self_name {
+                return None;
+            }
+            return Some(format!("app/models/{}", crate::naming::underscore(&owner)));
+        }
+    }
     // A core Ruby class an app reopens (e.g. `class String` in
     // lib/monkey.rb) lands in `library_classes`, but it is NOT an
     // `app/models/<name>` file — every `String.new` would otherwise emit
