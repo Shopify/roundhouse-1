@@ -382,6 +382,11 @@ pub struct App {
     /// (`ingest::initializer_programs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_programs: Vec<InitializerProgram>,
+    /// Each `config/environments/<env>.rb`, as the program the emitted
+    /// boot runs when `Rails.env` selects it, in file-name order
+    /// (`ingest::environments`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_programs: Vec<EnvironmentProgram>,
     /// Framework load hooks the app's initializers register for, with
     /// the base Rails fires each with (`ingest::initializer_programs`).
     /// The emitted boot fires them where the runtime has loaded the base.
@@ -938,6 +943,31 @@ pub struct InitializerProgram {
     pub statements: usize,
 }
 
+/// One `config/environments/<env>.rb`, as the emitted boot runs it when
+/// `Rails.env` is `env` (`ingest::environments`): the carried statements
+/// are the body of `holder.run_environment`; each statement not carried
+/// is named, and boot names it again when it selects this environment.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentProgram {
+    /// The environment, from the file name (`test`).
+    pub env: String,
+    /// The file, relative to the app root.
+    pub file: String,
+    /// The file as ingest registered it (`App::sources`).
+    pub source: String,
+    /// The holder module in `App::library_classes`; `None` when nothing
+    /// of the file is carried.
+    pub holder: Option<crate::ident::ClassId>,
+    /// Statements carried (top level, the `configure` block's, and inside
+    /// a deferred block).
+    pub carried: usize,
+    /// `config.*` writes applied by being inert, or read elsewhere
+    /// (`config.eager_load`).
+    pub consumed: usize,
+    /// `<file>:<line> <statement>` and why it is not carried.
+    pub refused: Vec<(String, String)>,
+}
+
 /// A framework load hook an initializer registers for, and the runtime
 /// class Rails fires it with.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1161,6 +1191,7 @@ impl App {
             initializer_gaps: Vec::new(),
             initializer_constants: Vec::new(),
             initializer_programs: Vec::new(),
+            environment_programs: Vec::new(),
             framework_load_hooks: Vec::new(),
             class_load_hooks: Vec::new(),
             load_hook_bases: std::collections::BTreeMap::new(),

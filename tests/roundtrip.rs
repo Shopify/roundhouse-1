@@ -139,6 +139,7 @@ fn tiny_blog_round_trips() {
         initializer_files: Vec::new(),
         initializer_gaps: Vec::new(),
         initializer_programs: Vec::new(),
+        environment_programs: Vec::new(),
         framework_load_hooks: Vec::new(),
         class_load_hooks: Vec::new(),
         load_hook_bases: std::collections::BTreeMap::new(),

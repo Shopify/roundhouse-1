@@ -3454,6 +3454,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
     let registrations = load_hook_registrations(app);
     let programs = initializer_program_block(app);
+    let environment = environment_program_block(app);
     apply_class_load_hooks(files, app);
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
@@ -3549,6 +3550,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // at the end of boot.rb.
             let eager = "RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n";
             let at = content.rfind(eager).ok_or("PostgreSQL bootstrap: missing eager load in app/models.rb")?;
+            content.insert_str(at, &environment);
+            let at = at + environment.len();
             content.insert_str(
                 at,
                 "# Application#initialize!: the railties' and engines' initializers, in\n\
@@ -3559,6 +3562,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         }
         if path == "test/test_helper.rb" {
             *content = content.replace("../runtime/sqlite_adapter", "../runtime/postgres_adapter");
+            // Rails' generated test_helper.rb sets RAILS_ENV before it
+            // requires config/environment: boot selects
+            // config/environments/test.rb (environment_program_block) and
+            // its `config.eager_load` by it.
+            let boot = "require_relative \"../boot\"\n";
+            if let Some(at) = content.find(boot) {
+                content.insert_str(at, "ENV[\"RAILS_ENV\"] ||= \"test\"\n");
+            }
             let start = content.find("def _test_db_path\n")
                 .ok_or("PostgreSQL bootstrap: missing test database setup anchor")?;
             let last = "ActiveRecord.adapter = SqliteAdapter";
@@ -3996,6 +4007,53 @@ fn initializer_program_block(app: &App) -> String {
             crate::ingest::initializer_programs::RUN_METHOD
         ));
     }
+    out
+}
+
+/// Run `config/environments/#{Rails.env}.rb`'s program
+/// (`ingest::environments`) where Rails' `load_environment_config` runs
+/// it: the first of Application#initialize!'s initializers, before the
+/// railties' and the app's initializers. Each statement not carried is
+/// named as boot selects the file. With environment files and none for
+/// `Rails.env`, boot raises as Rails 8.2 does (application.rb:791).
+/// Emitted into app/models.rb, whose path the holder stems are under.
+fn environment_program_block(app: &App) -> String {
+    if app.environment_programs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# config/environments/#{Rails.env}.rb (ingest::environments), where Rails'\n\
+         # `load_environment_config` runs it: first of Application#initialize!'s\n\
+         # initializers (railties 8.2.0.alpha engine.rb:584). A carried statement\n\
+         # that raises names itself (error[initializer_statement_not_run]); one not\n\
+         # carried is named here (error[environment_statement_not_carried]).\n\
+         case Rails.env.to_s\n",
+    );
+    for program in &app.environment_programs {
+        out.push_str(&format!("when {:?}\n", program.env));
+        out.push_str(&format!(
+            "  # {}: {} carried, {} consumed, {} not carried\n",
+            program.file,
+            program.carried,
+            program.consumed,
+            program.refused.len()
+        ));
+        for (site, reason) in &program.refused {
+            let message = format!("roundhouse: error[environment_statement_not_carried]: {site}: {reason}");
+            out.push_str(&format!("  warn {}\n", ruby_data_literal(&serde_json::Value::String(message))));
+        }
+        if let Some(holder) = &program.holder {
+            let stem = format!("models/{}", crate::naming::underscore(holder.0.as_str()));
+            out.push_str(&format!(
+                "  require_relative {stem:?}\n  {}.{}\n",
+                holder.0.as_str(),
+                crate::ingest::environments::RUN_METHOD
+            ));
+        }
+    }
+    out.push_str(
+        "else\n  raise \"Rails environment has been set to #{Rails.env} but config/environments/#{Rails.env}.rb does not exist.\"\nend\n",
+    );
     out
 }
 
