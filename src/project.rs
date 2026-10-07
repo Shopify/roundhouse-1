@@ -4794,8 +4794,14 @@ fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
 /// then. Those files keep loading at boot.
 fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> {
     let stem = anchor.strip_prefix("models/")?;
+    let root_segment = stem.split('/').next().unwrap_or(stem);
+    // A file that also opens a `class`/`module` at the top level: its
+    // other file-level constants ride along with that declaration.
+    let declares = content.lines().any(|line| line.starts_with("module ") || line.starts_with("class "));
     // Significant lines below the leading requires: (indent, text).
     let mut lines: Vec<(usize, &str)> = Vec::new();
+    // Inside a skipped file-level constant's value.
+    let mut in_file_constant = false;
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -4807,6 +4813,30 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
         // split around a cycle (`emit_library_class_decl_inner`: close,
         // require what the rest needs, reopen).
         if indent == 0 && (trimmed.starts_with("require ") || trimmed.starts_with("require_relative ")) {
+            in_file_constant = false;
+            continue;
+        }
+        // A constant the source wrote at FILE level beside the file's
+        // declaration (`IGNORE_TEST_INSTANCE_METHODS = %i[setup
+        // teardown].freeze` above `module Minitest`): Ruby binds it on
+        // Object when the file loads, which Zeitwerk does on the first
+        // reference to the declared constant. It names no file of its
+        // own, so it does not stop the file autoloading; it and the lines
+        // that continue or close its value are skipped.
+        if indent == 0 && declares {
+            if let Some(name) = constant_assignment(trimmed) {
+                if crate::naming::underscore(name) != root_segment {
+                    in_file_constant = true;
+                    continue;
+                }
+            }
+            let closes = trimmed.starts_with([')', ']', '}']) || trimmed == "end" || trimmed.starts_with("end.");
+            if in_file_constant && closes {
+                continue;
+            }
+            in_file_constant = false;
+        }
+        if in_file_constant && indent > 0 {
             continue;
         }
         lines.push((indent, trimmed));
@@ -10426,6 +10456,27 @@ mod tests {
         // A different constant at the top level is still two constants.
         let two = "module Billing\n  class Modifier\n  end\nend\nrequire_relative \"x\"\nmodule Other\nend\n";
         assert!(autoload_primary("models/billing/modifier", two).is_none());
+    }
+
+    /// A file-level constant beside the file's declaration loads with it:
+    /// it does not keep the file loading at boot. Core's
+    /// `type_exfiltrator_plugin/wrappers/test_wrapper.rb` writes
+    /// `IGNORE_TEST_INSTANCE_METHODS` above `module Minitest`; native's
+    /// lazy boot loads it only behind `EXFILTRATE_TYPES`, never locally.
+    #[test]
+    fn file_level_constants_beside_the_declaration_still_autoload() {
+        let wrapper = "require_relative \"../../test\"\n\nIGNORE_TEST_INSTANCE_METHODS = %i[setup teardown].freeze\n\nmodule Minitest\n  module Wrappers\n    class TestWrapper\n      A = 1\n    end\n  end\nend\n";
+        let chain = autoload_primary("models/minitest/wrappers/test_wrapper", wrapper).expect("autoloads");
+        assert_eq!(chain.last().map(|(n, _)| n.as_str()), Some("TestWrapper"));
+        // A value over several lines, before and after the declaration.
+        let multi = "VALID = %i[\n  test\n  sut\n].freeze\n\nmodule StrictWarning\n  def self.offense!(msg)\n  end\nend\n\nLATER = {\n  a: 1,\n}.freeze\n";
+        assert_eq!(autoload_primary("models/strict_warning", multi), Some(vec![("StrictWarning".to_string(), true)]));
+        // A second declaration still makes two constants.
+        let two = "X = 1\nmodule StrictWarning\nend\nmodule Other\nend\n";
+        assert!(autoload_primary("models/strict_warning", two).is_none());
+        // The file's own constant as an assignment is still its leaf.
+        let leaf = "RemoteDomain = DomainSubscription\n";
+        assert_eq!(autoload_primary("models/remote_domain", leaf), Some(vec![("RemoteDomain".to_string(), false)]));
     }
 
     /// A gem the tree loads or a runtime port stands in for is never

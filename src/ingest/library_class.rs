@@ -59,6 +59,77 @@ pub fn ingest_library_classes(
     library_classes(source, file, false)
 }
 
+/// What a support file defines at load time and the library-class
+/// ingest does not carry as Ruby would run it, as `(start, end,
+/// message)` at the statement: a `class`/`module` inside a file-level
+/// conditional (`if BootLib::RAILS_ENV == "test"` around Core's test-env
+/// `StrictWarning`), which Ruby defines only when the condition holds and
+/// the walk does not reach; and the definitions after a file-level
+/// `return` (`return unless ENV["EXFILTRATE_TYPES"]`), which Ruby skips
+/// when the guard returns and the ingest carries unconditionally.
+pub(super) fn file_level_definition_gaps(source: &[u8], file: &str) -> Vec<(usize, usize, String)> {
+    use ruby_prism::Visit;
+    /// The declarations a statement holds, outside method bodies.
+    #[derive(Default)]
+    struct Declared(Vec<String>);
+    impl<'pr> Visit<'pr> for Declared {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.0.push(format!("class {}", class_name_path(node).map(|p| p.join("::")).unwrap_or_default()));
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.0.push(format!("module {}", module_name_path(node).map(|p| p.join("::")).unwrap_or_default()));
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+    }
+    fn listed(names: &[String]) -> String {
+        let mut names: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+        names.dedup();
+        names.join(", ")
+    }
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
+    let returns = |stmt: &ruby_prism::Node<'_>| {
+        stmt.as_return_node().is_some()
+            || stmt.as_if_node().and_then(|n| n.statements()).is_some_and(|s| s.body().iter().any(|b| b.as_return_node().is_some()))
+            || stmt.as_unless_node().and_then(|n| n.statements()).is_some_and(|s| s.body().iter().any(|b| b.as_return_node().is_some()))
+    };
+    let mut out = Vec::new();
+    for (i, stmt) in statements.iter().enumerate() {
+        let loc = stmt.location();
+        if returns(stmt) {
+            let mut after = Declared::default();
+            for later in &statements[i + 1..] {
+                if later.as_class_node().is_some() || later.as_module_node().is_some() {
+                    after.visit(later);
+                } else if let Some(cw) = later.as_constant_write_node() {
+                    after.0.push(constant_id_str(&cw.name()).to_string());
+                }
+            }
+            if !after.0.is_empty() {
+                out.push((loc.start_offset(), loc.end_offset(), format!(
+                    "this file-level `return` skips the rest of the file when it returns, and Roundhouse carries the definitions after it unconditionally ({}): the emitted app defines them where Ruby may not",
+                    listed(&after.0)
+                )));
+            }
+            // Later statements are behind this guard; one report per file.
+            break;
+        }
+        if stmt.as_if_node().is_some() || stmt.as_unless_node().is_some() || stmt.as_case_node().is_some() {
+            let mut inside = Declared::default();
+            inside.visit(stmt);
+            if !inside.0.is_empty() {
+                out.push((loc.start_offset(), loc.end_offset(), format!(
+                    "{} defined inside a file-level conditional, which Ruby evaluates when the file loads; Roundhouse does not carry a conditional definition or the statements beside it, so the emitted app does not define it",
+                    listed(&inside.0)
+                )));
+            }
+        }
+    }
+    out
+}
+
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
 /// (`app/models`, the autoloaded support dirs): a file that declares
 /// no class or module but writes file-level constants still defines
