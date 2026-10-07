@@ -728,16 +728,19 @@ impl<'a> BodyTyper<'a> {
                 && variants.iter().all(|ty| self.owns_operator(Some(ty), method, class_object)),
             Some(Ty::Class { id, .. }) => {
                 let mut current = Some(id);
+                // Comparable defines the four orderings on `<=>`: an app
+                // value class, or a vendored one (`Gem::Version`) the
+                // registry does not model.
+                let ordering = !class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=");
                 for _ in 0..32 {
                     let Some(id) = current else { break };
-                    let Some(class) = self.classes().get(id) else { break };
+                    let Some(class) = self.classes().get(id) else {
+                        return ordering && crate::stdlib_rbs::declares_include(id.0.as_str(), "Comparable");
+                    };
                     let own = if class_object { class.has_class_method(method) } else { class.has_instance_method(method) };
                     if own { return true; }
                     if !class_object && class.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) { return true; }
-                    // Comparable defines the four orderings on `<=>`
-                    // (`Gem::Version`, an app value class).
-                    if !class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=")
-                        && class.includes.iter().any(|m| m.0.as_str() == "Comparable") { return true; }
+                    if ordering && class.includes.iter().any(|m| m.0.as_str() == "Comparable") { return true; }
                     current = class.parent_id();
                 }
                 false
