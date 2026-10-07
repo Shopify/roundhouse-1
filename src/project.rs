@@ -4629,7 +4629,11 @@ fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(St
             continue;
         }
         let file = names.get(&read.name).copied().unwrap_or("the Ruby-family runtime");
-        let (construct, detail) = if harness_name {
+        let (construct, detail) = if read.declaration {
+            ("runtime_constant", format!(
+                "`{}`: {} is declared by the Ruby-family runtime ({file}), which {} does not emit",
+                read.shown, read.name, target.as_str()))
+        } else if harness_name {
             ("harness_constant", format!(
                 "{} is declared by the Ruby-family test harness and runtime ({file}), which {} does not emit",
                 read.name, target.as_str()))

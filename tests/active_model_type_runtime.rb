@@ -221,4 +221,27 @@ show "DateTime apply_seconds_precision", outcome { AR::DateTime.new(precision: 2
 show "DateTime apply_seconds_precision local", outcome { AR::DateTime.new(precision: 1).apply_seconds_precision(LOCAL + Rational(37, 1000)) }
 show "DateTime serialize local zone", outcome { AR::DateTime.new(timezone: :local, precision: 6).serialize(TIME) }
 show "Integer RangeError limit 8", outcome { AR::Integer.new(limit: 8).serialize(2**63) }
+# QueryPredicates, the way Core's Shopify::NormalizedStringType uses it.
+class NormalizedProbe < ActiveRecord::Type::String
+  include ActiveRecord::Type::QueryPredicates
+
+  def comparison_expression(expression)
+    [:normalize, expression]
+  end
+end
+class DecoratedProbe
+  include ActiveRecord::Type::QueryPredicates::Decorator
+  attr_reader :subtype
+  def initialize(subtype) = @subtype = subtype
+end
+class NormalizedValueProbe
+  include ActiveRecord::Type::QueryPredicates::NormalizedValueTypeDecorator
+  attr_reader :cast_type
+  def initialize(cast_type) = @cast_type = cast_type
+end
+QP = ActiveRecord::Type::QueryPredicates
+show "QueryPredicates", [QP.instance_methods.sort, QP::Decorator.ancestors.map(&:name), QP::NormalizedValueTypeDecorator.ancestors.map(&:name)]
+show "QueryPredicates type?", [QP.type?(NormalizedProbe.new), QP.type?(AR::String.new), QP.type?(DecoratedProbe.new(NormalizedProbe.new)), QP.type?(DecoratedProbe.new(AR::String.new)), QP.type?(NormalizedValueProbe.new(NormalizedProbe.new)), QP.type?(nil)]
+show "QueryPredicates expressions", [NormalizedProbe.new.comparison_expression(:col), DecoratedProbe.new(NormalizedProbe.new).comparison_expression(:col), NormalizedValueProbe.new(NormalizedProbe.new).comparison_expression(:col), outcome { DecoratedProbe.new(AR::String.new).comparison_expression(:col) }]
+show "QueryPredicates subtype", [NormalizedProbe.new.query_predicates?, NormalizedProbe.new.cast(" Ab "), NormalizedProbe.new.type, NormalizedProbe.new == AR::String.new]
 show "Integer serializable? yields", outcome { y = nil; [AR::Integer.new(limit: 2).serializable?("40000") { |x| y = x }, y] }
