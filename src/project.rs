@@ -7233,7 +7233,7 @@ pub(crate) fn gem_port_files(gem: &str) -> Option<Vec<&'static str>> {
 /// The finished-tree port file that declares `name` for `gem`: a class,
 /// module or constant the port defines, by its full path.
 pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
-    type Declarations = std::collections::HashMap<&'static str, std::collections::HashMap<String, &'static str>>;
+    type Declarations = crate::det::HashMap<&'static str, crate::det::HashMap<String, &'static str>>;
     static DECLARED: std::sync::OnceLock<Declarations> = std::sync::OnceLock::new();
     DECLARED
         .get_or_init(|| {
@@ -7263,7 +7263,7 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
                     self.1.push(path.join("::"));
                 }
             }
-            let mut out = Declarations::new();
+            let mut out = Declarations::default();
             for (gem, ports) in GEM_RUNTIME_PORTS {
                 let names = out.entry(*gem).or_default();
                 for (source, emitted) in *ports {
