@@ -57,3 +57,41 @@ fn a_native_require_of_useragent_loads_the_port() {
     assert_eq!(stdout, "nil\nFirefox\n[]\n", "{stderr}");
     assert!(!stderr.contains("already initialized constant"), "{stderr}");
 }
+
+/// The tree's copy of the port loads useragent's UserAgent::Version
+/// (runtime/user_agent_version.rb), which Shopify Core's secure_headers gem
+/// source builds at class-body load through
+/// `require_relative "../../../runtime/user_agent"`: "uninitialized constant
+/// UserAgent::Version" stopped Core's emitted boot.
+#[test]
+fn the_ported_user_agent_carries_the_gems_version() {
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_user_agent_version\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let port = std::fs::read_to_string(dir.join("runtime/user_agent.rb")).unwrap();
+    assert!(port.ends_with("require_relative \"user_agent_version\"\n"), "{port}");
+    let feature = std::fs::read_to_string(dir.join("runtime/features/user_agent/version.rb")).unwrap();
+    assert!(feature.contains("require_relative \"../../user_agent_version\""), "{feature}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args([
+            "-W:no-deprecated",
+            "-e",
+            "require_relative 'runtime/user_agent'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require 'user_agent/version'\n\
+             v46 = ::UserAgent::Version.new('46')\n\
+             p [UserAgent::Version.new('126.0') >= v46, UserAgent::Version.new('45.9') >= v46, UserAgent::Version.new('4.0b2') < UserAgent::Version.new('4.0'), UserAgent::Version.new(nil).nil?]\n\
+             p UserAgent.parse('Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0').browser\n\
+             p $LOADED_FEATURES.grep(%r{useragent-|user_agent/version}).map { |f| File.basename(File.dirname(f)) + '/' + File.basename(f) }\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "[true, false, true, true]\n\"Firefox\"\n[\"user_agent/version.rb\"]\n", "{stderr}");
+    assert!(!stderr.contains("already initialized constant") && !stderr.contains("method redefined"), "{stderr}");
+}

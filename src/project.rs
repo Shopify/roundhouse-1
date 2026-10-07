@@ -3580,6 +3580,28 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 ),
             ));
         }
+        // useragent's UserAgent::Version, the gem's own file: the typed
+        // port has no Version class, and secure_headers builds three at
+        // class-body load. CRuby-only, so it rides on this tree's copy of
+        // the port rather than on the shared file every target types.
+        let version = crate::runtime_files::read_to_string("runtime/spinel/user_agent_version.rb")
+            .map_err(|e| format!("read runtime/spinel/user_agent_version.rb: {e}"))?;
+        for (path, content) in files.iter_mut() {
+            if path == "runtime/user_agent.rb" {
+                content.push_str(
+                    "\n# useragent 0.16.11's UserAgent::Version (CRuby PostgreSQL tree only).\n\
+                     require_relative \"user_agent_version\"\n",
+                );
+            }
+        }
+        files.push(("runtime/user_agent_version.rb".into(), version));
+        files.push((
+            "runtime/features/user_agent/version.rb".into(),
+            "# `require \"user_agent/version\"` on this tree: useragent 0.16.11's\n\
+             # UserAgent::Version (runtime/user_agent_version.rb).\n\
+             require_relative \"../../user_agent_version\"\n"
+                .into(),
+        ));
     }
     let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
