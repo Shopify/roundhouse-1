@@ -860,10 +860,19 @@ impl<'a> BodyTyper<'a> {
                     }
                 };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
+                    // A stored class-body local is reported by the name the
+                    // source wrote, not the hidden constant's.
+                    let local = match path.as_slice() {
+                        [name] => crate::ingest::library_class::stored_body_local_name(name.as_str()),
+                        _ => None,
+                    };
                     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
                         construct: Symbol::from("constant"),
-                        detail: written_class_id(path).0.as_str().to_string(),
+                        detail: match local {
+                            Some(local) => format!("class-body local `{local}` holds a value with no inferred type"),
+                            None => written_class_id(path).0.as_str().to_string(),
+                        },
                     });
                 }
                 // A gem's RBI types the constant; only a tree that loads
