@@ -87,7 +87,10 @@ fn app() -> emit_and_run::Overlay {
 /// The program on Core's ActiveSupport and sorbet-runtime.
 fn native(script: &str) -> String {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
-    let dir = std::env::temp_dir().join(format!("rh_string_blank_native_{}", std::process::id()));
+    // Each call gets its own directory, so concurrent tests never share one.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rh_string_blank_native_{}_{seq}", std::process::id()));
     std::fs::create_dir_all(dir.join("lib")).unwrap();
     std::fs::write(dir.join("lib/blank_probe.rb"), LIB).unwrap();
     let program = format!(
