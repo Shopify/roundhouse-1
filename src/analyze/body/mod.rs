@@ -377,6 +377,8 @@ pub struct BodyTyper<'a> {
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
     inquirers: Option<&'a crate::det::HashSet<Symbol>>,
+    /// The base each load hook fires with (see `Analyzer::load_hook_bases`).
+    load_hook_bases: Option<&'a std::collections::BTreeMap<String, ClassId>>,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -410,7 +412,15 @@ impl<'a> BodyTyper<'a> {
     }
 
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
-        Self { classes, deps: None, const_resolver: None, typed_constants: None, data_factories: None, inquirers: None }
+        Self {
+            classes,
+            deps: None,
+            const_resolver: None,
+            typed_constants: None,
+            data_factories: None,
+            inquirers: None,
+            load_hook_bases: None,
+        }
     }
 
     /// The app-wide bare-name value of `name`, noted as a read.
@@ -449,6 +459,11 @@ impl<'a> BodyTyper<'a> {
 
     /// Name the app's inquirer-returning methods, so their predicates
     /// type as Bool instead of failing dispatch on `Str`.
+    pub fn with_load_hook_bases(mut self, bases: &'a std::collections::BTreeMap<String, ClassId>) -> Self {
+        self.load_hook_bases = Some(bases);
+        self
+    }
+
     pub fn with_inquirers(
         mut self,
         inquirers: &'a crate::det::HashSet<Symbol>,
@@ -1499,6 +1514,16 @@ impl<'a> BodyTyper<'a> {
                             block_ctx.self_ty = recv_ty.clone();
                             block_ctx.class_side = self.is_class_object(receiver, ctx);
                         }
+                    }
+                    // `ActiveSupport.on_load(:hook) { … }`: lazy_load_hooks
+                    // `class_eval`s the block on the base the hook fires with.
+                    if method.as_str() == "on_load"
+                        && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ActiveSupport"))
+                        && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: hook } }) = args.first().map(|a| &*a.node)
+                        && let Some(base) = self.load_hook_bases.and_then(|bases| bases.get(hook.as_str()))
+                    {
+                        block_ctx.self_ty = Some(Ty::Class { id: base.clone(), args: vec![] });
+                        block_ctx.class_side = true;
                     }
                     let method_ref_ty = self.analyze_expr(b, &block_ctx);
                     // The Lambda walker stores the analyzed body's type

@@ -2199,6 +2199,32 @@ end
     // the controller that called it directly.
     super::allow_browser::lower_allow_browser(&mut app);
     super::rate_limit::lower_rate_limit(&mut app);
+    // The app's own `ActiveSupport.run_load_hooks` sites, and then every
+    // initializer statement no reader consumed or refused, carried to
+    // run at boot (`initializer_programs`). PostgreSQL trees only: their
+    // boot is the one that runs the railties and the load hooks. Before
+    // the drain, so the carried statements keep their spans; every reader
+    // but the Action Text allowed-attributes one has run (that one's
+    // statement shape is left to it, `initializer_programs::collect`).
+    if declared_database_adapter(vfs, dir).ok().flatten().is_some_and(|(adapter, _)| adapter == "postgresql") {
+        let (class_hooks, fired) =
+            super::initializer_programs::class_load_hooks(&sources, dir, &app.initializer_files);
+        app.class_load_hooks = class_hooks;
+        let load_path: Vec<PathBuf> = std::iter::once(dir.join("lib"))
+            .chain(path_gems.iter().map(|gem| gem.join("lib")))
+            .collect();
+        let lifted: Vec<&str> = super::on_load_hooks::FIRED_HOOKS.iter().map(|(h, _)| *h).collect();
+        let inputs = super::initializer_programs::Inputs {
+            vfs,
+            dir,
+            files: &boot_initializers,
+            load_path: &load_path,
+            loaded_support: &loaded_support,
+            lifted: &lifted,
+        };
+        super::initializer_programs::collect(&mut app, &inputs, &fired);
+        app.load_hook_bases = fired.bases;
+    }
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so

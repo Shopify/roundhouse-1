@@ -85,6 +85,11 @@ pub fn consumed(file: &str) -> Vec<(usize, usize)> {
     CONSUMED.with(|c| c.borrow().get(file).cloned().unwrap_or_default())
 }
 
+/// The ranges a reader refused in `file` so far.
+pub(super) fn refused_ranges(file: &str) -> Vec<(usize, usize)> {
+    REFUSED.with(|r| r.borrow().iter().filter(|x| x.file == file).map(|x| (x.start, x.end)).collect())
+}
+
 /// [`consume`] a prism node's whole location.
 pub(super) fn consume_node(file: &str, node: &Node<'_>) {
     let loc = node.location();
@@ -637,7 +642,7 @@ fn first_line(text: &str) -> String {
 /// receiverless call (`require`), `<expr>.<method>` for any other
 /// receiver, and the statement kind otherwise (`if`, `class`, `constant
 /// assignment`).
-fn construct_of(node: &Node<'_>, src: &str) -> String {
+pub(super) fn construct_of(node: &Node<'_>, src: &str) -> String {
     let with_receiver = |receiver: Option<Node<'_>>, member: String| match receiver {
         None => member,
         Some(r) => format!("{}.{member}", receiver_label(&r, src)),

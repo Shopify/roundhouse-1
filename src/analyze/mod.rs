@@ -134,6 +134,9 @@ pub struct Analyzer {
     /// [`inquiry::is_inquiry_predicate`] needs to answer
     /// `content_type.attachment?` as Bool on a `Str` receiver.
     inquirers: crate::det::HashSet<Symbol>,
+    /// The base each load hook fires with: the `self` of an
+    /// `ActiveSupport.on_load(:hook)` block (`ingest::initializer_programs`).
+    load_hook_bases: std::collections::BTreeMap<String, ClassId>,
     /// Per-(controller, method) ivar bindings AS REFINED by Phase B,
     /// carried across fixpoint rounds.
     ///
@@ -1211,6 +1214,11 @@ impl Analyzer {
             host_folded: HashMap::default(),
             refined_action_bindings: HashMap::default(),
             inquirers: inquiry::inquirer_methods(app),
+            load_hook_bases: crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS
+                .iter()
+                .map(|(hook, base, _)| (hook.to_string(), ClassId(Symbol::from(*base))))
+                .chain(app.load_hook_bases.iter().map(|(hook, base)| (hook.clone(), ClassId(Symbol::from(base.as_str())))))
+                .collect(),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
             typed_constants: IdentityHashMap::default(),
@@ -1233,6 +1241,7 @@ impl Analyzer {
     fn body_typer(&self) -> BodyTyper<'_> {
         let typer = BodyTyper::new(&self.classes)
             .with_inquirers(&self.inquirers)
+            .with_load_hook_bases(&self.load_hook_bases)
             .with_typed_constants(&self.typed_constants)
             .with_data_factories(&self.data_factories);
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
@@ -2182,6 +2191,7 @@ impl Analyzer {
             let shared = body::ConstScope::global(map.clone());
             let typer = BodyTyper::new(&self.classes)
                 .with_inquirers(&self.inquirers)
+            .with_load_hook_bases(&self.load_hook_bases)
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };

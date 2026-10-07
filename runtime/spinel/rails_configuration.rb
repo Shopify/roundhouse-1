@@ -97,6 +97,21 @@ module Rails
       ::Rails::Railtie::Configuration.new.app_middleware
     end
 
+    # The boot hooks `Rails.application.config` inherits from
+    # Rails::Railtie::Configuration (Application::Configuration <
+    # Engine::Configuration < Railtie::Configuration): an app initializer's
+    # `Rails.application.config.after_initialize { ... }` registers on the
+    # same load hooks a gem's railtie does, which the Railtie port's
+    # Initializable phases run (`:after_initialize` in the Finisher).
+    # Without the port, no such key.
+    %i[before_configuration before_eager_load before_initialize after_initialize after_routes_loaded to_prepare].each do |hook|
+      define_method(hook) do |&block|
+        return method_missing(hook, &block) unless defined?(::Rails::Railtie::Configuration)
+
+        ::Rails::Railtie::Configuration.new.public_send(hook, &block)
+      end
+    end
+
     private
 
     def lifted?(name)
