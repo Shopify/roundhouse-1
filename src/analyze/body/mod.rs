@@ -803,8 +803,22 @@ impl<'a> BodyTyper<'a> {
                 // the gem can run it.
                 if expr.diagnostic.is_none() && !app_value {
                     if let Some((gem, loaded)) = self.declaring_gem(path) {
-                        if loaded {
+                        let name = written_class_id(path);
+                        if loaded || crate::project::gem_port_file(&gem, name.0.as_str()).is_some() {
+                            // The gem, or its runtime port where the
+                            // tree carries the port's file (`project`
+                            // checks each tree).
                             expr.decisions |= crate::expr::GEM_CONSTANT_REF;
+                        } else if let Some(ports) = crate::project::gem_port_files(&gem) {
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("constant"),
+                                detail: format!(
+                                    "{} is declared by the {gem} gem, which runs as its runtime port ({}), and the port does not declare it",
+                                    name.0,
+                                    ports.join(", ")
+                                ),
+                            });
                         } else if let Some(reason) = crate::project::gem_requires_rails(&gem) {
                             // Named apart from "no tree loads it": the
                             // gem's source has to be compiled as app code.

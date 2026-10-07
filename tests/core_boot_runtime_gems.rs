@@ -464,6 +464,91 @@ fn a_rails_dependent_gem_is_refused_by_name_and_never_required() {
 
 /// Core's Money is shopify-money's. Another app's own `Money` is named
 /// the same and declares no gem.
+const SEMIAN_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    semian (0.28.3)\n\nDEPENDENCIES\n  activesupport\n  semian (~> 0.27)\n";
+
+/// Core's semian, as essentials and billing name it. The PostgreSQL
+/// CRuby tree carries the runtime port (runtime/spinel/semian*.rb), so
+/// the names it declares run as the port; the gem's net_http adapter is
+/// not ported.
+fn semian_app(postgresql: bool) -> emit_and_run::Overlay {
+    let config = if postgresql { "test_paths:\n  - test\ndatabase_adapter: postgresql\n" } else { "test_paths:\n  - test\n" };
+    let mut app = emit_and_run::empty_app()
+        .write("roundhouse.yml", config)
+        .write("Gemfile.lock", SEMIAN_LOCK)
+        .write("sorbet/rbi/gems/semian@0.28.3.rbi", "# typed: true\nmodule Semian; end\nclass Semian::BaseError < ::StandardError; end\nclass Semian::TimeoutError < ::Semian::BaseError; end\nclass Semian::OpenCircuitError < ::Semian::BaseError; end\nmodule Semian::AdapterError; end\nmodule Semian::NetHTTP; end\n")
+        .write("lib/resilience.rb", r#"class Resilience
+  def timeout?(error)
+    error.is_a?(Semian::TimeoutError)
+  end
+
+  def open_circuit
+    Semian::OpenCircuitError
+  end
+
+  def adapter_error?(error)
+    error.is_a?(Semian::AdapterError)
+  end
+end
+"#);
+    if postgresql {
+        app = app.write("config/database.yml", "test:\n  adapter: postgresql\n  database: app_test\n");
+    }
+    app
+}
+
+/// ingest's standing `database_adapter` refusal for a PostgreSQL app
+/// (`DatabaseAdapter::runtime_refusal`), as in tests/database_yml_boot.rs.
+fn is_adapter_refusal(error: &String) -> bool {
+    error.contains("database_adapter not supported")
+}
+
+#[test]
+fn a_ported_gem_s_constants_run_as_its_runtime_port() {
+    let (dir, errors) = semian_app(true).emit(BuildTarget::Ruby);
+    assert!(errors.iter().all(is_adapter_refusal), "{errors:#?}");
+    let port = std::fs::read_to_string(dir.join("runtime/semian.rb")).expect("semian port");
+    assert!(port.contains("TimeoutError = Class.new(BaseError)"), "{port}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(!facades.contains("\"semian\""), "the gem's own semian.rb is never required: {facades}");
+    let lib = std::fs::read_to_string(dir.join("app/models/resilience.rb")).expect("resilience");
+    let run = emit_and_run::ruby()
+        .args(["-e", "require \"./runtime/semian\"\nrequire \"./app/models/resilience\"\nr = Resilience.new\np [r.timeout?(Semian::TimeoutError.new), r.open_circuit.equal?(Semian::OpenCircuitError), r.adapter_error?(RuntimeError.new), Semian::OpenCircuitError.superclass]\np $LOADED_FEATURES.grep(%r{/gems/semian}).empty?"])
+        .current_dir(&dir)
+        // Names only: the bulkhead's extension is the semian gem's, which
+        // this machine's ruby need not have (tests/database_yml_boot.rs
+        // runs the bulkhead).
+        .env("SEMIAN_SEMAPHORES_DISABLED", "1")
+        .output()
+        .expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout, "[true, true, false, Semian::BaseError]\ntrue\n", "{}\n{lib}", String::from_utf8_lossy(&run.stderr));
+}
+
+/// A name only the gem declares has no port to run it; a tree without
+/// the port (no PostgreSQL bootstrap) and a non-CRuby tree refuse even
+/// the ported names.
+#[test]
+fn a_ported_gem_s_unported_names_and_portless_trees_are_refused() {
+    let gap = semian_app(true).write("lib/net.rb", "class NetAdapter\n  def adapter\n    Semian::NetHTTP\n  end\nend\n");
+    let (_, errors) = gap.emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::NetHTTP is declared by the semian gem, which runs as its runtime port (runtime/semian.rb, runtime/semian_activerecord_postgresql_adapter.rb), and the port does not declare it")),
+        "{errors:#?}"
+    );
+    assert_eq!(errors.iter().filter(|e| !is_adapter_refusal(*e)).count(), 1, "{errors:#?}");
+
+    let (_, errors) = semian_app(false).emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::TimeoutError is declared by the semian gem's runtime port runtime/semian.rb, which only the PostgreSQL CRuby tree carries")),
+        "{errors:#?}"
+    );
+    let (_, errors) = semian_app(false).emit(BuildTarget::Rust);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::TimeoutError is declared by the semian gem, which the rust tree does not load")),
+        "{errors:#?}"
+    );
+}
+
 const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
 
 const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";

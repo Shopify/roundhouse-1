@@ -1507,8 +1507,8 @@ pub fn target_files(
         report_unsupported_runtime_reads(app, target, &files);
         report_unsupported_harness_calls(app, target, &files);
     }
-    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
-        report_unloaded_gem_constants(app, target);
+    if target != BuildTarget::Blog {
+        report_unloaded_gem_constants(app, target, &files);
     }
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Roda) {
         report_unsupported_block_captures(app, target);
@@ -3088,10 +3088,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // `require "semian/activerecord_postgresql_adapter"`, which must
     // compile to `require_relative` of the second file before
     // `DatabaseConfiguration.configure!`.
-    for stem in ["semian", "semian_activerecord_postgresql_adapter"] {
-        let source = crate::runtime_files::read_to_string(&format!("runtime/spinel/{stem}.rb"))
-            .map_err(|e| format!("read {stem} runtime: {e}"))?;
-        files.push((format!("runtime/{stem}.rb"), source));
+    for (_, ports) in GEM_RUNTIME_PORTS {
+        for (source, emitted) in *ports {
+            let text = crate::runtime_files::read_to_string(source)
+                .map_err(|e| format!("read {source} runtime: {e}"))?;
+            files.push((emitted.to_string(), text));
+        }
     }
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
@@ -4847,24 +4849,36 @@ fn report_unsupported_block_captures(app: &App, target: BuildTarget) {
 /// tree, which loads the gem, and is refused on every other target,
 /// which loads none. The analyzer marks each such read
 /// (`GEM_CONSTANT_REF`) and has already refused the ones whose gem no
-/// tree loads.
-fn report_unloaded_gem_constants(app: &App, target: BuildTarget) {
-    fn visit(app: &App, target: BuildTarget, expr: &crate::expr::Expr) {
+/// tree loads. A name a gem's runtime port declares (`GEM_RUNTIME_PORTS`)
+/// runs on the CRuby tree only where the tree carries the port file.
+fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(String, String)]) {
+    fn visit(app: &App, target: BuildTarget, files: &[(String, String)], expr: &crate::expr::Expr) {
         if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
             if let crate::expr::ExprNode::Const { path } = &*expr.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                 let gem = app.gem_boundary.gem_of(&name).unwrap_or("its");
-                emit::diagnostics::report_unsupported(
-                    expr.span,
-                    target.as_str(),
-                    "gem_constant",
-                    format!("{name} is declared by the {gem} gem, which the {} tree does not load", target.as_str()),
-                );
+                if target != BuildTarget::Ruby {
+                    emit::diagnostics::report_unsupported(
+                        expr.span,
+                        target.as_str(),
+                        "gem_constant",
+                        format!("{name} is declared by the {gem} gem, which the {} tree does not load", target.as_str()),
+                    );
+                } else if let Some(port) = gem_port_file(gem, &name)
+                    .filter(|port| !app.gem_boundary.loads(gem) && !files.iter().any(|(p, _)| p == port))
+                {
+                    emit::diagnostics::report_unsupported(
+                        expr.span,
+                        target.as_str(),
+                        "gem_constant",
+                        format!("{name} is declared by the {gem} gem's runtime port {port}, which only the PostgreSQL CRuby tree carries"),
+                    );
+                }
             }
         }
-        expr.node.for_each_child(&mut |child| visit(app, target, child));
+        expr.node.for_each_child(&mut |child| visit(app, target, files, child));
     }
-    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, expr));
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, files, expr));
 }
 
 /// A read of a name only the Ruby-family runtime declares
@@ -6988,7 +7002,6 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
-    ("semian", "its Gemfile entry requires semian/rails, which reopens ActiveRecord's adapters, and semian.rb calls `ActiveSupport.on_load(:active_record)`"),
     ("gurgel", "requiring it loads 2 Rails framework files"),
     ("globalid", "requiring it loads 39 Rails framework files"),
     ("activeresource", "requiring it loads 55 Rails framework files"),
@@ -7083,6 +7096,84 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
 /// `RAILS_DEPENDENT_GEMS`.
 pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
     RAILS_DEPENDENT_GEMS.iter().find(|(g, _)| *g == gem).map(|(_, why)| *why)
+}
+
+/// Gems a runtime port stands in for, with the port's files by source
+/// path and the path each takes in the finished tree. The PostgreSQL
+/// CRuby tree carries them (`apply_postgres_bootstrap`); the gem's own
+/// Ruby is never loaded (`CRUBY_EXTENSION_GEMS`). A name a port file
+/// declares (`Semian::TimeoutError`) runs as the port's, not as the
+/// gem's, so a ported gem is never in `RAILS_DEPENDENT_GEMS`; a name only
+/// the gem's RBI declares (`Semian::NetHTTP`) is refused as a port gap.
+/// Not ports in this sense: concurrent.rb and web_push.rb stand in for
+/// loaded gems on Spinel only, and typed_store.rb and
+/// global_id_locator.rb back lowered DSLs, not the gems' constants.
+const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[(
+    "semian",
+    &[
+        ("runtime/spinel/semian.rb", "runtime/semian.rb"),
+        ("runtime/spinel/semian_activerecord_postgresql_adapter.rb", "runtime/semian_activerecord_postgresql_adapter.rb"),
+    ],
+)];
+
+/// The finished-tree path of `gem`'s runtime port files.
+pub(crate) fn gem_port_files(gem: &str) -> Option<Vec<&'static str>> {
+    GEM_RUNTIME_PORTS.iter().find(|(g, _)| *g == gem).map(|(_, ports)| ports.iter().map(|(_, emitted)| *emitted).collect())
+}
+
+/// The finished-tree port file that declares `name` for `gem`: a class,
+/// module or constant the port defines, by its full path.
+pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
+    type Declarations = std::collections::HashMap<&'static str, std::collections::HashMap<String, &'static str>>;
+    static DECLARED: std::sync::OnceLock<Declarations> = std::sync::OnceLock::new();
+    DECLARED
+        .get_or_init(|| {
+            struct Declared(Vec<String>, Vec<String>);
+            impl Declared {
+                fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+                    self.0.push(String::from_utf8_lossy(path).into_owned());
+                    self.1.push(self.0.join("::"));
+                    if let Some(body) = body {
+                        ruby_prism::Visit::visit(self, &body);
+                    }
+                    self.0.pop();
+                }
+            }
+            impl<'pr> ruby_prism::Visit<'pr> for Declared {
+                fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                    self.enter(node.constant_path().location().as_slice(), node.body());
+                }
+                fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+                    self.enter(node.constant_path().location().as_slice(), node.body());
+                }
+                // `class << Semian::Resource` opens no constant.
+                fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+                fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+                    let mut path = self.0.clone();
+                    path.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+                    self.1.push(path.join("::"));
+                }
+            }
+            let mut out = Declarations::new();
+            for (gem, ports) in GEM_RUNTIME_PORTS {
+                let names = out.entry(*gem).or_default();
+                for (source, emitted) in *ports {
+                    let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+                    let parsed = ruby_prism::parse(text.as_bytes());
+                    let mut declared = Declared(Vec::new(), Vec::new());
+                    if parsed.errors().next().is_none() {
+                        ruby_prism::Visit::visit(&mut declared, &parsed.node());
+                    }
+                    for name in declared.1 {
+                        names.entry(name).or_insert(*emitted);
+                    }
+                }
+            }
+            out
+        })
+        .get(gem)?
+        .get(name.trim_start_matches("::"))
+        .copied()
 }
 
 fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
@@ -9337,6 +9428,37 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gem the tree loads or a runtime port stands in for is never
+    /// refused as Rails-dependent, and a port answers for the names it
+    /// declares only.
+    #[test]
+    fn ported_and_loaded_gems_are_not_refused_as_rails_dependent() {
+        for (gem, _) in RAILS_DEPENDENT_GEMS {
+            assert!(gem_port_files(gem).is_none(), "{gem} has a runtime port");
+            assert!(!ruby_tree_loads_gem(gem), "{gem} is loaded by every CRuby tree");
+            assert!(!LOCK_GATED_REQUIRES.iter().any(|(_, g)| g == gem), "{gem} is Bundler.required");
+        }
+        for (name, file) in [
+            ("Semian", "runtime/semian.rb"),
+            ("Semian::BaseError", "runtime/semian.rb"),
+            ("Semian::TimeoutError", "runtime/semian.rb"),
+            ("Semian::OpenCircuitError", "runtime/semian.rb"),
+            ("Semian::AdapterError", "runtime/semian.rb"),
+            ("Semian::ProtectedResource", "runtime/semian.rb"),
+            ("Semian::Simple::State", "runtime/semian.rb"),
+            ("Semian::Instrumentable::SUBSCRIBERS", "runtime/semian.rb"),
+            ("::Semian::SyscallError", "runtime/semian.rb"),
+            ("Semian::ActiveRecordPostgreSQLAdapter", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            ("ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::CircuitOpenError", "runtime/semian_activerecord_postgresql_adapter.rb"),
+        ] {
+            assert_eq!(gem_port_file("semian", name), Some(file), "{name}");
+        }
+        for name in ["Semian::NetHTTP", "Semian::Redis", "Semian::Resource::<Resource>"] {
+            assert_eq!(gem_port_file("semian", name), None, "{name}");
+        }
+        assert_eq!(gem_port_file("dalli", "Dalli"), None);
+    }
 
     /// The cache port rides along where app code (not a test body)
     /// names its namespaces, and the harness's MemoryStore stand-in,
