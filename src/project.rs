@@ -12367,6 +12367,7 @@ mod tests {
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
             visibility_overrides: Vec::new(),
+            conditional_definitions: Vec::new(),
         };
 
         // The app declares one: the arm names it.
@@ -12543,6 +12544,7 @@ mod tests {
             unknown_calls: Vec::new(),
             class_ivar_initializers: Vec::new(),
             visibility_overrides: Vec::new(),
+            conditional_definitions: Vec::new(),
         });
         let mut files = vec![("boot.rb".to_string(), "# boot\n".to_string())];
         apply_module_mixins(&mut files, &modapp, MixinForm::Reopen);
