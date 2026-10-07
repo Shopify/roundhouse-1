@@ -1,6 +1,7 @@
 // `Rails.event` / `Rails.error` (runtime/ruby/active_support_reporters.rb)
-// against activesupport 8.1.4: tests/reporters_runtime.rb runs the same
-// observations natively and on the runtime port and requires them equal.
+// against the activesupport native Core runs (Shopify/rails 5813559f4aed,
+// 8.2.0.alpha; tests/support/rails_oracle.rb): tests/reporters_runtime.rb runs
+// the same observations natively and on the runtime port and requires them equal.
 
 use std::path::Path;
 use std::process::Command;

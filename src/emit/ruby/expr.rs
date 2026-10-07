@@ -105,6 +105,14 @@ pub fn emit_expr(e: &Expr) -> String {
             .render(&crate::diagnostic::Diagnostic::stub_text(kind));
         return format!("({stub})");
     }
+    // A statement ingest refused (`ingest_statement_list`). NotImplementedError
+    // is a ScriptError, so an app's `rescue => e` does not swallow the gap.
+    // Single-quoted: the detail quotes source, which may hold `#{`.
+    if let Some(kind @ DiagnosticKind::IngestRefused { .. }) = &e.diagnostic {
+        let text = format!("roundhouse: {}", crate::diagnostic::Diagnostic::stub_text(kind));
+        let quoted = text.replace('\\', "\\\\").replace('\'', "\\'");
+        return format!("(::Kernel.raise(::NotImplementedError, '{quoted}'))");
+    }
     if crate::emit::shared::string_bytes::materializes_array(e) {
         if let ExprNode::Send { recv, method, args, parenthesized, .. } = &*e.node {
             // Literal &nil supplies no block. Canonicalize it here so Spinel

@@ -1,4 +1,4 @@
-# Native ActiveSupport 8.1.4 oracle for LogSubscriber::TestHelper in the shape
+# Native ActiveSupport oracle (the copy native Core runs) for LogSubscriber::TestHelper in the shape
 # Core's query_error_log_subscriber_test uses it: a subscriber attached at boot,
 # Active Record's per-thread instrumenter cached by SQL that ran before setup,
 # then setup swapping in a fresh notifier and a MockLogger.
@@ -7,8 +7,10 @@ require "logger"
 
 if ARGV.first == "compare"
   require "open3"
+  require_relative "support/rails_oracle"
   outputs = ["native", "emitted"].map do |mode|
-    stdout, stderr, status = Open3.capture3(RbConfig.ruby, __FILE__, mode)
+    # The emitted side loads the pg gem from Core's pinned gem home.
+    stdout, stderr, status = Open3.capture3(RailsOracle.core_gems_env, RbConfig.ruby, __FILE__, mode)
     abort "#{mode}: #{stderr}" unless status.success?
     stdout
   end
@@ -19,7 +21,9 @@ if ARGV.first == "compare"
 end
 
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  # The ActiveSupport native Core runs (RH_RAILS_ORACLE overrides it).
+  require_relative "support/rails_oracle"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/log_subscriber"
   require "active_support/log_subscriber/test_helper"
@@ -84,7 +88,7 @@ class ProbeTest
     rescue StatementFailure
     end
     [@logger.logged(:error).size, @logger.logged(:error).first, @logger.error?, @logger.debug?,
-     ActiveSupport::LogSubscriber.colorize_logging]
+     ActiveSupport.colorize_logging, ActiveSupport::LogSubscriber.respond_to?(:colorize_logging)]
   ensure
     teardown
   end
@@ -117,8 +121,10 @@ mock.flush
 observed[:mock] = [mock.logged(:info), mock.logged(:warn), mock.info?, mock.warn?, mock.flush_count]
 
 expected = {
-  failing: [1, "relation does not exist\nSQL:\nSELECT * FROM missing", true, true, false],
-  working: [0, nil, true, true, false],
+  # Setup turns ActiveSupport.colorize_logging off; LogSubscriber has no
+  # class-level colorize_logging since Rails 8.2.
+  failing: [1, "relation does not exist\nSQL:\nSELECT * FROM missing", true, true, false, false],
+  working: [0, nil, true, true, false, false],
   after_teardown: [true, 0],
   fresh_thread: 0,
   mock: [["block"], ["padded"], false, true, 1]

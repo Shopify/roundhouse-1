@@ -918,6 +918,9 @@ impl<'a> BodyTyper<'a> {
                         return ty;
                     }
                 }
+                if id.0.as_str() == "Array" && method.as_str() == "try_convert" && call_args.len() == 1 {
+                    return array_try_convert(call_args[0].ty.as_ref());
+                }
                 // `Range` is modeled as `Ty::Class { id: "Range", args:
                 // [elem] }` (see the body-typer's `ExprNode::Range` arm),
                 // not a dedicated `Ty` variant, so its methods live in a
@@ -1917,6 +1920,27 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
 
 /// Ruby's native date-only surface. Do not inherit the Time table:
 /// Date has neither epoch seconds nor a zone, and only Date supports >>.
+/// `Array.try_convert(value)`: the value itself when it is an Array, `nil`
+/// for the core values that answer no `to_ary`, and `Array?` for an object
+/// whose own `to_ary` may answer. Ingest's splat multi-write desugar
+/// (`*a, b = value`) destructures `Array.try_convert(value) || [value]`, so
+/// an Array value keeps its element type and a String one wraps as itself.
+fn array_try_convert(value: Option<&Ty>) -> Ty {
+    match value {
+        Some(ty @ (Ty::Array { .. } | Ty::Tuple { .. })) => ty.clone(),
+        Some(Ty::Nil | Ty::Bool | Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Hash { .. } | Ty::Date | Ty::Time) => Ty::Nil,
+        Some(Ty::Union { variants }) => variants
+            .iter()
+            .map(|variant| array_try_convert(Some(variant)))
+            .reduce(union_of)
+            .unwrap_or_else(unknown),
+        Some(Ty::Untyped | Ty::Class { .. }) => Ty::Union {
+            variants: vec![Ty::Array { elem: Box::new(Ty::Untyped) }, Ty::Nil],
+        },
+        _ => unknown(),
+    }
+}
+
 fn date_constructor(method: &Symbol, args: &[crate::expr::Expr]) -> Option<Ty> {
     // Every core Date argument is optional. Reject known wrong types
     // and excess arguments rather than declaring a crashing call clean.

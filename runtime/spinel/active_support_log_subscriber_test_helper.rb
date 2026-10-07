@@ -1,4 +1,5 @@
-# ActiveSupport::LogSubscriber::TestHelper (activesupport 8.1.4), over the
+# ActiveSupport::LogSubscriber::TestHelper (the activesupport native Core runs,
+# Shopify/rails 5813559f4aed, 8.2.0.alpha), over the
 # Ruby-family notification and log-subscriber runtime. Test-only: the PostgreSQL
 # test bootstrap requires it when a test names it; SQL events there are
 # delivered synchronously.
@@ -16,7 +17,7 @@ module ActiveSupport
         @logger = MockLogger.new
         @notifier = ActiveSupport::Notifications::Fanout.new
 
-        ActiveSupport::LogSubscriber.colorize_logging = false
+        ActiveSupport.colorize_logging = false
 
         @old_notifier = ActiveSupport::Notifications.notifier
         set_logger(@logger)

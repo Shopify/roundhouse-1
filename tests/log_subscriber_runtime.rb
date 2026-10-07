@@ -17,9 +17,12 @@ if ARGV.first == "compare"
 end
 
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  # The ActiveSupport native Core runs (RH_RAILS_ORACLE overrides it).
+  require_relative "support/rails_oracle"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/log_subscriber"
+  require "active_support/core_ext/object/blank" # loaded by any Rails app; `color` needs it
 else
   require_relative "../runtime/spinel/active_support_log_subscriber"
 end
@@ -71,12 +74,34 @@ ContractLogSubscriber.detach_from(:contract)
 notifications.notifier = old_notifier
 observed[:notifier_swap] = output.string.lines.last
 
+# Rails 8.2's ColorizeLogging: ActiveSupport.colorize_logging, public
+# level helpers and color, no class-level colorize_logging; a logger
+# assigned without #flush is not flushed.
+colored = ContractLogSubscriber.new
+observed[:colorize] = [
+  ActiveSupport.colorize_logging,
+  colored.color("hi", :red, bold: true, italic: nil),
+  colored.color("hi", ActiveSupport::LogSubscriber::GREEN),
+  ActiveSupport::LogSubscriber.respond_to?(:colorize_logging),
+  ActiveSupport::LogSubscriber.public_method_defined?(:info),
+  ActiveSupport::LogSubscriber.public_method_defined?(:color),
+]
+ActiveSupport.colorize_logging = false
+observed[:colorize] << colored.color("hi", :red, bold: true)
+ActiveSupport.colorize_logging = true
+ActiveSupport::LogSubscriber.logger = Object.new
+ActiveSupport::LogSubscriber.flush_all!
+ActiveSupport::LogSubscriber.logger = logger
+observed[:flush_without_flush] = true
+
 expected = {
   errors: ["ERROR:SELECT missing:missing relation\n"],
   level_filter: true,
   method_added: "INFO:added after attach\n",
   detached: true,
-  notifier_swap: "INFO:new notifier\n"
+  notifier_swap: "INFO:new notifier\n",
+  colorize: [true, "\e[1m\e[31mhi\e[0m", "\e[32mhi\e[0m", false, true, true, "hi"],
+  flush_without_flush: true
 }
 abort "unexpected contract: #{observed.inspect}" unless observed == expected
 

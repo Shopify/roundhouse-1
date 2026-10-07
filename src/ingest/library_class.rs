@@ -1765,8 +1765,21 @@ fn walk_decl_body_with_visibility<'pr>(
                 continue;
             }
             let name = Symbol::from(constant_id_str(&cw.name()));
+            // `ZeitwerkLoader = Zeitwerk::Loader.for_gem`: compiled into
+            // the generated autoload, not run (`ingest::zeitwerk`).
+            if let Some(value) = super::zeitwerk::loader_constant(&cw, owner, file) {
+                out.constants.push((name, value));
+                continue;
+            }
             let value = ingest_expr(&cw.value(), file)?;
             out.constants.push((name, value));
+            continue;
+        }
+        // `ZeitwerkLoader.ignore(File.join(__dir__, "tapioca"))`,
+        // `ZeitwerkLoader.setup`: applied statically; any other call on
+        // the loader is refused at its site.
+        if let Some(applied) = super::zeitwerk::loader_call(stmt, owner, file) {
+            out.unknown_calls.extend(applied);
             continue;
         }
         // Retain native nil initialization in source order. Only a declared

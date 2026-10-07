@@ -36,6 +36,12 @@ pub use rbs::ty_to_rbs;
 // External API: the historical surface kept for `tests/` and `bin/`.
 pub use expr::{emit_expr, with_native_keyword_splats};
 
+/// The `app/models/<stem>` file a library class is emitted into (a
+/// nested class goes in its outermost owner's file), as `<stem>`.
+pub(crate) fn library_file_stem(name: &str, app: &App) -> String {
+    crate::naming::underscore(&library::file_owner(name, app))
+}
+
 /// Emit a single `MethodDef` as Ruby source (trailing newline included).
 /// The signature and effects are not emitted — they belong to the RBS
 /// sidecar, not to Ruby itself. Used by the runtime-extraction pipeline

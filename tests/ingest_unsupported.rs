@@ -5,9 +5,11 @@
 //! left the file's classes out of the IR with nothing said: a Core
 //! `check` reported zero errors for Podding files the emitted app did
 //! not contain. Each such file is now an `ingest_unsupported` error at
-//! the construct that failed it. `--continue` absorbs an expression gap
-//! (the file stays in), and lists a gap that still drops the file both
-//! as that error and in its punch list.
+//! the construct that failed it. A statement inside a body is refused at
+//! its own site instead (`tests/ingest_site_refusal.rs`): the file stays
+//! in and the statement raises if reached. `--continue` absorbs an
+//! expression gap (the file stays in), and lists a gap that still drops
+//! the file both as that error and in its punch list.
 
 use std::path::Path;
 use std::process::Command;
@@ -35,19 +37,20 @@ fn check(root: &Path, args: &[&str]) -> (bool, String) {
 }
 
 #[test]
-fn a_dropped_lib_file_is_an_error_at_the_construct() {
+fn a_refused_statement_is_an_error_at_the_construct_and_keeps_the_file() {
     let root = std::env::temp_dir().join(format!("roundhouse-ingest-unsupported-{}", std::process::id()));
     app(&root);
     let (ok, text) = check(&root, &[]);
     let (_, survey) = check(&root, &["--continue"]);
     let _ = std::fs::remove_dir_all(&root);
-    assert!(!ok, "check passed with a dropped file:\n{text}");
+    assert!(!ok, "check passed with a refused statement:\n{text}");
     assert!(
         text.contains("lib/tally.rb:4:5: error[ingest_unsupported]: `for` requires enclosing-scope lowering"),
         "no ingest_unsupported error at the `for`:\n{text}"
     );
-    assert!(text.contains("left this file's classes, modules and constants out of the emitted app"), "{text}");
-    assert_eq!(text.matches("error[ingest_unsupported]").count(), 1, "only the failed file:\n{text}");
+    assert!(text.contains("this statement was not ingested and raises NotImplementedError if reached"), "{text}");
+    assert!(!text.contains("out of the emitted app"), "the file was dropped:\n{text}");
+    assert_eq!(text.matches("error[ingest_unsupported]").count(), 1, "only the refused statement:\n{text}");
     // Survey mode keeps going through the gap and lists it once, as a
     // gap rather than a second, per-file error.
     assert!(!survey.contains("error[ingest_unsupported]"), "{survey}");

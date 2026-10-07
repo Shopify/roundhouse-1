@@ -70,6 +70,8 @@ module ActiveSupport
 
     def self.context_store: () -> untyped
     def self.context_store=: (untyped store) -> untyped
+    def self.filter_parameters: () -> Array[untyped]?
+    def self.filter_parameters=: (Array[untyped]? filters) -> Array[untyped]?
 
     def initialize: (*untyped subscribers, ?raise_on_error: bool) -> void
     def raise_on_error=: (bool value) -> bool
@@ -77,19 +79,20 @@ module ActiveSupport
     def subscribers: () -> Array[Hash[Symbol, untyped]]
     def subscribe: (untyped subscriber) ?{ (Hash[Symbol, untyped] event) -> untyped } -> Array[Hash[Symbol, untyped]]
     def unsubscribe: (untyped subscriber) -> Array[Hash[Symbol, untyped]]
-    def notify: (untyped name_or_object, ?untyped payload, ?caller_depth: Integer, **untyped kwargs) -> nil
+    def notify: (untyped name_or_object, ?untyped payload, ?caller_depth: Integer, ?filter_payload: bool, **untyped kwargs) -> nil
     def with_debug: () { () -> untyped } -> untyped
     def debug_mode?: () -> bool?
-    def debug: (untyped name_or_object, ?untyped payload, ?caller_depth: Integer, **untyped kwargs) ?{ () -> Hash[untyped, untyped] } -> nil
+    def debug: (untyped name_or_object, ?untyped payload, ?caller_depth: Integer, ?filter_payload: bool, **untyped kwargs) ?{ () -> Hash[untyped, untyped] } -> nil
     def tagged: (*untyped args, **untyped kwargs) { () -> untyped } -> untyped
     def set_context: (Hash[untyped, untyped] context) -> Hash[Symbol, untyped]
     def clear_context: () -> Hash[Symbol, untyped]
     def context: () -> Hash[Symbol, untyped]
     def reload_payload_filter: () -> ParameterFilter
-    def deliver: (untyped name_or_object, untyped payload, Hash[untyped, untyped] kwargs, Integer depth) -> nil
+    def deliver: (untyped name_or_object, untyped payload, Hash[untyped, untyped] kwargs, bool filter_payload, Integer depth) -> nil
     def payload_filter: () -> ParameterFilter
+    def effective_filter_parameters: () -> Array[untyped]
     def resolve_name: (untyped name_or_object) -> String?
-    def resolve_payload: (untyped name_or_object, untyped payload, Hash[untyped, untyped] kwargs) -> untyped
+    def resolve_payload: (untyped name_or_object, untyped payload, Hash[untyped, untyped] kwargs, bool filter) -> untyped
     def symbolize: (Hash[untyped, untyped] hash) -> Hash[Symbol, untyped]
     def handle_unexpected_args: (untyped name_or_object, untyped payload, Hash[untyped, untyped] kwargs) -> nil
   end
@@ -130,6 +133,7 @@ module ActiveSupport
     def set_context: (**untyped context) ?{ () -> untyped } -> untyped
     def add_middleware: (untyped middleware) -> Array[untyped]
     def report: (untyped error, ?handled: bool, ?severity: Symbol, ?context: Hash[untyped, untyped]?, ?source: String) -> nil
+    def deep_dup: (untyped value) -> untyped
     def disabled_for_thread: () -> Array[untyped]?
     def disabled_subscribers: () -> Array[untyped]
     def ensure_backtrace: (::Exception error) -> nil

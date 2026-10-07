@@ -817,7 +817,16 @@ fn every_runtime_method_body_concretely_typed() {
     // What it bought: `ValueTooLong` and `RecordNotUnique` hand their
     // message to a parent constructor that exists on Kotlin, Swift and
     // C# (tests/runtime_errors_strict_constructors.rs).
-    const CEILING: usize = 469;
+    //
+    // 469 -> 490 MEASURED, +21 (active_support_reporters.rb 172 -> 193):
+    // the port follows Core's pinned Rails 8.2.0.alpha. ErrorReporter
+    // hands each subscriber a `deep_dup` of the caller-defined context
+    // (Object#deep_dup over untyped hashes, arrays and values), and
+    // EventReporter resolves subscribers from the name before building a
+    // payload, with `filter_payload:` choosing whether that untyped
+    // payload is filtered. What it bought: a subscriber that mutates its
+    // context no longer changes what the next one sees, as in native Core.
+    const CEILING: usize = 490;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

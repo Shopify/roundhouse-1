@@ -202,7 +202,16 @@ fn declaration_gap_does_not_hide_a_failure_inside_the_block() {
         "class Article < ApplicationRecord\n  aasm do\n    `unsupported_command`\n  end\nend\n",
         "module Workflow\nend\n",
     );
-    let strict_error = ingest_app_from_tree(files.clone()).expect_err("strict ingest still fails");
+    // Strict ingest refuses the failing body statement at its own site
+    // (it raises if reached) and keeps the model.
+    let strict = ingest_app_from_tree(files.clone()).expect("strict ingest keeps the model");
+    let strict_error = diagnose(&strict)
+        .into_iter()
+        .find_map(|d| match d.kind {
+            DiagnosticKind::IngestRefused { detail } => Some(detail),
+            _ => None,
+        })
+        .expect("the body statement is refused at its site");
     survey::activate();
     let result = ingest_app_from_tree(files);
     let gaps = survey::drain();
@@ -228,7 +237,7 @@ fn declaration_gap_does_not_hide_a_failure_inside_the_block() {
         actual
             .iter()
             .skip(declaration + 1)
-            .any(|(_, message)| strict_error.to_string().contains(message)),
+            .any(|(_, message)| strict_error.contains(message)),
         "original body failure recorded after the declaration: {strict_error}"
     );
 }

@@ -1,13 +1,14 @@
 # frozen_string_literal: true
 
 # ActiveSupport::Testing::TimeHelpers and its SimpleStubs, ported from
-# activesupport 8.1.4 (lib/active_support/testing/time_helpers.rb) for the
+# the Rails Core runs, 8.2.0.alpha (Shopify/rails 5813559f4aed,
+# activesupport/lib/active_support/testing/time_helpers.rb) for the
 # CRuby and JRuby trees. Carried where the app or its tests name the
 # module or call a helper the harness lacks (`freeze_time`); the harness
 # TestBase then includes it, as ActiveSupport::TestCase does, in place of
 # its offset stand-in.
 #
-# Each method follows the 8.1.4 source: `travel_to` stubs `Time.now`,
+# Each method follows that source: `travel_to` stubs `Time.now`,
 # `Time.new` (no arguments), `Date.today` and `DateTime.now` on their
 # singletons, so time is frozen at the target until `travel_back`.
 # The runtime's own clock (`ActiveSupport.now`) reads `Time.now`, so it
@@ -176,7 +177,7 @@ module ActiveSupport
         end
 
         stubs.stub_object(Date, :today) { jd(now.to_date.jd) }
-        stubs.stub_object(DateTime, :now) { jd(now.to_date.jd, now.hour, now.min, now.sec, Rational(now.utc_offset, 86400)) }
+        stubs.stub_object(DateTime, :now) { jd(now.to_date.jd, now.hour, now.min, now.sec + now.subsec, Rational(now.utc_offset, 86400)) }
 
         if block_given?
           begin

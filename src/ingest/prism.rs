@@ -156,8 +156,8 @@ mod tests {
         let ExprNode::Send { block: Some(block), .. } = &*expr.node else { panic!("missing map block") };
         let ExprNode::Lambda { params, body, .. } = &*block.node else { panic!("missing lambda") };
         assert_eq!(params[0].as_str(), "__mw_24");
+        // The multi-write's assignments are spliced into the block body.
         let ExprNode::Seq { exprs } = &*body.node else { panic!("missing block body") };
-        let ExprNode::Seq { exprs } = &*exprs[0].node else { panic!("missing multi-write") };
         let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*exprs[0].node else {
             panic!("missing temporary");
         };

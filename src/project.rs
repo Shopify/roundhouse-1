@@ -4262,6 +4262,25 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     use std::collections::BTreeMap;
     use std::fmt::Write;
 
+    // Files a Zeitwerk loader leaves alone (`ingest::zeitwerk`): an
+    // ignored path, or a loader that is never set up. Still carried, but
+    // neither autoloaded nor eager-loaded, as Zeitwerk does. A file
+    // another, managed class also lives in stays registered.
+    let anchor_of = |name: &crate::ident::ClassId| {
+        format!("models/{}", crate::emit::ruby::library_file_stem(name.0.as_str(), app))
+    };
+    let ignored_classes: std::collections::BTreeSet<&crate::ident::ClassId> =
+        app.zeitwerk_loaders.iter().flat_map(|l| l.ignored.iter()).collect();
+    let kept: std::collections::BTreeSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| !ignored_classes.contains(&c.name))
+        .map(|c| anchor_of(&c.name))
+        .chain(app.models.iter().map(|m| anchor_of(&m.name)))
+        .collect();
+    let ignored_anchors: std::collections::BTreeSet<String> =
+        ignored_classes.iter().map(|c| anchor_of(c)).filter(|a| !kept.contains(a)).collect();
+
     let mut models: Vec<(String, String)> = files
         .iter()
         .filter(|(p, _)| p.starts_with("app/models/") && p.ends_with(".rb"))
@@ -4269,6 +4288,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             let anchor = p.strip_prefix("app/").unwrap_or(p).strip_suffix(".rb").unwrap_or(p).to_string();
             (anchor, c.clone())
         })
+        .filter(|(anchor, _)| !ignored_anchors.contains(anchor))
         .collect();
     models.sort();
 
@@ -4342,6 +4362,24 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     };
     write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().copied())).unwrap();
     write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut models.iter().map(|(a, _)| a.as_str()))).unwrap();
+    // Each Zeitwerk loader's files, for its `eager_load`.
+    body.push_str("  # Zeitwerk loader constant => the files it manages\n  LOADERS = {\n");
+    for loader in &app.zeitwerk_loaders {
+        let mut anchors: Vec<String> = loader
+            .managed
+            .iter()
+            .map(|c| anchor_of(c))
+            .filter(|a| models.iter().any(|(m, _)| m == a))
+            .collect();
+        anchors.sort();
+        anchors.dedup();
+        write!(body, "    {:?} => [\n", loader.constant).unwrap();
+        for anchor in &anchors {
+            write!(body, "      {anchor:?},\n").unwrap();
+        }
+        body.push_str("    ].freeze,\n");
+    }
+    body.push_str("  }.freeze\n");
     body.push_str(AUTOLOAD_RUNTIME);
 
     // The environment's `config.eager_load`, as the app wrote it. Rails'
@@ -4418,6 +4456,31 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   def self.eager_load!
     ALL_FILES.each { |file| require path(file) }
+  end
+
+  # A Zeitwerk loader the app creates (`Zeitwerk::Loader.for_gem`),
+  # compiled: its files are registered above with the app's, minus the
+  # paths it ignores, so it is already set up; `eager_load` loads them.
+  class Loader
+    attr_reader :name
+
+    def initialize(name, files)
+      @name = name
+      @files = files
+    end
+
+    def setup
+      nil
+    end
+
+    def eager_load(force: false)
+      @files.each { |file| require RoundhouseAutoload.path(file) }
+      nil
+    end
+  end
+
+  def self.loader(name)
+    Loader.new(name, LOADERS.fetch(name))
   end
 
   # A namespace defined by its own file, or by `const_set` above,

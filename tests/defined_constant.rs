@@ -101,10 +101,14 @@ fn argument_free_method_queries_keep_native_syntax() {
 #[test]
 fn argument_and_index_queries_stay_unsupported() {
     for guard in ["defined?(obj.method(11))", "defined?(foo[0])"] {
+        // Refused at the statement's own site: it raises if reached and
+        // the rest of the class is ingested.
         let source = format!("class Probe\n  def check\n    {guard}\n  end\nend\n");
-        let err = ingest_library_classes(source.as_bytes(), "guard.rb").expect_err(guard);
-        let message = err.to_string();
-        assert!(message.contains("defined? calls with arguments"), "{guard}: {message}");
+        let body = method_body(&source);
+        let Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail }) = &body.diagnostic else {
+            panic!("{guard}: not refused at its site: {body:?}");
+        };
+        assert!(detail.contains("defined? calls with arguments"), "{guard}: {detail}");
     }
 }
 

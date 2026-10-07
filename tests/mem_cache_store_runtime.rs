@@ -1,5 +1,6 @@
 // ActiveSupport::Cache::MemCacheStore (runtime/spinel/
-// active_support_mem_cache_store.rb) against activesupport 8.1.4, both on
+// active_support_mem_cache_store.rb) against the activesupport native Core
+// runs (Shopify/rails 5813559f4aed, 8.2.0.alpha), both on
 // the dalli fork in Core's pinned gem home: tests/mem_cache_store_runtime.rb
 // runs the same observations natively and on the runtime port and requires
 // them equal. The live half runs against a memcached the script starts on

@@ -1,5 +1,6 @@
 //! ActiveSupport::Testing::TimeHelpers (runtime/spinel/
-//! active_support_testing_time_helpers.rb) against activesupport 8.1.4:
+//! active_support_testing_time_helpers.rb) against the Rails native Core
+//! runs (tests/support/rails_oracle.rb; 8.2.0.alpha by default):
 //! tests/time_helpers_runtime.rb runs the same observations natively and
 //! on the runtime port and requires them equal. The emitted-tree tests
 //! hold the wiring: a CRuby tree whose tests freeze time carries the port,

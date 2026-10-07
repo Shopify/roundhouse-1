@@ -1,4 +1,5 @@
-# Native ActiveSupport 8.1.4 oracle for ActiveSupport::Cache::MemCacheStore
+# Native ActiveSupport oracle (the Rails native Core runs; tests/support/
+# rails_oracle.rb) for ActiveSupport::Cache::MemCacheStore
 # against runtime/spinel/active_support_mem_cache_store.rb. Both sides load
 # one dalli: Shopify's fork from Core's pinned gem home (CORE_GEM_HOME,
 # bundler/gems/dalli-*), and that gem home's connection_pool. Each mode
@@ -11,6 +12,7 @@
 # or the nix store has a binary; otherwise it prints "live: untested" in both modes.
 require "json"
 require "socket"
+require_relative "support/rails_oracle"
 
 CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
 
@@ -24,7 +26,8 @@ end
 
 if ARGV.first == "compare"
   require "open3"
-  env = {}
+  # Both modes load dalli and its dependencies from the pinned gem home.
+  env = RailsOracle.core_gems_env
   server = nil
   if (binary = memcached_binary)
     probe = TCPServer.new("127.0.0.1", 0)
@@ -59,7 +62,7 @@ if ARGV.first == "compare"
     abort "stores differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and the emitted MemCacheStore agree"
+  puts "Native ActiveSupport and the emitted MemCacheStore agree (#{RailsOracle.label})"
   exit
 end
 
@@ -69,7 +72,7 @@ $LOAD_PATH.unshift(dalli, pool)
 
 require "rack"
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/cache"
   require "active_support/cache/mem_cache_store"
@@ -126,16 +129,21 @@ class Lines
     @lines = []
   end
 
+  # ::Logger at :info: debug is dropped, its block not called.
   def debug? = false
-  def debug(message) = @lines << [:debug, message]
-  def error(message) = @lines << [:error, message]
-  def warn(message) = @lines << [:warn, message]
+  def debug(message = nil, &block) = (@lines << [:debug, block ? block.call : message] if debug?)
+  def error(message = nil, &block) = @lines << [:error, block ? block.call : message]
+  def warn(message = nil, &block) = @lines << [:warn, block ? block.call : message]
 end
 
 Store = ActiveSupport::Cache::MemCacheStore
 show "versioning", Store.supports_cache_versioning?
 show "overridden", Store::OVERRIDDEN_OPTIONS
-show "escape", Store::ESCAPE_KEY_CHARS
+# 8.2 dropped the constant and writes the pattern inline.
+show "escape", outcome { Store::ESCAPE_KEY_CHARS }
+# Which multi-key hooks the store answers itself, given this dalli
+# (set_multi: yes; delete_multi only from dalli 5.0.6).
+show "multi hooks", %i[write_multi_entries delete_multi_entries read_multi_entries].map { |m| Store.instance_method(m).owner.name }
 
 # --- construction and options, no server -----------------------------------
 offline = Store.new("127.0.0.1:1", namespace: "rh", expires_in: 60, compress_threshold: 10, pool: false)
@@ -151,6 +159,8 @@ show "array addresses", Store.new(["127.0.0.1:1", "127.0.0.1:2"], pool: false).i
 show "no addresses", Store.new(pool: false).instance_variable_get(:@data).instance_variable_get(:@normalized_servers)
 show "bad address", outcome { Store.new(1) }
 show "symbol address", outcome { Store.new(:x) }
+# 8.1 took a Dalli::Client as the first address; 8.2 refuses it.
+show "client address", outcome { Store.new(Dalli::Client.new("127.0.0.1:1"), pool: false).instance_variable_get(:@data).class }
 pooled = Store.new("127.0.0.1:1", pool: { size: 2, timeout: 1 })
 show "pooled", pooled.instance_variable_get(:@data).class
 show "pool size", pooled.instance_variable_get(:@data).size
@@ -237,6 +247,8 @@ show "skip_nil", [skip_nil.fetch("sn") { nil }, skip_nil.exist?("sn")]
 show "versioned", [store.write("v", 1, version: "a"), store.read("v", version: "a"), store.read("v", version: "b")]
 show "delete", [store.delete("k"), store.read("k"), store.delete("k")]
 show "write_multi", store.write_multi("m1" => 1, "m2" => [2])
+show "write_multi expiring", [store.write_multi({ "w1" => "a", "w2" => "b" }, expires_in: 1, race_condition_ttl: 2), store.read_multi("w1", "w2"), store.write_multi({})]
+show "write_multi raw", [store.write_multi({ "wr" => 7 }, raw: true), store.read("wr", raw: true), store.increment("wr")]
 show "read_multi", store.read_multi("m1", "m2", "m3")
 show "fetch_multi", store.fetch_multi("m1", "m4") { |key| "#{key}!" }
 show "read_multi versions", store.read_multi("v", version: "a")

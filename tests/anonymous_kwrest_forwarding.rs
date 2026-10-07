@@ -63,10 +63,17 @@ fn mixed_anonymous_keywords_keep_the_existing_unsupported_diagnostic() {
         let source = format!("class Probe; def call(options, **); {call}; end; end");
         let parsed = ruby_prism::parse(source.as_bytes());
         assert_eq!(parsed.errors().count(), 0, "legal Ruby control: {source}");
-        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-            .expect_err("mixed keyword forwarding remains unsupported");
-        assert!(matches!(err, roundhouse::ingest::IngestError::Unsupported { message, .. }
-            if message == "anonymous `**` keyword forwarding not yet supported"));
+        // Refused at the call's own statement, which raises if reached;
+        // the class and its method are still ingested.
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .expect("a refused statement keeps its class");
+        let method = classes[0].methods.iter().find(|m| m.name.as_str() == "call").expect("call");
+        assert!(
+            matches!(&method.body.diagnostic, Some(roundhouse::diagnostic::DiagnosticKind::IngestRefused { detail })
+                if detail == "anonymous `**` keyword forwarding not yet supported"),
+            "{call}: {:?}",
+            method.body
+        );
     }
 }
 

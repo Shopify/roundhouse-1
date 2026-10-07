@@ -1,5 +1,6 @@
-# Native Rails 8.1.4 oracle for tests/database_yml_boot.rs. Only this
-# script loads Rails; the emitted program never does.
+# Native Rails oracle for tests/database_yml_boot.rs: the Rails native Core
+# runs (tests/support/rails_oracle.rb; RH_RAILS_ORACLE overrides it). Only
+# this script loads Rails; the emitted program never does.
 #
 #   ruby tests/database_yml_oracle.rb APP_ROOT [LIB_FILE ...]
 #
@@ -10,9 +11,8 @@
 # YAML.unsafe_load; the `shared:` merge) and
 # ActiveRecord::DatabaseConfigurations.new over it, for Rails.env
 # (RAILS_ENV). No application is booted.
-gem "activesupport", "8.1.4"
-gem "activerecord", "8.1.4"
-gem "railties", "8.1.4"
+require_relative "support/rails_oracle"
+RailsOracle.activate("activesupport", "activerecord", "railties")
 require "active_support"
 require "active_record"
 require "rails"

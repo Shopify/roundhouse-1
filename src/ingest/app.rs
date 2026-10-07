@@ -657,6 +657,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // module definition the IR now carries, so the emitted app loads
     // all of this file (`require_of_loaded_support`).
     let mut loaded_support: crate::det::HashSet<PathBuf> = crate::det::HashSet::default();
+    // Each support file with the classes it produced, for the Zeitwerk
+    // loaders the walk declares (`ingest::zeitwerk::resolve`).
+    let mut support_classes: Vec<(PathBuf, Vec<crate::ident::ClassId>)> = Vec::new();
+    drop(super::zeitwerk::drain());
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
         let sub = sub.as_str();
         let support_dir = dir.join(sub);
@@ -712,6 +716,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         };
                         if let Some(classes) = classes {
                             let nested = nested_under(&outer, classes);
+                            let mut names: Vec<crate::ident::ClassId> = nested.iter().map(|c| c.name.clone()).collect();
+                            names.push(outer.clone());
+                            support_classes.push((entry.clone(), names));
                             let (concern_items, concern_enum_decls) =
                                 ingest_concern_model_items_with_constants(
                                     &source, &path_str, &enum_constants,
@@ -740,6 +747,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     if !classes.is_empty() && declarations_only(&source) {
                         loaded_support.insert(entry.clone());
                     }
+                    support_classes.push((entry.clone(), classes.iter().map(|c| c.name.clone()).collect()));
                     app.library_classes.extend(classes)
                 }
                 Err(err) => drop_library_file(&mut app, &path_str, &err),
@@ -751,6 +759,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
         }
     }
+    app.zeitwerk_loaders = super::zeitwerk::resolve(&super::zeitwerk::drain(), &support_classes);
 
     // `app/helpers/*.rb` — ingested as library classes like the support
     // dirs above, but ALSO registered in `helper_method_index` so the

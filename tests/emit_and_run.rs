@@ -4918,6 +4918,120 @@ end
         .run_ruby(ASSERTIONS).assert_passes();
 }
 
+/// `a, *b, c = value` and `a, *b = value` with a value that is not an
+/// array literal: Ruby destructures an Array as is, calls `to_ary`
+/// (private, or through method_missing) and wraps anything else, so a
+/// String or a Hash binds whole. A `to_ary` answering a non-Array raises
+/// Ruby's TypeError. The value is read once and the expression is that
+/// value. Core's in_progress_capabilities.rb `*parents, leaf =
+/// path.split(".")` is the first shape. The assertions run on CRuby and
+/// on the emitted tree.
+#[test]
+fn splat_destructuring_coerces_the_value_like_ruby() {
+    const SOURCE: &str = r#"class CoerceProbe
+  class Ary
+    def to_ary = [7, 8, 9]
+  end
+  class NilAry
+    def to_ary = nil
+  end
+  class PrivateAry
+    private def to_ary = [1, 2]
+  end
+  class MissingAry
+    def method_missing(name, *args) = name == :to_ary ? [3, 4] : super
+    def respond_to_missing?(name, include_private = false) = name == :to_ary || super
+  end
+  class BadAry
+    def to_ary = 5
+  end
+
+  def self.reads
+    @reads ||= 0
+  end
+
+  def self.value(v)
+    @reads = reads + 1
+    v
+  end
+
+  def self.post(v)
+    a, *b, c = value(v)
+    [a, b, c]
+  end
+
+  def self.leading(v)
+    *parents, leaf = v
+    [parents, leaf]
+  end
+
+  def self.trailing(v)
+    a, *rest = v
+    [a, rest]
+  end
+
+  def self.discard(v)
+    a, * = v
+    a
+  end
+
+  def self.path(path)
+    *parents, leaf = path.split(".")
+    [parents, leaf]
+  end
+
+  def self.expression(v)
+    (*b, c = v)
+  end
+
+  def self.bad
+    *b, c = BadAry.new
+    [b, c]
+  rescue TypeError => e
+    e.message
+  end
+end
+"#;
+    const ASSERTIONS: &str = r##"
+nil_ary = CoerceProbe::NilAry.new
+missing = CoerceProbe::MissingAry.new
+checks = {
+  post_array: [CoerceProbe.post([1, 2, 3, 4]), [1, [2, 3], 4]],
+  post_short: [CoerceProbe.post([1]), [1, [], nil]],
+  post_string: [CoerceProbe.post("s"), ["s", [], nil]],
+  post_nil: [CoerceProbe.post(nil), [nil, [], nil]],
+  post_int: [CoerceProbe.post(5), [5, [], nil]],
+  post_hash: [CoerceProbe.post({k: 1}), [{k: 1}, [], nil]],
+  post_to_ary: [CoerceProbe.post(CoerceProbe::Ary.new), [7, [8], 9]],
+  post_private: [CoerceProbe.post(CoerceProbe::PrivateAry.new), [1, [], 2]],
+  post_missing: [CoerceProbe.post(missing), [3, [], 4]],
+  reads: [CoerceProbe.reads, 9],
+  leading_nil_ary: [CoerceProbe.leading(nil_ary), [[], nil_ary]],
+  leading_string: [CoerceProbe.leading("x"), [[], "x"]],
+  leading_array: [CoerceProbe.leading([1, 2, 3]), [[1, 2], 3]],
+  trailing_string: [CoerceProbe.trailing("str"), ["str", []]],
+  trailing_hash: [CoerceProbe.trailing({k: 1}), [{k: 1}, []]],
+  trailing_to_ary: [CoerceProbe.trailing(CoerceProbe::Ary.new), [7, [8, 9]]],
+  discard_string: [CoerceProbe.discard("str"), "str"],
+  discard_array: [CoerceProbe.discard([4, 5]), 4],
+  path: [CoerceProbe.path("a.b.c"), [["a", "b"], "c"]],
+  path_single: [CoerceProbe.path("a"), [[], "a"]],
+  expression_value: [CoerceProbe.expression("v"), "v"],
+  bad: [CoerceProbe.bad, "can't convert CoerceProbe::BadAry to Array (CoerceProbe::BadAry#to_ary gives Integer)"],
+}
+checks.each do |name, (got, want)|
+  raise "#{name}: #{got.inspect}, expected #{want.inspect}" unless got == want
+end
+"##;
+    let native = std::process::Command::new("ruby").arg("-e")
+        .arg(format!("{SOURCE}\n{ASSERTIONS}"))
+        .output().expect("CRuby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    emit_and_run::real_blog()
+        .write("app/services/coerce_probe.rb", SOURCE)
+        .run_ruby(ASSERTIONS).assert_passes();
+}
+
 #[test]
 fn class_variable_compound_writes_share_the_read_storage() {
     emit_and_run::real_blog()
@@ -7893,7 +8007,8 @@ fn a_jump_that_stays_inside_an_assertion_block_runs_as_written() {
 }
 
 /// A nested destructuring target is refused by name at ingest rather
-/// than lowered with its block's assertions dropped.
+/// than lowered with its block's assertions dropped: its statement is a
+/// refusal at its own site, which raises when the test reaches it.
 #[test]
 fn a_nested_destructuring_target_is_refused_by_name() {
     let tree = [
@@ -7904,8 +8019,10 @@ fn a_nested_destructuring_target_is_refused_by_name() {
     .into_iter()
     .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
     .collect();
-    let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("refused");
-    assert!(err.to_string().contains("unsupported multi-write target"), "{err}");
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("a refused statement keeps its test");
+    let ir = format!("{:?}", app.test_modules);
+    assert!(ir.contains("IngestRefused { detail: \"unsupported multi-write target"), "{ir}");
+    assert!(!ir.contains("assert_equal"), "the refused statement's block is not lowered: {ir}");
 }
 
 const NAMELESS_REST_PROBE: &str = "class Probe\n  def m(*, &blk)\n    blk ? blk.call : :none\n  end\n\n  def acquire(*, &block)\n    yield\n  end\n\n  def first_of(x)\n    a, * = x\n    a\n  end\nend\n\nclass Child < Probe\n  def m(*rest)\n    [rest.size, super(rest.first)]\n  end\nend\n";

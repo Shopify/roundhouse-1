@@ -941,7 +941,7 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
 
     let files: &[(&str, &str)] = &[
         // A backtick command (`XStringNode`) — an expression roundhouse
-        // doesn't model, so it aborts strict ingest.
+        // doesn't model. Strict ingest refuses its statement at its site.
         (
             "app/controllers/widgets_controller.rb",
             "class WidgetsController < ApplicationController\n  def index\n    @out = `echo hi`\n  end\nend\n",
@@ -958,10 +958,18 @@ fn survey_mode_recovers_from_unsupported_construct_and_records_skipped_views() {
             .collect()
     };
 
-    // Strict mode (default): the unsupported construct aborts ingest.
+    // Strict mode (default): the statement holding the unsupported
+    // construct is refused at its own site (it raises if reached) and
+    // the rest of the app is ingested; it no longer aborts the ingest.
+    let strict = ingest_app_from_tree(tree()).expect("strict ingest keeps going past a refused statement");
+    let refusals: Vec<_> = roundhouse::analyze::diagnose(&strict)
+        .into_iter()
+        .filter(|d| d.code() == "ingest_unsupported")
+        .collect();
+    assert_eq!(refusals.len(), 1, "one refusal at the backtick statement: {refusals:?}");
     assert!(
-        ingest_app_from_tree(tree()).is_err(),
-        "expected strict ingest to abort on the unsupported backtick command"
+        matches!(refusals[0].kind, roundhouse::diagnostic::DiagnosticKind::IngestRefused { .. }),
+        "{refusals:?}"
     );
 
     // Survey mode: ingest recovers to a best-effort App and records every
@@ -1707,18 +1715,28 @@ fn class_method_classvar_writes_cannot_be_normalized_to_per_class_storage() {
     }
 }
 
+/// A splat multi-write whose RHS is not an array literal destructures
+/// what Ruby does: `Array.try_convert(value) || [value]` (to_ary, or the
+/// value wrapped). The behavior itself is checked against CRuby in
+/// tests/emit_and_run.rs (`splat_destructuring_coerces_the_value_like_ruby`).
 #[test]
-fn post_rest_nonliteral_rhs_remains_unsupported_without_coercion() {
-    for rhs in ["11", "nil", "Coercible.new", "values", "[11, 22].dup"] {
-        let source = format!("a, *b, c = {rhs}");
+fn splat_multi_write_with_a_nonliteral_rhs_coerces_through_try_convert() {
+    use roundhouse::emit::ruby::emit_expr;
+
+    let parse = |source: &str| {
         let result = ruby_prism::parse(source.as_bytes());
         assert_eq!(result.errors().count(), 0, "legal Ruby control: {source}");
         let program = result.node();
-        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
-        let err = roundhouse::ingest::ingest_expr(&stmt, "<snippet>")
-            .expect_err("collection methods do not implement Ruby coercion");
-        assert!(err.to_string().contains("to_ary coercion"), "{err}");
+        roundhouse::ingest::ingest_expr(&program.as_program_node().unwrap().statements().as_node(), "<snippet>").unwrap()
+    };
+    for source in ["a, *b, c = 11", "a, *b, c = nil", "a, *b, c = Coercible.new", "*b, c = values", "a, *b = path.split(\".\")", "a, * = x"] {
+        let expr = parse(source);
+        let emitted = emit_expr(&expr);
+        assert!(emitted.contains("Array.try_convert(__mw_"), "{source}: {emitted}");
+        assert_eq!(expr, parse(&emitted), "{source}: round-trip IR must be stable");
     }
+    let literal = emit_expr(&parse("a, *b, c = [11, 22, 33]"));
+    assert!(!literal.contains("try_convert"), "an array literal needs no coercion: {literal}");
 }
 
 #[test]
