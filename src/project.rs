@@ -5673,6 +5673,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     };
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
     let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut in_place_program: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, sources) in &declaring {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
@@ -5706,14 +5707,19 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             // program has it. An autoload of the declarations would
             // fire on the gem's own `class Schema` and load the reopen
             // first. So no autoload; the program loads the file in place,
-            // and `eager_load!` loads the program.
+            // and `eager_load!` loads the program. Not `program_of_file`:
+            // a file that requires these declarations (an initializer's
+            // constant, loading before app/models.rb) keeps requiring
+            // them, not the program.
             in_place.insert(anchor.clone());
             if let [one] = sources.as_slice() {
-                program_of_file.insert(anchor.clone(), program_by_source[one].clone());
+                in_place_program.insert(anchor.clone(), program_by_source[one].clone());
             }
         }
     }
-    let as_loaded = |anchor: &str| program_of_file.get(anchor).cloned().unwrap_or_else(|| anchor.to_string());
+    let as_loaded = |anchor: &str| {
+        program_of_file.get(anchor).or_else(|| in_place_program.get(anchor)).cloned().unwrap_or_else(|| anchor.to_string())
+    };
     models.sort();
 
     // namespace ("Object" for the top level) -> child -> (file, written as module)
