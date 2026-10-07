@@ -7953,6 +7953,10 @@ fn spinel_files_with_assertions(
     files.retain(|(p, _)| p != "runtime/active_model_type.rb");
     // And for the validator bases, pushed back the same way.
     files.retain(|(p, _)| p != "runtime/active_model_validator.rb");
+    // And for useragent's Version (the gem's own code: a `self.new`
+    // override and mixed Integer/String segments), pushed back by the
+    // PostgreSQL CRuby bootstrap beside the user_agent port.
+    files.retain(|(p, _)| p != "runtime/user_agent_version.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks

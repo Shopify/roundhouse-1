@@ -95,3 +95,18 @@ fn the_ported_user_agent_carries_the_gems_version() {
     assert_eq!(stdout, "[true, false, true, true]\n\"Firefox\"\n[\"user_agent/version.rb\"]\n", "{stderr}");
     assert!(!stderr.contains("already initialized constant") && !stderr.contains("method redefined"), "{stderr}");
 }
+
+/// The Version file is the gem's code (a `self.new` override, mixed
+/// Integer/String segments), so only the PostgreSQL CRuby tree carries it:
+/// a SQLite CRuby tree and a Spinel tree keep the typed port alone.
+#[test]
+fn only_the_postgresql_cruby_tree_carries_the_version_file() {
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        let (dir, _) = emit_and_run::empty_app()
+            .write("lib/oracle.rb", "class Oracle\nend\n")
+            .emit(target);
+        assert!(!dir.join("runtime/user_agent_version.rb").exists(), "{target:?}");
+        let port = std::fs::read_to_string(dir.join("runtime/user_agent.rb")).unwrap_or_default();
+        assert!(!port.contains("user_agent_version"), "{target:?}");
+    }
+}
