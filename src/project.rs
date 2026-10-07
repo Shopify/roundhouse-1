@@ -10054,6 +10054,16 @@ fn walk_dir_into(
     Ok(())
 }
 
+/// A file or directory name that says it holds secret material
+/// (credentials, keys, secrets, tokens, passwords, private data), which
+/// is never copied into an emitted tree, whatever its extension: Core's
+/// git-tracked `config/secrets.test.json` included.
+pub(crate) fn named_for_secrets(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["credential", "secret", "token", "password", "private", "master.key"].iter().any(|w| lower.contains(w))
+        || [".key", ".pem", ".ejson", ".enc"].iter().any(|ext| lower.ends_with(ext))
+}
+
 /// The app's data files (`*.yml`, `*.yaml`, `*.json`, each optionally
 /// `.erb`), carried verbatim at their Rails.root-relative paths: app code
 /// reads them by a path it builds from `Rails.root` (Core's
@@ -10066,17 +10076,14 @@ fn walk_dir_into(
 ///
 /// Skipped: dev/build dirs (`SKIP_DIRS`), hidden entries, `sorbet/`
 /// (type declarations the compiler reads), `config/database.yml` (compiled
-/// into the tree as `DatabaseYml`), and anything named for credentials or
-/// keys. Encrypted material (`*.ejson`, `credentials.yml.enc`,
-/// `master.key`) has no data extension and is never copied.
+/// into the tree as `DatabaseYml`), and any file or directory
+/// [`named_for_secrets`] (Core's `config/secrets.test.json`), each noted
+/// on stderr without its content. Encrypted material (`*.ejson`,
+/// `credentials.yml.enc`, `master.key`) has no data extension either.
 fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
     fn data_file(name: &str) -> bool {
         let name = name.strip_suffix(".erb").unwrap_or(name);
         [".yml", ".yaml", ".json"].iter().any(|ext| name.ends_with(ext))
-    }
-    fn secret(name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        lower.contains("credential") || lower.contains("master.key") || lower.ends_with(".key")
     }
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
@@ -10085,7 +10092,10 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || secret(&name) {
+            if name.starts_with('.') || named_for_secrets(&name) {
+                if !name.starts_with('.') {
+                    eprintln!("roundhouse: note: {prefix}{name} is named for secrets and is not carried into the tree");
+                }
                 continue;
             }
             let Ok(ty) = entry.file_type() else { continue };

@@ -23,24 +23,38 @@ fn a_class_body_reads_a_data_file_under_rails_root() {
 }
 
 #[test]
-fn credentials_keys_and_type_declarations_are_not_carried() {
+fn secrets_credentials_keys_and_type_declarations_are_not_carried() {
     let (emitted, _) = emit_and_run::empty_app()
         .write("config/data.yml", "a: 1\n")
         .write("config/credentials.yml", "secret: x\n")
         .write("config/credentials/test.yml", "secret: x\n")
         .write("config/master.key", "x\n")
         .write("config/settings.ejson", "{}\n")
+        .write("config/secrets.test.json", "{}\n")
+        .write("config/secrets.development.json", "{}\n")
+        .write("config/SECRETS/data.yml", "a: 1\n")
+        .write("config/api_token.yml", "a: 1\n")
+        .write("db/data/passwords.json", "{}\n")
+        .write("config/private_keys.yml", "a: 1\n")
+        .write("config/vault.json", "{}\n")
         .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: \":memory:\"\n")
         .write("sorbet/config.yml", "a: 1\n")
         .write("vendor/gems/g/data.yml", "a: 1\n")
         .write("lib/thing.rb", "class Thing\nend\n")
         .emit(roundhouse::project::BuildTarget::Ruby);
     assert!(emitted.join("config/data.yml").is_file());
+    assert!(emitted.join("config/vault.json").is_file());
     for path in [
         "config/credentials.yml",
         "config/credentials/test.yml",
         "config/master.key",
         "config/settings.ejson",
+        "config/secrets.test.json",
+        "config/secrets.development.json",
+        "config/SECRETS/data.yml",
+        "config/api_token.yml",
+        "db/data/passwords.json",
+        "config/private_keys.yml",
         "config/database.yml",
         "sorbet/config.yml",
         "vendor/gems/g/data.yml",
