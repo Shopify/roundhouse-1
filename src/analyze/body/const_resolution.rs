@@ -1003,4 +1003,27 @@ mod tests {
         assert_eq!(resolved_name(&reordered, &sources, 0, "Second"), "Second");
         assert_eq!(resolved_name(&reordered, &sources, 1, "Third"), "Third");
     }
+
+    /// Core lib/filter_parameter_logging.rb reads the runtime port of
+    /// activesupport 8.1.4 parameter_filter.rb: `FILTERED = "[FILTERED]"`
+    /// in `class ParameterFilter` inside `module ActiveSupport`
+    /// (runtime/ruby/active_support_reporters.rb). A scalar runtime
+    /// constant nested in a class in a module must answer with its
+    /// literal type, or the read is refused as an unsupported constant.
+    #[test]
+    fn a_runtime_class_scalar_constant_resolves_with_its_literal_type() {
+        let text = "module FilterProbe\n  R = \"\\\\1#{ActiveSupport::ParameterFilter::FILTERED}\".freeze\nend\n";
+        let sources = vec![SourceFile { path: "lib/filter_probe.rb".into(), text: text.into() }];
+        let resolver = ConstResolver::from_app_sources(&sources);
+        let end = (text.find("FILTERED}").unwrap() + "FILTERED".len()) as u32;
+        let span = Span { file: FileId(1), start: end - 40, end };
+        let path: Vec<Symbol> = ["ActiveSupport", "ParameterFilter", "FILTERED"].into_iter().map(Symbol::from).collect();
+        match resolver.reference(span, &path) {
+            Some(Some(ResolvedConstant::Value { name, runtime, stdlib: false, .. })) => {
+                assert_eq!(name.0.as_str(), "ActiveSupport::ParameterFilter::FILTERED");
+                assert_eq!(runtime.as_deref(), Some(&crate::ty::Ty::Str));
+            }
+            _ => panic!("ActiveSupport::ParameterFilter::FILTERED must resolve to the runtime value"),
+        }
+    }
 }
