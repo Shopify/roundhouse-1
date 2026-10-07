@@ -67,8 +67,11 @@ fn circular_config_load_emits_configuration_not_gradual_churn() {
         rbs.contains("def self.config: () -> Probe::Configuration"),
         "expected Probe.config to settle on Probe::Configuration, got:\n{rbs}"
     );
+    // `new` on a class-side `self` answers the receiving class, which a
+    // singleton signature spells `instance` (`Sub.load!` builds a Sub);
+    // the other branch is the configuration `Probe.config` holds.
     assert!(
-        rbs.contains("def self.load!: () -> Probe::Configuration"),
-        "expected Configuration.load! to settle on Probe::Configuration, got:\n{rbs}"
+        rbs.contains("def self.load!: () -> (instance | Probe::Configuration)"),
+        "expected Configuration.load! to settle on `instance | Probe::Configuration`, got:\n{rbs}"
     );
 }
