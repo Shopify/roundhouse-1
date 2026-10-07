@@ -200,9 +200,36 @@ What does NOT come out is sorbet-runtime. An app that annotates with
 it transpiles to a tree that does not need it at run time: a `sig` is
 read (see [`check.md`](check.md)) and then dropped, along with
 `extend T::Sig`, `abstract!` and the rest of the annotations;
-`T.let` / `T.must` / `T.cast` and their siblings become the value they
-wrap; `T.type_alias` constants go with the signatures that were their
-only reader. The two constructs that are class GENERATORS rather than
+`T.type_alias` constants go with the signatures that were their only
+reader. The assertions split by what they do natively:
+
+- `T.must`, `T.must_because` and the `#: as !nil` comment keep their
+  nil check on the Ruby trees: `TypeError` with sorbet-runtime's
+  message, raised where the assertion stood.
+- `T.let`, `T.cast`, `T.bind` and the `#: as Type` comment become the
+  value they wrap, unchanged, on the Ruby trees (ruby, jruby, spinel,
+  roda). The comment is inert natively, so `nil #: as Integer` is nil
+  here as it is there, never `0`. sorbet-runtime's `T.let`/`T.cast`
+  also check the value's class and raise `TypeError` on a mismatch;
+  that check is NOT repeated, so a value sorbet would reject flows on
+  where the native run would have stopped. The check only fires on a
+  path the native suite cannot pass through, which is why it is the
+  one divergence kept.
+- The type a cast declares still types the analysis, and
+  `roundhouse check` trusts it. Lowerings do not fold a value-dependent
+  predicate on it: `n = list.first #: as Integer; n.present?` keeps the
+  runtime predicate (`ActiveSupport.present?(n)`, false for nil), where
+  folding on the declared `Integer` would answer `true`. A class-typed
+  cast keeps its grounding plus a nil check. A declared type that
+  arrives through a method return or an RBS signature is trusted like
+  any other declared type.
+- The strict targets keep the conversion each emitter writes for a cast
+  (Go and Swift assert the type and fail loudly; C# `Convert.*` and
+  Kotlin's parse convert), because a typed slot needs a representation.
+  An author cast with no backing type is a known per-target divergence
+  there, not something the Ruby trees share.
+
+The two constructs that are class GENERATORS rather than
 annotations are lowered into the plain Ruby they stand for — a
 `T::Struct` into readers plus the keyword constructor it generates
 (and `==`, where it included `ActsAsComparable`), a `T::Enum` into its

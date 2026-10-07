@@ -91,8 +91,23 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // with closed vocabularies (python's unemittable-cond fallback is a
     // silent `False`; the flash-notice smoke caught it). Views rejoin
     // when the view pipeline migrates to shared lowerings.
-    super::for_each_hook_body(app, &mut |body| {
-        walk(body, &defs, &mut diags);
+    //
+    // Ivars an author cast types are read across the owner's methods
+    // (`@user = user #: as User` in `initialize`, `@user.present?` in a
+    // reader), so they are collected per owner before the walk. Locals
+    // are collected per body: their ids are body-local.
+    let mut cast_ivars: crate::det::HashMap<Option<crate::ident::ClassId>, HashSet<Symbol>> =
+        crate::det::HashMap::default();
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let found = CastBound::collect(body);
+        cast_ivars.entry(owner.cloned()).or_default().extend(found.ivars);
+    });
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let mut bound = CastBound::collect(body);
+        if let Some(ivars) = cast_ivars.get(&owner.cloned()) {
+            bound.ivars.extend(ivars.iter().cloned());
+        }
+        walk(body, &defs, &bound, &mut diags);
     });
 
     // TEST BODIES TOO, asked for by name — the widening
@@ -112,7 +127,8 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
     // the overlay served these already and the rewrite is neutral — it
     // is the AOT and strict targets that could not dispatch them.
     super::for_each_test_body(app, &mut |body| {
-        walk(body, &defs, &mut diags);
+        let bound = CastBound::collect(body);
+        walk(body, &defs, &bound, &mut diags);
     });
 
     diags
@@ -134,7 +150,8 @@ pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// `view_to_library`).
 pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) -> bool {
     let mut diags = Vec::new();
-    let changed = walk(body, defs, &mut diags);
+    let bound = CastBound::collect(body);
+    let changed = walk(body, defs, &bound, &mut diags);
     for d in diags {
         crate::emit::diagnostics::push(d);
     }
@@ -366,17 +383,114 @@ pub(crate) fn is_effect_free_reader(e: &Expr) -> bool {
     }
 }
 
-fn walk(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+/// The names in one body whose static type an AUTHOR cast declared
+/// (`n = x #: as Integer`, `@n = T.let(x, Integer)`) where the value's
+/// own type does not already say the same thing.
+///
+/// Such a type is not evidence about the value. The `#:` comment is
+/// inert natively, so `nil #: as Integer` stays nil; and sorbet-runtime's
+/// `T.let`/`T.cast` check only the outer class (`T::Array[String]` admits
+/// `[1]`), which the Ruby trees do not repeat anyway: they emit the
+/// value unchanged (`emit::ruby::expr::emit_expr`). Grounding
+/// `n.present?` to `true` on that type answered `true` for an empty
+/// list's `first`, where Rails answers `false`. A cast-bound receiver
+/// takes the RUNTIME predicate instead, which branches on the value and
+/// is right for every value; the analysis keeps the declared type for
+/// everything else (`roundhouse check` still trusts the annotation).
+///
+/// What this does not see: a type that reaches the receiver through a
+/// method return or an RBS signature. Both are as unchecked natively as
+/// the `#:` comment; they are trusted the way every declared type is.
+#[derive(Default)]
+struct CastBound {
+    vars: HashSet<(crate::ident::VarId, Symbol)>,
+    ivars: HashSet<Symbol>,
+}
+
+impl CastBound {
+    fn collect(body: &Expr) -> Self {
+        fn visit(e: &Expr, out: &mut CastBound) {
+            let bound = match &*e.node {
+                ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. }
+                    if is_unbacked_author_cast(value) =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            };
+            match bound {
+                Some(LValue::Var { id, name }) => {
+                    out.vars.insert((*id, name.clone()));
+                }
+                Some(LValue::Ivar { name }) => {
+                    out.ivars.insert(name.clone());
+                }
+                _ => {}
+            }
+            e.node.for_each_child(&mut |c| visit(c, out));
+        }
+        let mut out = CastBound::default();
+        visit(body, &mut out);
+        out
+    }
+
+    /// The receiver's static type came from an author cast: the cast
+    /// itself, a name one binds, or an assignment of one
+    /// (`(n = x #: as Integer).present?`).
+    fn binds(&self, r: &Expr) -> bool {
+        match &*r.node {
+            ExprNode::Cast { .. } => is_unbacked_author_cast(r),
+            ExprNode::Var { id, name } => self.vars.contains(&(*id, name.clone())),
+            ExprNode::Ivar { name } => self.ivars.contains(name),
+            ExprNode::Assign { value, .. } => is_unbacked_author_cast(value),
+            _ => false,
+        }
+    }
+}
+
+/// An author-written cast whose declared type the value's own stamped
+/// type does not already carry. `"a" #: as String` is backed by the
+/// literal; `@values.first #: as Integer` (an untyped read) is not.
+fn is_unbacked_author_cast(e: &Expr) -> bool {
+    let ExprNode::Cast { value, target_ty } = &*e.node else { return false };
+    e.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0
+        && !crate::expr::is_self_binding(e)
+        && value.ty.as_ref() != Some(target_ty)
+}
+
+/// What a grounding becomes when its type came only from an author cast
+/// (see the call site in `try_rewrite`).
+fn unbacked_grounding(grounding: Grounding, ty: Option<&Ty>) -> Grounding {
+    let class_typed = matches!(ty.map(non_nil_of), Some(Ty::Class { .. }));
+    match grounding {
+        Grounding::Container { whitespace, .. } if class_typed => {
+            Grounding::Container { nilable: true, whitespace }
+        }
+        Grounding::NeverBlank { .. } if class_typed => Grounding::NeverBlank { nilable: true },
+        Grounding::Container { .. }
+        | Grounding::NeverBlank { .. }
+        | Grounding::BoolLike
+        | Grounding::AlwaysNil => Grounding::Runtime,
+        other => other,
+    }
+}
+
+fn walk(
+    expr: &mut Expr,
+    defs: &AppDefinitions,
+    bound: &CastBound,
+    diags: &mut Vec<Diagnostic>,
+) -> bool {
     let mut changed = false;
     expr.node.for_each_child_mut(&mut |c| {
-        if walk(c, defs, diags) {
+        if walk(c, defs, bound, diags) {
             changed = true;
         }
     });
-    if try_rewrite(expr, defs, diags) {
+    if try_rewrite(expr, defs, bound, diags) {
         changed = true;
     }
-    if try_rewrite_compact_blank(expr, defs, diags) {
+    if try_rewrite_compact_blank(expr, defs, bound, diags) {
         changed = true;
     }
     changed
@@ -391,7 +505,12 @@ enum Pred {
     Presence,
 }
 
-fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+fn try_rewrite(
+    expr: &mut Expr,
+    defs: &AppDefinitions,
+    bound: &CastBound,
+    diags: &mut Vec<Diagnostic>,
+) -> bool {
     use Grounding::*;
 
     // Decision phase: everything read out of the node is owned before
@@ -416,6 +535,18 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
         // `Object#blank?` branches on the VALUE, and so does the
         // runtime predicate: hand it the read.
         let grounding = if is_params_read(r) { Grounding::Runtime } else { classify(r.ty.as_ref(), defs) };
+        // A type only an author cast declared is not grounds for a fold
+        // (see `CastBound`). A BUILTIN declared type takes the runtime
+        // predicate, which answers every builtin value the way Rails
+        // does (`nil`, `""`, `"  "`, `[]`, `0`, `false`). A CLASS
+        // declared type keeps its grounding but loses the non-nil
+        // half: `nil #: as Thing` is the case the comment cannot rule
+        // out, and the runtime predicate is the wrong answer for a class
+        // with its own `empty?` (`ActiveRecord::Relation`, whose `to_s`
+        // the helper would read). A class that owns the predicate keeps
+        // its own dispatch, and a refusal stays a refusal.
+        let grounding =
+            if bound.binds(r) { unbacked_grounding(grounding, r.ty.as_ref()) } else { grounding };
         (pred, grounding, r.ty.clone(), is_effect_free_reader(r))
     };
     // An ASSIGNMENT receiver — lobsters' login does
@@ -583,6 +714,7 @@ fn try_rewrite(expr: &mut Expr, defs: &AppDefinitions, diags: &mut Vec<Diagnosti
 fn try_rewrite_compact_blank(
     expr: &mut Expr,
     defs: &AppDefinitions,
+    bound: &CastBound,
     diags: &mut Vec<Diagnostic>,
 ) -> bool {
     enum Shape {
@@ -616,7 +748,13 @@ fn try_rewrite_compact_blank(
             Shape::Array { elem } => elem.clone(),
             Shape::Hash { value, .. } => value.clone(),
         };
-        (shape, classify(Some(&inner), defs), r.ty.clone())
+        // An element type only an author cast declared is unbacked the
+        // same way (see `CastBound`); for a builtin element the runtime
+        // predicate below branches on each element instead.
+        let grounding = classify(Some(&inner), defs);
+        let grounding =
+            if bound.binds(r) { unbacked_grounding(grounding, Some(&inner)) } else { grounding };
+        (shape, grounding, r.ty.clone())
     };
 
     let inner_ty = match &shape {

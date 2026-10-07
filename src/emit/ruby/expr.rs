@@ -127,6 +127,20 @@ pub fn emit_expr(e: &Expr) -> String {
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));
     }
+    // An AUTHOR-WRITTEN cast (`x #: as Integer`, `T.cast(x, Integer)`,
+    // `T.let`, `T.bind`) is the value unchanged on every Ruby tree. The
+    // coercion arm of `emit_cast` exists for the casts LOWERINGS build
+    // (row hydration into a typed slot); on an author cast it was a
+    // silent behavior change: `nil #: as Integer` read `0`, `"12"` read
+    // `12`, `0 #: as bool` read `false`. Natively the `#:` comment is
+    // inert, and sorbet-runtime's `T.cast`/`T.let` return the value
+    // itself when the check passes. docs/guide/transpile.md names the
+    // check this tree does not repeat.
+    if e.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
+        if let ExprNode::Cast { value, .. } = &*e.node {
+            return emit_expr(value);
+        }
+    }
     emit_node(&e.node)
 }
 
@@ -537,6 +551,10 @@ fn is_bool_target(ty: &crate::ty::Ty) -> bool {
 /// returns self, Integer#to_i returns self) but it surfaces the
 /// narrowing intent in the emitted source — load-bearing for downstream
 /// Ruby compilers (spinel AOT) that do per-use-site type narrowing.
+///
+/// On a poly value the coercion is NOT a no-op (`nil.to_i` is `0`), which
+/// is why only casts a lowering built reach here: an author-written cast
+/// (`SOURCE_TYPE_ASCRIPTION`) is its value unchanged (`emit_expr`).
 fn emit_cast(value: &Expr, target_ty: &crate::ty::Ty) -> String {
     use crate::ty::Ty;
     let inner = emit_expr(value);
