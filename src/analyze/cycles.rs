@@ -26,6 +26,25 @@
 //! settle. Slots that only move forward never revisit a value, so a
 //! long propagation chain (lobsters' nine-round pagination chain) is
 //! untouched.
+//!
+//! Joining cycles does not stop a slot that grows without repeating.
+//! A method that returns its own result one container deeper each
+//! round (`{ key => sub_set.serialize! }` on another instance of the
+//! same class, which the self-call recursion widening does not see),
+//! or a parameter fed back its own value wrapped in a Hash, gains one
+//! nesting level per round forever; on Shopify Core thousands of such
+//! slots kept the production and absorb loops moving at the cap, and
+//! each round typed larger trees than the last. Some gain the level in
+//! one round; others take a few rounds per level, the innermost
+//! element passing through `Var`, `Array[Var]` and a union on the way.
+//! The lattice has no finite height along that chain, so it needs the
+//! other standard widening, k-limiting: once a slot has grown (more
+//! type nodes than the round before) [`GROWTH_ROUNDS`] rounds running
+//! and is nested deeper than the larger of [`DEPTH_FLOOR`] and the
+//! depth it started the loop at, every container below that depth
+//! becomes the gradual `Untyped`, now and in each later round. The
+//! levels above the limit keep their precise types. A slot that stops
+//! growing, or grows only within the limit, is untouched.
 
 use std::collections::HashMap;
 
@@ -33,6 +52,7 @@ use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
 use super::body::union_of;
+use super::fixpoint_debug::ty_size;
 use super::{Analyzer, InferenceSig};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -49,6 +69,23 @@ enum Slot {
 /// cap is only reached after the period has repeated.
 const VISITED_PER_SLOT: usize = 6;
 
+/// Consecutive rounds a slot must grow before it is depth-limited.
+const GROWTH_ROUNDS: usize = 3;
+
+/// The least nesting depth a limited slot keeps precise.
+const DEPTH_FLOOR: usize = 4;
+
+/// One slot's growth over a loop.
+#[derive(Clone, Copy)]
+struct Growth {
+    /// Container depth when the slot first changed in the loop.
+    start_depth: usize,
+    /// The last round it changed in.
+    last_round: usize,
+    /// Consecutive rounds, up to `last_round`, in which it grew.
+    streak: usize,
+}
+
 /// One whole-program loop's cycle state. Start a fresh one per loop:
 /// the production, test and absorb loops recompute different evidence,
 /// so returning to a production-round value in the absorb loop is not a
@@ -57,11 +94,125 @@ const VISITED_PER_SLOT: usize = 6;
 pub(super) struct CycleWidening {
     visited: HashMap<Slot, Vec<Ty>>,
     widened: HashMap<Slot, Ty>,
+    growth: HashMap<Slot, Growth>,
+    /// `widen_cycles` calls so far in this loop.
+    round: usize,
+    /// Depth-limited slots and the depth each keeps. Carried into the
+    /// next loop (see [`Self::next_loop`]): a slot that grew without
+    /// bound under one loop's evidence does under the next one's too.
+    limited: HashMap<Slot, usize>,
+    /// What the last `widen_cycles` call did, for the debug report.
+    last: WidenRound,
+}
+
+/// Per-round counts of what widening did to the held slots.
+#[derive(Default, Clone, Copy)]
+struct WidenRound {
+    /// Held slot recomputed to a different value inside its join: written
+    /// back to the join, so it is no change.
+    held: usize,
+    /// Held slot recomputed outside its join: the join grew.
+    grew: usize,
+    /// Held slot whose new value cannot be joined (`Fn`, arity change):
+    /// it keeps the recomputed value.
+    unjoinable: usize,
+    /// Slots widened for the first time this round.
+    newly: usize,
+    /// Slots depth-limited for the first time this round.
+    newly_limited: usize,
+    /// Limited slots whose recomputed value was cut back this round.
+    cut: usize,
 }
 
 impl CycleWidening {
-    pub(super) fn widened_count(&self) -> usize {
-        self.widened.len()
+    /// The state the next loop starts from: no cycle history, the same
+    /// depth limits.
+    pub(super) fn next_loop(&self) -> Self {
+        Self { limited: self.limited.clone(), ..Self::default() }
+    }
+
+    /// Debug summary of the last round: what widening did to the held
+    /// slots, and how many of the round's changed slots `changed` are held
+    /// slots (their join grew or could not be joined) versus slots that
+    /// were never widened.
+    pub(super) fn round_summary(&self, analyzer: &Analyzer, prev: &InferenceSig) -> String {
+        let changed = analyzer.changed_slots(prev);
+        let in_held = changed.iter().filter(|(s, ..)| self.widened.contains_key(s)).count();
+        let WidenRound { held, grew, unjoinable, newly, newly_limited, cut } = self.last;
+        format!(
+            "widened {}: held-equal {held}, held-grew {grew}, unjoinable {unjoinable}, newly {newly}; depth-limited {}: newly {newly_limited}, cut {cut}; changed {} = {in_held} held + {} unwidened",
+            self.widened.len(),
+            self.limited.len(),
+            changed.len(),
+            changed.len() - in_held,
+        )
+    }
+}
+
+/// Container nesting depth: each Array, Hash, Tuple, Record or class
+/// with type arguments is a level; a union is not. A parameter vector
+/// is not a level either: its depth is its deepest parameter's.
+fn slot_depth(slot: &Slot, t: &Ty) -> usize {
+    match (slot, t) {
+        (Slot::Params(..), Ty::Tuple { elems }) => elems.iter().map(depth).max().unwrap_or(0),
+        _ => depth(t),
+    }
+}
+
+fn depth(t: &Ty) -> usize {
+    match t {
+        Ty::Array { elem } => 1 + depth(elem),
+        Ty::Hash { key, value } => 1 + depth(key).max(depth(value)),
+        Ty::Tuple { elems } => 1 + elems.iter().map(depth).max().unwrap_or(0),
+        Ty::Record { row } => 1 + row.fields.values().map(depth).max().unwrap_or(0),
+        Ty::Class { args, .. } if !args.is_empty() => 1 + args.iter().map(depth).max().unwrap_or(0),
+        Ty::Union { variants } => variants.iter().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `t` with every container below the first `keep` levels replaced by
+/// `Untyped`.
+fn limit_slot(slot: &Slot, t: Ty, keep: usize) -> Ty {
+    match (slot, t) {
+        (Slot::Params(..), Ty::Tuple { elems }) => {
+            Ty::Tuple { elems: elems.into_iter().map(|e| limit(e, keep)).collect() }
+        }
+        (_, t) => limit(t, keep),
+    }
+}
+
+fn limit(t: Ty, keep: usize) -> Ty {
+    let is_container = match &t {
+        Ty::Array { .. } | Ty::Hash { .. } | Ty::Tuple { .. } | Ty::Record { .. } => true,
+        Ty::Class { args, .. } => !args.is_empty(),
+        _ => false,
+    };
+    if is_container && keep == 0 {
+        return Ty::Untyped;
+    }
+    let below = keep.saturating_sub(1);
+    match t {
+        Ty::Array { elem } => Ty::Array { elem: Box::new(limit(*elem, below)) },
+        Ty::Hash { key, value } => Ty::Hash {
+            key: Box::new(limit(*key, below)),
+            value: Box::new(limit(*value, below)),
+        },
+        Ty::Tuple { elems } => Ty::Tuple { elems: elems.into_iter().map(|e| limit(e, below)).collect() },
+        Ty::Record { row } => Ty::Record {
+            row: crate::ty::Row {
+                fields: row.fields.into_iter().map(|(k, v)| (k, limit(v, below))).collect(),
+                rest: row.rest,
+            },
+        },
+        Ty::Class { id, args } => Ty::Class { id, args: args.into_iter().map(|a| limit(a, below)).collect() },
+        // Re-joined so two variants cut to the same shape merge.
+        Ty::Union { variants } => variants
+            .into_iter()
+            .map(|v| limit(v, keep))
+            .reduce(union_of)
+            .unwrap_or(Ty::Bottom),
+        other => other,
     }
 }
 
@@ -153,8 +304,10 @@ impl Analyzer {
     /// Run after a round's harvest and unify, before its convergence
     /// check against `prev` (the signature the round's typing passes
     /// read). Re-joins every slot already widened in this loop, then
-    /// widens each slot that has just returned to an earlier value.
+    /// widens each slot that has just returned to an earlier value,
+    /// then depth-limits slots that keep nesting deeper.
     pub(super) fn widen_cycles(&mut self, prev: &InferenceSig, state: &mut CycleWidening) {
+        let mut round = WidenRound::default();
         let widened: Vec<(Slot, Ty)> =
             state.widened.iter().map(|(s, t)| (s.clone(), t.clone())).collect();
         for (slot, acc) in widened {
@@ -162,12 +315,39 @@ impl Analyzer {
             if now == acc {
                 continue;
             }
-            if let Some(joined) = join(&slot, acc, now) {
+            if let Some(joined) = join(&slot, acc.clone(), now) {
+                if joined == acc {
+                    round.held += 1;
+                } else {
+                    round.grew += 1;
+                }
                 self.set_slot(&slot, joined.clone());
                 state.widened.insert(slot, joined);
+            } else {
+                round.unjoinable += 1;
             }
         }
         for (slot, before, now) in self.changed_slots(prev) {
+            if !state.limited.contains_key(&slot) {
+                let this_round = state.round;
+                let growth = state.growth.entry(slot.clone()).or_insert_with(|| Growth {
+                    start_depth: before.as_ref().map_or(0, |b| slot_depth(&slot, b)),
+                    last_round: usize::MAX,
+                    streak: 0,
+                });
+                let grew = before.as_ref().is_some_and(|b| ty_size(&now) > ty_size(b));
+                growth.streak = match (grew, growth.last_round.wrapping_add(1) == this_round) {
+                    (false, _) => 0,
+                    (true, true) => growth.streak + 1,
+                    (true, false) => 1,
+                };
+                growth.last_round = this_round;
+                let keep = growth.start_depth.max(DEPTH_FLOOR);
+                if growth.streak >= GROWTH_ROUNDS && slot_depth(&slot, &now) > keep {
+                    state.limited.insert(slot.clone(), keep);
+                    round.newly_limited += 1;
+                }
+            }
             if state.widened.contains_key(&slot) {
                 continue;
             }
@@ -192,8 +372,33 @@ impl Analyzer {
             if let Some(joined) = joined {
                 self.set_slot(&slot, joined.clone());
                 state.widened.insert(slot, joined);
+                round.newly += 1;
             }
         }
+        round.cut = self.limit_depths(state);
+        state.last = round;
+        state.round += 1;
+    }
+
+    /// Cut every depth-limited slot back to its limit; the number cut.
+    /// `widen_cycles` does this each round; call it after any later
+    /// harvest that recomputes returns from the bodies, which nest one
+    /// level past the limit again.
+    pub(super) fn limit_depths(&mut self, state: &mut CycleWidening) -> usize {
+        let mut cut_count = 0;
+        for (slot, &keep) in &state.limited {
+            let Some(now) = self.slot_ty(slot) else { continue };
+            if slot_depth(slot, &now) <= keep {
+                continue;
+            }
+            let cut = limit_slot(slot, now, keep);
+            self.set_slot(slot, cut.clone());
+            if let Some(acc) = state.widened.get_mut(slot) {
+                *acc = cut;
+            }
+            cut_count += 1;
+        }
+        cut_count
     }
 }
 

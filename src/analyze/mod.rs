@@ -25,6 +25,7 @@
 
 mod alba;
 mod cycles;
+mod incremental;
 mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
@@ -157,17 +158,54 @@ pub struct Analyzer {
     /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
     /// settle; see [`Self::fixpoint_rounds`].
     fixpoint_rounds: FixpointRounds,
+    /// What each library class's last typing read; lets the library
+    /// pass skip classes none of whose reads changed (see `incremental`).
+    incremental: incremental::Incremental,
 }
 
 /// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
-/// before its signature stopped moving — `None` when it hit the cap
-/// still moving. `absorb` is `Some(0)` when view unification moved no
+/// before its signature stopped moving. `Some(n)` (1-based, at most
+/// [`FIXPOINT_CAP`]) means the n-th round's check found nothing moved;
+/// `None` means all `FIXPOINT_CAP` rounds ran and the last one still
+/// moved. `absorb` is `Some(0)` when view unification moved no
 /// production signature and the absorb loop never ran.
+///
+/// The `ROUNDHOUSE_TIMINGS` span labels count differently: each loop's
+/// first round has its own label (`typing passes (views after
+/// fixpoint)`, `typing passes (after view unify)`), and the rest are
+/// `round 1` … `round 11`, so `round 11: absorb production` is the
+/// twelfth round. The `fixpoint rounds:` timing line prints this value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FixpointRounds {
     pub production: Option<usize>,
     pub tests: Option<usize>,
     pub absorb: Option<usize>,
+}
+
+/// Rounds a whole-program fixpoint loop may run.
+pub const FIXPOINT_CAP: usize = 12;
+
+/// [`FIXPOINT_CAP`], or `ROUNDHOUSE_FIXPOINT_CAP` when set: a diagnostic
+/// for asking whether a loop that reaches the cap would settle later.
+pub fn fixpoint_cap() -> usize {
+    std::env::var("ROUNDHOUSE_FIXPOINT_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(FIXPOINT_CAP)
+}
+
+impl std::fmt::Display for FixpointRounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = |name: &str, n: Option<usize>| match n {
+            Some(0) => format!("{name} not run"),
+            Some(n) => format!("{name} settled in {n} of {}", fixpoint_cap()),
+            None => format!("{name} at cap {}, still moving", fixpoint_cap()),
+        };
+        write!(
+            f,
+            "{}; {}; {}",
+            one("production", self.production),
+            one("tests", self.tests),
+            one("absorb", self.absorb)
+        )
+    }
 }
 
 /// Snapshot of the data the fixpoint refines: per-class instance/class
@@ -935,7 +973,7 @@ impl Analyzer {
             .flat_map(|(class_id, methods)| {
                 methods.iter().map(|(name, ty)| {
                     let scoped = ty.map_class_ids(&|id| {
-                        body::lexical_class(id, class_id.0.as_str(), &classes)
+                        body::lexical_class(id, class_id.0.as_str(), body::Classes::new(&classes, None))
                             .unwrap_or_else(|| id.clone())
                     });
                     (class_id.clone(), name.clone(), ty.clone(), scoped)
@@ -990,6 +1028,7 @@ impl Analyzer {
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
             fixpoint_rounds: FixpointRounds::default(),
+            incremental: incremental::Incremental::new(incremental::Mode::from_env()),
         }
     }
 
@@ -1043,7 +1082,7 @@ impl Analyzer {
         for class in &mut app.library_classes {
             for included in &class.includes {
                 let known = self.classes.contains_key(included)
-                    || body::lexical_class(included, class.name.0.as_str(), &self.classes).is_some()
+                    || body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str());
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
@@ -1071,7 +1110,7 @@ impl Analyzer {
                     let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                     let id = ClassId(Symbol::from(name.as_str()));
                     let known = self.classes.contains_key(&id)
-                        || body::lexical_class(&id, model.name.0.as_str(), &self.classes).is_some()
+                        || body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str());
                     (!known).then_some(name)
                 }).collect();
@@ -1083,7 +1122,6 @@ impl Analyzer {
                 }
             }
         }
-        const FIXPOINT_CAP: usize = 12;
         // View-name and dynamic-render ivar sets are invariant across
         // fixpoint rounds — they read source views, not the registry.
         let mut dynamic_render_ivars: std::collections::HashSet<Symbol> =
@@ -1140,7 +1178,7 @@ impl Analyzer {
         // settles on round 9.
         let mut prev_sig = self.capture_inference_sig();
         let mut cycles = cycles::CycleWidening::default();
-        for round in 0..FIXPOINT_CAP {
+        for round in 0..fixpoint_cap() {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
                 self.harvest_returns_to_registry(app, false)
             });
@@ -1149,7 +1187,7 @@ impl Analyzer {
             });
             self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("production round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("production round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.production = Some(round + 1);
@@ -1189,8 +1227,8 @@ impl Analyzer {
         // harvested helper surface rather than leftover untyped.
         let production_sig = prev_sig.clone();
         let mut production_view_params = None;
-        let mut cycles = cycles::CycleWidening::default();
-        for round in 0..FIXPOINT_CAP {
+        let mut cycles = cycles.next_loop();
+        for round in 0..fixpoint_cap() {
             crate::timings::phase(
                 if round == 0 {
                     "typing passes (views after fixpoint)".to_string()
@@ -1232,7 +1270,7 @@ impl Analyzer {
             );
             self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("test round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("test round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.tests = Some(round + 1);
@@ -1245,8 +1283,8 @@ impl Analyzer {
         }
         if !self.inference_matches(&production_sig) {
             let mut absorb_sig = self.capture_inference_sig();
-            let mut cycles = cycles::CycleWidening::default();
-            for round in 0..FIXPOINT_CAP {
+            let mut cycles = cycles.next_loop();
+            for round in 0..fixpoint_cap() {
                 crate::timings::phase(
                     if round == 0 {
                         "typing passes (after view unify)".to_string()
@@ -1273,7 +1311,7 @@ impl Analyzer {
                 self.overlay_test_params(app);
                 self.widen_cycles(&absorb_sig, &mut cycles);
                 if fixpoint_debug::enabled() {
-                    fixpoint_debug::report(&format!("absorb round {round} (widened {})", cycles.widened_count()), &absorb_sig, &self.capture_inference_sig());
+                    fixpoint_debug::report(&format!("absorb round {round} ({})", cycles.round_summary(self, &absorb_sig)), &absorb_sig, &self.capture_inference_sig());
                 }
                 if self.inference_matches(&absorb_sig) {
                     self.fixpoint_rounds.absorb = Some(round + 1);
@@ -1299,7 +1337,9 @@ impl Analyzer {
                 )
             });
             self.harvest_returns_to_registry(app, true);
+            self.limit_depths(&mut cycles);
         }
+        crate::timings::note(format_args!("fixpoint rounds: {}", self.fixpoint_rounds));
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.
@@ -1317,6 +1357,13 @@ impl Analyzer {
                 true,
             )
         });
+        // The oracle for the incremental library pass: every class it
+        // would have skipped typed to the trees it kept.
+        assert!(
+            self.incremental.mismatches_total == 0,
+            "ROUNDHOUSE_INCREMENTAL=check: {} library classes the incremental pass would skip typed differently",
+            self.incremental.mismatches_total
+        );
         // Effects are a function of the converged typed trees, not of
         // the fixpoint. Collecting inside every typing round walked
         // the same bodies two or three times per round for no harvest
@@ -1732,12 +1779,25 @@ impl Analyzer {
         let mut map: HashMap<Symbol, Ty> = HashMap::new();
         let mut ambiguous: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         let mut resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
+        // The class registry does not change while this runs, so a
+        // value whose constant reads all answer as they did when it was
+        // last typed types the same again: each round after the first
+        // re-types only the values that read a constant the round
+        // before changed. `version` counts the rounds' constant maps;
+        // `changed_at` holds, per read key, the version that last
+        // changed its answer.
+        let mode = self.incremental.mode;
+        let mut last: Vec<Option<(usize, Vec<u64>, Ty)>> = vec![None; entries.len()];
+        let mut changed_at: HashMap<u64, usize> = HashMap::new();
+        let (mut typed, mut clean_count, mut mismatches) = (0usize, 0usize, 0usize);
+        let mut rounds = 0usize;
         // Each round can type one more link of a `B = A` chain, so n
         // values need at most n + 1 rounds when no value changes after
         // it is typed. A cycle (`A = B`, `B = A`) never types and stays
         // unknown, and the read reports it. The bound also stops values
         // that change on each round.
-        for _ in 0..=entries.len() {
+        for version in 0..=entries.len() {
+            rounds += 1;
             let mut next: HashMap<Symbol, Ty> = HashMap::new();
             let mut next_resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
             let shared = body::ConstScope::global(map.clone());
@@ -1746,18 +1806,42 @@ impl Analyzer {
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
-            for (self_ty, name, id, value, production) in entries.iter_mut() {
-                let ctx = Ctx {
-                    self_ty: Some(self_ty.clone()),
-                    lexical_self: None,
-                    ivar_bindings: HashMap::new(),
-                    local_bindings: HashMap::new(),
-                    class_objects: Default::default(),
-                    constants: shared.clone(),
-                    annotate_self_dispatch: false,
-                    in_view: false, class_side: false,
+            for (index, (self_ty, name, id, value, production)) in entries.iter_mut().enumerate() {
+                let clean = last[index].as_ref().filter(|(at, reads, _)| {
+                    reads.iter().all(|k| changed_at.get(k).is_none_or(|v| v <= at))
+                });
+                let reused = clean.map(|(_, _, ty)| ty.clone());
+                clean_count += usize::from(reused.is_some());
+                let ty = if let (Some(ty), incremental::Mode::On) = (&reused, mode) {
+                    ty.clone()
+                } else {
+                    let ctx = Ctx {
+                        self_ty: Some(self_ty.clone()),
+                        lexical_self: None,
+                        ivar_bindings: HashMap::new(),
+                        local_bindings: HashMap::new(),
+                        class_objects: Default::default(),
+                        constants: shared.clone(),
+                        annotate_self_dispatch: false,
+                        in_view: false, class_side: false,
+                    };
+                    let deps = body::DepRecorder::default();
+                    let ty = typer.clone().with_deps(&deps).analyze_expr(value, &ctx);
+                    typed += 1;
+                    if let (Some(old), incremental::Mode::Check) = (&reused, mode) {
+                        if *old != ty {
+                            mismatches += 1;
+                            if mismatches <= 40 {
+                                eprintln!(
+                                    "roundhouse-incremental-check: constant {} round {version}: kept {old:?}, typed {ty:?}",
+                                    name.as_str()
+                                );
+                            }
+                        }
+                    }
+                    last[index] = Some((version, deps.take(), ty.clone()));
+                    ty
                 };
-                let ty = typer.analyze_expr(value, &ctx);
                 if matches!(ty, Ty::Var { .. }) {
                     continue;
                 }
@@ -1782,9 +1866,39 @@ impl Analyzer {
             if next == map && next_resolved == resolved {
                 break;
             }
+            // Stamp the keys whose answer the next round's maps change.
+            let next_version = version + 1;
+            for (name, ty) in &next {
+                if map.get(name) != Some(ty) {
+                    changed_at.insert(body::DepKey::ConstName(name).hash64(), next_version);
+                }
+            }
+            for name in map.keys() {
+                if !next.contains_key(name) {
+                    changed_at.insert(body::DepKey::ConstName(name).hash64(), next_version);
+                }
+            }
+            for (id, ty) in next_resolved.iter() {
+                if resolved.get(id) != Some(ty) {
+                    changed_at.insert(body::DepKey::Constant(id).hash64(), next_version);
+                }
+            }
+            for id in resolved.keys() {
+                if !next_resolved.contains_key(id) {
+                    changed_at.insert(body::DepKey::Constant(id).hash64(), next_version);
+                }
+            }
             map = next;
             resolved = next_resolved;
         }
+        crate::timings::note(format_args!(
+            "constants ({mode:?}): {} values, {rounds} rounds, typed {typed}, clean {clean_count}, check mismatches {mismatches}",
+            entries.len()
+        ));
+        assert!(
+            mismatches == 0,
+            "ROUNDHOUSE_INCREMENTAL=check: {mismatches} constant values the incremental registry would keep typed differently"
+        );
         // These source-declared constants have modeled factory-generated
         // object methods even though their initializer is not a retained class.
         for constant in app.generated_helper_methods.keys() {
@@ -3202,21 +3316,53 @@ impl Analyzer {
         let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::new();
 
         let _typing_library = crate::timings::begin("typing: library");
-        for lc in &mut app.library_classes {
+        self.incremental.begin_pass(
+            &self.classes,
+            &self.inferred_params,
+            &self.typed_constants,
+            app.library_classes.len(),
+        );
+        let mode = self.incremental.mode;
+        for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
-                self.classes
-                    .entry(lc.name.clone())
-                    .or_default()
-                    .instance_methods
-                    .insert(Symbol::from("params"), Ty::Record { row: row.clone() });
+                let created = !self.classes.contains_key(&lc.name);
+                let params_name = Symbol::from("params");
+                let params_ty = Ty::Record { row: row.clone() };
+                let methods = &mut self.classes.entry(lc.name.clone()).or_default().instance_methods;
+                if methods.get(&params_name) != Some(&params_ty) {
+                    methods.insert(params_name.clone(), params_ty);
+                    self.incremental.note_write(&lc.name, &params_name, created);
+                }
             }
             let self_id = if lc.is_module {
                 sole_includer.get(&lc.name).cloned().unwrap_or_else(|| lc.name.clone())
             } else {
                 lc.name.clone()
             };
+            // A mailer's pass also feeds its templates' ivar seeds below,
+            // so it is typed every pass.
+            let concern_env_here = concern_ivar_env.get(&lc.name);
+            let writes_here = current_attribute_writes.get(&lc.name);
+            let trees_before = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
+            let clean = !mailer_names.contains(&lc.name)
+                && self.incremental.is_clean(index, &lc.name, &self_id, trees_before, concern_env_here, writes_here);
+            if clean {
+                self.incremental.pass.clean += 1;
+                if mode == incremental::Mode::On {
+                    continue;
+                }
+            }
+            let kept = (clean && mode == incremental::Mode::Check).then(|| lc.clone());
+            let deps = body::DepRecorder::default();
+            // `seed_method_params` reads these outside the typer.
+            deps.note(body::DepKey::Class(&lc.name));
+            for method in &lc.methods {
+                deps.note(body::DepKey::Params(&lc.name, &method.name));
+                deps.note(body::DepKey::Instance(&lc.name, &method.name));
+                deps.note(body::DepKey::ClassMethod(&lc.name, &method.name));
+            }
             let class_ctx = Ctx {
-                self_ty: Some(Ty::Class { id: self_id, args: vec![] }),
+                self_ty: Some(Ty::Class { id: self_id.clone(), args: vec![] }),
                 lexical_self: None,
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
@@ -3225,11 +3371,11 @@ impl Analyzer {
             };
 
             for initializer in &mut lc.class_ivar_initializers {
-                self.body_typer().analyze_expr(initializer, &class_ctx);
+                self.body_typer().with_deps(&deps).analyze_expr(initializer, &class_ctx);
             }
             for (_, value) in &mut lc.constants {
                 if self.data_factories.contains_key(&value.span) {
-                    self.body_typer().analyze_expr(value, &class_ctx);
+                    self.body_typer().with_deps(&deps).analyze_expr(value, &class_ctx);
                 }
             }
             let lc_name = lc.name.clone();
@@ -3241,11 +3387,11 @@ impl Analyzer {
                 // and the stamped signature can fold it in.
                 for p in &mut method.params {
                     if let Some(default) = &mut p.default {
-                        self.body_typer().analyze_expr(default, &class_ctx);
+                        self.body_typer().with_deps(&deps).analyze_expr(default, &class_ctx);
                     }
                 }
                 let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
             }
 
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
@@ -3365,10 +3511,27 @@ impl Analyzer {
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
                 }
             }
+            if let Some(kept) = kept {
+                if kept != *lc {
+                    self.incremental.report_mismatch(&kept, lc);
+                }
+            }
+            let trees_after = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
+            self.incremental.record(
+                index,
+                &lc_name,
+                &self_id,
+                deps.take(),
+                trees_before,
+                trees_after,
+                concern_env_here,
+                writes_here,
+            );
         }
+        self.incremental.end_pass();
         drop(_typing_library);
 
         if !type_views_and_tests {
