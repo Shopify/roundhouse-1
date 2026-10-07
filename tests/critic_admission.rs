@@ -222,8 +222,11 @@ fn lambda_parameters_cannot_borrow_outer_class_identity() {
 
 #[test]
 fn dropped_block_capture_cannot_borrow_outer_identity() {
-    refuses("k = Probe; [1].each { |&k| k.define_method(:x) { 1 } }", "block parameter capture");
-    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", "block parameter capture");
+    // The capture is kept and shadows the outer `k`: the block's `k` is
+    // whatever block the call passes, not the class `Probe`.
+    let identity = "define_method requires a proven class/module object receiver";
+    refuses("k = Probe; [1].each { |&k| k.define_method(:x) { 1 } }", identity);
+    refuses("k = Probe; f = ->(&k) { k.define_method(:x) { 1 } }; f.call", identity);
 }
 
 #[test]

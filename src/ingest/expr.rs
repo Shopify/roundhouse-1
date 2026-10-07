@@ -1090,7 +1090,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
-            refuse_block_capture(l.parameters(), file)?;
+            let block_param = block_capture(l.parameters(), file)?;
             let params = block_param_names(l.parameters());
             let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
@@ -1102,7 +1102,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { rest_param, params, block_param: None, body, block_style }
+            ExprNode::Lambda { rest_param, params, block_param, body, block_style }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -2861,7 +2861,7 @@ fn ingest_call_block(
             // standalone-lambda-vs-attached-block distinction is lost,
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
-                refuse_block_capture(lam.parameters(), file)?;
+                let block_param = block_capture(lam.parameters(), file)?;
                 let params = block_param_names(lam.parameters());
                 let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
@@ -2872,7 +2872,7 @@ fn ingest_call_block(
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+                    ExprNode::Lambda { rest_param, params, block_param, body, block_style },
                 )));
             }
             // Any other proc-valued expression is evaluated once and passed as the block.
@@ -2928,7 +2928,7 @@ fn ingest_call_block(
 /// hands this the same `BlockNode` shape one level deeper (inside the
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
-    refuse_block_capture(b.parameters(), file)?;
+    let block_param = block_capture(b.parameters(), file)?;
     let params = block_param_names(b.parameters());
     let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
@@ -2939,7 +2939,7 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param, params, block_param: None, body, block_style },
+        ExprNode::Lambda { rest_param, params, block_param, body, block_style },
     ))
 }
 
@@ -3065,18 +3065,25 @@ fn block_style_from_opening(bytes: &[u8]) -> crate::expr::BlockStyle {
     }
 }
 
-/// Authored block captures are not retained by the Lambda ingest below.
-/// Refuse before dropping a binding that could shadow an outer local.
-fn refuse_block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<()> {
-    if params_node.and_then(|node| node.as_block_parameters_node())
-        .and_then(|node| node.parameters()).is_some_and(|params| params.block().is_some())
-    {
-        return Err(IngestError::Unsupported {
+/// A block's or lambda's own block parameter (`|*args, &blk|`,
+/// `->(&blk)`), kept on the `Lambda` so the binding shadows an outer
+/// local of the same name and the emitted block still receives the
+/// block it is called with. An anonymous `&` has no name to keep.
+fn block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Option<Symbol>> {
+    let Some(block) = params_node
+        .and_then(|node| node.as_block_parameters_node())
+        .and_then(|node| node.parameters())
+        .and_then(|params| params.block())
+    else {
+        return Ok(None);
+    };
+    match block.name() {
+        Some(name) => Ok(Some(Symbol::from(constant_id_str(&name)))),
+        None => Err(IngestError::Unsupported {
             file: file.into(),
-            message: "block parameter capture requires preserved Lambda signature semantics".into(),
-        });
+            message: "anonymous block parameter `&` in a block or lambda signature".into(),
+        }),
     }
-    Ok(())
 }
 
 fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {

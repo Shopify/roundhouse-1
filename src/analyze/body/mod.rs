@@ -1055,6 +1055,11 @@ impl<'a> BodyTyper<'a> {
                 for name in params.iter().chain(rest_param.iter()).chain(block_param.iter()) {
                     inner.class_objects.remove(name);
                 }
+                // `->(&blk)` binds the block the call passes (a Proc, or
+                // nil), shadowing any outer local of that name.
+                if let Some(name) = block_param {
+                    inner.local_bindings.insert(name.clone(), Ty::Untyped);
+                }
                 let body_ty = self.analyze_expr(body, &inner);
                 // Synthesize a `Fn` type from the body's type. Param
                 // types aren't tracked here (they were seeded into the
