@@ -3302,7 +3302,7 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// requiring the real ones would load Rails over the ports. A semian
 /// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
 pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
-    use std::collections::{HashMap, HashSet};
+    use crate::det::{HashMap, HashSet};
     if app.gem_lock.is_none() {
         return (Vec::new(), Vec::new());
     }
@@ -3327,7 +3327,7 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
     };
     let mut native: Vec<String> = Vec::new();
     let mut framework: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::default();
     for (entry, lib) in entries {
         let mut stack = vec![entry];
         let mut order: Vec<String> = Vec::new();

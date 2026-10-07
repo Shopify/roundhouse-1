@@ -6648,8 +6648,8 @@ pub(super) fn install_lookup_indexes(app: &App) -> LookupIndexes<'_> {
 /// Installed and keyed like `ConstantReaderIndex`; without it the
 /// lookups scan as before.
 struct NameIndex {
-    models: std::collections::HashSet<String>,
-    controllers: std::collections::HashSet<String>,
+    models: crate::det::HashSet<String>,
+    controllers: crate::det::HashSet<String>,
     library_classes: HashMap<String, Vec<usize>>,
 }
 
