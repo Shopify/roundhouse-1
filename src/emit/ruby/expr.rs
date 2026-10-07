@@ -1142,13 +1142,17 @@ fn is_string_keyed_hash(recv: &Expr) -> bool {
 }
 
 /// Coerce a key indexing a string-keyed hash: a symbol literal `:id` →
-/// `"id"`, an already-string key unchanged, and any dynamic key wrapped
-/// with `.to_s`. Safe on a `Hash[String, _]` — the key is a string, so
+/// `"id"`, an already-string key unchanged, and a Symbol-typed dynamic key
+/// wrapped with `.to_s`. Safe on a `Hash[String, _]` — the key is a string, so
 /// `.to_s` is a no-op on a string and repairs a symbol.
 fn coerce_str_key(key: &Expr) -> String {
     match &*key.node {
         ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
         ExprNode::Lit { value: Literal::Str { .. } } => emit_expr(key),
+        // Not every dynamic key: the receiver's `Hash[String, _]` may come from a signature over
+        // a plain Hash, where `values[key]` with a Symbol `key` natively misses the String entry.
+        // Only a key known to be a Symbol is the indifferent-access idiom.
+        _ if !matches!(key.ty, Some(Ty::Sym)) => emit_expr(key),
         _ => {
             let k = emit_expr(key);
             if recv_needs_parens(key) { format!("({k}).to_s") } else { format!("{k}.to_s") }
