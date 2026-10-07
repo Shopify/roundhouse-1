@@ -212,3 +212,76 @@ fn implicit_super_into_a_nameless_rest_is_refused_off_cruby() {
         assert_eq!(keyword_supers, 2, "{target:?}: {errors:?}");
     }
 }
+
+const BUILDER: &str = r#"module GraphApi
+  class ConnectionDataBuilder
+    attr_reader :opts
+
+    def initialize(context:, query_class: nil, sort_key: nil)
+      @opts = [context, query_class, sort_key]
+    end
+  end
+end
+"#;
+
+const ITEMS_BUILDER: &str = r#"module GraphApi
+  module Admin
+    class ItemsBuilder < GraphApi::ConnectionDataBuilder
+      def initialize(**kwargs)
+        super(**{ query_class: :items, **kwargs })
+      end
+    end
+  end
+end
+"#;
+
+const NESTED: &str = r#"module GraphApi
+  class ConnectionDataBuilder
+    class CursorPrefetch
+      def size = 1
+    end
+  end
+end
+"#;
+
+const PREPENDED: &str = r#"module Hook
+  def initialize(...)
+    super(...)
+  end
+end
+
+module GraphApi
+  class ConnectionDataBuilder
+    prepend Hook
+  end
+end
+"#;
+
+fn builder_app(reopen: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/fwd.rb", FWD)
+        .write("app/models/graph_api/connection_data_builder.rb", BUILDER)
+        .write("app/models/graph_api/admin/items_builder.rb", ITEMS_BUILDER)
+        .write("app/models/graph_api/connection_data_builder/cursor_prefetch.rb", reopen)
+}
+
+/// Core's `GraphApi::ConnectionDataBuilder` is reopened in
+/// `connection_data_builder/cursor_prefetch.rb` only to nest a class.
+/// That reopen adds nothing to the class, so the `super(**…)` of its
+/// subclasses still resolves to its `initialize`. A reopen that does add
+/// something (`prepend Hook`, with a `...` forwarder) still leaves the
+/// destination unverified.
+#[test]
+fn a_namespace_only_reopen_keeps_a_super_destination_resolved() {
+    let script = "p GraphApi::Admin::ItemsBuilder.new(context: 1, sort_key: :id).opts, GraphApi::ConnectionDataBuilder::CursorPrefetch.new.size\n";
+    let expected = native(&[FWD, BUILDER, ITEMS_BUILDER, NESTED], script);
+    assert_eq!(expected, "[1, :items, :id]\n1\n");
+    let run = builder_app(NESTED).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    let (_, errors) = builder_app(PREPENDED).emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("keyword producer's full forwarding destination cannot be verified")),
+        "{errors:?}"
+    );
+}

@@ -4801,8 +4801,13 @@ fn map_enum_labels(app: &mut App) {
 /// ordered one by one, so a require between two of a body's constants
 /// places the required file's constants between them.
 ///
-/// Returned is how many declarations each merged class came from, which
-/// the analysis keeps counting as fragments where the order matters.
+/// Returned is how many of each merged class's declarations declare
+/// something on it, which the analysis keeps counting as fragments where
+/// the order matters. A declaration that only nests other classes
+/// (`class GraphApi::ConnectionDataBuilder; class CursorPrefetch …`)
+/// adds no member to the class, so it cannot reorder one and is not
+/// counted (`declares_on_class`); a class left with one such
+/// declaration is not listed.
 fn merge_library_class_reopens(
     classes: &mut Vec<LibraryClass>,
     sources: &[crate::span::SourceFile],
@@ -4822,7 +4827,10 @@ fn merge_library_class_reopens(
     let mut groups: Vec<&Vec<usize>> = Vec::new();
     for (name, group) in &members {
         if group.len() > 1 && mergeable(group) {
-            merged.insert(name.clone(), group.len());
+            let declaring = group.iter().filter(|&&i| declares_on_class(&classes[i])).count();
+            if declaring > 1 {
+                merged.insert(name.clone(), declaring);
+            }
             groups.push(group);
         }
     }
@@ -4865,6 +4873,25 @@ fn merge_library_class_reopens(
     }
     *classes = slots.into_iter().flatten().collect();
     merged
+}
+
+/// Whether one declaration of a class gives it anything of its own: a
+/// superclass, a mixin, a method, alias, visibility change or
+/// conditional definition, a class-body call, a constant or a class
+/// ivar. One that does none of these only opens the namespace for nested
+/// classes, which ingest records as classes of their own.
+fn declares_on_class(lc: &LibraryClass) -> bool {
+    lc.parent.is_some()
+        || !lc.includes.is_empty()
+        || !lc.methods.is_empty()
+        || !lc.method_aliases.is_empty()
+        || !lc.visibility_overrides.is_empty()
+        || !lc.conditional_definitions.is_empty()
+        || !lc.unknown_calls.is_empty()
+        || !lc.constants.is_empty()
+        || !lc.top_level_constants.is_empty()
+        || !lc.class_ivar_initializers.is_empty()
+        || !lc.nullable_columns.is_empty()
 }
 
 /// Where a library-class declaration runs in load order: its earliest
