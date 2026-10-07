@@ -2580,6 +2580,7 @@ fn splice_concern_class_methods_into_includers(
                 }
                 provenance.insert(m.name.clone(), concern.clone());
                 let mut m = m.clone();
+                refuse_copied_classvars(&mut m.body, concern);
                 if !consts.is_empty() {
                     qualify_lexical_consts(&mut m.body, concern, consts);
                     for param in &mut m.params {
@@ -2625,6 +2626,32 @@ fn splice_concern_class_methods_into_includers(
         }
     }
     app.concern_spliced_class_methods = spliced;
+}
+
+/// A class variable in a concern's class-side method belongs to the
+/// concern (or its `ClassMethods`) lexically: Ruby resolves `@@x` from
+/// where the `def` is written, never from the includer it is called on.
+/// The copy emitted on the includer would resolve it there instead, so
+/// each class-variable read or write in a copy is refused at its site.
+fn refuse_copied_classvars(expr: &mut crate::expr::Expr, concern: &crate::ident::ClassId) {
+    use crate::expr::{ExprNode, LValue};
+    let classvar = match &*expr.node {
+        ExprNode::Var { name, .. } => name.as_str().starts_with("@@"),
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => name.as_str().starts_with("@@"),
+        _ => false,
+    };
+    if classvar {
+        expr.diagnostic.get_or_insert(crate::diagnostic::DiagnosticKind::Unsupported {
+            target: None,
+            construct: crate::ident::Symbol::from("class variable in a copied concern class method"),
+            detail: format!(
+                "Ruby resolves it lexically in {}, not in the includer the copy is emitted on",
+                concern.0.as_str()
+            ),
+        });
+    }
+    expr.node.for_each_child_mut(&mut |child| refuse_copied_classvars(child, concern));
 }
 
 /// A routed action with a template and no method behind it gets the

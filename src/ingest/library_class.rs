@@ -433,6 +433,7 @@ pub(super) fn library_class_and_struct_base(
         mut unknown_calls,
         class_initializers,
         visibility_overrides,
+        ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
@@ -1352,6 +1353,10 @@ struct DeclBody {
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
     visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
+    /// An include, constant or captured class-body call came AFTER a
+    /// class-variable initializer in source. The emitted body puts every
+    /// initializer after those buckets, so it cannot keep that order.
+    declaration_after_class_initializer: bool,
 }
 
 impl DeclBody {
@@ -1362,10 +1367,17 @@ impl DeclBody {
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
         self.visibility_overrides.extend(other.visibility_overrides);
+        self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
+    }
+
+    /// The class-body declarations an initializer must not precede.
+    fn ordered_declaration_count(&self) -> usize {
+        self.includes.len() + self.constants.len() + self.unknown_calls.len()
     }
 
     fn finalize_classvars(
         &mut self,
+        owner: &ClassId,
         class_attributes: &HashSet<Symbol>,
         has_class_attr_default: bool,
         file: &str,
@@ -1389,15 +1401,14 @@ impl DeclBody {
                     message: "native class-variable writes alongside cattr/mattr storage are not modeled".into(),
                 });
             }
+            // A native `@@x` (one no cattr/mattr declares) stays a native
+            // class variable in class and instance methods alike. The Ruby
+            // family emits it verbatim inside the same lexical class, so
+            // CRuby's own storage applies: shared by the class and every
+            // subclass, NameError when unset, RuntimeError when overtaken.
+            // Only declared cattr/mattr names keep the class-ivar
+            // approximation; their writes were refused just above.
             if m.receiver == MethodReceiver::Class {
-                // Native @@ storage is shared with subclasses, unlike the
-                // per-class @ storage of the existing cattr approximation.
-                if writes_classvar(&m.body, None) {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: "class-variable writes in class methods require shared inheritance storage".into(),
-                    });
-                }
                 normalize_classvars_to_ivars(&mut m.body, class_attributes);
             }
         }
@@ -1413,15 +1424,123 @@ impl DeclBody {
             ExprNode::Assign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().strip_prefix("@@").is_some_and(|bare|
                     class_attributes.iter().any(|attr| attr.as_str() == bare))));
-        if !self.class_initializers.is_empty()
-            && (!self.unknown_calls.is_empty() || !self.constants.is_empty() || !self.includes.is_empty())
-        {
+        if self.class_initializers.is_empty() {
+            return Ok(());
+        }
+        // The emitted body runs includes, constants and replayed calls,
+        // then every initializer in source order, then the defs. That is
+        // the source order exactly when nothing of the first kind follows
+        // an initializer and no initializer needs a def written above it.
+        if self.declaration_after_class_initializer {
             return Err(IngestError::Unsupported {
                 file: file.into(),
-                message: "native class-variable initialization alongside other class-body declarations requires source ordering".into(),
+                message: "native class-variable initialization followed by other class-body declarations requires source ordering".into(),
+            });
+        }
+        let own = OwnClassCalls::new(owner, &self.methods);
+        if self.class_initializers.iter().any(|init| own.runs(init)) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "class-variable initializer calling a method of its own class requires source ordering against the defs".into(),
+            });
+        }
+        // The Ruby emitter defers a constant that runs this class's own
+        // code past the defs (`partition_deferred_constants`), which would
+        // move it after an initializer it preceded.
+        if self.constants.iter().any(|(_, value)| own.runs(value)) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "native class-variable initialization alongside a constant that calls its own class requires source ordering".into(),
             });
         }
         Ok(())
+    }
+}
+
+/// Does a class-body expression run code this class body defines? A
+/// receiverless, `self.` or own-class-qualified call of a method it
+/// defines, or of `new`/`allocate` (which runs its `initialize`). A stored
+/// closure (`-> { }`, `proc { }`, `lambda { }`) runs later and is skipped;
+/// any other block is searched, since it may run now. Every def counts,
+/// whatever its side, so this covers the Ruby emitter's constant deferral
+/// (`partition_deferred_constants`).
+struct OwnClassCalls<'a> {
+    owner: &'a str,
+    leaf: &'a str,
+    methods: HashSet<&'a str>,
+}
+
+impl<'a> OwnClassCalls<'a> {
+    fn new(owner: &'a ClassId, methods: &'a [MethodDef]) -> Self {
+        let owner = owner.0.as_str();
+        OwnClassCalls {
+            owner,
+            leaf: owner.rsplit("::").next().unwrap_or(owner),
+            methods: methods.iter().map(|m| m.name.as_str()).collect(),
+        }
+    }
+
+    fn own_receiver(&self, recv: &Option<Expr>) -> bool {
+        match recv.as_ref().map(|r| &*r.node) {
+            None | Some(ExprNode::SelfRef) => true,
+            Some(ExprNode::Const { path }) => {
+                let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                joined == self.owner || joined == self.leaf
+            }
+            _ => false,
+        }
+    }
+
+    fn runs(&self, expr: &Expr) -> bool {
+        match &*expr.node {
+            // A closure literal is stored; a block that runs now is
+            // searched through its call below.
+            ExprNode::Lambda { .. } => false,
+            ExprNode::Send { recv, method, args, block, .. } => {
+                let name = method.as_str();
+                if self.own_receiver(recv)
+                    && (matches!(name, "new" | "allocate") || self.methods.contains(name))
+                {
+                    return true;
+                }
+                let stored = recv.is_none() && matches!(name, "proc" | "lambda")
+                    || name == "new" && recv.as_ref().is_some_and(|r| matches!(&*r.node,
+                        ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Proc"));
+                recv.iter().chain(args.iter()).any(|e| self.runs(e))
+                    || (!stored && block.as_ref().is_some_and(|b| match &*b.node {
+                        ExprNode::Lambda { body, .. } => self.runs(body),
+                        _ => self.runs(b),
+                    }))
+            }
+            _ => {
+                let mut found = false;
+                expr.node.for_each_child(&mut |child| found |= self.runs(child));
+                found
+            }
+        }
+    }
+}
+
+/// Per-statement watch for a declaration that follows a class-variable
+/// initializer. `observe` runs before each statement and after the last,
+/// so a statement that grew the include/constant/call buckets after an
+/// earlier statement recorded an initializer marks the body. Within one
+/// statement (a merged `class << self` walk) the nested body's own flag
+/// carries that statement's internal order.
+#[derive(Default)]
+struct InitializerOrder {
+    previous: Option<(bool, usize)>,
+}
+
+impl InitializerOrder {
+    fn observe(&mut self, out: &mut DeclBody) {
+        let now = out.ordered_declaration_count();
+        if let Some((had_initializer, before)) = self.previous {
+            if had_initializer && now > before {
+                out.declaration_after_class_initializer = true;
+            }
+        }
+        self.previous = Some((!out.class_initializers.is_empty(), now));
     }
 }
 
@@ -1670,7 +1789,7 @@ pub(super) fn factory_class_body(
     owner: &ClassId,
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
-    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers, visibility_overrides } =
+    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers, visibility_overrides, .. } =
         walk_decl_body(body, owner, file, false)?;
     if !constants.is_empty() || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
@@ -1732,7 +1851,9 @@ fn walk_decl_body_with_visibility<'pr>(
     let mut body_locals: Vec<BodyLocal> = Vec::new();
     let has_class_methods = statements.iter().any(|stmt| stmt.as_module_node()
         .is_some_and(|m| module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()])));
+    let mut order_mark = InitializerOrder::default();
     for statement in statements {
+        order_mark.observe(&mut out);
         // An `if` / `unless` around a `def`, a visibility marker, or an
         // accessor this walk would otherwise lower is not a statement it
         // can keep. Check the source statement, before a visibility
@@ -1863,19 +1984,12 @@ fn walk_decl_body_with_visibility<'pr>(
             out.unknown_calls.extend(applied);
             continue;
         }
-        // Retain native nil initialization in source order. Only a declared
-        // cattr/mattr storage approximation may drop it, after the whole body
-        // has been walked. Non-nil initializers remain outside this slice.
+        // Retain native initialization, with any value, in source order.
+        // Only a declared cattr/mattr storage approximation may drop a nil
+        // one, after the whole body has been walked; `finalize_classvars`
+        // refuses an order the emitted body cannot reproduce.
         if stmt.as_class_variable_write_node().is_some() {
             let initializer = ingest_expr(&stmt, file)?;
-            if !matches!(&*initializer.node, ExprNode::Assign { value, .. }
-                if matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }))
-            {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "class-variable initializer with non-nil value".into(),
-                });
-            }
             out.class_initializers.push(initializer);
             continue;
         }
@@ -2048,6 +2162,15 @@ fn walk_decl_body_with_visibility<'pr>(
                 if !force_class_receiver {
                     if let Some(block) = visibility::included_block_with_defs(&call) {
                         let inner = walk_decl_body_with_visibility(block.body(), owner, file, false, visibility)?;
+                        // The block is class_eval'd on each includer, so its
+                        // initializer would run once per includer; the
+                        // concern's own body runs it once.
+                        if !inner.class_initializers.is_empty() {
+                            return Err(IngestError::Unsupported {
+                                file: file.into(),
+                                message: "class-variable initialization in an included block is not modeled".into(),
+                            });
+                        }
                         out.methods.extend(inner.methods.into_iter().filter(|m| !m.name_span.is_synthetic()));
                         // A constant written in the block is the
                         // concern's: the block keeps its lexical scope.
@@ -2353,7 +2476,8 @@ fn walk_decl_body_with_visibility<'pr>(
         }
     }
 
-    out.finalize_classvars(&class_attributes, has_class_attr_default, file)?;
+    order_mark.observe(&mut out);
+    out.finalize_classvars(owner, &class_attributes, has_class_attr_default, file)?;
     Ok(out)
 }
 
