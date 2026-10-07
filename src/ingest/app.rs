@@ -3514,6 +3514,9 @@ fn splice_concerns_into_controllers(app: &mut App) {
         crate::ident::ClassId,
         HashMap<crate::ident::Symbol, crate::ident::ClassId>,
     > = HashMap::default();
+    // Module methods with a nameless rest copied into some controller.
+    let mut copied_rests: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+        crate::det::HashSet::default();
 
     for controller in &mut app.controllers {
         let include_groups = crate::analyze::controller_include_groups(controller);
@@ -3605,6 +3608,9 @@ fn splice_concerns_into_controllers(app: &mut App) {
                 if !defined.insert(method.name.clone()) {
                     continue;
                 }
+                if method.params.iter().any(crate::dialect::Param::is_nameless_rest) {
+                    copied_rests.insert((module.clone(), method.name.clone()));
+                }
                 let mut body = method.body.clone();
                 if let Some(consts) = module_constants.get(module) {
                     qualify_lexical_consts(&mut body, module, consts);
@@ -3680,6 +3686,20 @@ fn splice_concerns_into_controllers(app: &mut App) {
         }
         filters.extend(methods);
         controller.body = filters;
+    }
+    // An action keeps no nameless rest (its parameters are a row of
+    // names), so a module method copied into a controller with one is
+    // refused at its declaration, as before the module admitted it
+    // (`library_class::admit_nameless_rest`).
+    for lc in &mut app.library_classes {
+        for m in &mut lc.methods {
+            if m.receiver == MethodReceiver::Instance
+                && m.unsupported_formals.is_none()
+                && copied_rests.contains(&(lc.name.clone(), m.name.clone()))
+            {
+                m.unsupported_formals = Some(crate::dialect::UnsupportedFormal::AnonymousRest);
+            }
+        }
     }
     // The `sig` above a module's `def` describes the COPY as well: the
     // includer's method is that `def`, and inference over the copy would

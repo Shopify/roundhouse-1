@@ -1862,11 +1862,13 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 }
 
 /// A nameless positional rest (`def m(*)`) is carried only on a library
-/// class's own instance methods: those are emitted where they are
-/// written, so the emitted `def` keeps Ruby's arity with no binding.
-/// A module's methods are copied into whatever includes it, and a
-/// class-side `def self.m(*)` into other carriers, which are not shown
-/// to keep it, so those stay refused. So does a method that passes the
+/// class's or module's own instance methods: those are emitted where
+/// they are written (the Ruby family writes a module as a module and
+/// keeps each `include` as written), so the emitted `def` keeps Ruby's
+/// arity with no binding. A module method a controller copies in as an
+/// action is refused again there (`splice_concerns_into_controllers`).
+/// A class-side `def self.m(*)` is copied into other carriers, which are
+/// not shown to keep it, so it stays refused. So does a method that passes the
 /// rest on by a bare `*` (`source_passes_rest_on`): ingest keeps no slot
 /// for it. An implicit `super` passes it on as Ruby does: the CRuby tree
 /// writes the zsuper bare beside the kept `*`.
@@ -1933,7 +1935,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let visibility = Visibility::resolve_library(module.body().as_ref(), file, Some(&owner))?;
     let DeclBody {
         includes,
-        methods,
+        mut methods,
         constants,
         unknown_calls,
         class_initializers,
@@ -1942,6 +1944,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_attribute_effects,
         ..
     } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
     if !class_attribute_effects.is_empty() {

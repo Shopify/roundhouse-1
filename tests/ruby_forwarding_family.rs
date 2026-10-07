@@ -285,3 +285,118 @@ fn a_namespace_only_reopen_keeps_a_super_destination_resolved() {
         "{errors:?}"
     );
 }
+
+const LABELED: &str = r#"module Labeled
+  def label(*) = :label
+
+  def tag(*, **)
+    super
+  end
+end
+"#;
+
+const WRAPPED: &str = r#"module Wrapped
+  include Labeled
+
+  def wrap(*)
+    [:wrap, label(1, k: 2)]
+  end
+end
+"#;
+
+const TAGGER: &str = r#"class Tagger
+  def tag(*args, **kw)
+    [args, kw]
+  end
+end
+
+class Item < Tagger
+  include Wrapped
+end
+"#;
+
+/// Core's `AddActiveSupportNotificationToGRPC#request_response(*, **)`
+/// (a zsuper inside a block) and `AssertionHelp#assert_raise(*)`.
+const GRPCISH: &str = r#"module Grpcish
+  def request(*, **)
+    [:inst, [1].map { super }.first]
+  end
+end
+
+class Stub
+  def request(a, b: 1)
+    [a, b]
+  end
+end
+
+class Client < Stub
+  include Grpcish
+end
+
+module Assertish
+  def assert_raise(*)
+    raise NotImplementedError, "Use assert_raises instead"
+  end
+end
+
+class Checker
+  include Assertish
+end
+"#;
+
+fn module_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/labeled.rb", LABELED)
+        .write("app/models/wrapped.rb", WRAPPED)
+        .write("app/models/tagger.rb", TAGGER)
+        .write("app/models/grpcish.rb", GRPCISH)
+}
+
+/// A module's own instance methods with a nameless rest: the Ruby family
+/// writes the module and each `include` as written, so a call through an
+/// includer, a module included by a module, and an implicit `super` out
+/// of one (in a block too) bind as in Ruby.
+#[test]
+fn a_module_s_nameless_rest_runs_on_cruby() {
+    let script = "r = begin; Checker.new.assert_raise(1); rescue NotImplementedError => e; e.message; end\n\
+                  p Item.new.wrap, Item.new.tag(1, 2, k: 3), Client.new.request(5, b: 6), r\n";
+    let expected = native(&[LABELED, WRAPPED, TAGGER, GRPCISH], script);
+    assert_eq!(expected, "[:wrap, :label]\n[[1, 2], {k: 3}]\n[:inst, [5, 6]]\n\"Use assert_raises instead\"\n");
+    let run = module_app().run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    let (_, errors) = module_app().emit(BuildTarget::Spinel);
+    let declarations = errors.iter().filter(|e| e.contains("anonymous positional rest declaration")).count();
+    assert_eq!(declarations, 5, "{errors:?}");
+}
+
+/// A concern included in a model is a real module on the Ruby tree. One
+/// a controller includes is copied in as actions, whose parameters keep
+/// no nameless rest, so it stays refused there.
+#[test]
+fn a_concern_s_nameless_rest_runs_in_a_model_and_is_refused_in_a_controller() {
+    const CONCERN: &str = "module RestLabeled\n  extend ActiveSupport::Concern\n\n  def rest_label(*)\n    :rest\n  end\nend\n";
+    let run = emit_and_run::real_blog()
+        .write("app/models/concerns/rest_labeled.rb", CONCERN)
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", "class Article < ApplicationRecord\n  include RestLabeled\n")
+        .run_ruby("p Article.new.rest_label(1, k: 2)\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, ":rest\n");
+    // Read as `roundhouse check` reads it: the lowering prunes the
+    // spliced concern, and with it the refused declaration.
+    let files = [
+        ("app/controllers/concerns/rest_labeled.rb", CONCERN),
+        ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+        ("app/controllers/probes_controller.rb", "class ProbesController < ApplicationController\n  include RestLabeled\n\n  def index\n    head :ok\n  end\nend\n"),
+    ];
+    let mut app = roundhouse::ingest::ingest_app_from_tree(
+        files.iter().map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec())).collect(),
+    )
+    .expect("ingest synthetic source");
+    roundhouse::analyze::Analyzer::new(&app).analyze(&mut app);
+    let refused: Vec<_> = roundhouse::analyze::diagnose(&app)
+        .into_iter()
+        .filter(|d| d.message.contains("anonymous positional rest is not retained"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+}

@@ -9153,14 +9153,14 @@ fn a_nameless_rest_is_refused_off_cruby() {
 }
 
 /// Where the rest is passed on by a bare `*`, copied to another carrier
-/// (a module, the class side, a test helper), split across reopened
+/// (the class side, a test helper), split across reopened
 /// fragments, or declared beside `**nil`, the emitted program is not
 /// shown to keep it, so the declaration stays refused. So do `...` into
 /// it and a `delegate` to it. Other parameters beside the rest, reified
 /// methods and keyword splats into it run on the CRuby tree
-/// (`tests/ruby_anonymous_rest_dispatch.rs`), as do an implicit `super`
-/// from it and from an override with keywords into it
-/// (`tests/ruby_forwarding_family.rs`).
+/// (`tests/ruby_anonymous_rest_dispatch.rs`), as do a module's own
+/// instance methods and an implicit `super` from it and from an override
+/// with keywords into it (`tests/ruby_forwarding_family.rs`).
 #[test]
 fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
     use roundhouse::project::BuildTarget;
@@ -9169,7 +9169,6 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("bare_send", "class Probe\n  def m(*)\n    other(*)\n  end\n\n  def other(*args)\n    args.size\n  end\nend\n", "anonymous positional rest is not retained"),
         ("bare_array", "class Probe\n  def m(*)\n    [*]\n  end\nend\n", "anonymous positional rest is not retained"),
         ("bare_super", "class Probe < Base\n  def m(*)\n    super(*)\n  end\nend\n", "anonymous positional rest is not retained"),
-        ("module", "module Mixin\n  def m(*)\n    :mixed\n  end\nend\n\nclass Probe\n  include Mixin\nend\n", "anonymous positional rest is not retained"),
         ("class_side", "class Probe\n  def self.m(*)\n    :klass\n  end\nend\n", "anonymous positional rest is not retained"),
         ("singleton", "class Probe\n  class << self\n    def m(*)\n      :klass\n    end\n  end\nend\n", "anonymous positional rest is not retained"),
         ("reopened", "class Probe\n  def first\n    :first\n  end\nend\n\nclass Probe\n  def m(*)\n    first\n  end\nend\n", "nameless rest in a reopened class fragment"),
