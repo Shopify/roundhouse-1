@@ -350,8 +350,8 @@ struct ParamTables {
 /// The `ROUNDHOUSE_TIMINGS` span labels count differently: each loop's
 /// first round has its own label (`typing passes (views after
 /// fixpoint)`, `typing passes (after view unify)`), and the rest are
-/// `round 1` … `round 11`, so `round 11: absorb production` is the
-/// twelfth round. The `fixpoint rounds:` timing line prints this value.
+/// `round 1` … `round N-1`, so with a cap of 40 `round 39: absorb
+/// production` is the fortieth round. The `fixpoint rounds:` timing line prints this value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FixpointRounds {
     pub production: Option<usize>,
@@ -360,7 +360,14 @@ pub struct FixpointRounds {
 }
 
 /// Rounds a whole-program fixpoint loop may run.
-pub const FIXPOINT_CAP: usize = 12;
+///
+/// A backstop, not a budget: a loop that settles stops there. On the
+/// full Shopify Core check (the v3.1 and v3.4 slices) production settles
+/// in 30 rounds, absorb in 18 and tests in 4, once a slot that deepens
+/// every other round is depth-limited (`cycles::GROWTH_GAP`). The old cap
+/// of 12 stopped production and absorb while still moving; 40 leaves ten
+/// rounds of margin over the slowest loop.
+pub const FIXPOINT_CAP: usize = 40;
 
 /// [`FIXPOINT_CAP`], or `ROUNDHOUSE_FIXPOINT_CAP` when set: a diagnostic
 /// for asking whether a loop that reaches the cap would settle later.
