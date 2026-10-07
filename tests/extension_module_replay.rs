@@ -98,3 +98,40 @@ fn an_extend_self_module_s_body_sets_its_own_accessors() {
     run.assert_passes();
     assert_eq!(run.stdout, expected);
 }
+
+const CONFIG: &str = r#"module Config
+  extend self
+
+  attr_accessor :group_id
+
+  self.group_id = 36
+
+  PORT = 80
+
+  #: () -> String
+  def label
+    "group #{group_id} on #{PORT}"
+  end
+end
+"#;
+
+/// The same body with a constant after the write, as Core's
+/// `Shopify::Config` has. A replayed call above a constant runs before
+/// it, but `self.group_id = 36` calls the body's own writer, so it
+/// stays after the methods: hoisted above `PORT`, it ran before
+/// `group_id=` existed (NoMethodError at boot).
+#[test]
+fn a_self_write_above_a_constant_still_runs_after_its_writer() {
+    let script = "p Config.group_id, Config.label\n";
+    let native = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(format!("{CONFIG}\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "36\n\"group 36 on 80\"\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+    let run = emit_and_run::empty_app().write("app/models/config.rb", CONFIG).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+}

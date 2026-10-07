@@ -6865,9 +6865,19 @@ fn emit_library_class_decl_inner(
     // `remove_const :SYNTAX` and then assigns the new `SYNTAX`, which
     // written the other way round would remove the new one. Only by
     // real spans in one file; the rest follow the constants, as before.
+    //
+    // Except a call that runs this class's own code (`OwnClassCalls`:
+    // `self.x = v` through an `attr_accessor` the body declares) and
+    // every call after it: those go after the methods (`tail_effects`
+    // below), because the writer they call is one of them. Hoisted
+    // above a later constant, Core's `Shopify::Config` ran
+    // `self.zendesk_account_integrity_group_id = ...` before its writer
+    // existed.
+    let own_runs = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
+    let first_own = if railtie { None } else { replayed.iter().position(|c| own_runs.runs(c)) };
     let mut calls_before: crate::det::HashMap<usize, Vec<&Expr>> = crate::det::HashMap::default();
     let mut leading: crate::det::HashSet<crate::span::Span> = crate::det::HashSet::default();
-    for call in &replayed {
+    for call in replayed.iter().take(first_own.unwrap_or(replayed.len())) {
         let at = eager
             .iter()
             .copied()
