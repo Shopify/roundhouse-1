@@ -835,6 +835,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         .collect();
     app.zeitwerk_loaders = super::zeitwerk::resolve(&super::zeitwerk::drain(), &support_classes);
     app.railties = carried_railties(vfs, dir, &app, &support_classes, &engine_dirs);
+    // What native boot requires from its own (uncarried) boot files.
+    (app.boot_loads, app.boot_conditional_loads) =
+        super::boot_requires::boot_loads(vfs, dir, &path_gems, &gem_sources);
 
     // `app/helpers/*.rb` — ingested as library classes like the support
     // dirs above, but ALSO registered in `helper_method_index` so the

@@ -16,6 +16,7 @@
 //! cross-cutting Prism AST helpers live in [`util`].
 
 mod alba;
+mod boot_requires;
 mod graphql_ruby;
 pub(crate) mod class_attribute;
 mod class_configuration;

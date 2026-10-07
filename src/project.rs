@@ -4133,11 +4133,11 @@ fn gem_source_dependency_block(app: &App) -> String {
     out.push_str(
         "  spec = Gem::Specification.find_by_path(feature)\n  \
          if spec && __rh_compiled_gems.include?(spec.name)\n    \
-         warn \"roundhouse: warning[gem_source_file_not_compiled]: #{feature.inspect}, which a gem source requires, is a file of the #{spec.name} gem this tree carries as source, and this tree does not carry it compiled; it is not loaded\"\n    \
+         $stderr.puts \"roundhouse: warning[gem_source_file_not_compiled]: #{feature.inspect}, which a gem source requires, is a file of the #{spec.name} gem this tree carries as source, and this tree does not carry it compiled; it is not loaded\"\n    \
          next\n  \
          end\n  \
          if spec && (rails = __rh_rails_dependency.(spec, []))\n    \
-         warn \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
+         $stderr.puts \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
          next\n  \
          end\n  \
          loaded = $LOADED_FEATURES.size\n",
@@ -5519,12 +5519,21 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         .filter(|(anchor, _)| !ignored_anchors.contains(anchor))
         .collect();
     models.sort();
-    // The support files' file programs: neither autoloaded nor
-    // eager-loaded. One another emitted file requires (a program's
-    // `require`, an engine's glob) loads there, as Ruby loads it; the
-    // rest, which nothing in the tree requires (config/boot.rb's
-    // `require "strict_warnings"`, Bundler.require's gem entry), load at
-    // boot in source order, ahead of the boot files.
+    // The support files' file programs. Each loads where Ruby loads its
+    // source (`App::file_programs`):
+    // - where another emitted file requires it (a program's `require`,
+    //   an engine's glob);
+    // - at boot, where native boot requires it from a boot file the tree
+    //   does not carry (config/boot.rb's `require_relative
+    //   ".../strict_warnings"`, Bundler.require's gem entry, an
+    //   environment file's require: `App::boot_loads`), in that order;
+    // - on the first reference to a constant whose file it is, as
+    //   Zeitwerk loads an autoloaded file on demand: the constant's
+    //   autoload loads the program, which loads the declarations in
+    //   source order (below).
+    // A program none of these reaches is one native lazy boot never
+    // loads; `eager_load!` loads it, and app/models.rb names it
+    // (`UNREACHED_PROGRAMS`).
     let (programs, rest): (Vec<(String, String)>, Vec<(String, String)>) =
         models.into_iter().partition(|(anchor, _)| anchor.starts_with("models/roundhouse_files/"));
     let mut models = rest;
@@ -5543,9 +5552,98 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             rest = &tail[end..];
         }
     }
-    let mut programs: Vec<String> =
-        programs.into_iter().map(|(a, _)| a).filter(|a| !required.contains(a.as_str())).collect();
-    programs.sort();
+    let program_anchors: std::collections::BTreeSet<String> = programs.into_iter().map(|(a, _)| a).collect();
+    let program_anchor_of_source = |source: &str| {
+        let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+        let rel = rel.strip_suffix(".rb").unwrap_or(rel);
+        format!("models/roundhouse_files/{rel}")
+    };
+    // Native boot's own requires, in load order, each with the
+    // environments it loads in.
+    let mut boot_programs: Vec<(String, &crate::app::BootLoad)> = Vec::new();
+    for load in &app.boot_loads {
+        let anchor = program_anchor_of_source(&load.source);
+        if program_anchors.contains(&anchor) && !boot_programs.iter().any(|(a, _)| *a == anchor) {
+            boot_programs.push((anchor, load));
+        }
+    }
+    let conditional_programs: Vec<(String, &crate::app::BootLoad)> = app
+        .boot_conditional_loads
+        .iter()
+        .map(|load| (program_anchor_of_source(&load.source), load))
+        .filter(|(anchor, _)| program_anchors.contains(anchor) && !boot_programs.iter().any(|(a, _)| a == anchor))
+        // One a carried file requires under its condition is that file's
+        // to load (its program runs the condition).
+        .filter(|(anchor, _)| !required.contains(anchor.as_str()))
+        .collect();
+    // The program whose source is the file of each declarations anchor,
+    // as Zeitwerk maps a constant to the one file its name names: among
+    // the sources that declare it, the one whose path ends in the
+    // constant's path (compared as Zeitwerk's camelize would, without
+    // underscores and case: `organizations_api.rb` for OrganizationsAPI).
+    // A constant a file defines away from its own path (a runtime
+    // namespace essentials' high_throughput_local_cache.rb reopens) is
+    // no autoload of that file: it is defined when the file loads.
+    let program_by_source: std::collections::BTreeMap<&str, String> = app
+        .file_programs
+        .iter()
+        .map(|p| (p.source.as_str(), emit::ruby::file_program_anchor(app, p)))
+        .filter(|(_, anchor)| program_anchors.contains(anchor))
+        .collect();
+    let mut declaring: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (source, names) in &app.library_class_files {
+        for name in names {
+            let sources = declaring.entry(anchor_of(name)).or_default();
+            if !sources.contains(&source.as_str()) {
+                sources.push(source.as_str());
+            }
+        }
+    }
+    // The directory a constant's path is read from must be one Ruby
+    // resolves constant paths under: a Rails autoload root (`app/<x>`,
+    // `app/<x>/concerns`, a Zeitwerk loader's root) or a `lib/` on the
+    // load path. `lib/podding/patches/active_record.rb` names
+    // Podding::Patches::ActiveRecord, not the ActiveRecord it reopens.
+    let loader_roots: std::collections::BTreeSet<&str> = app
+        .zeitwerk_loaders
+        .iter()
+        .map(|l| l.root.strip_prefix(app.root.as_str()).unwrap_or(&l.root).trim_matches('/'))
+        .collect();
+    let autoload_root = |dir: &[&str]| -> bool {
+        let n = dir.len();
+        (n >= 1 && dir[n - 1] == "lib")
+            || (n >= 2 && dir[n - 2] == "app")
+            || (n >= 3 && dir[n - 1] == "concerns" && dir[n - 3] == "app")
+            || loader_roots.contains(dir.join("/").as_str())
+    };
+    let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
+    for (anchor, sources) in &declaring {
+        let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
+        let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
+        let wanted = fold(stem);
+        let named: Vec<&&str> = sources
+            .iter()
+            .filter(|source| {
+                let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+                let path = rel.strip_suffix(".rb").unwrap_or(rel);
+                let depth = stem.matches('/').count() + 1;
+                let segments: Vec<&str> = path.split('/').collect();
+                if segments.len() < depth {
+                    return false;
+                }
+                let (dir, named) = segments.split_at(segments.len() - depth);
+                fold(&named.join("/")) == wanted && autoload_root(dir)
+            })
+            .collect();
+        let owner = match named.as_slice() {
+            [one] => Some(**one),
+            _ => None,
+        };
+        if let Some(program) = owner.and_then(|o| program_by_source.get(o)) {
+            program_of_file.insert(anchor.clone(), program.clone());
+        }
+    }
+    let as_loaded = |anchor: &str| program_of_file.get(anchor).cloned().unwrap_or_else(|| anchor.to_string());
     models.sort();
 
     // namespace ("Object" for the top level) -> child -> (file, written as module)
@@ -5587,6 +5685,37 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         }
     }
 
+    // The railties' files (below), which load in Rails' order.
+    let program_of = |name: &crate::ident::ClassId| {
+        app.file_programs
+            .iter()
+            .find(|p| p.items.iter().any(|i| matches!(i, crate::app::ProgramItem::Declared(names) if names.contains(name))))
+            .map(|p| emit::ruby::file_program_anchor(app, p))
+    };
+    let railtie_files: Vec<(&crate::app::CarriedRailtie, String)> = app
+        .railties
+        .iter()
+        .filter(|r| app.library_classes.iter().any(|c| c.name == r.name))
+        .filter(|r| models.iter().any(|(m, _)| *m == anchor_of(&r.name)))
+        .map(|r| (r, program_of(&r.name).unwrap_or_else(|| anchor_of(&r.name))))
+        .collect();
+    boot_programs.retain(|(p, _)| !railtie_files.iter().any(|(_, anchor)| anchor == p));
+    // Each list names a declarations file's program in its place, so
+    // the program's statements run around its declarations.
+    let loaded_list = |anchors: &mut dyn Iterator<Item = &str>| -> Vec<String> {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        anchors.map(|a| as_loaded(a)).filter(|a| seen.insert(a.clone())).collect()
+    };
+    let boot_files: Vec<String> = loaded_list(&mut boot_files.iter().copied());
+    // The programs a constant's autoload (or the boot files) loads.
+    let mut autoloaded: std::collections::BTreeSet<String> = boot_files.iter().cloned().collect();
+    for children in namespaces.values() {
+        for child in children.values() {
+            if let Some(file) = &child.file {
+                autoloaded.insert(as_loaded(file));
+            }
+        }
+    }
     let mut body = String::from(
         "# Loads the model/support classes under app/models/ the way Rails'\n\
          # autoloader does. Generated from the emitted tree (see\n\
@@ -5607,7 +5736,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             if i > 0 {
                 body.push_str(", ");
             }
-            let file = child.file.as_ref().map_or("nil".to_string(), |f| format!("{f:?}"));
+            let file = child.file.as_ref().map_or("nil".to_string(), |f| format!("{:?}", as_loaded(f)));
             write!(body, "[:{name}, {file}, {}]", child.all_module).unwrap();
         }
         body.push_str("],\n");
@@ -5616,8 +5745,65 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let list = |names: &mut dyn Iterator<Item = &str>| -> String {
         names.map(|n| format!("    {n:?},\n")).collect()
     };
-    write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().copied())).unwrap();
-    write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut models.iter().map(|(a, _)| a.as_str()))).unwrap();
+    let unreached: Vec<&String> = program_anchors
+        .iter()
+        .filter(|p| {
+            !required.contains(p.as_str())
+                && !autoloaded.contains(*p)
+                && !boot_programs.iter().any(|(b, _)| b == *p)
+                && !railtie_files.iter().any(|(_, r)| r == *p)
+        })
+        .collect();
+    write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().map(String::as_str))).unwrap();
+    let all_files = loaded_list(&mut models.iter().map(|(a, _)| a.as_str()).chain(unreached.iter().map(|p| p.as_str())));
+    write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut all_files.iter().map(String::as_str))).unwrap();
+    // What native lazy boot never loads: a file program no file
+    // requires, no boot file requires, and no constant names as its
+    // file. `eager_load!` loads each (ALL_FILES).
+    write!(body, "  UNREACHED_PROGRAMS = [\n{}  ].freeze\n", list(&mut unreached.iter().map(|p| p.as_str()))).unwrap();
+    // A program native boot requires only under a condition of its boot
+    // file (config/boot.rb's `unless BootLib.production?`), which the
+    // emitted boot does not evaluate: not loaded at boot, but where a
+    // file requires it or with its constant, as any other.
+    body.push_str("  # file => where native boot requires it, under a condition\n  CONDITIONAL_BOOT_PROGRAMS = {\n");
+    for (anchor, load) in &conditional_programs {
+        writeln!(body, "    {anchor:?} => {:?},", load.site).unwrap();
+    }
+    body.push_str("  }.freeze\n");
+    // The constants whose autoload is each program (`entering_program`),
+    // and each declarations file that requires other files before its
+    // own definitions: a program (shopify-money's lib/money.rb) may load
+    // it by a plain `require` while its constant still autoloads it, and
+    // a file it requires first (money/null_currency.rb's `class Money`)
+    // would resolve that autoload into the in-flight file.
+    let requires_first = |file: &str| -> bool {
+        let path = format!("app/{file}.rb");
+        files.iter().find(|(p, _)| *p == path).is_some_and(|(_, content)| {
+            content
+                .lines()
+                .map(str::trim_start)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .is_some_and(|l| l.starts_with("require ") || l.starts_with("require_relative "))
+        })
+    };
+    let mut program_constants: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
+    for (namespace, children) in &namespaces {
+        for (name, child) in children {
+            let Some(file) = child.file.as_ref() else { continue };
+            if let Some(program) = program_of_file.get(file) {
+                program_constants.entry(program.clone()).or_default().push((namespace, name));
+            } else if requires_first(file) {
+                program_constants.entry(file.clone()).or_default().push((namespace, name));
+            }
+        }
+    }
+    body.push_str("  # program (or declarations file loading other files first) => the\n  # constants it is the autoload of, [namespace, constant]\n  PROGRAM_CONSTANTS = {\n");
+    for (program, constants) in &program_constants {
+        let pairs: Vec<String> = constants.iter().map(|(ns, name)| format!("[{ns:?}, :{name}]")).collect();
+        writeln!(body, "    {program:?} => [{}],", pairs.join(", ")).unwrap();
+    }
+    body.push_str("  }.freeze\n");
+    let autoloaded_programs: Vec<String> = program_constants.keys().cloned().collect();
     // Each Zeitwerk loader's files, for its `eager_load`.
     body.push_str("  # Zeitwerk loader constant => the files it manages\n  LOADERS = {\n");
     for loader in &app.zeitwerk_loaders {
@@ -5626,6 +5812,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             .iter()
             .map(|c| anchor_of(c))
             .filter(|a| models.iter().any(|(m, _)| m == a))
+            .map(|a| as_loaded(&a))
             .collect();
         anchors.sort();
         anchors.dedup();
@@ -5700,7 +5887,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     if !app.eager_load.is_empty() {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
     }
-    body.push_str("RoundhouseAutoload.register(Object)\n");
+    if boot_programs.is_empty() {
+        body.push_str("RoundhouseAutoload.register(Object)\n");
+    } else {
+        body.push_str("RoundhouseAutoload.register_deferring(Object)\n");
+    }
     // The railties and engines the app carries (`App::railties`, kept
     // only where the tree ports Rails::Railtie and Rails::Engine), loaded
     // at boot in Rails' order, as Bundler.require and
@@ -5709,20 +5900,6 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // source has it in, where its data files are carried
     // (`Rails::Engine.source_roots`). A railtie whose file runs more than
     // its declarations loads as its file program, in that order.
-    let program_of = |name: &crate::ident::ClassId| {
-        app.file_programs
-            .iter()
-            .find(|p| p.items.iter().any(|i| matches!(i, crate::app::ProgramItem::Declared(names) if names.contains(name))))
-            .map(|p| emit::ruby::file_program_anchor(app, p))
-    };
-    let railtie_files: Vec<(&crate::app::CarriedRailtie, String)> = app
-        .railties
-        .iter()
-        .filter(|r| app.library_classes.iter().any(|c| c.name == r.name))
-        .filter(|r| models.iter().any(|(m, _)| *m == anchor_of(&r.name)))
-        .map(|r| (r, program_of(&r.name).unwrap_or_else(|| anchor_of(&r.name))))
-        .collect();
-    programs.retain(|p| !railtie_files.iter().any(|(_, anchor)| anchor == p));
     if !railtie_files.is_empty() {
         body.push_str("# The app's railties and engines, in Rails' load order (runtime/rails_engine.rb).\n");
         for (railtie, _) in &railtie_files {
@@ -5737,12 +5914,21 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             }
         }
     }
-    if !programs.is_empty() {
-        body.push_str("# The support files' file-level programs (app/models/roundhouse_files): what\n# Ruby runs when it loads each, beyond the declarations autoloaded above.\n[\n");
-        for program in &programs {
-            writeln!(body, "  {program:?},").unwrap();
+    if !boot_programs.is_empty() {
+        body.push_str(
+            "# The support files' file-level programs (app/models/roundhouse_files) that\n\
+             # native boot requires from its own boot files (`App::boot_loads`), in its\n\
+             # order, with the environments each loads in (nil: every one). Every\n\
+             # other program loads where a file requires it, or with its constant.\n[\n",
+        );
+        for (program, load) in &boot_programs {
+            let envs = if load.envs.is_empty() { "nil".to_string() } else { format!("{:?}", load.envs) };
+            writeln!(body, "  [{program:?}, {envs}], # {}", load.site).unwrap();
         }
-        body.push_str("].each { |file| require RoundhouseAutoload.path(file) }\n");
+        body.push_str(
+            "].each { |file, envs| require RoundhouseAutoload.path(file) if envs.nil? || envs.include?(Rails.env.to_s) }\n\
+             RoundhouseAutoload.load_deferred\n",
+        );
     }
     body.push_str(
         "RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n",
@@ -5764,6 +5950,134 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     } else {
         files.push(("app/models.rb".to_string(), body));
     }
+    load_declarations_through_their_program(files, app, &program_of_file);
+    for program in &autoloaded_programs {
+        let file = format!("app/{program}.rb");
+        if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
+            // After the program's header comment (through its "else at
+            // boot" line), ahead of any note on its first statement.
+            let comments: Vec<&str> = content.split_inclusive('\n').take_while(|l| l.starts_with('#')).collect();
+            let header_lines = comments.iter().position(|l| l.trim_end().ends_with("else at boot (app/models.rb).")).map_or(comments.len(), |i| i + 1);
+            let header: usize = comments[..header_lines].iter().map(|l| l.len()).sum();
+            // An initializer's constant file loads before app/models.rb.
+            content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
+        }
+    }
+}
+
+/// A declarations file whose constant autoloads its program (above) is
+/// loaded through that program everywhere else too: a file that requires
+/// it (another file's load-time dependency on its constant) requires the
+/// program, as Ruby loading the constant's source runs the whole file.
+/// Loaded directly, the declarations file's own `module X` would fire
+/// X's autoload while the file is still loading; the program's require of
+/// that file is then a circular no-op and X stays undefined (Core's
+/// verdict/bucket_hash.rb, which verdict/experiment.rb depends on).
+/// The program's own declarations files keep requiring each other
+/// directly: the program is already loading them. So does a file the
+/// program is loading now (`require_through`): secure_headers.rb requires
+/// headers/content_security_policy, whose policy_management depends on
+/// SecureHeaders; natively nothing there requires secure_headers.rb back.
+fn load_declarations_through_their_program(
+    files: &mut [(String, String)],
+    app: &App,
+    program_of_file: &std::collections::BTreeMap<String, String>,
+) {
+    use std::collections::{BTreeMap, BTreeSet};
+    if program_of_file.is_empty() {
+        return;
+    }
+    let mut declarations_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for program in &app.file_programs {
+        let anchor = emit::ruby::file_program_anchor(app, program);
+        let own = declarations_of.entry(anchor).or_default();
+        for item in &program.items {
+            if let crate::app::ProgramItem::Declared(names) = item {
+                for name in names {
+                    own.insert(format!("models/{}", crate::emit::ruby::library_file_stem(name.0.as_str(), app)));
+                }
+            }
+        }
+    }
+    // `a/b/../c` => `a/c`.
+    let normalize = |path: &str| -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    };
+    let relative = |from_dir: &str, to: &str| -> String {
+        let from: Vec<&str> = from_dir.split('/').filter(|p| !p.is_empty()).collect();
+        let target: Vec<&str> = to.split('/').collect();
+        let common = from.iter().zip(&target).take_while(|(a, b)| a == b).count();
+        let mut out: Vec<&str> = std::iter::repeat_n("..", from.len() - common).collect();
+        out.extend(&target[common..]);
+        out.join("/")
+    };
+    for (path, content) in files.iter_mut() {
+        if !path.ends_with(".rb") || !content.contains("require") {
+            continue;
+        }
+        let own = path.strip_prefix("app/").and_then(|p| p.strip_suffix(".rb")).unwrap_or("");
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        // The program a dependency loads through, unless this file is
+        // that program or one of its declarations, or a program loading
+        // its own declarations there (a file reopening the constant).
+        let through = |anchor: &str| -> Option<&String> {
+            let program = program_of_file.get(anchor)?;
+            let theirs = program == own
+                || declarations_of.get(program).is_some_and(|d| d.contains(own))
+                || declarations_of.get(own).is_some_and(|d| d.contains(anchor));
+            (!theirs).then_some(program)
+        };
+        let mut changed = false;
+        let mut out = String::with_capacity(content.len());
+        for line in content.split_inclusive('\n') {
+            let text = line.trim_end_matches('\n');
+            let replaced = if let Some(rel) =
+                text.strip_prefix("require_relative \"").and_then(|r| r.strip_suffix('"'))
+            {
+                let target = normalize(&format!("{dir}/{rel}"));
+                let target = target.strip_suffix(".rb").unwrap_or(&target);
+                // A file loading before app/models.rb (an initializer's
+                // constant, boot.rb) keeps its direct require.
+                target.strip_prefix("app/").and_then(|anchor| {
+                    through(anchor).map(|program| {
+                        format!(
+                            "defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through({program:?}, {anchor:?}) : require_relative({:?})",
+                            relative(dir, &format!("app/{program}"))
+                        )
+                    })
+                })
+            } else if let Some(anchor) =
+                text.strip_prefix("require RoundhouseAutoload.path(\"").and_then(|r| r.strip_suffix("\")"))
+            {
+                through(anchor).map(|program| format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})"))
+            } else {
+                None
+            };
+            match replaced {
+                Some(new) => {
+                    changed = true;
+                    out.push_str(&new);
+                    if line.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                None => out.push_str(line),
+            }
+        }
+        if changed {
+            *content = out;
+        }
+    }
 }
 
 /// The registration half of the generated `app/models.rb`
@@ -5775,13 +6089,53 @@ const AUTOLOAD_RUNTIME: &str = r##"
     File.expand_path("#{file}.rb", ROOT)
   end
 
+  # A program loading by a plain `require` (a boot file's, another
+  # file's) while its constants still autoload it: Ruby would resolve its
+  # declarations' `class X` through that autoload, re-require the
+  # in-flight program (a circular require) and warn that it did not
+  # define X, which Core's StrictWarning raises. The load defines them, so
+  # their autoloads go first: a constant still listed whose autoload no
+  # longer resolves (`const_defined?` is false while its feature loads;
+  # `autoload?` reads nil then too). One loading through its own
+  # autoload resolves (Ruby's autoloading value) and is left to Ruby.
+  def self.entering_program(file)
+    (@entered ||= {})[file] = true
+    (PROGRAM_CONSTANTS[file] || []).each do |namespace, name|
+      mod = namespace == "Object" ? Object : namespace.split("::").inject(Object) do |m, n|
+        break nil unless m.const_defined?(n, false) && !m.autoload?(n, false)
+        m.const_get(n, false)
+      end
+      next unless mod.is_a?(Module)
+      next unless mod.constants(false).include?(name) && !mod.const_defined?(name, false)
+      mod.send(:remove_const, name)
+    end
+  end
+
+  # A load-time dependency on a constant whose program loads it
+  # (load_declarations_through_their_program): that program, unless it is
+  # loading now (entered, not yet a loaded feature), when it is the file
+  # being required on its way: then the declarations file, as the program
+  # itself loads it. Requiring the in-flight program is a circular
+  # require natively absent, which Core's StrictWarning raises.
+  def self.require_through(program, declarations)
+    @loaded_programs ||= {}
+    if @loaded_programs.key?(program) || !@entered&.key?(program)
+      require path(program)
+    elsif $LOADED_FEATURES.include?(path(program))
+      @loaded_programs[program] = true
+      require path(program)
+    else
+      require path(declarations)
+    end
+  end
+
   # A file-level statement of a support file's program: runs it, and
   # names one that fails (the rest of the file goes on, as the emitted
   # app has not ported everything a statement may reach).
   def self.file_statement(site)
     yield
   rescue StandardError, LoadError, NotImplementedError => e
-    warn "roundhouse: error[file_statement_not_run]: the file-level statement at #{site} did not run: #{e.class}: #{e.message}"
+    $stderr.puts "roundhouse: error[file_statement_not_run]: the file-level statement at #{site} did not run: #{e.class}: #{e.message}"
   end
 
   # A file-level conditional's condition: its value, or NOT_RUN when it
@@ -5791,7 +6145,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
   def self.file_condition(site)
     yield
   rescue StandardError, LoadError, NotImplementedError => e
-    warn "roundhouse: error[file_statement_not_run]: the file-level condition at #{site} did not run: #{e.class}: #{e.message}; neither branch ran"
+    $stderr.puts "roundhouse: error[file_statement_not_run]: the file-level condition at #{site} did not run: #{e.class}: #{e.message}; neither branch ran"
     NOT_RUN
   end
 
@@ -5801,7 +6155,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # carry (it does not load, as the native glob would load it).
   def self.carried_files(pattern, files, not_carried)
     not_carried.each do |source|
-      warn "roundhouse: error[engine_glob_file_not_carried]: #{source} matches #{pattern} in the source, but the tree carries no file for it; it was not loaded"
+      $stderr.puts "roundhouse: error[engine_glob_file_not_carried]: #{source} matches #{pattern} in the source, but the tree carries no file for it; it was not loaded"
     end
     files.map { |file| path(file) }
   end
@@ -5821,6 +6175,9 @@ const AUTOLOAD_RUNTIME: &str = r##"
     entries.each do |name, file, written_module|
       if mod.const_defined?(name, false)
         defined << [name, file] unless mod.autoload?(name, false)
+      elsif file && @entered&.key?(file)
+        # Its program is loading (or loaded): it defines the constant
+        # (`entering_program`).
       elsif file
         # `autoload` calls `const_added`, which must not resolve the
         # child: when the child's file is the one loading now (it was
@@ -5840,8 +6197,25 @@ const AUTOLOAD_RUNTIME: &str = r##"
     defined.each do |name, file|
       child = mod.const_get(name, false)
       register(child) if child.is_a?(Module)
-      require path(file) if file
+      next unless file
+      if @deferred then @deferred << file else require path(file) end
     end
+  end
+
+  # Registers like `register`, but the files of constants already defined
+  # (a gem's namespace an app file reopens: observe-instrument's Observe,
+  # essentials' lib/observe.rb) load after native boot's own requires
+  # (`load_deferred`), not ahead of them: native boot loads such a file
+  # where its boot files require it.
+  def self.register_deferring(mod)
+    @deferred = []
+    register(mod)
+  end
+
+  def self.load_deferred
+    files = @deferred || []
+    @deferred = nil
+    files.each { |file| require path(file) }
   end
 
   def self.registering_autoload?
@@ -8521,7 +8895,7 @@ fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> 
     // named rather than swallowed.
     out.push_str(
         "  begin\n    require gem_name\n  rescue LoadError => e\n    \
-         warn \"roundhouse: require #{gem_name.inspect} failed: #{e.message}\" unless e.path.nil? || e.path == gem_name\n    \
+         $stderr.puts \"roundhouse: require #{gem_name.inspect} failed: #{e.message}\" unless e.path.nil? || e.path == gem_name\n    \
          nil\n  end\nend\n",
     );
     out

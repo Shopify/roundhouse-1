@@ -453,6 +453,18 @@ pub struct App {
     /// as one file the boot loads (`app/models/roundhouse_files/…`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_programs: Vec<FileProgram>,
+    /// The app files native boot requires from the boot files the tree
+    /// does not carry (`config/boot.rb`, `config/application.rb` and its
+    /// `Bundler.require`, `config/environment.rb`, the selected
+    /// `config/environments/<env>.rb`), in load order
+    /// (`ingest::boot_requires`). The emitted boot loads a file program
+    /// at boot only when it is one of these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boot_loads: Vec<BootLoad>,
+    /// The boot files' requires under a condition (`if`/`unless`), which
+    /// the emitted boot does not evaluate: named, not loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boot_conditional_loads: Vec<BootLoad>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
@@ -857,6 +869,18 @@ pub struct CarriedRailtie {
     pub root: Option<String>,
 }
 
+/// A file native boot requires ([`App::boot_loads`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BootLoad {
+    /// The required file, relative to the app root.
+    pub source: String,
+    /// The environments it loads in (empty: every one): an environment
+    /// file's require, or a Gemfile group's gem.
+    pub envs: Vec<String>,
+    /// Where the boot requires it (`config/boot.rb:31`).
+    pub site: String,
+}
+
 /// A support file's file-level program ([`App::file_programs`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileProgram {
@@ -1220,6 +1244,8 @@ impl App {
             ingest_drops: Vec::new(),
             railties: Vec::new(),
             file_programs: Vec::new(),
+            boot_loads: Vec::new(),
+            boot_conditional_loads: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),

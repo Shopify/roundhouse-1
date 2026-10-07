@@ -262,11 +262,15 @@ fn a_gem_extension_loader_inflects_ignores_and_eager_loads_directories() {
         "native oracle"
     );
 
-    let mut overlay = emit_and_run::real_blog().edit(
-        "Gemfile.lock",
-        "GEM\n  remote: https://rubygems.org/\n",
-        "PATH\n  remote: gems/host-ext\n  specs:\n    host-ext (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n",
-    );
+    // The app's Gemfile lists the gem, so Bundler.require loads its
+    // entry at boot (`host-ext` => `host/ext`), as the oracle requires it.
+    let mut overlay = emit_and_run::real_blog()
+        .edit(
+            "Gemfile.lock",
+            "GEM\n  remote: https://rubygems.org/\n",
+            "PATH\n  remote: gems/host-ext\n  specs:\n    host-ext (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n",
+        )
+        .edit("Gemfile", "gem \"propshaft\"\n", "gem \"propshaft\"\ngem \"host-ext\", path: \"gems/host-ext\"\n");
     for (path, text) in files {
         overlay = overlay.write(path, text);
     }
