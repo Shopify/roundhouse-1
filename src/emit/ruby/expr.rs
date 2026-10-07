@@ -127,6 +127,9 @@ pub fn emit_expr(e: &Expr) -> String {
     if is_mutable_string_literal(e) {
         return format!("+{}", emit_node(&e.node));
     }
+    if let Some(blank) = rails_string_blank(e) {
+        return blank;
+    }
     // An AUTHOR-WRITTEN cast (`x #: as Integer`, `T.cast(x, Integer)`,
     // `T.let`, `T.bind`) is the value unchanged on every Ruby tree. The
     // coercion arm of `emit_cast` exists for the casts LOWERINGS build
@@ -142,6 +145,30 @@ pub fn emit_expr(e: &Expr) -> String {
         }
     }
     emit_node(&e.node)
+}
+
+/// A String `blank?` that `lower::blank` grounded as `r.strip.empty?`,
+/// written back as Rails' `r.blank?` on the CRuby and JRuby trees. Their
+/// overlay's `String#blank?` is activesupport's: `empty?`, else
+/// `/\A[[:space:]]*\z/`, retried in the string's own encoding when
+/// that raises `Encoding::CompatibilityError` (UTF-16, UTF-32). `strip`
+/// takes NUL and only ASCII space, so `"\0"` read blank and `"\u00A0"`
+/// present, both the other way round from Rails. The spinel tree keeps
+/// the `strip.empty?`, which has no `String#blank?` to send to (see
+/// `lower::blank`).
+fn rails_string_blank(e: &Expr) -> Option<String> {
+    if e.hint != Some(crate::expr::IrHint::StringBlank) || !native_keywords() {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(strip), method, args, block: None, .. } = &*e.node else { return None };
+    if method.as_str() != "empty?" || !args.is_empty() {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(value), method, args, block: None, .. } = &*strip.node else { return None };
+    if method.as_str() != "strip" || !args.is_empty() {
+        return None;
+    }
+    Some(emit_send_base(Some(value), &Symbol::from("blank?"), &[], false))
 }
 
 /// A string literal ingested from `+"literal"`. Written back with its

@@ -392,6 +392,7 @@ fn try_emit_raise_stmt(e: &Expr) -> Option<String> {
 fn try_string_builder_stmt(e: &Expr) -> Option<String> {
     match e.hint? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
+        IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 return Some(format!("{} = []", super::shared::py_ident(name.as_str())));

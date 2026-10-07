@@ -1212,6 +1212,7 @@ pub fn emit_expr(e: &Expr) -> String {
 fn try_string_builder(e: &Expr) -> Option<String> {
     match e.hint? {
         crate::expr::IrHint::MutableStringLiteral => None, // emitted as the plain literal
+        crate::expr::IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         crate::expr::IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 let n = camel(name.as_str());

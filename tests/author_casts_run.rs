@@ -485,7 +485,7 @@ fn a_cast_the_value_backs_still_grounds() {
         .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let backed = std::fs::read_to_string(emitted.join("app/models/backed.rb")).unwrap();
-    assert!(backed.contains("s = \"x\"\n    (s || \"\").strip.empty?\n"), "{backed}");
+    assert!(backed.contains("s = \"x\"\n    (s || \"\").blank?\n"), "{backed}");
 }
 
 /// A type the check cannot rebuild is refused at the site by name, on

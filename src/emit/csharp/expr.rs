@@ -858,6 +858,7 @@ pub fn emit_expr_for_runtime(e: &Expr) -> String {
 fn try_string_builder(e: &Expr) -> Option<String> {
     match e.hint? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
+        IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 return Some(format!("var {} = new StringBuilder()", camel(name.as_str())));
