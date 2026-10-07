@@ -246,7 +246,9 @@ fn class_methods(app: &roundhouse::App, class: &str, method: &str) -> Option<Met
 /// `super` from a factory class's `initialize` reaches the runtime
 /// `Data#initialize` / `Struct#initialize`, so an app `initialize(*)`
 /// elsewhere does not make it an implicit super into a nameless rest.
-/// A subclass of that app class still is one.
+/// A subclass of that app class still is one: the CRuby tree writes its
+/// keywords and the zsuper as written, so Ruby runs it, and every other
+/// target names it.
 #[test]
 fn implicit_super_in_a_factory_initialize_reaches_the_runtime_constructor() {
     const MONEY: &str = r##"module Conf
@@ -275,28 +277,34 @@ end
 "##;
     const REST: &str = "class Rest\n  def initialize(*)\n    @ok = true\n  end\nend\n";
     const SUB: &str = "class RestSub < Rest\n  def initialize(code:)\n    super\n  end\nend\n";
-    let script = "p Conf::Money.new.show\n";
+    let script = "p Conf::Money.new.show, RestSub.new(code: \"c\").instance_variable_get(:@ok)\n";
+    let expected = "[\"x=0\", 1]\ntrue\n";
     let native = Command::new("ruby")
         .arg("-e")
-        .arg(format!("{MONEY}\n{REST}\n{script}"))
+        .arg(format!("{MONEY}\n{REST}\n{SUB}\n{script}"))
         .output()
         .expect("native Ruby control");
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "[\"x=0\", 1]\n");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
 
     let run = emit_and_run::real_blog()
         .write("app/lib/conf/money.rb", MONEY)
         .write("app/lib/rest.rb", REST)
+        .write("app/lib/rest_sub.rb", SUB)
         .run_ruby(script);
     run.assert_passes();
-    assert_eq!(run.stdout, "[\"x=0\", 1]\n");
+    assert_eq!(run.stdout, expected);
 
-    let app = analyzed(&[("app/lib/rest.rb", REST), ("app/lib/rest_sub.rb", SUB)]);
-    let refused: Vec<_> = diagnose(&app)
-        .into_iter()
-        .filter(|d| d.severity == Severity::Error && d.message.contains("implicit super into an anonymous positional rest"))
-        .collect();
-    assert_eq!(refused.len(), 1, "{refused:?}");
+    let off_ruby = |files: &[(&str, &str)]| {
+        let app = analyzed(files);
+        assert!(!diagnose(&app).iter().any(|d| d.severity == Severity::Error), "{:?}", diagnose(&app));
+        roundhouse::analyze::nameless_rest_refusals_off_ruby(&app)
+            .into_iter()
+            .filter(|d| d.message.contains("implicit super with keywords into an anonymous positional rest"))
+            .count()
+    };
+    assert_eq!(off_ruby(&[("app/lib/conf/money.rb", MONEY), ("app/lib/rest.rb", REST)]), 0);
+    assert_eq!(off_ruby(&[("app/lib/conf/money.rb", MONEY), ("app/lib/rest.rb", REST), ("app/lib/rest_sub.rb", SUB)]), 1);
 }
 
 /// A constant written in a factory block is the ENCLOSING scope's:

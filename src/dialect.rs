@@ -710,6 +710,26 @@ impl Param {
     pub fn as_str(&self) -> &str {
         self.name.as_str()
     }
+
+    /// Where a native-keyword tree (the Ruby family) starts writing
+    /// ingest's flattened keywords back as keywords (`name: default`,
+    /// `**rest`): the first parameter of the trailing run of flattened
+    /// ones, `params.len()` when there is none. Only a trailing run can be
+    /// keywords, and a flattened keyword-rest only as its last; `None`
+    /// when the run breaks that, and the whole method stays positional.
+    pub fn respelled_keywords_from(params: &[Param]) -> Option<usize> {
+        let tail = params.iter().rev().take_while(|p| p.from_keyword || p.from_kwrest).count();
+        let first = params.len() - tail;
+        params[first..].iter().position(|p| p.from_kwrest).is_none_or(|i| i + 1 == tail).then_some(first)
+    }
+
+    /// Every keyword the source declared is a keyword in the Ruby family's
+    /// `def`: kept as one, or flattened and written back
+    /// ([`Param::respelled_keywords_from`]).
+    pub fn keywords_written_as_keywords(params: &[Param]) -> bool {
+        Param::respelled_keywords_from(params)
+            .is_some_and(|first| !params[..first].iter().any(|p| p.from_keyword || p.from_kwrest))
+    }
 }
 
 impl std::fmt::Display for Param {

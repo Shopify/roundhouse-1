@@ -92,7 +92,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     }
     out.extend(keyword_splats_into_nameless_rest(app, &contracts));
     for (span, policy) in keyword_calls_with_index(app, &contracts) {
-        if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
+        if policy.refused() {
             out.push(keyword_refusal(span, policy));
         }
     }
@@ -112,11 +112,12 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// Reifying such a method (`method(:m)`) is refused outright.
 /// An implicit `super` in an override of such a selector with keyword
 /// parameters (kept or flattened) passes the override's lowered
-/// keywords as positionals, so it is refused too.
+/// keywords as positionals, so it is refused too: off the CRuby tree
+/// always, and there too where a flattened keyword is not written back.
 ///
-/// Two of these refusals hold only off the CRuby tree
+/// Three of these refusals hold only off the CRuby tree
 /// ([`OFF_RUBY_FAMILY`]); this returns the rest, which hold on every
-/// target. [`nameless_rest_refusals_off_ruby`] returns those two.
+/// target. [`nameless_rest_refusals_off_ruby`] returns those three.
 fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<'_>) -> Vec<Diagnostic> {
     keyword_splats_into_nameless_rest_with_index(app, contracts)
         .into_iter()
@@ -124,17 +125,21 @@ fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<
         .collect()
 }
 
-/// Refusals whose whole cause is the shared lowering's erased `**value`.
-/// The Ruby emitter writes every keyword splat back (`KeywordSplat` as
-/// written, a legacy-erased one through `ERASED_KEYWORD_SPLAT`), keeps
-/// keyword arguments as keywords, and writes an admitted `def m(a, *, **)`
-/// as written. So a reified or dispatched call reaches the rest exactly as
-/// native Ruby's does, and the CRuby tree runs it as written. Every other
-/// target refuses the nameless rest declaration itself (`project.rs`);
-/// these name the call sites there too.
-const OFF_RUBY_FAMILY: [&str; 2] = [
+/// Refusals whose whole cause is the shared lowering's erased `**value`
+/// or flattened keywords. The Ruby emitter writes every keyword splat
+/// back (`KeywordSplat` as written, a legacy-erased one through
+/// `ERASED_KEYWORD_SPLAT`), keeps keyword arguments as keywords, writes a
+/// method's flattened keywords back as keywords where they trail
+/// (`Param::keywords_written_as_keywords`), a zsuper bare, and an admitted
+/// `def m(a, *, **)` as written. So a reified or dispatched call, or an
+/// override's implicit `super`, reaches the rest exactly as native Ruby's
+/// does, and the CRuby tree runs it as written. Every other target
+/// refuses the nameless rest declaration itself (`project.rs`); these
+/// name the call sites there too.
+const OFF_RUBY_FAMILY: [&str; 3] = [
     "method object of an anonymous positional rest",
     "keyword splat into an anonymous positional rest",
+    "implicit super with keywords into an anonymous positional rest",
 ];
 
 fn off_ruby_family(d: &Diagnostic) -> bool {
@@ -187,10 +192,18 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
             && !runtime_super
             && enclosing.is_some_and(|m| selectors.contains(&m.name) && m.params.iter().any(|p| p.keyword || p.from_keyword || p.from_kwrest))
         {
+            // The Ruby family writes the override's keywords as keywords
+            // and its zsuper bare, so Ruby passes them on as written.
+            // Elsewhere they are positionals, and the rest takes them.
+            let construct = if enclosing.is_some_and(|m| crate::dialect::Param::keywords_written_as_keywords(&m.params)) {
+                "implicit super with keywords into an anonymous positional rest"
+            } else {
+                "implicit super into an anonymous positional rest"
+            };
             out.push(Diagnostic::unsupported(
                 e.span,
                 None,
-                "implicit super into an anonymous positional rest",
+                construct,
                 "the override's lowered parameters are not shown to pass as written",
             ));
         }
@@ -896,6 +909,40 @@ pub(crate) enum KeywordPolicy {
     /// binds natively; the other targets refuse it like
     /// `RefuseOrdinarySuper`.
     NativeSuper,
+    /// A `**value` call whose selector may name a full (`...`) forwarder
+    /// but whose destination is not shown to be one, or not shown to be
+    /// an ordinary method: neither erasing nor keeping the splat is
+    /// proven for a target without keyword arguments, so those refuse it
+    /// (`project.rs`, through [`crate::expr::RUBY_NATIVE_KEYWORD_SPLAT`]).
+    /// The Ruby family writes every keyword splat as written, erased or
+    /// not (`emit::ruby::expr::emit_keyword_forward_arg`), and a callee's
+    /// keywords as keywords, so the interpreter binds the call as the
+    /// source does whichever method it reaches: a `...` forwarder hands
+    /// the keywords on, an ordinary method binds them. Kept as written.
+    ///
+    /// A `super` takes this only when its in-app destination is resolved;
+    /// one whose lookup leaves the app for code of unknown argument ABI
+    /// stays `Refuse` on every target.
+    NativeRuby,
+}
+
+impl KeywordPolicy {
+    /// One span's policy across the source copies sharing it (a cloned
+    /// concern body in two includers). Copies the Ruby family runs as
+    /// written in every case run so as one; a refusal in any copy holds.
+    fn join(self, other: Self) -> Self {
+        use KeywordPolicy::*;
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Refuse | RefuseOrdinarySuper, _) | (_, Refuse | RefuseOrdinarySuper) => Refuse,
+            _ => NativeRuby,
+        }
+    }
+
+    /// Refused on every target, the Ruby family included.
+    pub(crate) fn refused(self) -> bool {
+        matches!(self, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper)
+    }
 }
 
 /// `SourceContractIndex::super_leaves_source` for a `super` written
@@ -995,11 +1042,20 @@ fn keyword_calls_with_index(
                 }
             } else {
                 let resolved = destination(app, contracts, context, e);
+                // What the Ruby family can carry where the shared lowering
+                // proves neither form: a send reaches whatever method Ruby
+                // dispatches to with the splat as written; of a `super`,
+                // only an in-app destination is shown to bind natively.
+                let ruby_native = if matches!(&*e.node, ExprNode::Super { .. }) && resolved.is_none() {
+                    KeywordPolicy::Refuse
+                } else {
+                    KeywordPolicy::NativeRuby
+                };
                 if resolved.is_some_and(|(m, _)| m.params.iter().any(|p| p.forwarding)) {
                     if contract_error(context, e, resolved, contracts).is_none() {
                         KeywordPolicy::Native
                     } else {
-                        KeywordPolicy::Refuse
+                        ruby_native
                     }
                 } else if resolved.is_none()
                     && super_leaves_source(contracts, context, e, in_block)
@@ -1014,7 +1070,7 @@ fn keyword_calls_with_index(
                 {
                     // Ordinary lexical method, full virtual override: neither
                     // legacy expansion nor native-only admission proves both.
-                    KeywordPolicy::Refuse
+                    ruby_native
                 } else {
                     // Deliberately preserve the old ordinary-callee lowering;
                     // this prerequisite does not fix its missing/extra-key paths.
@@ -1023,11 +1079,7 @@ fn keyword_calls_with_index(
             };
             plans
                 .entry(e.span)
-                .and_modify(|previous| {
-                    if *previous != policy {
-                        *previous = KeywordPolicy::Refuse;
-                    }
-                })
+                .and_modify(|previous| *previous = previous.join(policy))
                 .or_insert(policy);
         }
         let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });

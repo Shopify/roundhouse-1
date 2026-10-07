@@ -414,7 +414,9 @@ pub struct App {
     pub file_statement_gaps: Vec<InitializerGap>,
     /// How many source declarations ingest merged into each library
     /// class reopened across declarations (`class X … end` again, in
-    /// this file or another), for classes with more than one. The IR
+    /// this file or another), for classes with more than one that
+    /// declares something on the class (a namespace-only reopen around a
+    /// nested class is not counted). The IR
     /// holds one class per name; this keeps the fact that its body came
     /// in pieces whose relative load order Ruby decides. The forwarding
     /// contracts count them as fragments, and a method that two files
