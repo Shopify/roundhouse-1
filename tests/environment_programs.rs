@@ -112,7 +112,7 @@ fn environment_files_become_programs_selected_by_rails_env() {
         "{models}"
     );
     assert!(models.contains("but config/environments/#{Rails.env}.rb does not exist.\""), "{models}");
-    let named: Vec<&str> = models.lines().filter(|l| l.starts_with("  warn \"roundhouse: error[environment_statement_not_carried]")).collect();
+    let named: Vec<&str> = models.lines().filter(|l| l.starts_with("  $stderr.puts \"roundhouse: error[environment_statement_not_carried]")).collect();
     assert_eq!(named.len(), 4, "{models}");
     assert!(
         named[0].contains("config/environments/test.rb:2 require \\\"no_such_feature\\\": `require \\\"no_such_feature\\\"`: not a runtime port"),

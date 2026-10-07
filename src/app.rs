@@ -465,6 +465,10 @@ pub struct App {
     /// the emitted boot does not evaluate: named, not loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_conditional_loads: Vec<BootLoad>,
+    /// The Gemfile gems the boot's `Bundler.require` requires, by
+    /// environment (`ingest::boot_requires::bundler_required_gems`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundler_gems: Vec<BundlerGem>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
@@ -913,6 +917,20 @@ pub struct CarriedRailtie {
 }
 
 /// A file native boot requires ([`App::boot_loads`]).
+/// A Gemfile gem the boot's `Bundler.require` requires
+/// (`ingest::boot_requires::bundler_required_gems`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BundlerGem {
+    /// The lockfile/Gemfile gem name.
+    pub name: String,
+    /// An explicit `require:` path (None: Bundler's default).
+    pub require: Option<String>,
+    /// The environments its groups limit it to (empty: every one).
+    pub envs: Vec<String>,
+    /// The Gemfile line (`Gemfile:665`).
+    pub site: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BootLoad {
     /// The required file, relative to the app root.
@@ -1287,6 +1305,7 @@ impl App {
             file_programs: Vec::new(),
             boot_loads: Vec::new(),
             boot_conditional_loads: Vec::new(),
+            bundler_gems: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),

@@ -3279,7 +3279,11 @@ fn ruby_family_files(
             // require grpc" (its grpc_fork_safety raises once GRPC is
             // loaded; the list's opentelemetry-instrumentation-grpc loads it).
             format!("{}{}", compiled_gem_native_copies_block(app), gem_source_dependency_block(app)),
-            gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
+            format!(
+                "{}{}",
+                gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
+                bundler_gem_require_block(&app.bundler_gems, app.gem_lock.as_ref())
+            ),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -3398,7 +3402,12 @@ fn ruby_family_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    let gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    let mut gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    // The app's own Bundler.require entries are activated as the
+    // lock-gated ones are (a GIT-sourced one by its checkout).
+    gem_sources.extend(
+        bundler_required_runtime_gems(&app.bundler_gems, app.gem_lock.as_ref()).into_iter().map(|gem| gem.name.clone()),
+    );
     apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref(), &gem_sources);
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
@@ -4176,7 +4185,7 @@ fn gem_source_dependency_block(app: &App) -> String {
     }
     for feature in &uncarried {
         out.push_str(&format!(
-            "warn \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
+            "$stderr.puts \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
             format!("{feature:?}").replace('"', "\\\"")
         ));
     }
@@ -4300,7 +4309,7 @@ fn environment_program_block(app: &App) -> String {
         ));
         for (site, reason) in &program.refused {
             let message = format!("roundhouse: error[environment_statement_not_carried]: {site}: {reason}");
-            out.push_str(&format!("  warn {}\n", ruby_data_literal(&serde_json::Value::String(message))));
+            out.push_str(&format!("  $stderr.puts {}\n", ruby_data_literal(&serde_json::Value::String(message))));
         }
         if let Some(holder) = &program.holder {
             let stem = format!("models/{}", crate::naming::underscore(holder.0.as_str()));
@@ -4451,7 +4460,7 @@ fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &
          [\n{entries}].each do |name, version|\n  \
            spec = Gem::Specification.find_all_by_name(name, \"= #{{version}}\").find {{ |s| Gem::Platform.match_spec?(s) }}\n  \
            if spec.nil?\n    \
-             warn \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
+             $stderr.puts \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
              next\n  \
            end\n  \
            spec.full_require_paths.each {{ |path| $LOAD_PATH << path unless $LOAD_PATH.include?(path) }}\n\
@@ -5696,6 +5705,8 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             || loader_roots.contains(dir.join("/").as_str())
     };
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
+    let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut in_place_program: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, sources) in &declaring {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
@@ -5720,9 +5731,28 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         };
         if let Some(program) = owner.and_then(|o| program_by_source.get(o)) {
             program_of_file.insert(anchor.clone(), program.clone());
+        } else if named.is_empty() && sources.iter().all(|source| program_by_source.contains_key(source)) {
+            // Declared only inside file programs, away from any path an
+            // autoload root maps the constant to (kafka-shopify's
+            // patches/avro_stdlib_json.rb reopens the gem's
+            // `Avro::Schema` after requiring it): natively the constant
+            // is whoever defines it, and the reopen runs where its
+            // program has it. An autoload of the declarations would
+            // fire on the gem's own `class Schema` and load the reopen
+            // first. So no autoload; the program loads the file in place,
+            // and `eager_load!` loads the program. Not `program_of_file`:
+            // a file that requires these declarations (an initializer's
+            // constant, loading before app/models.rb) keeps requiring
+            // them, not the program.
+            in_place.insert(anchor.clone());
+            if let [one] = sources.as_slice() {
+                in_place_program.insert(anchor.clone(), program_by_source[one].clone());
+            }
         }
     }
-    let as_loaded = |anchor: &str| program_of_file.get(anchor).cloned().unwrap_or_else(|| anchor.to_string());
+    let as_loaded = |anchor: &str| {
+        program_of_file.get(anchor).or_else(|| in_place_program.get(anchor)).cloned().unwrap_or_else(|| anchor.to_string())
+    };
     models.sort();
 
     // namespace ("Object" for the top level) -> child -> (file, written as module)
@@ -5736,6 +5766,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, content) in &models {
+        if in_place.contains(anchor) {
+            continue;
+        }
         let Some(chain) = autoload_primary(anchor, content) else {
             boot_files.push(anchor);
             continue;
@@ -9041,6 +9074,86 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
     Some(out)
 }
 
+/// Shopify Core's Gemfile entries outside the default group whose
+/// Bundler.require is measured Rails-free (`runs/rails-free-probe`,
+/// verdicts.tsv "test-group", by `LOCK_GATED_REQUIRES`' method): the
+/// gem's own require (or Bundler's `-` to `/` fallback) loads no Rails
+/// gem, bare or with the runtime's Rails modules defined, and registers
+/// no `ActiveSupport.on_load` hook. Not the measurement's minitest and
+/// minitest-reporters: they are `CRUBY_TEST_GEMS`, which the test
+/// process loads itself. ci-queue's `ci/queue` does not touch Minitest
+/// (its patches are minitest/queue, which only the app requires).
+const BUNDLER_GROUP_RAILS_FREE_GEMS: &[&str] = &[
+    "ci-queue", "debug", "dev_server", "erb-mux", "grizzly_ber", "grpc_mock", "jwt",
+    "letter_opener", "mocha", "octokit", "pdf-inspector", "rack-test", "rbi", "rotoscope",
+    "rubydex", "vcr", "webmock",
+];
+
+/// The app's Bundler.require entries (`App::bundler_gems`) the emitted
+/// tree requires as installed gems, beyond `GEM_REQUIRES` and
+/// `LOCK_GATED_REQUIRES`: resolved by the lock, not carried as source
+/// (a carried gem's entry is a file program the boot loads), and
+/// measured Rails-free (`BUNDLER_GROUP_RAILS_FREE_GEMS`). The rest of
+/// Core's default group is `LOCK_GATED_REQUIRES`, Rails-dependent, or
+/// unclassified (runtime-engine-client's `runtime/engine/client` does
+/// not exist, so native Bundler.require skips it too). `require: false`
+/// gems are not in `App::bundler_gems`: they still need the app's own
+/// require.
+pub(crate) fn bundler_required_runtime_gems<'a>(
+    bundler: &'a [crate::app::BundlerGem],
+    lock: Option<&crate::gems::Lockfile>,
+) -> Vec<&'a crate::app::BundlerGem> {
+    let Some(lock) = lock else { return Vec::new() };
+    bundler
+        .iter()
+        .filter(|gem| {
+            lock.has(&gem.name)
+                && !lock.is_in_repo(&gem.name)
+                && BUNDLER_GROUP_RAILS_FREE_GEMS.contains(&gem.name.as_str())
+                && !GEM_REQUIRES.contains(&gem.name.as_str())
+                && !LOCK_GATED_REQUIRES.iter().any(|(_, g)| *g == gem.name)
+        })
+        .collect()
+}
+
+/// Bundler.require of each gem in `bundler_required_runtime_gems`, in the
+/// environments its Gemfile groups name: the explicit `require:` path,
+/// else the gem name and then the name with `-` as `/` (Bundler's
+/// autorequire). Quiet only when the gem itself is absent; a LoadError
+/// for another feature is the gem failing part way, named as in
+/// `gem_require_block`.
+fn bundler_gem_require_block(bundler: &[crate::app::BundlerGem], lock: Option<&crate::gems::Lockfile>) -> String {
+    let gems = bundler_required_runtime_gems(bundler, lock);
+    if gems.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's Bundler.require: its other Gemfile gems, each in the\n\
+         # environments its groups name (`require: false` ones are the app's).\n[\n",
+    );
+    for gem in gems {
+        let envs: Vec<String> = gem.envs.iter().map(|e| format!("{e:?}")).collect();
+        let paths: Vec<String> = match &gem.require {
+            Some(path) => vec![format!("{path:?}")],
+            None if gem.name.contains('-') => vec![format!("{:?}", gem.name), format!("{:?}", gem.name.replace('-', "/"))],
+            None => vec![format!("{:?}", gem.name)],
+        };
+        out.push_str(&format!("  [[{}], [{}]], # {}\n", paths.join(", "), envs.join(", "), gem.site));
+    }
+    out.push_str(
+        "].each do |paths, envs|\n  \
+         next unless envs.empty? || envs.include?(Rails.env.to_s)\n  \
+         paths.each do |path|\n    \
+         begin\n      require path\n      break\n    \
+         rescue LoadError => e\n      \
+         next if e.path.nil? || e.path == path\n      \
+         $stderr.puts \"roundhouse: require #{path.inspect} failed: #{e.message}\"\n      \
+         break\n    \
+         end\n  end\nend\n",
+    );
+    out
+}
+
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
     let gated = LOCK_GATED_REQUIRES
         .iter()
@@ -9079,9 +9192,21 @@ pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
 /// run as the gems'. A lockfile dependency alone is not a load:
 /// payment_service_client depends on cusco but autoloads it, and cusco
 /// requires Rails. So the walk follows only `LOCK_GATED_DEPENDENCIES`.
-pub(crate) fn lock_loaded_gems(lock: &crate::gems::Lockfile) -> std::collections::BTreeSet<String> {
+/// Also the app's own Bundler.require entries
+/// (`bundler_required_runtime_gems`) for the test environment, which the
+/// emitted tree's gem_facades.rb requires there as Bundler would.
+pub(crate) fn lock_loaded_gems(
+    lock: &crate::gems::Lockfile,
+    bundler: &[crate::app::BundlerGem],
+) -> std::collections::BTreeSet<String> {
     let mut loaded = std::collections::BTreeSet::new();
     let mut stack: Vec<&str> = LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
+    stack.extend(
+        bundler_required_runtime_gems(bundler, Some(lock))
+            .into_iter()
+            .filter(|gem| gem.envs.is_empty() || gem.envs.iter().any(|e| e == "test"))
+            .map(|gem| gem.name.as_str()),
+    );
     while let Some(gem) = stack.pop() {
         if loaded.insert(gem.to_string()) {
             stack.extend(
@@ -9134,8 +9259,10 @@ const LOCK_GATED_DEPENDENCIES: [&str; 127] = [
 /// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the
 /// reporters Core's test boot subclasses. Its constants are the gems',
 /// typed from their RBIs; the Spinel and JRuby test bootstraps stay
-/// Minitest-free and refuse them. Not ci-queue: it patches Minitest when
-/// it loads, so it is required only where the app requires it.
+/// Minitest-free and refuse them. Not ci-queue: its minitest/queue
+/// patches Minitest, so it loads only where the app requires it, or (as
+/// `ci/queue`) where its Bundler.require does
+/// (`BUNDLER_GROUP_RAILS_FREE_GEMS`).
 const CRUBY_TEST_GEMS: [&str; 2] = ["minitest", "minitest-reporters"];
 
 fn runtime_gems() -> &'static [(Marker, &'static str)] {
@@ -9617,6 +9744,15 @@ const RUBY_BUNDLED_GEMS: [&str; 23] = [
     "benchmark", "irb", "reline", "tsort",
 ];
 
+/// Libraries Ruby 4.0 removed from its default gems, leaving a stdlib
+/// stub a plain `require` finds before the gem: lib/ruby/4.0.0/cgi.rb
+/// keeps only cgi/escape (and warns under $VERBOSE). Under Bundler the
+/// lock's cgi gem is on the load path instead; vcr 6.3.1, which Core's
+/// test group Bundler.requires, calls `CGI.method(:parse)` as it loads.
+/// Activated at the locked version as `RUBY_BUNDLED_GEMS` are, before
+/// boot.rb's `require "cgi"`.
+const RUBY_REMOVED_DEFAULT_GEMS: [&str; 1] = ["cgi"];
+
 /// So runtime/bundled_gems.rb activates the bundled gems the lock pins,
 /// at the pinned version, as Bundler.setup would, and runtime/gem_facades.rb
 /// requires it first. A pinned version that is not installed is left to
@@ -9625,6 +9761,7 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
     let Some(lock) = lock else { return };
     let entries: String = RUBY_BUNDLED_GEMS
         .iter()
+        .chain(&RUBY_REMOVED_DEFAULT_GEMS)
         .filter_map(|gem| {
             let version = lock.version_of(gem)?;
             // A platform spec (`1.1.8-x86_64-linux`) is pinned by its version.
@@ -9655,6 +9792,14 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
     let facades = &mut files[idx].1;
     if !facades.contains("require_relative \"bundled_gems\"") {
         facades.insert_str(0, "require_relative \"bundled_gems\"\n");
+    }
+    // Before boot.rb's own stdlib requires: its `require "cgi"` would
+    // otherwise load Ruby 4.0's stub, and the activated gem's cgi.rb
+    // would never load.
+    if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
+        if !boot.contains("require_relative \"runtime/bundled_gems\"") {
+            boot.insert_str(0, "require_relative \"runtime/bundled_gems\"\n");
+        }
     }
 }
 
@@ -9706,7 +9851,7 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
            dir = Gem.path.map {{ |root| File.join(root, \"bundler\", \"gems\", checkout) }}.find {{ |d| File.directory?(d) }}\n  \
            spec = dir && Dir[File.join(dir, \"{{,*,*/*}}.gemspec\")].filter_map {{ |f| Gem::Specification.load(f) }}.find {{ |s| s.name == name }}\n  \
            if spec.nil?\n    \
-             warn \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
+             $stderr.puts \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
              next\n  \
            end\n  \
            spec.full_gem_path = File.dirname(spec.loaded_from)\n  \

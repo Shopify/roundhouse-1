@@ -484,7 +484,7 @@ pub(super) fn guard(stmt: Expr, label: &str) -> Expr {
     let site: String = label.chars().map(|c| if matches!(c, '"' | '\\' | '#') { '\'' } else { c }).collect();
     let template = format!(
         "def __guard\n  begin\n    nil\n  rescue StandardError, LoadError, NotImplementedError => __initializer_error\n    \
-         warn \"roundhouse: error[initializer_statement_not_run]: {site} did not run: #{{__initializer_error.class}}: #{{__initializer_error.message}}\"\n  \
+         $stderr.puts \"roundhouse: error[initializer_statement_not_run]: {site} did not run: #{{__initializer_error.class}}: #{{__initializer_error.message}}\"\n  \
          end\nend\n"
     );
     let Ok(mut methods) = crate::runtime_src::parse_methods(&template) else { return stmt };

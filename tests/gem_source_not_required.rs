@@ -89,7 +89,7 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     // A path gem's file the tree does not carry compiled is named, not
     // loaded from the gem home; so is a gem source's (by the gem home's
     // spec that owns it), and a feature whose gem depends on Rails.
-    assert!(facades.contains(r#"warn "roundhouse: warning[gem_source_file_not_compiled]: \"essentials/uncarried\""#), "{facades}");
+    assert!(facades.contains(r#"$stderr.puts "roundhouse: warning[gem_source_file_not_compiled]: \"essentials/uncarried\""#), "{facades}");
     assert!(facades.contains("__rh_compiled_gems = [\"essentials\", \"opentelemetry-shopify\"].freeze"), "{facades}");
     assert!(facades.contains("Gem::Specification.find_by_path(feature)"), "{facades}");
     let check = emit_and_run::ruby().args(["-c", "runtime/gem_facades.rb"]).current_dir(&*dir).output().expect("ruby -c");

@@ -321,6 +321,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // The lockfile is not a source: it never enters the analysis. It
     // is carried so the census and the unknown-gem attribution can
     // read it beside the diagnostics.
+    // The Gemfile gems the boot's Bundler.require requires.
+    app.bundler_gems = super::boot_requires::bundler_required_gems(vfs, dir);
     let lock_path = dir.join("Gemfile.lock");
     if vfs.exists(&lock_path) {
         if let Ok(text) = vfs.read_to_string(&lock_path) {
@@ -330,7 +332,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             lock.in_repo.extend(gem_sources.iter().map(|(name, _)| name.clone()));
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
-                app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock);
+                app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock, &app.bundler_gems);
                 // What the natively loaded gems' installed sources
                 // declare, when the tree names the gem home they resolve
                 // in: the lock's Bundler.require closure, and the gems the

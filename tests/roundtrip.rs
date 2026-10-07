@@ -206,6 +206,11 @@ fn tiny_blog_round_trips() {
         file_programs: Vec::new(),
         boot_loads: Vec::new(),
         boot_conditional_loads: Vec::new(),
+        bundler_gems: Vec::new(),
+        ruby_delegate_forwarders: Default::default(),
+        ruby_declined_delegate_forwarders: Default::default(),
+        class_eval_macro_expansions: Default::default(),
+        concern_prepended_items: Default::default(),
         library_class_files: Vec::new(),
         library_class_reopens: Default::default(),
     };

@@ -14,6 +14,12 @@
 //! The fixture is a small gem `avrokit` with avro's shape, installed into
 //! a scratch gem home, and a gem source `kafkakit` with the patch's
 //! shape. The emitted tree must print what CRuby prints.
+//!
+//! The patch also reopens the gem-home class `Avrokit::Schema` after
+//! requiring it. That declarations file is the program's, loaded in
+//! place; no autoload root owns the constant, so app/models.rb must not
+//! register an autoload for it (the gem's own `class Schema` would fire
+//! it and load the reopen before the gem's definition).
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -118,14 +124,12 @@ fn a_gem_source_program_requires_a_gem_home_feature_in_place() {
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(run.status.success(), "emitted tree failed in {}: {stderr}\nerrors: {errors:#?}", tree.display());
     // The error class the patch defines is the one the gem's schema
-    // subclasses: the patch ran before `avrokit/schema` loaded.
-    let got = lines(&run.stdout);
-    assert_eq!(got.get(1), expected.get(1), "emitted Ruby diverges from CRuby\nerrors: {errors:#?}");
-    // Not yet as CRuby: the tree registers an autoload of
-    // `Avrokit::Schema` for the patch's reopen, so the gem's own
-    // `class Schema` loads the reopen first and its `parse` wins
-    // ("original x"). The autoload belongs to the program, not to the
-    // constant; when it does, this is `assert_eq!(got, expected)`.
-    assert_eq!(got.first().map(String::as_str), Some("original x"), "now as CRuby: tighten to the full comparison");
+    // subclasses (the patch ran before `avrokit/schema` loaded), and
+    // the patch's reopen of `Avrokit::Schema` runs where the program
+    // has it, after the gem's own `class Schema`: no autoload of the
+    // gem's constant loads the reopen first.
+    assert_eq!(lines(&run.stdout), expected, "emitted Ruby diverges from CRuby\nerrors: {errors:#?}");
+    let models = std::fs::read_to_string(tree.join("app/models.rb")).unwrap_or_default();
+    assert!(!models.contains("[:Schema, "), "the reopen registered the gem's constant:\n{models}");
     let _ = std::fs::remove_dir_all(&root);
 }
