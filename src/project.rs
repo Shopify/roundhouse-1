@@ -2985,7 +2985,7 @@ const CRUBY_EXTENSION_GEMS: [(&str, &str); 2] = [
     ("monorepo_slices", "1.17.0"),
 ];
 
-fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+fn apply_extension_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
     let Some(lock) = &app.gem_lock else { return Ok(()) };
     let declared: Vec<_> = CRUBY_EXTENSION_GEMS
         .iter()
@@ -2994,6 +2994,7 @@ fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Resu
     if declared.is_empty() {
         return Ok(());
     }
+    apply_extension_gem_load_paths(files, &declared);
     let gemfile = files
         .iter_mut()
         .find(|(path, _)| path == "Gemfile")
@@ -3012,6 +3013,47 @@ fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Resu
         ));
     }
     Ok(())
+}
+
+/// The emitted tree runs on plain RubyGems over the pinned gem home, so a
+/// `require: false` Gemfile line does not put anything on the load path.
+/// RubyGems would find the extension by activating the gem, and activation
+/// resolves the gem's runtime dependencies: monorepo_slices names
+/// activemodel and activesupport, which the pinned home has only as the
+/// Rails fork's git checkout, so activation fails, and the tree's ports stand in
+/// for them anyway. So runtime/extension_gems.rb appends each declared
+/// gem's require paths (with its built extension dir) to `$LOAD_PATH`
+/// without activating it, and runtime/gem_facades.rb requires that file
+/// first. Appended, so the tree's own files and every activated gem
+/// still resolve first. A gem missing from the gem home is a warning
+/// naming it, not a quiet LoadError later.
+fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &[&(&str, &str)]) {
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let entries: String = declared
+        .iter()
+        .map(|(gem, version)| format!("  [{gem:?}, {version:?}],\n"))
+        .collect();
+    let body = format!(
+        "# Gems the tree carries only for a native extension of their own\n\
+         # (project.rs::CRUBY_EXTENSION_GEMS): their require paths and built\n\
+         # extension dir, from the gem home, appended to $LOAD_PATH without\n\
+         # activating the gem, so its runtime dependencies are never resolved\n\
+         # and its entry file never loads. Written by\n\
+         # `project.rs::apply_extension_gem_load_paths`.\n\
+         [\n{entries}].each do |name, version|\n  \
+           spec = Gem::Specification.find_all_by_name(name, \"= #{{version}}\").find {{ |s| Gem::Platform.match_spec?(s) }}\n  \
+           if spec.nil?\n    \
+             warn \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
+             next\n  \
+           end\n  \
+           spec.full_require_paths.each {{ |path| $LOAD_PATH << path unless $LOAD_PATH.include?(path) }}\n\
+         end\n"
+    );
+    files.push(("runtime/extension_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"extension_gems\"") {
+        facades.insert_str(0, "require_relative \"extension_gems\"\n");
+    }
 }
 
 /// The JRuby tree's Gemfile: the committed scaffold Gemfile is MRI-only
