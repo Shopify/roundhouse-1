@@ -4658,7 +4658,20 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
             .strip_prefix("module ")
             .map(|rest| (rest, true))
             .or_else(|| text.strip_prefix("class ").map(|rest| (rest, false)));
-        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else { break };
+        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else {
+            // The constant itself may be a factory class's assignment
+            // (`Enum = Struct.new(:name) do`, `SignalType = Data.define(...)
+            // do`): the leaf of the chain, a class. Loaded at boot instead,
+            // its `module Podding; module Priority` reopen autoloaded
+            // priority.rb, whose `require_relative "priority/enum"` was
+            // the file already loading, and its read of `Enum` raised.
+            if *indent == 2 * chain.len() {
+                if let Some(name) = factory_class_assignment(text) {
+                    chain.push((name.to_string(), false));
+                }
+            }
+            break;
+        };
         let name = rest.split([' ', '<']).next().unwrap_or("");
         // `class << self`, `class A::B` (says nothing about `A`), and a
         // one-line `class X; end` are not a chain to follow.
@@ -4683,6 +4696,26 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     }
     chain.truncate(depth);
     Some(chain)
+}
+
+/// `Name = Struct.new(...) do` / `Name = Data.define(...) do`: the
+/// constant name, when the line assigns a factory class (one with a
+/// block; the block-less form is a constant of the enclosing file) to a
+/// bare constant.
+fn factory_class_assignment(text: &str) -> Option<&str> {
+    let (name, value) = text.split_once(" = ")?;
+    if name.is_empty()
+        || !name.starts_with(|c: char| c.is_ascii_uppercase())
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let value = value.trim_start();
+    ["Struct.new", "Data.define", "::Struct.new", "::Data.define"]
+        .iter()
+        .any(|f| value.strip_prefix(f).is_some_and(|rest| rest.starts_with(['(', ' '])))
+        .then_some(name)
+        .filter(|_| value.ends_with(" do") || value.contains(" do |"))
 }
 
 /// The CRuby/JRuby `app/models.rb`: Rails' autoloader, generated.
