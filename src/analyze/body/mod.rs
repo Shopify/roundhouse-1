@@ -656,6 +656,21 @@ impl<'a> BodyTyper<'a> {
                         Some(Ty::Class { id: ty_id, .. }) if *ty_id == id
                     )
             }
+            // Kernel#singleton_class answers the receiver's own singleton
+            // class, one class object unique to that receiver: no subclass
+            // can stand in, unlike `x.class` on a nominal type. Only for a
+            // proven class/module object or an instance of a known
+            // non-immediate class (`1.singleton_class` raises TypeError),
+            // and not where an app method overrides it.
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "singleton_class" && args.is_empty() =>
+            {
+                let class_object = self.is_class_object(r, ctx);
+                let instance = matches!(r.ty.as_ref(), Some(Ty::Class { id, .. })
+                    if self.classes().contains_key(id)
+                        && !matches!(id.0.as_str(), "Integer" | "Float" | "Symbol" | "Rational" | "Complex" | "NilClass" | "TrueClass" | "FalseClass"));
+                (class_object || instance) && !self.owns_operator(r.ty.as_ref(), method, class_object)
+            }
             _ => false,
         }
     }
