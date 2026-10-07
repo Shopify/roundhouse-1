@@ -7021,7 +7021,9 @@ fn emit_library_class_decl_inner(
         Vec::new()
     } else {
         let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
-        let at = body_effects.iter().position(|e| own.runs(e)).unwrap_or(body_effects.len());
+        let carried = carried_class_macro_calls(lc, app);
+        let wraps_own = |e: &Expr| carried.iter().any(|c| std::ptr::eq(*c, e)) && names_own_method(lc, e);
+        let at = body_effects.iter().position(|e| own.runs(e) || wraps_own(e)).unwrap_or(body_effects.len());
         body_effects.split_off(at)
     };
     // A carried railtie's body: its locals first (a statement's block
@@ -8000,13 +8002,49 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
         plain_extension_calls(lc, app)
     };
     let gem = gem_mixin_macro_calls(lc, app);
-    if gem.is_empty() {
+    let carried = carried_class_macro_calls(lc, app);
+    if gem.is_empty() && carried.is_empty() {
         return own;
     }
     lc.unknown_calls
         .iter()
-        .filter(|call| own.iter().chain(gem.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .filter(|call| own.iter().chain(gem.iter()).chain(carried.iter()).any(|c| std::ptr::eq(*c, *call)))
         .collect()
+}
+
+/// The body calls that name a class method an app module the class
+/// includes gives it through its `ClassMethods` carrier
+/// (`App::class_methods_carrier_splices`: ActiveSupport::Concern's
+/// `append_features`, or an authored `included` hook's
+/// `base.extend(ClassMethods)`). asset_cloud 2.7.3's `AssetExtension`
+/// includes the Concern `AssetCloud::Callbacks` and then calls
+/// `callback_methods :store, :delete, :validate`, which prepends wrappers
+/// around those methods; dropped, the class had no `validate` and no
+/// callbacks. The emitted class extends the carrier (or the include's
+/// hook does), so replaying the call is what Ruby runs. Bare and `self.`
+/// calls only. One that names a method of the class by symbol runs after
+/// the methods (`names_own_method`), as the source had it below them.
+fn carried_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let Some(splices) = app.class_methods_carrier_splices.get(&lc.name) else { return Vec::new() };
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && splices.iter().any(|splice| splice.methods.contains(method))
+        })
+        .collect()
+}
+
+/// Whether `call` names one of `lc`'s methods by a symbol argument
+/// (`callback_methods :store`): a macro that wraps or reads the def, so
+/// it runs after it.
+fn names_own_method(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { args, .. } = &*call.node else { return false };
+    args.iter().any(|arg| {
+        matches!(&*arg.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+            if lc.methods.iter().any(|m| m.name == *value))
+    })
 }
 
 /// The `app_extension_calls` of a plain module or class.
