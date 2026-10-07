@@ -2993,7 +2993,7 @@ fn ruby_family_files(
             // Gemfile requires panama_client "before anything else that may
             // require grpc" (its grpc_fork_safety raises once GRPC is
             // loaded; the list's opentelemetry-instrumentation-grpc loads it).
-            gem_source_dependency_block(app),
+            format!("{}{}", compiled_gem_native_copies_block(app), gem_source_dependency_block(app)),
             gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
@@ -3519,6 +3519,45 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     walk(program.statements().body().iter().collect(), &mut out);
     out
+}
+
+/// runtime/gem_facades.rb's registration of the app's own gems (the
+/// lock's in-repo gems, compiled into this tree) as loaded. The gem home
+/// can carry its own copy of one (paquito-1.0.2 next to Core's paquito),
+/// and a native gem requiring it (shopify_session's railtie initializer
+/// requires shopify_session/rack, whose coder.rb requires "paquito")
+/// loaded that copy, redefining the compiled gem's constants under it.
+/// Each copy is entered in `Gem.loaded_specs` without activation (no
+/// dependencies, nothing on $LOAD_PATH), so a gem depending on it
+/// resolves, and a copy already activated (a git gem's dependency) has
+/// its files taken off $LOAD_PATH. Requiring a file of one raises
+/// LoadError; `RH_COMPILED_GEM_COPIES` lets runtime/rails_railtie.rb name
+/// it (error[compiled_gem_native_copy]).
+fn compiled_gem_native_copies_block(app: &App) -> String {
+    let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
+    if in_repo.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
+    format!(
+        "\n# The app's own gems are compiled into this tree; the gem home's copy\n\
+         # of one is registered as loaded, not loaded, so a native gem's\n\
+         # require of it cannot load it over the compiled one\n\
+         # (`project::compiled_gem_native_copies_block`).\n\
+         RH_COMPILED_GEM_COPIES = [{}].filter_map do |name|\n  \
+         if (spec = Gem.loaded_specs[name])\n    \
+         paths = spec.full_require_paths\n    \
+         $LOAD_PATH.reject! {{ |path| paths.include?(path) }}\n  \
+         else\n    \
+         spec = Gem::Specification.find_all_by_name(name).max_by(&:version)\n    \
+         next unless spec\n    \
+         Gem.loaded_specs[name] = spec\n    \
+         spec.activated = true\n  \
+         end\n  \
+         [name, spec.version.to_s]\n\
+         end.to_h.freeze\n",
+        names.join(", ")
+    )
 }
 
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not

@@ -336,8 +336,20 @@ module Rails
       rescue StandardError, LoadError, NotImplementedError => e
         @@not_run += 1
         site = e.backtrace&.find { |line| !line.include?(__FILE__) && !line.include?("active_support_lazy_load_hooks") }
-        warn "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp} (#{site})"
+        warn "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)} (#{site})"
         nil
+      end
+
+      # A LoadError for a file of one of the app's own gems: this tree
+      # carries the gem compiled, and the gem home's copy is registered
+      # as loaded but not loaded (runtime/gem_facades.rb,
+      # RH_COMPILED_GEM_COPIES), so a native gem cannot load it over the
+      # compiled one.
+      def compiled_copy_note(e) # :nodoc:
+        return "" unless e.is_a?(LoadError) && e.path && defined?(::RH_COMPILED_GEM_COPIES)
+        spec = Gem::Specification.find_by_path(e.path)
+        return "" unless spec && ::RH_COMPILED_GEM_COPIES.key?(spec.name)
+        " (error[compiled_gem_native_copy]: #{e.path.inspect} is a file of the #{spec.name} gem this tree carries compiled; the gem home's #{spec.name}-#{spec.version} is not loaded over it)"
       end
 
       protected

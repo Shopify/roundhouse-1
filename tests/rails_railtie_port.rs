@@ -276,3 +276,95 @@ fn a_railtie_needing_unported_rails_is_named_and_the_rest_run() {
     );
     assert!(stderr.contains("roundhouse: 2 gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])"), "{stderr}");
 }
+
+/// A native gem's railtie requiring one of the app's own gems never loads
+/// the gem home's copy over the compiled gem. Shopify Core's
+/// shopify_session 7.40 railtie initializer requires shopify_session/rack,
+/// whose utils/coder.rb requires "paquito": the gem home's paquito-1.0.2
+/// loaded and redefined every constant of Core's compiled paquito. The
+/// copy is registered as loaded, not loaded; the require raises
+/// LoadError, and the initializer is named not run with the reason.
+#[test]
+fn a_railtie_cannot_load_the_gem_home_copy_of_a_compiled_gem() {
+    const PATH_LOCK: &str = "PATH\n  remote: gems/paqlike\n  specs:\n    paqlike (1.0.2)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    sessionish (7.40.0)\n      paqlike\n\nDEPENDENCIES\n  paqlike!\n  sessionish\n";
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_railtie_port\n")
+        .write("Gemfile.lock", PATH_LOCK)
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
+    let start = facades.find("RH_COMPILED_GEM_COPIES = [\"paqlike\"]").unwrap_or_else(|| panic!("{facades}"));
+    let block = &facades[start..];
+    let block = &block[..block.find("end.to_h.freeze\n").expect("block end") + "end.to_h.freeze\n".len()];
+
+    let home = dir.join("tmp-gem-home");
+    let gems: [(&str, Vec<(&str, &str)>, &str); 2] = [
+        ("paqlike-1.0.2", vec![("paqlike.rb", "module Paqlike\n  NATIVE = true\n  ORIGIN = :native\nend\n")], ""),
+        (
+            "sessionish-7.40.0",
+            vec![
+                ("sessionish.rb", "module Sessionish\nend\nrequire 'sessionish/railtie' if defined?(::Rails::Railtie)\n"),
+                (
+                    "sessionish/railtie.rb",
+                    "module Sessionish\n  class Railtie < ::Rails::Railtie\n    initializer 'sessionish.configure' do\n      require 'sessionish/coder'\n    end\n    initializer('sessionish.after') { RAN << :after }\n  end\nend\n",
+                ),
+                ("sessionish/coder.rb", "require 'paqlike'\n\nmodule Sessionish\n  CODER = Paqlike::ORIGIN\nend\n"),
+            ],
+            "  s.add_dependency \"paqlike\"\n",
+        ),
+    ];
+    for (gem, files, deps) in gems {
+        let (name, version) = gem.rsplit_once('-').unwrap();
+        let lib = home.join("gems").join(gem).join("lib");
+        for (path, body) in &files {
+            let file = lib.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, body).unwrap();
+        }
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        let listed: Vec<String> = files.iter().map(|(p, _)| format!("\"lib/{p}\"")).collect();
+        std::fs::write(
+            home.join(format!("specifications/{gem}.gemspec")),
+            format!(
+                "Gem::Specification.new do |s|\n  s.name = \"{name}\"\n  s.version = \"{version}\"\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.files = [{}]\n  s.require_paths = [\"lib\"]\n{deps}end\n",
+                listed.join(", ")
+            ),
+        )
+        .unwrap();
+    }
+    let script = format!(
+        "Gem.paths = {{ 'GEM_PATH' => [ENV['RH_TEST_GEMS'], *Gem.path].join(File::PATH_SEPARATOR) }}\n\
+         {block}\
+         require_relative 'runtime/active_support_lazy_load_hooks'\n\
+         $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+         require_relative 'runtime/rails'\n\
+         # The compiled gem (app/models/paqlike.rb in the tree).\n\
+         module Paqlike\n  ORIGIN = :compiled\nend\n\
+         RAN = []\n\
+         require 'rails/railtie'\n\
+         require 'sessionish'\n\
+         Rails::Railtie.run_initializers_of_railties(Rails.application)\n\
+         puts Paqlike::ORIGIN\n\
+         puts defined?(Paqlike::NATIVE).inspect\n\
+         puts RH_COMPILED_GEM_COPIES.inspect\n\
+         puts RAN.inspect\n\
+         puts Gem.loaded_specs['sessionish'].version\n\
+         puts $LOADED_FEATURES.grep(%r{{/paqlike-}}).inspect\n"
+    );
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .env("RH_TEST_GEMS", &home)
+        .args(["-e", &script])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "compiled\nnil\n{\"paqlike\" => \"1.0.2\"}\n[:after]\n7.40.0\n[]\n", "{stderr}");
+    assert!(
+        stderr.contains("roundhouse: error[gem_railtie_not_run]: Sessionish::Railtie initializer \"sessionish.configure\" did not run: LoadError: cannot load such file -- paqlike (error[compiled_gem_native_copy]: \"paqlike\" is a file of the paqlike gem this tree carries compiled; the gem home's paqlike-1.0.2 is not loaded over it)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("already initialized constant"), "{stderr}");
+}
