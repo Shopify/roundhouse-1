@@ -1403,7 +1403,10 @@ pub fn target_files(
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         for (span, policy) in crate::analyze::forwarding::keyword_calls(app) {
             if policy != crate::analyze::forwarding::KeywordPolicy::Legacy {
-                let (construct, detail) = if policy == crate::analyze::forwarding::KeywordPolicy::RefuseOrdinarySuper {
+                let (construct, detail) = if matches!(policy,
+                    crate::analyze::forwarding::KeywordPolicy::RefuseOrdinarySuper
+                        | crate::analyze::forwarding::KeywordPolicy::NativeSuper)
+                {
                     ("keyword splat in ordinary super",
                      "super destination's native or lowered argument ABI cannot be verified")
                 } else {

@@ -16,6 +16,8 @@ use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
 
+mod external;
+
 pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let contracts = SourceContractIndex::new(app);
@@ -83,9 +85,9 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                 ));
             }
         }
-        walk(app, &contracts, owner, method, &method.body, &mut out);
+        walk(app, &contracts, owner, method, &method.body, &mut out, false);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            walk(app, &contracts, owner, method, default, &mut out);
+            walk(app, &contracts, owner, method, default, &mut out, false);
         }
     }
     out.extend(keyword_splats_into_nameless_rest(app, &contracts));
@@ -580,6 +582,7 @@ fn walk(
     enclosing: &MethodDef,
     e: &Expr,
     out: &mut Vec<Diagnostic>,
+    in_block: bool,
 ) {
     let forwards_keywords = match &*e.node {
         ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args) } => args
@@ -625,7 +628,11 @@ fn walk(
             Some("forwarding source has an unrepresented parameter declaration")
         } else if !enclosing.params.iter().any(|p| p.forwarding) {
             Some("forwarding call has no preserved forwarding declaration")
-        } else if native_core_destination(app, e) {
+        } else if native_core_destination(app, e)
+            || super_leaves_source(contracts, Some((owner, enclosing)), e, in_block)
+        {
+            // The packet reaches code the app does not define, which the
+            // Ruby family binds natively against `...` as written.
             None
         } else {
             contract_error(
@@ -645,7 +652,10 @@ fn walk(
         }
     }
     e.node
-        .for_each_child(&mut |c| walk(app, contracts, owner, enclosing, c, out));
+        .for_each_child(&mut |c| {
+            let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+            walk(app, contracts, owner, enclosing, c, out, in_block)
+        });
 }
 
 /// `recv.m(...)` where `recv` is typed as a Ruby core value (a Hash,
@@ -867,6 +877,30 @@ pub(crate) enum KeywordPolicy {
     Legacy,
     Refuse,
     RefuseOrdinarySuper,
+    /// An ordinary `super(…, **value)` whose lookup leaves the app's
+    /// declarations for a method with the native argument ABI
+    /// (`super_leaves_source`): kept as written, which the Ruby family
+    /// binds natively; the other targets refuse it like
+    /// `RefuseOrdinarySuper`.
+    NativeSuper,
+}
+
+/// `SourceContractIndex::super_leaves_source` for a `super` written
+/// directly in an instance method's body. Inside a block it is not shown
+/// which method the `super` belongs to: `define_method` and its kin make
+/// a block a method body, and a block can be captured and passed on.
+fn super_leaves_source(
+    contracts: &SourceContractIndex<'_>,
+    context: Option<(&ClassId, &MethodDef)>,
+    e: &Expr,
+    in_block: bool,
+) -> bool {
+    let (false, ExprNode::Super { .. }, Some((owner, enclosing))) = (in_block, &*e.node, context)
+    else {
+        return false;
+    };
+    enclosing.receiver == MethodReceiver::Instance
+        && contracts.super_leaves_source(owner, &enclosing.name)
 }
 
 pub(crate) fn keyword_refusal(span: Span, policy: KeywordPolicy) -> Diagnostic {
@@ -914,6 +948,7 @@ fn keyword_calls_with_index(
         e: &Expr,
         plans: &mut HashMap<Span, KeywordPolicy>,
         fallback: bool,
+        in_block: bool,
     ) {
         let args = match &*e.node {
             ExprNode::Send { args, .. } => Some(args.as_slice()),
@@ -932,9 +967,13 @@ fn keyword_calls_with_index(
                 if matches!(&*e.node, ExprNode::Super { .. })
                     && destination(app, contracts, context, e).is_none()
                 {
-                    // An absent full selector does not prove that erasing **
-                    // matches an external parent's native keyword ABI.
-                    KeywordPolicy::RefuseOrdinarySuper
+                    if super_leaves_source(contracts, context, e, in_block) {
+                        KeywordPolicy::NativeSuper
+                    } else {
+                        // An absent full selector does not prove that erasing
+                        // ** matches an external parent's native keyword ABI.
+                        KeywordPolicy::RefuseOrdinarySuper
+                    }
                 } else {
                     KeywordPolicy::Legacy
                 }
@@ -946,6 +985,12 @@ fn keyword_calls_with_index(
                     } else {
                         KeywordPolicy::Refuse
                     }
+                } else if resolved.is_none()
+                    && super_leaves_source(contracts, context, e, in_block)
+                {
+                    // No full forwarder is reached: the lookup leaves the
+                    // app's declarations.
+                    KeywordPolicy::NativeSuper
                 } else if resolved.is_none()
                     || virtual_destinations(contracts, context, e).map_or(true, |v| {
                         v.iter().any(|(m, _)| m.params.iter().any(|p| p.forwarding))
@@ -969,8 +1014,10 @@ fn keyword_calls_with_index(
                 })
                 .or_insert(policy);
         }
-        e.node
-            .for_each_child(&mut |c| visit(app, contracts, context, c, plans, fallback));
+        let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
+        e.node.for_each_child(&mut |c| {
+            visit(app, contracts, context, c, plans, fallback, in_block)
+        });
     }
     let mut plans = HashMap::default();
     for (owner, method) in methods(app) {
@@ -981,6 +1028,7 @@ fn keyword_calls_with_index(
             &method.body,
             &mut plans,
             false,
+            false,
         );
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
             visit(
@@ -990,11 +1038,12 @@ fn keyword_calls_with_index(
                 default,
                 &mut plans,
                 false,
+                false,
             );
         }
     }
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| {
-        visit(app, contracts, None, e, &mut plans, true)
+        visit(app, contracts, None, e, &mut plans, true, false)
     });
     plans
 }
@@ -1127,6 +1176,12 @@ struct SourceContractIndex<'a> {
     virtual_owners: Vec<&'a ClassId>,
     full_selectors: HashSet<Symbol>,
     app: &'a App,
+    /// Names declared as a `module` in some fragment.
+    modules: HashSet<ClassId>,
+    /// Names whose methods are not all source declarations: models and
+    /// controllers (synthesized readers, actions, relation entry points)
+    /// and library classes a lowering generated.
+    synthesized: HashSet<ClassId>,
     unretained: OnceCell<Unretained<'a>>,
     /// Reverse lookup edges: the fragments naming a class as their
     /// superclass or including it as a module.
@@ -1152,6 +1207,8 @@ impl<'a> SourceContractIndex<'a> {
             virtual_owners: Vec::new(),
             full_selectors: HashSet::default(),
             app,
+            modules: HashSet::default(),
+            synthesized: HashSet::default(),
             unretained: OnceCell::new(),
             children: HashMap::default(),
             owner_positions: HashMap::default(),
@@ -1162,6 +1219,12 @@ impl<'a> SourceContractIndex<'a> {
         let mut class_owners = HashSet::default();
         for class in classes(app) {
             class_owners.insert(class.name.clone());
+            if class.is_module {
+                index.modules.insert(class.name.clone());
+            }
+            if class.origin.is_some() {
+                index.synthesized.insert(class.name.clone());
+            }
             index.add_fragment(
                 &class.name,
                 class.parent.as_ref(),
@@ -1170,6 +1233,10 @@ impl<'a> SourceContractIndex<'a> {
             index.add_methods(&class.name, class.methods.iter(), false);
             index.virtual_owners.push(&class.name);
         }
+        index.synthesized.extend(app.models.iter().map(|m| m.name.clone()));
+        index.synthesized.extend(app.controllers.iter().map(|c| c.name.clone()));
+        // Test classes are lowered into generated test methods.
+        index.synthesized.extend(app.test_modules.iter().map(|t| t.name.clone()));
         for model in &app.models {
             index.add_fragment(
                 &model.name,
@@ -1357,6 +1424,132 @@ impl<'a> SourceContractIndex<'a> {
             }
         }
         names
+    }
+
+    /// Does an explicit `super` in `owner`'s instance method `name` leave
+    /// the app's declarations altogether? Then its destination is code
+    /// the app does not define (a framework port, a gem, Ruby's core),
+    /// which the Ruby family binds natively against the call as written.
+    ///
+    /// Shown only for a class (a module's `super` continues in whatever
+    /// includes it), whose whole superclass/include hierarchy is single-
+    /// fragment (`verified`), where no class or module on that hierarchy
+    /// declares `name`, and none of it is a model, a controller or a
+    /// generated class: their methods are not all source declarations, so
+    /// an absent declaration does not show an absent method.
+    /// Does an ordinary `super` in instance method `name` of `owner` reach,
+    /// past every app declaration, a method whose argument ABI is the
+    /// native one (`external`)? The app part of the lookup must hold
+    /// source declarations only, none of them `name`; a class with no
+    /// recorded superclass (none written, or an expression) and a name
+    /// that could resolve to something nested are unknown.
+    fn super_leaves_source(&self, owner: &ClassId, name: &Symbol) -> bool {
+        if self.modules.contains(owner) || !self.verified(owner) {
+            return false;
+        }
+        if self
+            .ancestors(owner, name, MethodReceiver::Instance, &mut HashSet::default())
+            .is_some()
+        {
+            return false;
+        }
+        let mut seen = HashSet::default();
+        seen.insert(owner);
+        self.super_after(owner, name.as_str(), &mut seen) == external::Step::Bound
+    }
+
+    /// The lookup after `node`'s own methods: its includes, last first,
+    /// then its superclass.
+    fn super_after<'s>(&'s self, node: &'s ClassId, name: &str, seen: &mut HashSet<&'s ClassId>) -> external::Step {
+        if self.mixed_into(node) {
+            return external::Step::Refuse;
+        }
+        for module in self.includes(node).iter().rev() {
+            match self.super_through(module, name, false, seen) {
+                external::Step::Continue => {}
+                step => return step,
+            }
+        }
+        if self.modules.contains(node) {
+            return external::Step::Continue;
+        }
+        match self.parent(node) {
+            Some(parent) => match self.super_through(parent, name, true, seen) {
+                external::Step::Continue => external::Step::Refuse,
+                step => step,
+            },
+            None => external::Step::Refuse,
+        }
+    }
+
+    fn super_through<'s>(
+        &'s self,
+        node: &'s ClassId,
+        name: &str,
+        as_superclass: bool,
+        seen: &mut HashSet<&'s ClassId>,
+    ) -> external::Step {
+        if !seen.insert(node) {
+            return external::Step::Continue;
+        }
+        let world = external::world();
+        let written = node.0.as_str();
+        if self.fragments.contains_key(node) {
+            // A reopened runtime or core namespace continues outside the
+            // app; not followed.
+            if self.synthesized.contains(node)
+                || world.runtime_declares(written)
+                || world.stdlib_declares(written)
+            {
+                return external::Step::Refuse;
+            }
+            return self.super_after(node, name, seen);
+        }
+        if world.shadowed(written) || self.app_shadows(written) {
+            return external::Step::Refuse;
+        }
+        world.through(written, name, as_superclass, &|namespace, method| {
+            self.app_reopens(namespace, method)
+        })
+    }
+
+    /// An initializer's `Target.include(M)` / `Target.prepend(M)` names it.
+    fn mixed_into(&self, node: &ClassId) -> bool {
+        self.app.module_mixins.iter().any(|mixin| mixin.target.as_str() == node.0.as_str())
+    }
+
+    /// Some app class or module is named `…::written`: a relative written
+    /// superclass or include may mean it.
+    fn app_shadows(&self, written: &str) -> bool {
+        let suffix = format!("::{written}");
+        self.fragments.keys().any(|name| name.0.as_str().ends_with(&suffix))
+    }
+
+    /// The app declares instance method `method` on core `namespace`
+    /// (reopening it, through a module it includes there, or through an
+    /// initializer mixin naming it).
+    fn app_reopens(&self, namespace: &str, method: &str) -> bool {
+        let method = Symbol::from(method);
+        let id = ClassId(Symbol::from(namespace));
+        // An unverified reopening (several fragments) is not read: it may.
+        if self.fragments.contains_key(&id)
+            && (!self.verified(&id)
+                || self
+                    .declaration(&id, &method, MethodReceiver::Instance, &mut HashSet::default())
+                    .is_some())
+        {
+            return true;
+        }
+        self.app.module_mixins.iter().any(|mixin| {
+            mixin.target.as_str() == namespace && {
+                let module = ClassId(mixin.module.clone());
+                !self.fragments.contains_key(&module)
+                    || !self.verified(&module)
+                    || self
+                        .declaration(&module, &method, MethodReceiver::Instance, &mut HashSet::default())
+                        .is_some()
+            }
+        })
     }
 
     /// `verified_hierarchy` from a fresh walk, memoized.
