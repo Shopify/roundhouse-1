@@ -179,3 +179,35 @@ fn other_class_side_visibility_in_included_blocks_stays_refused() {
         assert!(error.contains(refused), "{label}: expected the refusal, got {error:?}");
     }
 }
+
+/// A refused `included do` block is reported at the block. Expanding the
+/// block's `class_attribute` defs ingests their generated source while
+/// the visibility walk is inside the `included` statement; that nested
+/// walk reset the statement it was in, so the refusal fell back to the
+/// enclosing module's line (Core's `clickjacking_protection.rb:4:1`
+/// instead of `:15:3`).
+#[test]
+fn a_refused_included_block_is_reported_at_its_own_line() {
+    let dir = std::env::temp_dir().join(format!("roundhouse-included-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("app/controllers/concerns")).unwrap();
+    std::fs::write(dir.join("roundhouse.yml"), "test_paths: []\n").unwrap();
+    std::fs::write(
+        dir.join("app/controllers/concerns/framed.rb"),
+        "module Framed\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :rules, instance_writer: false\n    private :rules\n    self.rules = []\n  end\nend\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .arg("check")
+        .arg("--continue")
+        .arg(&dir)
+        .output()
+        .expect("run roundhouse check");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+    let line = text
+        .lines()
+        .find(|l| l.contains("error[ingest_unsupported]") && l.contains("framed.rb"))
+        .unwrap_or_else(|| panic!("no ingest_unsupported for framed.rb:\n{text}"));
+    assert!(line.contains("framed.rb:4:3:"), "refusal not at the `included do` line: {line}");
+}

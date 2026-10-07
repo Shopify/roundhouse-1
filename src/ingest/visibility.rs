@@ -213,6 +213,23 @@ impl Visibility {
         module_owner: Option<&ClassId>,
         conditionals: bool,
     ) -> IngestResult<Self> {
+        // A body resolved while another walk is in a statement (the
+        // generated `class_attribute` defs, ingested from source text
+        // while a concern's `included do` is probed) must leave that
+        // walk's statement as it found it, or the walk's next refusal
+        // loses its site.
+        let outer = STATEMENT.get();
+        let resolved = Self::resolve_body_from_start(body, file, module_owner, conditionals);
+        STATEMENT.set(outer);
+        resolved
+    }
+
+    fn resolve_body_from_start(
+        body: Option<&Node<'_>>,
+        file: &str,
+        module_owner: Option<&ClassId>,
+        conditionals: bool,
+    ) -> IngestResult<Self> {
         let scope = if conditionals { "" } else { "a model body" };
         let mut out = Self { module: module_owner.is_some(), conditionals, scope, ..Self::default() };
         STATEMENT.set(None);
