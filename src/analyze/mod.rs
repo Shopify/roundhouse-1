@@ -1089,7 +1089,10 @@ impl Analyzer {
                 let known = self.classes.contains_key(included)
                     || body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str())
-                    || runtime_reads::ruby_family_runtime_names().contains_key(included.0.as_str());
+                    // A Ruby-family runtime port's module
+                    // (`ActiveRecord::Type::QueryPredicates`); its tree
+                    // carries it where the app names it (runtime_reads).
+                    || runtime_reads::is_runtime_declared_namespace(included.0.as_str());
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,

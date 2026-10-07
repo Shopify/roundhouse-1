@@ -34,6 +34,7 @@ fn attribute_types_answer_like_activemodel() {
         "ActiveModel::RangeError: 9223372036854775808 is out of range",
         "utc=false zone=\"ABC\"",
         "AR::DateTime(timezone: :local, precision: 3) from schema json: [true, true, nil, true, ",
+        "QueryPredicates type?: [true, false, true, false, true, false]",
         "AR::DateTime(timezone: :local, precision: 3) as_schema_json: {\"precision\" => 3, \"scale\" => nil, \"limit\" => nil, \"timezone\" => :local}",
     ] {
         assert!(stdout.contains(seen), "missing observation {seen:?}");

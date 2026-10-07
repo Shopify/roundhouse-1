@@ -79,6 +79,55 @@ pub(crate) fn is_runtime_declared_namespace(name: &str) -> bool {
     }).contains(name)
 }
 
+/// A gated port's constant aliases of its own classes, by the alias's
+/// full name: `ActiveRecord::Type::String = ActiveModel::Type::String`
+/// in runtime/spinel/active_model_type.rb. An expression read of the
+/// alias types as its target, so is gated as the target; a superclass
+/// or `include` written with the alias needs the target too.
+fn runtime_aliases() -> &'static HashMap<String, String> {
+    static ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    ALIASES.get_or_init(|| {
+        struct Aliases(Vec<String>, HashMap<String, String>);
+        impl Aliases {
+            fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+                self.0.push(String::from_utf8_lossy(path).into_owned());
+                if let Some(body) = body {
+                    ruby_prism::Visit::visit(self, &body);
+                }
+                self.0.pop();
+            }
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Aliases {
+            fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+                let value = node.value();
+                if value.as_constant_path_node().is_some() || value.as_constant_read_node().is_some() {
+                    let target = String::from_utf8_lossy(value.location().as_slice());
+                    let mut alias = self.0.clone();
+                    alias.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+                    self.1.insert(alias.join("::"), target.trim_start_matches("::").to_string());
+                }
+            }
+        }
+        let names = ruby_family_runtime_names();
+        let mut aliases = Aliases(Vec::new(), HashMap::new());
+        for (source, _) in RUBY_FAMILY_RUNTIME {
+            let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+            let parsed = ruby_prism::parse(text.as_bytes());
+            if parsed.errors().next().is_none() {
+                ruby_prism::Visit::visit(&mut aliases, &parsed.node());
+            }
+        }
+        aliases.1.retain(|_, target| names.contains_key(target.as_str()));
+        aliases.1
+    })
+}
+
 /// One read of a gated name.
 pub(crate) struct RuntimeRead {
     pub span: Span,
@@ -90,6 +139,9 @@ pub(crate) struct RuntimeRead {
     /// Read in a test body, where the Ruby-family test harness may
     /// declare the name too.
     pub in_test: bool,
+    /// A class's superclass or `include` (`shown` names the class), not
+    /// an expression: it has no source span of its own.
+    pub declaration: bool,
 }
 
 /// Singleton methods a gated runtime file defines that the registry
@@ -121,7 +173,7 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
     match &*expr.node {
         ExprNode::Const { path } => {
             if let Some(name) = class_name(&expr.ty).filter(|name| gated(name)) {
-                out.push(RuntimeRead { span: expr.span, name: name.to_string(), shown: written(path), in_test });
+                out.push(RuntimeRead { span: expr.span, name: name.to_string(), shown: written(path), in_test, declaration: false });
             }
         }
         ExprNode::Send { recv: Some(recv), method, .. } => {
@@ -134,7 +186,7 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
                             .map(|(_, _, name)| name.to_string())
                     });
                     if let Some(name) = needs {
-                        out.push(RuntimeRead { span: expr.span, name, shown: format!("{receiver}.{}", method.as_str()), in_test });
+                        out.push(RuntimeRead { span: expr.span, name, shown: format!("{receiver}.{}", method.as_str()), in_test, declaration: false });
                     }
                 }
             }
@@ -198,6 +250,25 @@ pub(crate) fn ruby_family_runtime_reads(app: &App) -> Vec<RuntimeRead> {
     // A test root the emit survey does not reach is still a test read.
     let seen: HashSet<(Span, String)> = out.iter().map(|read| (read.span, read.shown.clone())).collect();
     out.extend(tests.into_iter().filter(|read| !seen.contains(&(read.span, read.shown.clone()))));
+    // A class built on a port's class or module
+    // (`class NormalizedStringType < ActiveRecord::Type::String`,
+    // `include ActiveRecord::Type::QueryPredicates`) needs it at load.
+    for class in &app.library_classes {
+        let parent = class.parent.iter().map(|parent| (parent, "<"));
+        let includes = class.includes.iter().map(|included| (included, "includes"));
+        for (needed, how) in parent.chain(includes) {
+            let name = runtime_aliases().get(needed.0.as_str()).map(String::as_str).unwrap_or(needed.0.as_str());
+            if gated(name) && !resolver.has_source_namespace(needed.0.as_str()) {
+                out.push(RuntimeRead {
+                    span: Span::synthetic(),
+                    name: name.to_string(),
+                    shown: format!("{} {how} {}", class.name.0, needed.0),
+                    in_test: false,
+                    declaration: true,
+                });
+            }
+        }
+    }
     out
 }
 
@@ -269,6 +340,8 @@ mod tests {
             ("ActiveRecord::Type::Text", "runtime/active_model_type.rb"),
             ("ActiveRecord::Type::DateTime", "runtime/active_model_type.rb"),
             ("ActiveRecord::Type::Internal::Timezone", "runtime/active_model_type.rb"),
+            ("ActiveRecord::Type::QueryPredicates", "runtime/active_model_type.rb"),
+            ("ActiveRecord::Type::QueryPredicates::Decorator", "runtime/active_model_type.rb"),
             ("ActiveModel::RangeError", "runtime/active_model_type.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
@@ -285,5 +358,20 @@ mod tests {
             assert!(is_runtime_declared_namespace(name), "{name}");
         }
         assert!(!is_runtime_declared_namespace("ActiveSupport::MessageVerifiers"));
+    }
+
+    #[test]
+    fn port_aliases_name_their_gated_targets() {
+        let aliases = runtime_aliases();
+        for (alias, target) in [
+            ("ActiveRecord::Type::String", "ActiveModel::Type::String"),
+            ("ActiveRecord::Type::Integer", "ActiveModel::Type::Integer"),
+            ("ActiveRecord::Type::Value", "ActiveModel::Type::Value"),
+            ("ActiveRecord::Type::Boolean", "ActiveModel::Type::Boolean"),
+        ] {
+            assert_eq!(aliases.get(alias).map(String::as_str), Some(target), "{aliases:?}");
+        }
+        // An alias of a class no gated port declares is not a port name.
+        assert!(!aliases.contains_key("ActiveSupport::MessageEncryptor::OpenSSLCipherError"), "{aliases:?}");
     }
 }

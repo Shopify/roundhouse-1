@@ -164,6 +164,35 @@ fn rails_configuration_is_refused_where_the_runtime_lacks_it() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A class built on a ported ActiveModel/ActiveRecord type
+/// (runtime/spinel/active_model_type.rb), the way Core's
+/// Shopify::NormalizedStringType subclasses `ActiveRecord::Type::String`
+/// and includes `ActiveRecord::Type::QueryPredicates`. The ruby tree
+/// carries the port and emits the class; a target without the port
+/// refuses the superclass and the include by name rather than emitting a
+/// class whose ancestors do not exist.
+#[test]
+fn runtime_port_ancestors_are_refused_where_the_runtime_lacks_them() {
+    let root = probe_app("NormalizedProbeType.new.cast(title)");
+    let file = root.join("app/models/normalized_probe_type.rb");
+    std::fs::write(&file, "class NormalizedProbeType < ActiveRecord::Type::String\n  include ActiveRecord::Type::QueryPredicates\n\n  def comparison_expression(expression)\n    expression\n  end\nend\n").unwrap();
+    let (ok, text) = run(&root, &["check"]);
+    assert!(ok, "check refused the port subclass: {text}");
+    let (ok, text) = run(&root, &["--target", "ruby"]);
+    assert!(ok, "ruby refused the port subclass: {text}");
+    assert!(root.join("emitted-ruby/runtime/active_model_type.rb").is_file(), "ruby tree lacks the type port");
+    let emitted = std::fs::read_to_string(root.join("emitted-ruby/app/models/normalized_probe_type.rb")).unwrap();
+    assert!(!emitted.contains("not supported"), "ruby tree refuses inside the class: {emitted}");
+    for target in ["typescript", "rust"] {
+        let (ok, text) = run(&root, &["--target", target]);
+        assert!(!ok, "{target} accepted the port subclass: {text}");
+        for shown in ["NormalizedProbeType < ActiveRecord::Type::String", "NormalizedProbeType includes ActiveRecord::Type::QueryPredicates"] {
+            assert!(text.contains("runtime_constant") && text.contains(shown), "{target} lost named refusal {shown}: {text}");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn application_tracers_are_not_global_stdlib() {
     refuses("ShopifyTracer.in_span(\"probe\") { 42 }", "ShopifyTracer");

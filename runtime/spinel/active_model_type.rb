@@ -41,8 +41,14 @@
 #   computed in place: `ActiveSupport::Ractors.on_main` does exactly that
 #   on the main Ractor, and dispatches there only from another Ractor.
 # - ActiveRecord's `Type::DEFAULT_TYPE` (`Value.new.freeze`, the
-#   registry's fallback) and the opt-in Type::QueryPredicates (Arel
-#   comparison expressions) are not ported with the registries.
+#   registry's fallback) is not ported with the registries.
+# - Type::QueryPredicates (type/query_predicates.rb) is ported as the
+#   module a type includes (Core's Shopify::NormalizedStringType does):
+#   `query_predicates?`, `comparison_expression`, the Decorator modules
+#   and `QueryPredicates.type?`. The tree's query building does not ask
+#   a type for its comparison expression (natively PredicateBuilder,
+#   QueryMethods#order and Arel's ToSql do), so a model attribute whose
+#   type rewrites comparisons is not modeled by the queries.
 
 require "date"
 
@@ -760,6 +766,44 @@ module ActiveRecord
     class Text < ActiveModel::Type::String # :nodoc:
       def type
         :text
+      end
+    end
+
+    module QueryPredicates
+      def query_predicates? # :nodoc:
+        true
+      end
+
+      # Converts a stored attribute or serialized query value into the
+      # expression on which comparisons are performed.
+      def comparison_expression(expression)
+        expression
+      end
+
+      # Include in a representation-preserving type decorator that exposes its
+      # wrapped type as `subtype`.
+      module Decorator
+        include QueryPredicates
+
+        def query_predicates?
+          QueryPredicates.type?(subtype)
+        end
+
+        def comparison_expression(expression)
+          subtype.comparison_expression(expression)
+        end
+      end
+
+      module NormalizedValueTypeDecorator # :nodoc:
+        include Decorator
+
+        def subtype
+          cast_type
+        end
+      end
+
+      def self.type?(type) # :nodoc:
+        self === type && type.query_predicates?
       end
     end
   end
