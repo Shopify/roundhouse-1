@@ -237,6 +237,10 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         }
         return;
     }
+    if let Some(body) = hoisted_singleton_body(node) {
+        collect_classes(&body, scope, nesting, out);
+        return;
+    }
     if let Some(m) = node.as_module_node() {
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
@@ -327,7 +331,22 @@ fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
         for stmt in s.body().iter() {
             collect_modules(&stmt, scope, out);
         }
+        return;
     }
+    if let Some(body) = hoisted_singleton_body(node) {
+        collect_modules(&body, scope, out);
+    }
+}
+
+/// The body of a `class << self` inside a class or module. Ruby puts
+/// the classes and modules declared there on the singleton class
+/// (Core's `ConnectionSerializer` keeps its column serializers there
+/// and its class methods read them bare). Like the constants such a
+/// body writes, they are hoisted into the enclosing scope.
+fn hoisted_singleton_body<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
+    let sc = node.as_singleton_class_node()?;
+    sc.expression().as_self_node()?;
+    sc.body()
 }
 
 fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
