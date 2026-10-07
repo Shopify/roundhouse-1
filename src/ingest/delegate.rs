@@ -43,6 +43,16 @@
 //! class methods. Their callers are other files, so no call site here
 //! says what arity they need: each forwards `(...)`, which is exactly
 //! the method Rails generates.
+//!
+//! ## The Ruby target
+//!
+//! Ruby has no argument-forwarding gap, so the zero-arg instance
+//! forwarder is only the strict targets' answer. Each one also gets its
+//! `(...)` twin in `App::ruby_delegate_forwarders`, which the Ruby emit
+//! writes instead: a caller in another file that passes arguments
+//! (asset_cloud's includers calling `add_error(msg)`) reaches the target
+//! as it does under Rails. Declarations this pass declines stay declined
+//! there too.
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -87,9 +97,12 @@ pub fn lower_delegates(app: &mut crate::App) {
         .collect();
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
-        let methods = expand_delegates_declining(lc, &nameless_rest);
+        let (methods, full) = expand_delegates_declining(lc, &nameless_rest);
         if !methods.is_empty() {
             generated.push((i, methods));
+        }
+        if !full.is_empty() {
+            app.ruby_delegate_forwarders.entry(lc.name.clone()).or_default().extend(full);
         }
     }
     for (i, methods) in generated {
@@ -132,18 +145,42 @@ fn record_synthesis_failure(delegates: &[Delegation], diags: &[crate::diagnostic
 /// whole app; a single-class caller can just extend its own `methods`
 /// with the result).
 pub(crate) fn expand_delegates_in_class(lc: &mut LibraryClass) -> Vec<MethodDef> {
-    expand_delegates_declining(lc, &crate::det::HashSet::default())
+    expand_delegates_declining(lc, &crate::det::HashSet::default()).0
 }
 
 /// `expand_delegates_in_class`, leaving any delegation that names one
-/// of `decline` in `unknown_calls`.
-fn expand_delegates_declining(lc: &mut LibraryClass, decline: &crate::det::HashSet<String>) -> Vec<MethodDef> {
+/// of `decline` in `unknown_calls`. The second list is the Ruby target's
+/// version of each zero-arg instance forwarder: the same method forwarding
+/// `(...)`, which is what Rails generates (see
+/// `App::ruby_delegate_forwarders`).
+fn expand_delegates_declining(
+    lc: &mut LibraryClass,
+    decline: &crate::det::HashSet<String>,
+) -> (Vec<MethodDef>, Vec<MethodDef>) {
     let delegates = take_delegate_decls(lc, decline);
     if delegates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let src = synthesized_source(lc, &delegates);
+    let methods = parse_forwarders(&synthesized_source(lc, &delegates, false), &delegates);
+    let zero_arg: Vec<&Delegation> = delegates.iter().filter(|d| forwards_zero_arg(d)).collect();
+    let full = if zero_arg.is_empty() || methods.is_empty() {
+        Vec::new()
+    } else {
+        parse_forwarders(&synthesized_source(lc, &delegates, true), &delegates)
+            .into_iter()
+            .filter(|m| zero_arg.iter().any(|d| d.name == m.name.as_str()))
+            .collect()
+    };
+    (methods, full)
+}
 
+/// The shape `synthesized_source` writes as a zero-arg forwarder: an
+/// instance-side reader that is neither a setter nor an operator.
+fn forwards_zero_arg(d: &Delegation) -> bool {
+    !d.class_side && !d.method.as_str().ends_with('=') && operator_forwarder("t", d.method.as_str()).is_none()
+}
+
+fn parse_forwarders(src: &str, delegates: &[Delegation]) -> Vec<MethodDef> {
     // Isolated in its OWN scope — never the outer one that spans
     // the whole app's ingest — so a bug in `synthesized_source`
     // can't render its parse errors against an unrelated real
@@ -157,7 +194,7 @@ fn expand_delegates_declining(lc: &mut LibraryClass, decline: &crate::det::HashS
             classes.into_iter().flat_map(|c| c.methods).collect()
         }
         Ok(_) => {
-            record_synthesis_failure(&delegates, &diags);
+            record_synthesis_failure(delegates, &diags);
             Vec::new()
         }
         Err(err) => {
@@ -311,7 +348,9 @@ fn operator_forwarder(t: &str, m: &str) -> Option<(&'static str, String)> {
     }
 }
 
-fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
+/// `full_forward` writes every reader forwarder as `(...)`, the Ruby
+/// target's form; without it an instance reader is zero-arg (module doc).
+fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation], full_forward: bool) -> String {
     let defines = |name: &str, class_side: bool| {
         let receiver = if class_side { MethodReceiver::Class } else { MethodReceiver::Instance };
         lc.methods.iter().any(|m| m.receiver == receiver && m.name.as_str() == name)
@@ -330,7 +369,7 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation]) -> String {
             forwarder
         } else if let Some(attr) = m.strip_suffix('=') {
             ("value", format!("{t}.{attr} = value"))
-        } else if d.class_side {
+        } else if d.class_side || full_forward {
             ("...", format!("{t}.{m}(...)"))
         } else {
             ("", format!("{t}.{m}"))
@@ -381,7 +420,7 @@ mod tests {
     /// catches Bug A (a setter `def` with no parameter and a bare
     /// `x.y=` call is two syntax errors, not zero).
     fn synthesized_methods(lc: &LibraryClass, delegates: &[Delegation]) -> Vec<MethodDef> {
-        let src = synthesized_source(lc, delegates);
+        let src = synthesized_source(lc, delegates, false);
         crate::ingest::ingest_library_classes(src.as_bytes(), "<test>")
             .unwrap_or_else(|e| panic!("synthesized source failed to parse: {e}\n{src}"))
             .into_iter()

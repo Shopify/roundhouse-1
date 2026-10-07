@@ -2380,7 +2380,7 @@ end
     // later pass reads methods.
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
-    splice_concerns_into_models(&mut app);
+    splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     claim_class_attribute_writes(&mut app);
@@ -2762,9 +2762,43 @@ fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &m
 /// its DSL never ran; that's exactly the half this splice supplies).
 /// Strict targets get the DSL items the same way; module
 /// methods-via-include remain their separate, ledger-visible gap.
-fn splice_concerns_into_models(app: &mut App) {
+fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
+    use crate::ident::ClassId;
+
+    // A Concern's own module-level `include Other` of a Concern is
+    // deferred, not performed: `Other` becomes a dependency, and including
+    // the outer Concern includes each dependency into the includer first,
+    // running its `included do` there before the outer one's
+    // (ActiveSupport::Concern#append_features). Core's
+    // `ResolvableCapabilityColumn` is only `extend ActiveSupport::Concern;
+    // include CapabilityPayloadColumn`, so every validation its includers
+    // get comes this way. A plain module's include ran on the module
+    // itself, so its includes are not followed.
+    let concerns: crate::det::HashSet<&ClassId> =
+        carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
+    let mut dependencies: crate::det::HashMap<ClassId, Vec<ClassId>> = crate::det::HashMap::default();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module && concerns.contains(&lc.name)) {
+        dependencies.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+    }
+    // `id` with its dependencies ahead of it, depth first, each concern
+    // once per includer (`append_features` returns early for a module the
+    // base already includes, so its block runs once).
+    fn with_dependencies(
+        id: &ClassId,
+        dependencies: &crate::det::HashMap<ClassId, Vec<ClassId>>,
+        spliced: &mut crate::det::HashSet<ClassId>,
+        out: &mut Vec<ClassId>,
+    ) {
+        if !spliced.insert(id.clone()) {
+            return;
+        }
+        for dep in dependencies.get(id).into_iter().flatten() {
+            with_dependencies(dep, dependencies, spliced, out);
+        }
+        out.push(id.clone());
+    }
 
     // Every constant the app defines, fully qualified: a carried
     // statement's bare constant resolves in the concern's lexical scope.
@@ -2816,9 +2850,12 @@ fn splice_concerns_into_models(app: &mut App) {
                 _ => Vec::new(),
             };
             let model_name = model.name.clone();
-            let items: Vec<ModelBodyItem> = concern_ids
+            let mut ordered: Vec<ClassId> = Vec::new();
+            for id in &concern_ids {
+                with_dependencies(id, &dependencies, &mut spliced, &mut ordered);
+            }
+            let items: Vec<ModelBodyItem> = ordered
                 .iter()
-                .filter(|id| spliced.insert((*id).clone()))
                 .filter_map(|id| app.concern_model_items.get(id).map(|items| (id, items)))
                 .flat_map(|(id, items)| {
                     let class_attributes = super::class_attribute::declared_names(items);
@@ -2907,6 +2944,27 @@ fn rehome_carried(
     item
 }
 
+/// The attribute a `cattr_*`/`mattr_*` expansion's class-side writer
+/// (`def self.x=(value) = @x = value`) is for. With no `default:` the
+/// expansion seeds nothing, so a model's `self.x = []` beside the
+/// declaration (its own, or a concern's `included do`) is known by this.
+fn cattr_class_writer(method: &crate::dialect::MethodDef) -> Option<Symbol> {
+    use crate::expr::{ExprNode, LValue};
+    // Generated, not authored: an app's own `def self.x=` beside a
+    // class-body `self.x += 1` stays the reported drop it was.
+    if method.receiver != crate::dialect::MethodReceiver::Class
+        || !method.name_span.is_synthetic()
+        || method.kind != crate::dialect::AccessorKind::AttributeWriter
+    {
+        return None;
+    }
+    let base = method.name.as_str().strip_suffix('=')?;
+    let [param] = method.params.as_slice() else { return None };
+    let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*method.body.node else { return None };
+    let reads_param = matches!(&*value.node, ExprNode::Var { name, .. } if *name == param.name);
+    (name.as_str() == base && reads_param).then(|| Symbol::from(base))
+}
+
 /// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a
 /// `class_attribute` declares: the class's own, one an included concern
 /// carried in, or an ancestor's. A write through the class-side writer,
@@ -2924,7 +2982,14 @@ fn claim_class_attribute_writes(app: &mut App) {
     let bodies = app
         .models
         .iter()
-        .map(|m| (m.name.clone(), m.parent.clone(), super::class_attribute::declared_names(&m.body)))
+        .map(|m| {
+            let mut names = super::class_attribute::declared_names(&m.body);
+            names.extend(m.body.iter().filter_map(|item| match item {
+                ModelBodyItem::Method { method, .. } => cattr_class_writer(method),
+                _ => None,
+            }));
+            (m.name.clone(), m.parent.clone(), names)
+        })
         .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| {
             let names = lc
                 .class_ivar_initializers

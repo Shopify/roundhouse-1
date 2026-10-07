@@ -41,7 +41,9 @@ fn tree(helper: &str) -> HashMap<PathBuf, Vec<u8>> {
 
 /// The plain form: the forwarder CALLS the target, which is what Rails'
 /// generated body does and what makes it work when the target is an
-/// `attr_reader` rather than a raw ivar.
+/// `attr_reader` rather than a raw ivar. On the Ruby target it forwards
+/// `(...)` as Rails' does (`App::ruby_delegate_forwarders`); the IR's is
+/// zero-arg for the strict targets.
 #[test]
 fn a_delegated_reader_becomes_a_forwarding_method() {
     let out = emit(
@@ -56,9 +58,9 @@ fn a_delegated_reader_becomes_a_forwarding_method() {
 end
 "#,
     );
-    assert!(out.contains("def fragment\n    content.fragment\n  end"), "got:\n{out}");
+    assert!(out.contains("def fragment(...)\n    content.fragment(...)\n  end"), "got:\n{out}");
     assert!(
-        out.contains("def to_plain_text\n    content.to_plain_text\n  end"),
+        out.contains("def to_plain_text(...)\n    content.to_plain_text(...)\n  end"),
         "got:\n{out}"
     );
     // The declaration is CONSUMED, not replayed beside its expansion.
@@ -81,7 +83,7 @@ end
     );
     assert!(
         out.contains(
-            "def request_host\n    __delegate_target = request\n    if __delegate_target.nil?\n      nil\n    else\n      __delegate_target.host\n    end\n  end"
+            "def request_host(...)\n    __delegate_target = request\n    if __delegate_target.nil?\n      nil\n    else\n      __delegate_target.host(...)\n    end\n  end"
         ),
         "got:\n{out}"
     );

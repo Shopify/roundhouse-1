@@ -307,12 +307,15 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_has_mixin_include(m.body())
 }
 
-/// A body that includes a module by constant, outside a concern: the
-/// module is a mixin whose ancestry other code reads, not a namespace.
-/// Core's GraphQL interfaces (`module Types::NodeInterface; include
+/// A body that includes a module by constant: the module is a mixin
+/// whose ancestry other code reads, not a namespace. Core's GraphQL
+/// interfaces (`module Types::NodeInterface; include
 /// GraphApi::InterfaceType; field :id, ...; end`) declare no method, and
 /// dropped, the module the object types `implements` had no fields. A
-/// concern (`extend ActiveSupport::Concern`) is left to the concern rules.
+/// concern that only gathers others is one too: Core's
+/// `MerchantSubscriptions::Concerns::ResolvableCapabilityColumn` is
+/// `extend ActiveSupport::Concern; include CapabilityPayloadColumn`, and
+/// dropped, every model including it raised at load.
 /// sorbet's `mixes_in_class_methods M` (graphql-shopify's
 /// `Metrics::AuthorizedType`) makes one too: each includer is extended
 /// with `M`.
@@ -324,20 +327,16 @@ fn body_has_mixin_include(body: Option<Node<'_>>) -> bool {
             call.receiver().is_none() && call.block().is_none() && constant_id_str(&call.name()) == name
         })
     }
-    let constant_args = |call: &ruby_prism::CallNode<'_>, pred: &dyn Fn(&str) -> bool| {
+    let constant_args = |call: &ruby_prism::CallNode<'_>| {
         call.arguments().is_some_and(|a| {
             let args: Vec<_> = a.arguments().iter().collect();
-            !args.is_empty() && args.iter().all(|arg| constant_path_segments_strs(arg).is_some_and(|p| pred(&p.join("::"))))
+            !args.is_empty() && args.iter().all(|arg| constant_path_segments_strs(arg).is_some())
         })
     };
-    let concern = stmts.iter().any(|stmt| {
-        call_named(stmt, "extend").is_some_and(|call| constant_args(&call, &|p| p.trim_start_matches("::") == "ActiveSupport::Concern"))
-    });
-    !concern
-        && stmts.iter().any(|stmt| {
-            call_named(stmt, "include").is_some_and(|call| constant_args(&call, &|_| true))
-                || call_named(stmt, "mixes_in_class_methods").is_some_and(|call| call.arguments().is_some())
-        })
+    stmts.iter().any(|stmt| {
+        call_named(stmt, "include").is_some_and(|call| constant_args(&call))
+            || call_named(stmt, "mixes_in_class_methods").is_some_and(|call| call.arguments().is_some())
+    })
 }
 
 /// A body statement that calls a method on a constant, or on a

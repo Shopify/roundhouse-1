@@ -5079,9 +5079,19 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 let is_direct = direct.iter().any(|stmt| stmt.location().start_offset() == inner.location().start_offset());
                 // `class_attribute` runs on the includer: its defs and
                 // its seed are carried like the model's own declaration.
-                let class_attribute = inner
-                    .as_call_node()
-                    .is_some_and(|call| super::class_attribute::parse(&call, file).is_some());
+                // So does `cattr_*`/`mattr_*` (Core's `included do
+                // cattr_accessor :x` with a `class_methods` writer of
+                // `self.x = …`): the model walk expands it into the same
+                // class-side accessors a model body's own declaration gets.
+                let class_attribute = inner.as_call_node().is_some_and(|call| {
+                    super::class_attribute::parse(&call, file).is_some()
+                        || call.receiver().is_none()
+                            && matches!(
+                                &*constant_id_str(&call.name()),
+                                "cattr_reader" | "cattr_writer" | "cattr_accessor"
+                                    | "mattr_reader" | "mattr_writer" | "mattr_accessor"
+                            )
+                });
                 match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
