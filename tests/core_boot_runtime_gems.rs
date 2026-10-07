@@ -761,6 +761,31 @@ fn a_dependency_no_required_gem_loads_is_refused() {
     assert!(!errors.iter().any(|e| e.contains("stripe")), "{errors:#?}");
 }
 
+/// A lockfile dependency is not a load. Core's payment_service_client
+/// depends on cusco and autoloads it, and cusco requires Rails, so
+/// cusco's constants stay refused. So does a dependency no probe saw
+/// loaded (google-apis-core, behind stripe here).
+#[test]
+fn a_lockfile_dependency_requiring_does_not_load_is_refused() {
+    let lock = BUNDLED_LOCK
+        .replace("    stripe (18.4.2)\n", "    cusco (3.4.0)\n    google-apis-core (0.18.0)\n    payment_service_client (1.91.0)\n      cusco (>= 3.0)\n    stripe (18.4.2)\n      google-apis-core (>= 0.1)\n")
+        .replace("  stripe (~> 18.4.2)\n", "  payment_service_client\n  stripe (~> 18.4.2)\n");
+    let (_, errors) = bundled_app(&lock)
+        .write("sorbet/rbi/gems/cusco@3.4.0.rbi", "# typed: true\nmodule Cusco; end\nclass Cusco::Client; end\n")
+        .write("sorbet/rbi/gems/google-apis-core@0.18.0.rbi", "# typed: true\nmodule Google::Apis; end\nclass Google::Apis::Error < StandardError; end\n")
+        .write("lib/payments_reader.rb", "class PaymentsReader\n  def cusco?(value)\n    value.is_a?(Cusco::Client)\n  end\n\n  def api_error?(error)\n    error.is_a?(Google::Apis::Error)\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Cusco::Client is declared by the cusco gem, whose load closure requires Rails")),
+        "{errors:#?}"
+    );
+    assert!(
+        errors.iter().any(|e| e.contains("Google::Apis::Error is declared by the google-apis-core gem, which no emitted tree loads")),
+        "{errors:#?}"
+    );
+    assert!(!errors.iter().any(|e| e.contains("stripe") || e.contains("jwt")), "{errors:#?}");
+}
+
 /// A blog-shaped app whose lock names none of Core's gems requires none
 /// of them, whatever the machine has installed.
 #[test]
