@@ -5819,6 +5819,68 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         }
     }
 
+    // A plain gem's files, which its `require`s load: under the `lib/`
+    // of a gem the lockfile names (a vendored `<name>-<version>/lib`, a
+    // PATH gem's `<name>/lib`) and under no Zeitwerk loader's root.
+    // Native Ruby autoloads none of them: Rails' autoloader walks the
+    // app's autoload paths and Zeitwerk its loaders' roots, never a
+    // gem's `lib/` otherwise. So a namespace only such files open is no
+    // implicit module (shopify-money's `require_relative
+    // 'rubocop/cop/money' if defined?(RuboCop)`: with the module defined
+    // at boot the guard passed and the cops, whose `RuboCop::Cop::Base`
+    // nothing defines, loaded), and `eager_load!` loads none of them;
+    // their programs' requires do, where Ruby runs them.
+    let gem_names: std::collections::BTreeSet<&str> =
+        app.gem_lock.iter().flat_map(|lock| lock.specs.iter().map(|(name, _)| name.as_str())).collect();
+    let gem_dir = |dir: &str| {
+        gem_names.iter().any(|name| {
+            dir == *name
+                || dir
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+        })
+    };
+    let required_gem_file = |source: &str| -> bool {
+        let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+        if loader_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/"))) {
+            return false;
+        }
+        let segments: Vec<&str> = rel.split('/').collect();
+        (1..segments.len().saturating_sub(1)).any(|i| segments[i] == "lib" && gem_dir(segments[i - 1]))
+    };
+    let gem_only = |anchor: &str| {
+        declaring.get(anchor).is_some_and(|sources| !sources.is_empty() && sources.iter().all(|s| required_gem_file(s)))
+    };
+    let mut not_implicit: Vec<(String, String)> = Vec::new();
+    for (namespace, children) in &namespaces {
+        for (name, child) in children {
+            if child.file.is_some() || !child.all_module {
+                continue;
+            }
+            let full = if namespace == "Object" { name.clone() } else { format!("{namespace}::{name}") };
+            let inner = format!("{full}::");
+            let mut under = namespaces
+                .iter()
+                .filter(|(ns, _)| **ns == full || ns.starts_with(&inner))
+                .flat_map(|(_, grandchildren)| grandchildren.values().filter_map(|c| c.file.as_deref()))
+                .peekable();
+            if under.peek().is_some() && under.all(|file| gem_only(file)) {
+                not_implicit.push((namespace.clone(), name.clone()));
+            }
+        }
+    }
+    for (namespace, name) in not_implicit {
+        if let Some(child) = namespaces.get_mut(&namespace).and_then(|children| children.get_mut(&name)) {
+            child.all_module = false;
+        }
+    }
+    let program_sources: BTreeMap<String, &str> = app
+        .file_programs
+        .iter()
+        .map(|p| (emit::ruby::file_program_anchor(app, p), p.source.as_str()))
+        .collect();
+
     // The railties' files (below), which load in Rails' order.
     let program_of = |name: &crate::ident::ClassId| {
         app.file_programs
@@ -5889,7 +5951,13 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         })
         .collect();
     write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().map(String::as_str))).unwrap();
-    let all_files = loaded_list(&mut models.iter().map(|(a, _)| a.as_str()).chain(unreached.iter().map(|p| p.as_str())));
+    let all_files = loaded_list(
+        &mut models
+            .iter()
+            .map(|(a, _)| a.as_str())
+            .filter(|a| !gem_only(a))
+            .chain(unreached.iter().map(|p| p.as_str()).filter(|p| !program_sources.get(*p).is_some_and(|s| required_gem_file(s)))),
+    );
     write!(body, "  ALL_FILES = [\n{}  ].freeze\n", list(&mut all_files.iter().map(String::as_str))).unwrap();
     // What native lazy boot never loads: a file program no file
     // requires, no boot file requires, and no constant names as its
