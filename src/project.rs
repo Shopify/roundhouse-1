@@ -3382,6 +3382,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
     files.push(("runtime/active_support_backtrace_cleaner.rb".into(), cleaner));
+    // ActiveRecord::LogSubscriber.backtrace_cleaner and Active Record's
+    // `active_record.backtrace_cleaner` railtie hook (8.2.0.alpha).
+    let ar_log_subscriber = crate::runtime_files::read_to_string("runtime/spinel/active_record_log_subscriber.rb")
+        .map_err(|e| format!("read Active Record log subscriber runtime: {e}"))?;
+    files.push(("runtime/active_record_log_subscriber.rb".into(), ar_log_subscriber));
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
@@ -3426,6 +3431,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 "# `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
                  # (railties rails.rb:13): `Rails.backtrace_cleaner`, ported.\n\
                  require_relative \"runtime/active_support_backtrace_cleaner\"\n\
+                 # Active Record's railtie: LogSubscriber.backtrace_cleaner and its\n\
+                 # `active_record.backtrace_cleaner` load hook, registered ahead of\n\
+                 # every config/initializers file.\n\
+                 require_relative \"runtime/active_record_log_subscriber\"\n\
                  # Rails::Railtie and Rails::Engine, for the gems' railties and the\n\
                  # app's own railties and engines, which app/models.rb loads.\n\
                  require_relative \"runtime/rails_railtie\"\n\
@@ -6649,7 +6658,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
         && p != "runtime/semian_adapter.rb" && p != "runtime/semian_net_http.rb"
         && p != "runtime/active_support_lazy_load_hooks.rb"
-        && p != "runtime/active_support_backtrace_cleaner.rb");
+        && p != "runtime/active_support_backtrace_cleaner.rb"
+        && p != "runtime/active_record_log_subscriber.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance

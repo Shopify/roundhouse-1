@@ -32,6 +32,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
+    ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands
@@ -347,6 +348,7 @@ mod tests {
             ("ActiveModel::RangeError", "runtime/active_model_type.rb"),
             ("ActiveSupport::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
             ("Rails::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
+            ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }
