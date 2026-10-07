@@ -1035,6 +1035,12 @@ impl<'a> BodyTyper<'a> {
                     if let Some(ty) = range_method(method, args.first()) {
                         return ty;
                     }
+                    // Range is Enumerable: these build the same values
+                    // from its elements as from an Array's
+                    // (`(1..MAX).each_with_object({}) { ... }`).
+                    if is_enumerable_builder(method) {
+                        return array_method(method, &args.first().cloned().unwrap_or_else(unknown), block_ret);
+                    }
                 }
                 // `ActiveSupport.parse_db_time(<stored text>)` — the
                 // synthesized temporal-column reader intrinsic (see
@@ -2025,6 +2031,20 @@ fn conversion_fallback(method: &Symbol) -> Option<Ty> {
 // its return type. Entries grow as the type system gains coverage
 // of Ruby's standard library; mining `functions_spec.rb` in the
 // ruby2js codebase for additional translations is the ongoing work.
+
+/// Enumerable methods whose answer is built from the elements alone, the
+/// same for any Enumerable receiver as for an Array of its elements.
+/// Not those answering the receiver (`each_with_index`) or mutating it.
+fn is_enumerable_builder(method: &Symbol) -> bool {
+    matches!(
+        method.as_str(),
+        "map" | "collect" | "flat_map" | "collect_concat" | "select" | "filter" | "reject" | "filter_map"
+            | "each_with_object" | "inject" | "reduce" | "each_slice" | "each_cons" | "group_by"
+            | "index_by" | "index_with" | "partition" | "zip" | "to_h" | "sort" | "sort_by" | "min_by"
+            | "max_by" | "find" | "detect" | "take" | "drop" | "take_while" | "drop_while" | "tally"
+            | "uniq" | "any?" | "all?" | "none?" | "one?" | "find_index" | "to_set"
+    )
+}
 
 /// Methods on a `Range` value (`Ty::Class { id: "Range", args: [elem] }`).
 /// `elem` is the bound type (`Int` for `(1..10)`); `None` when the range

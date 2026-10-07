@@ -2018,6 +2018,11 @@ impl<'a> BodyTyper<'a> {
                 {
                     return t;
                 }
+                // Blockless, `n.times` is the Enumerator over 0...n, read
+                // as the Array of its Integers as `upto` is (`MAX.times.map`).
+                if recv_ty == Some(Ty::Int) && method.as_str() == "times" && block.is_none() && args.is_empty() {
+                    return Ty::Array { elem: Box::new(Ty::Int) };
+                }
                 let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
