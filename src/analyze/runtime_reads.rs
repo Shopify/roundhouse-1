@@ -26,6 +26,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
+    ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
+    ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
 ];
 
 /// Each gated namespace and the finished-tree file that declares it.
@@ -165,6 +167,40 @@ pub(crate) fn ruby_family_runtime_reads(app: &App) -> Vec<RuntimeRead> {
     out
 }
 
+/// Every `include` / `extend` / `prepend` of a gated module by an app
+/// class or model, as (span, including class, module). A library class
+/// keeps its includes as names, so its span is synthetic, as the
+/// analyzer's own include refusal is.
+pub(crate) fn ruby_family_runtime_includes(app: &App) -> Vec<(Span, String, String)> {
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    let names = ruby_family_runtime_names();
+    let gated = |name: &str| names.contains_key(name) && !resolver.has_source_namespace(name);
+    let mut out = Vec::new();
+    for class in &app.library_classes {
+        for included in class.includes.iter().filter(|m| gated(m.0.as_str())) {
+            out.push((Span::synthetic(), class.name.0.to_string(), included.0.to_string()));
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if !matches!(method.as_str(), "include" | "extend" | "prepend") {
+                continue;
+            }
+            for arg in args {
+                if let ExprNode::Const { path } = &*arg.node {
+                    let name = written(path);
+                    if gated(&name) {
+                        out.push((expr.span, model.name.0.to_string(), name));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +219,10 @@ mod tests {
             ("ActiveSupport::Cache::MemoryStore", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::Strategy::LocalCache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
+            ("ActiveSupport::Testing::TimeHelpers", "runtime/active_support_testing_time_helpers.rb"),
+            ("ActiveSupport::Testing::SimpleStubs", "runtime/active_support_testing_time_helpers.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }

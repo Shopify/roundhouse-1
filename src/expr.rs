@@ -55,7 +55,8 @@ pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
-/// keyword arguments. The Ruby emitter writes the splat back: in Ruby 3 a
+/// keyword arguments, or a `yield(**value)` argument, which ingest takes
+/// positionally. The Ruby emitter writes the splat back: in Ruby 3 a
 /// positional Hash does not bind keyword parameters.
 pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
 

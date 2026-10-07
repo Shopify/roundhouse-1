@@ -22,10 +22,11 @@
 #   installed on core classes; the few calls the stores make are written
 #   out below with the same results.
 # - `lookup_store` / `retrieve_store_class` find the stores this file
-#   defines. FileStore, MemCacheStore and RedisCacheStore are not ported
-#   (MemCacheStore needs the dalli gem, RedisCacheStore redis); asking
-#   for one raises the same "Could not find cache store adapter" error a
-#   missing native adapter does, naming what it needs.
+#   defines, and MemCacheStore where runtime/active_support_mem_cache_store.rb
+#   is loaded (a tree whose app names the class). FileStore and
+#   RedisCacheStore are not ported (RedisCacheStore needs redis); asking
+#   for a missing one raises the same "Could not find cache store adapter"
+#   error a missing native adapter does, naming what it needs.
 # - The :message_pack serializer needs ActiveSupport::MessagePack and the
 #   msgpack gem, which the tree does not carry; selecting it raises, and
 #   a MessagePack payload is not recognized on load (native behavior when
@@ -157,10 +158,12 @@ module ActiveSupport
 
     # The stores this file defines, by `lookup_store` symbol.
     PORTED_STORES = %i(memory_store null_store).freeze
-    # Native adapters this file does not port, and what each needs.
+    # Native adapters this file does not define, and why one is missing.
+    # MemCacheStore is runtime/active_support_mem_cache_store.rb's, carried
+    # where the app names the class; `lookup_store` finds it once loaded.
     UNPORTED_STORES = {
       file_store: "ActiveSupport::Cache::FileStore is not ported",
-      mem_cache_store: "ActiveSupport::Cache::MemCacheStore needs the dalli gem, which is not ported",
+      mem_cache_store: "ActiveSupport::Cache::MemCacheStore is carried only where the app names the class",
       redis_cache_store: "ActiveSupport::Cache::RedisCacheStore needs the redis gem, which is not ported",
     }.freeze
 
@@ -248,11 +251,13 @@ module ActiveSupport
         end
 
         def retrieve_store_class(store)
-          unless PORTED_STORES.include?(store)
+          name = store.to_s.split("_").map(&:capitalize).join
+          loaded = UNPORTED_STORES.key?(store) && ActiveSupport::Cache.const_defined?(name, false)
+          unless PORTED_STORES.include?(store) || loaded
             reason = UNPORTED_STORES.fetch(store) { "cannot load such file -- active_support/cache/#{store}" }
             raise "Could not find cache store adapter for #{store} (#{reason})"
           end
-          ActiveSupport::Cache.const_get(store.to_s.split("_").map(&:capitalize).join)
+          ActiveSupport::Cache.const_get(name)
         end
     end
 

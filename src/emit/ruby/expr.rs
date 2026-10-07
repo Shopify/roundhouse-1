@@ -371,7 +371,7 @@ fn emit_node(n: &ExprNode) -> String {
             format!("{} {} {}", emit_lvalue(target), op.as_ruby(), emit_expr(value))
         }
         ExprNode::Yield { args } => {
-            let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+            let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
             // Parenthesized: `html << yield x` does not parse bare.
             if args_s.is_empty() { "yield".to_string() } else { format!("yield({})", args_s.join(", ")) }
         }

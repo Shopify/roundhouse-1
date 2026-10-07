@@ -70,6 +70,9 @@ module RoundhouseTestRunner
       end
       capture(errors, "test") { test.public_send(name) } if errors.empty?
       capture(errors, "teardown") { test.teardown }
+      # Minitest's after_teardown hook, where something defines it
+      # (ActiveSupport's TimeHelpers travels back there).
+      capture(errors, "teardown") { test.after_teardown } if test.respond_to?(:after_teardown)
     end
     # Keep all phase failures. Error wins over failure/skip; a teardown error
     # cannot turn into a pass or disappear behind an earlier skip.
