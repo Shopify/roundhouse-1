@@ -1107,8 +1107,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             &bytes,
                             &entry.display().to_string(),
                         ));
+                        let file = entry.display().to_string();
                         match extract_video_preview_arguments(&bytes) {
-                            VideoPreviewArgsExtract::Value(a) => video_args = Some(a),
+                            VideoPreviewArgsExtract::Value(a) => {
+                                consume_config_assignment(&bytes, &file, "active_storage.video_preview_arguments");
+                                video_args = Some(a);
+                            }
                             VideoPreviewArgsExtract::Unsupported => {
                                 // A later computed assignment must not leave an
                                 // earlier literal override in effect.
@@ -1121,6 +1125,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             VideoPreviewArgsExtract::Absent => {}
                         }
                         if let Some(name) = extract_video_previewer_replacement(&bytes) {
+                            consume_config_assignment(&bytes, &file, "active_storage.previewers");
                             previewer_replacement = Some(name);
                         }
                     }
@@ -7383,8 +7388,14 @@ fn require_of_loaded_support<V: Vfs + ?Sized>(
     let result = ruby_prism::parse(source);
     let root = result.node();
     let Some(program) = root.as_program_node() else { return Vec::new() };
+    let src = String::from_utf8_lossy(source);
     let mut out = Vec::new();
     for stmt in program.statements().body().iter() {
+        let (start, end) = (stmt.location().start_offset(), stmt.location().end_offset());
+        if requires_loaded_lib_dirs(&src[start..end], load_path, loaded, vfs) {
+            out.push((start, end));
+            continue;
+        }
         let Some(call) = stmt.as_call_node() else { continue };
         if call.receiver().is_some() || super::util::constant_id_str(&call.name()) != "require" {
             continue;
@@ -7403,6 +7414,49 @@ fn require_of_loaded_support<V: Vfs + ?Sized>(
         }
     }
     out
+}
+
+/// A statement that globs `lib/<dir>` and requires what it finds
+/// (`Dir[Rails.root.join("lib/rails_ext/*.rb")].each { |f| require f }`,
+/// or the same over `%w[ rails_ext ].each`), where every Ruby file of
+/// each `lib/` subdirectory it names is a support file the emitted app
+/// already loads at boot ([`require_of_loaded_support`]): applied, as
+/// the literal require of one such file is. A subdirectory with a file
+/// boot does not load keeps the statement a gap.
+fn requires_loaded_lib_dirs<V: Vfs + ?Sized>(
+    text: &str,
+    load_path: &[PathBuf],
+    loaded: &crate::det::HashSet<PathBuf>,
+    vfs: &V,
+) -> bool {
+    if !(text.contains("require") && text.contains("Dir") && text.contains("lib/")) {
+        return false;
+    }
+    let Some(lib) = load_path.first() else { return false };
+    let Ok(children) = vfs.read_dir(lib) else { return false };
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let names_word = |word: &str| {
+        text.match_indices(word).any(|(i, _)| {
+            !text[..i].chars().next_back().is_some_and(is_ident)
+                && !text[i + word.len()..].chars().next().is_some_and(is_ident)
+        })
+    };
+    let mut named = 0usize;
+    for child in children {
+        if !vfs.is_dir(&child) {
+            continue;
+        }
+        let Some(name) = child.file_name().and_then(|n| n.to_str()) else { continue };
+        if !names_word(name) {
+            continue;
+        }
+        let Ok(files) = read_rb_files(vfs, &child) else { return false };
+        if files.is_empty() || !files.iter().all(|f| loaded.contains(f)) {
+            return false;
+        }
+        named += 1;
+    }
+    named > 0
 }
 
 /// One write to `config.filter_parameters`, as a statement on the list
@@ -7978,6 +8032,31 @@ fn join_ruby_string_literals(text: &str) -> String {
         }
     }
     out
+}
+
+/// Consume the statement of the first uncommented `<needle> = …`
+/// assignment (the one the line-scanned Active Storage readers above
+/// apply): the innermost statement at that line, when it is the
+/// assignment of `needle`.
+fn consume_config_assignment(bytes: &[u8], file: &str, needle: &str) {
+    let source = String::from_utf8_lossy(bytes);
+    for line in source.lines() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let Some(idx) = t.find(needle) else { continue };
+        let rest = t[idx + needle.len()..].trim_start();
+        if !rest.starts_with('=') || rest.starts_with("==") {
+            continue;
+        }
+        let offset = line_offset(&source, t) + idx;
+        super::initializers::consume_statement_at(bytes, file, offset, |stmt, src| {
+            let loc = stmt.location();
+            src[loc.start_offset()..loc.end_offset()].contains(needle)
+        });
+        return;
+    }
 }
 
 /// Replacement Const from

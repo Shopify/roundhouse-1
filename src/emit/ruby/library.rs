@@ -6935,10 +6935,12 @@ fn emit_library_class_decl_inner(
     // their source order (`@registry = {}` then `register :x`), so the
     // two interleave by source position when every one has a real span.
     //
-    // An initializer that calls one of this class's own class methods (a
-    // Concern macro writing its `class_attribute`, `ingest::
-    // class_attribute`) needs those methods defined first, so it and
-    // every initializer after it are written after the methods instead.
+    // An initializer that calls one of this class's own class methods, or
+    // is itself a class-body call (a Concern macro writing its
+    // `class_attribute`, `ingest::class_attribute`, possibly inherited
+    // and dispatching back to a reader this class defines), needs those
+    // methods defined first, so it and every initializer after it are
+    // written after the methods instead.
     let replayed: Vec<&Expr> = replayed.into_iter().filter(|call| !leading.contains(&call.span)).collect();
     let own_class_methods: crate::det::HashSet<&Symbol> = lc
         .methods
@@ -6949,7 +6951,7 @@ fn emit_library_class_decl_inner(
     let late_at = lc
         .class_ivar_initializers
         .iter()
-        .position(|init| calls_own_class_method(init, &own_class_methods))
+        .position(|init| is_self_call(init) || calls_own_class_method(init, &own_class_methods))
         .unwrap_or(lc.class_ivar_initializers.len());
     let (early_inits, late_inits) = lc.class_ivar_initializers.split_at(late_at);
     let mut body_effects: Vec<&Expr> = replayed.iter().copied().chain(early_inits.iter()).collect();
@@ -7730,6 +7732,13 @@ fn runtime_reopen_anchor(name: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Is `expr` itself a call on the implicit or explicit `self` (a
+/// class-body macro), rather than an assignment?
+fn is_self_call(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv, .. }
+        if recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)))
 }
 
 /// Does `expr` call, on the implicit or explicit `self`, a class method
