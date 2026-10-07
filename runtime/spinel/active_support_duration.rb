@@ -124,6 +124,36 @@ module ActiveSupport
       @seconds.to_f
     end
 
+    # activesupport 8.2 duration.rb: `alias :in_seconds :to_i`, and the
+    # `in_<unit>` readers divide the value by the unit's float length.
+    def in_seconds
+      to_i
+    end
+
+    def in_minutes
+      @seconds / SECONDS_PER_MINUTE.to_f
+    end
+
+    def in_hours
+      @seconds / SECONDS_PER_HOUR.to_f
+    end
+
+    def in_days
+      @seconds / SECONDS_PER_DAY.to_f
+    end
+
+    def in_weeks
+      @seconds / SECONDS_PER_WEEK.to_f
+    end
+
+    def in_months
+      @seconds / SECONDS_PER_MONTH.to_f
+    end
+
+    def in_years
+      @seconds / SECONDS_PER_YEAR.to_f
+    end
+
     # Rails parity: Duration#to_s is the seconds VALUE's to_s
     # (`30.minutes.to_s == "1800"`). Also what string interpolation
     # calls — lobsters' cache keys embed durations

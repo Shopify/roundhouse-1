@@ -200,6 +200,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActiveSupport::Duration", &class_side, &[
         ("ago", time_ty()), ("until", time_ty()), ("from_now", time_ty()), ("since", time_ty()),
         ("to_i", Ty::Int), ("seconds", Ty::Int), ("to_f", Ty::Float), ("to_s", Ty::Str),
+        ("in_seconds", Ty::Int), ("in_minutes", Ty::Float), ("in_hours", Ty::Float),
+        ("in_days", Ty::Float), ("in_weeks", Ty::Float), ("in_months", Ty::Float),
+        ("in_years", Ty::Float),
         ("==", Ty::Bool), ("<", Ty::Bool), ("<=", Ty::Bool), (">", Ty::Bool), (">=", Ty::Bool),
         ("<=>", Ty::Int),
     ]);
