@@ -393,10 +393,13 @@ module ActiveSupport
     end
 
     def payload_filter
-      @payload_filter ||= ParameterFilter.new(filter_parameters, mask: ParameterFilter::FILTERED)
+      @payload_filter ||= ParameterFilter.new(effective_filter_parameters, mask: ParameterFilter::FILTERED)
     end
 
-    def filter_parameters
+    # Rails' private `filter_parameters`. Renamed here because the runtime
+    # signature check keys a class's methods by name alone, and the class
+    # has a public `filter_parameters` accessor of its own.
+    def effective_filter_parameters
       self.class.filter_parameters || ActiveSupport.filter_parameters
     end
 
