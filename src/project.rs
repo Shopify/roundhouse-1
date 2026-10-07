@@ -2696,6 +2696,24 @@ fn ruby_family_runtime_files(
         ));
         drop_harness_memory_store(&mut files)?;
     }
+    // ActiveSupport's signed and encrypted messages (MessageVerifier,
+    // MessageEncryptor, SecureCompareRotator, KeyGenerator, Messages::*)
+    // with ActiveSupport::JSON's coder, ported from activesupport 8.1.4
+    // (see the files' headers; tests/messages_runtime.rb holds them to
+    // native ActiveSupport). OpenSSL, Marshal and computed-name dispatch,
+    // so ruby-family only, and carried only where the app's own code
+    // names one of the port's classes. active_support_ext.rb then
+    // requires the port where its InvalidSignature stand-in stood.
+    if carries_active_support_messages(&files) {
+        for name in ["active_support_messages", "active_support_json"] {
+            files.push((
+                format!("runtime/{name}.rb"),
+                crate::runtime_files::read_to_string(&format!("runtime/spinel/{name}.rb"))
+                    .map_err(|e| format!("read runtime/spinel/{name}.rb: {e}"))?,
+            ));
+        }
+        replace_message_verifier_stand_in(&mut files)?;
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -5282,6 +5300,9 @@ fn spinel_files_with_assertions(
     // Monitor and computed-name dispatch, pushed back by the two
     // ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
+    // And for the messages port and its JSON coder (OpenSSL, Marshal),
+    // pushed back by the two ruby-family forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -6978,6 +6999,85 @@ fn drop_harness_memory_store(files: &mut [(String, String)]) -> Result<(), Strin
     Ok(())
 }
 
+/// The classes runtime/spinel/active_support_messages.rb declares that
+/// an app reaches by name. `ActiveSupport::MessageVerifier` counts unless
+/// all it names is `::InvalidSignature`, which active_support_ext.rb
+/// declares on every target (a signed-id rescue).
+const ACTIVE_SUPPORT_MESSAGES_NAMES: &[&str] = &[
+    "ActiveSupport::MessageVerifier",
+    "ActiveSupport::MessageEncryptor",
+    "ActiveSupport::SecureCompareRotator",
+    "ActiveSupport::KeyGenerator",
+    "ActiveSupport::CachingKeyGenerator",
+    "ActiveSupport::Messages",
+];
+
+/// active_support_ext.rb's `ActiveSupport::MessageVerifier`, which only
+/// declares InvalidSignature. Loaded before the port, its superclass-less
+/// `class MessageVerifier` would make the port's `< Messages::Codec` a
+/// superclass mismatch, so a tree carrying the port requires the port in
+/// its place.
+const MESSAGE_VERIFIER_STAND_IN: &str = "  class MessageVerifier\n    class InvalidSignature < StandardError\n      def initialize(message = \"ActiveSupport::MessageVerifier::InvalidSignature\")\n        super(message)\n      end\n    end\n  end\n";
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a class the messages port declares, in any position a
+/// constant takes: a receiver (`MessageEncryptor.new`), an argument
+/// (`build_rotation(ActiveSupport::MessageVerifier, …)`), a parent
+/// (`< ::ActiveSupport::MessageVerifier`), a declared type, a rescue.
+fn carries_active_support_messages(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_SUPPORT_MESSAGES_NAMES.iter().any(|name| mentions_messages_constant(content, name))
+    })
+}
+
+/// `konst` as a whole constant path outside whole-line comments: no
+/// identifier or `Outer::` before it (`::Name` is top-level), no
+/// identifier character after it, and not `MessageVerifier::InvalidSignature`.
+fn mentions_messages_constant(src: &str, konst: &str) -> bool {
+    if !src.contains(konst) {
+        return false;
+    }
+    let ident = |c: u8| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+    src.lines().filter(|line| !line.trim_start().starts_with('#')).any(|line| {
+        let b = line.as_bytes();
+        let mut i = 0;
+        while let Some(off) = line[i..].find(konst) {
+            let at = i + off;
+            let top_level = at >= 2
+                && &b[at - 2..at] == b"::"
+                && (at == 2 || !(ident(b[at - 3]) || b[at - 3] == b':'));
+            let head_ok = at == 0 || top_level || !(ident(b[at - 1]) || b[at - 1] == b':');
+            let tail = at + konst.len();
+            let tail_ok = !b.get(tail).is_some_and(|&c| ident(c))
+                && !(konst == "ActiveSupport::MessageVerifier" && line[tail..].starts_with("::InvalidSignature"));
+            if head_ok && tail_ok {
+                return true;
+            }
+            i = tail;
+        }
+        false
+    })
+}
+
+/// Replace active_support_ext.rb's MessageVerifier stand-in with a
+/// require of the port (`MESSAGE_VERIFIER_STAND_IN`).
+fn replace_message_verifier_stand_in(files: &mut [(String, String)]) -> Result<(), String> {
+    let Some((_, ext)) = files.iter_mut().find(|(p, _)| p == "runtime/active_support_ext.rb") else {
+        return Err("replace_message_verifier_stand_in: the tree has no runtime/active_support_ext.rb".into());
+    };
+    if ext.matches(MESSAGE_VERIFIER_STAND_IN).count() != 1 {
+        return Err("replace_message_verifier_stand_in: expected one ActiveSupport::MessageVerifier stand-in in runtime/active_support_ext.rb".into());
+    }
+    *ext = ext.replace(
+        MESSAGE_VERIFIER_STAND_IN,
+        "  # (ActiveSupport::MessageVerifier is runtime/active_support_messages.rb's\n  # on this tree; the stand-in is dropped.)\n  require_relative \"active_support_messages\"\n",
+    );
+    Ok(())
+}
+
 fn names_constant(src: &str, konst: &str) -> bool {
     // Most files never mention this name. Reject those with the optimized
     // substring search before walking/decoding every line of the runtime.
@@ -8377,6 +8477,44 @@ mod tests {
         assert!(!dropped.contains("Rails.cache.class.new"), "{dropped}");
         assert_eq!(dropped.len() < helper.len(), true);
         assert!(drop_harness_memory_store(&mut files).is_err(), "a second drop finds no stand-in");
+    }
+
+    /// The messages port rides along where app code names one of its
+    /// classes in any constant position, and active_support_ext.rb then
+    /// requires it where its InvalidSignature stand-in stood.
+    #[test]
+    fn an_app_naming_active_support_messages_carries_the_port_and_drops_the_stand_in() {
+        let ext = crate::runtime_files::read_to_string("runtime/ruby/active_support_ext.rb").unwrap();
+        let mut files = vec![
+            ("runtime/active_support_ext.rb".to_string(), ext.clone()),
+            ("runtime/active_record.rb".to_string(), "ActiveSupport::MessageEncryptor.new(k)\n".to_string()),
+            ("test/models/token_test.rb".to_string(), "ActiveSupport::MessageVerifier.new(k)\n".to_string()),
+            ("app/controllers/a.rb".to_string(), "rescue ActiveSupport::MessageVerifier::InvalidSignature\n".to_string()),
+            ("app/models/b.rb".to_string(), "# ActiveSupport::MessageEncryptor.new\nActiveSupport::MessageEncryptorX\nFoo::ActiveSupport::KeyGenerator.new\n".to_string()),
+        ];
+        assert!(!carries_active_support_messages(&files), "runtime, test bodies, the stand-in's name, comments and longer names");
+        for use_site in [
+            "@crypt = build_rotation(ActiveSupport::MessageEncryptor, secrets)\n",
+            "class ReportifyTokenGenerator < ::ActiveSupport::MessageVerifier\n",
+            "x = y #: ActiveSupport::SecureCompareRotator\n",
+            "ActiveSupport::KeyGenerator.new(base, iterations: 1000)\n",
+            "rescue ActiveSupport::MessageEncryptor::InvalidMessage\n",
+            "ActiveSupport::MessageVerifier.new(secret).generate(x)\n",
+        ] {
+            let mut with = files.clone();
+            with.push(("app/models/secrets.rb".to_string(), use_site.to_string()));
+            assert!(carries_active_support_messages(&with), "{use_site}");
+        }
+
+        replace_message_verifier_stand_in(&mut files).unwrap();
+        let replaced = &files[0].1;
+        assert!(!replaced.contains("class InvalidSignature"), "{replaced}");
+        assert_eq!(replaced.matches("require_relative \"active_support_messages\"").count(), 1);
+        assert!(replace_message_verifier_stand_in(&mut files).is_err(), "a second replace finds no stand-in");
+        // The port declares what the stand-in did.
+        let port = crate::runtime_files::read_to_string("runtime/spinel/active_support_messages.rb").unwrap();
+        let declared = crate::analyze::test_constants::declared_namespaces(&port);
+        assert!(declared.contains("ActiveSupport::MessageVerifier::InvalidSignature"), "{declared:?}");
     }
 
     #[test]
