@@ -634,6 +634,45 @@ pub(super) fn checked_cast(
     Some(cast)
 }
 
+/// `mixes_in_class_methods(A, ...)` written in a module or class body,
+/// as `SorbetRuntimeCheck.mixes_in_class_methods(self, A, ...)`.
+///
+/// `T::Helpers#mixes_in_class_methods` is behavior, not an annotation:
+/// each later `include` of the module extends the includer with `A`.
+/// GraphQL interfaces (`GraphQL::Shopify::Types::BaseInterface`) get
+/// their `definition_methods` onto every implementing type through it.
+/// `extend T::Helpers` stays dropped with the other annotation mixins;
+/// the CRuby overlay's sorbet_runtime_check.rb ports the two modules
+/// that answer the call. `None` for any other call, or one with no
+/// argument.
+pub(super) fn mixes_in_class_methods(stmt: &Node<'_>, file: &str) -> Option<Expr> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() || constant_id_str(&call.name()) != MIXES_IN {
+        return None;
+    }
+    if call.arguments().is_none_or(|a| a.arguments().iter().next().is_none()) {
+        return None;
+    }
+    let lowered = super::expr::ingest_expr(stmt, file).ok()?;
+    let span = lowered.span;
+    let ExprNode::Send { recv: None, args, .. } = *lowered.node else { return None };
+    let mut args_with_self = vec![Expr::new(span, ExprNode::SelfRef)];
+    args_with_self.extend(args);
+    let mut out = send(helper(), MIXES_IN, args_with_self);
+    out.span = span;
+    Some(out)
+}
+
+const MIXES_IN: &str = "mixes_in_class_methods";
+
+/// Whether `expr` is a lowered `mixes_in_class_methods` (run wherever
+/// the body is emitted; `project` refuses it off the CRuby trees).
+pub(crate) fn is_mixes_in(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv: Some(recv), method, .. }
+        if method.as_str() == MIXES_IN
+            && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == HELPER))
+}
+
 /// Whether `expr` is a lowered check (`project` refuses it off the
 /// CRuby trees).
 pub(crate) fn is_check(expr: &Expr) -> bool {

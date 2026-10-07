@@ -938,7 +938,7 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         // emitted tree has no sorbet-runtime to read them.
         if matches!(
             name,
-            "abstract!" | "interface!" | "final!" | "sealed!" | "sig" | "type_parameters"
+            "abstract!" | "interface!" | "final!" | "sealed!" | "sig" | "type_parameters" | "requires_ancestor"
         ) {
             continue;
         }

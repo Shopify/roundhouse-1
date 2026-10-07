@@ -6765,7 +6765,7 @@ fn emit_library_class_decl_inner(
         let qualified = segments[..=i].join("::");
         let parent = outer_class_parent(&qualified, app);
         match (is_app_class(&qualified, app), parent) {
-            (true, Some(p)) => format!("class {seg} < {}", p.0.as_str()),
+            (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app)),
             (true, None) => format!("class {seg}"),
             (false, _) => format!("module {seg}"),
         }
@@ -6795,7 +6795,13 @@ fn emit_library_class_decl_inner(
                 (Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }), _) => {
                     writeln!(s, "{pad}{last} = {} do", super::emit_expr(factory)).unwrap()
                 }
-                (_, Some(p)) => writeln!(s, "{pad}class {last} < {}", written_parent(lc, p, app)).unwrap(),
+                (_, Some(p)) => {
+                    // As written (`written_parent`: a rooted `::X` stays
+                    // rooted), then qualified against the emitted nesting.
+                    let written = written_parent(lc, p, app);
+                    let parent = lexically_qualified(&written, &segments[..depth - 1], app);
+                    writeln!(s, "{pad}class {last} < {parent}").unwrap()
+                }
                 (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
             }
         }
@@ -6814,7 +6820,7 @@ fn emit_library_class_decl_inner(
             writeln!(s, "{body_pad}::Kernel.raise(::NotImplementedError, '{quoted}')").unwrap();
             return;
         }
-        writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
+        writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
     };
     // An include whose `self.included(base)` hook calls class methods of
     // this class runs after them, as in the source (see
@@ -6831,7 +6837,7 @@ fn emit_library_class_decl_inner(
         write_include(&mut s, inc);
     }
     for carrier in &carrier_extends {
-        writeln!(s, "{body_pad}extend {}", carrier.0.as_str()).unwrap();
+        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
     }
     if (lc.includes.len() > positioned.len() || !carrier_extends.is_empty()) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
@@ -6854,7 +6860,15 @@ fn emit_library_class_decl_inner(
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
         lc.unknown_calls.iter().collect()
     } else {
-        let own = app_extension_calls(lc, app);
+        // sorbet's `mixes_in_class_methods`, lowered by the ingest
+        // (`sorbet_check::mixes_in_class_methods`), is behavior every
+        // body runs, whatever its base; kept in source order.
+        let extensions = app_extension_calls(lc, app);
+        let own: Vec<&Expr> = lc
+            .unknown_calls
+            .iter()
+            .filter(|c| crate::ingest::sorbet_check::is_mixes_in(c) || extensions.iter().any(|e| std::ptr::eq(*e, *c)))
+            .collect();
         for call in &lc.unknown_calls {
             if !own.iter().any(|c| std::ptr::eq(*c, call)) {
                 report_dropped_class_body_call(lc, call);
@@ -7550,6 +7564,8 @@ struct NameIndex {
     declared_in: HashMap<String, Vec<u32>>,
     /// `carried_sources`, on first use.
     carried: std::cell::OnceCell<std::rc::Rc<CarriedSources>>,
+    /// `app_constant_paths`, on first use.
+    constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
 }
 
 thread_local! {
@@ -7578,6 +7594,7 @@ impl NameIndex {
             library_classes,
             declared_in: declaring_files(app),
             carried: std::cell::OnceCell::new(),
+            constant_paths: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -7840,16 +7857,90 @@ fn calls_own_class_method(expr: &Expr, own: &crate::det::HashSet<&Symbol>) -> bo
 ///
 /// A reopen of a loaded gem's class or module (`reopens_loaded_gem_class`)
 /// replays for the same reason: the receiver is the gem's own class.
+///
+/// The base is found through the app's own classes: a superclass the
+/// app compiles (a gem source's, carried as app code) is not the end of
+/// the chain. Core's `GraphApi::ObjectType < GraphQL::Shopify::Types::BaseObject`
+/// (graphql-shopify, a gem source) `< GraphQL::Schema::Object` (the
+/// graphql gem, loaded natively): every `field` / `description` /
+/// `argument` in a Core type's body is graphql's DSL on graphql's class,
+/// and dropping it loads the type with no fields. A module replays by
+/// the same rule when it includes, directly or through app modules, a
+/// module of a natively loaded gem (`GraphApi::InterfaceType` includes
+/// graphql-shopify's `BaseInterface`, which includes
+/// `GraphQL::Schema::Interface`), unless it is a concern (its hooks are
+/// spliced into each includer).
 fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
     if InlineDeclaration::active() || reopens_loaded_gem_class(lc, app) {
         return true;
     }
     if lc.is_module {
+        return !is_concern_body(lc) && includes_loaded_gem_module(lc, app, &mut Vec::new());
+    }
+    let mut seen: Vec<&str> = vec![lc.name.0.as_str()];
+    let mut parent = lc.parent.as_ref();
+    while let Some(p) = parent {
+        if require_path_for_parent(p, app).is_none() {
+            return !is_core_class_name(p.0.as_str());
+        }
+        // An app class (a gem source's included): its own superclass
+        // decides. A model, a controller or a runtime base ends here.
+        if is_model_named(p.0.as_str(), app) || seen.contains(&p.0.as_str()) {
+            return false;
+        }
+        seen.push(p.0.as_str());
+        parent = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.as_ref());
+    }
+    false
+}
+
+/// Whether a module body uses ActiveSupport::Concern's hooks, which
+/// `splice_concerns_into_models` applies to each includer.
+fn is_concern_body(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| match &*call.node {
+        ExprNode::Send { recv: None, method, args, .. } => match method.as_str() {
+            "included" | "class_methods" | "prepended" => true,
+            "extend" => args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+/// Whether `lc` includes a module of a gem the tree loads natively,
+/// directly or through the app's own modules. An include written
+/// relative to the module's namespace resolves lexically, innermost
+/// first.
+fn includes_loaded_gem_module<'a>(lc: &'a LibraryClass, app: &'a App, seen: &mut Vec<&'a str>) -> bool {
+    if seen.contains(&lc.name.0.as_str()) {
         return false;
     }
-    lc.parent.as_ref().is_some_and(|p| {
-        require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
-    })
+    seen.push(lc.name.0.as_str());
+    let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    for inc in &lc.includes {
+        let written = inc.0.as_str().trim_start_matches("::");
+        let candidates: Vec<String> = if inc.0.as_str().starts_with("::") {
+            vec![written.to_string()]
+        } else {
+            (0..=scope.len()).rev().map(|n| if n == 0 { written.to_string() } else { format!("{}::{written}", scope[..n].join("::")) }).collect()
+        };
+        for name in &candidates {
+            let own: Vec<&LibraryClass> = library_classes_named(name, app).into_iter().filter(|c| c.is_module).collect();
+            if !own.is_empty() {
+                if own.iter().any(|m| includes_loaded_gem_module(m, app, seen)) {
+                    return true;
+                }
+                break;
+            }
+            let id = ClassId(Symbol::from(name.as_str()));
+            let gem_module = app.gem_boundary.loaded_reopen(&id).is_some_and(|g| g.is_module)
+                || app.gem_boundary.loaded_source_reopen(&id).is_some_and(|(_, kind)| kind.is_module);
+            if gem_module {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The body calls of a plain module or class (no superclass, or a core
@@ -8608,6 +8699,14 @@ pub(super) fn emit_file_program(
                             );
                             writeln!(s, "{pad}warn {message:?}").unwrap();
                         }
+                        // graphql-shopify's `require "active_support/core_ext/
+                        // class/attribute"`: the runtime ports are the
+                        // framework here, loaded before any app file, and
+                        // no such file is on the tree's load path (as the
+                        // gem-source dependency block says of the same).
+                        None if !*relative && crate::project::is_framework_feature(feature) => {
+                            writeln!(s, "{pad}# {site}: `require {feature:?}` is a Rails feature this tree's runtime ports answer; not required").unwrap();
+                        }
                         None => {
                             writeln!(s, "{pad}RoundhouseAutoload.file_statement({site:?}) do").unwrap();
                             writeln!(s, "{pad}  require {feature:?}").unwrap();
@@ -8890,6 +8989,58 @@ fn owns_a_file(name: &str, app: &App) -> bool {
     library_classes_named(name, app).iter().any(|c| {
         !c.is_module && !matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
     })
+}
+
+/// Every constant path the app declares (models, controllers, library
+/// classes and modules, test modules) and each namespace enclosing one.
+fn app_constant_paths(app: &App) -> std::rc::Rc<crate::det::HashSet<String>> {
+    let build = || {
+        let mut out: crate::det::HashSet<String> = crate::det::HashSet::default();
+        let names = app.models.iter().map(|m| m.name.0.as_str())
+            .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+            .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+            .chain(app.test_modules.iter().map(|t| t.name.0.as_str()));
+        for name in names {
+            let name = name.trim_start_matches("::");
+            let mut end = 0;
+            while let Some(at) = name[end..].find("::") {
+                out.insert(name[..end + at].to_string());
+                end += at + 2;
+            }
+            out.insert(name.to_string());
+        }
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.constant_paths.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
+/// An app constant `written` as a class header's superclass or a body's
+/// mixin must spell it, given the lexical `scopes` (innermost last) Ruby
+/// searches first: `::GraphApi::ObjectType` inside `module Channels;
+/// module GraphApi`, where a bare `GraphApi` is `Channels::GraphApi`.
+/// Core writes the leading `::` (`class ListingAttributeValue <
+/// ::GraphApi::ObjectType`); the ingest records the absolute name, and
+/// written bare, the class died with `uninitialized constant
+/// Channels::GraphApi::ObjectType`. The ingest keeps a mixin's name as
+/// written, so a name the innermost shadowing scope does declare in full
+/// is that scope's, as Ruby binds it, and stays as written; so does a
+/// name the app does not declare.
+fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
+    if written.starts_with("::") || scopes.is_empty() {
+        return written.to_string();
+    }
+    let paths = app_constant_paths(app);
+    let first = written.split("::").next().unwrap_or(written);
+    let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
+        return written.to_string();
+    };
+    if paths.contains(&format!("{scope}::{written}")) || !paths.contains(written) {
+        return written.to_string();
+    }
+    format!("::{written}")
 }
 
 fn is_app_class(name: &str, app: &App) -> bool {

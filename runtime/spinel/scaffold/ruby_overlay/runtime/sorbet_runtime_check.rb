@@ -41,6 +41,33 @@ module SorbetRuntimeCheck
     raise ::TypeError.new("#{cast_method}: #{coerce(type).error_message(value)}\nCaller: #{path}:#{line}")
   end
 
+  # `T::Helpers#mixes_in_class_methods(mod, *mods)`, which a module body
+  # calls (sorbet-runtime 0.6.13502: lib/types/helpers.rb,
+  # private/mixins/mixins.rb). It is behavior, not an annotation: every
+  # later `include` of the module extends the includer with the given
+  # modules, then runs the module's own `included` hook. The ingest
+  # lowers the call to `SorbetRuntimeCheck.mixes_in_class_methods(self,
+  # mod, ...)`; the list lives where sorbet's `Abstract::Data` keeps it.
+  module MixesInClassMethods
+    def included(other)
+      mods = instance_variable_get(:@opus_abstract__class_methods_mixins)
+      mods.each { |mod| other.extend(mod) }
+      super
+    end
+  end
+
+  def self.mixes_in_class_methods(mixin, mod, *mods)
+    if mixin.is_a?(::Class)
+      raise "Classes cannot be used as mixins, and so mixes_in_class_methods cannot be used on a Class."
+    end
+    class_methods = [mod].concat(mods)
+    if mixin.instance_variable_defined?(:@opus_abstract__class_methods_mixins)
+      class_methods = mixin.instance_variable_get(:@opus_abstract__class_methods_mixins) + class_methods
+    end
+    mixin.singleton_class.include(MixesInClassMethods)
+    mixin.instance_variable_set(:@opus_abstract__class_methods_mixins, class_methods)
+  end
+
   # `T::Utils.coerce`: a type alias is the type it names, and
   # `T::Types::Simple::Private::Pool.type_for_module` names a bare
   # stdlib collection class as its untyped generic.

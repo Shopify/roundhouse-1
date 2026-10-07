@@ -5021,6 +5021,16 @@ impl Analyzer {
                 ctx.class_objects.insert(param.name.clone());
             }
         }
+        // Ruby calls `inherited(subclass)` on a class with the new Class:
+        // `def self.inherited`, or an extension module's `def inherited`
+        // (Core's `GraphApi::GlobalId`, which every GraphApi type extends,
+        // runs `subclass.class_eval { @has_numeric_gid = nil }`).
+        if method.name.as_str() == "inherited"
+            && (ctx.class_side || self.classes.get(class_id).is_some_and(|c| c.is_module))
+            && let Some(param) = method.params.first().filter(|p| !p.keyword && !p.rest)
+        {
+            ctx.class_objects.insert(param.name.clone());
+        }
         if let Some(bp) = &method.block_param {
             ctx.local_bindings.insert(bp.name.clone(), captured_block_ty());
         }

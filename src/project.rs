@@ -3771,10 +3771,15 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// `active_support/...`, ...): this tree's runtime ports answer those, and
 /// requiring the real ones would load Rails over the ports. A semian
 /// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
-pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
+///
+/// The third list names the native features every require of which sits
+/// in a `begin` that rescues LoadError (graphql-shopify 0.20.3's
+/// `begin require "shopify-cloud" rescue LoadError end`): the source runs
+/// on without them, so the load does too.
+pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, Vec<String>) {
     use crate::det::{HashMap, HashSet};
     if app.gem_lock.is_none() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
     // `<root>/<name>-<version>/lib/<name>.rb`: a gem source is the
@@ -3789,15 +3794,12 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
         let tail = format!("/lib/{rb}");
         app.sources.iter().any(|s| s.path.ends_with(&tail) || s.path == format!("lib/{rb}"))
     };
-    let framework_feature = |feature: &str| {
-        feature == "rails"
-            || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
-                .iter()
-                .any(|prefix| feature.starts_with(prefix))
-    };
+    let framework_feature = is_framework_feature;
     let mut native: Vec<String> = Vec::new();
     let mut framework: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::default();
+    let mut optional: HashSet<String> = HashSet::default();
+    let mut required: HashSet<String> = HashSet::default();
     for (entry, lib) in entries {
         let mut stack = vec![entry];
         let mut order: Vec<String> = Vec::new();
@@ -3817,7 +3819,12 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
                 };
                 if by_path.contains_key(target.as_str()) {
                     nested.push(target);
-                } else if kind == "require" && !compiled_feature(&feature) {
+                } else if (kind == "require" || kind == "optional_require") && !compiled_feature(&feature) {
+                    if kind == "require" {
+                        required.insert(feature.clone());
+                    } else {
+                        optional.insert(feature.clone());
+                    }
                     order.push(feature);
                 }
             }
@@ -3832,7 +3839,9 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
             }
         }
     }
-    (native, framework)
+    let optional: Vec<String> =
+        native.iter().filter(|f| optional.contains(f.as_str()) && !required.contains(f.as_str())).cloned().collect();
+    (native, framework, optional)
 }
 
 /// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
@@ -3887,15 +3896,38 @@ fn normalize_rb_path(path: &Path) -> String {
     out
 }
 
-/// `("require" | "require_relative", feature)` for each string-literal
-/// require that runs when `source` loads (see [`gem_source_dependencies`]).
+/// `("require" | "optional_require" | "require_relative", feature)` for
+/// each string-literal require that runs when `source` loads (see
+/// [`gem_source_dependencies`]). An `optional_require` is a `require` in
+/// the body of a `begin` with a rescue clause naming LoadError (or its
+/// ancestors ScriptError and Exception).
 fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
+    fn rescues_load_error(n: &ruby_prism::BeginNode<'_>) -> bool {
+        let mut rescue = n.rescue_clause();
+        while let Some(r) = rescue {
+            let names_it = r.exceptions().iter().any(|e| {
+                e.as_constant_read_node().is_some_and(|c| {
+                    matches!(std::str::from_utf8(c.name().as_slice()), Ok("LoadError" | "ScriptError" | "Exception"))
+                })
+            });
+            if names_it {
+                return true;
+            }
+            rescue = r.subsequent();
+        }
+        false
+    }
     fn walk<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>) {
+        walk_in(nodes, out, false)
+    }
+    fn walk_in<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>, guarded: bool) {
+        let walk = |nodes, out: &mut Vec<(&'static str, String)>| walk_in(nodes, out, guarded);
         for node in nodes {
             if let Some(call) = node.as_call_node() {
                 let name = call.name();
                 let name = std::str::from_utf8(name.as_slice()).unwrap_or("");
                 let kind = match name {
+                    "require" if guarded => "optional_require",
                     "require" => "require",
                     "require_relative" => "require_relative",
                     _ => continue,
@@ -3928,7 +3960,7 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
                     walk(stmts(e.statements()), out);
                 }
             } else if let Some(n) = node.as_begin_node() {
-                walk(stmts(n.statements()), out);
+                walk_in(stmts(n.statements()), out, guarded || rescues_load_error(&n));
                 let mut rescue = n.rescue_clause();
                 while let Some(r) = rescue {
                     walk(stmts(r.statements()), out);
@@ -3996,6 +4028,15 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
     )
 }
 
+/// A Rails feature (`rails`, `active_support/...`, `action_...`): this
+/// tree's runtime ports answer it, so nothing requires it.
+pub(crate) fn is_framework_feature(feature: &str) -> bool {
+    feature == "rails"
+        || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
+            .iter()
+            .any(|prefix| feature.starts_with(prefix))
+}
+
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
 /// guarded: a gem source's dependency is a dependency of the app, and
 /// its absence is a boot failure, as under Bundler.
@@ -4016,7 +4057,7 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
 /// `bundler/gems/rails-<revision>`) is error[gem_requires_rails], raised
 /// at boot.
 fn gem_source_dependency_block(app: &App) -> String {
-    let (all_native, framework) = gem_source_dependencies(app);
+    let (all_native, framework, optional) = gem_source_dependencies(app);
     let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
     let owned_by_path_gem = |feature: &str| {
         in_repo.iter().any(|name| {
@@ -4050,7 +4091,13 @@ fn gem_source_dependency_block(app: &App) -> String {
     if native.is_empty() {
         return out;
     }
-    let names: Vec<String> = native.iter().map(|f| format!("{f:?}")).collect();
+    // With a feature the source rescues LoadError around, each entry
+    // carries whether it is one (`[feature, optional]`).
+    let names: Vec<String> = if optional.is_empty() {
+        native.iter().map(|f| format!("{f:?}")).collect()
+    } else {
+        native.iter().map(|f| format!("[{f:?}, {}]", optional.contains(f))).collect()
+    };
     let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
     out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
     out.push_str(
@@ -4067,7 +4114,9 @@ fn gem_source_dependency_block(app: &App) -> String {
          nil\n\
          end\n",
     );
-    out.push_str(&format!("[{}].each do |feature|\n", names.join(", ")));
+    // `optional`: the source rescues LoadError around the require.
+    let params = if optional.is_empty() { "feature" } else { "feature, optional" };
+    out.push_str(&format!("[{}].each do |{params}|\n", names.join(", ")));
     out.push_str(
         "  spec = Gem::Specification.find_by_path(feature)\n  \
          if spec && __rh_compiled_gems.include?(spec.name)\n    \
@@ -4078,9 +4127,15 @@ fn gem_source_dependency_block(app: &App) -> String {
          warn \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
          next\n  \
          end\n  \
-         loaded = $LOADED_FEATURES.size\n  \
-         require feature\n  \
-         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
+         loaded = $LOADED_FEATURES.size\n",
+    );
+    out.push_str(if optional.is_empty() {
+        "  require feature\n"
+    } else {
+        "  begin\n    require feature\n  rescue LoadError\n    raise unless optional\n  end\n"
+    });
+    out.push_str(
+        "  rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
          end\n",
     );
@@ -5568,6 +5623,43 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         body.push_str("    ].freeze,\n");
     }
     body.push_str("  }.freeze\n");
+    // Each loader's `eager_load_dir` directories: per source file under
+    // it, its file program when it has one (which loads its declarations
+    // and runs the rest of the file), else its declarations.
+    body.push_str("  # Zeitwerk loader constant => directory (relative to its root) => the files `eager_load_dir` loads\n  EAGER_DIRS = {\n");
+    for loader in app.zeitwerk_loaders.iter().filter(|l| !l.eager_dirs.is_empty()) {
+        write!(body, "    {:?} => {{\n", loader.constant).unwrap();
+        for dir in &loader.eager_dirs {
+            let mut anchors: Vec<String> = Vec::new();
+            for source in &dir.sources {
+                let program = app
+                    .file_programs
+                    .iter()
+                    .find(|p| p.source == *source)
+                    .map(|p| crate::emit::ruby::file_program_anchor(app, p))
+                    .filter(|anchor| files.iter().any(|(path, _)| *path == format!("app/{anchor}.rb")));
+                match program {
+                    Some(anchor) => anchors.push(anchor),
+                    None => anchors.extend(
+                        app.library_class_files
+                            .iter()
+                            .filter(|(file, _)| file == source)
+                            .flat_map(|(_, names)| names.iter().map(|c| anchor_of(c)))
+                            .filter(|a| models.iter().any(|(m, _)| m == a)),
+                    ),
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            anchors.retain(|a| seen.insert(a.clone()));
+            write!(body, "      {:?} => [\n", dir.dir).unwrap();
+            for anchor in &anchors {
+                write!(body, "        {anchor:?},\n").unwrap();
+            }
+            body.push_str("      ].freeze,\n");
+        }
+        body.push_str("    }.freeze,\n");
+    }
+    body.push_str("  }.freeze\n");
     body.push_str(AUTOLOAD_RUNTIME);
 
     // The environment's `config.eager_load`, as the app wrote it. Rails'
@@ -5764,6 +5856,22 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
     def eager_load(force: false)
       @files.each { |file| require RoundhouseAutoload.path(file) }
+      nil
+    end
+
+    # `eager_load_dir`, compiled: `namespace` is the directory's, which
+    # Zeitwerk walks from the root namespace. An undefined segment (an
+    # autoload counts as defined) makes it a no-op; else the directory's
+    # files load, each referenced into loading as Zeitwerk does.
+    def eager_load_dir(namespace, dir, own = nil)
+      path = []
+      namespace.split("::").inject(Object) do |mod, cname|
+        path << cname
+        return nil unless mod.const_defined?(cname, false)
+        return nil if own == path.join("::") && mod.autoload?(cname, false)
+        mod.const_get(cname, false)
+      end
+      EAGER_DIRS.fetch(@name, {}).fetch(dir, []).each { |file| require RoundhouseAutoload.path(file) }
       nil
     end
   end
@@ -6636,6 +6744,14 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 target,
                 crate::ingest::sorbet_check::CONSTRUCT,
                 format!("sorbet-runtime's class check of `T.let`, `T.cast`, `T.bind` and `T.assert_type!` runs on the CRuby and JRuby trees, not {target}"),
+            );
+        }
+        if !matches!(target, "ruby" | "jruby") && crate::ingest::sorbet_check::is_mixes_in(expr) {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "mixes_in_class_methods",
+                format!("sorbet-runtime's `mixes_in_class_methods` runs on the CRuby and JRuby trees, not {target}"),
             );
         }
         if target == "ruby" {

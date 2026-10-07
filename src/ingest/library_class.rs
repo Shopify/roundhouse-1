@@ -385,6 +385,15 @@ fn program_items(
         if stmt.as_constant_write_node().is_some() && !in_branch && !*guarded {
             continue;
         }
+        // A Zeitwerk loader the file holds (`LOADER =` above, or a
+        // local): its calls are applied statically or kept on the
+        // compiled handle (`ingest::zeitwerk`).
+        if !in_branch && !*guarded {
+            if let Some(item) = super::zeitwerk::file_loader_statement(stmt, file) {
+                out.extend(item);
+                continue;
+            }
+        }
         if let Some(call) = stmt.as_call_node() {
             let name = constant_id_str(&call.name());
             if call.receiver().is_none() && matches!(name, "require" | "require_relative") {
@@ -840,11 +849,13 @@ fn file_level_constants(
             }
             continue;
         }
-        out.push((
-            Symbol::from(constant_id_str(&cw.name())),
-            ingest_expr(&cw.value(), file)?,
-            after_declarations,
-        ));
+        // `LOADER = Zeitwerk::Loader.for_gem_extension(GraphQL)`: the
+        // compiled handle (`ingest::zeitwerk`).
+        let value = match super::zeitwerk::loader_constant(&cw, &ClassId(Symbol::from("")), file) {
+            Some(handle) => handle,
+            None => ingest_expr(&cw.value(), file)?,
+        };
+        out.push((Symbol::from(constant_id_str(&cw.name())), value, after_declarations));
     }
     Ok(out)
 }
@@ -2341,6 +2352,12 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
+///
+/// `requires_ancestor { X }` (`T::Helpers`) is an annotation at runtime
+/// too: sorbet-runtime 0.6.13502 defines it with an empty body (helpers.rb,
+/// "TODO: implement the checks"), so the block never runs. Its sibling
+/// `mixes_in_class_methods` is behavior and is lowered instead
+/// (`sorbet_check::mixes_in_class_methods`).
 pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
@@ -2348,6 +2365,7 @@ pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "final!",
     "sealed!",
     "type_parameters",
+    "requires_ancestor",
 ];
 
 const POSITION_SENSITIVE_MARKERS: &[&str] = &[
@@ -3059,6 +3077,26 @@ fn walk_decl_body_with_visibility<'pr>(
                 }
                 match kw {
                     "include" => {
+                        // `class << self; include M; end` is `extend M`:
+                        // M's methods are the class's own, not its
+                        // instances'. Kept as that `extend` (an unknown
+                        // call, replayed where the body replays and
+                        // reported where it is not), never as an
+                        // instance include. The route-helper marker
+                        // below is the one singleton include modeled.
+                        if force_class_receiver
+                            && call.arguments().is_some_and(|args| {
+                                args.arguments().iter().all(|arg| constant_path_of(&arg).is_some())
+                            })
+                        {
+                            if let Ok(mut e) = ingest_expr(&stmt, file) {
+                                if let ExprNode::Send { method, .. } = &mut *e.node {
+                                    *method = Symbol::from("extend");
+                                }
+                                out.unknown_calls.push(e);
+                            }
+                            continue;
+                        }
                         if let Some(args) = call.arguments() {
                             // `include Resolvers.for(:product)`: a module
                             // computed at load time. Dropping it emitted
@@ -3257,7 +3295,11 @@ fn walk_decl_body_with_visibility<'pr>(
                         // side reports the gap. That keeps a single
                         // exotic call in one library class from taking
                         // the app's ingest down.
-                        if !POSITION_SENSITIVE_MARKERS.contains(&kw)
+                        if !force_class_receiver
+                            && let Some(e) = super::sorbet_check::mixes_in_class_methods(&stmt, file)
+                        {
+                            out.unknown_calls.push(e);
+                        } else if !POSITION_SENSITIVE_MARKERS.contains(&kw)
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
