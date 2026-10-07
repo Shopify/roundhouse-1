@@ -628,7 +628,7 @@ end
 # name is half the URI. A fuller GlobalID — `Locator.locate`, which the
 # subscribe side needs to turn a name back into a record — would earn its
 # own file; minting alone does not.
-module GlobalID
+class GlobalID
   # `record.to_gid_param`, spelled from parts the caller already knows.
   # globalid 1.3.0:
   #

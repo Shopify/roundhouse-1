@@ -89,6 +89,9 @@ require_relative "runtime/rails_application_routes"
 require_relative "runtime/active_support_duration"
 require_relative "runtime/active_support_time_parsing"
 require_relative "runtime/active_support_core_ext"
+# globalid 1.4.0's GlobalID value, GlobalID::Identification and URI::GID,
+# reopening the mint above (CRuby overlay only; see the file).
+require_relative "runtime/global_id"
 # type_toolkit's `not_nil!` (Kernel / NilClass reopen, CRuby overlay only).
 require_relative "runtime/type_toolkit"
 # sorbet-runtime's T.let / T.cast / T.bind / T.assert_type! check, which
