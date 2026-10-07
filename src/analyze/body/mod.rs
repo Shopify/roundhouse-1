@@ -411,6 +411,38 @@ impl<'a> BodyTyper<'a> {
         info.constants.contains_key(name).then(|| info.gem.clone().map(|gem| (gem, info.gem_loaded))).flatten()
     }
 
+    /// The gem owning the nearest enclosing namespace of `name` that the
+    /// registry knows, when that namespace is a gem's (its RBI declares
+    /// it, and neither the app nor the framework catalog does).
+    fn namespace_gem(&self, name: &str) -> Option<String> {
+        let mut scope = name;
+        while let Some((outer, _)) = scope.rsplit_once("::") {
+            scope = outer;
+            if let Some(info) = self.classes().get(&ClassId(Symbol::from(scope))) {
+                if info.app_declared {
+                    return None;
+                }
+                return info.gem.clone();
+            }
+        }
+        None
+    }
+
+    /// The gem that provides the unindexed constant `name` at runtime on
+    /// the CRuby tree: the gem owning its nearest known namespace, when
+    /// the tree loads that gem natively.
+    fn runtime_constant_owner(&self, name: &str) -> Option<String> {
+        let gem = self.namespace_gem(name)?;
+        let mut scope = name;
+        while let Some((outer, _)) = scope.rsplit_once("::") {
+            scope = outer;
+            if let Some(info) = self.classes().get(&ClassId(Symbol::from(scope))) {
+                return info.gem_loaded.then_some(gem);
+            }
+        }
+        None
+    }
+
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
         Self {
             classes,
@@ -2565,11 +2597,41 @@ impl<'a> BodyTyper<'a> {
                     });
                 }
                 let missing = missing.into_inner();
-                if !missing.is_empty() {
+                if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 {
+                    // Decided by the registry that saw the gems' namespaces
+                    // (the analyzer's); a lowerer's reduced registry does
+                    // not re-decide it.
+                } else if !missing.is_empty() {
+                    // Ruby never evaluates the annotation. Where each name
+                    // sits in a namespace a gem the CRuby tree loads owns,
+                    // that tree runs the authored value, typed as the
+                    // opaque declared class; anything else stays refused.
+                    let owners: Vec<Option<String>> =
+                        missing.iter().map(|name| self.runtime_constant_owner(name)).collect();
+                    let detail = if owners.iter().all(Option::is_some) {
+                        expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
+                        let gems: Vec<String> = owners.into_iter().flatten().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                        format!(
+                            "{} has no indexed declaration; the {} gem{} the CRuby tree loads provide{} it at runtime, so the value runs and is typed as opaque",
+                            missing.join(", "),
+                            gems.join(", "),
+                            if gems.len() == 1 { "" } else { "s" },
+                            if gems.len() == 1 { "s" } else { "" },
+                        )
+                    } else if let Some((name, gem, reason)) = missing.iter().find_map(|name| {
+                        let gem = self.namespace_gem(name)?;
+                        crate::project::gem_requires_rails(&gem).map(|reason| (name.clone(), gem, reason))
+                    }) {
+                        format!(
+                            "{name} is in a namespace of the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree has it"
+                        )
+                    } else {
+                        format!("{} has no indexed declaration or modeled dependency", missing.join(", "))
+                    };
                     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
                         construct: Symbol::from("declared type"),
-                        detail: format!("{} has no indexed declaration or modeled dependency", missing.join(", ")),
+                        detail,
                     });
                 } else {
                     if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {

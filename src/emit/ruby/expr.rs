@@ -98,7 +98,14 @@ pub fn emit_expr(e: &Expr) -> String {
     // rather than compiling a construct no target can run. Only the
     // `Unsupported` kind: an `IncompatibleBinop` the analyzer stamps is
     // left to Ruby itself, which raises at the same site on its own.
-    if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e.diagnostic {
+    // A declared type a natively loaded gem provides at runtime
+    // (`DECLARED_TYPE_RUNTIME_CONSTANT`): Ruby never evaluates the
+    // annotation, so the authored value runs; `check` keeps the
+    // declaration's diagnostic, and `project` refuses it on every tree
+    // but CRuby's.
+    let runtime_declared_type = e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
+        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "declared type");
+    if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e.diagnostic.as_ref().filter(|_| !runtime_declared_type) {
         // This is an expression, including in a rescue list or a binary
         // operand. A bare command-style `raise` is not valid there.
         let stub = crate::emit::diagnostics::StubStyle::Raise

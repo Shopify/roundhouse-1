@@ -83,6 +83,14 @@ pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 /// not every class the app's declaration may name.
 pub const DECLARED_TYPE_INDEXED: u64 = 1 << 14;
 
+/// A [`SOURCE_TYPE_ASCRIPTION`] cast whose declared type names a constant
+/// no registry indexes, inside a namespace a gem the CRuby tree loads
+/// owns (`OpenTelemetry::Trace::Tracer`, opentelemetry-api). Ruby never
+/// evaluates an annotation, so the CRuby tree emits the authored value;
+/// the declaration stays a `declared type` diagnostic (the value is an
+/// opaque nominal type), and every other target refuses it at emit.
+pub const DECLARED_TYPE_RUNTIME_CONSTANT: u64 = 1 << 17;
+
 /// A call argument the SOURCE passed by keyword, which a lowering (or the
 /// analyzer's trailing-kwargs normalization) made positional because the
 /// callee's keyword was flattened to a positional-with-default
@@ -1584,7 +1592,7 @@ mod tests {
             RESOLVED_CLASS_REF, RESOLVED_DATA_FACTORY, GENERATED_CONST_REF, CLASS_OBJECT_VALUE,
             RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
-            DECLARED_TYPE_INDEXED,
+            DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL,
         ];
         let mut seen = 0u64;

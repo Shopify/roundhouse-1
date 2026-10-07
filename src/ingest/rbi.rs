@@ -63,6 +63,9 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 /// enters the analysis at all. A gem an emitted tree loads natively
 /// (`crate::project::ruby_tree_loads_gem`) is read whatever its fate:
 /// the analyzer has no model of it, and its constants run as the gem's.
+/// So is one this app's lock routes to Bundler.require
+/// (`GemBoundary::loaded`): opentelemetry-api is "infrastructure" by
+/// family, yet Core's code reads `OpenTelemetry::Trace::Tracer`.
 /// So is a Rails-dependent one (`crate::project::gem_requires_rails`),
 /// so its constants are refused by that name.
 pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) -> GemBoundary {
@@ -80,6 +83,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
         let Some((name, version)) = stem.split_once('@') else { continue };
         let read = matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled)
             || crate::project::ruby_tree_loads_gem(name)
+            || boundary.loaded.contains(name)
             || crate::project::gem_requires_rails(name).is_some();
         if lock.is_in_repo(name) || !read {
             continue;

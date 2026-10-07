@@ -5668,6 +5668,18 @@ fn report_unsupported_block_captures(app: &App, target: BuildTarget) {
 /// runs on the CRuby tree only where the tree carries the port file.
 fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(String, String)]) {
     fn visit(app: &App, target: BuildTarget, files: &[(String, String)], expr: &crate::expr::Expr) {
+        // A declared type only such a gem provides at runtime
+        // (`DECLARED_TYPE_RUNTIME_CONSTANT`), refused the same way.
+        if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 && target != BuildTarget::Ruby {
+            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, .. }) = &expr.diagnostic {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target.as_str(),
+                    "declared type",
+                    format!("{detail}; the {} tree does not load the gem", target.as_str()),
+                );
+            }
+        }
         if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
             if let crate::expr::ExprNode::Const { path } = &*expr.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
