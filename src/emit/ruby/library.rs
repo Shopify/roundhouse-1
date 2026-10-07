@@ -6625,9 +6625,23 @@ fn emit_library_class_decl_inner(
     // Most of them sit in blocks Rails runs later (`initializer`,
     // `config.to_prepare`); a require at the top of the file loaded
     // their files when the engine loaded.
+    //
+    // Only the calls the body replays (`replays_foreign_class_body`,
+    // `app_extension_calls`): a dropped one is not emitted, so what it
+    // names is no load-time need, and a require for it can close a
+    // cycle the source does not have. A closure a replayed call only
+    // stores (`scope :x, -> { Plan.active }`, `if: -> { ... }`) runs
+    // later, so what its body names resolves like a method body's.
     let railtie = carried_railtie(lc, app);
-    for call in lc.unknown_calls.iter().filter(|_| !railtie) {
-        body_requires.extend(resolve_all(call, true));
+    let replays_all = replays_foreign_class_body(lc, app);
+    let own_calls = if railtie || replays_all { Vec::new() } else { app_extension_calls(lc, app) };
+    let replayed = |call: &&Expr| replays_all || own_calls.iter().any(|c| std::ptr::eq(*c, *call));
+    for call in lc.unknown_calls.iter().filter(|_| !railtie).filter(replayed) {
+        let mut now: BTreeSet<Vec<String>> = BTreeSet::new();
+        let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
+        walk_class_body_call_paths(call, &mut now, &mut later);
+        body_requires.extend(now.iter().filter_map(|p| resolve(p, true)));
+        body_requires.extend(later.iter().filter(|p| !now.contains(*p)).filter_map(|p| resolve(p, false)));
     }
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
@@ -9143,6 +9157,41 @@ fn relpath(from_dir: &Path, to_anchor: &str) -> String {
     let mut parts: Vec<&str> = std::iter::repeat("..").take(ups).collect();
     parts.extend(&to_parts[common..]);
     parts.join("/")
+}
+
+/// A class-body call's constant references, split into the ones its
+/// load reads (`now`) and the ones inside a closure literal it only
+/// passes along (`later`): `scope :x, -> { Plan.active }` stores the
+/// lambda, so `Plan` is read when the scope runs, not when the body
+/// does. A block (`included do ... end`) may run at once, so it counts
+/// as `now`, as does everything that is not an argument.
+fn walk_class_body_call_paths(e: &Expr, now: &mut BTreeSet<Vec<String>>, later: &mut BTreeSet<Vec<String>>) {
+    match &*e.node {
+        ExprNode::Lambda { .. } => walk_const_paths(e, later),
+        ExprNode::Send { recv, args, block, .. } => {
+            if let Some(r) = recv {
+                walk_const_paths(r, now);
+            }
+            for a in args {
+                walk_class_body_call_paths(a, now, later);
+            }
+            if let Some(b) = block {
+                walk_const_paths(b, now);
+            }
+        }
+        ExprNode::Hash { entries, .. } => {
+            for (k, v) in entries {
+                walk_const_paths(k, now);
+                walk_class_body_call_paths(v, now, later);
+            }
+        }
+        ExprNode::Array { elements, .. } => {
+            for el in elements {
+                walk_class_body_call_paths(el, now, later);
+            }
+        }
+        _ => walk_const_paths(e, now),
+    }
 }
 
 pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
