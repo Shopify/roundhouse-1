@@ -59,77 +59,6 @@ pub fn ingest_library_classes(
     library_classes(source, file, false)
 }
 
-/// What a support file defines at load time and the library-class
-/// ingest does not carry as Ruby would run it, as `(start, end,
-/// message)` at the statement: a `class`/`module` inside a file-level
-/// conditional (`if BootLib::RAILS_ENV == "test"` around Core's test-env
-/// `StrictWarning`), which Ruby defines only when the condition holds and
-/// the walk does not reach; and the definitions after a file-level
-/// `return` (`return unless ENV["EXFILTRATE_TYPES"]`), which Ruby skips
-/// when the guard returns and the ingest carries unconditionally.
-pub(super) fn file_level_definition_gaps(source: &[u8], file: &str) -> Vec<(usize, usize, String)> {
-    use ruby_prism::Visit;
-    /// The declarations a statement holds, outside method bodies.
-    #[derive(Default)]
-    struct Declared(Vec<String>);
-    impl<'pr> Visit<'pr> for Declared {
-        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            self.0.push(format!("class {}", class_name_path(node).map(|p| p.join("::")).unwrap_or_default()));
-        }
-        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            self.0.push(format!("module {}", module_name_path(node).map(|p| p.join("::")).unwrap_or_default()));
-        }
-        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
-    }
-    fn listed(names: &[String]) -> String {
-        let mut names: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
-        names.dedup();
-        names.join(", ")
-    }
-    let result = super::prism::parse(source, file);
-    let root = result.node();
-    let Some(program) = root.as_program_node() else { return Vec::new() };
-    let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
-    let returns = |stmt: &ruby_prism::Node<'_>| {
-        stmt.as_return_node().is_some()
-            || stmt.as_if_node().and_then(|n| n.statements()).is_some_and(|s| s.body().iter().any(|b| b.as_return_node().is_some()))
-            || stmt.as_unless_node().and_then(|n| n.statements()).is_some_and(|s| s.body().iter().any(|b| b.as_return_node().is_some()))
-    };
-    let mut out = Vec::new();
-    for (i, stmt) in statements.iter().enumerate() {
-        let loc = stmt.location();
-        if returns(stmt) {
-            let mut after = Declared::default();
-            for later in &statements[i + 1..] {
-                if later.as_class_node().is_some() || later.as_module_node().is_some() {
-                    after.visit(later);
-                } else if let Some(cw) = later.as_constant_write_node() {
-                    after.0.push(constant_id_str(&cw.name()).to_string());
-                }
-            }
-            if !after.0.is_empty() {
-                out.push((loc.start_offset(), loc.end_offset(), format!(
-                    "this file-level `return` skips the rest of the file when it returns, and Roundhouse carries the definitions after it unconditionally ({}): the emitted app defines them where Ruby may not",
-                    listed(&after.0)
-                )));
-            }
-            // Later statements are behind this guard; one report per file.
-            break;
-        }
-        if stmt.as_if_node().is_some() || stmt.as_unless_node().is_some() || stmt.as_case_node().is_some() {
-            let mut inside = Declared::default();
-            inside.visit(stmt);
-            if !inside.0.is_empty() {
-                out.push((loc.start_offset(), loc.end_offset(), format!(
-                    "{} defined inside a file-level conditional, which Ruby evaluates when the file loads; Roundhouse does not carry a conditional definition or the statements beside it, so the emitted app does not define it",
-                    listed(&inside.0)
-                )));
-            }
-        }
-    }
-    out
-}
-
 /// [`ingest_library_classes`] for an app file Rails' autoloader loads
 /// (`app/models`, the autoloaded support dirs): a file that declares
 /// no class or module but writes file-level constants still defines
@@ -152,29 +81,11 @@ fn library_classes(
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
-    let mut out = Vec::new();
-    for (scope, class) in find_all_classes_with_scope(&root) {
-        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)
-            .map_err(|err| super::error_site::at(err, &class.as_node()))?;
-        // BEFORE the class it serves: a superclass has to be defined
-        // when the `class X < Y` line runs, and these two share a file.
-        if let Some(base) = struct_base {
-            out.push(base);
-        }
-        out.push(lc);
-    }
-    for (scope, module) in find_all_modules_with_scope(&root) {
-        // A nested `ClassMethods` is a module of its own, as in Ruby:
-        // `Owner.const_defined?(:ClassMethods)`, `k.is_a?(ClassMethods)`
-        // and `base.extend(ClassMethods)` all read it. Its defs are its
-        // INSTANCE methods; they reach an includer only through an
-        // `extend` (the authored `included` hook, or Concern's
-        // `append_features`), never the owner's own singleton.
-        out.push(
-            library_class_from_module_node_with_scope(&module, &scope, file)
-                .map_err(|err| super::error_site::at(err, &module.as_node()))?,
-        );
-    }
+    // What follows a file-level `return` is the file program's
+    // (`file_program`), which Ruby runs only when the guard does not
+    // return.
+    let guard = file_guard_offset(&root).unwrap_or(usize::MAX);
+    let mut out = declared_classes(&root, file, guard)?;
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
     // parser's `rule(:stopword)` reads it. Ruby binds these on Object, so
@@ -250,6 +161,497 @@ fn library_classes(
         }
     }
     Ok(top_level)
+}
+
+/// The classes and modules declared under `node` (a file's program, or
+/// one top-level declaration) before byte offset `before`, as library
+/// classes: classes, then modules, a `Class.new` constant right after
+/// its owner (the file-level walk adds the rest).
+fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> IngestResult<Vec<LibraryClass>> {
+    let mut out = Vec::new();
+    for (scope, class) in find_all_classes_with_scope(node) {
+        if class.location().start_offset() >= before {
+            continue;
+        }
+        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)
+            .map_err(|err| super::error_site::at(err, &class.as_node()))?;
+        // BEFORE the class it serves: a superclass has to be defined
+        // when the `class X < Y` line runs, and these two share a file.
+        if let Some(base) = struct_base {
+            out.push(base);
+        }
+        out.push(lc);
+    }
+    for (scope, module) in find_all_modules_with_scope(node) {
+        if module.location().start_offset() >= before {
+            continue;
+        }
+        // A nested `ClassMethods` is a module of its own, as in Ruby:
+        // `Owner.const_defined?(:ClassMethods)`, `k.is_a?(ClassMethods)`
+        // and `base.extend(ClassMethods)` all read it. Its defs are its
+        // INSTANCE methods; they reach an includer only through an
+        // `extend` (the authored `included` hook, or Concern's
+        // `append_features`), never the owner's own singleton.
+        out.push(
+            library_class_from_module_node_with_scope(&module, &scope, file)
+                .map_err(|err| super::error_site::at(err, &module.as_node()))?,
+        );
+    }
+    Ok(out)
+}
+
+/// A top-level statement that can end the file's load: one holding a
+/// `return` outside a `def` or lambda. A `return` in a block or proc
+/// the file's top level runs ends the load too (ruby 4.0).
+fn is_file_guard(stmt: &ruby_prism::Node<'_>) -> bool {
+    use ruby_prism::Visit;
+    #[derive(Default)]
+    struct Finds(bool);
+    impl<'pr> Visit<'pr> for Finds {
+        fn visit_return_node(&mut self, _: &ruby_prism::ReturnNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+    }
+    let mut finds = Finds::default();
+    finds.visit(stmt);
+    finds.0
+}
+
+/// The byte offset of a file's first top-level guard ([`is_file_guard`]).
+fn file_guard_offset(root: &ruby_prism::Node<'_>) -> Option<usize> {
+    let program = root.as_program_node()?;
+    let stmts = program.statements();
+    let found = stmts.body().iter().find(|stmt| is_file_guard(stmt)).map(|stmt| stmt.location().start_offset());
+    found
+}
+
+/// A support file's file-level program: what Ruby runs when it loads the
+/// file beyond the declarations the library-class walk carries.
+/// `None` when the file holds only declarations and file-level
+/// constants before any guard (one that also requires has a program:
+/// shopify-money's money_column.rb). `classes` are the walk's classes
+/// for the file, which a top-level declaration loads by name.
+///
+/// In source order: each top-level declaration (loaded where it
+/// stands), statement, `require`, a file-level `if`/`unless` holding
+/// declarations (its branches as items, each declaration carried inline
+/// so it is defined only where Ruby defines it: Core's test-env
+/// `StrictWarning`), and a file-level `return` guard, after which every
+/// declaration is carried inline behind it
+/// (`return unless ENV["EXFILTRATE_TYPES"]`). Not carried, and named:
+/// a file-level `case` holding declarations, and a statement the
+/// expression ingest refuses. `ActiveSupport.on_load` is
+/// `on_load_reopen`'s and `autoload` the autoloader's.
+pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) -> Option<crate::app::FileProgram> {
+    use crate::app::ProgramItem;
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let statements: Vec<ruby_prism::Node<'_>> = program.statements().body().iter().collect();
+    let carried: HashSet<&str> = classes.iter().map(|c| c.name.0.as_str()).collect();
+    let mut items = Vec::new();
+    let mut guarded = false;
+    program_items(source, &statements, file, &carried, false, &mut guarded, &mut items);
+    let runs = |item: &ProgramItem| !matches!(item, ProgramItem::Declared(_) | ProgramItem::Require { .. });
+    let requires = |item: &ProgramItem| matches!(item, ProgramItem::Require { .. });
+    (items.iter().any(runs) || items.iter().any(requires))
+        .then(|| crate::app::FileProgram { source: file.to_string(), items })
+}
+
+fn program_items(
+    source: &[u8],
+    statements: &[ruby_prism::Node<'_>],
+    file: &str,
+    carried: &HashSet<&str>,
+    in_branch: bool,
+    guarded: &mut bool,
+    out: &mut Vec<crate::app::ProgramItem>,
+) {
+    use crate::app::ProgramItem;
+    let span_of = |node: &ruby_prism::Node<'_>| {
+        let loc = node.location();
+        Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 }
+    };
+    let not_carried = |node: &ruby_prism::Node<'_>, message: String| ProgramItem::NotCarried {
+        span: span_of(node),
+        construct: statement_construct(source, node),
+        message,
+    };
+    // The expression ingest reads a `def` in a block as nil, so a
+    // statement defining a method other than by `class_eval` is named.
+    let statement = |node: &ruby_prism::Node<'_>| {
+        if defines_method(node) {
+            return not_carried(
+                node,
+                "a method this file-level statement defines (in a block) is not carried; Ruby defines it when the file loads".to_string(),
+            );
+        }
+        match ingest_expr(node, file) {
+            Ok(expr) => ProgramItem::Statement(expr),
+            Err(err) => not_carried(node, format!("the ingest cannot carry this file-level statement: {err}")),
+        }
+    };
+    for stmt in statements {
+        let declaration = stmt.as_class_node().is_some() || stmt.as_module_node().is_some();
+        if declaration && (in_branch || *guarded) {
+            match declared_classes(stmt, file, usize::MAX) {
+                Ok(classes) => {
+                    let mut all: Vec<LibraryClass> = Vec::new();
+                    for mut class in classes {
+                        let nested = take_class_new_declarations(&mut class);
+                        all.push(class);
+                        all.extend(nested);
+                    }
+                    // An enclosing namespace before what it nests.
+                    all.sort_by_key(|c| c.name.0.as_str().matches("::").count());
+                    out.push(ProgramItem::Inline(all));
+                }
+                Err(err) => out.push(not_carried(stmt, format!("the ingest cannot carry this conditional definition: {err}"))),
+            }
+            continue;
+        }
+        if declaration {
+            let mut names: Vec<ClassId> = Vec::new();
+            let classes = find_all_classes_with_scope(stmt).into_iter().filter_map(|(scope, c)| {
+                class_name_path(&c).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+            });
+            let modules = find_all_module_declarations_with_scope(stmt).into_iter().filter_map(|(scope, m)| {
+                module_name_path(&m).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+            });
+            let mut found: Vec<String> = classes.chain(modules).collect();
+            found.sort_by_key(|n| n.matches("::").count());
+            for name in found {
+                if carried.contains(name.as_str()) && !names.iter().any(|n| n.0.as_str() == name) {
+                    names.push(ClassId(Symbol::from(name)));
+                }
+            }
+            if !names.is_empty() {
+                out.push(ProgramItem::Declared(names));
+            }
+            continue;
+        }
+        // A constant before any guard rides on the file's first class
+        // (`carry_file_constants`); after one, or in a branch, it is a
+        // statement.
+        if stmt.as_constant_write_node().is_some() && !in_branch && !*guarded {
+            continue;
+        }
+        if let Some(call) = stmt.as_call_node() {
+            let name = constant_id_str(&call.name());
+            if call.receiver().is_none() && matches!(name, "require" | "require_relative") {
+                let arg = call.arguments().and_then(|a| {
+                    let args: Vec<_> = a.arguments().iter().collect();
+                    match args.as_slice() {
+                        [one] => one.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()),
+                        _ => None,
+                    }
+                });
+                match arg {
+                    Some(feature) => out.push(ProgramItem::Require {
+                        span: span_of(stmt),
+                        feature,
+                        relative: name == "require_relative",
+                    }),
+                    None => out.push(statement(stmt)),
+                }
+                continue;
+            }
+            if call.receiver().is_none() && matches!(name, "autoload" | "load") {
+                continue;
+            }
+            if let Some(item) = class_eval_item(source, &call, file) {
+                out.push(match item {
+                    Ok(item) => item,
+                    Err(message) => not_carried(stmt, message),
+                });
+                continue;
+            }
+            let on_load = name == "on_load"
+                && call.receiver().is_some_and(|r| {
+                    r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "ActiveSupport")
+                });
+            if on_load {
+                continue;
+            }
+        }
+        // `$VERBOSE = true`: the expression ingest reads a global and
+        // writes none, so a file-level write is carried here.
+        if let Some(write) = stmt.as_global_variable_write_node() {
+            match ingest_expr(&write.value(), file) {
+                Ok(value) => out.push(ProgramItem::Statement(Expr::new(
+                    span_of(stmt),
+                    ExprNode::Assign {
+                        target: crate::expr::LValue::Var {
+                            id: crate::ident::VarId(0),
+                            name: Symbol::from(constant_id_str(&write.name())),
+                        },
+                        value,
+                    },
+                ))),
+                Err(err) => out.push(not_carried(stmt, format!("the ingest cannot carry this global variable's value: {err}"))),
+            }
+            continue;
+        }
+        if !in_branch && is_file_guard(stmt) {
+            *guarded = true;
+            match ingest_expr(stmt, file) {
+                Ok(expr) => out.push(ProgramItem::Guard(expr)),
+                Err(err) => out.push(not_carried(stmt, format!("the ingest cannot carry this file-level guard: {err}"))),
+            }
+            continue;
+        }
+        let holds_declarations = {
+            use ruby_prism::Visit;
+            #[derive(Default)]
+            struct Finds(bool);
+            impl<'pr> Visit<'pr> for Finds {
+                fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {
+                    self.0 = true;
+                }
+                fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {
+                    self.0 = true;
+                }
+                fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+                fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+            }
+            let mut finds = Finds::default();
+            finds.visit(stmt);
+            finds.0
+        };
+        if holds_declarations {
+            if let Some(branch) = program_branch(source, stmt, file, carried, guarded) {
+                out.push(branch);
+            } else {
+                out.push(not_carried(
+                    stmt,
+                    "a declaration inside this file-level statement (a `case`, `begin` or block) is not carried; Ruby defines it when the file loads".to_string(),
+                ));
+            }
+            continue;
+        }
+        out.push(statement(stmt));
+    }
+}
+
+/// A file-level statement's groupable name, as diagnostics show it: a
+/// call's receiver path and method (`Money::Converters.register`,
+/// `<expr>.register` for a receiver that is not a constant path), and
+/// otherwise the statement's first word (`if`, `case`, `begin`, `$X`).
+fn statement_construct(source: &[u8], node: &ruby_prism::Node<'_>) -> String {
+    if let Some(call) = node.as_call_node() {
+        let method = constant_id_str(&call.name()).to_string();
+        let receiver = call.receiver();
+        return match (receiver.as_ref().and_then(constant_path_of), receiver.is_some()) {
+            (Some(path), _) => format!("{}.{method}", path.join("::")),
+            (None, true) => format!("<expr>.{method}"),
+            (None, false) => method,
+        };
+    }
+    let loc = node.location();
+    let text = String::from_utf8_lossy(&source[loc.start_offset()..loc.end_offset()]);
+    text.split_whitespace().next().unwrap_or_default().chars().take(40).collect()
+}
+
+/// Whether `node` holds a `def`.
+fn defines_method(node: &ruby_prism::Node<'_>) -> bool {
+    use ruby_prism::Visit;
+    #[derive(Default)]
+    struct Finds(bool);
+    impl<'pr> Visit<'pr> for Finds {
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut finds = Finds::default();
+    finds.visit(node);
+    finds.0
+}
+
+/// The name the body of a file-level `Const.class_eval do … end` is
+/// ingested under (`class_eval_item`); the emit writes the body back
+/// into the block.
+pub const CLASS_EVAL_BODY: &str = "RhCe";
+
+/// A file-level `Const.class_eval do … end` (`module_eval`, and the
+/// `_exec` forms without arguments or block parameters): the block body
+/// is a body of `Const` (a `def` defines `Const`'s method, a `def self.x`
+/// its singleton's) in the file's lexical scope (a constant it writes is
+/// the file's). Shopify-money's deprecations.rb is one: `Money.class_eval
+/// do def self.deprecate … end`. The body is ingested as a module body:
+/// the source with everything but the body blanked (offsets and lines
+/// kept) inside `module RhCe; … end`. `None` for any other call; an
+/// error for a body this cannot carry.
+fn class_eval_item(
+    source: &[u8],
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+) -> Option<Result<crate::app::ProgramItem, String>> {
+    let method = constant_id_str(&call.name());
+    if !matches!(method, "class_eval" | "module_eval" | "class_exec" | "module_exec") || call.arguments().is_some() {
+        return None;
+    }
+    let receiver = call.receiver()?;
+    if receiver.as_constant_read_node().is_none() && receiver.as_constant_path_node().is_none() {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let receiver = match ingest_expr(&receiver, file) {
+        Ok(expr) => expr,
+        Err(err) => return Some(Err(format!("the ingest cannot carry this `{method}` receiver: {err}"))),
+    };
+    let statements: Vec<ruby_prism::Node<'_>> = match block.body() {
+        None => Vec::new(),
+        Some(body) => match body.as_statements_node() {
+            Some(statements) => statements.body().iter().collect(),
+            None => return Some(Err(format!("this `{method}` body (a `rescue` or `ensure`) is not carried"))),
+        },
+    };
+    Some(class_eval_parts(source, &statements, file, method).map(|parts| crate::app::ProgramItem::ClassEval {
+        receiver,
+        method: method.to_string(),
+        parts,
+    }))
+}
+
+/// A `class_eval` body's statements as parts: each run of statements a
+/// module body, each `if`/`unless` defining methods a branch of parts
+/// (shopify-money defines `Money.caller_stack` per Ruby version so).
+fn class_eval_parts(
+    source: &[u8],
+    statements: &[ruby_prism::Node<'_>],
+    file: &str,
+    method: &str,
+) -> Result<Vec<crate::app::ClassEvalPart>, String> {
+    use crate::app::ClassEvalPart;
+    let mut parts = Vec::new();
+    let mut run: Vec<&ruby_prism::Node<'_>> = Vec::new();
+    let flush = |run: &mut Vec<&ruby_prism::Node<'_>>, parts: &mut Vec<ClassEvalPart>| -> Result<(), String> {
+        let (Some(first), Some(last)) = (run.first(), run.last()) else { return Ok(()) };
+        let (start, end) = (first.location().start_offset(), last.location().end_offset());
+        run.clear();
+        parts.push(ClassEvalPart::Body(class_eval_body(source, start, end, file, method)?));
+        Ok(())
+    };
+    let parts_of = |statements: Option<ruby_prism::StatementsNode<'_>>| -> Result<Vec<ClassEvalPart>, String> {
+        let body: Vec<ruby_prism::Node<'_>> = statements.map(|s| s.body().iter().collect()).unwrap_or_default();
+        class_eval_parts(source, &body, file, method)
+    };
+    fn branch<'pr>(
+        node: &ruby_prism::Node<'pr>,
+        file: &str,
+        parts_of: &dyn Fn(Option<ruby_prism::StatementsNode<'pr>>) -> Result<Vec<crate::app::ClassEvalPart>, String>,
+    ) -> Result<crate::app::ClassEvalPart, String> {
+        let cond_of = |pred: &ruby_prism::Node<'_>| {
+            ingest_expr(pred, file).map_err(|err| format!("the ingest cannot carry this condition: {err}"))
+        };
+        if let Some(n) = node.as_if_node() {
+            let else_parts = match n.subsequent() {
+                None => Vec::new(),
+                Some(next) => match next.as_else_node() {
+                    Some(e) => parts_of(e.statements())?,
+                    None => vec![branch(&next, file, parts_of)?],
+                },
+            };
+            return Ok(crate::app::ClassEvalPart::Branch {
+                cond: cond_of(&n.predicate())?,
+                negate: false,
+                then_parts: parts_of(n.statements())?,
+                else_parts,
+            });
+        }
+        let n = node.as_unless_node().expect("an if or unless");
+        Ok(crate::app::ClassEvalPart::Branch {
+            cond: cond_of(&n.predicate())?,
+            negate: true,
+            then_parts: parts_of(n.statements())?,
+            else_parts: match n.else_clause() {
+                Some(e) => parts_of(e.statements())?,
+                None => Vec::new(),
+            },
+        })
+    }
+    for stmt in statements {
+        if (stmt.as_if_node().is_some() || stmt.as_unless_node().is_some()) && defines_method(stmt) {
+            flush(&mut run, &mut parts)?;
+            parts.push(branch(stmt, file, &parts_of)?);
+        } else {
+            run.push(stmt);
+        }
+    }
+    flush(&mut run, &mut parts)?;
+    Ok(parts)
+}
+
+/// The source's bytes `start..end`, `class_eval` body statements, as the
+/// body of `module RhCe`: everything else blanked, lines and offsets
+/// kept, and the header written into blanked bytes before `start`.
+fn class_eval_body(source: &[u8], start: usize, end: usize, file: &str, method: &str) -> Result<LibraryClass, String> {
+    let header = format!("module {CLASS_EVAL_BODY};");
+    let mut masked: Vec<u8> =
+        source.iter().enumerate().map(|(i, &b)| if (start..end).contains(&i) || b == b'\n' { b } else { b' ' }).collect();
+    let at = (0..start.saturating_sub(header.len()) + 1)
+        .rev()
+        .find(|&at| at + header.len() <= start && !masked[at..at + header.len()].contains(&b'\n'))
+        .ok_or_else(|| format!("this `{method}` body has no room for its carry"))?;
+    masked[at..at + header.len()].copy_from_slice(header.as_bytes());
+    masked.extend_from_slice(b"\nend\n");
+    let result = super::prism::parse(&masked, file);
+    let root = result.node();
+    let classes =
+        declared_classes(&root, file, usize::MAX).map_err(|err| format!("the ingest cannot carry this `{method}` body: {err}"))?;
+    match <[LibraryClass; 1]>::try_from(classes) {
+        Ok([class]) => Ok(class),
+        Err(_) => Err(format!("a class or module declared in this `{method}` body is not carried")),
+    }
+}
+
+/// A file-level `if`/`elsif`/`else` or `unless` holding declarations,
+/// its branches as program items.
+fn program_branch(
+    source: &[u8],
+    stmt: &ruby_prism::Node<'_>,
+    file: &str,
+    carried: &HashSet<&str>,
+    guarded: &mut bool,
+) -> Option<crate::app::ProgramItem> {
+    use crate::app::ProgramItem;
+    let items_of = |statements: Option<ruby_prism::StatementsNode<'_>>, guarded: &mut bool| {
+        let mut out = Vec::new();
+        if let Some(statements) = statements {
+            let body: Vec<ruby_prism::Node<'_>> = statements.body().iter().collect();
+            program_items(source, &body, file, carried, true, guarded, &mut out);
+        }
+        out
+    };
+    if let Some(node) = stmt.as_if_node() {
+        let cond = ingest_expr(&node.predicate(), file).ok()?;
+        let then_items = items_of(node.statements(), guarded);
+        let else_items = match node.subsequent() {
+            None => Vec::new(),
+            Some(next) => {
+                if let Some(else_node) = next.as_else_node() {
+                    items_of(else_node.statements(), guarded)
+                } else {
+                    vec![program_branch(source, &next, file, carried, guarded)?]
+                }
+            }
+        };
+        return Some(ProgramItem::Branch { cond, negate: false, then_items, else_items });
+    }
+    if let Some(node) = stmt.as_unless_node() {
+        let cond = ingest_expr(&node.predicate(), file).ok()?;
+        let then_items = items_of(node.statements(), guarded);
+        let else_items = node.else_clause().map(|e| items_of(e.statements(), guarded)).unwrap_or_default();
+        return Some(ProgramItem::Branch { cond, negate: true, then_items, else_items });
+    }
+    None
 }
 
 /// The `LibraryClassOrigin::FileConstants` holder of a file whose
@@ -365,6 +767,10 @@ fn file_level_constants(
     };
     let mut after_declarations = false;
     for stmt in prog.statements().body().iter() {
+        // Behind a file-level `return`: the file program's.
+        if is_file_guard(&stmt) {
+            break;
+        }
         if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
             after_declarations = true;
         }

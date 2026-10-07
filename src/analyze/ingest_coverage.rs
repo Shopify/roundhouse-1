@@ -5,16 +5,14 @@
 //! survey mode any per-file class ingest. That left the file out of the
 //! IR in silence (or as a file-only punch-list line); each is now an
 //! `ingest_unsupported` error at the construct that failed it. A
-//! support-file definition the ingest carries but not as Ruby runs it
-//! (`file_level_definition`: inside a file-level conditional, or after a
-//! file-level `return`) is an `unsupported` error at that statement.
-//!
-//! Also every top-level call of a support file whose declarations were
-//! carried (`App::file_statement_gaps`): a `file_statement_unsupported`
-//! error at the call, which Ruby runs on load and the emitted app does
-//! not. A call is reported by one of the two only: a call inside a
-//! file-level conditional, or after a file-level `return`, is not a
-//! top-level call statement.
+//! support file's file-level statement its file program does not carry
+//! (`App::file_statement_gaps`, from `ProgramItem::NotCarried`) is a
+//! `file_statement_unsupported` error at that statement, which Ruby runs
+//! on load and the emitted app names at boot instead
+//! (`error[file_statement_not_carried]`). A statement the program
+//! carries (a call, a require, a conditional definition, a guard) is
+//! not reported. Each site has one report: an item inside a carried
+//! conditional is reported, the conditional itself is not.
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::App;

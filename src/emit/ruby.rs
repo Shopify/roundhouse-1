@@ -43,6 +43,25 @@ pub(crate) fn library_file_stem(name: &str, app: &App) -> String {
     crate::naming::underscore(&library::file_owner(name, app))
 }
 
+/// The app/models.rb anchor of a support file's file program.
+pub(crate) fn file_program_anchor(app: &App, program: &crate::app::FileProgram) -> String {
+    library::file_program_anchor(app, program)
+}
+
+/// Each support file's file program (`App::file_programs`) as
+/// `(app/models/roundhouse_files/<source>.rb, content)`. `emitted` is
+/// every app/models.rb anchor (`models/<stem>`) the tree has.
+pub(crate) fn file_program_files(app: &App, emitted: &std::collections::BTreeSet<String>) -> Vec<(String, String)> {
+    app.file_programs
+        .iter()
+        .map(|program| {
+            let path = format!("app/{}.rb", library::file_program_anchor(app, program));
+            let content = library::emit_file_program(program, app, std::path::Path::new(&path), emitted);
+            (path, content)
+        })
+        .collect()
+}
+
 /// Emit a single `MethodDef` as Ruby source (trailing newline included).
 /// The signature and effects are not emitted — they belong to the RBS
 /// sidecar, not to Ruby itself. Used by the runtime-extraction pipeline

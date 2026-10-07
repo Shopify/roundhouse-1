@@ -21,9 +21,11 @@
 //! first four lines (Currency `find!`/`new`, `find`, `UnknownCurrency`)
 //! equal CRuby's. `Money.new` then raises "unknown format: 'iso4217'":
 //! the gem registers each converter with a file-level
-//! `Money::Converters.register(…)` call, which the tree does not run
-//! (reported as `file_statement_unsupported`, as is `deprecations.rb`'s
-//! file-level `Money.class_eval do … end`). Analysis also still
+//! `Money::Converters.register(…)` call, which the tree did not run.
+//! That call and `deprecations.rb`'s file-level `Money.class_eval do …
+//! end` are now carried as the files' programs (`App::file_programs`,
+//! tests/file_level_calls.rs); this probe has not been rerun since, as
+//! its closure step does not find the pinned gem's files. Analysis also still
 //! refuses the probe's `as_json`. `Money::Helpers::DECIMAL_ZERO`
 //! (`BigDecimal(0).freeze`), `Float::EPSILON` and `Rational` in
 //! `Money::Allocator < SimpleDelegator`, and `Accounting#parse`'s

@@ -7565,6 +7565,11 @@ fn relative_source_path<'a>(app: &App, path: &'a str) -> &'a str {
 /// to that one emitted file.
 fn carried_source_files(app: &App) -> BTreeMap<String, String> {
     let mut table: BTreeMap<String, String> = BTreeMap::new();
+    // A file with a file program loads as that program, which loads its
+    // declarations in turn.
+    for program in &app.file_programs {
+        table.insert(relative_source_path(app, &program.source).to_string(), file_program_anchor(app, program));
+    }
     for lc in &app.library_classes {
         let anchor = format!("models/{}", super::library_file_stem(lc.name.0.as_str(), app));
         let mut add = |span: crate::span::Span| {
@@ -7582,7 +7587,98 @@ fn carried_source_files(app: &App) -> BTreeMap<String, String> {
             add(value.span);
         }
     }
+    // A file that declares only empty classes (shopify-money's
+    // errors.rb) has no span to find it by: its first declaration.
+    for (source, names) in &app.library_class_files {
+        if let Some(first) = names.iter().min_by_key(|n| n.0.as_str().matches("::").count()) {
+            table
+                .entry(relative_source_path(app, source).to_string())
+                .or_insert_with(|| format!("models/{}", super::library_file_stem(first.0.as_str(), app)));
+        }
+    }
     table
+}
+
+/// Where a file program's `require`/`require_relative` of `feature`
+/// lands: `Some(Ok(anchor))` an app file the tree carries, `Some(Err)`
+/// an app file it does not (the source names it, the tree has nothing
+/// for it), `None` a feature outside the app (a gem's, the stdlib's).
+/// `rel` is the program's source, relative to the app root.
+fn program_require(
+    app: &App,
+    rel: &str,
+    feature: &str,
+    relative: bool,
+    table: &BTreeMap<String, String>,
+) -> Option<Result<String, String>> {
+    let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+    let source = if relative {
+        let base = Path::new(rel).parent().unwrap_or(Path::new(""));
+        let mut parts: Vec<String> = Vec::new();
+        for part in base.join(&rb).to_string_lossy().split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other.to_string()),
+            }
+        }
+        Some(parts.join("/"))
+    } else {
+        let mut hits = table.keys().filter(|src| **src == format!("lib/{rb}") || src.ends_with(&format!("/lib/{rb}")));
+        match (hits.next(), hits.next()) {
+            (Some(src), None) => Some(src.clone()),
+            _ => None,
+        }
+    };
+    if let Some(anchor) = source.as_ref().and_then(|src| table.get(src)) {
+        return Some(Ok(anchor.clone()));
+    }
+    let app_file = source.as_ref().is_some_and(|src| app.sources.iter().any(|f| relative_source_path(app, &f.path) == src));
+    (app_file || relative).then(|| Err(source.unwrap_or_default()))
+}
+
+/// A file program statement's `require "f"` / `require_relative "f"` of
+/// an app file, resolved as `ProgramItem::Require` is: the emitted file,
+/// or a named error for one the tree does not carry. A feature outside
+/// the app stays as written.
+fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Option<BTreeMap<String, String>>) {
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node {
+        let relative = method.as_str() == "require_relative";
+        let feature = match args.as_slice() {
+            [one] => match &*one.node {
+                ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let (true, Some(feature)) = (relative || method.as_str() == "require", feature) {
+            let table = sources.get_or_insert_with(|| carried_source_files(app));
+            let span = e.span;
+            let mk = |node: ExprNode| Expr::new(span, node);
+            let lit = |value: String| mk(ExprNode::Lit { value: crate::expr::Literal::Str { value } });
+            let call = |recv: Option<Expr>, method: &str, args: Vec<Expr>, parenthesized: bool| {
+                mk(ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized })
+            };
+            match program_require(app, rel, &feature, relative, table) {
+                Some(Ok(anchor)) => {
+                    let path = call(Some(mk(ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })), "path", vec![lit(anchor)], true);
+                    *e = call(None, "require", vec![path], false);
+                }
+                Some(Err(_)) => {
+                    let message = format!(
+                        "roundhouse: error[file_require_not_carried]: {}: `{method} {feature:?}` names an app file the tree does not carry; it was not loaded",
+                        statement_site(app, span)
+                    );
+                    *e = call(None, "warn", vec![lit(message)], true);
+                }
+                None => {}
+            }
+            return;
+        }
+    }
+    e.node.for_each_child_mut(&mut |child| rewrite_program_requires(child, app, rel, sources));
 }
 
 /// A carried engine body statement's loads of the app's own Ruby files,
@@ -7715,6 +7811,224 @@ fn rewrite_carried_loads(
         return;
     }
     e.node.for_each_child_mut(&mut |child| rewrite_carried_loads(child, app, root, sources));
+}
+
+/// The app/models.rb anchor of a support file's file program
+/// (`App::file_programs`): `models/roundhouse_files/<source path>`.
+pub(super) fn file_program_anchor(app: &App, program: &crate::app::FileProgram) -> String {
+    let rel = relative_source_path(app, &program.source).trim_start_matches('/');
+    let rel = rel.strip_suffix(".rb").unwrap_or(rel);
+    format!("models/roundhouse_files/{rel}")
+}
+
+/// A support file's file program as one Ruby file: what Ruby runs when
+/// it loads the source, in source order (`ingest::library_class::
+/// file_program`). `emitted` is every app/models.rb anchor the tree
+/// has. A top-level declaration loads its emitted file where it stands;
+/// a statement runs under `RoundhouseAutoload.file_statement`, which
+/// names one that fails and goes on; a guard and a conditional run as
+/// written, with the declarations they hold inline; a `require` of an
+/// app file loads the emitted file, and of anything else is kept as
+/// written.
+pub(super) fn emit_file_program(
+    program: &crate::app::FileProgram,
+    app: &App,
+    out_path: &Path,
+    emitted: &BTreeSet<String>,
+) -> String {
+    use crate::app::ProgramItem;
+    let mut sources: Option<BTreeMap<String, String>> = None;
+    let rel = relative_source_path(app, &program.source).to_string();
+    let mut s = format!(
+        "# The file-level program of {rel}: what Ruby runs when it loads\n\
+         # that file, in source order. Loaded where a file in this tree\n\
+         # requires it, else at boot (app/models.rb).\n"
+    );
+    fn locals_of(items: &[ProgramItem], out: &mut Vec<String>) {
+        for item in items {
+            match item {
+                ProgramItem::Statement(e) | ProgramItem::Guard(e) => body_scope_locals(e, out),
+                ProgramItem::Branch { then_items, else_items, .. } => {
+                    locals_of(then_items, out);
+                    locals_of(else_items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut locals = Vec::new();
+    locals_of(&program.items, &mut locals);
+    // A global (`$VERBOSE = true`) is no local.
+    locals.retain(|local| !local.starts_with('$'));
+    for local in &locals {
+        writeln!(s, "{local} = nil").unwrap();
+    }
+    let mut loaded: BTreeSet<String> = BTreeSet::new();
+    fn render(
+        items: &[ProgramItem],
+        pad: &str,
+        app: &App,
+        rel: &str,
+        out_path: &Path,
+        emitted: &BTreeSet<String>,
+        sources: &mut Option<BTreeMap<String, String>>,
+        loaded: &mut BTreeSet<String>,
+        s: &mut String,
+    ) {
+        let lines = |s: &mut String, pad: &str, text: &str| {
+            for line in text.lines() {
+                if line.is_empty() {
+                    s.push('\n');
+                } else {
+                    writeln!(s, "{pad}{line}").unwrap();
+                }
+            }
+        };
+        let require_anchor = |s: &mut String, anchor: &str| {
+            writeln!(s, "{pad}require RoundhouseAutoload.path({anchor:?})").unwrap();
+        };
+        for item in items {
+            match item {
+                ProgramItem::Declared(names) => {
+                    for name in names {
+                        let anchor = format!("models/{}", super::library_file_stem(name.0.as_str(), app));
+                        if emitted.contains(&anchor) && loaded.insert(anchor.clone()) {
+                            require_anchor(s, &anchor);
+                        }
+                    }
+                }
+                ProgramItem::Statement(expr) => {
+                    let mut expr = carried_loads(expr, app, None, sources);
+                    rewrite_program_requires(&mut expr, app, rel, sources);
+                    let text = super::emit_expr(&expr);
+                    writeln!(s, "{pad}RoundhouseAutoload.file_statement({:?}) do", statement_site(app, expr.span)).unwrap();
+                    lines(s, &format!("{pad}  "), &text);
+                    writeln!(s, "{pad}end").unwrap();
+                }
+                // A `return` in the block still ends the file's load.
+                ProgramItem::Guard(expr) => {
+                    writeln!(s, "{pad}RoundhouseAutoload.file_statement({:?}) do", statement_site(app, expr.span)).unwrap();
+                    lines(s, &format!("{pad}  "), &super::emit_expr(expr));
+                    writeln!(s, "{pad}end").unwrap();
+                }
+                ProgramItem::Require { span, feature, relative } => {
+                    let table = sources.get_or_insert_with(|| carried_source_files(app));
+                    let site = statement_site(app, *span);
+                    match program_require(app, rel, feature, *relative, table) {
+                        Some(Ok(anchor)) => {
+                            if loaded.insert(anchor.clone()) {
+                                require_anchor(s, &anchor);
+                            }
+                        }
+                        Some(Err(_)) => {
+                            let message = format!(
+                                "roundhouse: error[file_require_not_carried]: {site}: `require{} {feature:?}` names an app file the tree does not carry; it was not loaded",
+                                if *relative { "_relative" } else { "" }
+                            );
+                            writeln!(s, "{pad}warn {message:?}").unwrap();
+                        }
+                        None => {
+                            writeln!(s, "{pad}RoundhouseAutoload.file_statement({site:?}) do").unwrap();
+                            writeln!(s, "{pad}  require {feature:?}").unwrap();
+                            writeln!(s, "{pad}end").unwrap();
+                        }
+                    }
+                }
+                ProgramItem::Inline(classes) => {
+                    for lc in classes {
+                        let rendered = emit_library_class_decl(lc, app, out_path.to_path_buf());
+                        lines(s, pad, &rendered.content);
+                    }
+                }
+                ProgramItem::ClassEval { receiver, method, parts } => {
+                    writeln!(s, "{pad}{}.{method} do", super::emit_expr(receiver)).unwrap();
+                    class_eval_parts(parts, &format!("{pad}  "), app, out_path, method, s);
+                    writeln!(s, "{pad}end").unwrap();
+                }
+                // A condition that raises runs neither branch, named.
+                ProgramItem::Branch { cond, negate, then_items, else_items } => {
+                    let site = statement_site(app, cond.span);
+                    let cond_text = super::emit_expr(cond);
+                    if cond_text.contains('\n') {
+                        writeln!(s, "{pad}roundhouse_condition = RoundhouseAutoload.file_condition({site:?}) do").unwrap();
+                        lines(s, &format!("{pad}  "), &cond_text);
+                        writeln!(s, "{pad}end").unwrap();
+                    } else {
+                        writeln!(s, "{pad}roundhouse_condition = RoundhouseAutoload.file_condition({site:?}) {{ {cond_text} }}").unwrap();
+                    }
+                    writeln!(s, "{pad}if roundhouse_condition.equal?(RoundhouseAutoload::NOT_RUN)").unwrap();
+                    writeln!(s, "{pad}  nil").unwrap();
+                    writeln!(s, "{pad}elsif {}roundhouse_condition", if *negate { "!" } else { "" }).unwrap();
+                    let inner = format!("{pad}  ");
+                    render(then_items, &inner, app, rel, out_path, emitted, sources, loaded, s);
+                    if !else_items.is_empty() {
+                        writeln!(s, "{pad}else").unwrap();
+                        render(else_items, &inner, app, rel, out_path, emitted, sources, loaded, s);
+                    }
+                    writeln!(s, "{pad}end").unwrap();
+                }
+                ProgramItem::NotCarried { span, message, .. } => {
+                    let text = format!(
+                        "roundhouse: error[file_statement_not_carried]: {}: {message}",
+                        statement_site(app, *span)
+                    );
+                    writeln!(s, "{pad}warn {text:?}").unwrap();
+                }
+            }
+        }
+    }
+    render(&program.items, "", app, &rel, out_path, emitted, &mut sources, &mut loaded, &mut s);
+    s
+}
+
+/// A `class_eval` body's parts (`ProgramItem::ClassEval`): each body the
+/// module's, without its `module`/`end`; each branch an `if`/`unless`.
+fn class_eval_parts(
+    parts: &[crate::app::ClassEvalPart],
+    pad: &str,
+    app: &App,
+    out_path: &Path,
+    method: &str,
+    s: &mut String,
+) {
+    use crate::app::ClassEvalPart;
+    for part in parts {
+        match part {
+            ClassEvalPart::Body(lc) => {
+                let rendered = emit_library_class_decl(lc, app, out_path.to_path_buf()).content;
+                let header = format!("module {}", crate::ingest::library_class::CLASS_EVAL_BODY);
+                let body: Vec<&str> = rendered.lines().collect();
+                match body.as_slice() {
+                    [first, inner @ .., "end"] if *first == header => {
+                        for line in inner {
+                            let line = line.strip_prefix("  ").unwrap_or(line);
+                            if line.is_empty() {
+                                s.push('\n');
+                            } else {
+                                writeln!(s, "{pad}{line}").unwrap();
+                            }
+                        }
+                    }
+                    _ => {
+                        let message = format!(
+                            "roundhouse: error[file_statement_not_carried]: a part of this `{method}` body did not emit as a module body; it was not carried"
+                        );
+                        writeln!(s, "{pad}warn {message:?}").unwrap();
+                    }
+                }
+            }
+            ClassEvalPart::Branch { cond, negate, then_parts, else_parts } => {
+                let keyword = if *negate { "unless" } else { "if" };
+                writeln!(s, "{pad}{keyword} {}", super::emit_expr(cond)).unwrap();
+                class_eval_parts(then_parts, &format!("{pad}  "), app, out_path, method, s);
+                if !else_parts.is_empty() {
+                    writeln!(s, "{pad}else").unwrap();
+                    class_eval_parts(else_parts, &format!("{pad}  "), app, out_path, method, s);
+                }
+                writeln!(s, "{pad}end").unwrap();
+            }
+        }
+    }
 }
 
 /// `path:line` of a body statement, the path relative to the app root.

@@ -187,12 +187,13 @@ fn is_mutable_string_literal(e: &Expr) -> bool {
 }
 
 /// A receiver that a postfix form (`[i]`, `.attr = v`, `.method(:m)`)
-/// follows directly. `+"a"[0]` is `+("a"[0])`: unary `+` binds looser
-/// than both, so a `+"literal"` there keeps parentheses. The general
-/// call path makes the same call through `recv_needs_parens`.
+/// follows directly, parenthesized as a call's receiver is
+/// (`recv_needs_parens`): `+"a"[0]` is `+("a"[0])`, and
+/// `(@entries ||= {})[key] = klass` written bare is
+/// `@entries ||= ({}[key] = klass)`, which stores the value in the ivar.
 fn emit_postfix_recv(r: &Expr) -> String {
     let s = emit_expr(r);
-    if is_mutable_string_literal(r) { format!("({s})") } else { s }
+    if recv_needs_parens(r) { format!("({s})") } else { s }
 }
 
 /// True when an If's else-branch carries no statements: an empty `Seq`

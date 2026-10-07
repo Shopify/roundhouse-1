@@ -761,18 +761,19 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             }
             match super::library_class::ingest_app_library_classes(&source, &path_str) {
                 Ok(classes) => {
-                    // What the file defines conditionally at load is
-                    // named where the source has it, never left silent.
-                    for (start, end, message) in super::library_class::file_level_definition_gaps(&source, &path_str) {
-                        let span = crate::span::Span { file: super::sources::file_id(&path_str), start: start as u32, end: end as u32 };
-                        app.ingest_drops.push(crate::app::IngestDrop { span, message, construct: Some("file_level_definition".into()) });
+                    // What the file runs at load beyond its
+                    // declarations: its file program, in source order;
+                    // what that cannot carry is named where the source
+                    // has it.
+                    if let Some(program) = super::library_class::file_program(&source, &path_str, &classes) {
+                        report_not_carried(&source, &program.items, &mut app);
+                        app.file_programs.push(program);
                     }
                     if !classes.is_empty() && declarations_only(&source) {
                         loaded_support.insert(entry.clone());
                     }
                     support_classes.push((entry.clone(), classes.iter().map(|c| c.name.clone()).collect()));
                     app.library_classes.extend(classes);
-                    report_file_level_calls(&source, &path_str, &mut app);
                 }
                 Err(err) => drop_library_file(&mut app, &path_str, &err),
             }
@@ -783,6 +784,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
         }
     }
+    app.library_class_files = support_classes
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(entry, names)| (entry.display().to_string(), names.clone()))
+        .collect();
     app.zeitwerk_loaders = super::zeitwerk::resolve(&super::zeitwerk::drain(), &support_classes);
     app.railties = carried_railties(vfs, dir, &app, &support_classes, &engine_dirs);
 
@@ -2392,54 +2398,33 @@ fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
     }
 }
 
-/// A call at the top level of a support file, outside every class and
-/// module, runs when Ruby loads the file. shopify-money's
-/// `Money::Converters.register(:iso4217, Iso4217Converter)` is one:
-/// without it, `Money::Converters.for(:iso4217)` raises "unknown
-/// format". Ingest carries the file's declarations and constants but
-/// no other statement, and these calls used to be dropped with no
-/// diagnostic. Each one is now a gap at its own site
-/// (`App::file_statement_gaps`).
-///
-/// Not reported: a receiverless `require` / `require_relative` /
-/// `load` / `autoload`, since loading files is the emitted tree's own
-/// job, and `ActiveSupport.on_load`, which `on_load_reopen` reads and
-/// reports for itself. LIMITATION: only a statement that is itself a
-/// call is reported. A top-level `begin`/`if` wrapping calls, or a
-/// local variable write, is still dropped without a diagnostic.
-fn report_file_level_calls(source: &[u8], path: &str, app: &mut App) {
-    let result = ruby_prism::parse(source);
-    let root = result.node();
-    let Some(program) = root.as_program_node() else { return };
-    if result.errors().next().is_some() {
-        return;
-    }
-    for stmt in program.statements().body().iter() {
-        let Some(call) = stmt.as_call_node() else { continue };
-        let method = super::util::constant_id_str(&call.name()).to_string();
-        let receiver = call.receiver();
-        if receiver.is_none() && matches!(method.as_str(), "require" | "require_relative" | "load" | "autoload") {
-            continue;
+/// Each file-level statement a support file's program does not carry
+/// (`ProgramItem::NotCarried`, in a branch too) is a gap at its own site
+/// (`App::file_statement_gaps`): Ruby runs it when it loads the file,
+/// and the emitted program names it there instead. What the program
+/// carries (a call such as shopify-money's
+/// `Money::Converters.register(:iso4217, …)`, a `require`, a guard, a
+/// conditional definition) is not a gap, so each site has one report.
+fn report_not_carried(source: &[u8], items: &[crate::app::ProgramItem], app: &mut App) {
+    use crate::app::ProgramItem;
+    for item in items {
+        match item {
+            ProgramItem::NotCarried { span, construct, message } => {
+                let text = source.get(span.start as usize..span.end as usize).unwrap_or_default();
+                let first_line = String::from_utf8_lossy(text).lines().next().unwrap_or_default().trim().to_string();
+                let first_line: String = first_line.chars().take(160).collect();
+                app.file_statement_gaps.push(crate::app::InitializerGap {
+                    span: *span,
+                    construct: construct.clone(),
+                    detail: format!("{message}: {first_line}"),
+                });
+            }
+            ProgramItem::Branch { then_items, else_items, .. } => {
+                report_not_carried(source, then_items, app);
+                report_not_carried(source, else_items, app);
+            }
+            _ => {}
         }
-        let receiver_path = receiver.as_ref().and_then(super::util::constant_path_of).map(|p| p.join("::"));
-        if method == "on_load" && receiver_path.as_deref() == Some("ActiveSupport") {
-            continue;
-        }
-        let shown = match &receiver_path {
-            Some(recv) => format!("{recv}.{method}"),
-            None if receiver.is_some() => format!("<expr>.{method}"),
-            None => method,
-        };
-        let location = stmt.location();
-        let span = crate::span::Span {
-            file: super::sources::file_id(path),
-            start: location.start_offset() as u32,
-            end: location.end_offset() as u32,
-        };
-        let text = &source[location.start_offset()..location.end_offset()];
-        let first_line = String::from_utf8_lossy(text).lines().next().unwrap_or_default().trim().to_string();
-        let detail: String = first_line.chars().take(160).collect();
-        app.file_statement_gaps.push(crate::app::InitializerGap { span, construct: shown, detail });
     }
 }
 
