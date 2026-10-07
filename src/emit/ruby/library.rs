@@ -7668,19 +7668,31 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
     })
 }
 
-/// The class-body calls of a plain class (no superclass, or a core one)
-/// that only the app's own code defines: `extend M` of an app module and
-/// the bare calls after it to that module's methods (`extend SymbolEnum`
-/// then `symbol_enum :state, [:on, :off]`). No runtime base answers
-/// these, so the module is the receiver's and replaying the calls is what
-/// Ruby runs. They are written before the methods, like every replayed
-/// call, so a call to the class's own `def self.` (defined below it in
-/// the emitted body) is not one of them. Anything else stays dropped and
-/// reported (`replays_foreign_class_body`).
+/// The body calls of a plain module or class (no superclass, or a core
+/// one) that only the app's own code answers, which Ruby runs on the
+/// module or class itself:
+/// - `extend M` of an app module and the bare calls after it to that
+///   module's methods (`extend SymbolEnum` then `symbol_enum :state,
+///   [:on, :off]`; Core's `extend LazyAttrAccessor` then
+///   `lazy_attr_accessor :x` in `Shopify::Config`);
+/// - `extend self` in a module. The ingest already gives its `def`s and
+///   `attr_*`s their module-side form; the replayed `extend self` makes
+///   the instance methods a replayed macro defines module methods too;
+/// - `self.x = v` through the body's own class-side writer
+///   (`attr_accessor :x` then `self.x = 1` under `extend self`), or
+///   after an `extend` of an app module (a writer its macro defines).
+///   One that runs the body's own code is written after the methods
+///   (`OwnClassCalls`), keeping their order.
+///
+/// No runtime base answers these, so replaying them is what Ruby runs.
+/// Anything else stays dropped and reported (`replays_foreign_class_body`).
 fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
-    if lc.is_module || lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
+    if lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
         return Vec::new();
     }
+    let own_class_side = |name: &str| {
+        lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
+    };
     let app_module = |path: &[Symbol]| -> Option<&LibraryClass> {
         let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
         let nested = format!("{}::{written}", lc.name.0.as_str());
@@ -7691,7 +7703,27 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let mut extended: Vec<&LibraryClass> = Vec::new();
     let mut out = Vec::new();
     for call in &lc.unknown_calls {
-        let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { continue };
+        // `self.x = v` through the body's own class-side writer, or after
+        // an `extend` of an app module, whose methods or macros
+        // (`lazy_attr_accessor :x`) may define it. A plain body has no
+        // other base to answer it, so native Ruby runs exactly this.
+        let ExprNode::Send { recv, method, args, .. } = &*call.node else { continue };
+        let self_write = method.as_str().ends_with('=')
+            && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::SelfRef));
+        if self_write && (own_class_side(method.as_str()) || !extended.is_empty()) {
+            out.push(call);
+            continue;
+        }
+        if recv.is_some() {
+            continue;
+        }
+        if lc.is_module
+            && method.as_str() == "extend"
+            && matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::SelfRef))
+        {
+            out.push(call);
+            continue;
+        }
         if method.as_str() == "extend" {
             let modules: Option<Vec<&LibraryClass>> = args
                 .iter()
