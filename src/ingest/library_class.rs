@@ -2240,10 +2240,23 @@ impl<'a> OwnClassCalls<'a> {
             {
                 true
             }
+            // `&method(:x)` / `method(:x)`: a lookup of `x` as it runs.
+            ExprNode::MethodRef { recv, name }
+                if self.own_receiver(recv.as_ref()) && self.methods.contains(name.as_str()) =>
+            {
+                true
+            }
             ExprNode::Send { recv, method, args, block, .. } => {
                 let name = method.as_str();
                 if self.own_receiver(recv.as_ref())
                     && (matches!(name, "new" | "allocate") || self.methods.contains(name))
+                {
+                    return true;
+                }
+                if self.own_receiver(recv.as_ref())
+                    && matches!(name, "method" | "public_method" | "instance_method" | "public_instance_method")
+                    && args.first().is_some_and(|a| matches!(&*a.node,
+                        ExprNode::Lit { value: Literal::Sym { value } } if self.methods.contains(value.as_str())))
                 {
                     return true;
                 }
