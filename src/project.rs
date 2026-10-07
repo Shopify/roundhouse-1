@@ -2853,6 +2853,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
     files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
     let registrations = load_hook_registrations(app);
+    // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.1.4).
+    let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
+        .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
+    files.push(("runtime/active_support_backtrace_cleaner.rb".into(), cleaner));
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
@@ -2868,7 +2872,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
-            content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
+            content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
+            content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
             content.push_str("require_relative \"runtime/database_configuration\"\n");
         }
@@ -4963,7 +4968,8 @@ fn spinel_files_with_assertions(
     // so is the semian port that wraps that driver's adapter.
     files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
         && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
-        && p != "runtime/active_support_lazy_load_hooks.rb");
+        && p != "runtime/active_support_lazy_load_hooks.rb"
+        && p != "runtime/active_support_backtrace_cleaner.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance
