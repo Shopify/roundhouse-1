@@ -3710,11 +3710,14 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
             rewrite_defined_to_nil_check(fallback);
         }
         ExprNode::Return { value } => rewrite_defined_to_nil_check(value),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, block } => {
             if let Some(arglist) = args {
                 for a in arglist {
                     rewrite_defined_to_nil_check(a);
                 }
+            }
+            if let Some(b) = block {
+                rewrite_defined_to_nil_check(b);
             }
         }
         ExprNode::Next { value } | ExprNode::Break { value } => {

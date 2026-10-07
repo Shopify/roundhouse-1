@@ -191,7 +191,7 @@ fn collect_var_reads(
             }
         }
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => collect_var_reads(value, seq, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(arglist) = args.as_ref() {
                 for a in arglist {
                     collect_var_reads(a, seq, out);
@@ -410,7 +410,7 @@ fn stamp_var_reads(
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
             stamp_var_reads(value, seq, counts, last_seq)
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(arglist) = args.as_mut() {
                 for a in arglist {
                     stamp_var_reads(a, seq, counts, last_seq);

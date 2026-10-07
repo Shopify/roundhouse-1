@@ -1301,6 +1301,9 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. }
                 if name.as_str().starts_with("@@") => Some("class variable write"),
             ExprNode::Var { name, .. } if name.as_str().starts_with("@@") => Some("class variable read"),
+            // Only the Ruby trees write the block a super passes; other
+            // emitters would drop it, or hand on the method's own.
+            ExprNode::Super { block: Some(_), .. } => Some("super with a block"),
             _ => None,
         };
         if let Some(construct) = construct {

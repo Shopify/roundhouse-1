@@ -183,7 +183,8 @@ fn rewrite_super_writers(lc: &mut LibraryClass, attrs: &[Symbol]) {
 
 fn rewrite_super(expr: &mut Expr, ivar: &Symbol) {
     expr.node.for_each_child_mut(&mut |c| rewrite_super(c, ivar));
-    let ExprNode::Super { args } = &*expr.node else { return };
+    // A super that passes a block is not a plain setter call; leave it.
+    let ExprNode::Super { args, block: None } = &*expr.node else { return };
     // `super` with no argument list (`ZSuper`) forwards the method's own
     // params; campfire writes the explicit `super(value)` form, and only
     // that is reproduced — a bare `super` keeps its shape and stays

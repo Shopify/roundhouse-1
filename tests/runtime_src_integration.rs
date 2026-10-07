@@ -230,7 +230,7 @@ fn count_gradual_recurse(e: &Expr, total: &mut usize) {
         N::Assign { value, .. } | N::OpAssign { value, .. } => count_gradual_recurse(value, total),
         N::Yield { args } => for a in args { count_gradual_recurse(a, total); },
         N::Raise { value } | N::Return { value } => count_gradual_recurse(value, total),
-        N::Super { args } => {
+        N::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args { count_gradual_recurse(a, total); }
             }
@@ -389,7 +389,7 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
         ExprNode::Return { value } => {
             collect_untyped(value, &format!("{path}/return.value"), out)
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for (i, a) in args.iter().enumerate() {
                     collect_untyped(a, &format!("{path}/super.arg[{i}]"), out);

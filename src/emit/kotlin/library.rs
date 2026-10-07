@@ -975,7 +975,7 @@ fn body_has_yield(e: &Expr) -> bool {
 /// class header). Returns the emitted arg strings, or `None` if there's
 /// no `super` (or it's `super()` with no args returns `Some(vec![])`).
 fn find_super_args(e: &Expr) -> Option<Vec<String>> {
-    if let ExprNode::Super { args } = &*e.node {
+    if let ExprNode::Super { args, .. } = &*e.node {
         return Some(
             args.as_ref()
                 .map(|a| a.iter().map(emit_expr).collect())

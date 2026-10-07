@@ -546,11 +546,14 @@ pub(crate) fn walk_subexprs_mut(expr: &mut Expr, f: &mut dyn FnMut(&mut Expr)) {
             f(fallback);
         }
         ExprNode::Return { value } => f(value),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, block } => {
             if let Some(args) = args {
                 for a in args {
                     f(a);
                 }
+            }
+            if let Some(b) = block {
+                f(b);
             }
         }
         ExprNode::Next { value } | ExprNode::Break { value } => {

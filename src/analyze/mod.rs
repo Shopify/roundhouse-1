@@ -6389,10 +6389,11 @@ impl Analyzer {
             }
             ExprNode::Raise { value } => self.collect_send_sites(value, self_class, side, helpers, out),
             ExprNode::Return { value } => self.collect_send_sites(value, self_class, side, helpers, out),
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, block } => {
                 if let Some(args) = args {
                     for a in args { self.collect_send_sites(a, self_class, side, helpers, out); }
                 }
+                if let Some(b) = block { self.collect_send_sites(b, self_class, side, helpers, out); }
             }
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
                 self.collect_send_sites(body, self_class, side, helpers, out);

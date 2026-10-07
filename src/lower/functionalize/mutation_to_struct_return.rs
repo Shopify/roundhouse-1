@@ -1365,7 +1365,7 @@ mod tests {
     fn constructor_drops_super_and_threads_attr_writers() {
         // def initialize(attrs = {}); super; self.title = attrs[:title]; end
         // → `new` with super dropped and the attr-writer as a struct update.
-        let super_call = syn(ExprNode::Super { args: None });
+        let super_call = syn(ExprNode::Super { args: None, block: None });
         let write = send(
             Some(syn(ExprNode::SelfRef)),
             "title=",

@@ -326,20 +326,23 @@ fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
     let run = emit_and_run::real_blog().write("app/lib/probe.rb", source).run_ruby("puts Probe.new.message");
     run.assert_passes();
     assert_eq!(run.stdout, "Probe\n");
+    // The block the super writes is the one bound, whatever it is: a
+    // literal block, or a block parameter the method reassigns.
+    let source = "class Probe < Array; def sum; options={}; super(**options) { |x| x * 2 }; end; def map(&blk); blk = proc { |x| x + 1 }; options={}; super(**options, &blk); end; end";
+    let script = "p Probe.new([1, 2, 3]).sum; p Probe.new([1, 2, 3]).map { |x| x * 5 }";
+    native_result(source, script, "12\n[2, 3, 4]\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe.rb", source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "12\n[2, 3, 4]\n");
     // Not shown to reach a native ABI, so refused as an ordinary super:
     // the runtime's Logger is no port; a class with no recorded
     // superclass; a relative superclass name an app class could mean;
-    // the app reopening a core ancestor with the method; a block the
-    // emitted `super` would not pass.
+    // the app reopening a core ancestor with the method.
     for source in [
         "class Probe < Logger; def add(severity, message = nil, progname = nil, **options); super(severity, message, progname, **options); end; end",
         "class Probe; def initialize; options={}; super(**options); end; end",
         "module Shop; class Base; end; end; module Shop; class Probe < Base; def initialize; options={}; super(**options); end; end; end; class Base; end",
         "class Object; def probe_hook(**o); o.size; end; end; class Probe < StandardError; def probe_hook; options={}; super(**options); end; end",
-        // A block the IR's `super` does not carry: a literal one, or a
-        // block parameter the method reassigns.
-        "class Probe < StandardError; def initialize; options={}; super(**options) { 1 }; end; end",
-        "class Probe < StandardError; def initialize(&blk); blk = proc { 2 }; options={}; super(**options, &blk); end; end",
     ] {
         let (_, errors) = emit_and_run::real_blog()
             .write("app/lib/probe.rb", source)

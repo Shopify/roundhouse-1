@@ -7688,9 +7688,12 @@ pub(super) fn walk_const_paths(e: &Expr, out: &mut BTreeSet<Vec<String>>) {
             walk_const_paths(fallback, out);
         }
         ExprNode::Return { value } => walk_const_paths(value, out),
-        ExprNode::Super { args: Some(args) } => {
-            for a in args {
+        ExprNode::Super { args, block } => {
+            for a in args.iter().flatten() {
                 walk_const_paths(a, out);
+            }
+            if let Some(b) = block {
+                walk_const_paths(b, out);
             }
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {

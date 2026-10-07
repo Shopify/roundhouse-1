@@ -183,6 +183,7 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass) {
                     id: crate::ident::VarId(0),
                     name: attrs.clone(),
                 })]),
+                block: None,
             }),
             syn(ExprNode::If {
                 cond: unset,

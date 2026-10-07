@@ -162,7 +162,12 @@ fn walk_children<F: FnMut(&Expr)>(expr: &Expr, f: &mut F) {
             f(fallback);
         }
         ExprNode::Return { value } => f(value),
-        ExprNode::Super { args: Some(args) } => args.iter().for_each(&mut *f),
+        ExprNode::Super { args, block } => {
+            args.iter().flatten().for_each(&mut *f);
+            if let Some(b) = block {
+                f(b);
+            }
+        }
         ExprNode::Next { value: Some(v) } => f(v),
         ExprNode::Let { value, body, .. } => {
             f(value);
@@ -331,8 +336,9 @@ where
         },
         ExprNode::Return { value } => ExprNode::Return { value: map_expr(value, f) },
         ExprNode::KeywordSplat { value } => ExprNode::KeywordSplat { value: map_expr(value, f) },
-        ExprNode::Super { args: Some(args) } => ExprNode::Super {
-            args: Some(args.iter().map(|a| map_expr(a, f)).collect()),
+        ExprNode::Super { args, block } => ExprNode::Super {
+            args: args.as_ref().map(|args| args.iter().map(|a| map_expr(a, f)).collect()),
+            block: block.as_ref().map(|b| map_expr(b, f)),
         },
         ExprNode::Next { value: Some(v) } => ExprNode::Next { value: Some(map_expr(v, f)) },
         ExprNode::Let { name, id, value, body } => ExprNode::Let {

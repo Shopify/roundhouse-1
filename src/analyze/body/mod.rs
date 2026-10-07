@@ -985,11 +985,20 @@ impl<'a> BodyTyper<'a> {
                 Ty::Bottom
             }
 
-            ExprNode::Super { args } => {
+            ExprNode::Super { args, block } => {
                 if let Some(args) = args {
                     for a in args.iter_mut() {
                         self.analyze_expr(a, ctx);
                     }
+                }
+                // The parent's yield signature is not known here, so a
+                // literal block's params bind `Untyped`, as for any call
+                // on an untyped receiver.
+                if let Some(b) = block {
+                    let method = crate::ident::Symbol::from("super");
+                    let block_ctx = self.block_ctx_for(
+                        ctx, Some(&Ty::Untyped), &method, args.as_deref().unwrap_or(&[]), b);
+                    self.analyze_expr(b, &block_ctx);
                 }
                 // `super` invokes the parent's same-name method;
                 // tracking which method we're inside (and looking up

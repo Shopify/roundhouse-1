@@ -641,7 +641,7 @@ fn emit_node(n: &ExprNode) -> String {
                 format!("return {}", emit_expr(value))
             }
         }
-        ExprNode::Super { args } => match args {
+        ExprNode::Super { args, .. } => match args {
             None => "super".to_string(),
             Some(args) => {
                 let args_s: Vec<String> = args.iter().map(emit_expr).collect();

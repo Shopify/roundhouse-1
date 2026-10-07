@@ -1421,7 +1421,7 @@ fn emit_node(n: &ExprNode, e: &Expr) -> String {
         // synthesized message property (`Error` is a protocol — there is
         // no super-initializer to delegate to). Elsewhere it stays a
         // placeholder until real designated-init delegation is needed.
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if IN_ERROR_CLASS.with(|f| *f.borrow()) {
                 match args.as_ref().and_then(|a| a.first()) {
                     Some(msg) => format!("self.message = {}", emit_expr(msg)),

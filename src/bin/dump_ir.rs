@@ -623,7 +623,7 @@ fn visit_subexprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         }
         ExprNode::Raise { value } => { f(value); visit_subexprs(value, f); }
         ExprNode::Return { value } => { f(value); visit_subexprs(value, f); }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args { f(a); visit_subexprs(a, f); }
             }

@@ -820,7 +820,7 @@ fn walk_children(e: &mut Expr, tail_expect: ParentExpect, ctx: &mut WalkCtx<'_>)
             count += walk(expr, tail_expect, ctx);
             count += walk(fallback, tail_expect, ctx);
         }
-        ExprNode::Yield { args } | ExprNode::Super { args: Some(args) } => {
+        ExprNode::Yield { args } | ExprNode::Super { args: Some(args), .. } => {
             for arg in args.iter_mut() {
                 count += walk(arg, ParentExpect::None, ctx);
             }
@@ -847,7 +847,7 @@ fn walk_children(e: &mut Expr, tail_expect: ParentExpect, ctx: &mut WalkCtx<'_>)
         | ExprNode::Ivar { .. }
         | ExprNode::Const { .. }
         | ExprNode::SelfRef
-        | ExprNode::Super { args: None }
+        | ExprNode::Super { args: None, .. }
         | ExprNode::Next { value: None }
         | ExprNode::Break { value: None }
         | ExprNode::Retry

@@ -609,11 +609,14 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         }
         ExprNode::Raise { value } => diagnose_expr(value, out),
         ExprNode::Return { value } => diagnose_expr(value, out),
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, block } => {
             if let Some(args) = args {
                 for a in args {
                     diagnose_expr(a, out);
                 }
+            }
+            if let Some(b) = block {
+                diagnose_expr(b, out);
             }
         }
         ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {

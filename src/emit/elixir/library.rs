@@ -521,7 +521,7 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
         ExprNode::RescueModifier { expr, fallback } => {
             references_var(expr, name) || references_var(fallback, name)
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             args.as_ref().is_some_and(|a| a.iter().any(|x| references_var(x, name)))
         }
         ExprNode::Next { value } | ExprNode::Break { value } => opt(value, name),

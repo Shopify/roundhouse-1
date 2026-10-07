@@ -1868,7 +1868,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_forwarding_super_node().is_some() => {
             // `super` without parens forwards the current method's args.
-            ExprNode::Super { args: None }
+            // Its block, when written, is a literal one (`super { }`);
+            // `super &blk` parses as an explicit, argument-less super.
+            let f = n.as_forwarding_super_node().unwrap();
+            let block = match f.block() {
+                Some(b) => Some(ingest_block_node_as_lambda(&b, file)?),
+                None => None,
+            };
+            ExprNode::Super { args: None, block }
         }
         n if n.as_super_node().is_some() => {
             // `super(args)` / `super()` — args = Some(vec).
@@ -1877,7 +1884,14 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 Some(a) => ingest_forwardable_arguments(&a, file)?,
                 None => vec![],
             };
-            ExprNode::Super { args: Some(args) }
+            // The block the source passes, in `Send::block`'s slot shape.
+            // Dropping it would let Ruby's super hand on the method's own
+            // block instead.
+            let block = match s.block() {
+                Some(b) => ingest_call_block(&b, file, "super")?,
+                None => None,
+            };
+            ExprNode::Super { args: Some(args), block }
         }
         n if n.as_begin_node().is_some() => {
             let b = n.as_begin_node().unwrap();

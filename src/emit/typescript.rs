@@ -2093,7 +2093,7 @@ fn body_contains_yield(body: &crate::expr::Expr) -> bool {
             value.as_ref().is_some_and(body_contains_yield)
         }
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => body_contains_yield(value),
-        ExprNode::Super { args } => args
+        ExprNode::Super { args, .. } => args
             .as_ref()
             .is_some_and(|v| v.iter().any(body_contains_yield)),
         ExprNode::BoolOp { left, right, .. } => {
@@ -2712,7 +2712,7 @@ fn collect_ivar_assignments(
                 collect_ivar_assignments(e2, out);
             }
         }
-        ExprNode::Super { args } => {
+        ExprNode::Super { args, .. } => {
             if let Some(args) = args {
                 for a in args {
                     collect_ivar_assignments(a, out);
