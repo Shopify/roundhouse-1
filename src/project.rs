@@ -3497,7 +3497,9 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
 /// - a feature whose gem depends on a Rails gem (error[gem_requires_rails]):
 ///   Rails' own code cannot run over this tree's ports.
 /// A require that loads Rails anyway (a gem in the gem home under
-/// `activesupport-*`, ...) is error[gem_requires_rails], raised at boot.
+/// `activesupport-*`, ..., or the Rails git checkout
+/// `bundler/gems/rails-<revision>`) is error[gem_requires_rails], raised
+/// at boot.
 fn gem_source_dependency_block(app: &App) -> String {
     let (all_native, framework) = gem_source_dependencies(app);
     let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
@@ -3563,7 +3565,7 @@ fn gem_source_dependency_block(app: &App) -> String {
          end\n  \
          loaded = $LOADED_FEATURES.size\n  \
          require feature\n  \
-         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d}) }\n  \
+         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
          end\n",
     );
@@ -7964,6 +7966,11 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
 /// `runtime/gem_facades.rb` requires it before its guarded requires. A
 /// missing checkout is a warning naming the gem, source and revision: the
 /// guarded require would otherwise swallow it as a quiet LoadError.
+/// The gems of the Rails repository, as a Ruby `%w[]` literal: their git
+/// checkout activates (`runtime/git_gems.rb`) but none of their files
+/// load, since the runtime ports stand in for them.
+const RAILS_REPOSITORY_GEMS_RUBY: &str = "%w[rails railties activesupport activemodel activerecord activejob activestorage actionpack actionview actioncable actionmailer actionmailbox actiontext]";
+
 fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
     let Some(lock) = lock else { return };
     // The needed gems' whole dependency closure, not only the needed gems
@@ -8005,8 +8012,19 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
            # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).\n  \
            spec.extension_dir = File.join(File.dirname(dir), \"extensions\", Gem::Platform.local.to_s,\n    \
              Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join(\"-\"))\n  \
-           spec.activate\n\
-         end\n"
+           spec.activate\n  \
+           # Rails' own components are activated, so a gem that depends on\n  \
+           # one resolves, but their files are taken off $LOAD_PATH: Rails'\n  \
+           # code cannot run over this tree's runtime ports (the ports\n  \
+           # answer for Rails). A gem's optional Rails integration then\n  \
+           # sees a LoadError, as it would without Rails — hashie's\n  \
+           # `require 'rails/railtie' if defined?(::Rails)` loaded the real\n  \
+           # railties, and actionpack-xml_parser then the real ActionDispatch.\n  \
+           next unless {rails}.include?(name)\n  \
+           paths = spec.full_require_paths\n  \
+           $LOAD_PATH.reject! {{ |path| paths.include?(path) }}\n\
+         end\n",
+        rails = RAILS_REPOSITORY_GEMS_RUBY
     );
     files.push(("runtime/git_gems.rb".to_string(), body));
     let facades = &mut files[idx].1;
