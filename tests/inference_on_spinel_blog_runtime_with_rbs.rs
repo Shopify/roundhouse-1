@@ -529,7 +529,7 @@ fn qualified_finder_signatures_seed_contexts_and_results() {
         let (_, lc) = classes.iter().find(|(_, lc)| lc.name.0.as_str() == class &&
             lc.methods.iter().any(|m| m.name.as_str() == method)).expect("runtime class/method");
         let method = lc.methods.iter().find(|m| m.name.as_str() == method).unwrap();
-        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::new());
+        let ctx = build_method_ctx(&lc.name, method, &sigs, &HashMap::default());
         for (name, ty) in expected {
             assert_eq!(ctx.local_bindings.get(&Symbol::new(name)), Some(&ty), "{class}.{name}");
         }
