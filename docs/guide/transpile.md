@@ -217,12 +217,16 @@ what they do natively:
   or raises sorbet's `TypeError`, message and `Caller:` line included.
   The type is checked as sorbet 0.6.13502 does: the outer class
   (`is_a?`), `T.nilable` as nil-or, `T.any` as any-of, `T::Boolean` as
-  true/false, `T.class_of`, and the stdlib generics (`T::Array[X]`, ...)
-  and user generics by their outer class only. A check that cannot fail
+  true/false, `T.class_of`, a hash shape (`{a: X, "b" => Y}`, sorbet's
+  `FixedHash`) as a Hash whose declared keys' values pass (an absent key
+  reads nil or the hash's default) with no other key, and the stdlib
+  generics (`T::Array[X]`, ...) and user generics by their outer class
+  only. A check that cannot fail
   (`T.untyped`, `checked: false`, `T.let(nil, T.nilable(X))`,
   `T.let([], T::Array[X])`) is the value alone. A type the check cannot
   rebuild faithfully (`T.proc`, `T.self_type`, `T.attached_class`, type
-  parameters, `T.all`, tuple and hash shapes, sorbet's own constants
+  parameters, `T.all`, tuple shapes, a hash shape keyed by anything but
+  a symbol or string literal, sorbet's own constants
   such as `T::Struct`) is refused at the site by name. A type alias
   (`X = T.type_alias { T }` in a library class, model, test or module
   body) that a check reads (directly or through another alias) is
@@ -231,13 +235,15 @@ what they do natively:
   check as sorbet's `aliased_type` is and unwrapped wherever a type is
   read (a union of aliases names their flattened members); the analysis
   reads the declared type through it. Still dropped, so their sites keep
-  the refusal: aliases whose type is a form above (shapes, procs), aliases
+  the refusal: aliases whose type is a form above (tuples, procs), aliases
   in controller bodies or `class << self`, and the blockless
-  `T.type_alias(T)`. A file-level alias outside any class is emitted in
-  the file's first class, so it does not resolve elsewhere. The other
+  `T.type_alias(T)`. A file-level alias outside any class is written at
+  the top level of its file, like every file-level constant (see below), but
+  the analysis expands it only inside the file's first class. The other
   targets (spinel, roda and the strict ones) refuse the check by name
   (`sorbet type check not supported`) rather than drop it.
-  `tests/author_casts_run.rs` compares every result and message with
+  `tests/author_casts_run.rs` and `tests/sorbet_fixed_hash_run.rs`
+  compare every result and message with
   the native run on Core's sorbet-runtime.
 - The type a cast declares still types the analysis, and
   `roundhouse check` trusts it. Lowerings do not fold a value-dependent
@@ -268,6 +274,20 @@ What remains is a `const` or `prop` on a base class from a gem: nothing
 in the tree says that DSL is a typed prop rather than some other one,
 and guessing from the method name would rewrite calls that were never
 props.
+
+A constant a file writes at file level, outside every class and
+module, is Object's in Ruby, and a bare read from any class in any
+file finds it. The Ruby trees write it at the top level of the
+emitted file of that source file's first class, ahead of the class
+where the source had it ahead of the first declaration and after it
+otherwise; that file then loads at boot. A file with no class or
+module declaration has no such carrier unless it declares a factory
+class (`X = Struct.new(...) do … end`): its other constants, such as
+a class alias `RemoteDomain = DomainSubscription` or a blockless
+`Pair = Struct.new(:a, :b)`, are not carried, and a read of one is
+refused as `constant not supported`. The strict targets keep the
+constant on the first class. `tests/file_level_constants_run.rs`
+compares the CRuby tree with the native run.
 
 The server targets all serve the app on `http://localhost:3000` (`PORT`
 overrides), with Action Cable at `/cable`, against a SQLite file at

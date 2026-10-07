@@ -204,6 +204,7 @@ fn factory_class(
         });
     }
     Ok(LibraryClass {
+        top_level_constants: Vec::new(),
         name: owner,
         is_module: false,
         parent: Some(ClassId(Symbol::from(generator))),

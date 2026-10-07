@@ -277,6 +277,7 @@ mod tests {
         };
         let out = transform_method(m);
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("Acc")),
             is_module: true,
             parent: None,
@@ -330,6 +331,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("Acc")),
             is_module: true,
             parent: None,
@@ -387,6 +389,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("Views::Articles")),
             is_module: true,
             parent: None,
@@ -441,6 +444,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("A")),
             is_module: true,
             parent: None,
@@ -499,6 +503,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("B")),
             is_module: true,
             parent: None,
@@ -549,6 +554,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(s("F")),
             is_module: true,
             parent: None,

@@ -20,11 +20,14 @@
 //!   their arguments only spell the message;
 //! - a user generic `Foo[X]` is `Foo`: `T::Generic#[]` answers `self`;
 //! - `T.class_of(C)` is `C.singleton_class`; `T.untyped` / `T.anything`
-//!   accept everything.
+//!   accept everything;
+//! - a hash shape `{a: X, "b" => Y}` is sorbet's `FixedHash`: a Hash
+//!   whose every declared key's value passes its type (an absent key
+//!   reads nil) and which has no other key.
 //!
 //! A form sorbet checks some other way, or that names sorbet-runtime's
 //! own constants (`T.proc`, `T.self_type`, `T.attached_class`,
-//! `T.type_parameter`, `T.all`, shapes, ...), is refused at the site by
+//! `T.type_parameter`, `T.all`, tuple shapes, ...), is refused at the site by
 //! name ("sorbet type check"), never skipped. A check that provably
 //! passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
 //! `T::Array[...]`, ...) is the value alone, as is `checked: false`.
@@ -66,6 +69,15 @@ enum SorbetType {
     Any(Vec<SorbetType>),
     Generic { label: &'static str, outer: &'static [&'static str], args: Vec<SorbetType> },
     ClassOf(Expr),
+    /// `{a: Integer, "b" => String}`: sorbet's `T::Types::FixedHash`,
+    /// which checks each declared key's value and admits no other key.
+    FixedHash(Vec<(ShapeKey, SorbetType)>),
+}
+
+/// A shape's key, as written: sorbet keys the hash by the literal.
+enum ShapeKey {
+    Sym(String),
+    Str(String),
 }
 
 impl SorbetType {
@@ -234,11 +246,12 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
             .map(|segments| segments.join("::"));
         return Ok(Ok(SorbetType::Module(super::expr::ingest_expr(node, file)?, name)));
     }
+    if let Some(hash) = node.as_hash_node() {
+        return read_shape(&hash, file);
+    }
     let Some(call) = node.as_call_node() else {
         let shape = if node.as_array_node().is_some() {
             "is a tuple shape, which sorbet checks member by member"
-        } else if node.as_hash_node().is_some() {
-            "is a hash shape, which sorbet checks key by key"
         } else {
             "is not a type expression this check reads"
         };
@@ -319,6 +332,31 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
         return Ok(Ok(SorbetType::Module(super::expr::ingest_expr(&receiver, file)?, name)));
     }
     Ok(Err(format!("`{}` is not a type expression this check reads", text())))
+}
+
+/// A hash shape: each key a plain symbol or string literal (what sorbet
+/// keys `FixedHash#types` by), each value a type this check reads.
+fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+    let text = || String::from_utf8_lossy(hash.location().as_slice()).into_owned();
+    let mut fields = Vec::new();
+    for element in hash.elements().iter() {
+        let Some(assoc) = element.as_assoc_node() else {
+            return Ok(Err(format!("`{}` splats a hash into a shape", text())));
+        };
+        let key = assoc.key();
+        let key = if let Some(sym) = key.as_symbol_node() {
+            ShapeKey::Sym(String::from_utf8_lossy(sym.unescaped()).into_owned())
+        } else if let Some(string) = key.as_string_node() {
+            ShapeKey::Str(String::from_utf8_lossy(string.unescaped()).into_owned())
+        } else {
+            return Ok(Err(format!("`{}` has a key that is not a symbol or string literal", text())));
+        };
+        match read_type(&assoc.value(), file)? {
+            Ok(ty) => fields.push((key, ty)),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    Ok(Ok(SorbetType::FixedHash(fields)))
 }
 
 /// `T.proc`, or a builder chain on it (`T.proc.params(...).returns(...)`).
@@ -423,6 +461,42 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
         ("nilable", [inner]) => Some(Ty::Union { variants: vec![type_object_ty(inner)?, Ty::Nil] }),
         ("any", members) => Some(Ty::Union { variants: members.iter().map(type_object_ty).collect::<Option<_>>()? }),
         ("class_of", [class]) => Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(const_name(class)?.as_str())), args: Vec::new() }),
+        // A symbol-keyed shape is the record `sorbet_sig` reads `{a: X}`
+        // as; one with a string key is the `T::Hash` sorbet widens a
+        // shape to (`FixedHash#subtype_of_single?`), keys and values
+        // each the union of theirs.
+        ("fixed_hash", [hash]) => {
+            let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
+            let mut fields = indexmap::IndexMap::new();
+            let mut keys: Vec<Ty> = Vec::new();
+            let mut values: Vec<Ty> = Vec::new();
+            let mut all_symbols = true;
+            for (key, value) in entries {
+                let value = type_object_ty(value)?;
+                let key_ty = match &*key.node {
+                    ExprNode::Lit { value: Literal::Sym { value: key } } => {
+                        fields.insert(key.clone(), value.clone());
+                        Ty::Sym
+                    }
+                    ExprNode::Lit { value: Literal::Str { .. } } => {
+                        all_symbols = false;
+                        Ty::Str
+                    }
+                    _ => return None,
+                };
+                if !keys.contains(&key_ty) {
+                    keys.push(key_ty);
+                }
+                if !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+            if all_symbols {
+                return Some(Ty::Record { row: crate::ty::Row { fields, rest: None } });
+            }
+            let union = |mut tys: Vec<Ty>| if tys.len() == 1 { tys.remove(0) } else { Ty::Union { variants: tys } };
+            Some(Ty::Hash { key: Box::new(union(keys)), value: Box::new(union(values)) })
+        }
         ("generic", [label, _outer, rest @ ..]) => {
             let ExprNode::Lit { value: Literal::Str { value: label } } = &*label.node else { return None };
             let args: Vec<Ty> = rest.iter().map(type_object_ty).collect::<Option<_>>()?;
@@ -457,6 +531,20 @@ fn type_expr(ty: &SorbetType) -> Expr {
             send(helper(), "generic", all)
         }
         SorbetType::ClassOf(expr) => send(helper(), "class_of", vec![expr.clone()]),
+        SorbetType::FixedHash(fields) => {
+            let entries = fields
+                .iter()
+                .map(|(key, ty)| {
+                    let key = match key {
+                        ShapeKey::Sym(name) => Literal::Sym { value: Symbol::from(name.as_str()) },
+                        ShapeKey::Str(name) => Literal::Str { value: name.clone() },
+                    };
+                    (Expr::new(Span::synthetic(), ExprNode::Lit { value: key }), type_expr(ty))
+                })
+                .collect();
+            let hash = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
+            send(helper(), "fixed_hash", vec![hash])
+        }
     }
 }
 
@@ -576,6 +664,8 @@ pub(crate) fn settle_type_aliases(app: &mut crate::App) {
     let unread = |name: &Symbol, value: &Expr| is_alias(value) && !read.contains(name);
     for lc in &mut app.library_classes {
         lc.constants.retain(|(name, value)| !unread(name, value));
+        let kept: crate::det::HashSet<Symbol> = lc.constants.iter().map(|(name, _)| name.clone()).collect();
+        lc.top_level_constants.retain(|c| kept.contains(&c.name));
     }
     for tm in &mut app.test_modules {
         tm.constants.retain(|(name, value)| !unread(name, value));

@@ -5959,6 +5959,7 @@ fn synthesize_module_lc(
         })
         .collect();
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: module_id,
         is_module: true,
         parent: None,
@@ -6042,6 +6043,9 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    if !lc.top_level_constants.is_empty() {
+        return emit_with_top_level_constants(lc, app, out_path, synthesized_siblings);
+    }
     let name = lc.name.0.as_str();
     let out_dir = out_path
         .parent()
@@ -6499,6 +6503,80 @@ fn emit_library_class_decl_inner(
     }
 
     EmittedFile { path: out_path, content: s }
+}
+
+/// `lc`'s file with the source's FILE-level constants (see
+/// `LibraryClass::top_level_constants`) written at the top level, around
+/// the class: Ruby binds them on Object, so a bare read from any class
+/// in any file finds them. Written inside the class they were
+/// `Owner::NAME`, and every reader outside `Owner` raised NameError.
+/// Those the source wrote ahead of its first declaration come first,
+/// the rest after the class, so each runs where the source ran it.
+///
+/// A line at the top level ahead of the class header also makes this a
+/// boot file for the autoloader (`autoload_primary`), which is what a
+/// constant nothing names a file for needs: it exists from boot.
+fn emit_with_top_level_constants(
+    lc: &LibraryClass,
+    app: &App,
+    out_path: PathBuf,
+    synthesized_siblings: &[(String, String)],
+) -> EmittedFile {
+    let top: crate::det::HashSet<&str> =
+        lc.top_level_constants.iter().map(|c| c.name.as_str()).collect();
+    let mut class = lc.clone();
+    class.constants.retain(|(name, _)| !top.contains(name.as_str()));
+    class.top_level_constants.clear();
+    let inner = emit_library_class_decl_inner(&class, app, out_path.clone(), synthesized_siblings);
+
+    let out_dir = out_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let self_anchor = out_path.with_extension("").to_string_lossy().into_owned();
+    let value_of = |name: &Symbol| lc.constants.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+    // A top-level initializer runs at load, so what it names is loaded
+    // first, exactly as for a class-body constant.
+    let mut requires: BTreeSet<String> = BTreeSet::new();
+    for c in &lc.top_level_constants {
+        let Some(value) = value_of(&c.name) else { continue };
+        let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+        walk_const_paths(value, &mut paths);
+        for p in &paths {
+            if let Some(anchor) = require_path_for_body_const(p, app, "") {
+                if anchor != self_anchor {
+                    requires.insert(relpath(&out_dir, &anchor));
+                }
+            }
+        }
+    }
+    let render = |s: &mut String, after: bool| {
+        for c in lc.top_level_constants.iter().filter(|c| c.after_declarations == after) {
+            let Some(value) = value_of(&c.name) else { continue };
+            let rendered = super::emit_expr(value);
+            match rendered.lines().next() {
+                Some(_) => writeln!(s, "{} = {rendered}", c.name.as_str()).unwrap(),
+                None => writeln!(s, "{} = nil", c.name.as_str()).unwrap(),
+            }
+        }
+    };
+    let mut s = String::new();
+    for r in &requires {
+        writeln!(s, "require_relative {r:?}").unwrap();
+    }
+    if !requires.is_empty() {
+        writeln!(s).unwrap();
+    }
+    let before = s.len();
+    render(&mut s, false);
+    if s.len() > before {
+        writeln!(s).unwrap();
+    }
+    s.push_str(&inner.content);
+    let mut tail = String::new();
+    render(&mut tail, true);
+    if !tail.is_empty() {
+        writeln!(s).unwrap();
+        s.push_str(&tail);
+    }
+    EmittedFile { path: inner.path, content: s }
 }
 
 /// For each of `lc`'s constants, the requires (as `resolve` spells them

@@ -87,18 +87,13 @@ pub fn ingest_library_classes(
     }
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
-    // parser's `rule(:stopword)` reads it. Ruby puts these on Object,
-    // so every class in the file sees them; we hoist them into the
-    // first class instead, ahead of its own constants.
-    //
-    // That is an approximation in exactly one direction: a file-level
-    // constant read UNQUALIFIED from a different file would resolve
-    // under Ruby and won't here. Reading it from inside the owning
-    // class — including from inside a block in its body, which is what
-    // a class-body DSL is — resolves either way, because a block
-    // carries the lexical scope it was written in. The corpus has no
-    // cross-file reader; a new one surfaces as a NameError naming the
-    // constant, not as a silent wrong answer.
+    // parser's `rule(:stopword)` reads it. Ruby binds these on Object, so
+    // every class in every file sees them. They ride on the file's first
+    // class (see `carry_file_constants`), which gives analysis and
+    // lowering a place to type and lower them, and are named in its
+    // `top_level_constants` so the Ruby family writes them at the top
+    // level of that class's file instead of inside the class: written
+    // inside, a reader in another class raised NameError.
     // `Err = Class.new(StandardError)` inside a declaration is a class
     // declaration, so it becomes the `class Err < StandardError; end`
     // it stands for, right after its owner. See `class_new_declaration`.
@@ -114,7 +109,7 @@ pub fn ingest_library_classes(
     // At file level the constant is Object's, not the first class's.
     let mut file_constants = file_level_constants(&root, file)?;
     let mut top_level = Vec::new();
-    file_constants.retain(|(name, value)| match class_new_declaration(&[], name, value) {
+    file_constants.retain(|(name, value, _)| match class_new_declaration(&[], name, value) {
         Some(class) => {
             top_level.push(class);
             false
@@ -122,10 +117,7 @@ pub fn ingest_library_classes(
         None => true,
     });
     if let Some(first) = out.first_mut() {
-        if !file_constants.is_empty() {
-            file_constants.extend(std::mem::take(&mut first.constants));
-            first.constants = file_constants;
-        }
+        carry_file_constants(first, std::mem::take(&mut file_constants));
     }
     // `X = Struct.new(...) do … end` / `X = Data.define(...) do … end`,
     // which the body walks above skip: classes of their own. After the
@@ -139,6 +131,11 @@ pub fn ingest_library_classes(
     // were dropped before this too.
     synthesized.extend(top_level.iter().map(|class| class.name.clone()));
     top_level.append(&mut out);
+    // No class or module declaration: the first class this file still
+    // declares (a factory or `Class.new` constant) carries the rest.
+    if let Some(first) = top_level.first_mut() {
+        carry_file_constants(first, file_constants);
+    }
     // `Sub = Class.new(Err)` inside `module Foo` names `Foo::Err` when
     // this file declares it: Ruby's lexical lookup, innermost scope
     // first. Written in full, the emitted file can require the class
@@ -204,6 +201,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
+        top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
         parent: Some(ClassId(Symbol::from(parent.join("::")))),
@@ -222,19 +220,43 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
 /// order. Only direct program-body statements — anything inside a
 /// class or module body is that declaration's own constant and is
 /// collected by `walk_decl_body`.
+/// Puts a file's top-level constants ahead of `host`'s own and names
+/// them in its `top_level_constants`. See [`LibraryClass::top_level_constants`].
+fn carry_file_constants(host: &mut LibraryClass, constants: Vec<(Symbol, Expr, bool)>) {
+    if constants.is_empty() {
+        return;
+    }
+    let mut carried = Vec::with_capacity(constants.len() + host.constants.len());
+    for (name, value, after_declarations) in constants {
+        host.top_level_constants.push(crate::dialect::TopLevelConstant {
+            name: name.clone(),
+            after_declarations,
+        });
+        carried.push((name, value));
+    }
+    carried.extend(std::mem::take(&mut host.constants));
+    host.constants = carried;
+}
+
+/// The program body's constant writes, each with whether a class or
+/// module declaration precedes it in the file.
 fn file_level_constants(
     root: &ruby_prism::Node<'_>,
     file: &str,
-) -> IngestResult<Vec<(Symbol, Expr)>> {
+) -> IngestResult<Vec<(Symbol, Expr, bool)>> {
     let mut out = Vec::new();
     let Some(prog) = root.as_program_node() else {
         return Ok(out);
     };
+    let mut after_declarations = false;
     for stmt in prog.statements().body().iter() {
+        if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
+            after_declarations = true;
+        }
         let Some(cw) = stmt.as_constant_write_node() else { continue };
         if is_sorbet_type_alias(&cw.value()) {
             if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
-                out.push((Symbol::from(constant_id_str(&cw.name())), value));
+                out.push((Symbol::from(constant_id_str(&cw.name())), value, after_declarations));
             }
             continue;
         }
@@ -244,6 +266,7 @@ fn file_level_constants(
         out.push((
             Symbol::from(constant_id_str(&cw.name())),
             ingest_expr(&cw.value(), file)?,
+            after_declarations,
         ));
     }
     Ok(out)
@@ -428,6 +451,7 @@ pub(super) fn library_class_and_struct_base(
     admit_nameless_rest(&mut methods);
     Ok((
         LibraryClass {
+            top_level_constants: Vec::new(),
             name: owner,
             is_module: false,
             parent,
@@ -1156,6 +1180,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         block_param: None,
     });
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: base,
         is_module: false,
         parent: None,
@@ -1247,6 +1272,7 @@ pub(super) fn library_class_from_module_node_with_scope(
     let DeclBody { includes, methods, constants, unknown_calls, class_initializers, .. } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     Ok(LibraryClass {
+        top_level_constants: Vec::new(),
         name: owner,
         is_module: true,
         parent: None,

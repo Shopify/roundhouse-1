@@ -1203,6 +1203,7 @@ fn build_params_class(spec: &ParamsSpec) -> LibraryClass {
     }
 
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: spec.class_id.clone(),
         is_module: false,
         parent: None,

@@ -765,6 +765,7 @@ fn build_library_class(
         methods.push(m);
     }
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: tm.name.clone(),
         is_module: false,
         parent: tm.parent.clone(),

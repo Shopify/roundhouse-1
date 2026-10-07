@@ -1,7 +1,8 @@
 # sorbet-runtime's inline type check, the one `T.let`, `T.cast`,
 # `T.bind` and `T.assert_type!` perform (sorbet-runtime 0.6.13502:
 # lib/types/_types.rb, private/casts.rb, types/base.rb, types/simple.rb,
-# types/union.rb, types/typed_*.rb, types/class_of.rb, utils.rb).
+# types/union.rb, types/typed_*.rb, types/class_of.rb, types/fixed_hash.rb,
+# utils.rb).
 #
 # No tree loads sorbet-runtime, so `ingest::expr` lowers each of those
 # calls to `SorbetRuntimeCheck.cast(value, type, "T.let", path, line)`:
@@ -12,11 +13,11 @@
 #
 # The type argument is a Module, as written, or one of the type objects
 # below, which the ingest builds for `T.nilable`, `T.any`, `T::Boolean`,
-# `T.untyped`, `T.anything`, `T.class_of` and the stdlib generics
+# `T.untyped`, `T.anything`, `T.class_of`, hash shapes and the stdlib generics
 # (`T::Array[X]` and friends, which check the outer class only, as
 # sorbet's `valid?` does). A user generic `Foo[X]` is `Foo` itself:
 # `T::Generic#[]` answers `self`. Type forms the ingest cannot build here
-# (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, shapes)
+# (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, tuples)
 # are refused at the site and never reach this file.
 #
 # `Name = T.type_alias { X }` is carried as
@@ -82,6 +83,11 @@ module SorbetRuntimeCheck
 
     def error_message(obj)
       "Expected type #{name}, got #{describe_obj(obj)}"
+    end
+
+    # `T::Types::Base#to_s`: a type interpolates as its name.
+    def to_s
+      name
     end
   end
 
@@ -262,6 +268,62 @@ module SorbetRuntimeCheck
     end
   end
 
+  # `T::Types::FixedHash`: `{a: Integer, "b" => String}`. Each declared
+  # key's value must pass its type (`obj[key]`, so an absent key reads
+  # nil, or the hash's default), and the hash may hold no other key.
+  class FixedHash
+    include Described
+
+    def initialize(types)
+      @inner_types = types
+    end
+
+    def types
+      @types ||= @inner_types.transform_values { |v| SorbetRuntimeCheck.coerce(v) }
+    end
+
+    def name
+      serialize_hash(types)
+    end
+
+    def valid?(obj)
+      return false unless obj.is_a?(::Hash)
+      field_types = types
+      field_types.each_pair do |key, type|
+        return false unless type.valid?(obj[key])
+      end
+      # Pigeonhole: more entries than declared keys guarantees an undeclared key.
+      return false if obj.size > field_types.size
+      obj.each_key do |key|
+        return false unless field_types.key?(key)
+      end
+      true
+    end
+
+    # `Expected {a: String}, got type {a: TrueClass}`, not `got Hash`.
+    def describe_obj(obj)
+      if obj.is_a?(::Hash)
+        "type #{serialize_hash(obj.transform_values(&:class))}"
+      else
+        super
+      end
+    end
+
+    private
+
+    def serialize_hash(hash)
+      entries = hash.map do |(k, v)|
+        if ::Symbol === k && ":#{k}" == k.inspect
+          "#{k}: #{v}"
+        else
+          "#{k.inspect} => #{v}"
+        end
+      end
+
+      "{#{entries.join(', ')}}"
+    end
+  end
+
   # `T::Private::Types::StringHolder`: the `T::Boolean` stand-in a union
   # name puts in place of TrueClass and FalseClass.
   class Named
@@ -269,6 +331,10 @@ module SorbetRuntimeCheck
 
     def initialize(name)
       @name = name
+    end
+
+    def to_s
+      name
     end
   end
 
@@ -355,6 +421,10 @@ module SorbetRuntimeCheck
 
   def self.class_of(type)
     ClassOf.new(type)
+  end
+
+  def self.fixed_hash(types)
+    FixedHash.new(types)
   end
 
   def self.untyped

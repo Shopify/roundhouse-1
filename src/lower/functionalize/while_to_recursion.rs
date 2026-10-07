@@ -935,6 +935,7 @@ mod tests {
 
         let methods = transform_method(find_method());
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("Finder")),
             is_module: true,
             parent: None,
@@ -1028,6 +1029,7 @@ mod tests {
 
         // Render through the real Elixir walker.
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("Pat")),
             is_module: true,
             parent: None,
@@ -1062,6 +1064,7 @@ mod tests {
         let body = seq(vec![binop_call(table, "length")]);
         let m = method("len", MethodReceiver::Class, &["table"], body);
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("L")),
             is_module: true,
             parent: None,
@@ -1104,6 +1107,7 @@ mod tests {
         // Run the full functionalize pipeline (while→recursion, then
         // mutation-threading) and render.
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("S")),
             is_module: false,
             parent: None,
@@ -1159,6 +1163,7 @@ mod tests {
             syn(ExprNode::SelfRef),
         ]);
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("Sess")),
             is_module: false,
             parent: None,
@@ -1238,6 +1243,7 @@ mod tests {
         );
 
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("Session")),
             is_module: false,
             parent: None,
@@ -1353,6 +1359,7 @@ mod tests {
         let out = transform_method(method("all", MethodReceiver::Class, &[], body));
         assert_eq!(out.len(), 2, "counter-less drain splits into entry + helper");
         let class = LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(sym("M")),
             is_module: true,
             parent: None,

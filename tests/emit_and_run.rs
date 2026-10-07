@@ -2094,8 +2094,8 @@ puts "ok"
         .assert_passes();
 }
 
-/// Ingest hoists a file-level constant into the first class of the
-/// file, but Ruby declares it on Object. The inferred value must belong
+/// Ingest carries a file-level constant on the first class of the
+/// file, and Ruby declares it on Object. The inferred value must belong
 /// to the declaration that the read resolves to.
 #[test]
 fn a_file_level_constant_runs_from_the_class_below_it() {

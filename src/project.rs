@@ -11154,6 +11154,7 @@ mod tests {
 
         let cable = crate::runtime_files::read_to_string("runtime/spinel/action_cable.rb").unwrap();
         let connection_class = |name: &str| LibraryClass {
+            top_level_constants: Vec::new(),
             name: ClassId(Symbol::from(name)),
             is_module: false,
             parent: Some(ClassId(Symbol::from("ActionCable::Connection::Base"))),
@@ -11327,6 +11328,7 @@ mod tests {
             kind: MixinKind::Include,
         });
         modapp.library_classes.push(crate::dialect::LibraryClass {
+            top_level_constants: Vec::new(),
             name: crate::ident::ClassId(Symbol::from("Greetable")),
             is_module: true,
             parent: None,
