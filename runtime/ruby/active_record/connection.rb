@@ -337,6 +337,71 @@ module ActiveRecord
       true
     end
 
+    # inheritance.rb (8.2.0.alpha): `attr_accessor :abstract_class` on the
+    # class, so the value is the declaring class's own ivar and a subclass
+    # of an abstract class is not abstract. The emitted class body replays
+    # `self.abstract_class = true` (emit::ruby::attribute_api).
+    def self.abstract_class
+      @abstract_class
+    end
+    
+    def self.abstract_class=(value)
+      @abstract_class = value
+    end
+    
+    def self.abstract_class?
+      @abstract_class == true
+    end
+    
+    # The model's column name => cast-type spec table. Emitted models
+    # override it from the schema (emit::ruby::attribute_api). The base and
+    # an abstract class have no table, so no columns; any other class
+    # without the override is a model the tree has no schema for, whose
+    # types are unknown rather than empty.
+    def self.schema_column_types
+      return {} if equal?(ActiveRecord::Base) || abstract_class?
+      raise NotImplementedError, "#{name}.type_for_attribute: the tree carries no schema for #{name}"
+    end
+    
+    # attribute_registration.rb (8.2.0.alpha): `attribute_types` is the
+    # name => cast type Hash whose default is `Type.default_value`, and
+    # `type_for_attribute` takes `attribute_name.to_s` (aliases are not
+    # modeled here) and, given a block, fetches with it. The types come from
+    # `schema_column_types`, built once per class and name. An entry the
+    # type port does not carry raises NotImplementedError when asked for,
+    # rather than answering some other type.
+    def self.type_for_attribute(attribute_name, &block)
+      name = attribute_name.to_s
+      spec = schema_column_types[name]
+      if spec.nil?
+        return block ? block.call(name) : ActiveModel::Type.default_value
+      end
+      cache = (@__attribute_types ||= {})
+      cache.fetch(name) { cache[name] = _cast_type_for_spec(name, spec) }
+    end
+    
+    def self.attribute_types
+      types = Hash.new(ActiveModel::Type.default_value)
+      schema_column_types.each_key { |name| types[name] = type_for_attribute(name) }
+      types
+    end
+    
+    def self._cast_type_for_spec(name, spec)
+      kind = spec[0]
+      case kind
+      when :integer then ActiveRecord::Type::Integer.new(limit: spec[1])
+      when :big_integer then ActiveRecord::Type::BigInteger.new
+      when :string then ActiveRecord::Type::String.new(limit: spec[1])
+      when :text then ActiveRecord::Type::Text.new
+      when :boolean then ActiveRecord::Type::Boolean.new
+      when :binary then ActiveRecord::Type::Binary.new
+      when :immutable_string then ActiveRecord::Type::ImmutableString.new
+      when :value then ActiveRecord::Type::Value.new
+      else
+        raise NotImplementedError, "#{self.name}.type_for_attribute(#{name.inspect}): #{spec[1]} is not ported"
+      end
+    end
+    
     # `record.update_column(name, value)` — write one attribute straight
     # to the row, skipping validations and callbacks. Sets the in-memory
     # value via the `[]=` indexer, then persists via the same adapter

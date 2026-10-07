@@ -34,8 +34,10 @@
 #   no zone), so every time casts in UTC.
 # - The type registries (`ActiveModel::Type.lookup` / `register`,
 #   ActiveRecord's AdapterSpecificRegistry) and the other types (Date,
-#   Time, Decimal, Float, Json, Serialized) are not
-#   ported. No code the tree carries reaches them yet.
+#   Time, Decimal, Float, Json, Serialized) are not ported; type.rb's
+#   `default_value` is. No code the tree carries reaches them yet: the
+#   runtime's `type_for_attribute` raises NotImplementedError for a
+#   column whose type is not here.
 # - Binary::Data#as_json answers String#as_json's value (the string
 #   itself) where the tree does not define String#as_json.
 # - SerializeCastValue extends its ClassMethods in `included`, which is
@@ -58,8 +60,13 @@ module ActiveModel
   class RangeError < ::RangeError
   end
 
-  module Type
-    module SerializeCastValue # :nodoc:
+module Type
+  # type.rb: the registry's fallback cast type, one shared Value.
+  def self.default_value # :nodoc:
+    @default_value ||= Value.new
+  end
+
+  module SerializeCastValue # :nodoc:
       module ClassMethods
         def serialize_cast_value_compatible?
           return @serialize_cast_value_compatible if defined?(@serialize_cast_value_compatible)

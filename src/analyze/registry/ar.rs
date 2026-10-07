@@ -116,6 +116,21 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         for m in ["sanitize_sql", "sanitize_sql_array"] {
             base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
         }
+        // The attribute API a model shares, read through a receiver cast
+        // to the base (`#: self as singleton(ActiveRecord::Base)` in a
+        // concern's `class_methods`, Core's ModelUuidColumns). The model
+        // registry seeds the same names per model (analyze/mod.rs); the
+        // Ruby-family runtime answers them on Base itself
+        // (connection.rb), and every emitted model overrides `[]`/`[]=`.
+        base.class_methods.entry(Symbol::from("abstract_class?")).or_insert(Ty::Bool);
+        base.class_methods.entry(Symbol::from("abstract_class")).or_insert(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] });
+        base.class_methods.entry(Symbol::from("abstract_class=")).or_insert(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] });
+        for m in ["type_for_attribute", "attribute_types"] {
+            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
+        }
+        for m in ["[]", "[]="] {
+            base.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
+        }
     }
 
     // CollectionProxy — the runtime helper transpiled models use

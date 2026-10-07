@@ -635,6 +635,12 @@ fn report_unclaimed_unknowns(model: &Model) {
                 continue;
             }
         }
+        // `self.abstract_class = true|false` — read by
+        // markers::is_abstract_class for synthesis and replayed into the
+        // Ruby-family class body by emit::ruby::attribute_api.
+        if self::markers::literal_abstract_class_write(expr).is_some() {
+            continue;
+        }
         // A bare visibility keyword is a marker for the `def`s after
         // it (the method walk reads it as one); it is not a DSL call.
         if matches!(name, "private" | "protected" | "public") {

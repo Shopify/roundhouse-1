@@ -272,25 +272,45 @@ fn is_primary_abstract_class(model: &Model) -> bool {
 /// requires a concrete includer; production separately checks whether
 /// the model is a primary base before suppressing inherited methods.
 pub(crate) fn is_abstract_class(model: &Model) -> bool {
-    let mut abstract_class = false;
+    abstract_class_setting(model) == Some(true)
+}
+
+/// The value the class body last gave `abstract_class`, from literal
+/// markers only: `self.abstract_class = true|false`, or
+/// `primary_abstract_class` (which sets it true). `None` when the body
+/// never sets it, so `abstract_class` reads nil as in Rails.
+pub(crate) fn abstract_class_setting(model: &Model) -> Option<bool> {
+    let mut abstract_class = None;
     for item in &model.body {
         if let ModelBodyItem::Unknown { expr, .. } = item {
             if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
                 if args.is_empty() && method.as_str() == "primary_abstract_class" {
-                    abstract_class = true;
+                    abstract_class = Some(true);
                 }
-            } else if let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node {
-                if matches!(&*recv.node, ExprNode::SelfRef) && method.as_str() == "abstract_class=" {
-                    if let [arg] = args.as_slice() {
-                        if let ExprNode::Lit { value: Literal::Bool { value } } = &*arg.node {
-                            abstract_class = *value;
-                        }
-                    }
-                }
+            } else if let Some(value) = literal_abstract_class_write(expr) {
+                abstract_class = Some(value);
             }
         }
     }
     abstract_class
+}
+
+/// `self.abstract_class = <true|false>`: the literal write the class
+/// body replays (see `emit::ruby::attribute_api`).
+pub(crate) fn literal_abstract_class_write(expr: &Expr) -> Option<bool> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+        return None;
+    };
+    if !matches!(&*recv.node, ExprNode::SelfRef) || method.as_str() != "abstract_class=" {
+        return None;
+    }
+    match args.as_slice() {
+        [arg] => match &*arg.node {
+            ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// `attr_accessor :vote` / `attr_reader :x` / `attr_writer :y` on a model

@@ -530,6 +530,9 @@ pub fn shakeable_synthesized_names(table: &Table, model: &Model) -> Vec<Symbol> 
     }
     // Mirrors `synth_update_typed(.., bang: true)`.
     names.push(Symbol::from("update!"));
+    // The Ruby family's per-model type table (`emit::ruby::attribute_api`),
+    // read only by the runtime's `type_for_attribute`.
+    names.push(Symbol::from("schema_column_types"));
     names
 }
 

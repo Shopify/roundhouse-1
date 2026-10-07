@@ -39,6 +39,13 @@ module ActiveRecord
     def self.upsert_all: (Array[Hash[Symbol, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer
     def self.record_timestamps=: (bool value) -> bool
     def self.record_timestamps: () -> bool
+    def self.abstract_class: () -> bool?
+    def self.abstract_class=: (bool? value) -> bool?
+    def self.abstract_class?: () -> bool
+    def self.schema_column_types: () -> Hash[String, Array[untyped]]
+    def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> untyped } -> untyped
+    def self.attribute_types: () -> Hash[String, untyped]
+    def self._cast_type_for_spec: (String name, Array[untyped] spec) -> untyped
     def update_column: (String | Symbol name, untyped value) -> bool
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
