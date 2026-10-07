@@ -703,7 +703,14 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         app.models.push(model);
                         // Classes nested in the model's body are classes
                         // of their own, exactly as under `app/models`.
-                        if let Ok(classes) = ingest_library_classes(&source, &path_str) {
+                        let classes = match ingest_library_classes(&source, &path_str) {
+                            Ok(classes) => Some(classes),
+                            Err(err) => {
+                                drop_library_file(&mut app, &path_str, &err);
+                                None
+                            }
+                        };
+                        if let Some(classes) = classes {
                             let nested = nested_under(&outer, classes);
                             let (concern_items, concern_enum_decls) =
                                 ingest_concern_model_items_with_constants(
@@ -735,11 +742,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     }
                     app.library_classes.extend(classes)
                 }
-                Err(err) => {
-                    if survey::is_active() {
-                        survey::record_dropped_file(&err);
-                    }
-                }
+                Err(err) => drop_library_file(&mut app, &path_str, &err),
             }
             // A reopen deferred behind `ActiveSupport.on_load` is
             // invisible to the class finder above (it skips blocks);
@@ -825,11 +828,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         }
                         app.library_classes.extend(classes);
                     }
-                    Err(err) => {
-                        if survey::is_active() {
-                            survey::record_dropped_file(&err);
-                        }
-                    }
+                    Err(err) => drop_library_file(&mut app, &path_str, &err),
                 }
             }
         }
@@ -872,6 +871,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             Err(err) => {
                 if survey::is_active() {
                     survey::record(&err);
+                } else {
+                    push_ingest_drop(&mut app, &file, &err);
                 }
                 Vec::new()
             }
@@ -882,6 +883,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 Err(err) => {
                     if survey::is_active() {
                         survey::record(&err);
+                    } else {
+                        push_ingest_drop(&mut app, &file, &err);
                     }
                     Vec::new()
                 }
@@ -2167,6 +2170,29 @@ end
     super::sources::assert_snapshot_matches(&[], &late_sources);
     app.dropped_files = survey::dropped_files();
     Ok(app)
+}
+
+/// A support-dir file whose library-class ingest failed. The walk goes
+/// on without it; survey mode records the gap in its punch list, and
+/// outside it the file is an `ingest_unsupported` error at the construct
+/// that failed it, not a silent absence.
+fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
+    if survey::is_active() {
+        survey::record_dropped_file(err);
+    } else {
+        push_ingest_drop(app, path, err);
+    }
+}
+
+fn push_ingest_drop(app: &mut App, path: &str, err: &IngestError) {
+    let (start, end) = super::error_site::of(err).unwrap_or((0, 0));
+    let message = match err {
+        IngestError::Unsupported { message, .. } => message.clone(),
+        IngestError::Parse { message, .. } => format!("parse error: {message}"),
+        IngestError::Io(e) => format!("io error: {e}"),
+    };
+    let span = crate::span::Span { file: super::sources::file_id(path), start: start as u32, end: end as u32 };
+    app.ingest_drops.push(crate::app::IngestDrop { span, message });
 }
 
 /// Source subtrees whose binary files are copied into the emitted tree.

@@ -61,7 +61,8 @@ pub fn ingest_library_classes(
     let root = result.node();
     let mut out = Vec::new();
     for (scope, class) in find_all_classes_with_scope(&root) {
-        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)?;
+        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)
+            .map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
         if let Some(base) = struct_base {
@@ -79,9 +80,10 @@ pub fn ingest_library_classes(
         {
             continue;
         }
-        out.push(library_class_from_module_node_with_scope(
-            &module, &scope, file,
-        )?);
+        out.push(
+            library_class_from_module_node_with_scope(&module, &scope, file)
+                .map_err(|err| super::error_site::at(err, &module.as_node()))?,
+        );
     }
     // Constants written at FILE level, outside any class — lobsters'
     // `search_parser.rb` opens with `MYISAM_STOPWORDS = %w[…]` and the
@@ -2366,13 +2368,19 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
         let local = |name: &Symbol| {
             locals.iter().find(|l| &l.name == name).filter(|_| !shadowed.contains(name))
         };
-        let opaque = |l: &BodyLocal, why: &str| IngestError::Unsupported {
+        // The read is the refusal's site.
+        let span = expr.span;
+        let sited = |err: IngestError| {
+            super::error_site::note(&err, span.start as usize, span.end as usize);
+            err
+        };
+        let opaque = |l: &BodyLocal, why: &str| sited(IngestError::Unsupported {
             file: file.into(),
             message: format!(
                 "class-body local `{}` {why}; the constants reading it cannot keep its scope",
                 l.name.as_str()
             ),
-        };
+        });
         if let ExprNode::Send { recv: Some(recv), method, .. } = &mut *expr.node {
             if method.as_str() == "call" {
                 if let ExprNode::Var { name, .. } = &*recv.node {
@@ -2393,14 +2401,14 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
                     Err(why) => return Err(opaque(l, why)),
                 };
                 if l.lambda {
-                    return Err(IngestError::Unsupported {
+                    return Err(sited(IngestError::Unsupported {
                         file: file.into(),
                         message: format!(
                             "class-body lambda `{}` is read other than as the receiver of `.call`; \
                              the constants reading it cannot keep its scope",
                             l.name.as_str()
                         ),
-                    });
+                    }));
                 }
                 *expr = value.clone();
                 return Ok(());
