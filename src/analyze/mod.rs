@@ -465,8 +465,9 @@ impl Analyzer {
         let model_parents: HashMap<&ClassId, Option<&ClassId>> =
             app.models.iter().map(|m| (&m.name, m.parent.as_ref())).collect();
         let belongs_to_wrappers = belongs_to_wrappers(app);
+        let models = merged_reopened_models(&app.models);
 
-        for model in &app.models {
+        for model in models.iter().map(|m| &**m) {
             let self_ty = Ty::Class { id: model.name.clone(), args: vec![] };
             let array_of_self =
                 Ty::Array { elem: Box::new(self_ty.clone()) };
@@ -8534,6 +8535,51 @@ fn register_has_secure_password(
             .entry(Symbol::from(format!("find_by_{attr}_reset_token!")))
             .or_insert(self_ty.clone());
     }
+}
+
+/// One model per class, in first-file order. Ruby reopens a class, and
+/// Core reopens a model in a second file to nest a service under it
+/// (`class AssetPack < CoreGeneral2Record; class InspirationImageIngest`).
+/// Ingest records each such file as a `Model` of its own, and registering
+/// them one by one let the last file's ClassInfo replace the first's: its
+/// columns came back without the `serialize :payload` override, and the
+/// first file's associations and scopes were gone. The merged model has
+/// every file's body items in order. Its table, attributes and key come
+/// from the first file whose table has columns (a reopening that doesn't
+/// repeat `self.table_name` infers the default table), its parent from
+/// the first file that names one, and an enum from the first file that
+/// declares it.
+fn merged_reopened_models(models: &[Model]) -> Vec<std::borrow::Cow<'_, Model>> {
+    use std::borrow::Cow;
+    let mut by_name: HashMap<&ClassId, Vec<&Model>> = HashMap::default();
+    let mut order: Vec<&ClassId> = Vec::new();
+    for m in models {
+        let files = by_name.entry(&m.name).or_default();
+        if files.is_empty() {
+            order.push(&m.name);
+        }
+        files.push(m);
+    }
+    order
+        .into_iter()
+        .map(|name| {
+            let files = &by_name[name];
+            let [only] = files.as_slice() else {
+                let base = files.iter().find(|m| !m.attributes.fields.is_empty()).unwrap_or(&files[0]);
+                let mut merged = (*base).clone();
+                merged.body = files.iter().flat_map(|m| m.body.iter().cloned()).collect();
+                merged.parent = files.iter().find_map(|m| m.parent.clone());
+                merged.primary_key = base.primary_key.clone().or_else(|| files.iter().find_map(|m| m.primary_key.clone()));
+                for m in files {
+                    for (name, labels) in &m.enums {
+                        merged.enums.entry(name.clone()).or_insert_with(|| labels.clone());
+                    }
+                }
+                return Cow::Owned(merged);
+            };
+            Cow::Borrowed(*only)
+        })
+        .collect()
 }
 
 /// Library methods that declare a `belongs_to` named by their first
