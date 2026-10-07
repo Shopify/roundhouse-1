@@ -1322,12 +1322,13 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
             let block_param = block_capture(l.parameters(), file)?;
-            let params = block_param_names(l.parameters());
+            let (params, destructures) = block_param_names(l.parameters(), file)?;
             let mut rest_param = block_rest_param(l.parameters());
             let body = match l.body() {
                 Some(b) => ingest_expr(&b, file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             };
+            let body = open_with_destructures(destructures, body);
             let body = desugar_post_params(&mut rest_param, block_post_params(l.parameters()), body);
             // `->(x) { body }` literals always use brace form (Prism's
             // opening_loc is `{`); `->(x) do body end` exists but isn't
@@ -3122,12 +3123,13 @@ fn ingest_call_block(
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
                 let block_param = block_capture(lam.parameters(), file)?;
-                let params = block_param_names(lam.parameters());
+                let (params, destructures) = block_param_names(lam.parameters(), file)?;
                 let mut rest_param = block_rest_param(lam.parameters());
                 let body = match lam.body() {
                     Some(body) => ingest_expr(&body, file)?,
                     None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
                 };
+                let body = open_with_destructures(destructures, body);
                 let body = desugar_post_params(&mut rest_param, block_post_params(lam.parameters()), body);
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 return Ok(Some(Expr::new(
@@ -3189,12 +3191,13 @@ fn ingest_call_block(
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
     let block_param = block_capture(b.parameters(), file)?;
-    let params = block_param_names(b.parameters());
+    let (params, destructures) = block_param_names(b.parameters(), file)?;
     let mut rest_param = block_rest_param(b.parameters());
     let body = match b.body() {
         Some(body) => ingest_expr(&body, file)?,
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
+    let body = open_with_destructures(destructures, body);
     let body = desugar_post_params(&mut rest_param, block_post_params(b.parameters()), body);
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     Ok(Expr::new(
@@ -3346,20 +3349,78 @@ fn block_capture(params_node: Option<Node<'_>>, file: &str) -> IngestResult<Opti
     }
 }
 
-fn block_param_names(params_node: Option<Node<'_>>) -> Vec<Symbol> {
-    let Some(params_node) = params_node else { return vec![] };
+/// A block's required parameters, with the assignments its body opens
+/// with for the destructuring ones (see `positional_param`).
+fn block_param_names(params_node: Option<Node<'_>>, file: &str) -> IngestResult<(Vec<Symbol>, Vec<Expr>)> {
+    let mut destructures = Vec::new();
+    let Some(params_node) = params_node else { return Ok((vec![], destructures)) };
     if params_node.as_it_parameters_node().is_some() {
-        return vec![Symbol::from("it")];
+        return Ok((vec![Symbol::from("it")], destructures));
     }
-    let Some(bpn) = params_node.as_block_parameters_node() else {
-        return vec![];
+    let Some(pn) = params_node.as_block_parameters_node().and_then(|bpn| bpn.parameters()) else {
+        return Ok((vec![], destructures));
     };
-    let Some(pn) = bpn.parameters() else { return vec![] };
-    pn.requireds()
-        .iter()
-        .filter_map(|req| req.as_required_parameter_node())
-        .map(|rp| Symbol::from(constant_id_str(&rp.name())))
-        .collect()
+    let mut names = Vec::new();
+    for req in pn.requireds().iter() {
+        names.extend(positional_param(&req, &mut destructures, file)?);
+    }
+    Ok((names, destructures))
+}
+
+/// A positional block parameter's name. A destructuring one (`|(k, v),
+/// memo|`) takes a fresh name and adds `k, v = <it>` to `destructures`,
+/// which binds as Ruby's block does (an Array, else `to_ary`, else the
+/// value as the first name). Dropping it left the body reading unbound
+/// `k` and `v` and shifted `memo` onto the pair. Nested and splatting
+/// destructures are refused, not dropped.
+fn positional_param(node: &Node<'_>, destructures: &mut Vec<Expr>, file: &str) -> IngestResult<Option<Symbol>> {
+    if let Some(rp) = node.as_required_parameter_node() {
+        return Ok(Some(Symbol::from(constant_id_str(&rp.name()))));
+    }
+    let Some(mt) = node.as_multi_target_node() else { return Ok(None) };
+    let mut targets = Vec::new();
+    for left in mt.lefts().iter() {
+        let Some(rp) = left.as_required_parameter_node() else {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "nested destructuring block parameter `|(a, (b, c))|`".into(),
+            });
+        };
+        targets.push(crate::expr::LValue::Var {
+            id: crate::ident::VarId(0),
+            name: Symbol::from(constant_id_str(&rp.name())),
+        });
+    }
+    if mt.rest().is_some() || !mt.rights().is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "splatting destructuring block parameter `|(a, *b)|`".into(),
+        });
+    }
+    let span = super::util::node_span(node, file);
+    let mut name = format!("__param_{}", span.start);
+    while super::sources::generated_local_is_reserved(&mt.location(), &name) {
+        name.push('_');
+    }
+    let name = Symbol::from(name);
+    let value = Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+    destructures.push(Expr::new(span, ExprNode::MultiAssign { targets, value }));
+    Ok(Some(name))
+}
+
+/// `body` after the assignments of its destructuring parameters.
+fn open_with_destructures(destructures: Vec<Expr>, body: Expr) -> Expr {
+    if destructures.is_empty() {
+        return body;
+    }
+    let span = body.span;
+    let mut exprs = destructures;
+    if let ExprNode::Seq { exprs: rest } = *body.node {
+        exprs.extend(rest);
+    } else {
+        exprs.push(body);
+    }
+    Expr::new(span, ExprNode::Seq { exprs })
 }
 
 /// The block's REST parameter (`|*args|`), without its sigil.
