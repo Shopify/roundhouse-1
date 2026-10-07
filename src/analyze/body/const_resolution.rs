@@ -77,6 +77,9 @@ pub(crate) struct ConstResolver {
     /// The superclass every `class X < Y` across the sources binds, by
     /// X's full name; `None` where two definitions disagree.
     superclasses: HashMap<Box<str>, Option<Box<str>>>,
+    /// Every name `has_source_namespace` answers yes for, gathered once
+    /// from `files`: the question used to scan every file's answers.
+    source_namespaces: HashSet<Box<str>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -397,7 +400,16 @@ impl ConstResolver {
                 }
             }
         }
-        Self { files, stdlib_namespaces, superclasses, source_fingerprint: source_fingerprint(sources) }
+        let class_definitions: HashSet<&str> =
+            files.iter().flatten().flat_map(|file| file.class_definitions.iter().map(|c| c.as_ref())).collect();
+        let mut source_namespaces: HashSet<Box<str>> =
+            files.iter().flatten().flat_map(|file| file.namespace_definitions.iter().cloned()).collect();
+        for (alias, target) in files.iter().flatten().flat_map(|file| file.runtime_namespace_aliases.iter()) {
+            if class_definitions.contains(alias.as_ref()) {
+                source_namespaces.insert(target.clone());
+            }
+        }
+        Self { files, stdlib_namespaces, superclasses, source_namespaces, source_fingerprint: source_fingerprint(sources) }
     }
 
     fn file(&self, file: FileId) -> Option<&FileAnswers> {
@@ -463,14 +475,10 @@ impl ConstResolver {
         self.file(value.file)?.constant_classes.get(&declaration).cloned()
     }
 
+    /// A source file defines `name` as a class or module, or aliases a
+    /// runtime namespace to it under a name a source class defines.
     pub(crate) fn has_source_namespace(&self, name: &str) -> bool {
-        self.files.iter().flatten().any(|file| file.namespace_definitions.contains(name))
-            || self.files.iter().flatten().any(|file| {
-                file.runtime_namespace_aliases.iter().any(|(alias, target)| {
-                    target.as_ref() == name && self.files.iter().flatten()
-                        .any(|source| source.class_definitions.contains(alias.as_ref()))
-                })
-            })
+        self.source_namespaces.contains(name)
     }
 
     /// Whether Ruby's signatures declare this class or module (a declared

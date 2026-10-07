@@ -2705,6 +2705,14 @@ fn ruby_family_files(
         RubyFlavor::CRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest,
         RubyFlavor::JRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline,
     };
+    // The class-name and constant-reader lookups (`file_owner`,
+    // `library_classes_named`, `constant_readers`) answer from an index
+    // for the whole assembly. `app` is borrowed for the guard's life, so
+    // the index cannot go stale; without it the library passes before
+    // `emit_library_class_decls` installs its own, the layout-controller
+    // emit and the autoload table each scanned every library class per
+    // question, quadratic on the full Core closure.
+    let _indexes = emit::ruby::install_lookup_indexes(app);
     let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
     crate::timings::lap_start();
     if matches!(flavor, RubyFlavor::CRuby) {
