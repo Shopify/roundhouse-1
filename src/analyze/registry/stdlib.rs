@@ -76,6 +76,41 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "ActiveSupport::ErrorReporter::UnexpectedError", &[], &[
         ("message", Ty::Str), ("cause", Ty::Untyped), ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
     ]);
+    // `Rails.backtrace_cleaner` — railties' Rails::BacktraceCleaner over
+    // ActiveSupport::BacktraceCleaner, answered by
+    // runtime/spinel/active_support_backtrace_cleaner.rb (Rails
+    // 8.2.0.alpha), which only the PostgreSQL CRuby tree carries
+    // (`runtime_reads` refuses the read wherever the tree lacks it). A
+    // backtrace is Strings or Thread::Backtrace::Locations, and `clean`
+    // hands its input back whole under ENV["BACKTRACE"], so it is
+    // `Array[untyped]`; `add_filter` / `add_silencer` answer the list.
+    let str_or_nil = || Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+    for (name, parent) in [
+        ("ActiveSupport::BacktraceCleaner", None),
+        ("Rails::BacktraceCleaner", Some("ActiveSupport::BacktraceCleaner")),
+    ] {
+        let cleaner = class(name);
+        let mut class_methods = vec![("new", cleaner.clone())];
+        if parent.is_some() {
+            class_methods.push(("root", str_or_nil()));
+        }
+        register_stdlib_class(classes, name, &class_methods, &[
+            ("clean", untyped_arr()), ("filter", untyped_arr()),
+            ("clean_locations", untyped_arr()), ("clean_frame", str_or_nil()),
+            ("first_clean_frame", str_or_nil()), ("first_clean_location", Ty::Untyped),
+            ("add_filter", untyped_arr()), ("add_silencer", untyped_arr()),
+            ("remove_silencers!", untyped_arr()), ("remove_filters!", untyped_arr()),
+            ("dup", cleaner.clone()), ("clone", cleaner.clone()), ("freeze", cleaner.clone()),
+        ]);
+        if let Some(parent) = parent {
+            if let Some(info) = classes.get_mut(&ClassId(Symbol::from(name))) {
+                info.parent.get_or_insert_with(|| ClassId(Symbol::from(parent)));
+            }
+        }
+    }
+    register_stdlib_class(classes, "Rails", &[
+        ("backtrace_cleaner", class("Rails::BacktraceCleaner")),
+    ], &[]);
     register_stdlib_class(classes, "ActiveSupport::ExecutionContext", &[
         ("set", Ty::Untyped), ("[]=", Ty::Untyped), ("to_h", sym_hash()),
         ("clear", Ty::Nil), ("push", Ty::Untyped), ("pop", Ty::Untyped), ("flush", Ty::Untyped),

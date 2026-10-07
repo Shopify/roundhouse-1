@@ -1,19 +1,30 @@
 # frozen_string_literal: true
 
-# activesupport 8.1.4 lib/active_support/backtrace_cleaner.rb and railties
-# 8.1.4 lib/rails/backtrace_cleaner.rb, with `Rails.backtrace_cleaner`
-# (railties rails.rb:55). Verbatim in behavior: filters run first, in
-# order, then silencers; `dup` copies the filter and silencer lists
-# (initialize_copy) so an app's `Rails.backtrace_cleaner.dup.add_silencer`
-# leaves the shared cleaner alone. The default gem filter and gem/core/
-# stdlib silencers read this process's Gem.path and rubylibdir, as Rails
-# does.
+# activesupport lib/active_support/backtrace_cleaner.rb and railties
+# lib/rails/backtrace_cleaner.rb, with `Rails.backtrace_cleaner` (railties
+# rails.rb:55-57), from the Rails native Core runs: Shopify/rails
+# 5813559f4aed, 8.2.0.alpha (docs/RAILS_VERSION.md). Compared against it by
+# tests/backtrace_cleaner_runtime.rb.
 #
-# The Rails cleaner's root filter strips "#{Rails.root}/". This runtime's
-# Rails.root is the emitted tree root ("."), so the filter strips a
-# leading "./" only; absolute frames from the tree's require_relative
-# chain keep their absolute path, and the app-dirs silencer then silences
-# them as Rails silences any frame outside app/config/lib/test.
+# Filters run first, in order, then silencers. `dup` copies the filter and
+# silencer lists (initialize_copy), so an app's
+# `Rails.backtrace_cleaner.dup.add_silencer { ... }` leaves the shared
+# cleaner alone. The default gem filter and the gem, core and stdlib
+# silencers read this process's Gem.path, Gem.default_dir and rubylibdir,
+# as Rails does.
+#
+# Rails' root filter strips "#{Rails.root}/". Rails.root in a Rails app is
+# absolute: `find_root` answers the realpath of the directory holding
+# config.ru (railties application.rb). This runtime's Rails.root is the
+# emitted tree root written relative, "." (runtime/ruby/rails.rb), and the
+# emitted app runs from it, so `Rails::BacktraceCleaner.root` is the
+# realpath of that directory. A frame of a file the tree requires (an
+# absolute realpath) is then made root-relative, as in Rails.
+#
+# One shape-only difference: Rails wraps each default filter and silencer
+# in `ActiveSupport::Ractors.shareable_proc` (Ractor.shareable_proc on Ruby
+# 4.0), for `config.ractor_shareable`. This runtime has no Ractor support
+# and the procs are plain blocks; what each one answers is the same.
 #
 # CRuby-only (the PostgreSQL tree, `project::apply_postgres_bootstrap`).
 require "rbconfig"
@@ -28,6 +39,8 @@ module ActiveSupport
       add_stdlib_silencer
     end
 
+    # Returns the backtrace after all filters and silencers have been run
+    # against it. Filters run first, then silencers.
     def clean(backtrace, kind = :silent)
       filtered = filter_backtrace(backtrace)
 
@@ -42,10 +55,15 @@ module ActiveSupport
     end
     alias :filter :clean
 
+    # Given an array of Thread::Backtrace::Location objects, returns an
+    # array with the clean ones. Filters and silencers receive the
+    # locations' strings; the locations themselves are returned unchanged.
     def clean_locations(locations, kind = :silent)
       locations.select { |location| clean_frame(location, kind) }
     end
 
+    # Returns the frame with all filters applied, or nil if the frame was
+    # silenced.
     def clean_frame(frame, kind = :silent)
       frame = frame.to_s
       @filters.each do |f|
@@ -62,31 +80,72 @@ module ActiveSupport
       end
     end
 
-    def first_clean_frame(kind = :silent)
-      Thread.each_caller_location(2) do |location|
-        frame = clean_frame(location, kind)
-        return frame if frame
+    if Thread.method(:each_caller_location).arity == 0
+      # Returns the first clean frame of the caller's backtrace, or nil.
+      # Frames are strings.
+      def first_clean_frame(kind = :silent)
+        caller_location_skipped = false
+
+        Thread.each_caller_location do |location|
+          unless caller_location_skipped
+            caller_location_skipped = true
+            next
+          end
+
+          frame = clean_frame(location, kind)
+          return frame if frame
+        end
+      end
+
+      # Returns the first clean location of the caller's call stack, or nil.
+      def first_clean_location(kind = :silent)
+        caller_location_skipped = false
+
+        Thread.each_caller_location do |location|
+          unless caller_location_skipped
+            caller_location_skipped = true
+            next
+          end
+
+          return location if clean_frame(location, kind)
+        end
+      end
+    else
+      # Returns the first clean frame of the caller's backtrace, or nil.
+      # Frames are strings.
+      def first_clean_frame(kind = :silent)
+        Thread.each_caller_location(2) do |location|
+          frame = clean_frame(location, kind)
+          return frame if frame
+        end
+      end
+
+      # Returns the first clean location of the caller's call stack, or nil.
+      def first_clean_location(kind = :silent)
+        Thread.each_caller_location(2) do |location|
+          return location if clean_frame(location, kind)
+        end
       end
     end
 
-    def first_clean_location(kind = :silent)
-      Thread.each_caller_location(2) do |location|
-        return location if clean_frame(location, kind)
-      end
-    end
-
+    # Adds a filter from the block provided. Each line in the backtrace
+    # will be mapped against this filter.
     def add_filter(&block)
       @filters << block
     end
 
+    # Adds a silencer from the block provided. If the silencer returns
+    # true for a given line, it will be excluded from the clean backtrace.
     def add_silencer(&block)
       @silencers << block
     end
 
+    # Removes all silencers, but leaves in the filters.
     def remove_silencers!
       @silencers = []
     end
 
+    # Removes all filters, but leaves in the silencers.
     def remove_filters!
       @filters = []
     end
@@ -117,7 +176,8 @@ module ActiveSupport
       end
 
       def add_stdlib_silencer
-        add_silencer { |line| line.start_with?(RbConfig::CONFIG["rubylibdir"]) }
+        rubylibdir = -RbConfig::CONFIG["rubylibdir"]
+        add_silencer { |line| line.start_with?(rubylibdir) }
       end
 
       def filter_backtrace(backtrace)
@@ -148,16 +208,22 @@ end
 
 module Rails
   class BacktraceCleaner < ActiveSupport::BacktraceCleaner # :nodoc:
-    APP_DIRS_PATTERN = /\A(?:\.\/)?(?:app|config|lib|test|\(\w+(?:-\w+)*\))/
     RENDER_TEMPLATE_PATTERN = /:in [`'].*_\w+_{2,3}\d+_\d+'/
+
+    class << self
+      # "#{Rails.root}/", with Rails.root absolute as in Rails (see the
+      # file note).
+      def root
+        @root ||= Rails.root && "#{File.realpath(Rails.root.to_s)}/".freeze
+      end
+    end
 
     def initialize
       super
       add_filter do |line|
         # We may be called before Rails.root is assigned.
         # When that happens we fallback to not truncating.
-        @root ||= Rails.root && "#{Rails.root}/"
-        @root && line.start_with?(@root) ? line[@root.size..] : line
+        BacktraceCleaner.root && line.start_with?(BacktraceCleaner.root) ? line[BacktraceCleaner.root.size..] : line
       end
       add_filter do |line|
         if RENDER_TEMPLATE_PATTERN.match?(line)
@@ -166,7 +232,15 @@ module Rails
           line
         end
       end
-      add_silencer { |line| !APP_DIRS_PATTERN.match?(line) }
+
+      add_silencer do |line|
+        line.start_with?(File::SEPARATOR, "vendor/", "bin/")
+      end
+    end
+
+    def freeze
+      self.class.root
+      super
     end
 
     def clean(backtrace, kind = :silent)
