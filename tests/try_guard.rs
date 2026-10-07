@@ -240,3 +240,60 @@ fn a_runtime_method_try_keeps_its_type_through_the_guard() {
         "the desugared `blob.caption` must not diagnose as a failed dispatch:\n{errors:#?}"
     );
 }
+
+/// Scale, the shape full Core has: a name with a thousand definers under
+/// one base, and many `try` sites. The cover must still be the one base,
+/// and a name with more unrelated definers than `MAX_ARMS` keeps the nil
+/// guard.
+///
+/// This is also the regression test for a post-analyze stall. Climbing
+/// used to re-check "every descendant answers" for each defining
+/// ancestor by scanning every class in the tree, |definers| * |classes|
+/// * depth^2 per site; on the v3.1 Core slice that held the fused
+/// context rewrites for 13+ minutes. On this fixture the old check made
+/// the debug test take 114 s, with the same output; now it is one
+/// ancestry walk per definer per site and the test takes under a second.
+#[test]
+fn a_thousand_definers_under_one_base_narrow_to_the_base_quickly() {
+    const WIDGETS: usize = 1000;
+    const SITES: usize = 40;
+    let mut owned: Vec<(String, String)> = Vec::new();
+    owned.push((
+        "app/models/widget.rb".into(),
+        "class Widget\n  def title\n    \"w\"\n  end\nend\n".into(),
+    ));
+    for i in 0..WIDGETS {
+        owned.push((
+            format!("app/models/widget{i}.rb"),
+            format!("class Widget{i} < Widget\n  def title\n    \"w{i}\"\n  end\nend\n"),
+        ));
+    }
+    for i in 0..6 {
+        owned.push((
+            format!("app/models/gadget{i}.rb"),
+            format!("class Gadget{i}\n  def label\n    \"g{i}\"\n  end\nend\n"),
+        ));
+    }
+    let mut user = String::from("class User < ApplicationRecord\n");
+    for i in 0..SITES {
+        user.push_str(&format!(
+            "  def show{i}(w, g)\n    [w.try(:title), g.try(:label)]\n  end\n\n"
+        ));
+    }
+    user.push_str("end\n");
+    owned.push(("app/models/user.rb".into(), user));
+    let files: Vec<(&str, &str)> =
+        owned.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    let src = emit(&files);
+    let shown = src.find("def show0").map(|i| &src[i..src.len().min(i + 1500)]).unwrap_or(&src[..src.len().min(1500)]);
+    assert_eq!(
+        src.matches("(w.title if w.is_a?(Widget))").count(),
+        SITES,
+        "every Widget subclass inherits `title` from Widget, so Widget is the one arm:\n{shown}"
+    );
+    assert_eq!(
+        src.matches("g && g.label").count(),
+        SITES,
+        "six unrelated definers is past MAX_ARMS, so the nil guard stays:\n{shown}",
+    );
+}
