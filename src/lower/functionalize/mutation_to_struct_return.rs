@@ -1296,6 +1296,7 @@ mod tests {
     }
     fn render_via_elixir(methods: Vec<MethodDef>) -> String {
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Ctl")),
@@ -1530,6 +1531,7 @@ mod tests {
         // initialize isn't threaded by the pipeline; emit_constructor calls
         // thread_constructor_body itself. Render it through a class.
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Flash")),

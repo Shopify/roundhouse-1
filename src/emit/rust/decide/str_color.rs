@@ -1065,6 +1065,7 @@ mod tests {
 
     fn class(name: &str, methods: Vec<MethodDef>) -> LibraryClass {
         LibraryClass {
+            conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from(name)),

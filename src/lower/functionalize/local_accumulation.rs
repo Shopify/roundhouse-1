@@ -277,6 +277,7 @@ mod tests {
         };
         let out = transform_method(m);
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("Acc")),
@@ -332,6 +333,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("Acc")),
@@ -391,6 +393,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("Views::Articles")),
@@ -447,6 +450,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("A")),
@@ -507,6 +511,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("B")),
@@ -559,6 +564,7 @@ mod tests {
             mutates_self: false,
         };
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(s("F")),

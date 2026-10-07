@@ -935,6 +935,7 @@ mod tests {
 
         let methods = transform_method(find_method());
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Finder")),
@@ -1030,6 +1031,7 @@ mod tests {
 
         // Render through the real Elixir walker.
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Pat")),
@@ -1066,6 +1068,7 @@ mod tests {
         let body = seq(vec![binop_call(table, "length")]);
         let m = method("len", MethodReceiver::Class, &["table"], body);
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("L")),
@@ -1110,6 +1113,7 @@ mod tests {
         // Run the full functionalize pipeline (while→recursion, then
         // mutation-threading) and render.
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("S")),
@@ -1167,6 +1171,7 @@ mod tests {
             syn(ExprNode::SelfRef),
         ]);
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Sess")),
@@ -1248,6 +1253,7 @@ mod tests {
         );
 
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("Session")),
@@ -1365,6 +1371,7 @@ mod tests {
         let out = transform_method(method("all", MethodReceiver::Class, &[], body));
         assert_eq!(out.len(), 2, "counter-less drain splits into entry + helper");
         let class = LibraryClass {
+                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(sym("M")),

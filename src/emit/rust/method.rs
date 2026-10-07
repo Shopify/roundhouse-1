@@ -1035,6 +1035,7 @@ mod tests {
             block_param: Some(Param::positional(blk)),
         };
         let mut class = LibraryClass {
+                            conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from("Holder")),

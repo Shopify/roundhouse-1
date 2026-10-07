@@ -270,6 +270,7 @@ mod tests {
         let mut app = App::new();
         for c in channels {
             app.library_classes.push(crate::dialect::LibraryClass {
+                                         conditional_definitions: Vec::new(),
                 method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: ClassId(Symbol::from(*c)),

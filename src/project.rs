@@ -12093,6 +12093,7 @@ mod tests {
 
         let cable = crate::runtime_files::read_to_string("runtime/spinel/action_cable.rb").unwrap();
         let connection_class = |name: &str| LibraryClass {
+                                                conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from(name)),
@@ -12268,6 +12269,7 @@ mod tests {
             kind: MixinKind::Include,
         });
         modapp.library_classes.push(crate::dialect::LibraryClass {
+                                        conditional_definitions: Vec::new(),
             method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: crate::ident::ClassId(Symbol::from("Greetable")),
