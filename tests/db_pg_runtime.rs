@@ -522,3 +522,24 @@ fn postgres_project_declares_semian_unloaded_only_when_the_app_does() {
     sqlite.gem_lock = Some(lock("  semian (~> 0.27)"));
     assert!(!gemfile(&emitted(&sqlite)).contains("gem \"semian\""));
 }
+
+/// Shopify Core's monorepo_slices: its Ruby needs ActiveSupport, so it is
+/// compiled as app code, and the tree carries the gem only for the native
+/// glob extension that Ruby requires. The Gemfile line never loads the
+/// gem's own entry file.
+#[test]
+fn postgres_project_declares_monorepo_slices_unloaded_for_its_extension() {
+    use roundhouse::project::{target_files, BuildTarget};
+    const LINE: &str = "gem \"monorepo_slices\", \"1.17.0\", require: false";
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let mut app = postgres_model_app();
+    app.gem_lock = Some(roundhouse::gems::Lockfile::parse(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    monorepo_slices (1.17.0)\n    shopify_errors (0.5.0)\n      monorepo_slices\n\nDEPENDENCIES\n  monorepo_slices (~> 1.17)\n  shopify_errors\n",
+    ));
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).unwrap();
+    let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
+    assert_eq!(gemfile.matches(LINE).count(), 1, "{gemfile}");
+    assert!(!files.iter().any(|(p, c)| p.ends_with(".rb")
+        && c.lines().any(|l| l.trim() == "require \"monorepo_slices\"" || l.contains("\"monorepo_slices\",") && l.contains(".each do |gem_name|"))),
+        "an emitted file requires the monorepo_slices entry");
+}

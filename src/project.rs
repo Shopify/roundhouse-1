@@ -2971,11 +2971,18 @@ fn load_hook_registrations(app: &App) -> String {
 /// constants and hook the native Active Record adapter through `on_load`.
 /// So the Gemfile line is `require: false`, written only when the app's
 /// own Gemfile declares the gem.
-const CRUBY_EXTENSION_GEMS: [(&str, &str); 1] = [
+const CRUBY_EXTENSION_GEMS: [(&str, &str); 2] = [
     // runtime/spinel/semian*.rb ports semian's circuit breaker, bulkhead,
     // registry, errors and Active Record PostgreSQL adapter. The bulkhead
     // requires "semian/semian", the gem's SysV semaphore extension.
     ("semian", "0.28.3"),
+    // Shopify Core's slice attribution (shopify_errors). The gem's Ruby
+    // requires ActiveSupport and ActiveModel, so it is compiled as app code
+    // (a gem source), and its entry file still requires
+    // "monorepo_slices/glob_matcher", the gem's Rust glob extension. That
+    // extension defines `MonorepoSlices.match_paths_parallel` and names no
+    // Rails constant (`nm -D`: no rb_const_get or rb_path2class).
+    ("monorepo_slices", "1.17.0"),
 ];
 
 fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Result<(), String> {
