@@ -11,9 +11,11 @@
 # ActiveSupport's full irregular/uncountable tables.
 
 class Object
-  # `blank?`/`present?` (core_ext/object/blank.rb). The generic form
-  # covers nil (!nil → true), false, numerics, and containers via
-  # `empty?`. lobsters calls `present?` ~113 times.
+  # `blank?`/`present?` (core_ext/object/blank.rb). Rails' generic form,
+  # with its NilClass / FalseClass / TrueClass answers folded into the
+  # `!self` tail (Numeric and Time have no `empty?`, so they answer
+  # false as Rails' overrides do; Array, Hash and Symbol answer by
+  # `empty?`). lobsters calls `present?` ~113 times.
   def blank?
     respond_to?(:empty?) ? !!empty? : !self
   end
@@ -93,9 +95,19 @@ class SafeString < String
 end
 
 class String
-  # AS specializes String#blank? to treat whitespace-only as blank.
+  # AS specializes String#blank? to treat whitespace-only as blank,
+  # retrying with the regex in the string's own encoding where the
+  # UTF-8 one cannot read it (UTF-16 and UTF-32), as Rails does.
+  BLANK_RE = /\A[[:space:]]*\z/
+  ENCODED_BLANKS = {}
+
   def blank?
-    empty? || match?(/\A[[:space:]]*\z/)
+    empty? ||
+      begin
+        BLANK_RE.match?(self)
+      rescue Encoding::CompatibilityError
+        (ENCODED_BLANKS[encoding] ||= Regexp.new(BLANK_RE.source.encode(encoding), BLANK_RE.options | Regexp::FIXEDENCODING)).match?(self)
+      end
   end
 
   # `html_safe` promotes to the marked type; plain strings answer

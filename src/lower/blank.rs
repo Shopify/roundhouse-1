@@ -631,9 +631,10 @@ fn try_rewrite(
     // guess that the class has no predicate of its own, made from the
     // app's definitions alone — and a RUNTIME class can have one:
     // `ActionText::Content#blank?` tracks the plain text, where the
-    // runtime helper's `to_s.strip.empty?` would read the markup and
-    // call `<div></div>` present. Such a receiver keeps the dispatch it
-    // always had, which on the ruby family reaches the real method.
+    // spinel tree's runtime helper only reaches an object's `empty?`
+    // (the CRuby/JRuby helper dispatches to `blank?` itself). Such a
+    // receiver keeps the dispatch it always had, which on the ruby
+    // family reaches the real method.
     let builtin_recv = !matches!(
         recv_ty.as_ref().map(non_nil_of),
         Some(Ty::Class { .. }) | None
