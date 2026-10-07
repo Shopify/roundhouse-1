@@ -5118,9 +5118,12 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   # Register `mod`'s children: an autoload for each file, an implicit
   # module for a namespace only other files open. A child already
-  # defined (a runtime class the app reopens) loads its file now, after
-  # its siblings are registered, since nothing will reference it into
-  # loading.
+  # defined (a runtime class the app reopens, or a gem's namespace the
+  # app's file reopens, observe-instrument's `Observe`) loads its file
+  # now, after its siblings are registered, since nothing will reference
+  # it into loading. Its own children are registered first, as Zeitwerk
+  # sets up an already-defined namespace's autoloads at setup: its
+  # file's body may run code that reaches them (`@x = Child.new`).
   def self.register(mod)
     key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
     entries = NAMESPACES[key] or return
@@ -5135,9 +5138,9 @@ const AUTOLOAD_RUNTIME: &str = r##"
       end
     end
     defined.each do |name, file|
-      require path(file) if file
       child = mod.const_get(name, false)
       register(child) if child.is_a?(Module)
+      require path(file) if file
     end
   end
 
