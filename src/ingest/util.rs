@@ -409,17 +409,36 @@ fn body_has_constant_receiver_call(body: Option<Node<'_>>) -> bool {
 /// AdyenApi::Responses::AdyenResponse are included by factory classes;
 /// with the module dropped the include could not resolve and the class
 /// body raised at load. Only the statements a member-less module is
-/// written with count: one holding anything else (a nested declaration,
-/// a DSL call) is a namespace or a module the other rules judge.
+/// written with count: one holding anything else (a DSL call) is a
+/// namespace or a module the other rules judge.
+///
+/// A nested class or module declaration counts only beside a Sorbet
+/// marker (`interface!`, `abstract!`, `sealed!`, `final!`): a sealed
+/// interface that nests its own implementations (Core's
+/// `StorefrontCarts::CartCompletion::CompletionAttempt::State`, `extend
+/// T::Helpers; interface!; sealed!; class Failed; include State; …`) is
+/// still the type its classes include. Those nested classes are ingested
+/// as classes on their own, as under any other module. Without a marker,
+/// a body of declarations is a plain namespace.
 fn is_marker_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return true };
-    flatten_statements(body).iter().all(|stmt| {
+    let stmts = flatten_statements(body);
+    let mut marked = false;
+    let mut nests = false;
+    let all_marker_statements = stmts.iter().all(|stmt| {
+        if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
+            nests = true;
+            return true;
+        }
         let Some(call) = stmt.as_call_node() else { return false };
         if call.receiver().is_some() || call.block().is_some() {
             return false;
         }
         match constant_id_str(&call.name()) {
-            "interface!" | "abstract!" | "sealed!" | "final!" => call.arguments().is_none(),
+            "interface!" | "abstract!" | "sealed!" | "final!" => {
+                marked = true;
+                call.arguments().is_none()
+            }
             "extend" => call.arguments().is_some_and(|a| {
                 a.arguments().iter().all(|arg| {
                     constant_path_segments_strs(&arg)
@@ -428,7 +447,8 @@ fn is_marker_module(body: Option<Node<'_>>) -> bool {
             }),
             _ => false,
         }
-    })
+    });
+    all_marker_statements && (marked || !nests)
 }
 
 /// A module whose whole content is the route-helper mixin — core's
