@@ -2387,6 +2387,9 @@ end
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
     qualify_model_class_method_ar_calls(&mut app);
+    // After the splice: a concern's association names its class
+    // relative to the includer, as Rails' `compute_type` reads it.
+    qualify_association_targets(&mut app);
     // After the splice too: the inverse `has_many …, as: :owner` may be
     // declared in a concern's `included do`.
     resolve_polymorphic_targets(&mut app);
@@ -5219,6 +5222,43 @@ fn qualify_relative_includes(app: &mut App) {
             if let Some(qualified) = resolve(&owner, &path, &known) {
                 let joined = qualified.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                 *inc = crate::ident::ClassId(crate::ident::Symbol::from(joined));
+            }
+        }
+    }
+}
+
+/// Resolve each association's class the way Rails' `compute_type`
+/// does: inside the owner's namespace first, innermost scope out, then
+/// at the top level. `has_one :measurement` on `Shipping::Box` is
+/// `Shipping::Box::Measurement` when that model exists, then
+/// `Shipping::Measurement`, then `Measurement`. A written
+/// `class_name:` is resolved the same way, except a rooted
+/// `"::Measurement"`, which only loses its `::`.
+fn qualify_association_targets(app: &mut App) {
+    use crate::dialect::{Association, ModelBodyItem};
+    use crate::ident::{ClassId, Symbol};
+
+    let models: crate::det::HashSet<String> =
+        app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    for model in &mut app.models {
+        let scope: Vec<String> = model.name.0.as_str().split("::").map(str::to_string).collect();
+        for item in &mut model.body {
+            let ModelBodyItem::Association { assoc, .. } = item else { continue };
+            let (Association::BelongsTo { target, .. }
+            | Association::HasOne { target, .. }
+            | Association::HasMany { target, .. }
+            | Association::HasAndBelongsToMany { target, .. }) = assoc;
+            let written = target.0.as_str();
+            if let Some(rooted) = written.strip_prefix("::") {
+                *target = ClassId(Symbol::from(rooted));
+                continue;
+            }
+            let found = (1..=scope.len())
+                .rev()
+                .map(|depth| format!("{}::{written}", scope[..depth].join("::")))
+                .find(|candidate| models.contains(candidate));
+            if let Some(qualified) = found {
+                *target = ClassId(Symbol::from(qualified));
             }
         }
     }

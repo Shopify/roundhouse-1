@@ -145,8 +145,7 @@ pub(super) fn ingest_model_with_enum_constants(
     // must ingest as `Admin::Report` (the compound `class Admin::Report`
     // spelling already carries its path). Falls back to the scopeless
     // finder for shapes the scoped walk doesn't cover.
-    let (scope, class) = match super::util::find_all_classes_with_scope(&root).into_iter().next()
-    {
+    let (scope, class) = match super::util::primary_class_with_scope(&root) {
         Some((s, c)) => (s, Some(c)),
         None => (Vec::new(), find_first_class(&root)),
     };
@@ -2693,8 +2692,11 @@ fn parse_association(
             let Some(key) = symbol_value(&assoc.key()) else { continue };
             let value = assoc.value();
             match key.as_str() {
-                // `"::Portal"` names the top-level class `Portal`; kept as written it is a class no one defines.
-                "class_name" => class_name = string_value(&value).map(|s| s.trim_start_matches("::").to_string()),
+                // `"::Portal"` names the top-level class `Portal`. Kept as
+                // written: app assembly's `qualify_association_targets`
+                // resolves a relative name in the owner's namespace and
+                // only unroots a rooted one.
+                "class_name" => class_name = string_value(&value),
                 "foreign_key" => {
                     foreign_key = string_value(&value).or_else(|| symbol_value(&value))
                 }
