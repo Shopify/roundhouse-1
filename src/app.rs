@@ -566,6 +566,16 @@ pub struct App {
     /// only Concern would have run (its `append_features` is not emitted).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub class_methods_carrier_splices: HashMap<ClassId, Vec<ClassMethodsCarrierSplice>>,
+    /// The Ruby target's forwarders for a library class's instance-side
+    /// `delegate :m, to: :t`: `def m(...) = t.m(...)`, as Rails generates.
+    /// `ingest::delegate` writes the IR forwarder zero-arg (argument
+    /// forwarding is the shape the strict targets do not lower), and
+    /// that stays the method analysis and the other targets see. The
+    /// Ruby emit writes this one in its place, so a caller in another
+    /// file passing arguments (asset_cloud's `add_error(...)` through
+    /// `delegate :add_error, to: :asset`) reaches the target.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ruby_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
     /// Model DSL declared inside a concern module's `included do`
     /// (`Account::Associations` → its `has_many :statuses` etc.),
     /// keyed by the module and classified as the same
@@ -1255,6 +1265,7 @@ impl App {
             concern_spliced_actions: HashMap::default(),
             concern_spliced_class_methods: HashMap::default(),
             class_methods_carrier_splices: HashMap::default(),
+            ruby_delegate_forwarders: HashMap::default(),
             concern_model_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             render_edges: HashMap::default(),

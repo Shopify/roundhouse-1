@@ -6454,6 +6454,23 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // `delegate :m, to: :t` forwards `(...)` in Ruby; the IR's forwarder
+    // is the zero-arg one the strict targets get (`App::ruby_delegate_forwarders`).
+    let with_full_forwarders;
+    let lc = match app.ruby_delegate_forwarders.get(&lc.name) {
+        Some(full) => {
+            let mut copy = lc.clone();
+            for m in &mut copy.methods {
+                let Some(f) = full.iter().find(|f| f.name == m.name) else { continue };
+                if m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.block_param.is_none() {
+                    *m = crate::dialect::MethodDef { visibility: m.visibility, ..f.clone() };
+                }
+            }
+            with_full_forwarders = copy;
+            &with_full_forwarders
+        }
+        None => lc,
+    };
     // A concern's nested `module ClassMethods` reaches a library-class
     // includer through `extend`, as in Ruby: the authored `included` hook
     // or (written here) ActiveSupport::Concern's `append_features`. The
