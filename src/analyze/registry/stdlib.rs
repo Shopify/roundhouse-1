@@ -675,7 +675,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("to_sym", Ty::Union { variants: vec![Ty::Sym, Ty::Nil] }),
         ("to_s", Ty::Str), ("to_str", Ty::Str), ("inspect", Ty::Str),
         ("hash", Ty::Int), ("==", Ty::Bool), ("eql?", Ty::Bool),
+        ("html?", Ty::Bool), ("all?", Ty::Bool),
     ]);
+    // `Mime::ALL`'s class: the `*/*` wildcard, a Type whose `all?` and
+    // `html?` answer true (actionpack mime_type.rb:433-447).
+    let all_type = Ty::Class { id: ClassId(Symbol::from("Mime::AllType")), args: vec![] };
+    register_stdlib_class(classes, "Mime::AllType", &[("instance", all_type)], &[]);
+    if let Some(all) = classes.get_mut(&ClassId(Symbol::from("Mime::AllType"))) {
+        all.parent.get_or_insert_with(|| ClassId(Symbol::from("Mime::Type")));
+    }
     // `URI.parse` returns a URI object we don't model; `Untyped` lets
     // chained `.scheme` / `.host` flow gradually instead of erroring.
     register_stdlib_class(classes, "URI", &[
