@@ -1149,21 +1149,86 @@ pub fn emit_with_assertions(
             }
             PathBuf::from(format!("test/{}/{stem}_test.rb", test_subdir(lc)))
         };
+        // Every test module gets a file of its own. A class reopened in a
+        // second authored file (`class SecondTest` in pair_test.rb and
+        // again_test.rb, which Ruby merges into one suite) is a second
+        // module with the same name and so the same path, and the second
+        // written silently replaced the first, tests and all. A path
+        // already taken takes the next free `_<n>` suffix, in module
+        // order (authored files sorted, classes in source order).
+        let out_paths: Vec<PathBuf> = {
+            let mut taken: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            test_lowered
+                .iter()
+                .map(|l| {
+                    let base = out_path_of(&l.test_class);
+                    let mut path = base.clone();
+                    let mut n = 2;
+                    while !taken.insert(path.clone()) {
+                        let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("test");
+                        let stem = stem.strip_suffix("_test").unwrap_or(stem);
+                        path = base.with_file_name(format!("{stem}_{n}_test.rb"));
+                        n += 1;
+                    }
+                    path
+                })
+                .collect()
+        };
         // A test class may subclass another the app defines (a base in
         // test_helper.rb: `class Sqlite3QueryHelperTest <
-        // SqliteTestCompat::TestCase`). Its file has to be loaded first.
-        let test_paths: std::collections::HashMap<&str, PathBuf> = test_lowered
-            .iter()
-            .map(|l| (l.test_class.name.0.as_str(), out_path_of(&l.test_class)))
-            .collect();
+        // SqliteTestCompat::TestCase`). Its file has to be loaded first:
+        // the first file that declares it.
+        let mut test_paths: std::collections::HashMap<&str, PathBuf> = std::collections::HashMap::new();
+        for (l, path) in test_lowered.iter().zip(&out_paths) {
+            test_paths.entry(l.test_class.name.0.as_str()).or_insert_with(|| path.clone());
+        }
+        // Minitest runs a test class's inherited `test_` methods too
+        // (`runnable_methods` reads `public_instance_methods(true)`), so
+        // `PermissionGeneratorTest::ValidateInitialTest <
+        // PermissionGeneratorTest` runs the outer class's tests again,
+        // as its own. The driver lists them: own first, then each app
+        // test-class ancestor's, nearest first, each name once.
+        let test_names_of = |lc: &LibraryClass| -> Vec<String> {
+            let own = |lc: &LibraryClass| -> Vec<String> {
+                lc.methods
+                    .iter()
+                    .filter(|m| matches!(m.receiver, MethodReceiver::Instance) && m.name.as_str().starts_with("test_"))
+                    .map(|m| m.name.as_str().to_string())
+                    .collect()
+            };
+            let mut names = own(lc);
+            let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+            let mut current = lc.parent.clone();
+            for _ in 0..32 {
+                let Some(parent) = current.take() else { break };
+                let defs: Vec<&LibraryClass> = test_lowered
+                    .iter()
+                    .map(|l| &l.test_class)
+                    .filter(|c| c.name == parent && c.name != lc.name)
+                    .collect();
+                if defs.is_empty() {
+                    break;
+                }
+                for def in &defs {
+                    for name in own(def) {
+                        if seen.insert(name.clone()) {
+                            names.push(name);
+                        }
+                    }
+                }
+                current = defs[0].parent.clone();
+            }
+            names
+        };
+        let mut index: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
         let test_parents: std::collections::HashSet<&str> = test_lowered
             .iter()
             .filter_map(|l| l.test_class.parent.as_ref().map(|p| p.0.as_str()))
             .collect();
-        for lowered in &test_lowered {
+        assert_eq!(test_lowered.len(), app.test_modules.len(), "one lowered class per test module");
+        for ((lowered, out_path), module) in test_lowered.iter().zip(out_paths).zip(&app.test_modules) {
             let lc = &lowered.test_class;
             let class_name = lc.name.0.as_str();
-            let out_path = test_paths[class_name].clone();
             // Map both `ActiveSupport::TestCase` (Rails app tests) and
             // `Minitest::Test` (framework's own tests) to roundhouse-
             // owned `TestBase` (defined in test_helper.rb). Insulates
@@ -1177,15 +1242,7 @@ pub fn emit_with_assertions(
             // CRuby. Ruby-target-specific rewrite, lives here rather
             // than in the lowerer.
             let mut lc_for_emit = lc.clone();
-            if matches!(
-                &lc.parent,
-                Some(p) if p.0.as_str() == "ActiveSupport::TestCase"
-                    || p.0.as_str() == "Minitest::Test"
-            ) {
-                lc_for_emit.parent = Some(crate::ident::ClassId(
-                    crate::ident::Symbol::from("TestBase"),
-                ));
-            }
+            lc_for_emit.parent = lc.parent.as_ref().map(emitted_test_parent);
             let test_rb_path = out_path.clone();
             let mut emitted = library::emit_library_class_decl_with_synthesized(
                 &lc_for_emit,
@@ -1283,14 +1340,19 @@ pub fn emit_with_assertions(
             emitted.content = format!("{preamble}{}", emitted.content);
             // A base with no tests of its own is loaded by its subclasses'
             // files; a driver there would report on it once per require.
-            let is_bare_base = test_parents.contains(class_name)
-                && lowered.test_class.methods.iter().all(|m| !m.name.as_str().starts_with("test_"));
+            let test_names = test_names_of(lc);
+            let is_bare_base = test_parents.contains(class_name) && test_names.is_empty();
             let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
             if !is_bare_base && minitest {
-                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &reset_lines));
+                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &test_names, &reset_lines));
             } else if !is_bare_base {
-                emitted.content.push_str(&render_autorun_shim(&lc_for_emit, &reset_lines));
+                emitted.content.push_str(&render_autorun_shim(&lc_for_emit, &test_names, &reset_lines));
             }
+            index.entry(module.source_file.clone().unwrap_or_default()).or_default().push(serde_json::json!({
+                "class": class_name,
+                "file": emitted.path.display().to_string(),
+                "tests": if is_bare_base { Vec::new() } else { test_names.clone() },
+            }));
             let rbs_path = emitted.path.clone();
             files.push(emitted);
             // RBS sidecar for the test class — describes the test
@@ -1299,6 +1361,25 @@ pub fn emit_with_assertions(
             // pure type info, the runtime bootstrap doesn't apply.
             files.push(library::emit_rbs_sidecar(&lc_for_emit, &rbs_path));
         }
+        // The emitted test index: each authored test file and the
+        // emitted file, class and test names of every class it declares.
+        // One authored file can become several emitted ones (a file per
+        // class), so a runner given the authored file reads this to run
+        // all of them; a class ingest refused is named in the ingest
+        // ledger and is absent here.
+        let sources: Vec<serde_json::Value> = index
+            .into_iter()
+            .map(|(source, classes)| serde_json::json!({ "source": source, "classes": classes }))
+            .collect();
+        files.push(EmittedFile {
+            path: PathBuf::from("test/roundhouse_tests.json"),
+            content: serde_json::to_string_pretty(&serde_json::json!({
+                "schema": "roundhouse-test-index/v1",
+                "sources": sources,
+            }))
+            .expect("test index json")
+                + "\n",
+        });
     }
 
     // `app/models.rb` aggregator — loads every emitted app/models/*.rb.
@@ -1390,27 +1471,26 @@ fn rbs_only_from_funcs(
 /// against the test); `teardown` runs outside it so it fires whether
 /// or not the body raised, and a raise from teardown itself still
 /// aborts the file rather than being swallowed.
-fn render_minitest_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
-    let methods: Vec<String> = lc.methods.iter()
-        .filter(|m| matches!(m.receiver, MethodReceiver::Instance) && m.name.as_str().starts_with("test_"))
-        .map(|m| format!("{:?}", m.name.as_str())).collect();
-    let mut s = format!("\nRoundhouseTestRunner.run({}, [{}]) do\n", lc.name.0, methods.join(", "));
+/// The CRuby (Minitest-assertion) driver. It runs when this file is the
+/// program, or when the program is a loader rather than an emitted test
+/// (`RoundhouseTestRunner.drive?`): a subclass's file requires its
+/// parent's, and the parent's tests are not the subclass file's to run
+/// (Minitest runs them once under the parent, and again, inherited,
+/// under the subclass, which `test_names` lists).
+fn render_minitest_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[String]) -> String {
+    let methods: Vec<String> = test_names.iter().map(|name| format!("{name:?}")).collect();
+    let mut s = String::from("\nif RoundhouseTestRunner.drive?(__FILE__)\n");
+    writeln!(s, "  RoundhouseTestRunner.run({}, [{}]) do", lc.name.0, methods.join(", ")).unwrap();
     for line in reset_lines {
-        writeln!(s, "  {line}").unwrap();
+        writeln!(s, "    {line}").unwrap();
     }
-    s.push_str("end\n");
+    s.push_str("  end\nend\n");
     s
 }
 
-fn render_autorun_shim(lc: &LibraryClass, reset_lines: &[String]) -> String {
+fn render_autorun_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[String]) -> String {
     let class_name = lc.name.0.as_str();
-    let test_methods: Vec<&str> = lc
-        .methods
-        .iter()
-        .filter(|m| matches!(m.receiver, MethodReceiver::Instance))
-        .map(|m| m.name.as_str())
-        .filter(|n| n.starts_with("test_"))
-        .collect();
+    let test_methods: Vec<&str> = test_names.iter().map(String::as_str).collect();
 
     let mut s = String::from(
         "\n# Spinel AOT autorun shim — see emit/ruby.rs::render_autorun_shim.\n",
@@ -1767,6 +1847,18 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
             .join("\n")
     };
     out.replace(SCAN_BLOCK, &explicit)
+}
+
+/// The superclass an emitted test class declares: `ActiveSupport::
+/// TestCase` and `Minitest::Test` become the harness's `TestBase`, any
+/// other parent is kept.
+pub(crate) fn emitted_test_parent(parent: &crate::ident::ClassId) -> crate::ident::ClassId {
+    match parent.0.as_str() {
+        "ActiveSupport::TestCase" | "Minitest::Test" => {
+            crate::ident::ClassId(crate::ident::Symbol::from("TestBase"))
+        }
+        _ => parent.clone(),
+    }
 }
 
 /// `ArticleTest` → `article`, `ArticlesControllerTest` →

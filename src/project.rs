@@ -2481,6 +2481,7 @@ fn database_configuration_source(app: &App, yml: &crate::database::DatabaseYml) 
 # config/database.yml by runtime/database_configurations.rb. Holds no
 # credentials: the endpoint is ROUNDHOUSE_DATABASE_URL, read at boot.
 require_relative "database_configurations"
+require_relative "active_support_lazy_load_hooks"
 
 module DatabaseConfiguration
   PATH = {path}
@@ -2514,6 +2515,14 @@ module DatabaseConfiguration
 
   def self.configure!
     @configurations, @primary = resolve
+    # Active Record loads the adapter class here (establish_connection ->
+    # resolve_pool_config -> db_config.validate! -> adapter_class), and the
+    # adapter file ends with run_load_hooks (activerecord 8.1.4
+    # postgresql_adapter.rb:1210): once per process, before any connection.
+    unless @adapter_loaded
+      @adapter_loaded = true
+      ActiveSupport.run_load_hooks(:active_record_postgresqladapter, ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+    end
     Db.configure_database("primary", DatabaseConfigurations.connection_entry(@primary, ENV["ROUNDHOUSE_DATABASE_URL"]))
     ActiveRecord.adapter = PostgresAdapter
     Schema.statements.each {{ |sql| Db.exec(sql) }}
@@ -2847,6 +2856,41 @@ fn ruby_family_files(
         ));
         use_ported_time_helpers(&mut files)?;
     }
+    // ActiveSupport's signed and encrypted messages (MessageVerifier,
+    // MessageEncryptor, SecureCompareRotator, KeyGenerator, Messages::*)
+    // with ActiveSupport::JSON's coder, ported from activesupport 8.2.0.alpha
+    // (see the files' headers; tests/messages_runtime.rb holds them to
+    // native ActiveSupport). OpenSSL, Marshal and computed-name dispatch,
+    // so ruby-family only, and carried only where the app's own code
+    // names one of the port's classes. active_support_ext.rb then
+    // requires the port where its InvalidSignature stand-in stood.
+    if carries_active_support_messages(&files) {
+        for name in ["active_support_messages", "active_support_json"] {
+            files.push((
+                format!("runtime/{name}.rb"),
+                crate::runtime_files::read_to_string(&format!("runtime/spinel/{name}.rb"))
+                    .map_err(|e| format!("read runtime/spinel/{name}.rb: {e}"))?,
+            ));
+        }
+        replace_message_verifier_stand_in(&mut files)?;
+    }
+    // ActiveModel's attribute types and ActiveRecord::Type's names over
+    // them (Value, ImmutableString, String, Text, Integer, Boolean,
+    // DateTime), ported from activemodel / activerecord 8.2.0.alpha (see the
+    // file's header; tests/active_model_type_runtime.rb holds it to
+    // native ActiveModel). A Module subclass that defines methods from a
+    // block and ancestor-index dispatch, so ruby-family only, and carried
+    // only where the app's own code names a type: an app that builds its
+    // columns (Core's TablelessSchema) needs the real classes.
+    // gem_facades.rb requires it, before any app file loads.
+    let carries_types = carries_active_model_type(&files);
+    if carries_types {
+        files.push((
+            "runtime/active_model_type.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_model_type.rb")
+                .map_err(|e| format!("read runtime/spinel/active_model_type.rb: {e}"))?,
+        ));
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2942,6 +2986,11 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_time_helpers {
         format!("{gem_facades}require_relative \"active_support_testing_time_helpers\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_types {
+        format!("{gem_facades}require_relative \"active_model_type\"\n")
     } else {
         gem_facades
     };
@@ -3044,6 +3093,17 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read {stem} runtime: {e}"))?;
         files.push((format!("runtime/{stem}.rb"), source));
     }
+    // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
+    // initializer hooks boot registers (`load_hook_registrations`) and the
+    // adapter-load point `DatabaseConfiguration.configure!` fires.
+    let hooks = crate::runtime_files::read_to_string("runtime/spinel/active_support_lazy_load_hooks.rb")
+        .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
+    files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
+    let registrations = load_hook_registrations(app);
+    // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.1.4).
+    let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
+        .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
+    files.push(("runtime/active_support_backtrace_cleaner.rb".into(), cleaner));
     let resolver = crate::runtime_files::read_to_string("runtime/spinel/cruby/database_configurations.rb")
         .map_err(|e| format!("read database configuration resolver: {e}"))?;
     files.push(("runtime/database_configurations.rb".into(), resolver));
@@ -3059,7 +3119,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
-            content.push_str("\nrequire_relative \"runtime/database_configuration\"\n");
+            content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
+            content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
+            content.push_str(&registrations);
+            content.push_str("require_relative \"runtime/database_configuration\"\n");
         }
         if path == "test/test_helper.rb" {
             *content = content.replace("../runtime/sqlite_adapter", "../runtime/postgres_adapter");
@@ -3086,6 +3149,30 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     Ok(())
 }
 
+/// The boot-time registration of each `ActiveSupport.on_load` block the
+/// app's initializers declare (`ingest::on_load_hooks`), in boot order.
+/// Rails registers them as each initializer runs, after the app's code
+/// is loadable; the emitted boot.rb does it after app/models. The block
+/// runs under `class_eval` on the hook's base, so `self` there is the
+/// base the lifted method takes.
+fn load_hook_registrations(app: &App) -> String {
+    if app.load_hooks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's `ActiveSupport.on_load` initializer blocks, registered in\n\
+         # boot order; each body was lifted onto the Application reopen\n\
+         # (ingest::on_load_hooks).\n",
+    );
+    for hook in &app.load_hooks {
+        out.push_str(&format!(
+            "# {}\nActiveSupport.on_load(:{}) {{ Rails.application.{}(self) }}\n",
+            hook.file, hook.hook, hook.method
+        ));
+    }
+    out
+}
+
 /// Gems the PostgreSQL CRuby tree carries on disk but never loads: a
 /// runtime port stands in for the gem's Ruby and requires one native
 /// extension of the gem itself. Each row is the gem and the version the
@@ -3108,7 +3195,7 @@ const CRUBY_EXTENSION_GEMS: [(&str, &str); 2] = [
     ("monorepo_slices", "1.17.0"),
 ];
 
-fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Result<(), String> {
+fn apply_extension_gem_wiring(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
     let Some(lock) = &app.gem_lock else { return Ok(()) };
     let declared: Vec<_> = CRUBY_EXTENSION_GEMS
         .iter()
@@ -3117,6 +3204,7 @@ fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Resu
     if declared.is_empty() {
         return Ok(());
     }
+    apply_extension_gem_load_paths(files, &declared);
     let gemfile = files
         .iter_mut()
         .find(|(path, _)| path == "Gemfile")
@@ -3135,6 +3223,47 @@ fn apply_extension_gem_wiring(files: &mut [(String, String)], app: &App) -> Resu
         ));
     }
     Ok(())
+}
+
+/// The emitted tree runs on plain RubyGems over the pinned gem home, so a
+/// `require: false` Gemfile line does not put anything on the load path.
+/// RubyGems would find the extension by activating the gem, and activation
+/// resolves the gem's runtime dependencies: monorepo_slices names
+/// activemodel and activesupport, which the pinned home has only as the
+/// Rails fork's git checkout, so activation fails, and the tree's ports stand in
+/// for them anyway. So runtime/extension_gems.rb appends each declared
+/// gem's require paths (with its built extension dir) to `$LOAD_PATH`
+/// without activating it, and runtime/gem_facades.rb requires that file
+/// first. Appended, so the tree's own files and every activated gem
+/// still resolve first. A gem missing from the gem home is a warning
+/// naming it, not a quiet LoadError later.
+fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &[&(&str, &str)]) {
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let entries: String = declared
+        .iter()
+        .map(|(gem, version)| format!("  [{gem:?}, {version:?}],\n"))
+        .collect();
+    let body = format!(
+        "# Gems the tree carries only for a native extension of their own\n\
+         # (project.rs::CRUBY_EXTENSION_GEMS): their require paths and built\n\
+         # extension dir, from the gem home, appended to $LOAD_PATH without\n\
+         # activating the gem, so its runtime dependencies are never resolved\n\
+         # and its entry file never loads. Written by\n\
+         # `project.rs::apply_extension_gem_load_paths`.\n\
+         [\n{entries}].each do |name, version|\n  \
+           spec = Gem::Specification.find_all_by_name(name, \"= #{{version}}\").find {{ |s| Gem::Platform.match_spec?(s) }}\n  \
+           if spec.nil?\n    \
+             warn \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
+             next\n  \
+           end\n  \
+           spec.full_require_paths.each {{ |path| $LOAD_PATH << path unless $LOAD_PATH.include?(path) }}\n\
+         end\n"
+    );
+    files.push(("runtime/extension_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"extension_gems\"") {
+        facades.insert_str(0, "require_relative \"extension_gems\"\n");
+    }
 }
 
 /// The JRuby tree's Gemfile: the committed scaffold Gemfile is MRI-only
@@ -5443,7 +5572,9 @@ fn spinel_files_with_assertions(
     // projects, never included by the generic runtime directory walk, and
     // so is the semian port that wraps that driver's adapter.
     files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
-        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb");
+        && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
+        && p != "runtime/active_support_lazy_load_hooks.rb"
+        && p != "runtime/active_support_backtrace_cleaner.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
     // markly contract over commonmark-java (Java interop; conformance
@@ -5470,6 +5601,12 @@ fn spinel_files_with_assertions(
     files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
     files.retain(|(p, _)| p != "runtime/active_support_mem_cache_store.rb");
     files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");
+    // And for the messages port and its JSON coder (OpenSSL, Marshal),
+    // pushed back by the two ruby-family forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
+    // And for the attribute types, pushed back by the two ruby-family
+    // forks where the app names one.
+    files.retain(|(p, _)| p != "runtime/active_model_type.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -6440,7 +6577,15 @@ fn gem_require_block(exclude: &[&str]) -> String {
         .map(|g| format!("{g:?}"))
         .collect();
     let mut out = format!("[{}].each do |gem_name|\n", names.join(", "));
-    out.push_str("  begin\n    require gem_name\n  rescue LoadError\n    nil\n  end\nend\n");
+    // Quiet only when the gem itself is absent. A LoadError for another
+    // feature is the gem failing part way (a C extension's own
+    // `rb_require`, which RubyGems cannot activate a gem for), and is
+    // named rather than swallowed.
+    out.push_str(
+        "  begin\n    require gem_name\n  rescue LoadError => e\n    \
+         warn \"roundhouse: require #{gem_name.inspect} failed: #{e.message}\" unless e.path.nil? || e.path == gem_name\n    \
+         nil\n  end\nend\n",
+    );
     out
 }
 
@@ -6691,10 +6836,16 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
              # constants app/ actually names.\n",
         );
         for gem in &needed {
-            if gemfile.contains(&format!("gem {gem:?}")) {
+            if gemfile.contains(&format!("gem {gem:?}")) || block.contains(&format!("gem {gem:?}")) {
                 continue;
             }
-            block.push_str(&format!("gem {gem:?}\n"));
+            // A gem the lock resolves from a `GIT` source is declared with
+            // that source and the locked revision: a bare `gem "dalli"`
+            // would resolve the rubygems.org release, not Core's fork.
+            match lock.and_then(|l| l.git_source_of(gem)) {
+                Some(git) => block.push_str(&format!("gem {gem:?}, git: {:?}, ref: {:?}\n", git.remote, git.revision)),
+                None => block.push_str(&format!("gem {gem:?}\n")),
+            }
         }
         if block.contains("gem \"") {
             if !gemfile.ends_with('\n') {
@@ -6702,6 +6853,123 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
             }
             gemfile.push_str(&block);
         }
+    }
+    apply_git_gem_load_paths(files, &needed, lock);
+    apply_locked_bundled_gems(files, lock);
+}
+
+/// Ruby's bundled gems: the gems that left the default set (Ruby 4.0's
+/// `Gem::BUNDLED_GEMS::SINCE`). Under Bundler an app has the ones its
+/// lock names on the load path from the start. Plain RubyGems puts one
+/// there only when a Ruby-level `require` activates it, and a C
+/// extension's own `rb_require` bypasses that: trilogy's cext requires
+/// "bigdecimal" and fails with "cannot load such file" although
+/// bigdecimal is installed.
+const RUBY_BUNDLED_GEMS: [&str; 23] = [
+    "racc", "abbrev", "base64", "bigdecimal", "csv", "drb", "getoptlong", "mutex_m", "nkf", "observer",
+    "resolv-replace", "rinda", "syslog", "ostruct", "pstore", "rdoc", "win32ole", "fiddle", "logger",
+    "benchmark", "irb", "reline", "tsort",
+];
+
+/// So runtime/bundled_gems.rb activates the bundled gems the lock pins,
+/// at the pinned version, as Bundler.setup would, and runtime/gem_facades.rb
+/// requires it first. A pinned version that is not installed is left to
+/// RubyGems' default resolution, as before.
+fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
+    let Some(lock) = lock else { return };
+    let entries: String = RUBY_BUNDLED_GEMS
+        .iter()
+        .filter_map(|gem| {
+            let version = lock.version_of(gem)?;
+            // A platform spec (`1.1.8-x86_64-linux`) is pinned by its version.
+            let version = version.split('-').next().unwrap_or(version);
+            Some(format!("  [{gem:?}, {version:?}],\n"))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let body = format!(
+        "# Ruby's bundled gems the app's Gemfile.lock pins, activated at that\n\
+         # version the way Bundler.setup puts them on the load path. A C\n\
+         # extension's own rb_require (trilogy's cext requires \"bigdecimal\")\n\
+         # finds only what is already there. Written by\n\
+         # `project.rs::apply_locked_bundled_gems`.\n\
+         [\n{entries}].each do |name, version|\n  \
+           next if Gem.loaded_specs.key?(name)\n  \
+           begin\n    \
+             gem name, \"= #{{version}}\"\n  \
+           rescue Gem::LoadError\n    \
+             nil\n  \
+           end\n\
+         end\n"
+    );
+    files.push(("runtime/bundled_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"bundled_gems\"") {
+        facades.insert_str(0, "require_relative \"bundled_gems\"\n");
+    }
+}
+
+/// The CRuby tree runs as plain `ruby` on the gem home's GEM_PATH, with no
+/// Bundler, and RubyGems never sees a `GIT` gem: Bundler checks it out
+/// under `<gem dir>/bundler/gems/<repo>-<revision[0, 12]>` and activates
+/// the checkout's gemspec itself (`Bundler::Source::Git`). So for each
+/// needed gem the lock resolves from git, `runtime/git_gems.rb` does the
+/// same — finds that checkout on Gem.path, loads its gemspec and
+/// activates it (its require paths and its runtime dependencies) — and
+/// `runtime/gem_facades.rb` requires it before its guarded requires. A
+/// missing checkout is a warning naming the gem, source and revision: the
+/// guarded require would otherwise swallow it as a quiet LoadError.
+fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
+    let Some(lock) = lock else { return };
+    // The needed gems' whole dependency closure, not only the needed gems
+    // themselves: panama_client is a GEM spec, but it depends on Core's
+    // grpc fork, and RubyGems activating panama_client cannot find that
+    // spec on its own. Dependencies first.
+    let mut entries = String::new();
+    for gem in lock.git_specs_in_closure(needed) {
+        if let Some(git) = lock.git_source_of(&gem) {
+            entries.push_str(&format!(
+                "  [{gem:?}, {:?}, {:?}, {:?}],\n",
+                git.checkout_dir(),
+                git.remote,
+                git.revision
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let body = format!(
+        "# Gems the app's Gemfile.lock resolves from a GIT source, activated the\n\
+         # way Bundler::Source::Git does: the checkout under\n\
+         # <gem dir>/bundler/gems/<repo>-<revision[0, 12]>, its gemspec, its\n\
+         # require paths and runtime dependencies. RubyGems alone never sees\n\
+         # these, so runtime/gem_facades.rb requires this file first.\n\
+         # Written by `project.rs::apply_git_gem_load_paths` from the lock.\n\
+         [\n{entries}].each do |name, checkout, remote, revision|\n  \
+           next if Gem.loaded_specs.key?(name)\n  \
+           dir = Gem.path.map {{ |root| File.join(root, \"bundler\", \"gems\", checkout) }}.find {{ |d| File.directory?(d) }}\n  \
+           spec = dir && Dir[File.join(dir, \"{{,*,*/*}}.gemspec\")].filter_map {{ |f| Gem::Specification.load(f) }}.find {{ |s| s.name == name }}\n  \
+           if spec.nil?\n    \
+             warn \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
+             next\n  \
+           end\n  \
+           spec.full_gem_path = File.dirname(spec.loaded_from)\n  \
+           # Where Bundler builds a git gem's extensions\n  \
+           # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).\n  \
+           spec.extension_dir = File.join(File.dirname(dir), \"extensions\", Gem::Platform.local.to_s,\n    \
+             Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join(\"-\"))\n  \
+           spec.activate\n\
+         end\n"
+    );
+    files.push(("runtime/git_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"git_gems\"") {
+        facades.insert_str(0, "require_relative \"git_gems\"\n");
     }
 }
 
@@ -7303,6 +7571,102 @@ fn use_ported_time_helpers(files: &mut [(String, String)]) -> Result<(), String>
     *helper = helper.replace(
         STAND_IN,
         "  # (The stand-in is replaced on this tree: the app or its tests use\n  # ActiveSupport's own TimeHelpers, runtime/active_support_testing_time_helpers.rb.)\n  include ActiveSupport::Testing::TimeHelpers\n",
+    );
+    Ok(())
+}
+
+/// The classes runtime/spinel/active_support_messages.rb declares that
+/// an app reaches by name. `ActiveSupport::MessageVerifier` counts unless
+/// all it names is `::InvalidSignature`, which active_support_ext.rb
+/// declares on every target (a signed-id rescue).
+const ACTIVE_SUPPORT_MESSAGES_NAMES: &[&str] = &[
+    "ActiveSupport::MessageVerifier",
+    "ActiveSupport::MessageEncryptor",
+    "ActiveSupport::SecureCompareRotator",
+    "ActiveSupport::KeyGenerator",
+    "ActiveSupport::CachingKeyGenerator",
+    "ActiveSupport::Messages",
+];
+
+/// active_support_ext.rb's `ActiveSupport::MessageVerifier`, which only
+/// declares InvalidSignature. Loaded before the port, its superclass-less
+/// `class MessageVerifier` would make the port's `< Messages::Codec` a
+/// superclass mismatch, so a tree carrying the port requires the port in
+/// its place.
+const MESSAGE_VERIFIER_STAND_IN: &str = "  class MessageVerifier\n    class InvalidSignature < StandardError\n      def initialize(message = \"ActiveSupport::MessageVerifier::InvalidSignature\")\n        super(message)\n      end\n    end\n  end\n";
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a class the messages port declares, in any position a
+/// constant takes: a receiver (`MessageEncryptor.new`), an argument
+/// (`build_rotation(ActiveSupport::MessageVerifier, …)`), a parent
+/// (`< ::ActiveSupport::MessageVerifier`), a declared type, a rescue.
+fn carries_active_support_messages(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_SUPPORT_MESSAGES_NAMES.iter().any(|name| mentions_messages_constant(content, name))
+    })
+}
+
+/// The namespaces runtime/spinel/active_model_type.rb declares that an
+/// app reaches by name: `ActiveRecord::Type::Integer`,
+/// `ActiveModel::Type::Value`, a `< ActiveRecord::Type::Value` subclass.
+const ACTIVE_MODEL_TYPE_NAMES: &[&str] = &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError"];
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a namespace the type port declares, in any position a
+/// constant takes (`mentions_messages_constant`).
+fn carries_active_model_type(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_MODEL_TYPE_NAMES.iter().any(|name| mentions_messages_constant(content, name))
+    })
+}
+
+/// `konst` as a whole constant path outside whole-line comments: no
+/// identifier or `Outer::` before it (`::Name` is top-level), no
+/// identifier character after it, and not `MessageVerifier::InvalidSignature`.
+fn mentions_messages_constant(src: &str, konst: &str) -> bool {
+    if !src.contains(konst) {
+        return false;
+    }
+    let ident = |c: u8| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+    src.lines().filter(|line| !line.trim_start().starts_with('#')).any(|line| {
+        let b = line.as_bytes();
+        let mut i = 0;
+        while let Some(off) = line[i..].find(konst) {
+            let at = i + off;
+            let top_level = at >= 2
+                && &b[at - 2..at] == b"::"
+                && (at == 2 || !(ident(b[at - 3]) || b[at - 3] == b':'));
+            let head_ok = at == 0 || top_level || !(ident(b[at - 1]) || b[at - 1] == b':');
+            let tail = at + konst.len();
+            let tail_ok = !b.get(tail).is_some_and(|&c| ident(c))
+                && !(konst == "ActiveSupport::MessageVerifier" && line[tail..].starts_with("::InvalidSignature"));
+            if head_ok && tail_ok {
+                return true;
+            }
+            i = tail;
+        }
+        false
+    })
+}
+
+/// Replace active_support_ext.rb's MessageVerifier stand-in with a
+/// require of the port (`MESSAGE_VERIFIER_STAND_IN`).
+fn replace_message_verifier_stand_in(files: &mut [(String, String)]) -> Result<(), String> {
+    let Some((_, ext)) = files.iter_mut().find(|(p, _)| p == "runtime/active_support_ext.rb") else {
+        return Err("replace_message_verifier_stand_in: the tree has no runtime/active_support_ext.rb".into());
+    };
+    if ext.matches(MESSAGE_VERIFIER_STAND_IN).count() != 1 {
+        return Err("replace_message_verifier_stand_in: expected one ActiveSupport::MessageVerifier stand-in in runtime/active_support_ext.rb".into());
+    }
+    *ext = ext.replace(
+        MESSAGE_VERIFIER_STAND_IN,
+        "  # (ActiveSupport::MessageVerifier is runtime/active_support_messages.rb's\n  # on this tree; the stand-in is dropped.)\n  require_relative \"active_support_messages\"\n",
     );
     Ok(())
 }
@@ -8729,6 +9093,71 @@ mod tests {
         assert!(!dropped.contains("Rails.cache.class.new"), "{dropped}");
         assert_eq!(dropped.len() < helper.len(), true);
         assert!(drop_harness_memory_store(&mut files).is_err(), "a second drop finds no stand-in");
+    }
+
+    /// The messages port rides along where app code names one of its
+    /// classes in any constant position, and active_support_ext.rb then
+    /// requires it where its InvalidSignature stand-in stood.
+    #[test]
+    fn an_app_naming_active_support_messages_carries_the_port_and_drops_the_stand_in() {
+        let ext = crate::runtime_files::read_to_string("runtime/ruby/active_support_ext.rb").unwrap();
+        let mut files = vec![
+            ("runtime/active_support_ext.rb".to_string(), ext.clone()),
+            ("runtime/active_record.rb".to_string(), "ActiveSupport::MessageEncryptor.new(k)\n".to_string()),
+            ("test/models/token_test.rb".to_string(), "ActiveSupport::MessageVerifier.new(k)\n".to_string()),
+            ("app/controllers/a.rb".to_string(), "rescue ActiveSupport::MessageVerifier::InvalidSignature\n".to_string()),
+            ("app/models/b.rb".to_string(), "# ActiveSupport::MessageEncryptor.new\nActiveSupport::MessageEncryptorX\nFoo::ActiveSupport::KeyGenerator.new\n".to_string()),
+        ];
+        assert!(!carries_active_support_messages(&files), "runtime, test bodies, the stand-in's name, comments and longer names");
+        for use_site in [
+            "@crypt = build_rotation(ActiveSupport::MessageEncryptor, secrets)\n",
+            "class ReportifyTokenGenerator < ::ActiveSupport::MessageVerifier\n",
+            "x = y #: ActiveSupport::SecureCompareRotator\n",
+            "ActiveSupport::KeyGenerator.new(base, iterations: 1000)\n",
+            "rescue ActiveSupport::MessageEncryptor::InvalidMessage\n",
+            "ActiveSupport::MessageVerifier.new(secret).generate(x)\n",
+        ] {
+            let mut with = files.clone();
+            with.push(("app/models/secrets.rb".to_string(), use_site.to_string()));
+            assert!(carries_active_support_messages(&with), "{use_site}");
+        }
+
+        replace_message_verifier_stand_in(&mut files).unwrap();
+        let replaced = &files[0].1;
+        assert!(!replaced.contains("class InvalidSignature"), "{replaced}");
+        assert_eq!(replaced.matches("require_relative \"active_support_messages\"").count(), 1);
+        assert!(replace_message_verifier_stand_in(&mut files).is_err(), "a second replace finds no stand-in");
+        // The port declares what the stand-in did.
+        let port = crate::runtime_files::read_to_string("runtime/spinel/active_support_messages.rb").unwrap();
+        let declared = crate::analyze::test_constants::declared_namespaces(&port);
+        assert!(declared.contains("ActiveSupport::MessageVerifier::InvalidSignature"), "{declared:?}");
+    }
+
+    #[test]
+    fn an_app_naming_an_attribute_type_carries_the_type_port() {
+        let files = vec![
+            ("runtime/active_record/connection.rb".to_string(), "# ActiveModel::Type::Integer serializes\nActiveRecord::Type::Integer.new\n".to_string()),
+            ("test/models/schema_test.rb".to_string(), "ActiveRecord::Type::String.new\n".to_string()),
+            ("app/models/b.rb".to_string(), "# ActiveRecord::Type::Text.new\nActiveRecord::Types\nFoo::ActiveModel::Type::Value\nMyActiveRecord::Type\n".to_string()),
+        ];
+        assert!(!carries_active_model_type(&files), "runtime, test bodies, comments, longer and nested names");
+        for use_site in [
+            "BIGINT = ActiveRecord::Type::Integer.new(limit: 8)\n",
+            "class Money < ::ActiveRecord::Type::Value\n",
+            "x = y #: ActiveModel::Type::DateTime\n",
+            "rescue ActiveModel::RangeError\n",
+            "TYPES = [ActiveRecord::Type::Text, ActiveModel::Type::Boolean]\n",
+        ] {
+            let mut with = files.clone();
+            with.push(("components/x/lib/schema.rb".to_string(), use_site.to_string()));
+            assert!(carries_active_model_type(&with), "{use_site}");
+        }
+        // The port declares the names the app reaches.
+        let port = crate::runtime_files::read_to_string("runtime/spinel/active_model_type.rb").unwrap();
+        let declared = crate::analyze::test_constants::declared_namespaces(&port);
+        for name in ["ActiveModel::Type::Integer", "ActiveModel::Type::String", "ActiveModel::Type::Boolean", "ActiveModel::Type::DateTime", "ActiveRecord::Type::Text", "ActiveRecord::Type::DateTime"] {
+            assert!(declared.contains(name), "{name}: {declared:?}");
+        }
     }
 
     #[test]

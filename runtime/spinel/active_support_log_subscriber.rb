@@ -63,7 +63,13 @@ module ActiveSupport
   end
 
   class LogSubscriber < Subscriber
-    LEVEL_CHECKS = [:debug, :info, :error].freeze
+    # activesupport 8.1.4 log_subscriber.rb:86: each level's check answers
+    # "silenced?" for a logger.
+    LEVEL_CHECKS = {
+      debug: -> (logger) { !logger.debug? },
+      info: -> (logger) { !logger.info? },
+      error: -> (logger) { !logger.error? },
+    }
 
     # `mattr_accessor :colorize_logging, default: true`: one value shared by
     # every subclass and instance.
@@ -114,8 +120,7 @@ module ActiveSupport
       private
 
       def subscribe_log_level(event, level)
-        raise KeyError, "unsupported log level: #{level}" unless LEVEL_CHECKS.include?(level)
-        @log_levels = log_levels.merge(event => level)
+        @log_levels = log_levels.merge(event => LEVEL_CHECKS.fetch(level))
         set_event_levels
       end
 
@@ -140,8 +145,7 @@ module ActiveSupport
     end
 
     def silenced?(event)
-      level = @event_levels[event]
-      logger.nil? || (level && !logger.public_send("#{level}?"))
+      logger.nil? || @event_levels[event]&.call(logger)
     end
 
     def call(event)

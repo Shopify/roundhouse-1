@@ -88,6 +88,63 @@ fn the_boot_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
     }
 }
 
+/// Core's dalli is the Shopify fork, a `GIT` source in Gemfile.lock.
+const GIT_LOCK: &str = "GIT\n  remote: https://github.com/Shopify/dalli.git\n  revision: 262698ca57e937a3cb4420d169db2adce428adcc\n  ref: 262698ca57e937a3cb4420d169db2adce428adcc\n  specs:\n    dalli (3.2.9)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    google-protobuf (3.25.8)\n    proto (2026.10.02.63343)\n      google-protobuf (>= 3.25, < 5.0)\n\nDEPENDENCIES\n  activesupport\n  dalli!\n  google-protobuf\n  proto\n";
+
+#[test]
+fn a_git_sourced_gem_is_declared_with_its_source_and_activated_from_its_bundler_checkout() {
+    let (dir, errors) = boot_app().write("Gemfile.lock", GIT_LOCK).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    assert!(
+        gemfile.contains(
+            "gem \"dalli\", git: \"https://github.com/Shopify/dalli.git\", ref: \"262698ca57e937a3cb4420d169db2adce428adcc\""
+        ),
+        "{gemfile}"
+    );
+    assert!(gemfile.contains("gem \"google-protobuf\"\n"), "a GEM spec stays bare: {gemfile}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(facades.starts_with("require_relative \"git_gems\"\n"), "{facades}");
+    let git_gems = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
+    assert!(git_gems.contains("\"dalli-262698ca57e9\""), "{git_gems}");
+    assert!(!git_gems.contains("google-protobuf"), "only git specs: {git_gems}");
+
+    // The loader against a gem dir laid out as Bundler installs a git gem.
+    let gems = dir.join("tmp-gem-home");
+    let checkout = gems.join("bundler/gems/dalli-262698ca57e9");
+    std::fs::create_dir_all(checkout.join("lib")).unwrap();
+    std::fs::write(
+        checkout.join("dalli.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"dalli\"\n  s.version = \"3.2.9\"\n  s.summary = \"fork\"\n  s.authors = [\"x\"]\n  s.files = [\"lib/dalli.rb\"]\n  s.require_paths = [\"lib\"]\nend\n",
+    )
+    .unwrap();
+    std::fs::write(checkout.join("lib/dalli.rb"), "module Dalli; FROM = __FILE__; end\n").unwrap();
+    let run = |gem_path: &std::path::Path| {
+        std::process::Command::new("ruby")
+            .current_dir(&dir)
+            .env("GEM_PATH", gem_path)
+            .env("GEM_HOME", gem_path)
+            .args(["-e", "require_relative 'runtime/git_gems'; require 'dalli'; puts Dalli::FROM; puts Gem.loaded_specs['dalli'].version"])
+            .output()
+            .expect("ruby")
+    };
+    let out = run(&gems);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("bundler/gems/dalli-262698ca57e9/lib/dalli.rb"), "{stdout}");
+    assert!(stdout.contains("3.2.9"), "{stdout}");
+
+    // No checkout: a warning naming the gem and revision, not a quiet miss.
+    let empty = dir.join("tmp-empty-gem-home");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = run(&empty);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("roundhouse: git gem dalli (https://github.com/Shopify/dalli.git at 262698ca57e937a3cb4420d169db2adce428adcc) has no checkout bundler/gems/dalli-262698ca57e9"),
+        "{stderr}"
+    );
+}
+
 /// Essentials' test config (`config/test.rb`): an in-process Redis, the
 /// Panama fake client over the metadata registry, and Snappy-compressed
 /// bodies. Core's Gemfile Bundler.requires redis, hiredis-client,
@@ -160,6 +217,27 @@ fn the_test_config_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
             "{gem}: {errors:#?}"
         );
     }
+}
+
+/// panama_client is a GEM spec, but it depends on Core's grpc fork, a GIT
+/// spec RubyGems cannot find on its own (`Gem::MissingSpecError: Could not
+/// find 'grpc'`, swallowed by the guarded require). The git closure of
+/// the needed gems is activated, dependencies first.
+#[test]
+fn a_git_dependency_of_a_needed_gem_is_activated_before_it() {
+    let lock = TEST_CONFIG_LOCK.replace(
+        "    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
+        "    panama_client (3.2.3)\n      grpc (>= 1.40)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
+    );
+    let lock = format!(
+        "GIT\n  remote: https://github.com/Shopify/grpc.git\n  revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  branch: shopify-fixes\n  submodules: true\n  specs:\n    grpc (1.85.0.dev)\n\n{lock}"
+    );
+    let (dir, errors) = test_config_app().write("Gemfile.lock", &lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let git_gems = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
+    assert!(git_gems.contains("[\"grpc\", \"grpc-d5dd2a32be6b\", \"https://github.com/Shopify/grpc.git\""), "{git_gems}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"panama_client\"\n"), "{gemfile}");
 }
 
 /// Essentials' boot path through Rack, Faraday, Trilogy, Sabertooth,
@@ -401,4 +479,69 @@ fn the_service_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
             "{gem}: {errors:#?}"
         );
     }
+/// Core's trilogy: its C extension requires "bigdecimal" with its own
+/// `rb_require`, which RubyGems cannot activate a gem for, so on plain
+/// RubyGems it fails although bigdecimal is installed. The bundled gems
+/// the lock pins are activated at the pinned version first, as
+/// Bundler.setup puts them on the load path, and a guarded require that
+/// fails part way names the missing feature instead of swallowing it.
+#[test]
+fn the_locked_bundled_gems_are_on_the_load_path_and_a_partial_gem_load_is_named() {
+    let lock = LOCK.replace("    dalli (3.2.9)\n", "    csv (9.0.0)\n    dalli (3.2.9)\n");
+    let (dir, errors) = boot_app().write("Gemfile.lock", &lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(facades.starts_with("require_relative \"bundled_gems\"\n"), "{facades}");
+    let pins = std::fs::read_to_string(dir.join("runtime/bundled_gems.rb")).expect("bundled_gems");
+    assert!(pins.contains("[\"csv\", \"9.0.0\"]"), "{pins}");
+    assert!(!pins.contains("dalli"), "only bundled gems: {pins}");
+
+    // A gem home holding csv at the pinned and a newer version, and a
+    // dalli whose entry requires a feature no gem provides.
+    let home = dir.join("tmp-bundled-gem-home");
+    for version in ["9.0.0", "9.1.0"] {
+        let lib = home.join(format!("gems/csv-{version}/lib"));
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("csv.rb"), format!("CSV_FROM = {version:?}\n")).unwrap();
+    }
+    std::fs::create_dir_all(home.join("gems/dalli-3.2.9/lib")).unwrap();
+    std::fs::write(home.join("gems/dalli-3.2.9/lib/dalli.rb"), "require \"roundhouse_no_such_feature\"\n").unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    for (name, version) in [("csv", "9.0.0"), ("csv", "9.1.0"), ("dalli", "3.2.9")] {
+        std::fs::write(
+            home.join(format!("specifications/{name}-{version}.gemspec")),
+            format!("Gem::Specification.new do |s|\n  s.name = {name:?}\n  s.version = {version:?}\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\nend\n"),
+        )
+        .unwrap();
+    }
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &home)
+        .env("GEM_HOME", &home)
+        .args([
+            "-e",
+            "require_relative 'runtime/bundled_gems'; p Gem.loaded_specs['csv'].version.to_s; \
+             p $LOAD_PATH.include?(File.join(Gem.loaded_specs['csv'].full_gem_path, 'lib')); p defined?(CSV_FROM); \
+             require 'csv'; p CSV_FROM",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), ["\"9.0.0\"", "true", "nil", "\"9.0.0\""], "{stdout}");
+
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &home)
+        .env("GEM_HOME", &home)
+        .args(["-e", "require_relative 'runtime/gem_facades'"])
+        .output()
+        .expect("ruby");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("roundhouse: require \"dalli\" failed: cannot load such file -- roundhouse_no_such_feature"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("require \"bcrypt\""), "an absent gem stays quiet: {stderr}");
 }

@@ -543,3 +543,70 @@ fn postgres_project_declares_monorepo_slices_unloaded_for_its_extension() {
         && c.lines().any(|l| l.trim() == "require \"monorepo_slices\"" || l.contains("\"monorepo_slices\",") && l.contains(".each do |gem_name|"))),
         "an emitted file requires the monorepo_slices entry");
 }
+
+/// The tree runs on plain RubyGems, where a `require: false` Gemfile line
+/// puts nothing on the load path, and activating monorepo_slices would
+/// resolve its activemodel / activesupport dependencies. The generated
+/// runtime/extension_gems.rb appends the gem's require paths from the gem
+/// home without activating it, so the extension's require resolves and
+/// the gem's own entry file stays unloaded.
+#[test]
+fn postgres_project_puts_an_extension_gems_lib_on_the_load_path_without_activating_it() {
+    use roundhouse::project::{target_files, BuildTarget};
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let mut app = postgres_model_app();
+    app.gem_lock = Some(roundhouse::gems::Lockfile::parse(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    monorepo_slices (1.17.0)\n      activemodel\n\nDEPENDENCIES\n  monorepo_slices (~> 1.17)\n",
+    ));
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).unwrap();
+    let file = |path: &str| files.iter().find(|(p, _)| p == path).unwrap_or_else(|| panic!("{path}")).1.clone();
+    assert!(file("runtime/gem_facades.rb").starts_with("require_relative \"extension_gems\"\n"));
+    let loader = file("runtime/extension_gems.rb");
+    assert!(loader.contains("[\"monorepo_slices\", \"1.17.0\"]"), "{loader}");
+
+    // The loader against a gem home holding the gem, whose declared
+    // dependency is NOT installed (as activemodel is not, outside the
+    // Rails fork's checkout).
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("extension_gem_load_path");
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("gem-home");
+    let lib = home.join("gems/monorepo_slices-1.17.0/lib/monorepo_slices");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications/monorepo_slices-1.17.0.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"monorepo_slices\"\n  s.version = \"1.17.0\"\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\n  s.add_runtime_dependency \"activemodel\", \">= 0\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(lib.join("glob_matcher.rb"), "module MonorepoSlices; GLOB = __FILE__; end\n").unwrap();
+    std::fs::write(lib.join("../monorepo_slices.rb"), "raise \"the gem's entry file loaded\"\n").unwrap();
+    std::fs::create_dir_all(root.join("runtime")).unwrap();
+    std::fs::write(root.join("runtime/extension_gems.rb"), &loader).unwrap();
+    let run = |gem_home: &std::path::Path| {
+        std::process::Command::new("ruby")
+            .current_dir(&root)
+            .env("GEM_HOME", gem_home)
+            .env("GEM_PATH", gem_home)
+            .args(["-e", "require_relative 'runtime/extension_gems'; require 'monorepo_slices/glob_matcher'; puts MonorepoSlices::GLOB; p Gem.loaded_specs.key?('monorepo_slices'); p $LOADED_FEATURES.any? { |f| f.end_with?('/lib/monorepo_slices.rb') }"])
+            .output()
+            .expect("ruby")
+    };
+    let out = run(&home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [lib.join("glob_matcher.rb").to_str().unwrap(), "false", "false"],
+        "{stdout}"
+    );
+
+    // Not installed: a warning naming the gem, not a quiet LoadError later.
+    let empty = root.join("empty-home");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = run(&empty);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("roundhouse: extension gem monorepo_slices 1.17.0 is not installed on Gem.path"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -2356,12 +2356,24 @@ impl<'a> BodyTyper<'a> {
                 // Lowerers also synthesize casts whose identities were proven
                 // against the full app before a reduced view/runtime registry
                 // retypes them. Resolve source declarations at their boundary.
-                if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
+                // A declaration a registry already resolved
+                // (DECLARED_TYPE_INDEXED) is not re-decided by a reduced one:
+                // the model lowerer retypes `klass = self #: as
+                // singleton(ActiveRecord::Base)` in a registry of the models
+                // and runtime stubs, which names neither ActiveRecord::Base
+                // nor Module, and check never sees that registry.
+                if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0
+                    && expr.decisions & crate::expr::DECLARED_TYPE_INDEXED == 0
+                {
                     resolved.map_class_ids(&|id| {
                         if !self.classes().contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
                             && !self.const_resolver.as_ref().is_some_and(|r| {
                                 r.has_source_namespace(id.0.as_str()) || r.has_stdlib_namespace(id.0.as_str())
-                            }) {
+                            })
+                            // A Ruby-family runtime port's class
+                            // (`ActiveSupport::MessageEncryptor`); its
+                            // reads are gated per target (runtime_reads).
+                            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(id.0.as_str()) {
                             missing.borrow_mut().push(id.0.as_str().to_owned());
                         }
                         id.clone()
@@ -2374,8 +2386,13 @@ impl<'a> BodyTyper<'a> {
                         construct: Symbol::from("declared type"),
                         detail: format!("{} has no indexed declaration or modeled dependency", missing.join(", ")),
                     });
-                } else if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "declared type") {
-                    expr.diagnostic = None;
+                } else {
+                    if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
+                        expr.decisions |= crate::expr::DECLARED_TYPE_INDEXED;
+                    }
+                    if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "declared type") {
+                        expr.diagnostic = None;
+                    }
                 }
                 resolved
             }

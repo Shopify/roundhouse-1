@@ -63,9 +63,10 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
     let mut top_classes: Vec<ScopedClass<'_>> = Vec::new();
     collect_top_level_classes(&root, &[], &mut top_classes);
     if top_classes.is_empty() {
+        refuse_unreached_test_classes(&root, &[], file)?;
         return Ok(Vec::new());
     }
-    let (mut test_nodes, helper_nodes): (Vec<_>, Vec<_>) =
+    let (test_nodes, helper_nodes): (Vec<_>, Vec<_>) =
         top_classes.into_iter().partition(|(_, c)| is_test_class_node(c));
     // No candidate matches: the historical single-class shape, where
     // the first top-level class is the test whatever it is called. A
@@ -74,15 +75,171 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
     if test_nodes.is_empty() {
         let mut helper_nodes = helper_nodes;
         let Some(first) = helper_nodes.iter().position(|(scope, _)| scope.is_empty()) else {
+            refuse_unreached_test_classes(&root, &[], file)?;
             return Ok(Vec::new());
         };
-        test_nodes.push(helper_nodes.remove(first));
-        return ingest_test_class(&test_nodes[0], &helper_nodes, file).map(|tm| vec![tm]);
+        let first = helper_nodes.remove(first);
+        let mut test_nodes = Vec::new();
+        push_with_nested_test_classes(first, &mut test_nodes);
+        refuse_unreached_test_classes(&root, &test_nodes, file)?;
+        return ingest_each_test_class(&test_nodes, &helper_nodes, file);
     }
-    test_nodes
+    // A test class declared in a test class's body (Core's
+    // `class PermissionGeneratorTest … class ValidateInitialTest <
+    // PermissionGeneratorTest`) is a suite Minitest runs on its own,
+    // `PermissionGeneratorTest::ValidateInitialTest`. It used to ride
+    // along as an inner helper class, emitted verbatim and never run.
+    let mut all_test_nodes = Vec::new();
+    for class in test_nodes {
+        push_with_nested_test_classes(class, &mut all_test_nodes);
+    }
+    refuse_unreached_test_classes(&root, &all_test_nodes, file)?;
+    ingest_each_test_class(&all_test_nodes, &helper_nodes, file)
+}
+
+/// Ingest each test class on its own. A class that cannot be ingested is
+/// refused BY NAME (the error names the class); under `--survey` the
+/// refusal is recorded and the file's other classes still ingest, so one
+/// unsupported construct does not take its neighbours' tests with it.
+fn ingest_each_test_class(
+    test_nodes: &[ScopedClass<'_>],
+    helper_nodes: &[ScopedClass<'_>],
+    file: &str,
+) -> IngestResult<Vec<TestModule>> {
+    let mut out = Vec::new();
+    for class in test_nodes {
+        let result = ingest_test_class(class, helper_nodes, file).map_err(|err| match err {
+            IngestError::Unsupported { file, message } => IngestError::Unsupported {
+                message: format!("test class `{}` refused: {message}", scoped_class_name(class)),
+                file,
+            },
+            other => other,
+        });
+        if let Some(tm) = super::survey::unwrap_or_record(result)? {
+            out.push(tm);
+        }
+    }
+    Ok(out)
+}
+
+/// `Outer::Inner` for a class at `scope`, as written.
+fn scoped_class_name((scope, class): &ScopedClass<'_>) -> String {
+    let mut path = scope.clone();
+    path.extend(class_name_path(class).unwrap_or_default());
+    path.join("::")
+}
+
+/// `class` and, after it, every test class its body declares (at any
+/// depth of test-class nesting), each scoped by the classes around it.
+fn push_with_nested_test_classes<'pr>(class: ScopedClass<'pr>, out: &mut Vec<ScopedClass<'pr>>) {
+    let (scope, node) = class;
+    let mut inner_scope = scope.clone();
+    inner_scope.extend(class_name_path(&node).unwrap_or_default());
+    let nested: Vec<ruby_prism::ClassNode<'pr>> = node
+        .body()
+        .map(flatten_statements)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|stmt| stmt.as_class_node())
+        .filter(is_nested_test_class_node)
+        .collect();
+    out.push((scope, node));
+    for inner in nested {
+        push_with_nested_test_classes((inner_scope.clone(), inner), out);
+    }
+}
+
+/// A class in a test class's body that is a test class of its own: it
+/// has a superclass and is test-shaped. `class Validatable` and
+/// `class FakeController < ActionController::Base` stay helpers.
+fn is_nested_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
+    c.superclass().is_some() && is_test_class_node(c)
+}
+
+/// Refuse, by name, every class in the file that declares tests but is
+/// not one of the test classes collected (`reached`): one inside an `if`,
+/// a block or a method body. Minitest would run it; nothing here would,
+/// and nothing would say so.
+fn refuse_unreached_test_classes(root: &Node<'_>, reached: &[ScopedClass<'_>], file: &str) -> IngestResult<()> {
+    use ruby_prism::Visit;
+    struct Classes(Vec<(usize, String)>);
+    impl<'pr> Visit<'pr> for Classes {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if declares_tests(node) {
+                let name = class_name_path(node).map(|p| p.join("::")).unwrap_or_else(|| "?".into());
+                self.0.push((node.location().start_offset(), name));
+            }
+            ruby_prism::visit_class_node(self, node);
+        }
+    }
+    let mut classes = Classes(Vec::new());
+    classes.visit(root);
+    let reached: std::collections::HashSet<usize> =
+        reached.iter().map(|(_, c)| c.location().start_offset()).collect();
+    for (offset, name) in classes.0 {
+        if reached.contains(&offset) {
+            continue;
+        }
+        let line = super::sources::line_at(file, offset).map(|l| format!(" (line {l})")).unwrap_or_default();
+        super::survey::unwrap_or_record::<()>(Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "test class `{name}`{line} refused: it is declared inside a conditional, block or method, which is not modeled, so its tests would not run"
+            ),
+        }))?;
+    }
+    Ok(())
+}
+
+/// The class body declares at least one test: `test "…"` with arguments
+/// or a `def test_…`.
+fn declares_tests(c: &ruby_prism::ClassNode<'_>) -> bool {
+    c.body()
+        .map(flatten_statements)
+        .unwrap_or_default()
         .iter()
-        .map(|class| ingest_test_class(class, &helper_nodes, file))
-        .collect()
+        .any(is_test_declaration_shape)
+}
+
+/// `test "…" …` (a receiverless `test` call with arguments) or a
+/// receiverless `def test_…`, whether or not ingest models its form.
+fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
+    if let Some(def) = stmt.as_def_node() {
+        return def.receiver().is_none() && def.name().as_slice().starts_with(b"test_");
+    }
+    stmt.as_call_node().is_some_and(|call| {
+        call.receiver().is_none() && call.name().as_slice() == b"test" && call.arguments().is_some()
+    })
+}
+
+/// The first test declaration (`test "…"`, `def test_…`) inside `stmt`,
+/// a class-body statement ingest does not model (`%w[a b].each do |x|
+/// test "#{x}" do … end end`, or a `test` whose name is not a string
+/// literal), as its offset. Nested classes and method bodies are not
+/// searched: a class is its own suite, and a method's body runs when
+/// called, not at class load.
+fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
+    use ruby_prism::Visit;
+    struct Find(Option<usize>);
+    impl<'pr> Visit<'pr> for Find {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.0.is_none() && is_test_declaration_shape(&node.as_node()) {
+                self.0 = Some(node.location().start_offset());
+                return;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            if self.0.is_none() && is_test_declaration_shape(&node.as_node()) {
+                self.0 = Some(node.location().start_offset());
+            }
+        }
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+    }
+    let mut find = Find(None);
+    find.visit(stmt);
+    find.0
 }
 
 fn ingest_test_class(
@@ -168,6 +325,11 @@ fn ingest_test_class(
             // ...; end`. Captured per-test-module so the emit can
             // hoist them to file scope above the lowered test class.
             if let Some(inner) = stmt.as_class_node() {
+                // A nested test class is a module of its own
+                // (`push_with_nested_test_classes`).
+                if is_nested_test_class_node(&inner) {
+                    continue;
+                }
                 let lc = library_class_from_node(&inner, file)?;
                 inner_classes.push(lc);
                 continue;
@@ -231,6 +393,19 @@ fn ingest_test_class(
                     constants.push((const_name, value));
                 }
                 continue;
+            }
+            // Any other class-body statement is not modeled. One that
+            // declares tests (`%w[a b].each { |x| test "#{x}" do … end }`,
+            // a `test` named by a non-literal) would lose them silently,
+            // so the class is refused instead.
+            if let Some(offset) = hidden_test_declaration(&stmt) {
+                let line = super::sources::line_at(file, offset).map(|l| format!(" at line {l}")).unwrap_or_default();
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: format!(
+                        "a test declared{line} by a class-body statement ingest does not model (a computed name, a loop or a block); its tests would not run"
+                    ),
+                });
             }
         }
     }
@@ -304,6 +479,7 @@ fn ingest_test_class(
         teardown_def,
         constants,
         includes,
+        source_file: None,
     })
 }
 
@@ -678,6 +854,12 @@ fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
                     return true;
                 }
             }
+        }
+        // Whatever the names, a subclass that declares tests is a test
+        // class (`class Checks < GeneratorTestBase` with `test "…"`):
+        // as a helper its tests would be emitted and never run.
+        if declares_tests(c) {
+            return true;
         }
     }
     false

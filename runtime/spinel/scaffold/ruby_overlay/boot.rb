@@ -269,6 +269,17 @@ else
   "UTC"
 end
 ENV["TZ"] = ActiveSupport::RAILS_TZ_TO_IANA.fetch(tz_name, tz_name)
+# `config.active_support.cache_format_version` (from `load_defaults` or
+# written outright, lifted at ingest onto the reopen) reaches the
+# ActiveSupport::Cache port before any app code runs, as activesupport's
+# `active_support.set_configs` initializer assigns it
+# (`ActiveSupport.cache_format_version=` -> `Cache.format_version=`).
+# Only where the port is carried (runtime/active_support_cache.rb, required
+# by gem_facades.rb) and the app set one; otherwise the library default.
+if ActiveSupport.const_defined?(:Cache, false) && ActiveSupport::Cache.respond_to?(:format_version=) &&
+    Rails.application.respond_to?(:active_support_cache_format_version)
+  ActiveSupport::Cache.format_version = Rails.application.active_support_cache_format_version
+end
 # The app/models.rb aggregator (generated — see apply_models_aggregator)
 # loads every model/support class. Model files only require their own
 # LOAD-time deps (superclass, class-body consts); method-body references
@@ -284,3 +295,11 @@ require_relative "app/views"
 # app's list, lifted at ingest onto the reopen (framework default `[]`).
 ActiveSupport.filter_parameters += Rails.application.filter_parameters
 ActiveSupport.event_reporter.reload_payload_filter
+# `config.active_support.hash_digest_class`, after initialization as
+# activesupport's `active_support.set_hash_digest_class` initializer (a
+# `config.after_initialize` hook) assigns it to ActiveSupport::Digest, the
+# cache port's key digest. Lifted at ingest as the OpenSSL::Digest name.
+if ActiveSupport.const_defined?(:Digest, false) && ActiveSupport::Digest.respond_to?(:hash_digest_class=) &&
+    Rails.application.respond_to?(:active_support_hash_digest_class_name)
+  ActiveSupport::Digest.hash_digest_class = OpenSSL::Digest.const_get(Rails.application.active_support_hash_digest_class_name, false)
+end

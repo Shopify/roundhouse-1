@@ -519,6 +519,33 @@ fn a_connection_override_from_a_concern_is_refused_at_its_def() {
     assert_eq!(owners["Post"]["app_defined"]["defined_by"], "Routed", "{owners}");
 }
 
+/// A concern that defines several lookups (`with_connection`,
+/// `lease_connection`, `connection_pool`, Core's
+/// Podding::Database::Concerns::MainShardTable) is one app-defined
+/// routing, as Rails consults all of them: one refusal at the first def,
+/// counting every includer, and no "declares its connection more than
+/// once".
+#[test]
+fn several_lookups_from_one_concern_are_one_app_defined_routing() {
+    let mut files = with_manifest(base_files(), &sqlite_manifest());
+    put(
+        &mut files,
+        "app/models/concerns/main_shard.rb",
+        "module MainShard\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def with_connection(&block)\n      connection_pool.with_connection(&block)\n    end\n\n    def lease_connection\n      super\n    end\n    alias_method :connection, :lease_connection\n\n    def connection_pool\n      super\n    end\n  end\nend\n",
+    );
+    put(&mut files, "app/models/post.rb", "class Post < ApplicationRecord\n  include MainShard\nend\n");
+    put(&mut files, "app/models/comment.rb", "class Comment < ApplicationRecord\n  include MainShard\nend\n");
+    let checked = check(&files);
+    let routing: Vec<&String> = checked.errors.iter().filter(|e| e.contains("app-defined") || e.contains("more than once")).collect();
+    assert_eq!(routing.len(), 1, "{routing:#?}");
+    assert_error_at(&checked.errors, "app/models/concerns/main_shard.rb:5:", &["with_connection", "app-defined", "MainShard", "2 model(s)", "Post", "Comment"]);
+    let owners = serde_json::to_value(&checked.app).unwrap()["model_databases"].clone();
+    for model in ["Post", "Comment"] {
+        assert_eq!(owners[model]["app_defined"]["method"], "with_connection", "{owners}");
+        assert_eq!(owners[model]["app_defined"]["defined_by"], "MainShard", "{owners}");
+    }
+}
+
 /// `connects_to` without a manifest has nothing to resolve its names
 /// against, so it is refused rather than run on the primary.
 #[test]

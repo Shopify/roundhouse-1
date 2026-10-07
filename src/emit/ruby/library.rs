@@ -105,6 +105,12 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         }
     }
 
+    // `constant_readers` asks, per emitted class, which OTHER classes'
+    // load-time code reads its constants. Answered by walking every
+    // class per class, that is quadratic in the class count: on a
+    // 9000-file Core slice the emit sat in `walk_const_paths` for good.
+    // So the reads are indexed once, for the duration of this emit.
+    let _readers = ConstantReaderIndex::install(app);
     lcs.iter()
         .filter(|lc| owner_in_this_tree(lc).is_none())
         .flat_map(|lc| {
@@ -6493,6 +6499,29 @@ fn constant_readers(
         lc.constants.iter().map(|(n, _)| n.as_str()).collect();
     let mut out: std::collections::HashMap<String, BTreeSet<String>> =
         std::collections::HashMap::new();
+    if let Some(index) = ConstantReaderIndex::current(app) {
+        // The same reads as the walk below, looked up: a qualified
+        // `Own::NAME` from any other class, or a bare `NAME` from a
+        // class nested inside this one.
+        for (cname, _) in &lc.constants {
+            let mut qualified: Vec<String> = own_segs.iter().map(|s| s.to_string()).collect();
+            qualified.push(cname.as_str().to_string());
+            let bare = vec![cname.as_str().to_string()];
+            let qualified_readers = index.get(&qualified).into_iter().flatten().map(|&j| (j, false));
+            let bare_readers = index.get(&bare).into_iter().flatten().map(|&j| (j, true));
+            for (j, needs_nesting) in qualified_readers.chain(bare_readers) {
+                let other_name = app.library_classes[j].name.0.as_str();
+                if other_name == own || (needs_nesting && !other_name.starts_with(&format!("{own}::"))) {
+                    continue;
+                }
+                let other_path: Vec<String> = other_name.split("::").map(str::to_string).collect();
+                if let Some(req) = resolve(&other_path, true) {
+                    out.entry(cname.as_str().to_string()).or_default().insert(req);
+                }
+            }
+        }
+        return out;
+    }
     for other in &app.library_classes {
         let other_name = other.name.0.as_str();
         if other_name == own {
@@ -6524,6 +6553,61 @@ fn constant_readers(
         }
     }
     out
+}
+
+/// Every constant path each library class's load-time code (constant
+/// initializers and class-body calls) names, inverted: path → indices
+/// into `app.library_classes` of the classes naming it. Built once per
+/// `emit_library_class_decls` and dropped when it returns; outside that
+/// scope (or for another `App`) `constant_readers` walks as before.
+struct ConstantReaderIndex;
+
+type ReaderIndex = std::rc::Rc<HashMap<Vec<String>, Vec<usize>>>;
+
+thread_local! {
+    static CONSTANT_READER_INDEX: std::cell::RefCell<Option<(usize, ReaderIndex)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous index when the emit that installed this one
+/// returns. Borrows the `App` for its whole life, so the address the
+/// index is keyed by cannot be reused by another `App` meanwhile.
+struct ConstantReaderIndexGuard<'a>(Option<(usize, ReaderIndex)>, std::marker::PhantomData<&'a App>);
+
+impl Drop for ConstantReaderIndexGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CONSTANT_READER_INDEX.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+impl ConstantReaderIndex {
+    fn install(app: &App) -> ConstantReaderIndexGuard<'_> {
+        let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+        for (j, other) in app.library_classes.iter().enumerate() {
+            let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+            for (_, v) in &other.constants {
+                walk_const_paths(v, &mut paths);
+            }
+            for call in &other.unknown_calls {
+                walk_const_paths(call, &mut paths);
+            }
+            for path in paths {
+                index.entry(path).or_default().push(j);
+            }
+        }
+        let key = app as *const App as usize;
+        let previous =
+            CONSTANT_READER_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
+        ConstantReaderIndexGuard(previous, std::marker::PhantomData)
+    }
+
+    /// The installed index, when it was built from this `app`.
+    fn current(app: &App) -> Option<ReaderIndex> {
+        let key = app as *const App as usize;
+        CONSTANT_READER_INDEX
+            .with(|slot| slot.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, index)| index.clone()))
+    }
 }
 
 /// Split a class's constants into the ones that can be initialized
@@ -6825,6 +6909,7 @@ fn is_app_class(name: &str, app: &App) -> bool {
             .library_classes
             .iter()
             .any(|c| c.name.0.as_str() == name && !c.is_module)
+        || app.test_modules.iter().any(|t| t.name.0.as_str() == name)
 }
 
 /// The declared superclass of an app class named by a namespace
@@ -6836,10 +6921,17 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
     if let Some(c) = app.controllers.iter().find(|c| c.name.0.as_str() == name) {
         return c.parent.clone();
     }
-    app.library_classes
+    if let Some(c) = app.library_classes.iter().find(|c| c.name.0.as_str() == name && !c.is_module) {
+        return c.parent.clone();
+    }
+    // A test class nesting another (`PermissionGeneratorTest::
+    // ValidateInitialTest`) reopens with the parent its own file
+    // declares, after the emit's base rewrite.
+    app.test_modules
         .iter()
-        .find(|c| c.name.0.as_str() == name && !c.is_module)
-        .and_then(|c| c.parent.clone())
+        .find(|t| t.name.0.as_str() == name)
+        .and_then(|t| t.parent.as_ref())
+        .map(super::emitted_test_parent)
 }
 
 /// The app class a written superclass names, looked up from the child's

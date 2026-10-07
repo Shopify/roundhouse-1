@@ -13,7 +13,8 @@
 //!   defines, on the class itself, through a concern's `class_methods`
 //!   (spliced onto the includer by then), or by `extend`ing a module →
 //!   [`ModelDatabase::AppDefined`]: which database a query reaches is
-//!   app code;
+//!   app code. Rails consults every such method a class defines, so
+//!   several are one routing, decided at the first;
 //! * any other `connects_to` (computed, under a condition, `shards:`)
 //!   or an `establish_connection` → [`ModelDatabase::Unresolved`].
 //!
@@ -221,6 +222,19 @@ fn own_decision(
             _ => {}
         }
     }
+    // Rails consults every lookup a class defines (`with_connection`
+    // runs queries, `lease_connection` answers `connection`, and the
+    // default `with_connection` checks out of `connection_pool`), so
+    // several of them are one app-defined routing, decided at the first.
+    let mut app_defined = false;
+    found.retain(|own| match own {
+        Own::AppDefined { .. } if app_defined => false,
+        Own::AppDefined { .. } => {
+            app_defined = true;
+            true
+        }
+        _ => true,
+    });
     // A class body that says two things is unresolved, at the second.
     match found.len() {
         0 => None,
@@ -370,14 +384,14 @@ pub(super) fn resolve(app: &mut App) {
                 }
                 ModelDatabase::Named { writing, reading, declared_by, span }
             }
-            Some((j, Own::AppDefined { method, defined_by, span })) => {
-                let class = app.models[j].name.0.as_str();
+            Some((_, Own::AppDefined { method, defined_by, span })) => {
+                // Named by its definition, not the deciding model, so a
+                // concern's override is one refusal counting its includers.
                 note(
                     span,
                     "connection_override",
                     format!(
-                        "`{}.{}` is app-defined (in `{}`): app-defined connection routing is not modeled, so the database its queries reach cannot be resolved",
-                        class,
+                        "`{}` is app-defined (in `{}`): app-defined connection routing is not modeled, so the database the queries reach cannot be resolved",
                         method.as_str(),
                         defined_by.0.as_str()
                     ),

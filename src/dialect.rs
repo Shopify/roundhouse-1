@@ -1846,6 +1846,13 @@ pub struct TestModule {
     /// import-stripper, so the field is informational only there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub includes: Vec<ClassId>,
+    /// The authored file that declares the class, relative to the app
+    /// root (`test/lib/x_test.rb`). One file can declare several test
+    /// classes, each emitted to a file of its own; the emitted test
+    /// index (`test/roundhouse_tests.json`) maps each authored file back
+    /// to all of them, so a run of the file runs every class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
 }
 
 impl TestModule {

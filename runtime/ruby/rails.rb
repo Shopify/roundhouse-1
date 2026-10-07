@@ -424,6 +424,31 @@ module Rails
     def fatal(message)
       Rails.log_line("[rails] FATAL " + message.to_s)
     end
+
+    # ::Logger's level predicates (logger 1.7 `debug?` .. `fatal?`),
+    # answering for what this logger writes: `debug` is silent, every
+    # other severity is written. ActiveSupport::LogSubscriber#silenced?
+    # asks `logger.<level>?` of its logger, which defaults to
+    # Rails.logger (activesupport 8.1.4 log_subscriber.rb:143).
+    def debug?
+      false
+    end
+
+    def info?
+      true
+    end
+
+    def warn?
+      true
+    end
+
+    def error?
+      true
+    end
+
+    def fatal?
+      true
+    end
   end
 
   # App-config stand-in (see module note). Otherwise empty — the app's
