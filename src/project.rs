@@ -3963,8 +3963,13 @@ fn gem_source_dependency_block(app: &App) -> String {
     if native.is_empty() {
         return out;
     }
-    let names: Vec<String> =
-        native.iter().map(|f| format!("[{f:?}, {}]", optional.contains(f))).collect();
+    // With a feature the source rescues LoadError around, each entry
+    // carries whether it is one (`[feature, optional]`).
+    let names: Vec<String> = if optional.is_empty() {
+        native.iter().map(|f| format!("{f:?}")).collect()
+    } else {
+        native.iter().map(|f| format!("[{f:?}, {}]", optional.contains(f))).collect()
+    };
     let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
     out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
     out.push_str(
@@ -3982,7 +3987,8 @@ fn gem_source_dependency_block(app: &App) -> String {
          end\n",
     );
     // `optional`: the source rescues LoadError around the require.
-    out.push_str(&format!("[{}].each do |feature, optional|\n", names.join(", ")));
+    let params = if optional.is_empty() { "feature" } else { "feature, optional" };
+    out.push_str(&format!("[{}].each do |{params}|\n", names.join(", ")));
     out.push_str(
         "  spec = Gem::Specification.find_by_path(feature)\n  \
          if spec && __rh_compiled_gems.include?(spec.name)\n    \
@@ -3993,13 +3999,15 @@ fn gem_source_dependency_block(app: &App) -> String {
          warn \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
          next\n  \
          end\n  \
-         loaded = $LOADED_FEATURES.size\n  \
-         begin\n    \
-         require feature\n  \
-         rescue LoadError\n    \
-         raise unless optional\n  \
-         end\n  \
-         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
+         loaded = $LOADED_FEATURES.size\n",
+    );
+    out.push_str(if optional.is_empty() {
+        "  require feature\n"
+    } else {
+        "  begin\n    require feature\n  rescue LoadError\n    raise unless optional\n  end\n"
+    });
+    out.push_str(
+        "  rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d|/bundler/gems/rails-\\h+/}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
          end\n",
     );
