@@ -285,6 +285,19 @@ fn is_stdlib_only(graph: &Graph, declaration: &Declaration) -> bool {
         })
 }
 
+/// Whether every definition of the declaration is in the Roundhouse
+/// runtime: neither Ruby's signatures nor the app assign it.
+fn is_runtime_only(graph: &Graph, declaration: &Declaration) -> bool {
+    !declaration.definitions().is_empty()
+        && declaration.definitions().iter().all(|id| {
+            graph
+                .definitions()
+                .get(id)
+                .and_then(|definition| graph.documents().get(definition.uri_id()))
+                .is_some_and(|document| document.uri().starts_with(RUNTIME_URI_PREFIX))
+        })
+}
+
 /// The name a declaration answers to once ingest has hoisted it.
 ///
 /// Rubydex names what `class << self` declares by its singleton class:
@@ -737,14 +750,21 @@ fn answer_file(
             .map(|(id, declaration)| {
                 // An RBS class alias is the class it names. The alias
                 // declaration is the signatures' own, so an app that
-                // assigns the name instead keeps its value.
+                // assigns the name instead keeps its value. So is a
+                // runtime alias of a runtime class
+                // (`ActiveRecord::Type::Integer = ActiveModel::Type::Integer`)
+                // that only the runtime assigns.
                 let stdlib_alias = matches!(declaration, Declaration::ConstantAlias(_))
                     && is_stdlib_only(graph, declaration);
-                let aliased = stdlib_alias
+                let runtime_alias = !stdlib_alias
+                    && matches!(declaration, Declaration::ConstantAlias(_))
+                    && is_runtime_only(graph, declaration);
+                let aliased = (stdlib_alias || runtime_alias)
                     .then(|| graph.resolve_alias(&id))
                     .flatten()
                     .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
-                    .filter(|(_, target)| target.as_namespace().is_some());
+                    .filter(|(_, target)| target.as_namespace().is_some()
+                        && (stdlib_alias || is_runtime_declaration(graph, target)));
                 let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
                 let (id, declaration) = aliased.unwrap_or((id, declaration));
                 if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
