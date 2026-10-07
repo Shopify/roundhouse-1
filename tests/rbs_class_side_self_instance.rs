@@ -25,6 +25,15 @@ const SOURCE: &str = r#"class Widget
 end
 
 class Child < Widget
+  def label
+    "c"
+  end
+end
+
+class Shelf
+  def self.first_label
+    Child.make.label
+  end
 end
 "#;
 
@@ -44,6 +53,13 @@ fn a_class_side_new_is_the_rbs_instance_type() {
     assert!(rbs.contains("def self.pair: () -> Array[instance]"), "{rbs}");
     assert!(!rbs.contains("RoundhouseUnsupported"), "{rbs}");
     assert!(diags.is_empty(), "{diags:#?}");
+    // As in Ruby, `Child.make` is a Child: `label` is Child's alone.
+    let shelf = files
+        .iter()
+        .find(|f| f.path.ends_with("sig/app/models/shelf.rbs"))
+        .map(|f| f.content.clone())
+        .expect("shelf.rbs");
+    assert!(shelf.contains("def self.first_label: () -> String"), "{shelf}");
 
     let path = std::env::temp_dir().join(format!("rh_widget_{}.rbs", std::process::id()));
     std::fs::write(&path, &rbs).unwrap();
