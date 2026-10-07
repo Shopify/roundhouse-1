@@ -312,14 +312,26 @@ fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
     // A signature port's method is the native declaration (its parity
     // test holds it to activesupport), so the Ruby tree binds
     // `super(key, **options)` into MemoryStore's as Ruby would.
+    // Through the public API, which instruments every operation through
+    // ActiveSupport::Notifications: the same events native activesupport
+    // publishes (tests/support/rails_oracle.rb's copy, run below).
     let source = "class ProbeStore < ActiveSupport::Cache::MemoryStore; def write_entry(key, entry, **options); options = options.merge(unless_exist: false); super(key, entry, **options); end; end";
+    let script = "events = []; ActiveSupport::Notifications.subscribe(/cache_/) { |name, *, payload| events << [name, payload[:key]] }; s = ProbeStore.new; s.write('k', 7); p s.read('k'); s.fetch('j') { 3 }; p events";
+    let oracle = std::env::temp_dir().join(format!("rh-cache-oracle-{}.rb", std::process::id()));
+    std::fs::write(&oracle, format!(
+        "require_relative {:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\nrequire \"active_support/cache\"\nrequire \"active_support/cache/memory_store\"\nrequire \"active_support/notifications\"\n{source}\n{script}\n",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle"),
+    )).unwrap();
+    let native = Command::new("ruby").arg(&oracle).output().unwrap();
+    let _ = std::fs::remove_file(&oracle);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(expected.contains("cache_write.active_support"), "{expected}");
     let run = emit_and_run::real_blog()
         .write("app/lib/probe_store.rb", source)
-        // The entry methods directly: Store#write instruments through
-        // ActiveSupport::Notifications, which this tree does not carry.
-        .run_ruby("s = ProbeStore.new; s.send(:write_entry, 'k', ActiveSupport::Cache::Entry.new(7)); puts s.send(:read_entry, 'k').value");
+        .run_ruby(script);
     run.assert_passes();
-    assert_eq!(run.stdout, "7\n");
+    assert_eq!(run.stdout, expected);
     // The method's own block, passed on: what the implicit pass does.
     let source = "class Probe < StandardError; def initialize(&blk); options={}; super(**options, &blk); end; end";
     native_result(source, "puts Probe.new.message", "Probe\n");
