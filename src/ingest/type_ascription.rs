@@ -177,19 +177,29 @@ pub(super) fn trailing_ascription(file: &str, end: usize) -> Option<Trailing> {
 }
 
 /// Apply a trailing ascription to `value`: a `Cast` to the declared
-/// type, or `value.not_nil!` for `#: as !nil` — the method core writes
-/// instead of `T.must`, which the analyzer already reads as "the
-/// receiver, nil removed".
-pub(super) fn ascribe_trailing(value: Expr, trailing: Option<Trailing>) -> Expr {
+/// type, or for `#: as !nil` the nil check `T.must` lowers to. Core
+/// writes the comment, `T.must` and type_toolkit's `not_nil!` for the
+/// same assertion. RBS inline itself checks nothing at runtime, but an
+/// unchecked value typed without nil is what this assertion must not
+/// become, so a wrong annotation raises TypeError here rather than
+/// letting nil run on as a non-nil value.
+pub(super) fn ascribe_trailing(
+    value: Expr,
+    trailing: Option<Trailing>,
+    location: &ruby_prism::Location<'_>,
+) -> Expr {
     match trailing {
         Some(Trailing::Type(ty)) => ascribe(value, Some(ty)),
-        Some(Trailing::NotNil) => not_nil(value),
+        Some(Trailing::NotNil) => {
+            let span = value.span;
+            super::expr::must_check(span, value, location, "Passed `nil` into `#: as !nil`")
+        }
         None => value,
     }
 }
 
-/// A generated non-nil assertion carries a refusal until nil-check semantics
-/// have a shared executable implementation.
+/// `T.must_because`'s non-nil assertion carries a refusal until its
+/// reason block has an executable lowering.
 pub(super) fn not_nil(value: Expr) -> Expr {
     let span = value.span;
     let mut expr = Expr::new(

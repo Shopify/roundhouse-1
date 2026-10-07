@@ -3,8 +3,8 @@
 //! The gem's definition: every object answers itself, and nil raises
 //! `TypeToolkit::UnexpectedNilError` (an Exception, not a
 //! StandardError). The CRuby tree carries that definition; every other
-//! tree refuses the call. The `#: as !nil` comment is not this call and
-//! keeps its own refusal. The error class is not a modeled constant,
+//! tree refuses the call. The `#: as !nil` comment is not this call: it
+//! lowers to T.must's check (tests/rbs_as_not_nil_check.rs). The error class is not a modeled constant,
 //! so the test reads it by name.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
