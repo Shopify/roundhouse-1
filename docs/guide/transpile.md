@@ -201,7 +201,8 @@ it transpiles to a tree that does not need it at run time: a `sig` is
 read (see [`check.md`](check.md)) and then dropped, along with
 `extend T::Sig`, `abstract!` and the rest of the annotations;
 `T.type_alias` constants go with the signatures that were their only
-reader. The assertions split by what they do natively:
+reader, except where a check below reads them. The assertions split by
+what they do natively:
 
 - `T.must`, `T.must_because` and the `#: as !nil` comment keep their
   nil check on the Ruby trees: `TypeError` with sorbet-runtime's
@@ -222,8 +223,17 @@ reader. The assertions split by what they do natively:
   `T.let([], T::Array[X])`) is the value alone. A type the check cannot
   rebuild faithfully (`T.proc`, `T.self_type`, `T.attached_class`, type
   parameters, `T.all`, tuple and hash shapes, sorbet's own constants
-  such as `T::Struct`) is refused at the site by name, as is a type
-  alias constant (the aliases are not carried into the tree). The other
+  such as `T::Struct`) is refused at the site by name. A type alias
+  (`X = T.type_alias { T }` in a library class, model, test or module
+  body) is carried on the Ruby trees as
+  `X = SorbetRuntimeCheck.type_alias { <T> }`, resolved at its first
+  check as sorbet's `aliased_type` is and unwrapped wherever a type is
+  read (a union of aliases names their flattened members); the analysis
+  reads the declared type through it. Still dropped, so their sites keep
+  the refusal: aliases whose type is a form above (shapes, procs), aliases
+  in controller bodies or `class << self`, and the blockless
+  `T.type_alias(T)`. A file-level alias outside any class is emitted in
+  the file's first class, so it does not resolve elsewhere. The other
   targets (spinel, roda and the strict ones) refuse the check by name
   (`sorbet type check not supported`) rather than drop it.
   `tests/author_casts_run.rs` compares every result and message with

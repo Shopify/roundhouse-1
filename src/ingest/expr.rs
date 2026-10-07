@@ -1447,7 +1447,12 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_constant_write_node().is_some() => {
             let w = n.as_constant_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
-            let value = ingest_expr(&w.value(), file)?;
+            // A sorbet type alias in a body this arm ingests (a model's)
+            // is the type object the check reads, as in a class body.
+            let value = match super::sorbet_check::alias_value(&w.value(), file)? {
+                Some(alias) => alias,
+                None => ingest_expr(&w.value(), file)?,
+            };
             ExprNode::Assign {
                 target: crate::expr::LValue::Const { path: vec![name] },
                 value,

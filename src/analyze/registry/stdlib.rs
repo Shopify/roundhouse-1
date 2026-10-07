@@ -105,9 +105,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // check `ingest::sorbet_check` lowers `T.let` / `T.cast` / `T.bind` /
     // `T.assert_type!` to, and the type-object builders its type
     // argument is made of; the CRuby overlay's sorbet_runtime_check.rb
-    // answers them. The call's value is the source `Cast`'s to type.
+    // answers them, and `type_alias { ... }`, a carried sorbet type alias
+    // (`sorbet_check::alias_value`). The call's value is the source
+    // `Cast`'s to type.
     let mut sorbet_check = ClassInfo::default();
-    for method in ["cast", "nilable", "any", "generic", "class_of", "untyped", "anything", "boolean"] {
+    for method in ["cast", "nilable", "any", "generic", "class_of", "untyped", "anything", "boolean", "type_alias"] {
         sorbet_check.class_methods.insert(Symbol::from(method), Ty::Untyped);
     }
     classes.insert(ClassId(Symbol::from(crate::ingest::sorbet_check::HELPER)), sorbet_check);

@@ -1,10 +1,11 @@
 //! The two sorbet constructs left in the emit, which are not the same
 //! kind of thing.
 //!
-//! `NAME = T.type_alias { … }` is a TYPE. It generates nothing and
-//! answers nothing — the only thing that reads it is a `sig`, and
-//! those are read before they are dropped — so the constant goes with
-//! them.
+//! `NAME = T.type_alias { … }` is a TYPE. It generates no class. A
+//! `sig` reads it before sigs are dropped, and a sorbet check
+//! (`T.let(x, NAME)`) reads it at runtime, so the Ruby trees carry the
+//! type object that check reads (`ingest::sorbet_check::alias_value`);
+//! the other trees drop it with the checks they refuse.
 //!
 //! `T.absurd(x)` is BEHAVIOR. It sits in the branch a case analysis is
 //! supposed to have made unreachable, and it raises there. Dropping it
@@ -48,7 +49,7 @@ fn emitted(source: &str, file: &str) -> String {
 }
 
 #[test]
-fn a_type_alias_constant_goes_with_the_sigs_that_read_it() {
+fn a_type_alias_constant_is_the_type_object_the_check_reads() {
     let emitted = emitted(
         r#"class Gauge
   Reading = T.type_alias { T.any(Integer, Float) }
@@ -61,8 +62,11 @@ end
 "#,
         "gauge.rb",
     );
-    assert!(!emitted.contains("type_alias"), "got:\n{emitted}");
-    assert!(!emitted.contains("Reading"), "got:\n{emitted}");
+    assert!(
+        emitted.contains("Reading = SorbetRuntimeCheck.type_alias { SorbetRuntimeCheck.any(Integer, Float) }"),
+        "got:\n{emitted}"
+    );
+    assert!(!emitted.contains("T.type_alias") && !emitted.contains("T.any"), "got:\n{emitted}");
     // An ordinary constant in the same body is untouched — the rule is
     // about what the initializer IS, not about where it sits.
     assert!(emitted.contains("LIMIT = 100"), "got:\n{emitted}");

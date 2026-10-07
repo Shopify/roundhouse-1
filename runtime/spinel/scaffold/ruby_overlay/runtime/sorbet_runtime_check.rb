@@ -19,6 +19,10 @@
 # (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, shapes)
 # are refused at the site and never reach this file.
 #
+# `Name = T.type_alias { X }` is carried as
+# `Name = SorbetRuntimeCheck.type_alias { <X> }`, an Alias whose block
+# runs at its first check, as sorbet-runtime's `aliased_type` does.
+#
 # CRuby overlay only (it reads `Method#owner` and binds `Module#name`);
 # `project` refuses the call on every other tree.
 module SorbetRuntimeCheck
@@ -35,9 +39,11 @@ module SorbetRuntimeCheck
     raise ::TypeError.new("#{cast_method}: #{coerce(type).error_message(value)}\nCaller: #{path}:#{line}")
   end
 
-  # `T::Types::Simple::Private::Pool.type_for_module`: a bare stdlib
-  # collection class names itself as its untyped generic.
+  # `T::Utils.coerce`: a type alias is the type it names, and
+  # `T::Types::Simple::Private::Pool.type_for_module` names a bare
+  # stdlib collection class as its untyped generic.
   def self.coerce(type)
+    return type.aliased_type if type.is_a?(Alias)
     return type unless type.is_a?(::Module)
     if type == ::Array
       Generic.new("T::Array", ::Array, [UNTYPED])
@@ -301,6 +307,35 @@ module SorbetRuntimeCheck
         "T.any(#{types.map(&:name).compact.sort.join(', ')})"
       end
     end
+  end
+
+  # `T::Private::Types::TypeAlias`. The block runs at the first check
+  # (`aliased_type`), so it may name a constant defined after the alias.
+  # `coerce` unwraps it wherever a type is read, as sorbet's does, so
+  # its own name and `valid?` are reached only by a direct call. Core's
+  # `TypeAliasRuntimeValidation` makes every alias check its aliased
+  # type, which is also sorbet's default level, so `.checked` levels
+  # are not modeled.
+  class Alias
+    def initialize(block)
+      @block = block
+    end
+
+    def aliased_type
+      @aliased_type ||= SorbetRuntimeCheck.coerce(@block.call)
+    end
+
+    def name
+      aliased_type.name
+    end
+
+    def valid?(obj)
+      aliased_type.valid?(obj)
+    end
+  end
+
+  def self.type_alias(&block)
+    Alias.new(block)
   end
 
   BOOLEAN = Union.new([::TrueClass, ::FalseClass])

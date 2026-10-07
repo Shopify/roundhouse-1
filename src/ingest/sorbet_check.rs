@@ -345,6 +345,100 @@ fn str_lit(span: Span, value: &str) -> Expr {
     Expr::new(span, ExprNode::Lit { value: Literal::Str { value: value.to_string() } })
 }
 
+/// `Name = T.type_alias { X }` as the Ruby trees carry it:
+/// `SorbetRuntimeCheck.type_alias { <X> }`, a type object whose block
+/// runs at its first check, as sorbet-runtime's `aliased_type` does, so
+/// a check naming the alias (`T.let(x, Name)`) reaches the type it
+/// names. `None` when `value` is not that call or its type is one the
+/// check does not read; such an alias goes, as before, with the `sig`s
+/// that read it, and a check naming it is refused as an unknown constant.
+/// `project` drops the carried alias off the CRuby / JRuby trees, which
+/// refuse every check that could read it.
+pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
+    let Some(call) = value.as_call_node() else { return Ok(None) };
+    if constant_id_str(&call.name()) != "type_alias" || !call.receiver().is_some_and(|r| is_t(&r)) || call.arguments().is_some() {
+        return Ok(None);
+    }
+    let Some(body) = call
+        .block()
+        .and_then(|b| b.as_block_node())
+        .and_then(|b| b.body())
+        .and_then(|b| b.as_statements_node())
+    else {
+        return Ok(None);
+    };
+    let statements: Vec<Node<'_>> = body.body().iter().collect();
+    let [ty] = statements.as_slice() else { return Ok(None) };
+    let Ok(ty) = read_type(ty, file)? else { return Ok(None) };
+    let loc = value.location();
+    let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
+    let block = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda {
+            params: Vec::new(),
+            rest_param: None,
+            block_param: None,
+            body: type_expr(&ty),
+            block_style: crate::expr::BlockStyle::Brace,
+        },
+    );
+    Ok(Some(Expr::new(
+        span,
+        ExprNode::Send { recv: Some(helper()), method: Symbol::from("type_alias"), args: Vec::new(), block: Some(block), parenthesized: false },
+    )))
+}
+
+/// The static type a carried alias (`alias_value`) names, read back from
+/// its type object the way `sorbet_sig::sorbet_ty` reads the written
+/// type: the analyzer substitutes it where a declared type names the
+/// alias (`analyze::body::expand_type_aliases`). A user generic is its
+/// class without arguments; `None` for anything else.
+pub(crate) fn alias_ty(expr: &Expr) -> Option<crate::ty::Ty> {
+    let ExprNode::Send { block: Some(block), .. } = &*expr.node else { return None };
+    if !is_alias(expr) {
+        return None;
+    }
+    let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+    type_object_ty(body)
+}
+
+fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
+    use crate::ty::Ty;
+    let const_name = |expr: &Expr| match &*expr.node {
+        ExprNode::Const { path } => {
+            Some(path.iter().map(Symbol::as_str).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::"))
+        }
+        _ => None,
+    };
+    if let Some(name) = const_name(expr) {
+        return Some(super::sorbet_sig::named_ty(&name));
+    }
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else { return None };
+    if const_name(recv).as_deref() != Some(HELPER) {
+        return None;
+    }
+    match (method.as_str(), args.as_slice()) {
+        ("untyped" | "anything", []) => Some(Ty::Untyped),
+        ("boolean", []) => Some(Ty::Bool),
+        ("nilable", [inner]) => Some(Ty::Union { variants: vec![type_object_ty(inner)?, Ty::Nil] }),
+        ("any", members) => Some(Ty::Union { variants: members.iter().map(type_object_ty).collect::<Option<_>>()? }),
+        ("class_of", [class]) => Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(const_name(class)?.as_str())), args: Vec::new() }),
+        ("generic", [label, _outer, rest @ ..]) => {
+            let ExprNode::Lit { value: Literal::Str { value: label } } = &*label.node else { return None };
+            let args: Vec<Ty> = rest.iter().map(type_object_ty).collect::<Option<_>>()?;
+            crate::rbs::sorbet_generic_ty(label, &args)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a carried type alias (`alias_value`).
+pub(crate) fn is_alias(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Send { recv: Some(recv), method, block: Some(_), .. }
+        if method.as_str() == "type_alias"
+            && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == HELPER))
+}
+
 /// The runtime type object the overlay's helper reads.
 fn type_expr(ty: &SorbetType) -> Expr {
     match ty {

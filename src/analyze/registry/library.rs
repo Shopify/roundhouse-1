@@ -112,6 +112,20 @@ pub(in crate::analyze) fn register(
         if lc.parent.is_some() {
             cls.parent = lc.parent.clone();
         }
+        for (name, value) in &lc.constants {
+            if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(value) {
+                cls.type_aliases.insert(name.clone(), aliased);
+            }
+        }
+    }
+    // A model's sorbet type aliases, which its body carries as constants
+    // (`lower::model_to_library::collect_model_constants`).
+    for model in &app.models {
+        for (name, value) in crate::lower::model_to_library::collect_model_constants(model) {
+            if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(&value) {
+                classes.entry(model.name.clone()).or_default().type_aliases.insert(name, aliased);
+            }
+        }
     }
 
     // The Attachment's own readers, on the app's attachable classes.

@@ -835,7 +835,7 @@ fn sorbet_proc_ty(
 
 /// A constant in type position, mapped the way the RBS reader maps the
 /// same names so both sources agree.
-fn named_ty(name: &str) -> Ty {
+pub(crate) fn named_ty(name: &str) -> Ty {
     match name {
         "Integer" => Ty::Int,
         "Float" => Ty::Float,
