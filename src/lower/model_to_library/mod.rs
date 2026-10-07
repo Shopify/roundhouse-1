@@ -597,10 +597,32 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         nullable_columns: nullable_column_names(table),
         origin: None,
         constants: collect_model_constants(model),
-        unknown_calls: Vec::new(),
+        unknown_calls: class_body_prepends(model.body.iter().filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })),
         class_ivar_initializers: collect_class_attr_initializers(model),
         visibility_overrides: model.visibility_overrides.clone(),
     }
+}
+
+/// A class body's `prepend M, ...` statements naming constants, as the
+/// lowered class's `unknown_calls`: the Ruby family replays one whose
+/// modules the app defines (`emit::ruby::library::app_prepend_calls`)
+/// and reports the rest; a target outside it refuses each
+/// (`project::report_class_body_prepends`). Dropped here, the module's
+/// wrappers silently never ran around the class's methods.
+pub(crate) fn class_body_prepends<'a>(body: impl Iterator<Item = &'a Expr>) -> Vec<Expr> {
+    body.filter(|expr| is_constant_prepend(expr)).cloned().collect()
+}
+
+/// `prepend A, B` (bare or `self.`) whose every argument is a constant.
+pub(crate) fn is_constant_prepend(expr: &Expr) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return false };
+    method.as_str() == "prepend"
+        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && !args.is_empty()
+        && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
 }
 
 /// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
@@ -914,6 +936,11 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         // left for an emitter to lower. Framework marker includes are
         // dropped by `model_includes` for the same reason.
         if name == "include" {
+            continue;
+        }
+        // `prepend Guard` — carried to the lowered class
+        // (`class_body_prepends`); the emit replays or refuses it.
+        if is_constant_prepend(expr) {
             continue;
         }
         // Block-form and lambda-argument lifecycle hooks

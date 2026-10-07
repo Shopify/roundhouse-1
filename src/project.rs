@@ -1654,6 +1654,7 @@ pub fn target_files(
     ) {
         report_keyword_params(app, target.as_str());
     }
+    report_class_body_prepends(app, target);
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         for controller in &app.controllers {
             if controller.class_methods().next().is_some() {
@@ -6633,6 +6634,91 @@ fn report_keyword_params(app: &App, target: &str) {
                         action.name.as_str()
                     ),
                 );
+            }
+        }
+    }
+}
+
+/// A class-body `prepend M` puts `M` ahead of the class, so `M`'s
+/// methods run around the class's own. The Ruby family writes the line
+/// into library classes and models (`emit::ruby::library::
+/// app_prepend_calls`); every other target has no prepended-module
+/// lookup and refuses each one by name.
+///
+/// A controller's mixins are flattened into it on every target, the
+/// controller's own method winning a name collision
+/// (`analyze::controller_include_groups`). For a prepended module that
+/// is backwards, so each collision is named, also on the Ruby family.
+fn report_class_body_prepends(app: &App, target: BuildTarget) {
+    use crate::dialect::{ControllerBodyItem, ModelBodyItem};
+    use crate::lower::model_to_library::is_constant_prepend;
+    let ruby_family = matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel);
+    let written = |call: &crate::expr::Expr| crate::emit::ruby::emit_expr(call).lines().next().unwrap_or_default().to_string();
+    if !ruby_family {
+        let library = app.library_classes.iter().flat_map(|lc| lc.unknown_calls.iter().map(move |c| (&lc.name, c)));
+        let models = app.models.iter().flat_map(|m| {
+            m.body.iter().filter_map(move |item| match item {
+                ModelBodyItem::Unknown { expr, .. } => Some((&m.name, expr)),
+                _ => None,
+            })
+        });
+        let controllers = app.controllers.iter().flat_map(|c| {
+            c.body.iter().filter_map(move |item| match item {
+                ControllerBodyItem::Unknown { expr, .. } => Some((&c.name, expr)),
+                _ => None,
+            })
+        });
+        for (owner, call) in library.chain(models).chain(controllers) {
+            if !is_constant_prepend(call) {
+                continue;
+            }
+            emit::diagnostics::report_unsupported(
+                call.span,
+                target.as_str(),
+                "prepend",
+                format!(
+                    "`{}` in `{}`: this target has no prepended-module lookup, so the module's \
+                     methods would not run ahead of the class's own; the line is dropped",
+                    written(call),
+                    owner.0.as_str()
+                ),
+            );
+        }
+        return;
+    }
+    for controller in &app.controllers {
+        let own: Vec<&crate::ident::Symbol> = controller.actions().map(|a| &a.name).collect();
+        for item in &controller.body {
+            let ControllerBodyItem::Unknown { expr, .. } = item else { continue };
+            if !is_constant_prepend(expr) {
+                continue;
+            }
+            let crate::expr::ExprNode::Send { args, .. } = &*expr.node else { continue };
+            for arg in args {
+                let crate::expr::ExprNode::Const { path } = &*arg.node else { continue };
+                let id = crate::analyze::mixin_path_id(path);
+                let Some(module) = app.library_classes.iter().find(|lc| lc.is_module && lc.name == id) else { continue };
+                for m in &module.methods {
+                    if m.receiver != crate::dialect::MethodReceiver::Instance || !own.contains(&&m.name) {
+                        continue;
+                    }
+                    let mut d = crate::diagnostic::Diagnostic::unsupported(
+                        expr.span,
+                        Some(crate::ident::Symbol::from(target.as_str())),
+                        "prepend",
+                        format!(
+                            "`{}` in `{}`: the controller's mixins are flattened into it, so its own \
+                             `{}` shadows `{}#{}`, which Ruby runs ahead of it",
+                            written(expr),
+                            controller.name.0.as_str(),
+                            m.name.as_str(),
+                            module.name.0.as_str(),
+                            m.name.as_str()
+                        ),
+                    );
+                    d.severity = crate::diagnostic::Severity::Warning;
+                    emit::diagnostics::push(d);
+                }
             }
         }
     }
