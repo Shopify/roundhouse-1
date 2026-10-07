@@ -608,6 +608,13 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // tree (ruby_overlay active_record_sqlite3_adapter.rb), as a name;
     // `project` refuses it on every other target.
     register_stdlib_class(classes, "ActiveRecord::ConnectionAdapters::SQLite3Adapter", &[], &[]);
+    // `ActiveModel::Type.default_value` (activemodel 8.2.0.alpha
+    // type.rb): the `Type::Value` an attribute with no declared type
+    // answers. The Ruby family's type port defines it
+    // (runtime/spinel/active_model_type.rb); the AR attribute API reads it.
+    register_stdlib_class(classes, "ActiveModel::Type", &[
+        ("default_value", Ty::Class { id: ClassId(Symbol::from("ActiveModel::Type::Value")), args: vec![] }),
+    ], &[]);
     // `ActiveModel::Type::Boolean.new.cast(v)`: nil for a blank value, else the boolean.
     register_stdlib_class(classes, "ActiveModel::Type::Boolean", &[], &[
         ("cast", Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }),

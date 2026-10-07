@@ -42,10 +42,10 @@ module ActiveRecord
     def self.abstract_class: () -> bool?
     def self.abstract_class=: (bool? value) -> bool?
     def self.abstract_class?: () -> bool
-    def self.schema_column_types: () -> Hash[String, Array[untyped]]
-    def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> untyped } -> untyped
-    def self.attribute_types: () -> Hash[String, untyped]
-    def self._cast_type_for_spec: (String name, Array[untyped] spec) -> untyped
+    def self.schema_column_types: () -> Hash[String, Array[(Symbol | Integer | String)?]]
+    def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> ActiveModel::Type::Value } -> ActiveModel::Type::Value
+    def self.attribute_types: () -> Hash[String, ActiveModel::Type::Value]
+    def self._cast_type_for_spec: (String name, Array[(Symbol | Integer | String)?] spec) -> ActiveModel::Type::Value
     def update_column: (String | Symbol name, untyped value) -> bool
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.

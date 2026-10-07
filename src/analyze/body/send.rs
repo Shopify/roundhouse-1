@@ -363,6 +363,9 @@ impl<'a> BodyTyper<'a> {
                 "transform_values" => Some(vec![(**value).clone()]),
                 // `transform_keys { |k| ... }` — block receives just the key.
                 "transform_keys" => Some(vec![(**key).clone()]),
+                // `each_key { |k| ... }` / `each_value { |v| ... }` yield one side.
+                "each_key" => Some(vec![(**key).clone()]),
+                "each_value" => Some(vec![(**value).clone()]),
                 _ => None,
             },
             Ty::Class { id, .. } if id.0.as_str() == "CSV" && method.as_str() == "generate" => {
