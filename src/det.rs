@@ -5,11 +5,14 @@
 //! output — could produce a different (equally valid) answer run to run.
 //! On Shopify Core the cap-12 fixpoint still moves when it stops, and
 //! which facts it reached first decided hundreds of notes per run.
-//! These aliases keep `std`'s SipHash but with fixed keys: same speed,
-//! same API (construct with `default()`/`with_capacity_and_hasher`), and
-//! a deterministic order for a given insertion sequence.
+//! These aliases use rustc's FxHasher, which has no seed: same API
+//! (construct with `default()`/`with_capacity_and_hasher`), and a
+//! deterministic order for a given insertion sequence. It replaced
+//! `std`'s fixed-key SipHash, which was a sixth of `check`'s analyze
+//! time on Shopify Core (perf, 2026-10-07). Nothing here hashes
+//! attacker-chosen keys at a scale where Fx's weaker mixing matters.
 
-use std::collections::hash_map::DefaultHasher;
+use rustc_hash::FxHasher as DefaultHasher;
 use std::hash::BuildHasherDefault;
 
 /// The fixed-key hasher behind [`HashMap`] and [`HashSet`].
