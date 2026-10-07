@@ -2680,6 +2680,22 @@ fn ruby_family_runtime_files(
         crate::runtime_files::read_to_string("runtime/spinel/rails_configuration.rb")
             .map_err(|e| format!("read runtime/spinel/rails_configuration.rb: {e}"))?,
     ));
+    // ActiveSupport::Cache (Store, Entry, Coder, LocalCache, MemoryStore,
+    // NullStore) with IsolatedExecutionState and Digest, ported from
+    // activesupport 8.1.4 (see the file's header; tests/cache_runtime.rb
+    // holds it to native ActiveSupport). Marshal, Monitor, Zlib and
+    // computed-name dispatch, so ruby-family only, and carried only where
+    // the app's own code names one of its namespaces: an app that
+    // subclasses MemoryStore (Core's TestCacheStore) needs the real class.
+    let carries_cache = carries_active_support_cache(&files);
+    if carries_cache {
+        files.push((
+            "runtime/active_support_cache.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_cache.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_cache.rb: {e}"))?,
+        ));
+        drop_harness_memory_store(&mut files)?;
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2762,6 +2778,11 @@ fn ruby_family_runtime_files(
                 WEB_PUSH_STUB_REOPEN
             )
         }
+    };
+    let gem_facades = if carries_cache {
+        format!("{gem_facades}require_relative \"active_support_cache\"\n")
+    } else {
+        gem_facades
     };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {
@@ -5297,6 +5318,10 @@ fn spinel_files_with_assertions(
     // ruby-family forks only. A tree without it refuses the read
     // (`report_unsupported_runtime_reads`).
     files.retain(|(p, _)| p != "runtime/rails_configuration.rb");
+    // And for `active_support_cache.rb` (ActiveSupport::Cache): Marshal,
+    // Monitor and computed-name dispatch, pushed back by the two
+    // ruby-family forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -7018,6 +7043,49 @@ fn trim_gemfile(content: &str, has_js: bool, has_cable: bool) -> String {
 /// character or colon rules out `HashSet` and `Foo::Set`. Whole-line
 /// comments are skipped: the cookie jar explains a `Set.new` rewrite in
 /// one, and that is not a use.
+/// The namespaces runtime/spinel/active_support_cache.rb declares that an
+/// app reaches by name.
+const ACTIVE_SUPPORT_CACHE_NAMES: &[&str] = &[
+    "ActiveSupport::Cache",
+    "ActiveSupport::IsolatedExecutionState",
+    "ActiveSupport::Digest",
+];
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a namespace the cache port declares. A test body's
+/// `ActiveSupport::Cache::MemoryStore.new` alone is the harness's
+/// (`drop_harness_memory_store`), so tests do not count.
+fn carries_active_support_cache(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_SUPPORT_CACHE_NAMES.iter().any(|name| names_constant(content, name))
+    })
+}
+
+/// The Ruby-family test harness answers `ActiveSupport::Cache::MemoryStore.new`
+/// with the store `Rails.cache` is (`test/test_helper.rb`), for a test
+/// that swaps a memory store in and has no MemoryStore otherwise. A tree
+/// that carries the real one drops that reopen: its `self.new` would be
+/// inherited by every subclass (Core's `TestCacheStore.new` would build
+/// a `Rails::MemoryStore`), and `MemoryStore.new(size: n)` would not
+/// take its options.
+fn drop_harness_memory_store(files: &mut [(String, String)]) -> Result<(), String> {
+    const REOPEN: &str = "module ActiveSupport\n  module Cache\n    class MemoryStore\n      def self.new\n        Rails.cache.class.new\n      end\n    end\n  end\nend\n";
+    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
+        return Ok(());
+    };
+    if helper.matches(REOPEN).count() != 1 {
+        return Err("drop_harness_memory_store: expected one ActiveSupport::Cache::MemoryStore reopen in test/test_helper.rb".into());
+    }
+    *helper = helper.replace(
+        REOPEN,
+        "# (ActiveSupport::Cache::MemoryStore is runtime/active_support_cache.rb's\n# on this tree; the harness's stand-in is dropped.)\n",
+    );
+    Ok(())
+}
+
 fn names_constant(src: &str, konst: &str) -> bool {
     // Most files never mention this name. Reject those with the optimized
     // substring search before walking/decoding every line of the runtime.
@@ -7053,9 +7121,12 @@ fn names_constant(src: &str, konst: &str) -> bool {
         let mut i = 0;
         while let Some(off) = line[i..].find(konst) {
             let at = i + off;
-            let head_ok = at == 0
-                || !matches!(b[at - 1],
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b':');
+            let ident = |c: u8| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+            // `::Name` is the top-level `Name`; `Outer::Name` is not.
+            let top_level = at >= 2
+                && &b[at - 2..at] == b"::"
+                && (at == 2 || !(ident(b[at - 3]) || b[at - 3] == b':'));
+            let head_ok = at == 0 || top_level || !(ident(b[at - 1]) || b[at - 1] == b':');
             let tail = at + konst.len();
             let tail_ok = matches!(b.get(tail), Some(b'.' | b'[' | b'('))
                 || (b.get(tail) == Some(&b':') && b.get(tail + 1) == Some(&b':'));
@@ -8388,6 +8459,33 @@ fn walk_ruby(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache port rides along where app code (not a test body)
+    /// names its namespaces, and the harness's MemoryStore stand-in,
+    /// whose `self.new` every subclass would inherit, is dropped then.
+    #[test]
+    fn an_app_naming_active_support_cache_carries_the_port_and_drops_the_stand_in() {
+        let helper = crate::runtime_files::read_to_string("runtime/spinel/test/test_helper.rb").unwrap();
+        let subclass = "class TestCacheStore < ::ActiveSupport::Cache::MemoryStore\nend\n";
+        let mut files = vec![
+            ("test/test_helper.rb".to_string(), helper.clone()),
+            ("test/models/cache_test.rb".to_string(), "ActiveSupport::Cache::MemoryStore.new\n".to_string()),
+        ];
+        assert!(!carries_active_support_cache(&files), "a test body's read is the harness's");
+        files.push(("app/models/test_cache_store.rb".to_string(), subclass.to_string()));
+        assert!(carries_active_support_cache(&files));
+        files.push((
+            "app/models/ttl.rb".to_string(),
+            "x = ActiveSupport::IsolatedExecutionState[:k]\n".to_string(),
+        ));
+        assert!(carries_active_support_cache(&files[2..]));
+
+        drop_harness_memory_store(&mut files).unwrap();
+        let dropped = &files[0].1;
+        assert!(!dropped.contains("Rails.cache.class.new"), "{dropped}");
+        assert_eq!(dropped.len() < helper.len(), true);
+        assert!(drop_harness_memory_store(&mut files).is_err(), "a second drop finds no stand-in");
+    }
 
     #[test]
     fn bundled_constant_gate_covers_auxiliary_emitted_roots() {
