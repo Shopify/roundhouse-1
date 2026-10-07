@@ -6466,14 +6466,13 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
 /// guarded require would otherwise swallow it as a quiet LoadError.
 fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
     let Some(lock) = lock else { return };
+    // The needed gems' whole dependency closure, not only the needed gems
+    // themselves: panama_client is a GEM spec, but it depends on Core's
+    // grpc fork, and RubyGems activating panama_client cannot find that
+    // spec on its own. Dependencies first.
     let mut entries = String::new();
-    let mut seen: Vec<&str> = Vec::new();
-    for &gem in needed {
-        if seen.contains(&gem) {
-            continue;
-        }
-        seen.push(gem);
-        if let Some(git) = lock.git_source_of(gem) {
+    for gem in lock.git_specs_in_closure(needed) {
+        if let Some(git) = lock.git_source_of(&gem) {
             entries.push_str(&format!(
                 "  [{gem:?}, {:?}, {:?}, {:?}],\n",
                 git.checkout_dir(),
@@ -6502,6 +6501,10 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
              next\n  \
            end\n  \
            spec.full_gem_path = File.dirname(spec.loaded_from)\n  \
+           # Where Bundler builds a git gem's extensions\n  \
+           # (Gem::Specification#extension_dir in bundler/rubygems_ext.rb).\n  \
+           spec.extension_dir = File.join(File.dirname(dir), \"extensions\", Gem::Platform.local.to_s,\n    \
+             Gem.extension_api_version, [checkout, File.basename(spec.full_gem_path)].uniq.join(\"-\"))\n  \
            spec.activate\n\
          end\n"
     );

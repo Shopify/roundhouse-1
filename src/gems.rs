@@ -60,6 +60,10 @@ pub struct Lockfile {
     /// sees it, so a bare `gem "x"` cannot resolve it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub git: Vec<GitSource>,
+    /// Each spec's own runtime dependencies (the six-space lines under
+    /// it), by name, lock order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub spec_deps: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// One `GIT` section of a `Gemfile.lock`.
@@ -134,6 +138,14 @@ impl Lockfile {
                         if let (true, Some(git)) = (section == "GIT", lock.git.last_mut()) {
                             git.specs.push(name.to_string());
                         }
+                    } else if indent == 6 && in_specs {
+                        // `      google-protobuf (>= 3.25, < 5.0)` — a
+                        // dependency of the spec just above.
+                        if let Some((spec, _)) = lock.specs.last() {
+                            let dep = body.split(' ').next().unwrap_or(body);
+                            let spec = spec.clone();
+                            lock.spec_deps.entry(spec).or_default().push(dep.to_string());
+                        }
                     }
                 }
                 "DEPENDENCIES" => {
@@ -160,6 +172,30 @@ impl Lockfile {
     /// Does `name` live in this repository (a `PATH` source)?
     pub fn is_in_repo(&self, name: &str) -> bool {
         self.in_repo.iter().any(|n| n == name)
+    }
+
+    /// The GIT-sourced specs `roots` load, directly or through their
+    /// dependency closure, dependencies first: the order RubyGems must
+    /// see them activated in, since it cannot find a git spec itself.
+    pub fn git_specs_in_closure(&self, roots: &[&str]) -> Vec<String> {
+        fn visit(lock: &Lockfile, name: &str, seen: &mut Vec<String>, out: &mut Vec<String>) {
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(name.to_string());
+            for dep in lock.spec_deps.get(name).into_iter().flatten() {
+                visit(lock, dep, seen, out);
+            }
+            if lock.git_source_of(name).is_some() {
+                out.push(name.to_string());
+            }
+        }
+        let mut seen = Vec::new();
+        let mut out = Vec::new();
+        for root in roots {
+            visit(self, root, &mut seen, &mut out);
+        }
+        out
     }
 
     /// The `GIT` source `name` resolves from, if any.
@@ -733,7 +769,11 @@ BUNDLED WITH
              revision: 262698ca57e937a3cb4420d169db2adce428adcc\n  \
              ref: 262698ca57e937a3cb4420d169db2adce428adcc\n  specs:\n    \
              dalli (3.2.9)\n      logger\n      opentelemetry-api\n\n\
-             GEM\n  remote: https://rubygems.org/\n  specs:\n    logger (1.7.0)\n\n\
+             GIT\n  remote: https://github.com/Shopify/grpc.git\n  \
+             revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  specs:\n    \
+             grpc (1.85.0.dev)\n      google-protobuf (>= 3.25, < 5.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n    logger (1.7.0)\n    \
+             panama_client (3.2.3)\n      grpc (>= 1.40)\n      dalli\n\n\
              DEPENDENCIES\n  dalli!\n  logger\n",
         );
         let git = lock.git_source_of("dalli").expect("dalli is a GIT spec");
@@ -744,6 +784,12 @@ BUNDLED WITH
         assert_eq!(lock.version_of("dalli"), Some("3.2.9"));
         assert!(lock.git_source_of("logger").is_none(), "a GEM spec has no git source");
         assert_eq!(lock.dependencies, ["dalli", "logger"]);
+        assert_eq!(lock.spec_deps["panama_client"], ["grpc", "dalli"]);
+        assert_eq!(lock.git_source_of("grpc").map(GitSource::checkout_dir).as_deref(), Some("grpc-d5dd2a32be6b"));
+        // A GEM spec that depends on git specs: they activate first.
+        assert_eq!(lock.git_specs_in_closure(&["panama_client"]), ["grpc", "dalli"]);
+        assert_eq!(lock.git_specs_in_closure(&["logger"]), Vec::<String>::new());
+        assert_eq!(lock.version_of("google-protobuf"), None, "a dependency line is not a spec");
     }
 
     #[test]

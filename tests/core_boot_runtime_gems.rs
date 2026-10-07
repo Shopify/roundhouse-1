@@ -218,3 +218,24 @@ fn the_test_config_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
         );
     }
 }
+
+/// panama_client is a GEM spec, but it depends on Core's grpc fork, a GIT
+/// spec RubyGems cannot find on its own (`Gem::MissingSpecError: Could not
+/// find 'grpc'`, swallowed by the guarded require). The git closure of
+/// the needed gems is activated, dependencies first.
+#[test]
+fn a_git_dependency_of_a_needed_gem_is_activated_before_it() {
+    let lock = TEST_CONFIG_LOCK.replace(
+        "    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
+        "    panama_client (3.2.3)\n      grpc (>= 1.40)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
+    );
+    let lock = format!(
+        "GIT\n  remote: https://github.com/Shopify/grpc.git\n  revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  branch: shopify-fixes\n  submodules: true\n  specs:\n    grpc (1.85.0.dev)\n\n{lock}"
+    );
+    let (dir, errors) = test_config_app().write("Gemfile.lock", &lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let git_gems = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
+    assert!(git_gems.contains("[\"grpc\", \"grpc-d5dd2a32be6b\", \"https://github.com/Shopify/grpc.git\""), "{git_gems}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"panama_client\"\n"), "{gemfile}");
+}
