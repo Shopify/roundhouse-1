@@ -2698,7 +2698,7 @@ fn ruby_family_runtime_files(
     }
     // ActiveSupport's signed and encrypted messages (MessageVerifier,
     // MessageEncryptor, SecureCompareRotator, KeyGenerator, Messages::*)
-    // with ActiveSupport::JSON's coder, ported from activesupport 8.1.4
+    // with ActiveSupport::JSON's coder, ported from activesupport 8.2.0.alpha
     // (see the files' headers; tests/messages_runtime.rb holds them to
     // native ActiveSupport). OpenSSL, Marshal and computed-name dispatch,
     // so ruby-family only, and carried only where the app's own code
@@ -2716,7 +2716,7 @@ fn ruby_family_runtime_files(
     }
     // ActiveModel's attribute types and ActiveRecord::Type's names over
     // them (Value, ImmutableString, String, Text, Integer, Boolean,
-    // DateTime), ported from activemodel / activerecord 8.1.4 (see the
+    // DateTime), ported from activemodel / activerecord 8.2.0.alpha (see the
     // file's header; tests/active_model_type_runtime.rb holds it to
     // native ActiveModel). A Module subclass that defines methods from a
     // block and ancestor-index dispatch, so ruby-family only, and carried

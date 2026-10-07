@@ -1,4 +1,4 @@
-# Native ActiveModel / ActiveRecord 8.1.4 oracle for the attribute type
+# Native ActiveModel / ActiveRecord 8.2.0.alpha oracle for the attribute type
 # port (runtime/spinel/active_model_type.rb).
 #
 # Modes:
@@ -19,10 +19,30 @@
 # branches are observed too.
 ENV["TZ"] = "ABC-3" # POSIX: UTC+3, no zoneinfo needed
 
+# The native side is the Rails Core pins: Shopify/rails 5813559f
+# (8.2.0.alpha) from Core's bundle, run with Core's gem home
+# (CORE_GEM_HOME, default the one bin/check-target uses) so its
+# dependencies are Core's too.
+CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
+RAILS_CHECKOUT = File.join(CORE_GEM_HOME, "bundler/gems/rails-5813559f4aed")
+RAILS_LIBS = %w[activesupport activemodel activerecord].map { |lib| File.join(RAILS_CHECKOUT, lib, "lib") }
+
+def ruby_command(mode)
+  return [{}, RbConfig.ruby] unless mode == "native"
+  abort "native: Core's Rails checkout #{RAILS_CHECKOUT} is missing (set CORE_GEM_HOME)" unless File.directory?(RAILS_CHECKOUT)
+  [{ "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
+end
+
+# Loaded from the checkout, not from some other installed Rails.
+def require_native_rails
+  abort "native: ActiveSupport #{ActiveSupport.gem_version} from #{$LOADED_FEATURES.grep(/active_support\/version/).first}" unless
+    ActiveSupport.gem_version.to_s == "8.2.0.alpha" && $LOADED_FEATURES.any? { |f| f.start_with?(RAILS_CHECKOUT) && f.end_with?("active_support/version.rb") }
+end
+
 if ARGV.first == "compare"
   require "open3"
   run = lambda do |mode|
-    stdout, stderr, status = Open3.capture3(RbConfig.ruby, __FILE__, mode)
+    stdout, stderr, status = Open3.capture3(*ruby_command(mode), __FILE__, mode)
     abort "#{mode}: #{stderr}" unless status.success?
     stdout
   end
@@ -39,9 +59,8 @@ if ARGV.first == "compare"
 end
 
 if ARGV.first == "native"
-  gem "activerecord", "8.1.4"
-  gem "activemodel", "8.1.4"
   require "active_record"
+  require_native_rails
   # Touch the autoloads the port defines eagerly.
   ActiveRecord::Type::Text
   ActiveRecord::Type::DateTime
@@ -57,6 +76,7 @@ else
 end
 require "bigdecimal"
 require "date"
+require "json"
 
 # ActiveSupport reopens Date / Time / DateTime#inspect, so times print
 # by their parts, which both sides compute the same way.
@@ -145,6 +165,15 @@ TYPES.each do |name, build|
   show "#{name} itself_if_compatible", type.itself_if_serialize_cast_value_compatible.equal?(type)
   show "#{name} try(:limit)", type.respond_to?(:limit) ? type.limit : :none
   show "#{name} as_json", outcome { type.as_json }
+  # 8.2's schema-cache coder: a type rebuilt from its JSON on an
+  # allocated (not initialized) instance answers like the original.
+  puts "#{name} as_schema_json: #{outcome { type.as_schema_json }}"
+  rebuilt = outcome {
+    rebuilt = type.class.allocate
+    rebuilt.init_from_schema_json(JSON.parse(JSON.generate(type.as_schema_json)), nil)
+    [rebuilt == type, rebuilt.as_schema_json == type.as_schema_json, rebuilt.cast("12"), rebuilt.serialize(true), outcome { rebuilt.serialize(2**40) }]
+  }
+  puts "#{name} from schema json: #{rebuilt}"
   VALUES.each do |value|
     v = label_of(value)
     copy = -> { value.is_a?(::String) ? value.dup : (value.is_a?(Hash) ? value.dup : value) }

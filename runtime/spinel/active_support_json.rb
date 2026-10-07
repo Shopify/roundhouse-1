@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-# ActiveSupport::JSON's coder, ported from activesupport 8.1.4
+# ActiveSupport::JSON's coder, ported from activesupport 8.2.0.alpha
+# (Shopify/rails 5813559f, the version Core pins)
 # (lib/active_support/json/{encoding,decoding}.rb and the `as_json`
 # table of core_ext/object/json.rb) for the CRuby and JRuby trees.
 # It replaces runtime/ruby/active_support_ext.rb's flat-Hash `encode`
@@ -9,7 +10,7 @@
 # `ActiveSupport::JSON`, and every legacy metadata envelope
 # (`{"_rails":{"message":…,"exp":…,"pur":…}}`), go through `dump` /
 # `encode`, `load` / `decode`. tests/messages_runtime.rb holds both
-# to native ActiveSupport.
+# to that native ActiveSupport.
 #
 # Differences, all at the edges:
 # - `as_json` is not installed on core classes (no Object / Hash /
@@ -17,10 +18,10 @@
 #   values a message carries: an object that defines its own `as_json`
 #   (a record) is asked, everything else follows core_ext/object/json.
 #   `to_json` is not rerouted through this encoder.
-# - The encoder is JSONGemEncoder. 8.1.4 picks JSONGemCoderEncoder when
-#   json >= 2.15.2; the two produce the same text for every value this
-#   table covers, except a non-finite Float, which JSON::Coder refuses
-#   (GeneratorError) and JSONGemEncoder writes as `null`.
+# - The encoder is JSONGemEncoder. Rails picks JSONGemCoderEncoder when
+#   json >= 2.15.2 (Core's bundle has 2.19); the two produce the same
+#   text for every value this table covers, a non-finite Float (`null`)
+#   included (tests/messages_runtime.rb compares them).
 # - `parse_json_times` converts with `Time.zone.parse` as natively; it
 #   is off unless the app turns it on (Core sets it false).
 
@@ -45,12 +46,8 @@ module ActiveSupport
       end
       alias_method :dump, :encode
 
-      def decode(json, options = nil)
-        data = if options
-          ::JSON.parse(json, **options)
-        else
-          ::JSON.parse(json)
-        end
+      def decode(json, options = {})
+        data = ::JSON.parse(json, **options)
 
         if ActiveSupport.parse_json_times
           convert_dates_from(data)
@@ -98,22 +95,22 @@ module ActiveSupport
       U2029 = -"\u2029".b
 
       ESCAPED_CHARS = {
-        U2028 => '\u2028'.b,
-        U2029 => '\u2029'.b,
-        ">".b => '\u003e'.b,
-        "<".b => '\u003c'.b,
-        "&".b => '\u0026'.b,
-      }
+        U2028 => -'\u2028'.b,
+        U2029 => -'\u2029'.b,
+        ">".b => -'\u003e'.b,
+        "<".b => -'\u003c'.b,
+        "&".b => -'\u0026'.b,
+      }.freeze
 
-      HTML_ENTITIES_REGEX = Regexp.union(*(ESCAPED_CHARS.keys - [U2028, U2029]))
-      FULL_ESCAPE_REGEX = Regexp.union(*ESCAPED_CHARS.keys)
-      JS_SEPARATORS_REGEX = Regexp.union(U2028, U2029)
+      HTML_ENTITIES_REGEX = Regexp.union(*(ESCAPED_CHARS.keys - [U2028, U2029])).freeze
+      FULL_ESCAPE_REGEX = Regexp.union(*ESCAPED_CHARS.keys).freeze
+      JS_SEPARATORS_REGEX = Regexp.union(U2028, U2029).freeze
 
       class JSONGemEncoder # :nodoc:
         attr_reader :options
 
         def initialize(options = nil)
-          @options = options || {}
+          @options = options.dup.freeze || {}.freeze
         end
 
         def encode(value)
@@ -176,8 +173,8 @@ module ActiveSupport
 
         def json_encoder=(encoder)
           @json_encoder = encoder
-          @encoder_without_options = encoder.new
-          @encoder_without_escape = encoder.new(escape: false)
+          @encoder_without_options = encoder.new.freeze
+          @encoder_without_escape = encoder.new(escape: false).freeze
         end
 
         def encode_without_options(value) # :nodoc:
@@ -190,7 +187,7 @@ module ActiveSupport
 
         # `value.as_json(options)` as core_ext/object/json.rb answers it,
         # without reopening the core classes. An object with an `as_json`
-        # of its own is asked; the rest follow the 8.1.4 table.
+        # of its own is asked; the rest follow the core_ext/object/json.rb table.
         def as_json(value, options = nil)
           case value
           when String, true, false, nil

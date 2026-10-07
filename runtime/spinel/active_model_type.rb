@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
 # ActiveModel's attribute types and the ActiveRecord::Type names over them,
-# ported from activemodel / activerecord 8.1.4 for the CRuby and JRuby
+# ported from activemodel / activerecord 8.2.0.alpha (Shopify/rails
+# 5813559f, the version Core pins) for the CRuby and JRuby
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
 # Type::{ImmutableString,String,Integer,Boolean,DateTime}, and
@@ -12,13 +13,13 @@
 # which builds `ActiveRecord::Type::Integer.new(limit: 8)` and its
 # siblings at load.
 #
-# Each method follows the 8.1.4 source (activemodel
+# Each method follows the 8.2.0.alpha source (activemodel
 # lib/active_model/type/{value,serialize_cast_value,immutable_string,
 # string,integer,boolean,date_time}.rb and type/helpers/*.rb; activerecord
 # lib/active_record/type/{text,date_time}.rb and type/internal/
 # timezone.rb). tests/active_model_type_runtime.rb runs the same
-# observations against native ActiveModel and this file and requires
-# them equal.
+# observations against that native ActiveModel and this file and
+# requires them equal.
 #
 # Differences, all at the edges:
 # - The ActiveSupport core extensions the source calls are private
@@ -36,7 +37,12 @@
 #   Time, Decimal, Float, BigInteger, Binary, Json, Serialized) are not
 #   ported. No code the tree carries reaches them yet.
 # - SerializeCastValue extends its ClassMethods in `included`, which is
-#   what ActiveSupport::Concern does for it.
+#   what ActiveSupport::Concern does for it. Its compatibility flag is
+#   computed in place: `ActiveSupport::Ractors.on_main` does exactly that
+#   on the main Ractor, and dispatches there only from another Ractor.
+# - ActiveRecord's `Type::DEFAULT_TYPE` (`Value.new.freeze`, the
+#   registry's fallback) and the opt-in Type::QueryPredicates (Arel
+#   comparison expressions) are not ported with the registries.
 
 require "date"
 
@@ -193,6 +199,16 @@ module ActiveModel
 
       def as_json(*)
         raise NoMethodError
+      end
+
+      def as_schema_json
+        { "precision" => precision, "scale" => scale, "limit" => limit }
+      end
+
+      def init_from_schema_json(coder, references)
+        @precision = coder["precision"]
+        @scale = coder["scale"]
+        @limit = coder["limit"]
       end
 
       private
@@ -407,40 +423,16 @@ module ActiveModel
             end
           end
 
-          ISO_DATETIME = /
-            \A
-            (\d{4})-(\d\d)-(\d\d)(?:T|\s)            # 2020-06-20T
-            (\d\d):(\d\d):(\d\d)(?:\.(\d{1,6})\d*)?  # 10:20:30.123456
-            (?:(Z(?=\z)|[+-]\d\d)(?::?(\d\d))?)?     # +09:00
-            \z
-          /x
+          def fast_string_to_time(string)
+            return unless string.include?("-") #  Time.new("1234") # => 1234-01-01 00:00:00
 
-          if ::Time.new(2000, 1, 1, 0, 0, 0, "-00:00").yday != 1 # Early 3.2.x had a bug
-            # BUG: Time.new with in: "UTC" or "-00:00" does not compute the
-            # yday correctly.
-            def fast_string_to_time(string)
-              return unless string.include?("-") #  Time.new("1234") # => 1234-01-01 00:00:00
-
-              if is_utc?
-                ::Time.at(::Time.new(string, in: "UTC"))
-              else
-                ::Time.new(string)
-              end
-            rescue ArgumentError
-              nil
+            if is_utc?
+              ::Time.new(string, in: "UTC")
+            else
+              ::Time.new(string)
             end
-          else
-            def fast_string_to_time(string)
-              return unless string.include?("-") #  Time.new("1234") # => 1234-01-01 00:00:00
-
-              if is_utc?
-                ::Time.new(string, in: "UTC")
-              else
-                ::Time.new(string)
-              end
-            rescue ArgumentError
-              nil
-            end
+          rescue ArgumentError
+            nil
           end
       end
     end
@@ -474,6 +466,16 @@ module ActiveModel
 
       def serialize_cast_value(value) # :nodoc:
         value
+      end
+
+      def as_schema_json
+        super.merge!("true" => @true, "false" => @false)
+      end
+
+      def init_from_schema_json(coder, references)
+        super
+        @true = coder["true"]
+        @false = coder["false"]
       end
 
       private
@@ -575,6 +577,12 @@ module ActiveModel
         return true unless out_of_range?(cast_value)
         yield cast_value if block_given?
         false
+      end
+
+      def init_from_schema_json(coder, references)
+        super
+        @max = max_value
+        @min = min_value
       end
 
       private
@@ -721,6 +729,17 @@ module ActiveRecord
 
         def ==(other)
           super(other) && timezone == other.timezone
+        end
+
+        def as_schema_json
+          json = super
+          json["timezone"] = @timezone
+          json
+        end
+
+        def init_from_schema_json(coder, references)
+          @timezone = coder["timezone"]&.to_sym
+          super
         end
 
         protected

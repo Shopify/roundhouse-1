@@ -1,7 +1,8 @@
 // ActiveModel's attribute types and ActiveRecord::Type's names over them
 // (runtime/spinel/active_model_type.rb: Type::{Value,ImmutableString,
 // String,Integer,Boolean,DateTime} with their helpers, ActiveRecord::
-// Type::{Text,DateTime}) against activemodel / activerecord 8.1.4:
+// Type::{Text,DateTime}) against activemodel / activerecord 8.2.0.alpha
+// (Core's pinned Shopify/rails 5813559f, from CORE_GEM_HOME):
 // tests/active_model_type_runtime.rb runs the same observations natively
 // and on the port and requires every observation equal.
 
@@ -32,6 +33,8 @@ fn attribute_types_answer_like_activemodel() {
         "AR::DateTime(precision: 6) type: :datetime",
         "ActiveModel::RangeError: 9223372036854775808 is out of range",
         "utc=false zone=\"ABC\"",
+        "AR::DateTime(timezone: :local, precision: 3) from schema json: [true, true, nil, true, ",
+        "AR::DateTime(timezone: :local, precision: 3) as_schema_json: {\"precision\" => 3, \"scale\" => nil, \"limit\" => nil, \"timezone\" => :local}",
     ] {
         assert!(stdout.contains(seen), "missing observation {seen:?}");
     }
