@@ -255,3 +255,59 @@ fn the_platform_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
         );
     }
 }
+
+/// Constants Essentials' middlewares, query capture and customer account
+/// read at load time, from gems Core Bundler.requires and that load
+/// without Rails. ShopifyBots' middleware is one of its listed requires.
+const MIDDLEWARE_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    customer_privacy_api_ruby (42.1.0)\n    lru_redux (1.1.0)\n    secure_headers (5.2.0)\n    shopify_bots (0.59.0)\n    stack_frames (0.1.3)\n\nDEPENDENCIES\n  activesupport\n  customer_privacy_api_ruby (= 42.1.0)\n  lru_redux (~> 1.1)\n  secure_headers (~> 5.2)\n  shopify_bots (= 0.59.0)\n  stack_frames\n";
+
+fn middleware_app() -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", MIDDLEWARE_LOCK)
+        .write("sorbet/rbi/gems/stack_frames@0.1.3.rbi", &rbi("module StackFrames; end\nclass StackFrames::Buffer\n  def initialize(size); end\nend\n"))
+        .write("sorbet/rbi/gems/lru_redux@1.1.0.rbi", &rbi("module LruRedux; end\nclass LruRedux::Cache\n  def initialize(max_size); end\nend\nclass LruRedux::ThreadSafeCache < ::LruRedux::Cache; end\n"))
+        .write("sorbet/rbi/gems/secure_headers@5.2.0.rbi", &rbi("module SecureHeaders; end\nclass SecureHeaders::StrictTransportSecurity; end\nSecureHeaders::StrictTransportSecurity::HEADER_NAME = T.let(T.unsafe(nil), String)\n"))
+        .write("sorbet/rbi/gems/shopify_bots@0.59.0.rbi", &rbi("module ShopifyBots; end\nmodule ShopifyBots::Rack; end\nclass ShopifyBots::Rack::Middleware; end\nShopifyBots::Rack::Middleware::REQUEST_PRIORITY = T.let(T.unsafe(nil), String)\n"))
+        .write("sorbet/rbi/gems/customer_privacy_api_ruby@42.1.0.rbi", &rbi("module CustomerPrivacyApiRuby; end\nmodule CustomerPrivacyApiRuby::Storage; end\nCustomerPrivacyApiRuby::Storage::VISIT_COOKIE_EXPIRATION_TIME_SECONDS = T.let(T.unsafe(nil), Integer)\n"))
+        .write("lib/middleware_settings.rb", r#"class MiddlewareSettings
+  FRAMES = StackFrames::Buffer.new(32)
+  CACHE = LruRedux::ThreadSafeCache.new(100)
+  HSTS = SecureHeaders::StrictTransportSecurity::HEADER_NAME
+  PRIORITY = ShopifyBots::Rack::Middleware::REQUEST_PRIORITY
+  VISIT_TTL = CustomerPrivacyApiRuby::Storage::VISIT_COOKIE_EXPIRATION_TIME_SECONDS
+
+  def headers
+    { HSTS => PRIORITY, "ttl" => VISIT_TTL.to_s }
+  end
+end
+"#)
+}
+
+const MIDDLEWARE_GEMS: [&str; 5] = ["stack_frames", "lru_redux", "secure_headers", "shopify_bots", "customer_privacy_api_ruby"];
+
+#[test]
+fn the_emitted_ruby_tree_declares_and_loads_the_middleware_gems() {
+    let (dir, errors) = middleware_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    for gem in MIDDLEWARE_GEMS {
+        assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
+    }
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    for feature in MIDDLEWARE_GEMS.iter().copied().chain(["shopify_bots/rack/middleware"]) {
+        assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
+}
+
+#[test]
+fn the_middleware_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
+    let (_, errors) = middleware_app().emit(BuildTarget::Rust);
+    for gem in MIDDLEWARE_GEMS {
+        assert!(
+            errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem"))),
+            "{gem}: {errors:#?}"
+        );
+    }
+}

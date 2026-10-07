@@ -5618,15 +5618,25 @@ const GEM_REQUIRES: &[&str] = &[
     "panama_client",
     "redis",
     "hiredis-client",
+    "stack_frames",
     "snappy",
     "faraday",
     "faraday/gzip",
     "opentelemetry-instrumentation-trilogy",
     "opentelemetry-instrumentation-pg",
+    "lru_redux",
+    "secure_headers",
     "trilogy",
+    "shopify_bots",
+    "shopify_bots/agent_classification_identifier",
+    "shopify_bots/rack/middleware",
+    "shopify_bots/request_extension",
+    "shopify_bots/session/object_agent_classification_record",
+    "shopify_bots/session/agent_classification_updater",
     "sabertooth",
     "sabertooth/prelude",
     "shopify-opensrs",
+    "customer_privacy_api_ruby",
     "panama_metadata",
     "opentelemetry-shopify",
     "magellan-ruby",
@@ -5924,7 +5934,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 45] = [
+    const RUNTIME_GEMS: [(Marker, &str); 50] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6069,6 +6079,18 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         (Marker::Constant("Sabertooth"), "sabertooth"),
         (Marker::Constant("OpenSRS"), "shopify-opensrs"),
         (Marker::Constant("Magellan"), "magellan-ruby"),
+        // More of Essentials' load-time constants, each Bundler.required by
+        // Core and loaded natively without Rails: query capture's
+        // StackFrames buffer, the middlewares' LruRedux cache, SecureHeaders
+        // and ShopifyBots (with its listed requires) and customer account's
+        // CustomerPrivacyApiRuby. Not shopify-money: RubyMoney's money gem
+        // defines the same `Money`, so the constant alone cannot say which
+        // gem an app means.
+        (Marker::Constant("StackFrames"), "stack_frames"),
+        (Marker::Constant("LruRedux"), "lru_redux"),
+        (Marker::Constant("SecureHeaders"), "secure_headers"),
+        (Marker::Constant("ShopifyBots"), "shopify_bots"),
+        (Marker::Constant("CustomerPrivacyApiRuby"), "customer_privacy_api_ruby"),
         // Core's tracing. opentelemetry-shopify is the Bundler.required
         // entry and loads the API, SDK and the instrumentations below;
         // each gem whose RBI declares a constant Core names is its own

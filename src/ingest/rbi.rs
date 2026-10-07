@@ -250,6 +250,28 @@ impl Reader<'_> {
                     self.out.classes.entry(ClassId(Symbol::new(&alias))).or_insert(class);
                 }
             }
+            if let Some(write) = statement.as_constant_path_write_node() {
+                // Tapioca writes a namespace's constant as a path, usually
+                // at top level (`SecureHeaders::StrictTransportSecurity::
+                // HEADER_NAME = T.let(...)`): another name for a class this
+                // gem declared, or a constant of that namespace.
+                let full = declared_name(scope, &write.target().as_node());
+                if let Some((owner, leaf)) = full.rsplit_once("::") {
+                    let written = constant_path_name(&write.value());
+                    let target = [qualify(scope, &written), written]
+                        .into_iter()
+                        .filter(|name| !name.is_empty())
+                        .map(|name| ClassId(Symbol::new(&name)))
+                        .find(|id| self.out.classes.contains_key(id));
+                    if let Some(target) = target {
+                        let class = self.out.classes[&target].clone();
+                        self.out.classes.entry(ClassId(Symbol::new(&full))).or_insert(class);
+                    } else if !aliases.contains_key(leaf) {
+                        self.class_entry(owner, true).constants.push(Symbol::new(leaf));
+                    }
+                }
+                continue;
+            }
             let Some(scope) = scope else {
                 // Top-level: only a `sig` carries over to the next
                 // statement; there is no class to declare into.
