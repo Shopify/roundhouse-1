@@ -189,6 +189,7 @@ fn tiny_blog_round_trips() {
         zeitwerk_loaders: Vec::new(),
         sorbet_type_aliases: Vec::new(),
         initializer_constants: Vec::new(),
+        railties: Vec::new(),
     };
 
     let json = serde_json::to_string_pretty(&app).expect("serialize");
