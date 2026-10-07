@@ -56,7 +56,7 @@ use crate::app::App;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
 use crate::expr::Expr;
 use crate::ident::{ClassId, Symbol};
-use crate::ingest::survey::{self, DroppedFile};
+use crate::ingest::survey;
 use crate::ingest::IngestError;
 use crate::span::FileId;
 use crate::ty::Ty;
@@ -117,9 +117,8 @@ pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[Ingest
         return;
     }
     let ctx = AttributionCtx::build(app, gaps);
-    let resolver = (!app.dropped_files.is_empty() && diags.iter().any(is_constant_refusal))
-        .then(|| app.const_resolver.for_sources(&app.sources));
-    let dropped = resolver.as_deref().map(|resolver| DroppedDefinitions::build(app, resolver));
+    let resolver = diags.iter().any(is_constant_refusal).then(|| app.const_resolver.for_sources(&app.sources));
+    let dropped = resolver.as_deref().map(|resolver| DroppedDefinitions::build(app, gaps, resolver));
     // Sites of constants whose declaring file recorded a gap, for the ivar pass below.
     let mut constant_sites: Vec<(FileId, u32, String)> = Vec::new();
     for d in diags.iter_mut() {
@@ -224,27 +223,50 @@ struct DroppedDefinitions<'a> {
     by_name: HashMap<&'a str, DroppedDefinition<'a>>,
     /// Names of the models, controllers and library classes in the IR.
     ingested: HashSet<&'a str>,
+    /// `Owner::NAME` for each constant a library class in the IR holds.
+    /// An ingest that kept the class can still have left out a constant
+    /// whose value was the gap (`SIGN_BIT = 0x8000000000000000`, wider
+    /// than 64 bits).
+    held: HashSet<String>,
+    /// The library classes in the IR, whose constants `held` lists.
+    library: HashSet<&'a str>,
 }
 
 #[derive(Clone, Copy)]
 struct DroppedDefinition<'a> {
     /// App-root relative.
     path: &'a str,
-    drop: &'a DroppedFile,
+    /// The gap that failed the file's class ingest, else the file's
+    /// first recorded gap.
+    message: &'a str,
     /// The IR holds none of the file's classes or modules, so its
     /// top-level constants went with them.
     whole_file: bool,
 }
 
 impl<'a> DroppedDefinitions<'a> {
-    fn build(app: &'a App, resolver: &'a ConstResolver) -> Self {
+    fn build(app: &'a App, gaps: &'a [IngestError], resolver: &'a ConstResolver) -> Self {
         let ingested: HashSet<&str> = app.models.iter().map(|m| m.name.0.as_str())
             .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
             .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
             .collect();
-        let mut drops: HashMap<&str, &DroppedFile> = HashMap::default();
+        let mut drops: HashMap<&str, &str> = HashMap::default();
         for drop in &app.dropped_files {
-            drops.entry(drop.file.as_str()).or_insert(drop);
+            drops.entry(drop.file.as_str()).or_insert(drop.message.as_str());
+        }
+        // A file whose gap the ingest absorbed (a skipped item) kept its
+        // classes, but not the constant the gap was in. The analyzer's
+        // own gaps (`analysis: ...`) dropped nothing.
+        for gap in gaps {
+            match gap {
+                IngestError::Unsupported { file, message } if !message.starts_with("analysis: ") => {
+                    drops.entry(file.as_str()).or_insert(message.as_str());
+                }
+                IngestError::Parse { file, message } => {
+                    drops.entry(file.as_str()).or_insert(message.as_str());
+                }
+                _ => {}
+            }
         }
         // A name several dropped files define names one cause, the same on
         // every run: the file Rails would autoload it from, else the first
@@ -259,7 +281,7 @@ impl<'a> DroppedDefinitions<'a> {
             let path = source.path.strip_prefix(&app.root)
                 .map_or(source.path.as_str(), |rel| rel.trim_start_matches('/'));
             let whole_file = !resolver.class_definitions(file).any(|name| ingested.contains(name));
-            let dropped = DroppedDefinition { path, drop, whole_file };
+            let dropped = DroppedDefinition { path, message: drop, whole_file };
             for name in resolver.class_definitions(file).chain(resolver.constant_definitions(file)) {
                 let slot = by_name.entry(name).or_insert(dropped);
                 if conventional(name, path) && !conventional(name, slot.path) {
@@ -267,7 +289,25 @@ impl<'a> DroppedDefinitions<'a> {
                 }
             }
         }
-        DroppedDefinitions { resolver, by_name, ingested }
+        let library: HashSet<&str> = app.library_classes.iter().map(|c| c.name.0.as_str()).collect();
+        // A value the ingest substituted for its gap (survey mode's `nil`
+        // placeholder: synthetic, or spanning the source it stands for)
+        // holds nothing. A `nil` the source wrote spans `nil`.
+        let placeholder = |value: &crate::expr::Expr| {
+            matches!(&*value.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
+                && (value.span.file.0 == 0
+                    || app.sources.get(value.span.file.0 as usize - 1).is_some_and(|source| {
+                        source.text.get(value.span.start as usize..value.span.end as usize).is_some_and(|text| text != "nil")
+                    }))
+        };
+        let held = app.library_classes.iter()
+            .flat_map(|c| {
+                c.constants.iter()
+                    .filter(|(_, value)| !placeholder(value))
+                    .map(move |(name, _)| format!("{}::{}", c.name.0, name.as_str()))
+            })
+            .collect();
+        DroppedDefinitions { resolver, by_name, ingested, held, library }
     }
 
     /// For a `constant` refusal that resolves to a definition a dropped
@@ -292,10 +332,12 @@ impl<'a> DroppedDefinitions<'a> {
         // another cause.
         let compiled = match (value, name.rsplit_once("::")) {
             (false, _) => self.ingested.contains(name),
-            (true, Some((owner, _))) => self.ingested.contains(owner),
+            (true, Some((owner, _))) => {
+                self.ingested.contains(owner) && (!self.library.contains(owner) || self.held.contains(name))
+            }
             (true, None) => !dropped.whole_file,
         };
-        let gap = survey::bucket_message(&dropped.drop.message);
+        let gap = survey::bucket_message(dropped.message);
         (!compiled).then(|| (
             format!(
                 " — likely roundhouse coverage, not an app error (ingest gap in {}: {name} was not compiled: {gap})",
