@@ -157,7 +157,14 @@ fn split(m: &MethodDef, module_path: &[Symbol], acc: &str) -> (MethodDef, Method
     // to the caller) only to methods whose parameters are all required
     // positional. Keeping an unused `= nil` here would leave the
     // variant on value semantics and its appends would land in a copy.
-    into_params.extend(m.params.iter().map(|p| Param { default: None, ..p.clone() }));
+    // Its own internal ABI, so not a flattened keyword either: the
+    // ruby-family trees must not write these back as keywords.
+    into_params.extend(m.params.iter().map(|p| Param {
+        default: None,
+        from_keyword: false,
+        from_kwrest: false,
+        ..p.clone()
+    }));
 
     // `io` is declared, and so is a parameter the wrapper declares as a
     // model or a collection of them; everything else is `untyped`.

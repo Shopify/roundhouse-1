@@ -128,6 +128,9 @@ pub fn apply_mailer_class_side(app: &mut App) -> Vec<Diagnostic> {
                         },
                     );
                     v.ty = ty;
+                    // The wrapper declares the instance method's params as
+                    // they are, flattened keywords included.
+                    crate::lower::keyword_marks::mark_forwarded_param(&mut v, p);
                     v
                 })
                 .collect();

@@ -29,6 +29,7 @@ pub mod controller;
 pub mod controller_test;
 pub mod fixtures;
 pub(crate) mod forwarding;
+pub(crate) mod keyword_marks;
 pub mod functionalize;
 pub mod model_associations;
 pub mod persistence;
