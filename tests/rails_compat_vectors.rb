@@ -61,7 +61,7 @@ MV = ActionController::MessageVerifier
 # that define them, without the rest of those files' load chains.
 def load_module(path, name)
   src = File.read(path)
-  start = src.index(/^(module|  module) #{name}\b/) or abort "no #{name} in #{path}"
+  start = src.index(/^(module|class|  module|  class) #{name}\b/) or abort "no #{name} in #{path}"
   indent = src[start, 2] == "  " ? "  " : ""
   finish = src.index(/^#{indent}end\b/, start) or abort "no end of #{name}"
   src[start..finish + indent.length + 2]

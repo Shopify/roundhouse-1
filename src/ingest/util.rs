@@ -292,6 +292,37 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_has_included_block(m.body())
         || body_has_constant_decl(m.body())
         || body_has_route_helpers_include(m.body())
+        || is_marker_module(m.body())
+}
+
+/// A module that declares nothing but itself: `module Segment; end`, or a
+/// Sorbet interface with no members (`extend T::Helpers; interface!`).
+/// It is a type other code names (`include Segment`, `is_a?(Segment)`),
+/// so it must exist when that code loads. Shopify Core's
+/// Pagination::Ast::ReferenceFilterPathSegment and
+/// AdyenApi::Responses::AdyenResponse are included by factory classes;
+/// with the module dropped the include could not resolve and the class
+/// body raised at load. Only the statements a member-less module is
+/// written with count: one holding anything else (a nested declaration,
+/// a DSL call) is a namespace or a module the other rules judge.
+fn is_marker_module(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return true };
+    flatten_statements(body).iter().all(|stmt| {
+        let Some(call) = stmt.as_call_node() else { return false };
+        if call.receiver().is_some() || call.block().is_some() {
+            return false;
+        }
+        match constant_id_str(&call.name()) {
+            "interface!" | "abstract!" | "sealed!" | "final!" => call.arguments().is_none(),
+            "extend" => call.arguments().is_some_and(|a| {
+                a.arguments().iter().all(|arg| {
+                    constant_path_segments_strs(&arg)
+                        .is_some_and(|p| matches!(p.join("::").as_str(), "T::Helpers" | "T::Sig"))
+                })
+            }),
+            _ => false,
+        }
+    })
 }
 
 /// A module whose whole content is the route-helper mixin — core's

@@ -181,7 +181,7 @@ fn serialize_json_shadowed_by_local_const_stays_unclaimed() {
     let article = app.models.iter().find(|m| m.name.0.as_str() == "Article").unwrap();
     assert!(
         roundhouse::lower::serialize::serialize_decls(article).is_empty(),
-        "bare JSON shadowed by a model constant must not claim JsonColumn"
+        "bare JSON shadowed by a model constant must not claim RoundhouseJsonColumn"
     );
     // Absolute ::JSON still names the stdlib coder.
     let app = ingest_app_from_tree(article_app(

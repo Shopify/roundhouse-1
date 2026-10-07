@@ -126,6 +126,11 @@ fn postgresql_app_lifts_the_adapter_hook_and_fires_it_before_configure() {
         .expect("registration");
     let configure = boot.find("require_relative \"runtime/database_configuration\"").expect("database configuration");
     assert!(hooks < register && register < configure, "{boot}");
+    // Defined before any gem loads, as Rails defines it before
+    // Bundler.require: a gem may register a hook as it loads.
+    let facades = file("runtime/gem_facades.rb");
+    assert!(facades.starts_with("require_relative \"active_support_lazy_load_hooks\"\n"), "{facades}");
+    assert!(boot.find("require_relative \"runtime/gem_facades\"").is_some_and(|f| f < register), "{boot}");
 
     let config = file("runtime/database_configuration.rb");
     let fire = config

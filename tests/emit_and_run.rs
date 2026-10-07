@@ -3588,6 +3588,39 @@ end
         .assert_passes();
 }
 
+/// The runtime's json column boundary does not take a name the app may
+/// own. Shopify Core defines a top-level `class JsonColumn` (a serialize
+/// coder); the runtime's `module JsonColumn`, loaded first, made it fail
+/// to load: "JsonColumn is not a class".
+#[test]
+fn an_app_class_named_json_column_loads_beside_a_json_column() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "create_table \"articles\", force: :cascade do |t|",
+            "create_table \"articles\", force: :cascade do |t|\n    t.json \"metadata\"",
+        )
+        .write(
+            "app/models/json_column.rb",
+            "class JsonColumn\n  def initialize(type = nil)\n    @type = type\n  end\n\n  def kind\n    \"app\"\n  end\nend\n",
+        )
+        .write(
+            "test/models/app_json_column_test.rb",
+            r#"require "test_helper"
+
+class AppJsonColumnTest < ActiveSupport::TestCase
+  test "the app's JsonColumn and a json attribute both work" do
+    assert_equal "app", JsonColumn.new.kind
+    article = Article.create!(title: "JSON", body: "A body long enough to validate.", metadata: { "a" => 1 })
+    assert_equal({ "a" => 1 }, Article.find(article.id).metadata)
+  end
+end
+"#,
+        )
+        .run_test("test/models/app_json_column_test.rb")
+        .assert_passes();
+}
+
 /// Not the column default: `enum …, default:` is the value Rails gives an unset attribute, and a value the caller passes still wins.
 #[test]
 fn an_enum_default_option_seeds_a_new_record() {

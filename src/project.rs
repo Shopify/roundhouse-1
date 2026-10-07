@@ -2961,6 +2961,17 @@ fn ruby_family_files(
     // conditional on the app naming the constant, not on the require
     // graph's shape (which is what kept the blog's JRuby tree booting
     // with no jars).
+    // A gem the app carries as source (`gem_sources:` in roundhouse.yml,
+    // or a lockfile PATH gem) is compiled with the app: requiring the
+    // installed gem as well would load a second copy under the compiled
+    // one (opentelemetry-shopify's `private_constant`s, then the compiled
+    // reopen's qualified reads of them, raised NameError at boot).
+    let compiled_gems: Vec<&str> = app
+        .gem_lock
+        .as_ref()
+        .map(|lock| lock.in_repo.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let jruby_excluded: Vec<&str> = std::iter::once("markly").chain(compiled_gems.iter().copied()).collect();
     let gem_facades = match flavor {
         RubyFlavor::CRuby => format!(
             "# Gem façades are spinel-only (no native gems there). On the CRuby\n\
@@ -2977,7 +2988,7 @@ fn ruby_family_files(
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
              {}{}",
-            gem_require_block(&[], app.gem_lock.as_ref()),
+            gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -3002,7 +3013,7 @@ fn ruby_family_files(
              require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
-                gem_require_block(&["markly"], app.gem_lock.as_ref()),
+                gem_require_block(&jruby_excluded, app.gem_lock.as_ref()),
                 WEB_PUSH_STUB_REOPEN
             )
         }
@@ -3026,6 +3037,10 @@ fn ruby_family_files(
         format!("{gem_facades}require_relative \"active_model_type\"\n")
     } else {
         gem_facades
+    };
+    let gem_facades = match flavor {
+        RubyFlavor::CRuby => format!("{gem_facades}{}", gem_source_dependency_block(app)),
+        RubyFlavor::JRuby => gem_facades,
     };
     for (path, content) in files.iter_mut() {
         if path == "runtime/gem_facades.rb" {
@@ -3081,7 +3096,8 @@ fn ruby_family_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref());
+    let gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref(), &gem_sources);
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
     // target cannot perform a mixin — see `apply_module_mixins`), and the
@@ -3128,6 +3144,24 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             files.push((emitted.to_string(), text));
         }
     }
+    // The features themselves, on the load path ahead of any gem, so a
+    // gem loaded natively that requires one (elasticsearch-shopify,
+    // trust_battery_client, cusco ... `require "semian"`) gets the port
+    // and lib/semian.rb never loads over it.
+    for (feature, stem) in SEMIAN_LOAD_PATH_FEATURES {
+        let depth = feature.matches('/').count() + 1;
+        files.push((
+            format!("runtime/features/{feature}.rb"),
+            format!(
+                "# `require {feature:?}` on this tree: semian 0.28.3's file, ported\n\
+                 # (runtime/{stem}.rb). runtime/gem_facades.rb puts this directory\n\
+                 # first on the load path.\n\
+                 require_relative \"{}{stem}\"\n",
+                "../".repeat(depth)
+            ),
+        ));
+    }
+    let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
     // adapter-load point `DatabaseConfiguration.configure!` fires.
@@ -3151,6 +3185,27 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 && line.contains("LogSubscriber::TestHelper"))
     });
     for (path, content) in files.iter_mut() {
+        // Before any gem loads. Rails defines `ActiveSupport.on_load`
+        // before Bundler.require, and a gem may register a hook as it
+        // loads (semian 0.28.3 lib/semian.rb:443, paquito.rb:60, guarded
+        // by `if defined?(ActiveSupport)`). The hooks file depends on
+        // nothing, so it goes first.
+        if path == "runtime/gem_facades.rb" {
+            content.insert_str(
+                0,
+                "require_relative \"active_support_lazy_load_hooks\"\n\
+                 # semian's features answer from the runtime ports (runtime/features).\n\
+                 $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
+            );
+            // Where Bundler.require would have loaded them: with the gems.
+            for (feature, stem) in &port_requires {
+                content.push_str(&format!(
+                    "\n# `require {feature:?}`, which the app's code (or a gem source) makes at load:\n\
+                     # semian's own file, ported over runtime/semian.rb, never the gem's.\n\
+                     require_relative {stem:?}\n"
+                ));
+            }
+        }
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
@@ -3182,6 +3237,335 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         }
     }
     Ok(())
+}
+
+/// `require` features of semian 0.28.3 that a runtime port answers on the
+/// PostgreSQL CRuby tree, with the port's stem under `runtime/`. The gem's
+/// own files cannot load there: each begins `require "semian"`, whose
+/// lib/semian.rb redefines `Semian` over the port and registers
+/// `ActiveSupport.on_load(:active_record) { require "semian/rails" }`.
+/// (`semian/activerecord_postgresql_adapter` is not here: it is installed
+/// from its load hook, `ingest::on_load_hooks::RUNTIME_PORTS`.)
+pub const SEMIAN_PORT_FEATURES: &[(&str, &str)] = &[("semian/net_http", "semian_net_http")];
+
+/// Every semian feature a port answers, as runtime/features/<feature>.rb
+/// on the load path: lib/semian.rb, lib/semian/adapter.rb, and the
+/// [`SEMIAN_PORT_FEATURES`].
+const SEMIAN_LOAD_PATH_FEATURES: &[(&str, &str)] = &[
+    ("semian", "semian"),
+    ("semian/adapter", "semian_adapter"),
+    ("semian/net_http", "semian_net_http"),
+    ("semian/activerecord_postgresql_adapter", "semian_activerecord_postgresql_adapter"),
+];
+
+/// The [`SEMIAN_PORT_FEATURES`] some ingested file requires at its top
+/// level (a statement in column 0, as opentelemetry-shopify 1.22.0's
+/// exporters/otlp.rb:4 `require 'semian/net_http'`). That require runs as
+/// the file loads, and the emitted file does not carry it (a bare gem
+/// require is the load list's job), so runtime/gem_facades.rb loads the
+/// port with the gems, where Bundler.require would have loaded it.
+fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
+    SEMIAN_PORT_FEATURES
+        .iter()
+        .copied()
+        .filter(|(feature, _)| {
+            let forms = [format!("require \"{feature}\""), format!("require '{feature}'")];
+            app.sources.iter().any(|source| {
+                source.text.contains(feature)
+                    && source.text.lines().any(|line| {
+                        let code = line.split(" #").next().unwrap_or(line).trim_end();
+                        forms.iter().any(|form| code == form)
+                    })
+            })
+        })
+        .collect()
+}
+
+/// What the gems the app carries as source (`gem_sources:`, compiled
+/// with the app) require from the gem home as they load, in load order:
+/// `(native, framework)`. Bundler.require loads a gem's entry file
+/// (`lib/<name>.rb`), which runs every `require` at load level (the file's
+/// top level, a class or module body, a branch of an `if`/`unless`/`begin`
+/// there; not a method or block body), and through each require that
+/// lands in the gem's own compiled lib, that file's. A file reached only
+/// through `autoload` is not followed: it loads on reference, and so does
+/// its compiled copy.
+///
+/// The emitted files do not carry a bare gem require (the load list's
+/// job), so without this a gem source's own dependencies never loaded:
+/// opentelemetry-shopify 1.22.0's `require 'opentelemetry/sdk'` and the
+/// 22 others in lib/opentelemetry/shopify.rb, whose constants Core's
+/// 00_tracing.rb initializer reads at boot.
+///
+/// `framework` holds the Rails features among them (`rails`,
+/// `active_support/...`, ...): this tree's runtime ports answer those, and
+/// requiring the real ones would load Rails over the ports. A semian
+/// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
+pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
+    use std::collections::{HashMap, HashSet};
+    if app.gem_lock.is_none() {
+        return (Vec::new(), Vec::new());
+    }
+    let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
+    // `<root>/<name>-<version>/lib/<name>.rb`: a gem source is the
+    // released gem, vendored at its version. (A lockfile PATH gem is in
+    // `in_repo` too, but it is the app's own code, required as the app
+    // requires it.)
+    let entries: Vec<(String, String)> = gem_source_entries(app).into_iter().map(|(_, entry, lib)| (entry, lib)).collect();
+    // A feature some compiled lib answers (another gem source's, a path
+    // gem's, the app's `lib/`): compiled, so not the gem home's.
+    let compiled_feature = |feature: &str| {
+        let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+        let tail = format!("/lib/{rb}");
+        app.sources.iter().any(|s| s.path.ends_with(&tail) || s.path == format!("lib/{rb}"))
+    };
+    let framework_feature = |feature: &str| {
+        feature == "rails"
+            || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
+                .iter()
+                .any(|prefix| feature.starts_with(prefix))
+    };
+    let mut native: Vec<String> = Vec::new();
+    let mut framework: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (entry, lib) in entries {
+        let mut stack = vec![entry];
+        let mut order: Vec<String> = Vec::new();
+        while let Some(path) = stack.pop() {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Some(text) = by_path.get(path.as_str()) else { continue };
+            let mut nested: Vec<String> = Vec::new();
+            for (kind, feature) in load_level_requires(text.as_bytes()) {
+                let target = if kind == "require_relative" {
+                    let base = Path::new(&path).parent().unwrap_or(Path::new(""));
+                    normalize_rb_path(&base.join(&feature))
+                } else {
+                    let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                    format!("{lib}{rb}")
+                };
+                if by_path.contains_key(target.as_str()) {
+                    nested.push(target);
+                } else if kind == "require" && !compiled_feature(&feature) {
+                    order.push(feature);
+                }
+            }
+            // Depth-first in source order: a nested file's requires run
+            // where its require statement does.
+            stack.extend(nested.into_iter().rev());
+            for feature in order.drain(..) {
+                let list = if framework_feature(&feature) { &mut framework } else { &mut native };
+                if !list.contains(&feature) && !SEMIAN_PORT_FEATURES.iter().any(|(f, _)| *f == feature) {
+                    list.push(feature);
+                }
+            }
+        }
+    }
+    (native, framework)
+}
+
+/// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
+/// the released gem vendored at its version. (A lockfile PATH gem is in
+/// `in_repo` too, but it is the app's own code, required as the app
+/// requires it.)
+fn gem_source_entries(app: &App) -> Vec<(String, String, String)> {
+    let Some(lock) = app.gem_lock.as_ref() else { return Vec::new() };
+    let mut entries = Vec::new();
+    for name in &lock.in_repo {
+        let tail = format!("/lib/{name}.rb");
+        for source in &app.sources {
+            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
+            let gem_dir = dir.rsplit('/').next().unwrap_or("");
+            let versioned = gem_dir
+                .strip_prefix(name.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+            if versioned {
+                entries.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+            }
+        }
+    }
+    entries
+}
+
+/// `a/b/../c.rb` → `a/c.rb`, with `.rb` added when absent.
+fn normalize_rb_path(path: &Path) -> String {
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => parts.push(other.as_os_str()),
+        }
+    }
+    let joined: PathBuf = parts.iter().collect();
+    let mut out = joined.to_string_lossy().into_owned();
+    if !out.ends_with(".rb") {
+        out.push_str(".rb");
+    }
+    out
+}
+
+/// `("require" | "require_relative", feature)` for each string-literal
+/// require that runs when `source` loads (see [`gem_source_dependencies`]).
+fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
+    fn walk<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>) {
+        for node in nodes {
+            if let Some(call) = node.as_call_node() {
+                let name = call.name();
+                let name = std::str::from_utf8(name.as_slice()).unwrap_or("");
+                let kind = match name {
+                    "require" => "require",
+                    "require_relative" => "require_relative",
+                    _ => continue,
+                };
+                if call.receiver().is_some() {
+                    continue;
+                }
+                let Some(args) = call.arguments() else { continue };
+                let args: Vec<_> = args.arguments().iter().collect();
+                if let [arg] = args.as_slice() {
+                    if let Some(s) = arg.as_string_node() {
+                        out.push((kind, String::from_utf8_lossy(s.unescaped()).into_owned()));
+                    }
+                }
+            } else if let Some(n) = node.as_module_node() {
+                walk(body_nodes(n.body()), out);
+            } else if let Some(n) = node.as_class_node() {
+                walk(body_nodes(n.body()), out);
+            } else if let Some(n) = node.as_if_node() {
+                walk(stmts(n.statements()), out);
+                if let Some(sub) = n.subsequent() {
+                    match sub.as_else_node() {
+                        Some(e) => walk(stmts(e.statements()), out),
+                        None => walk(vec![sub], out),
+                    }
+                }
+            } else if let Some(n) = node.as_unless_node() {
+                walk(stmts(n.statements()), out);
+                if let Some(e) = n.else_clause() {
+                    walk(stmts(e.statements()), out);
+                }
+            } else if let Some(n) = node.as_begin_node() {
+                walk(stmts(n.statements()), out);
+                let mut rescue = n.rescue_clause();
+                while let Some(r) = rescue {
+                    walk(stmts(r.statements()), out);
+                    rescue = r.subsequent();
+                }
+            }
+        }
+    }
+    fn stmts<'pr>(s: Option<ruby_prism::StatementsNode<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+        s.map(|s| s.body().iter().collect()).unwrap_or_default()
+    }
+    fn body_nodes<'pr>(body: Option<ruby_prism::Node<'pr>>) -> Vec<ruby_prism::Node<'pr>> {
+        match body {
+            Some(b) => match b.as_statements_node() {
+                Some(s) => s.body().iter().collect(),
+                None => vec![b],
+            },
+            None => Vec::new(),
+        }
+    }
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    walk(program.statements().body().iter().collect(), &mut out);
+    out
+}
+
+/// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
+/// guarded: a gem source's dependency is a dependency of the app, and
+/// its absence is a boot failure, as under Bundler.
+///
+/// Two kinds of feature are never loaded from the gem home, and each is
+/// named on stderr at boot instead:
+/// - a file of one of the app's own gems (a gem source, or a path gem)
+///   that this tree does not carry compiled (a capped slice leaves some
+///   out): the gem home's copy is the real gem, over the compiled one.
+///   A path gem's is known here by its name (`identifications`,
+///   `identifications/...`); a gem source's by the gem home's spec that
+///   owns the feature (`Gem::Specification.find_by_path`), since its
+///   files need not be under its name (shopify-money's `money/...`).
+/// - a feature whose gem depends on a Rails gem (error[gem_requires_rails]):
+///   Rails' own code cannot run over this tree's ports.
+/// A require that loads Rails anyway (a gem in the gem home under
+/// `activesupport-*`, ...) is error[gem_requires_rails], raised at boot.
+fn gem_source_dependency_block(app: &App) -> String {
+    let (all_native, framework) = gem_source_dependencies(app);
+    let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
+    let owned_by_path_gem = |feature: &str| {
+        in_repo.iter().any(|name| {
+            let slashed = name.replace('-', "/");
+            [name.as_str(), slashed.as_str()]
+                .iter()
+                .any(|stem| feature == *stem || feature.strip_prefix(stem).is_some_and(|rest| rest.starts_with('/')))
+        })
+    };
+    let (uncarried, native): (Vec<String>, Vec<String>) = all_native.into_iter().partition(|f| owned_by_path_gem(f));
+    if native.is_empty() && framework.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n# What the gems carried as source (compiled with the app) require from\n\
+         # the gem home as they load (`project::gem_source_dependencies`).\n",
+    );
+    if !framework.is_empty() {
+        let names: Vec<String> = framework.iter().map(|f| format!("{f:?}")).collect();
+        out.push_str(&format!(
+            "# Their Rails features are this tree's runtime ports, not required: {}.\n",
+            names.join(", ")
+        ));
+    }
+    for feature in &uncarried {
+        out.push_str(&format!(
+            "warn \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
+            format!("{feature:?}").replace('"', "\\\"")
+        ));
+    }
+    if native.is_empty() {
+        return out;
+    }
+    let names: Vec<String> = native.iter().map(|f| format!("{f:?}")).collect();
+    let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
+    out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
+    out.push_str(
+        "__rh_rails_gems = %w[activesupport activerecord activemodel actionpack actionview activejob railties].freeze\n\
+         __rh_rails_dependency = lambda do |spec, seen|\n  \
+         spec.runtime_dependencies.each do |dep|\n    \
+         return \"#{spec.name} depends on #{dep.name}\" if __rh_rails_gems.include?(dep.name)\n    \
+         next if seen.include?(dep.name)\n    \
+         seen << dep.name\n    \
+         sub = begin\n      dep.to_spec\n    rescue Gem::MissingSpecError\n      nil\n    end\n    \
+         found = sub && __rh_rails_dependency.(sub, seen)\n    \
+         return found if found\n  \
+         end\n  \
+         nil\n\
+         end\n",
+    );
+    out.push_str(&format!("[{}].each do |feature|\n", names.join(", ")));
+    out.push_str(
+        "  spec = Gem::Specification.find_by_path(feature)\n  \
+         if spec && __rh_compiled_gems.include?(spec.name)\n    \
+         warn \"roundhouse: warning[gem_source_file_not_compiled]: #{feature.inspect}, which a gem source requires, is a file of the #{spec.name} gem this tree carries as source, and this tree does not carry it compiled; it is not loaded\"\n    \
+         next\n  \
+         end\n  \
+         if spec && (rails = __rh_rails_dependency.(spec, []))\n    \
+         warn \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
+         next\n  \
+         end\n  \
+         loaded = $LOADED_FEATURES.size\n  \
+         require feature\n  \
+         rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d}) }\n  \
+         raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\
+         end\n",
+    );
+    out
 }
 
 /// The boot-time registration of each `ActiveSupport.on_load` block the
@@ -4167,6 +4551,36 @@ fn apply_module_mixins(files: &mut Vec<(String, String)>, app: &App, form: Mixin
     }
 }
 
+/// `app/route_helpers.rb` is generated from the app's named routes, and
+/// a tree whose source carries no `config/routes.rb` (Shopify Core's
+/// test slice: its routes load lazily and the selected test reaches none
+/// of them) gets no file. Code that names a route helper still requires
+/// `app/route_helpers` at LOAD time, so the tree did not boot
+/// (`cannot load such file -- app/route_helpers`, from
+/// ApplicationController). The module is emitted empty instead: the
+/// tree loads, and a call to a helper raises NoMethodError naming it.
+fn apply_route_helpers_demand(files: &mut Vec<(String, String)>) {
+    const PATH: &str = "app/route_helpers.rb";
+    if files.iter().any(|(p, _)| p == PATH) {
+        return;
+    }
+    let named = files
+        .iter()
+        .any(|(p, c)| p.ends_with(".rb") && !p.starts_with("runtime/") && c.contains("RouteHelpers"));
+    if !named {
+        return;
+    }
+    files.push((
+        PATH.to_string(),
+        "# The source app declares no named routes (its config/routes.rb is\n\
+         # not in this tree), so no route helper is generated. Code that\n\
+         # names one loads; calling it raises NoMethodError, naming it.\n\
+         module RouteHelpers\n\
+         end\n"
+            .to_string(),
+    ));
+}
+
 fn apply_models_aggregator(files: &mut Vec<(String, String)>) {
     use std::fmt::Write;
 
@@ -4244,7 +4658,20 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
             .strip_prefix("module ")
             .map(|rest| (rest, true))
             .or_else(|| text.strip_prefix("class ").map(|rest| (rest, false)));
-        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else { break };
+        let Some((rest, is_module)) = header.filter(|_| *indent == 2 * chain.len()) else {
+            // The constant itself may be a factory class's assignment
+            // (`Enum = Struct.new(:name) do`, `SignalType = Data.define(...)
+            // do`): the leaf of the chain, a class. Loaded at boot instead,
+            // its `module Podding; module Priority` reopen autoloaded
+            // priority.rb, whose `require_relative "priority/enum"` was
+            // the file already loading, and its read of `Enum` raised.
+            if *indent == 2 * chain.len() {
+                if let Some(name) = factory_class_assignment(text) {
+                    chain.push((name.to_string(), false));
+                }
+            }
+            break;
+        };
         let name = rest.split([' ', '<']).next().unwrap_or("");
         // `class << self`, `class A::B` (says nothing about `A`), and a
         // one-line `class X; end` are not a chain to follow.
@@ -4269,6 +4696,26 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     }
     chain.truncate(depth);
     Some(chain)
+}
+
+/// `Name = Struct.new(...) do` / `Name = Data.define(...) do`: the
+/// constant name, when the line assigns a factory class (one with a
+/// block; the block-less form is a constant of the enclosing file) to a
+/// bare constant.
+fn factory_class_assignment(text: &str) -> Option<&str> {
+    let (name, value) = text.split_once(" = ")?;
+    if name.is_empty()
+        || !name.starts_with(|c: char| c.is_ascii_uppercase())
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let value = value.trim_start();
+    ["Struct.new", "Data.define", "::Struct.new", "::Data.define"]
+        .iter()
+        .any(|f| value.strip_prefix(f).is_some_and(|rest| rest.starts_with(['(', ' '])))
+        .then_some(name)
+        .filter(|_| value.ends_with(" do") || value.contains(" do |"))
 }
 
 /// The CRuby/JRuby `app/models.rb`: Rails' autoloader, generated.
@@ -5745,6 +6192,7 @@ fn spinel_files_with_assertions(
     // so is the semian port that wraps that driver's adapter.
     files.retain(|(p, _)| p != "runtime/db_jruby.rb" && p != "runtime/db_pg_cruby.rb" && p != "runtime/postgres_adapter.rb"
         && p != "runtime/semian.rb" && p != "runtime/semian_activerecord_postgresql_adapter.rb"
+        && p != "runtime/semian_adapter.rb" && p != "runtime/semian_net_http.rb"
         && p != "runtime/active_support_lazy_load_hooks.rb"
         && p != "runtime/active_support_backtrace_cleaner.rb");
 
@@ -6041,6 +6489,7 @@ fn spinel_files_with_assertions(
     apply_attachable_locate(&mut files, app);
     apply_views_aggregator(&mut files);
     apply_models_aggregator(&mut files);
+    apply_route_helpers_demand(&mut files);
     apply_module_mixins(&mut files, app, MixinForm::Reopen);
     // All three scaffold targets (spinel + the ruby/jruby trees derived
     // from this set) ship the comprehensive scaffold README as SPECIMEN.md,
@@ -6908,7 +7357,7 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
     let gated = LOCK_GATED_REQUIRES
         .iter()
-        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)))
+        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)) && !exclude.contains(gem))
         .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
         .iter()
@@ -7299,7 +7748,7 @@ pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
 /// Ruby is never loaded (`CRUBY_EXTENSION_GEMS`). A name a port file
 /// declares (`Semian::TimeoutError`) runs as the port's, not as the
 /// gem's, so a ported gem is never in `RAILS_DEPENDENT_GEMS`; a name only
-/// the gem's RBI declares (`Semian::NetHTTP`) is refused as a port gap.
+/// the gem's RBI declares (`Semian::Redis`) is refused as a port gap.
 /// Not ports in this sense: concurrent.rb and web_push.rb stand in for
 /// loaded gems on Spinel only, and typed_store.rb and
 /// global_id_locator.rb back lowered DSLs, not the gems' constants.
@@ -7307,7 +7756,11 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[(
     "semian",
     &[
         ("runtime/spinel/semian.rb", "runtime/semian.rb"),
+        // lib/semian/adapter.rb, which both adapters share.
+        ("runtime/spinel/semian_adapter.rb", "runtime/semian_adapter.rb"),
         ("runtime/spinel/semian_activerecord_postgresql_adapter.rb", "runtime/semian_activerecord_postgresql_adapter.rb"),
+        // `require "semian/net_http"`.
+        ("runtime/spinel/semian_net_http.rb", "runtime/semian_net_http.rb"),
     ],
 )];
 
@@ -7371,7 +7824,12 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
         .copied()
 }
 
-fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
+/// `gem_sources`: the gems carried as source (`gem_source_entries`). They
+/// are compiled, but their own dependencies load from the gem home
+/// (`gem_source_dependency_block`), so a `GIT` gem in their closure is
+/// activated as a runtime gem's is: panama_client 3.2.3 requires
+/// grpc_fork_safety, which depends on Core's grpc fork.
+fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>, gem_sources: &[String]) {
     let mut needed: Vec<&str> = Vec::new();
     for &(ref marker, gem) in runtime_gems() {
         // `app/` only. The runtime tree names several of these itself (the
@@ -7395,10 +7853,10 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     let gated: Vec<&str> = lock
         .map(|l| LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
         .unwrap_or_default();
-    if needed.is_empty() && gated.is_empty() {
+    if needed.is_empty() && gated.is_empty() && gem_sources.is_empty() {
         return;
     }
-    if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile") {
+    if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile").filter(|_| !needed.is_empty()) {
         let mut block = String::from(
             "\n# Gems the emitted app reaches at RUNTIME. runtime/gem_facades.rb\n\
              # guarded-requires these, so a missing one is not a boot failure —\n\
@@ -7429,6 +7887,11 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     for gem in gated {
         if !activated.contains(&gem) {
             activated.push(gem);
+        }
+    }
+    for gem in gem_sources {
+        if !activated.contains(&gem.as_str()) {
+            activated.push(gem.as_str());
         }
     }
     apply_git_gem_load_paths(files, &activated, lock);
@@ -9647,10 +10110,12 @@ mod tests {
             ("::Semian::SyscallError", "runtime/semian.rb"),
             ("Semian::ActiveRecordPostgreSQLAdapter", "runtime/semian_activerecord_postgresql_adapter.rb"),
             ("ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::CircuitOpenError", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            ("Semian::NetHTTP", "runtime/semian_net_http.rb"),
+            ("Semian::Adapter", "runtime/semian_adapter.rb"),
         ] {
             assert_eq!(gem_port_file("semian", name), Some(file), "{name}");
         }
-        for name in ["Semian::NetHTTP", "Semian::Redis", "Semian::Resource::<Resource>"] {
+        for name in ["Semian::Redis", "Semian::Resource::<Resource>"] {
             assert_eq!(gem_port_file("semian", name), None, "{name}");
         }
         assert_eq!(gem_port_file("dalli", "Dalli"), None);

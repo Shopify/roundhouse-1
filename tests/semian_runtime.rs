@@ -83,3 +83,23 @@ fn semian_postgresql_adapter_answers_like_the_gem_on_rails() {
         assert!(stdout.contains(observation), "missing {observation:?}:\n{stdout}");
     }
 }
+
+#[test]
+#[ignore = "needs the semian 0.28.3 gem on GEM_PATH"]
+fn semian_net_http_answers_like_the_gem() {
+    let stdout = compare("net_http");
+    assert!(stdout.lines().count() > 80, "too few observations:\n{stdout}");
+    for observation in [
+        "prepended => [\"Semian::NetHTTP\", \"Semian::Adapter\"]",
+        "configure again !! Semian::NetHTTP::SemianConfigurationChangedError: Cannot re-initialize semian_configuration",
+        "opted out disabled => true",
+        "down 2 !! Net::CircuitOpenError: [nethttp_down] Semian::OpenCircuitError caused by Failed to open TCP connection",
+        "server error after !! Net::CircuitOpenError: [nethttp_servererr] Semian::OpenCircuitError caused by Internal Server Error",
+        "busy !! Net::ResourceBusyError: [nethttp_busy] timed out waiting for resource",
+        "read timeout opened => true",
+    ] {
+        assert!(stdout.contains(observation), "missing {observation:?}:\n{stdout}");
+    }
+    // Only the gem's compiled bulkhead; its lib/semian.rb never loads over the port.
+    assert!(stdout.contains("gem files loaded by the port: [\"lib/semian/semian.so\"]"), "{stdout}");
+}

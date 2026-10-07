@@ -2302,6 +2302,43 @@ fn strip_url_helpers_receiver(expr: &Expr) -> Expr {
     })
 }
 
+/// Methods ending in `_path` / `_url` that Rails' own controller, view
+/// and test-case modules define (Rails 8.2.0.alpha): not route helpers,
+/// so the suffix rule below must leave them to self. Shopify Core's
+/// ApplicationController reads `controller_path`
+/// (AbstractController::Base) in a `before_action`, and the rewrite made
+/// it `RouteHelpers.controller_path`, a method no route generates.
+const FRAMEWORK_PATH_METHODS: &[&str] = &[
+    // AbstractController::Base / ActionView::ViewPaths
+    "controller_path",
+    "prepend_view_path",
+    "append_view_path",
+    // ActionDispatch::Routing::PolymorphicRoutes
+    "polymorphic_path",
+    "polymorphic_url",
+    "new_polymorphic_path",
+    "new_polymorphic_url",
+    "edit_polymorphic_path",
+    "edit_polymorphic_url",
+    // ActionView::Helpers::AssetUrlHelper
+    "asset_path",
+    "asset_url",
+    "audio_path",
+    "audio_url",
+    "font_path",
+    "font_url",
+    "image_path",
+    "image_url",
+    "javascript_path",
+    "javascript_url",
+    "stylesheet_path",
+    "stylesheet_url",
+    "video_path",
+    "video_url",
+    "compute_asset_path",
+    "public_compute_asset_path",
+];
+
 pub fn rewrite_route_helpers(
     expr: &Expr,
     shadowed: &HashSet<Symbol>,
@@ -2312,7 +2349,8 @@ pub fn rewrite_route_helpers(
         ExprNode::Send { recv: None, method, args, block, parenthesized }
             if (method.as_str().ends_with("_path")
                 || method.as_str().ends_with("_url"))
-                && !shadowed.contains(method) =>
+                && !shadowed.contains(method)
+                && !FRAMEWORK_PATH_METHODS.contains(&method.as_str()) =>
         {
             // `RouteHelpers` only emits `_path` helpers — Rails'
             // `_url` form differs by host prefix, which we don't

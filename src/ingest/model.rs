@@ -2832,7 +2832,7 @@ fn ty_of_column(t: &ColumnType) -> Ty {
         // Array, Hash, scalar, or nil, so neither String nor one fixed
         // container type is honest. The emitted model keeps serialized
         // text in its DB slot and decodes/encodes at the public accessor
-        // boundary (`JsonColumn`); analysis uses the deliberate gradual
+        // boundary (`RoundhouseJsonColumn`); analysis uses the deliberate gradual
         // type. A `has_json` declaration adds its stronger per-key schema
         // separately in `lower::has_json`.
         ColumnType::Json => Ty::Untyped,

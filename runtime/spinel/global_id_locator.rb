@@ -34,7 +34,7 @@
 # contract and campfire's `room_from` rescues exactly it.
 require_relative "base64"
 
-module GlobalID
+class GlobalID
   module Locator
     # `gid_param` is the urlsafe-base64 form (what a stream name carries);
     # `only` is the model class the caller will accept.
