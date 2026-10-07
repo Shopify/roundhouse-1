@@ -3673,23 +3673,31 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
 /// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
 /// the released gem vendored at its version. (A lockfile PATH gem is in
 /// `in_repo` too, but it is the app's own code, required as the app
-/// requires it.)
+/// requires it.) A hyphenated name with no `lib/<name>.rb` enters as
+/// Bundler.require falls back to, `lib/<name with / for ->.rb`:
+/// elasticsearch-shopify 6.0.1's `lib/elasticsearch/shopify.rb`.
 fn gem_source_entries(app: &App) -> Vec<(String, String, String)> {
     let Some(lock) = app.gem_lock.as_ref() else { return Vec::new() };
     let mut entries = Vec::new();
     for name in &lock.in_repo {
-        let tail = format!("/lib/{name}.rb");
-        for source in &app.sources {
-            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
-            let gem_dir = dir.rsplit('/').next().unwrap_or("");
-            let versioned = gem_dir
-                .strip_prefix(name.as_str())
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
-            if versioned {
-                entries.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+        let stems = [name.clone(), name.replace('-', "/")];
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for stem in stems.iter().take(if name.contains('-') { 2 } else { 1 }) {
+            let tail = format!("/lib/{stem}.rb");
+            for source in &app.sources {
+                let Some(dir) = source.path.strip_suffix(&tail) else { continue };
+                let gem_dir = dir.rsplit('/').next().unwrap_or("");
+                let versioned = gem_dir
+                    .strip_prefix(name.as_str())
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+                // The namespaced file only where the gem lacks the plain one.
+                if versioned && !found.iter().any(|(_, _, lib)| lib == &format!("{dir}/lib/")) {
+                    found.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+                }
             }
         }
+        entries.extend(found);
     }
     entries
 }

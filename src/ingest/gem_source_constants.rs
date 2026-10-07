@@ -116,6 +116,92 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
     out
 }
 
+/// The Rails gems the boot's gem-source dependency block refuses a
+/// feature for depending on (`project::gem_source_dependency_block`,
+/// `__rh_rails_gems`).
+const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "actionpack", "actionview", "activejob", "railties"];
+
+/// Add to `app`'s source constants the gems the gem sources (`gem_sources:`,
+/// compiled with the app) require from the gem home as they load
+/// (`project::gem_source_dependencies`), which the boot loads there too:
+/// elasticsearch-shopify 6.0.1's `require "elastic/transport"` loads
+/// elastic-transport, whose `Elastic::Transport::Transport::Errors::*`
+/// its errors.rb lists at load. A required feature is a gem's when that
+/// gem, a lock dependency of a gem source (transitively), has the file
+/// under a require path. Not read: a gem whose lock closure reaches a
+/// Rails gem (the boot refuses its feature), a ported gem (its runtime
+/// port answers, `project::gem_port_files`), a gem the app carries, and
+/// a gem already read. Runs after the sources are registered, which the
+/// feature walk reads.
+pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
+    let Some(lock) = app.gem_lock.as_ref() else { return };
+    let (features, _) = crate::project::gem_source_dependencies(app);
+    if features.is_empty() {
+        return;
+    }
+    fn deps<'a>(lock: &'a Lockfile, gem: &str) -> impl Iterator<Item = &'a str> {
+        lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
+    }
+    let reaches_rails = |gem: &str| {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<&str> = deps(lock, gem).collect();
+        if RAILS_GEMS.contains(&gem) {
+            return true;
+        }
+        while let Some(next) = stack.pop() {
+            if RAILS_GEMS.contains(&next) {
+                return true;
+            }
+            if seen.insert(next) {
+                stack.extend(deps(lock, next));
+            }
+        }
+        false
+    };
+    let mut candidates = BTreeSet::new();
+    let mut stack: Vec<&str> = lock.in_repo.iter().flat_map(|g| deps(lock, g)).collect();
+    while let Some(gem) = stack.pop() {
+        if candidates.insert(gem) {
+            stack.extend(deps(lock, gem));
+        }
+    }
+    let sources = &app.gem_boundary.source_constants;
+    let mut installed = None;
+    let mut found = BTreeSet::new();
+    for gem in candidates {
+        if sources.scans.contains_key(gem)
+            || lock.is_in_repo(gem)
+            || crate::project::gem_requires_rails(gem).is_some()
+            || crate::project::gem_port_files(gem).is_some()
+            || reaches_rails(gem)
+        {
+            continue;
+        }
+        let Some(version) = lock.version_of(gem) else { continue };
+        let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
+        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let owns = |feature: &str| {
+            let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+            require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
+        };
+        if features.iter().any(|f| owns(f)) {
+            found.insert(gem.to_string());
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let read = scan(vfs, home, lock, &found);
+    let sources = &mut app.gem_boundary.source_constants;
+    for (name, gems) in read.declared {
+        sources.declared.entry(name).or_default().extend(gems);
+    }
+    for (name, gems) in read.dynamic {
+        sources.dynamic.entry(name).or_default().extend(gems);
+    }
+    sources.scans.extend(read.scans);
+}
+
 /// `<home>/gems/<gem>-<version>` (or a platform build of it,
 /// `nokogiri-1.19.4-x86_64-linux-gnu`); a gem the lock takes from git is
 /// Bundler's checkout `<home>/bundler/gems/<repo>-<rev12>`, or the gem's

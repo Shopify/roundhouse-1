@@ -2306,6 +2306,13 @@ end
     app.sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&sources, &app.sources);
     app.source_index_required = !app.sources.is_empty();
+    // What the gem sources require from the gem home, read now that
+    // their files are registered.
+    if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
+        crate::timings::phase("gem sources: required gems", || {
+            super::gem_source_constants::scan_gem_source_requires(vfs, &home, &mut app)
+        });
+    }
     drop(sources);
     splice_concerns_into_controllers(&mut app);
     // After the splice: an action a concern provides is not implicit.
