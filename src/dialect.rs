@@ -932,6 +932,26 @@ pub struct LibraryClass {
     /// `methods`. See [`VisibilityOverride`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visibility_overrides: Vec<VisibilityOverride>,
+    /// The entries of `constants` that the source wrote at FILE level,
+    /// outside every class and module: Ruby binds those on Object, not
+    /// on this class. Ingest carries them on the file's first class so
+    /// analysis and lowering see them like any constant (a bare read
+    /// resolves by name), and the Ruby family writes them at the top
+    /// level of that class's file, where the source had them. Other
+    /// targets keep them on the class. See [`TopLevelConstant`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_level_constants: Vec<TopLevelConstant>,
+}
+
+/// One file-level constant carried on a [`LibraryClass`]: its name in
+/// that class's `constants`, and whether the source wrote it after the
+/// file's first class or module declaration (so it runs after that
+/// declaration, as a value reading the declared class needs).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TopLevelConstant {
+    pub name: Symbol,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub after_declarations: bool,
 }
 
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to

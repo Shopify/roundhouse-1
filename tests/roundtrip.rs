@@ -133,6 +133,7 @@ fn tiny_blog_round_trips() {
         inferred_method_params: Default::default(),
         models: vec![post_model],
         library_classes: vec![],
+        sorbet_type_aliases: Vec::new(),
         current_attribute_classes: vec![],
         initializer_filters: Vec::new(),
         initializer_files: Vec::new(),

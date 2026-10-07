@@ -233,8 +233,9 @@ what they do natively:
   reads the declared type through it. Still dropped, so their sites keep
   the refusal: aliases whose type is a form above (shapes, procs), aliases
   in controller bodies or `class << self`, and the blockless
-  `T.type_alias(T)`. A file-level alias outside any class is emitted in
-  the file's first class, so it does not resolve elsewhere. The other
+  `T.type_alias(T)`. A file-level alias outside any class is written at
+  the top level of its file, like every file-level constant (see below), but
+  the analysis expands it only inside the file's first class. The other
   targets (spinel, roda and the strict ones) refuse the check by name
   (`sorbet type check not supported`) rather than drop it.
   `tests/author_casts_run.rs` compares every result and message with
@@ -268,6 +269,20 @@ What remains is a `const` or `prop` on a base class from a gem: nothing
 in the tree says that DSL is a typed prop rather than some other one,
 and guessing from the method name would rewrite calls that were never
 props.
+
+A constant a file writes at file level, outside every class and
+module, is Object's in Ruby, and a bare read from any class in any
+file finds it. The Ruby trees write it at the top level of the
+emitted file of that source file's first class, ahead of the class
+where the source had it ahead of the first declaration and after it
+otherwise; that file then loads at boot. A file with no class or
+module declaration has no such carrier unless it declares a factory
+class (`X = Struct.new(...) do … end`): its other constants, such as
+a class alias `RemoteDomain = DomainSubscription` or a blockless
+`Pair = Struct.new(:a, :b)`, are not carried, and a read of one is
+refused as `constant not supported`. The strict targets keep the
+constant on the first class. `tests/file_level_constants_run.rs`
+compares the CRuby tree with the native run.
 
 The server targets all serve the app on `http://localhost:3000` (`PORT`
 overrides), with Action Cable at `/cable`, against a SQLite file at

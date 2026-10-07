@@ -76,6 +76,7 @@ fn synthesize_module_lc(funcs: &[LibraryFunction]) -> LibraryClass {
         })
         .collect();
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: module_id,
         is_module: true,
         parent: None,

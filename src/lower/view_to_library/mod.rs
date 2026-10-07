@@ -824,6 +824,7 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
     }
 
     LibraryClass {
+        top_level_constants: Vec::new(),
         name: module_id,
         is_module: true,
         parent: None,

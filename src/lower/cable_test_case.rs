@@ -270,6 +270,7 @@ mod tests {
         let mut app = App::new();
         for c in channels {
             app.library_classes.push(crate::dialect::LibraryClass {
+                top_level_constants: Vec::new(),
                 name: ClassId(Symbol::from(*c)),
                 is_module: false,
                 parent: Some(ClassId(Symbol::from("ApplicationCable::Channel"))),

@@ -545,6 +545,7 @@ pub fn lower_controllers_with_arel_views_assocs_and_routes(
         apply_alias_methods(controller, &mut methods);
         apply_undef_methods(controller, &mut methods);
         let mut lc = LibraryClass {
+            top_level_constants: Vec::new(),
             name: controller.name.clone(),
             is_module: false,
             parent: controller.parent.clone(),
@@ -617,6 +618,7 @@ pub fn lower_controller_to_library_class(controller: &Controller) -> LibraryClas
     apply_alias_methods(controller, &mut methods);
     apply_undef_methods(controller, &mut methods);
     let mut lc = LibraryClass {
+        top_level_constants: Vec::new(),
         name: controller.name.clone(),
         is_module: false,
         parent: controller.parent.clone(),

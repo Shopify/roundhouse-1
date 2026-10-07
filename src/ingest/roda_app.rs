@@ -350,6 +350,7 @@ fn ingest_roda_class(source: &[u8], file: &str, app: &mut App) -> IngestResult<S
             app.helper_method_index.insert(m.name.clone(), helper_id.clone());
         }
         app.library_classes.push(LibraryClass {
+            top_level_constants: Vec::new(),
             name: helper_id,
             is_module: true,
             parent: None,
