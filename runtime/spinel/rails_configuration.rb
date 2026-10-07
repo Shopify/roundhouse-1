@@ -75,6 +75,28 @@ module Rails
       @application.public_send(name, *args, &block)
     end
 
+    # Two framework keys (railties 8.2.0.alpha
+    # application/configuration.rb) a gem's railtie reads, outside the
+    # lifted ones. `filter_parameters` is the app's list, lifted onto the
+    # reopen as a plain reader with the framework's `[]` default
+    # (runtime/rails.rb); bugsnag 5.5's after_initialize hook reads it.
+    def filter_parameters
+      @application.filter_parameters
+    end
+
+    # `config.middleware`, the application's MiddlewareStackProxy: the
+    # one a railtie's `config.app_middleware` records into
+    # (Rails::Railtie::Configuration#app_middleware), which boot names
+    # operation by operation (error[gem_railtie_middleware_not_applied]):
+    # the tree has no middleware stack to apply them to. bugsnag 5.5's
+    # `bugsnag.use_rack_middleware` initializer writes it. Without the
+    # Railtie port (runtime/rails_railtie.rb), no such key.
+    def middleware
+      return method_missing(:middleware) unless defined?(::Rails::Railtie::Configuration)
+
+      ::Rails::Railtie::Configuration.new.app_middleware
+    end
+
     private
 
     def lifted?(name)

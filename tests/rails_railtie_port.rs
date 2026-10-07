@@ -123,10 +123,11 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
     let feature = std::fs::read_to_string(dir.join("runtime/features/rails/railtie.rb")).expect("rails/railtie feature");
     assert!(feature.contains("require_relative \"../../rails_railtie\""), "{feature}");
     let boot = std::fs::read_to_string(dir.join("boot.rb")).expect("boot.rb");
-    let run = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application)").unwrap_or_else(|| panic!("{boot}"));
+    let run = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{boot}"));
+    let finish = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)").unwrap_or_else(|| panic!("{boot}"));
     let gems = boot.find("require_relative \"runtime/gem_facades\"").expect("gem facades");
     let models = boot.find("require_relative \"app/models\"").expect("app/models");
-    assert!(gems < run && run < models, "{boot}");
+    assert!(gems < run && run < models && models < finish, "{boot}");
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
     let features = facades.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))").unwrap_or_else(|| panic!("{facades}"));
     let dependency = facades.find("[\"hashlike\"].each do |feature|").unwrap_or_else(|| panic!("{facades}"));
@@ -275,6 +276,68 @@ fn a_railtie_needing_unported_rails_is_named_and_the_rest_run() {
         "{stderr}"
     );
     assert!(stderr.contains("roundhouse: 2 gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])"), "{stderr}");
+}
+
+/// bugsnag 5.5's railtie, reduced: its `bugsnag.use_rack_middleware`
+/// initializer writes `app.config.middleware` (the application's
+/// MiddlewareStackProxy; boot names the operation, as the tree has no
+/// stack to apply it to), and its after_initialize hook reads
+/// `Rails.configuration.filter_parameters`, which an app initializer
+/// sets. Boot runs the Finisher part (to_prepare, after_initialize) after
+/// the app's code and initializers, so the hook sees the app's list.
+#[test]
+fn a_railtie_s_finisher_hooks_run_after_the_app_s_initializers() {
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_railtie_port\n")
+        .write("config/application.rb", "require \"rails\"\n\nmodule RailtieApp\n  class Application < Rails::Application\n  end\nend\n")
+        .write("config/initializers/filter_parameter_logging.rb", "Rails.application.config.filter_parameters += [:passw, \"secret\"]\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let boot = std::fs::read_to_string(dir.join("boot.rb")).expect("boot.rb");
+    let models = boot.find("require_relative \"app/models\"").expect("app/models");
+    let finish = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)").unwrap_or_else(|| panic!("{boot}"));
+    assert!(models < finish, "{boot}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args([
+            "-e",
+            "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/rails'\n\
+             require_relative 'runtime/rails_configuration'\n\
+             require_relative 'config/application'\n\
+             require 'rails/railtie'\n\
+             FILTERS = []\n\
+             class Bugsnagish < Rails::Railtie\n\
+               config.after_initialize do\n\
+                 FILTERS.concat(::Rails.configuration.filter_parameters.map { |f| f.is_a?(Symbol) || f.is_a?(String) ? /\\A#{f}\\z/ : f })\n\
+               end\n\
+               initializer 'bugsnagish.use_rack_middleware' do |app|\n\
+                 begin\n\
+                   app.config.middleware.insert_after ActionDispatch::DebugExceptions, :BugsnagRack\n\
+                 rescue\n\
+                   app.config.middleware.use :BugsnagRack\n\
+                 end\n\
+               end\n\
+             end\n\
+             Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n\
+             puts FILTERS.inspect\n\
+             Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n\
+             puts FILTERS.inspect\n\
+             puts Rails.configuration.middleware.equal?(Bugsnagish.config.app_middleware)\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "[]\n[/\\Apassw\\z/, /\\Asecret\\z/]\ntrue\n", "{stderr}");
+    assert!(
+        stderr.contains("roundhouse: error[gem_railtie_middleware_not_applied]: config.app_middleware.use(:BugsnagRack)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("gem_railtie_not_run"), "{stderr}");
 }
 
 /// A native gem's railtie requiring one of the app's own gems never loads

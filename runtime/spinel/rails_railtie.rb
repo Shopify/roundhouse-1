@@ -293,13 +293,42 @@ module Rails
       # and Finisher work, the part a railtie registers into runs at its
       # Rails name: `:bootstrap_hook` runs the `:before_initialize` load
       # hooks, `:run_prepare_callbacks` the `to_prepare` blocks and
-      # `:finisher_hook` the `:after_initialize` load hooks.
-      def run_initializers_of_railties(app)
-        return if defined?(@@ran_railties)
-        @@ran_railties = true
+      # `:finisher_hook` the `:after_initialize` load hooks, and
+      # `:build_middleware_stack` names each `app_middleware` operation.
+      #
+      # In two phases on the emitted boot: `:boot` runs the sorted list up
+      # to Finisher's first name, before the app's code loads; `:finish`
+      # runs the rest after the app's code and its initializers, as Rails
+      # runs the Finisher after `load_config_initializers` and eager
+      # loading (an after_initialize hook reads what an app initializer
+      # set: bugsnag's reads `config.filter_parameters`). `:all` (the
+      # default) runs both. Each phase runs once.
+      def run_initializers_of_railties(app, phase = :all)
+        @@ran_phases ||= []
+        phases = (phase == :all ? [:boot, :finish] : [phase]) - @@ran_phases
+        return if phases.empty?
+        @@ran_phases.concat(phases)
+        @@sorted ||= sorted_initializers_of_railties(app)
+        finisher = @@sorted.index { |initializer| initializer.name == FINISHER_INITIALIZERS.first }
+        part = { boot: @@sorted[0...finisher], finish: @@sorted[finisher..] }
+        phases.each do |name|
+          part.fetch(name).each do |initializer|
+            next unless initializer.belongs_to?(:default)
+            if initializer.context_class == app.class
+              initializer.run(app)
+            else
+              not_run_unless_it_runs("#{initializer.context_class.name} initializer #{initializer.name.inspect}") { initializer.run(app) }
+            end
+          end
+        end
+        return unless phases.include?(:finish)
+        warn "roundhouse: #{@@not_run} gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])" if @@not_run > 0
+      end
+
+      def sorted_initializers_of_railties(app) # :nodoc:
         work = {
           bootstrap_hook: -> { ActiveSupport.run_load_hooks(:before_initialize, app) },
-          add_to_prepare_blocks: -> { Configuration.refuse_app_middleware! },
+          build_middleware_stack: -> { Configuration.refuse_app_middleware! },
           run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
           finisher_hook: -> { ActiveSupport.run_load_hooks(:after_initialize, app) },
         }
@@ -315,15 +344,7 @@ module Rails
         add.(BOOTSTRAP_INITIALIZERS)
         subclasses.each { |railtie| collection.concat(railtie.instance.initializers) }
         add.(FINISHER_INITIALIZERS)
-        collection.tsort_each do |initializer|
-          next unless initializer.belongs_to?(:default)
-          if initializer.context_class == app.class
-            initializer.run(app)
-          else
-            not_run_unless_it_runs("#{initializer.context_class.name} initializer #{initializer.name.inspect}") { initializer.run(app) }
-          end
-        end
-        warn "roundhouse: #{@@not_run} gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])" if @@not_run > 0
+        collection.tsort
       end
 
       # A railtie's initializer or hook that needs Rails this tree does

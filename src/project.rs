@@ -3279,12 +3279,18 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 at,
                 "# Application#initialize!: the gems' railties' initializers, in\n\
                  # Rails' order, before the app's code loads (runtime/rails_railtie.rb).\n\
+                 # Finisher's part runs at the end of this file.\n\
                  require_relative \"runtime/rails_railtie\"\n\
-                 Rails::Railtie.run_initializers_of_railties(Rails.application)\n",
+                 Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n",
             );
             content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
             content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
+            content.push_str(
+                "# Application#initialize!'s Finisher (middleware, to_prepare,\n\
+                 # after_initialize), after the app's code and initializers.\n\
+                 Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n",
+            );
             content.push_str("require_relative \"runtime/database_configuration\"\n");
         }
         if path == "test/test_helper.rb" {
