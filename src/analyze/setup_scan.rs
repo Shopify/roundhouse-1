@@ -169,7 +169,7 @@ fn other_hook_bodies(app: &App, models: bool, f: &mut impl FnMut(&Expr)) {
                             f(cond);
                         }
                     }
-                    crate::dialect::ModelBodyItem::Unknown { expr, .. } => f(expr),
+                    crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => f(expr),
                     crate::dialect::ModelBodyItem::Association {
                         assoc: crate::dialect::Association::HasMany { extension, .. },
                         ..

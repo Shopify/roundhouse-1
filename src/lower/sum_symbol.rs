@@ -22,7 +22,7 @@ pub fn apply_sum_symbol_lowering(app: &mut App) {
                 crate::dialect::ModelBodyItem::Method { method, .. } => {
                     rewrite(&mut method.body);
                 }
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => rewrite(expr),
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => rewrite(expr),
                 _ => {}
             }
         }

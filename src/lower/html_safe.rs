@@ -102,7 +102,7 @@ pub fn apply_html_safe_lowering(app: &mut App) {
             match item {
                 ModelBodyItem::Method { method, .. } => rewrite(&mut method.body),
                 ModelBodyItem::Scope { scope, .. } => rewrite(&mut scope.body),
-                ModelBodyItem::Unknown { expr, .. } => rewrite(expr),
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => rewrite(expr),
                 _ => {}
             }
         }
@@ -190,7 +190,7 @@ fn apply_filter_chain_h_exemption(app: &mut App) {
             match item {
                 ModelBodyItem::Method { method, .. } => unescape_chain_h(&mut method.body, &chains),
                 ModelBodyItem::Scope { scope, .. } => unescape_chain_h(&mut scope.body, &chains),
-                ModelBodyItem::Unknown { expr, .. } => unescape_chain_h(expr, &chains),
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => unescape_chain_h(expr, &chains),
                 _ => {}
             }
         }

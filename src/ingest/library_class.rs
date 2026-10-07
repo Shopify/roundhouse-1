@@ -964,12 +964,14 @@ pub(super) fn library_class_and_struct_base(
         visibility_overrides,
         method_aliases,
         conditional_definitions,
+        class_attribute_effects,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
     }
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attribute_effects);
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
     // :name, String` IS the constructor and the reader. Lower it into
@@ -1917,8 +1919,17 @@ pub(super) fn library_class_from_module_node_with_scope(
         class_initializers,
         method_aliases,
         conditional_definitions,
+        class_attribute_effects,
         ..
     } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    // `class_attribute` is `Class#class_attribute`: a module body has
+    // none to call (a concern's `included do` block runs on the class).
+    if !class_attribute_effects.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "`class_attribute` in a module body (outside `included do`) is not modeled".into(),
+        });
+    }
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
         conditional_definitions,
@@ -1981,6 +1992,20 @@ fn with_class_body_ivar_writes(
     Ok(initializers)
 }
 
+/// Merge a class body's `class_attribute` statements into its class-side
+/// initializers by source position: each is a class ivar write (or a
+/// write through one's writer) that runs where it stood. The Ruby emit
+/// runs one that calls this class's own writer after the defs
+/// (`emit_library_class_decl_inner`'s tail effects).
+fn with_class_attribute_effects(mut initializers: Vec<Expr>, effects: Vec<Expr>) -> Vec<Expr> {
+    if effects.is_empty() {
+        return initializers;
+    }
+    initializers.extend(effects);
+    initializers.sort_by_key(|e| e.span.start);
+    initializers
+}
+
 fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
@@ -2019,6 +2044,13 @@ struct DeclBody {
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
     declaration_after_class_initializer: bool,
+    /// `class_attribute` (`ingest::class_attribute`): the names declared
+    /// so far, and the class-body statements on its storage in source
+    /// order, its seeds and `self.x = v` writes through its writers.
+    /// They are class-side ivar writes, not class-variable initializers:
+    /// `with_class_attribute_effects` merges them by source position.
+    class_attribute_names: Vec<Symbol>,
+    class_attribute_effects: Vec<Expr>,
 }
 
 impl DeclBody {
@@ -2032,6 +2064,8 @@ impl DeclBody {
         self.method_aliases.extend(other.method_aliases);
         self.conditional_definitions.extend(other.conditional_definitions);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
+        self.class_attribute_names.extend(other.class_attribute_names);
+        self.class_attribute_effects.extend(other.class_attribute_effects);
     }
 
     /// The class-body declarations an initializer must not precede.
@@ -2128,14 +2162,14 @@ impl DeclBody {
 /// any other block is searched, since it may run now. Every def counts,
 /// whatever its side, so this covers the Ruby emitter's constant deferral
 /// (`partition_deferred_constants`).
-struct OwnClassCalls<'a> {
+pub(crate) struct OwnClassCalls<'a> {
     owner: &'a str,
     leaf: &'a str,
     methods: HashSet<&'a str>,
 }
 
 impl<'a> OwnClassCalls<'a> {
-    fn new(owner: &'a ClassId, methods: &'a [MethodDef]) -> Self {
+    pub(crate) fn new(owner: &'a ClassId, methods: &'a [MethodDef]) -> Self {
         let owner = owner.0.as_str();
         OwnClassCalls {
             owner,
@@ -2155,7 +2189,7 @@ impl<'a> OwnClassCalls<'a> {
         }
     }
 
-    fn runs(&self, expr: &Expr) -> bool {
+    pub(crate) fn runs(&self, expr: &Expr) -> bool {
         match &*expr.node {
             // A closure literal is stored; a block that runs now is
             // searched through its call below.
@@ -2864,6 +2898,19 @@ fn walk_decl_body_with_visibility<'pr>(
                 message: "alias names a method this body has not defined".into(),
             });
         }
+        // `self.x += v` / `||=` / `&&=` through a `class_attribute`'s
+        // class-side reader and writer, in source order with its seed.
+        if !force_class_receiver
+            && (stmt.as_call_operator_write_node().is_some()
+                || stmt.as_call_or_write_node().is_some()
+                || stmt.as_call_and_write_node().is_some())
+            && let Ok(e) = ingest_expr(&stmt, file)
+            && super::class_attribute::self_write(&e)
+                .is_some_and(|name| out.class_attribute_names.iter().any(|n| n.as_str() == name))
+        {
+            out.class_attribute_effects.push(e);
+            continue;
+        }
         if let Some(call) = stmt.as_call_node() {
             // `include X` and `self.include(X)` are the same call: the
             // explicit-self spelling is how a file that must satisfy a
@@ -2916,6 +2963,30 @@ fn walk_decl_body_with_visibility<'pr>(
                         // concern's: the block keeps its lexical scope.
                         out.constants.extend(inner.constants);
                     }
+                }
+                // `class_attribute :x, …` (`ingest::class_attribute`): its
+                // defs, public whatever the surrounding visibility (Rails
+                // writes them through a string class_eval), and the seed.
+                if !force_class_receiver
+                    && let Some(decl) = super::class_attribute::parse(&call, file)
+                {
+                    for method in super::class_attribute::methods(owner, &decl) {
+                        out.methods.retain(|e| !(e.name == method.name && e.receiver == method.receiver));
+                        out.methods.push(method);
+                    }
+                    out.class_attribute_effects.extend(super::class_attribute::seeds(&decl));
+                    out.class_attribute_names.extend(decl.names);
+                    continue;
+                }
+                // `self.x = v` through a `class_attribute` writer.
+                if !force_class_receiver
+                    && call.receiver().is_some()
+                    && let Ok(e) = ingest_expr(&stmt, file)
+                    && let Some(name) = super::class_attribute::self_write(&e)
+                    && out.class_attribute_names.iter().any(|n| n.as_str() == name)
+                {
+                    out.class_attribute_effects.push(e);
+                    continue;
                 }
                 match kw {
                     "include" => {

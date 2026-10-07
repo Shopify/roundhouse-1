@@ -2312,6 +2312,7 @@ end
     splice_concerns_into_models(&mut app);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
+    claim_class_attribute_writes(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
     qualify_model_class_method_ar_calls(&mut app);
@@ -2734,6 +2735,83 @@ fn splice_concerns_into_models(app: &mut App) {
             }
             model.body.splice(i + 1..i + 1, items);
             i += 1;
+        }
+    }
+}
+
+/// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a
+/// `class_attribute` declares: the class's own, one an included concern
+/// carried in, or an ancestor's. A write through the class-side writer,
+/// run in the class body (`ModelBodyItem::ClassBody`, or a library
+/// class's initializers).
+fn claim_class_attribute_writes(app: &mut App) {
+    use crate::dialect::ModelBodyItem;
+    use crate::ident::ClassId;
+    // Each class's own declarations, models and library classes alike; a
+    // write may name one an ancestor declares (`ProPlan < Plan` writing
+    // `self.tier = :pro`).
+    let own: crate::det::HashMap<ClassId, (Option<ClassId>, Vec<Symbol>)> = app
+        .models
+        .iter()
+        .map(|m| (m.name.clone(), (m.parent.clone(), super::class_attribute::declared_names(&m.body))))
+        .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| {
+            let names = lc
+                .class_ivar_initializers
+                .iter()
+                .filter_map(|e| super::class_attribute::seeded_name(e).map(Symbol::from))
+                .collect();
+            (lc.name.clone(), (lc.parent.clone(), names))
+        }))
+        .collect();
+    let declared_for = |name: &ClassId| -> crate::det::HashSet<String> {
+        let mut declared = crate::det::HashSet::default();
+        let mut at = Some(name.clone());
+        let mut seen: Vec<ClassId> = Vec::new();
+        while let Some(id) = at.take() {
+            if seen.contains(&id) {
+                break;
+            }
+            let Some((parent, names)) = own.get(&id) else { break };
+            declared.extend(names.iter().map(|n| n.as_str().to_string()));
+            seen.push(id);
+            at = parent.clone();
+        }
+        declared
+    };
+    for model in &mut app.models {
+        let declared = declared_for(&model.name);
+        if declared.is_empty() {
+            continue;
+        }
+        for item in &mut model.body {
+            let ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else { continue };
+            if super::class_attribute::self_write(expr).is_some_and(|name| declared.contains(name)) {
+                *item = ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+        }
+    }
+    // A library class's own writes were claimed by its body walk; these
+    // name an inherited declaration. A class-side ivar write like the
+    // rest of its initializers, in source order with them.
+    for lc in &mut app.library_classes {
+        if lc.is_module {
+            continue;
+        }
+        let declared = declared_for(&lc.name);
+        if declared.is_empty() {
+            continue;
+        }
+        let (writes, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut lc.unknown_calls)
+            .into_iter()
+            .partition(|e| super::class_attribute::self_write(e).is_some_and(|name| declared.contains(name)));
+        lc.unknown_calls = rest;
+        if !writes.is_empty() {
+            lc.class_ivar_initializers.extend(writes);
+            lc.class_ivar_initializers.sort_by_key(|e| e.span.start);
         }
     }
 }
@@ -4494,7 +4572,7 @@ fn map_enum_labels(app: &mut App) {
             match item {
                 ModelBodyItem::Method { method, .. } => map_in_subtree(&mut method.body, &table),
                 ModelBodyItem::Scope { scope, .. } => map_in_subtree(&mut scope.body, &table),
-                ModelBodyItem::Unknown { expr, .. } => map_in_subtree(expr, &table),
+                ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => map_in_subtree(expr, &table),
                 _ => {}
             }
         }
@@ -4881,7 +4959,7 @@ fn scan_type_literals(
         match item {
             ModelBodyItem::Scope { scope, .. } => visit(&scope.body),
             ModelBodyItem::Method { method, .. } => visit(&method.body),
-            ModelBodyItem::Unknown { expr, .. } => visit(expr),
+            ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => visit(expr),
             ModelBodyItem::Association { assoc, .. } => {
                 if let Association::HasMany { scope: Some(s), .. } = assoc {
                     visit(s);

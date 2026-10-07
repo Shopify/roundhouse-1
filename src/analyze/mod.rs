@@ -2675,6 +2675,18 @@ impl Analyzer {
             for name in collect_attr_accessor_names(&model.body) {
                 class_ivars.entry(name).or_insert(Ty::Untyped);
             }
+            // `class_attribute :x`: the class-side `@__class_attr_x` and the
+            // instance's own `@x` hold whatever the app writes; gradual,
+            // like an `attr_accessor` virtual.
+            let class_attribute_names = crate::ingest::class_attribute::declared_names(&model.body);
+            let class_attribute_ivars: Vec<Symbol> = class_attribute_names
+                .iter()
+                .cloned()
+                .flat_map(|name| [crate::ingest::class_attribute::storage_ivar(&name), name])
+                .collect();
+            for name in &class_attribute_ivars {
+                class_ivars.entry(name.clone()).or_insert(Ty::Untyped);
+            }
 
             // Phase 0: type the model's `Unknown` body items so the
             // RHS of in-class constant assignments (`FLAGGABLE_DAYS = 7`,
@@ -2729,7 +2741,10 @@ impl Analyzer {
                         self.body_typer().analyze_expr(default, &class_ctx);
                     }
                 }
-                let mctx = self.seed_method_params(&class_ctx, &model_name, method);
+                let mut mctx = self.seed_method_params(&class_ctx, &model_name, method);
+                if let Some(param) = crate::ingest::class_attribute::generated_writer_param(method, &class_attribute_names) {
+                    mctx.local_bindings.insert(param.clone(), Ty::Untyped);
+                }
                 self.body_typer().analyze_expr(&mut method.body, &mctx);
             }
 
@@ -2754,6 +2769,11 @@ impl Analyzer {
                 let mut reseeded = class_ivars;
                 let initialized = ivars_initialized_by(model.methods());
                 for (name, ty) in flow_ivars {
+                    // A class_attribute ivar stays gradual: its generated
+                    // writer's untyped `value` is no answer to replace it.
+                    if class_attribute_ivars.contains(&name) {
+                        continue;
+                    }
                     // `initialize` sets its own ivars before any other method
                     // runs (see the library-class pass).
                     let union_ty = if initialized.contains(&name) && !ty.is_open() {
@@ -2777,7 +2797,10 @@ impl Analyzer {
                     self.body_typer().analyze_expr(&mut scope.body, &reseeded_ctx);
                 }
                 for method in model.methods_mut() {
-                    let mctx = self.seed_method_params(&reseeded_ctx, &model_name, method);
+                    let mut mctx = self.seed_method_params(&reseeded_ctx, &model_name, method);
+                    if let Some(param) = crate::ingest::class_attribute::generated_writer_param(method, &class_attribute_names) {
+                        mctx.local_bindings.insert(param.clone(), Ty::Untyped);
+                    }
                     self.body_typer().analyze_expr(&mut method.body, &mctx);
                 }
             }

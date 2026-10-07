@@ -420,7 +420,7 @@ impl<'a> RestReach<'a> {
         for model in &app.models {
             module.entry(&model.name).or_insert(false);
             constants.extend(model.body.iter().filter_map(|item| match item {
-                crate::dialect::ModelBodyItem::Unknown { expr, .. } => assigned(expr),
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => assigned(expr),
                 _ => None,
             }));
         }

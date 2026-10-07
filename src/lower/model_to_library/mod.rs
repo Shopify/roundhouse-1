@@ -547,7 +547,9 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
 }
 
 /// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object.
+/// ivar writes emitted once on the model class object, then the body's
+/// `ModelBodyItem::ClassBody` statements in source order (class_attribute
+/// seeds, class-side writes, carried `included do` statements).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
     model
         .class_attr_defaults
@@ -561,7 +563,16 @@ fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
                 },
             )
         })
+        .chain(class_body_statements(model).cloned())
         .collect()
+}
+
+/// The model body's `ModelBodyItem::ClassBody` statements, in order.
+pub(crate) fn class_body_statements(model: &Model) -> impl Iterator<Item = &Expr> {
+    model.body.iter().filter_map(|item| match item {
+        crate::dialect::ModelBodyItem::ClassBody { expr, .. } => Some(expr),
+        _ => None,
+    })
 }
 
 /// Class-level `NAME = <expr>` constants declared in a model body (e.g.
@@ -2159,6 +2170,12 @@ fn type_method_body(
             for (name, ty) in self::associations::assoc_cache_ivar_bindings(m) {
                 ctx.ivar_bindings.insert(name, ty);
             }
+        }
+    }
+    if let Some(m) = model {
+        for name in crate::ingest::class_attribute::declared_names(&m.body) {
+            ctx.ivar_bindings.entry(crate::ingest::class_attribute::storage_ivar(&name)).or_insert(Ty::Untyped);
+            ctx.ivar_bindings.entry(name).or_insert(Ty::Untyped);
         }
     }
     // Opt-in to `recv: Some(SelfRef)` rewriting on bare Sends —
