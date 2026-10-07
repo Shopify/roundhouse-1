@@ -114,6 +114,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rails", &[
         ("backtrace_cleaner", class("Rails::BacktraceCleaner")),
     ], &[]);
+    // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
+    // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
+    let as_cleaner = class("ActiveSupport::BacktraceCleaner");
+    register_stdlib_class(classes, "ActiveRecord::LogSubscriber", &[
+        ("backtrace_cleaner", as_cleaner.clone()), ("backtrace_cleaner=", as_cleaner.clone()),
+        ("backtrace_cleaner?", Ty::Bool),
+    ], &[
+        ("backtrace_cleaner", as_cleaner.clone()), ("backtrace_cleaner=", as_cleaner.clone()),
+        ("backtrace_cleaner?", Ty::Bool),
+    ]);
     register_stdlib_class(classes, "ActiveSupport::ExecutionContext", &[
         ("set", Ty::Untyped), ("[]=", Ty::Untyped), ("to_h", sym_hash()),
         ("clear", Ty::Nil), ("push", Ty::Untyped), ("pop", Ty::Untyped), ("flush", Ty::Untyped),
