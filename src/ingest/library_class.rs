@@ -4982,6 +4982,32 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
     file: &str,
     enum_constants: &super::model::EnumConstants,
 ) -> ConcernModelItems {
+    ingest_concern_hook_items(source, file, enum_constants, "included")
+}
+
+/// A Concern's `prepended do` block, read like `included do`: Rails
+/// evaluates it in the body of each class that PREPENDS the concern
+/// (`ActiveSupport::Concern#prepend_features`), never in an includer's.
+/// Kept apart from `concern_model_items` for that reason. Only files
+/// that mention `prepended` are parsed a second time.
+pub(in crate::ingest) fn ingest_concern_prepended_items(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+) -> Vec<(ClassId, Vec<crate::dialect::ModelBodyItem>)> {
+    if !source.windows(b"prepended".len()).any(|w| w == b"prepended") {
+        return Vec::new();
+    }
+    ingest_concern_hook_items(source, file, enum_constants, "prepended").0
+}
+
+/// The model DSL of each module's `<hook> do ... end` block.
+fn ingest_concern_hook_items(
+    source: &[u8],
+    file: &str,
+    enum_constants: &super::model::EnumConstants,
+    hook: &str,
+) -> ConcernModelItems {
     use super::concern_accessors::{decline, is_candidate, is_supported};
     use crate::dialect::ModelBodyItem;
 
@@ -5020,7 +5046,7 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         }));
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
-            if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
+            if call.receiver().is_some() || constant_id_str(&call.name()) != hook {
                 continue;
             }
             let Some(block) = call.block().and_then(|b| b.as_block_node()) else { continue };
