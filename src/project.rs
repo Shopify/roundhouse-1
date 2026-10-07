@@ -6595,6 +6595,11 @@ fn spinel_files_with_assertions(
     if public.exists() {
         walk_dir_into(&public, "public/", &mut files)?;
     }
+    // The app's data files, at their Rails.root-relative paths. First, so
+    // anything the emit produces at the same path wins.
+    let mut data = Vec::new();
+    walk_data_files_into(fixture, &mut data)?;
+    files.splice(0..0, data);
 
     let mut files = dedupe_last_wins(files);
     // De-blog the scaffold for whatever app was ingested: regenerate the
@@ -10043,6 +10048,67 @@ fn walk_dir_into(
                     Err(_) => continue,
                 };
                 out.push((nested, content));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A file or directory name that says it holds secret material
+/// (credentials, keys, secrets, tokens, passwords, private data), which
+/// is never copied into an emitted tree, whatever its extension: Core's
+/// git-tracked `config/secrets.test.json` included.
+pub(crate) fn named_for_secrets(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["credential", "secret", "token", "password", "private", "master.key"].iter().any(|w| lower.contains(w))
+        || [".key", ".pem", ".ejson", ".enc"].iter().any(|ext| lower.ends_with(ext))
+}
+
+/// The app's data files (`*.yml`, `*.yaml`, `*.json`, each optionally
+/// `.erb`), carried verbatim at their Rails.root-relative paths: app code
+/// reads them by a path it builds from `Rails.root` (Core's
+/// `Markets::DefaultMarkets` loads `components/markets/config/
+/// countries_for_currency_overrides.yml` in its class body), and the
+/// emitted app serves from its root (runtime `Rails.root` is "."), so a
+/// file that is not there is an Errno::ENOENT the source never raises.
+/// Nothing transpiles them; whatever ERB they hold is the reading code's
+/// to render.
+///
+/// Skipped: dev/build dirs (`SKIP_DIRS`), hidden entries, `sorbet/`
+/// (type declarations the compiler reads), `config/database.yml` (compiled
+/// into the tree as `DatabaseYml`), and any file or directory
+/// [`named_for_secrets`] (Core's `config/secrets.test.json`), each noted
+/// on stderr without its content. Encrypted material (`*.ejson`,
+/// `credentials.yml.enc`, `master.key`) has no data extension either.
+fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    fn data_file(name: &str) -> bool {
+        let name = name.strip_suffix(".erb").unwrap_or(name);
+        [".yml", ".yaml", ".json"].iter().any(|ext| name.ends_with(ext))
+    }
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || named_for_secrets(&name) {
+                if !name.starts_with('.') {
+                    eprintln!("roundhouse: note: {prefix}{name} is named for secrets and is not carried into the tree");
+                }
+                continue;
+            }
+            let Ok(ty) = entry.file_type() else { continue };
+            let rel = format!("{prefix}{name}");
+            if ty.is_dir() {
+                if !SKIP_DIRS.contains(&name.as_str()) && !(prefix.is_empty() && name == "sorbet") {
+                    stack.push((entry.path(), format!("{rel}/")));
+                }
+            } else if ty.is_file() && data_file(&name) && rel != "config/database.yml" {
+                // Not UTF-8: `collect_binary_assets` carries what it can.
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    out.push((rel, content));
+                }
             }
         }
     }

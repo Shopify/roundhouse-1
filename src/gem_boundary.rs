@@ -38,9 +38,31 @@ pub struct GemBoundary {
     /// never in here.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub loaded: BTreeSet<String>,
+    /// Each `include` of a module only a Rails-dependent gem declares
+    /// (error[gem_requires_rails]): no emitted tree loads that gem, so
+    /// the include cannot run. Written by analysis, which decides it
+    /// against the whole registry; the Ruby family emits each as a
+    /// named raise where the source has the include.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_includes: Vec<RefusedInclude>,
+}
+
+/// One refused include: the including class or module, the module as
+/// written, and the refusal's text.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RefusedInclude {
+    pub class: ClassId,
+    pub include: ClassId,
+    pub detail: String,
 }
 
 impl GemBoundary {
+    /// The refusal for `class`'s `include` of `include`, if analysis
+    /// refused it.
+    pub fn refused_include(&self, class: &ClassId, include: &ClassId) -> Option<&RefusedInclude> {
+        self.refused_includes.iter().find(|r| &r.class == class && &r.include == include)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
     }

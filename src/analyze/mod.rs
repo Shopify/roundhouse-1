@@ -1294,8 +1294,24 @@ impl Analyzer {
         self.incremental = incremental::Incremental::new(self.incremental.mode);
         // An unresolvable include is a load-time error, not an open method
         // surface. Keep it in the class-body ledger even when no method is called.
+        app.gem_boundary.refused_includes.clear();
         for class in &mut app.library_classes {
             for included in &class.includes {
+                if let Some(detail) = rails_dependent_include(&self.classes, included, &class.name) {
+                    app.gem_boundary.refused_includes.push(crate::gem_boundary::RefusedInclude {
+                        class: class.name.clone(), include: included.clone(), detail: detail.clone(),
+                    });
+                    if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
+                        Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
+                        if construct.as_str() == "gem_requires_rails" && old == &detail)) { continue; }
+                    let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
+                        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
+                    refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None, construct: Symbol::from("gem_requires_rails"), detail,
+                    });
+                    class.unknown_calls.push(refusal);
+                    continue;
+                }
                 // A Ruby-family runtime module (ActiveSupport::Testing::
                 // TimeHelpers) is resolved here and gated per target by
                 // `project` (report_unsupported_runtime_reads).
@@ -1324,13 +1340,19 @@ impl Analyzer {
                 let ModelBodyItem::Unknown { expr, .. } = item else { continue };
                 let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
                 if method.as_str() != "include" { continue; }
-                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "include") {
+                if matches!(&expr.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+                    if matches!(construct.as_str(), "include" | "gem_requires_rails")) {
                     expr.diagnostic = None;
                 }
+                let mut refused = Vec::new();
                 let missing: Vec<_> = args.iter().filter_map(|arg| {
                     let ExprNode::Const { path } = &*arg.node else { return None };
                     let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                     let id = ClassId(Symbol::from(name.as_str()));
+                    if let Some(detail) = rails_dependent_include(&self.classes, &id, &model.name) {
+                        refused.push(crate::gem_boundary::RefusedInclude { class: model.name.clone(), include: id, detail });
+                        return None;
+                    }
                     let known = self.classes.contains_key(&id)
                         || body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str())
@@ -1342,7 +1364,12 @@ impl Analyzer {
                         target: None, construct: Symbol::from("include"),
                         detail: format!("{} includes unresolved {}", model.name.0, missing.join(", ")),
                     });
+                } else if let Some(first) = refused.first() {
+                    expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                        target: None, construct: Symbol::from("gem_requires_rails"), detail: first.detail.clone(),
+                    });
                 }
+                app.gem_boundary.refused_includes.extend(refused);
             }
         }
         // View-name and dynamic-render ivar sets are invariant across
@@ -7494,6 +7521,27 @@ fn association_builder_members(assoc: &crate::dialect::Association) -> Vec<(Symb
 /// The model-side twin of [`controller_includes`]: modules a model mixes
 /// in via top-level `include X` calls (round-tripped as `Unknown` body
 /// items).
+/// The refusal for `class`'s `include` of `included` when the module it
+/// names is declared only by a Rails-dependent gem's RBI
+/// (`crate::project::gem_requires_rails`): no emitted tree loads that
+/// gem (its load closure requires Rails), and the runtime ports none of
+/// it, so the include can only fail. The name resolves as Ruby's
+/// constant lookup does (`body::lexical_class`): innermost enclosing
+/// scope of the includer first, so a module the app nests there wins.
+fn rails_dependent_include(classes: &HashMap<ClassId, ClassInfo>, included: &ClassId, class: &ClassId) -> Option<String> {
+    let resolved = body::lexical_class(included, class.0.as_str(), body::Classes::new(classes, None))?;
+    let info = classes.get(&resolved).filter(|info| !info.app_declared && !info.gem_loaded)?;
+    let gem = info.gem.as_deref()?;
+    if crate::project::gem_port_file(gem, resolved.0.as_str()).is_some() {
+        return None;
+    }
+    let reason = crate::project::gem_requires_rails(gem)?;
+    Some(format!(
+        "{} includes {}, declared by the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree loads it natively",
+        class.0, included.0
+    ))
+}
+
 pub(crate) fn model_includes(model: &crate::dialect::Model) -> Vec<ClassId> {
     let mut out = Vec::new();
     for item in &model.body {

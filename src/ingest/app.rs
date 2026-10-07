@@ -2301,10 +2301,16 @@ fn collect_binary_assets<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
 /// root), so no emitter produces them and nothing can know statically
 /// which one a run opens. JSON only: `config/` also holds encrypted
 /// material (`*.ejson`, `credentials.yml.enc`, `master.key`), which is
-/// never copied, and YAML the compiler reads itself.
+/// never copied, and YAML the compiler reads itself. Nor is anything
+/// `crate::project::named_for_secrets`, Core's git-tracked
+/// `config/secrets.test.json` included: a read of one is the app's
+/// Errno::ENOENT.
 fn collect_config_data<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &mut App) {
     let Ok(entries) = vfs.read_dir(dir) else { return };
     for entry in entries {
+        if entry.file_name().and_then(|n| n.to_str()).is_some_and(crate::project::named_for_secrets) {
+            continue;
+        }
         if vfs.is_dir(&entry) {
             collect_config_data(vfs, root, &entry, app);
             continue;
