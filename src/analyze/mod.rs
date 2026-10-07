@@ -1666,11 +1666,17 @@ impl Analyzer {
 
                 // Class-side `new` answers `Ty::SelfInstance` so inherited
                 // factories stay receiver-dependent in the registry. The
-                // MethodDef signature is what RBS emit reads, and emit
-                // refuses a bare SelfInstance — pin it to the owner the
-                // method is stamped on (same concrete shape
-                // `concern_class_methods` requires).
-                let owner_ty = Ty::Class { id: owner.clone(), args: Vec::new() };
+                // MethodDef signature is what RBS emit reads. On a
+                // singleton method it keeps SelfInstance: RBS spells it
+                // `instance`, which is what Ruby answers (`Child.make` is
+                // a Child), where the owner would type it as a Widget.
+                // Elsewhere emit refuses a bare SelfInstance, so it is
+                // pinned to the owner the method is stamped on (the
+                // concrete shape `concern_class_methods` requires).
+                let owner_ty = match method.receiver {
+                    crate::dialect::MethodReceiver::Class => Ty::SelfInstance,
+                    crate::dialect::MethodReceiver::Instance => Ty::Class { id: owner.clone(), args: Vec::new() },
+                };
 
                 let params: Vec<crate::ty::Param> = method
                     .params
