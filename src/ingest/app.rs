@@ -972,6 +972,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // decides at boot, as Rails does, whether to load every file or
     // autoload on reference (`project::apply_models_autoload`).
     app.eager_load = super::environments::ingest_eager_load(vfs, dir);
+    // App config keys a `config/initializers` file writes, lifted below:
+    // an environment file's write of one is superseded
+    // (`environments::collect_programs`).
+    let mut initializer_config_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
@@ -1420,6 +1424,16 @@ end
                     }
                 }
             }
+            // The app keys `config/environments/<env>.rb` writes. The
+            // environment program writes each through the lifted writer
+            // (`environments::collect_programs`), replacing application.rb's
+            // value as Rails' later write does. A key only environment
+            // files write answers, until one does, as Rails' unset key
+            // (`environments::written_app_keys`).
+            for (segments, value) in super::environments::written_app_keys(vfs, dir) {
+                assignments.push((segments, value));
+                assignment_sites.push(("<environment>".to_string(), 0, 0));
+            }
             // ONCE PER PROCESS. An initializer runs at boot, so the
             // value an assignment writes is built one time and every
             // read afterwards answers the same object. A reader that
@@ -1450,6 +1464,9 @@ end
                 assignments.iter().zip(&assignment_sites)
             {
                 let name = segments.join("_");
+                if Path::new(site_file).starts_with(&init_dir) {
+                    initializer_config_keys.insert(name.clone());
+                }
                 // A framework key is NOT consumed here: it is railtie
                 // configuration this lift does not model, and only the
                 // keys `INERT_FRAMEWORK_CONFIG_KEYS` vouches for count as
@@ -2393,6 +2410,15 @@ end
             lifted: &lifted,
         };
         super::initializer_programs::collect(&mut app, &inputs, &fired);
+        let lifted = super::environments::LiftedConfig {
+            readers: app
+                .rails_application
+                .iter()
+                .flat_map(|lc| lc.methods.iter().map(|m| m.name.as_str().to_string()))
+                .collect(),
+            superseded: initializer_config_keys,
+        };
+        super::environments::collect_programs(&mut app, &inputs, &fired, &lifted);
         app.load_hook_bases = fired.bases;
     }
     // The real drain, now that every pass re-ingesting synthesized
@@ -6856,7 +6882,7 @@ fn extract_autoload_lib_ignores(source: &[u8]) -> Vec<String> {
 /// railtie configuration the emitted app has no use for — either a
 /// reader is synthesized for it explicitly (`time_zone`) or it
 /// configures machinery that does not exist here.
-const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
+pub(super) const FRAMEWORK_CONFIG_KEYS: &[&str] = &[
     "time_zone",
     // Applied by its own reader (`extract_filter_parameters`), not lifted.
     "filter_parameters",
@@ -7406,7 +7432,7 @@ pub(crate) fn applied_framework_config_reader(key: &str) -> String {
 
 /// Whether a written config path (`["assets", "version"]`) is one
 /// [`INERT_FRAMEWORK_CONFIG_KEYS`] vouches for.
-fn inert_framework_config(path: &[String]) -> bool {
+pub(super) fn inert_framework_config(path: &[String]) -> bool {
     let dotted = path.join(".");
     INERT_FRAMEWORK_CONFIG_KEYS.iter().any(|(key, _)| {
         dotted == *key || dotted.strip_prefix(key).is_some_and(|rest| rest.starts_with('.'))

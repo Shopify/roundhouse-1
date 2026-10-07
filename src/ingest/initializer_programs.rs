@@ -402,7 +402,7 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
     app.framework_load_hooks = framework.into_values().collect();
 }
 
-fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
+pub(super) fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
     LibraryClass {
         conditional_definitions: Vec::new(),
         top_level_constants: Vec::new(),
@@ -424,8 +424,13 @@ fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
 
 /// `RoundhouseInitializer` + the initializer's relative path, camelized.
 fn holder_name(rel: &str, used: &mut crate::det::HashSet<String>) -> String {
+    prefixed_holder_name("RoundhouseInitializer", rel, used)
+}
+
+/// `prefix` + `rel` camelized, unique among `used`.
+pub(super) fn prefixed_holder_name(prefix: &str, rel: &str, used: &mut crate::det::HashSet<String>) -> String {
     let stem = rel.strip_suffix(".rb").unwrap_or(rel);
-    let mut name = String::from("RoundhouseInitializer");
+    let mut name = String::from(prefix);
     for part in stem.split(|c: char| !c.is_ascii_alphanumeric()) {
         let mut chars = part.chars();
         if let Some(first) = chars.next() {
@@ -442,16 +447,16 @@ fn holder_name(rel: &str, used: &mut crate::det::HashSet<String>) -> String {
     unique
 }
 
-fn relative(dir: &Path, path: &Path) -> String {
+pub(super) fn relative(dir: &Path, path: &Path) -> String {
     path.strip_prefix(dir).unwrap_or(path).display().to_string()
 }
 
-fn label(rel: &str, text: &str, stmt: &Node<'_>) -> String {
+pub(super) fn label(rel: &str, text: &str, stmt: &Node<'_>) -> String {
     let loc = stmt.location();
     label_range(rel, text, loc.start_offset(), loc.end_offset())
 }
 
-fn label_range(rel: &str, text: &str, start: usize, end: usize) -> String {
+pub(super) fn label_range(rel: &str, text: &str, start: usize, end: usize) -> String {
     let line = text[..start].matches('\n').count() + 1;
     let first = text[start..end].lines().next().unwrap_or("").trim();
     let mut short: String = first.chars().take(60).collect();
@@ -463,7 +468,7 @@ fn label_range(rel: &str, text: &str, start: usize, end: usize) -> String {
 
 /// Ingest `stmt` as app code; a gap the survey would absorb into a `nil`
 /// placeholder refuses it instead.
-fn ingest(stmt: &Node<'_>, file: &str) -> Result<Expr, String> {
+pub(super) fn ingest(stmt: &Node<'_>, file: &str) -> Result<Expr, String> {
     let before = super::survey::recorded_len();
     match super::expr::ingest_expr(stmt, file) {
         Ok(expr) => match super::survey::recorded_since(before) {
@@ -475,7 +480,7 @@ fn ingest(stmt: &Node<'_>, file: &str) -> Result<Expr, String> {
 }
 
 /// The guard around one carried statement.
-fn guard(stmt: Expr, label: &str) -> Expr {
+pub(super) fn guard(stmt: Expr, label: &str) -> Expr {
     let site: String = label.chars().map(|c| if matches!(c, '"' | '\\' | '#') { '\'' } else { c }).collect();
     let template = format!(
         "def __guard\n  begin\n    nil\n  rescue StandardError, LoadError, NotImplementedError => __initializer_error\n    \
@@ -503,7 +508,7 @@ fn guard(stmt: Expr, label: &str) -> Expr {
 
 /// Drop the refused statements of the deferred call's block and guard
 /// the rest.
-fn guard_block_body(expr: &mut Expr, refused: &[u32], labels: &BTreeMap<u32, String>) -> Result<(), String> {
+pub(super) fn guard_block_body(expr: &mut Expr, refused: &[u32], labels: &BTreeMap<u32, String>) -> Result<(), String> {
     let ExprNode::Send { block: Some(block), .. } = &mut *expr.node else {
         return Err("the deferred call's block did not ingest as a block".into());
     };
@@ -529,7 +534,7 @@ fn guard_block_body(expr: &mut Expr, refused: &[u32], labels: &BTreeMap<u32, Str
 
 /// `require "x"` → a runtime port, a no-op for a lib file boot already
 /// loads, or the standard library feature itself; anything else refuses.
-fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs<'_, V>) -> Result<(), String> {
+pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs<'_, V>) -> Result<(), String> {
     let mut failure: Option<String> = None;
     walk(expr, &mut |e| {
         if failure.is_some() {
@@ -580,12 +585,12 @@ fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs<'_, V>) ->
     }
 }
 
-fn walk(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+pub(super) fn walk(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     f(expr);
     expr.node.for_each_child_mut(&mut |child| walk(child, f));
 }
 
-enum Verdict {
+pub(super) enum Verdict {
     /// Another reader lifts it (an adapter hook on PostgreSQL).
     Lifted,
     Refused(String),
@@ -595,22 +600,45 @@ enum Verdict {
     Deferred { refused: Vec<(usize, usize, String)>, kept: Vec<(usize, usize)> },
 }
 
+/// What an environment file's statement may do beyond an initializer's
+/// (`ingest::environments`).
+pub(super) struct EnvironmentRules<'s> {
+    /// A statement of `Rails.application.configure do … end`, whose
+    /// `self` is the application: a bare `config` is its config.
+    pub in_configure: bool,
+    /// Each `config.*` write (a call or an operator write on an anchored
+    /// config chain) found in the statement: `Some(reason)` refuses it.
+    pub config_write: &'s dyn Fn(&Node<'_>) -> Option<String>,
+}
+
 /// The admission rule (module doc), statement by statement.
-struct Scan<'s, 'a, V: Vfs + ?Sized> {
+pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
     inputs: &'s Inputs<'a, V>,
     fired: &'s FiredHooks,
     framework: &'s mut BTreeMap<String, FrameworkLoadHook>,
     /// Inside an `on_load` block: `self` is the hook's base.
     in_hook: usize,
     reason: Option<String>,
+    /// An environment file's statement, not an initializer's.
+    env: Option<EnvironmentRules<'s>>,
 }
 
 impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
     fn new(inputs: &'s Inputs<'a, V>, fired: &'s FiredHooks, framework: &'s mut BTreeMap<String, FrameworkLoadHook>) -> Self {
-        Scan { inputs, fired, framework, in_hook: 0, reason: None }
+        Scan { inputs, fired, framework, in_hook: 0, reason: None, env: None }
     }
 
-    fn statement(&mut self, stmt: &Node<'_>) -> Verdict {
+    /// The admission rule for an environment file's statement.
+    pub(super) fn environment(
+        inputs: &'s Inputs<'a, V>,
+        fired: &'s FiredHooks,
+        framework: &'s mut BTreeMap<String, FrameworkLoadHook>,
+        rules: EnvironmentRules<'s>,
+    ) -> Self {
+        Scan { inputs, fired, framework, in_hook: 0, reason: None, env: Some(rules) }
+    }
+
+    pub(super) fn statement(&mut self, stmt: &Node<'_>) -> Verdict {
         if let Some(call) = stmt.as_call_node() {
             let name = constant_id_str(&call.name());
             if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
@@ -733,12 +761,36 @@ struct ScanVisit<'v, 's, 'a, V: Vfs + ?Sized> {
     scan: &'v mut Scan<'s, 'a, V>,
 }
 
+impl<V: Vfs + ?Sized> ScanVisit<'_, '_, '_, V> {
+    /// An environment file's refused `config.*` operator write: refuses
+    /// the statement.
+    fn env_config_write(&mut self, node: &Node<'_>) -> bool {
+        if self.scan.reason.is_some() {
+            return true;
+        }
+        let Some(rules) = &self.scan.env else { return false };
+        match (rules.config_write)(node) {
+            Some(reason) => {
+                self.scan.refuse(reason);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         if self.scan.reason.is_some() {
             return;
         }
         let name = constant_id_str(&node.name());
+        if let Some(rules) = &self.scan.env {
+            if let Some(reason) = (rules.config_write)(&node.as_node()) {
+                self.scan.refuse(reason);
+                return;
+            }
+        }
         if REBINDS_SELF.contains(&name) {
             self.scan.refuse(format!("`{name}` runs its block with another `self`"));
             return;
@@ -771,8 +823,22 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
             return;
         }
         if node.receiver().is_none() {
+            let env = self.scan.env.as_ref().map(|rules| rules.in_configure);
             match name {
                 "require" => {}
+                // The environment file's own path: resolved by
+                // `ingest::environments`.
+                "require_relative" if env.is_some() && node.block().is_none() => {}
+                // `self` of `Rails.application.configure` is the
+                // application; its `config` is `Rails.application.config`.
+                "config" if env == Some(true) && node.arguments().is_none() && node.block().is_none() => {}
+                _ if env == Some(true) && self.scan.in_hook == 0 && !KERNEL.contains(&name) => {
+                    self.scan.refuse(format!(
+                        "`{name}` has an implicit receiver, Rails.application (the `configure` block's `self`), \
+                         whose `{name}` the emitted boot does not carry"
+                    ));
+                    return;
+                }
                 "require_relative" | "load" | "autoload" | "__dir__" | "binding" => {
                     self.scan.refuse(format!("`{name}` reads the initializer's own file or scope"));
                     return;
@@ -790,6 +856,24 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
             }
         }
         ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
+        if self.env_config_write(&node.as_node()) {
+            return;
+        }
+        ruby_prism::visit_call_operator_write_node(self, node);
+    }
+    fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
+        if self.env_config_write(&node.as_node()) {
+            return;
+        }
+        ruby_prism::visit_call_or_write_node(self, node);
+    }
+    fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
+        if self.env_config_write(&node.as_node()) {
+            return;
+        }
+        ruby_prism::visit_call_and_write_node(self, node);
     }
     fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {
         self.scan.refuse("`def` in an initializer defines a method on Object (or the hook's base)");
