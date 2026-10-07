@@ -6648,7 +6648,7 @@ fn emit_library_class_decl_inner(
         let qualified = segments[..=i].join("::");
         let parent = outer_class_parent(&qualified, app);
         match (is_app_class(&qualified, app), parent) {
-            (true, Some(p)) => format!("class {seg} < {}", p.0.as_str()),
+            (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app)),
             (true, None) => format!("class {seg}"),
             (false, _) => format!("module {seg}"),
         }
@@ -6678,7 +6678,10 @@ fn emit_library_class_decl_inner(
                 (Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }), _) => {
                     writeln!(s, "{pad}{last} = {} do", super::emit_expr(factory)).unwrap()
                 }
-                (_, Some(p)) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
+                (_, Some(p)) => {
+                    let parent = lexically_qualified(p.0.as_str(), &segments[..depth - 1], app);
+                    writeln!(s, "{pad}class {last} < {parent}").unwrap()
+                }
                 (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
             }
         }
@@ -6697,7 +6700,7 @@ fn emit_library_class_decl_inner(
             writeln!(s, "{body_pad}::Kernel.raise(::NotImplementedError, '{quoted}')").unwrap();
             return;
         }
-        writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
+        writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
     };
     // An include whose `self.included(base)` hook calls class methods of
     // this class runs after them, as in the source (see
@@ -6714,7 +6717,7 @@ fn emit_library_class_decl_inner(
         write_include(&mut s, inc);
     }
     for carrier in &carrier_extends {
-        writeln!(s, "{body_pad}extend {}", carrier.0.as_str()).unwrap();
+        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
     }
     if (lc.includes.len() > positioned.len() || !carrier_extends.is_empty()) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
@@ -7398,6 +7401,8 @@ struct NameIndex {
     declared_in: HashMap<String, Vec<u32>>,
     /// `carried_sources`, on first use.
     carried: std::cell::OnceCell<std::rc::Rc<CarriedSources>>,
+    /// `app_constant_paths`, on first use.
+    constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
 }
 
 thread_local! {
@@ -7426,6 +7431,7 @@ impl NameIndex {
             library_classes,
             declared_in: declaring_files(app),
             carried: std::cell::OnceCell::new(),
+            constant_paths: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -8556,6 +8562,58 @@ fn owns_a_file(name: &str, app: &App) -> bool {
     library_classes_named(name, app).iter().any(|c| {
         !c.is_module && !matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
     })
+}
+
+/// Every constant path the app declares (models, controllers, library
+/// classes and modules, test modules) and each namespace enclosing one.
+fn app_constant_paths(app: &App) -> std::rc::Rc<crate::det::HashSet<String>> {
+    let build = || {
+        let mut out: crate::det::HashSet<String> = crate::det::HashSet::default();
+        let names = app.models.iter().map(|m| m.name.0.as_str())
+            .chain(app.controllers.iter().map(|c| c.name.0.as_str()))
+            .chain(app.library_classes.iter().map(|c| c.name.0.as_str()))
+            .chain(app.test_modules.iter().map(|t| t.name.0.as_str()));
+        for name in names {
+            let name = name.trim_start_matches("::");
+            let mut end = 0;
+            while let Some(at) = name[end..].find("::") {
+                out.insert(name[..end + at].to_string());
+                end += at + 2;
+            }
+            out.insert(name.to_string());
+        }
+        std::rc::Rc::new(out)
+    };
+    match NameIndex::current(app) {
+        Some(index) => index.constant_paths.get_or_init(build).clone(),
+        None => build(),
+    }
+}
+
+/// An app constant `written` as a class header's superclass or a body's
+/// mixin must spell it, given the lexical `scopes` (innermost last) Ruby
+/// searches first: `::GraphApi::ObjectType` inside `module Channels;
+/// module GraphApi`, where a bare `GraphApi` is `Channels::GraphApi`.
+/// Core writes the leading `::` (`class ListingAttributeValue <
+/// ::GraphApi::ObjectType`); the ingest records the absolute name, and
+/// written bare, the class died with `uninitialized constant
+/// Channels::GraphApi::ObjectType`. The ingest keeps a mixin's name as
+/// written, so a name the innermost shadowing scope does declare in full
+/// is that scope's, as Ruby binds it, and stays as written; so does a
+/// name the app does not declare.
+fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
+    if written.starts_with("::") || scopes.is_empty() {
+        return written.to_string();
+    }
+    let paths = app_constant_paths(app);
+    let first = written.split("::").next().unwrap_or(written);
+    let Some(scope) = (1..=scopes.len()).rev().map(|i| scopes[..i].join("::")).find(|scope| paths.contains(&format!("{scope}::{first}"))) else {
+        return written.to_string();
+    };
+    if paths.contains(&format!("{scope}::{written}")) || !paths.contains(written) {
+        return written.to_string();
+    }
+    format!("::{written}")
 }
 
 fn is_app_class(name: &str, app: &App) -> bool {
