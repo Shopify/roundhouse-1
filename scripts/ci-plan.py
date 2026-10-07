@@ -112,6 +112,9 @@ def native_coverage(path):
         "tests/param_binds_emit.rb",
         "tests/param_binds_raw_where.rb",
         "tests/param_binds_runtime.rb",
+        "tests/param_binds_cruby_cache.rb",
+        "tests/param_binds_spinel_cache.rb",
+        "runtime/spinel/test/statement_cache_cases.rb",
         "tests/support/emit_and_run.rs",
         "src/lower/model_to_library/adapter_emit.rs",
     } or path.startswith("src/lower/arel/"):
@@ -119,6 +122,8 @@ def native_coverage(path):
     if path.startswith(("runtime/spinel/", "runtime/ruby/")) and not interpreter_only:
         name = path.rsplit("/", 1)[-1]
         owned_tests = set()
+        if name == "statement_cache_cases.rb":
+            owned_tests.add("param_binds")
         if any(word in name for word in ("web_push", "base64")):
             owned_tests.add("spinel_web_push_crypto")
         if any(
@@ -253,6 +258,12 @@ def select(
                 spinel_tests.update(SPINEL_TESTS)
             reasons.append(f"{path}: proven {project_scope} assembly bodies only")
             continue
+        if path in {
+            "tests/support/jdbc_cleanup_failures.rb",
+            "runtime/spinel/test/statement_cache_cases.rb",
+        }:
+            targets.add("jruby")
+            reasons.append(f"{path}: JDBC statement lifecycle")
         match = re.match(r"(?:src/emit/|runtime/)([^/.]+)(?:[/.]|$)", path)
         test = re.match(
             r"tests/(?:framework_tests_)?([a-z]+)_toolchain\.rs$|tests/framework_tests_([a-z]+)\.rs$",

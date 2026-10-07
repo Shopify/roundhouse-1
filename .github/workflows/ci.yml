@@ -2264,13 +2264,30 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      # JRuby provisioning only — no bundler-cache. The committed scaffold
+      # No scaffold bundler-cache. The committed scaffold
       # Gemfile is MRI-only (`gem "sqlite3"`), so it can't be bundled under
       # JRuby; `scripts/compare jruby` resolves the JRuby bundle
       # (jdbc-sqlite3) against the emitted tree's own Gemfile instead.
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: 'jruby-10.0'
+      - name: JDBC statement cleanup and ownership
+        run: |
+          jruby -S gem install jdbc-sqlite3 --no-document
+          jruby tests/support/jdbc_cleanup_failures.rb
+          # These shared ownership cases need no Db.bind_* setters.
+          jruby -r ./runtime/spinel/db_jruby -r ./runtime/spinel/test/statement_cache_cases <<'RUBY'
+          Db.configure(":memory:", pool_size: 1)
+          begin
+            cases = StatementCacheTest.new
+            cases.test_nested_identical_sql
+            cases.test_overlapping_replay_promotions
+            cases.test_lease_cleans_abandoned_replay
+            puts "jdbc ownership: 3 cases passed"
+          ensure
+            Db.close
+          end
+          RUBY
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ env.MRI_RUBY }}
