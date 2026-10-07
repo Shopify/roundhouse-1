@@ -136,7 +136,7 @@ fn postgresql_app_lifts_the_adapter_hook_and_fires_it_before_configure() {
     let fire = config
         .find("ActiveSupport.run_load_hooks(:active_record_postgresqladapter, ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)")
         .expect("fires the hook");
-    let connect = config.find("Db.configure_database(").expect("configure_database");
+    let connect = config.find("ActiveRecord::Base.establish_connection").expect("establish_connection");
     assert!(fire < connect, "{config}");
     assert!(files.iter().any(|(n, _)| n.as_str() == "runtime/semian_activerecord_postgresql_adapter.rb"));
 }

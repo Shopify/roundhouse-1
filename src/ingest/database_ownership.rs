@@ -26,6 +26,12 @@
 //! manifest to resolve its names, and each of the shapes above. A
 //! role or shard switch (`connected_to`, `connecting_to`,
 //! `while_preventing_writes`) anywhere in the app is refused at its call.
+//!
+//! The CRuby PostgreSQL runtime, which resolves `config/database.yml` at
+//! boot, carries Rails' multiple-database model: a named `connects_to`
+//! is replayed at boot onto a pool of its own and role and shard
+//! switches run, so neither is refused there. The shapes it cannot
+//! replay (Unresolved) still are, and their models refuse at run time.
 
 use crate::det::HashMap;
 
@@ -323,6 +329,12 @@ pub(super) fn resolve(app: &mut App) {
         }
     };
     let have_manifest = !app.databases.is_empty();
+    // The CRuby PostgreSQL runtime carries Rails' multiple-database model
+    // (runtime/spinel/cruby/active_record_connection_handling.rb): boot
+    // resolves `config/database.yml`, establishes a pool per configuration
+    // a `connects_to` names, and switches roles and shards at run time.
+    let multi_database_runtime = app.database_yml.is_some()
+        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
     let mut owners = indexmap::IndexMap::new();
     for (i, model) in app.models.iter().enumerate() {
         let name = model.name.0.as_str();
@@ -331,7 +343,11 @@ pub(super) fn resolve(app: &mut App) {
             Some((j, Own::Named { writing, reading, span })) => {
                 let declared_by = app.models[j].name.clone();
                 let class = declared_by.0.as_str();
-                if !have_manifest && app.database_yml.is_some() {
+                if multi_database_runtime {
+                    // Boot resolves `config/database.yml`, checks each named
+                    // role and replays the `connects_to`
+                    // (`DatabaseConfiguration::OWNERSHIP`).
+                } else if !have_manifest && app.database_yml.is_some() {
                     // Boot resolves `config/database.yml` and checks each
                     // named role (`DatabaseConfiguration::OWNERSHIP`); the
                     // runtime opens only the primary, so a writing role
@@ -449,6 +465,9 @@ pub(super) fn resolve(app: &mut App) {
     switches.sort_by_key(|(s, _)| (s.file.0, s.start));
     switches.dedup_by_key(|(s, _)| *s);
     for (span, method) in switches {
+        if multi_database_runtime {
+            break;
+        }
         refusals.push(DatabaseRefusal {
             span,
             construct: method.clone(),

@@ -6,7 +6,10 @@ require "bigdecimal"
 require "date"
 
 module Db
-  Pool = Struct.new(:config, :size, :connections, :free, :mutex, :cv, :pid)
+  # `lazy`: adapters are built on first checkout, up to `size`, as Rails'
+  # ConnectionPool builds them; `pinned`: the adapter every lease of the
+  # pool returns while ConnectionPool#pin_connection! holds it.
+  Pool = Struct.new(:config, :size, :connections, :free, :mutex, :cv, :pid, :lazy, :search_path, :pinned)
   @databases = {}
   @primary = "primary"
   @owner_pid = Process.pid
@@ -177,7 +180,7 @@ module Db
     # around a verified session, yielding the PG::Connection. Driver errors
     # leave as their Active Record translation.
     def raw_execute(sql, name = "SQL", binds = [])
-      Db.instrument_sql(sql, binds, name: name) do
+      Db.instrument_sql(sql, binds, name: name, connection: self) do
         with_raw_connection(sql, binds) { |conn| yield conn }
       end
     end
@@ -487,8 +490,12 @@ module Db
   # reads them (both set and different, or `pool` with `min_connections`,
   # is Rails' ambiguity error); otherwise Rails' 5 for a Hash entry and
   # `default_pool_size` for a connection string. Every adapter connects
-  # here, so the size must be positive.
-  def self.configure_database(name, config, pool_size: nil, search_path: nil, semian: nil, default_pool_size: 3)
+  # here, so the size must be positive. A `lazy:` pool connects nothing
+  # here: Rails' ConnectionPool (8.2.0.alpha connection_pool.rb
+  # `try_to_checkout_new_connection`) builds an adapter on a checkout that
+  # finds no free one while fewer than `size` exist, and the adapter
+  # connects on its first statement.
+  def self.configure_database(name, config, pool_size: nil, search_path: nil, semian: nil, default_pool_size: 3, lazy: false)
     raise ArgumentError, "database already configured: #{name}" if @databases.key?(name.to_s)
     options = if config.is_a?(Hash)
       config.dup
@@ -507,11 +514,12 @@ module Db
     options[:options] = options.fetch(:options, "")
     pool_size ||= configured_max_connections(options) || (config.is_a?(Hash) ? RAILS_DEFAULT_POOL : default_pool_size)
     raise ArgumentError, "pool_size must be positive" unless pool_size.positive?
-    pool = Pool.new(options.freeze, pool_size, [], [], Mutex.new, ConditionVariable.new, Process.pid)
+    pool = Pool.new(options.freeze, pool_size, [], [], Mutex.new, ConditionVariable.new, Process.pid, lazy, search_path, nil)
     begin
-      pool_size.times do
+      (lazy ? 0 : pool_size).times do
         adapter = adapter_class.new(options)
         adapter.search_path = search_path
+        adapter.instance_variable_set(:@rh_pg_database, name.to_s)
         pool.connections << adapter
         adapter.connect!
         pool.free << adapter
@@ -590,25 +598,140 @@ module Db
       # Rails' PostgreSQL discard! strategy: a plain finish would send
       # Terminate over the shared socket and disconnect the parent.
       pool.connections.each(&:discard!)
-      [name, pool.config, pool.size, search_path]
+      [name, pool.config, pool.size, search_path || pool.search_path, pool.lazy]
     end
     @databases = {}
     @owner_pid = Process.pid
     Thread.current[:roundhouse_pg_db] = { name: selected, leases: {}, cache: nil, capture: nil }
-    configurations.each do |name, config, size, path|
-      configure_database(name, config, pool_size: size, search_path: path)
+    configurations.each do |name, config, size, path, lazy|
+      configure_database(name, config, pool_size: size, search_path: path, lazy: lazy)
     end
   end
 
   # The adapter leased to this thread/fiber for the selected database.
   def self.current_adapter
     pool = database_pool
-    context[:leases][context[:name]] ||= pool.mutex.synchronize do
+    context[:leases][context[:name]] ||= checkout(pool, context[:name])
+  end
+
+  # One adapter off the free list; a lazy pool below its size builds one;
+  # a pinned pool hands out its pinned adapter (Rails 8.2 `checkout`).
+  # Each adapter knows the pool it belongs to (`@rh_pg_database`).
+  def self.checkout(pool, name)
+    return pool.pinned if pool.pinned
+    pool.mutex.synchronize do
+      if pool.free.empty? && pool.lazy && pool.connections.size < pool.size
+        adapter = adapter_class.new(pool.config)
+        adapter.search_path = pool.search_path
+        adapter.instance_variable_set(:@rh_pg_database, name)
+        pool.connections << adapter
+        pool.free << adapter
+      end
       pool.cv.wait(pool.mutex) while pool.free.empty?
       adapter = pool.free.shift
       adapter.instance_variable_set(:@rh_pg_lease, Object.new)
       adapter
     end
+  end
+
+  # ConnectionPool#pin_connection! / #unpin_connection!: while pinned,
+  # every lease of the pool, on any thread, is `adapter`; releasing it
+  # returns nothing to the free list.
+  def self.pin(name, adapter)
+    pool = @databases.fetch(name.to_s)
+    pool.mutex.synchronize { pool.pinned = adapter }
+  end
+
+  def self.unpin(name)
+    pool = @databases.fetch(name.to_s)
+    adapter = pool.pinned
+    pool.mutex.synchronize { pool.pinned = nil }
+    adapter
+  end
+
+  def self.pinned(name)
+    @databases[name.to_s]&.pinned
+  end
+
+  # ConnectionPool#checkout / #checkin: an adapter taken off (or put back
+  # on) the pool outside any thread's lease.
+  def self.checkout_from(name)
+    adopt_after_fork
+    checkout(@databases.fetch(name.to_s), name.to_s)
+  end
+
+  def self.checkin_to(name, adapter)
+    pool = @databases.fetch(name.to_s)
+    return if pool.pinned.equal?(adapter)
+    pool.mutex.synchronize do
+      raise ArgumentError, "adapter does not belong to PostgreSQL pool #{name}" unless pool.connections.any? { |c| c.equal?(adapter) }
+      next if pool.free.any? { |c| c.equal?(adapter) }
+      adapter.instance_variable_set(:@rh_pg_lease, nil)
+      pool.free << adapter
+      pool.cv.signal
+    end
+    nil
+  end
+
+  def self.free?(name, adapter)
+    pool = @databases.fetch(name.to_s)
+    pool.mutex.synchronize { pool.free.any? { |c| c.equal?(adapter) } }
+  end
+
+  def self.free_count(name)
+    pool = @databases.fetch(name.to_s)
+    pool.mutex.synchronize { pool.free.size }
+  end
+
+  def self.database_pool_size(name)
+    @databases.fetch(name.to_s).size
+  end
+
+  # The adapters a pool has built (Rails' ConnectionPool#connections).
+  def self.pool_connections(name)
+    pool = @databases[name.to_s]
+    pool ? pool.mutex.synchronize { pool.connections.dup } : []
+  end
+
+  def self.database_configured?(name)
+    adopt_after_fork
+    @databases.key?(name.to_s)
+  end
+
+  # The adapter leased to this thread/fiber from `name`, without leasing.
+  def self.leased_adapter(name)
+    adopt_after_fork
+    context[:leases][name.to_s]
+  end
+
+  # Rails' ConnectionPool#disconnect!: every adapter of the pool is
+  # disconnected; the pool keeps its size and builds new ones lazily
+  # (an eager pool keeps its adapters, which reconnect on next use).
+  # Another thread's lease refuses it, as Rails raises ExclusiveConnectionTimeoutError
+  # when it cannot take every connection.
+  def self.disconnect_database(name)
+    adopt_after_fork
+    name = name.to_s
+    pool = @databases.fetch(name) { return nil }
+    with_database(name) { release_connection } if context[:leases].key?(name)
+    pool.mutex.synchronize do
+      raise "cannot disconnect a leased PostgreSQL pool (#{name})" unless pool.free.size == pool.connections.size
+      pool.connections.each(&:disconnect!)
+      if pool.lazy
+        pool.connections.clear
+        pool.free.clear
+      end
+      pool.pinned = nil
+    end
+    nil
+  end
+
+  # Rails' ConnectionHandler#remove_connection_pool: the pool is
+  # disconnected and forgotten.
+  def self.remove_database(name)
+    disconnect_database(name)
+    @databases.delete(name.to_s)
+    nil
   end
 
   def self.current_dbh
@@ -656,6 +779,9 @@ module Db
     adapter = context[:leases].delete(name)
     return unless adapter
     pool = @databases.fetch(name)
+    # Rails 8.2 `checkin`: a pinned connection is not checked in; its
+    # transaction belongs to the pin.
+    return if pool.pinned.equal?(adapter)
     begin
       conn = adapter.raw_connection
       if conn && !conn.finished?
@@ -699,7 +825,7 @@ module Db
     end
     @databases.each_value do |pool|
       pool.mutex.synchronize do
-        raise "cannot close a leased PostgreSQL pool" unless pool.free.size == pool.size
+        raise "cannot close a leased PostgreSQL pool" unless pool.free.size == pool.connections.size
       end
     end
     @databases.each_value { |pool| pool.connections.each(&:disconnect!) }
@@ -820,9 +946,9 @@ module Db
   # subscribers receive the same ActiveRecord exception that the caller
   # rescues; like Rails' log, nothing is translated here, so a driver error
   # raised by with_raw_connection's own recovery reaches the caller as is.
-  def self.instrument_sql(sql, binds = [], name: "SQL", &operation)
+  def self.instrument_sql(sql, binds = [], name: "SQL", connection: nil, &operation)
     if defined?(ActiveSupport::Notifications::Event)
-      active_record_instrumenter.instrument("sql.active_record", sql: sql, name: name, binds: binds.dup, &operation)
+      active_record_instrumenter.instrument("sql.active_record", sql: sql, name: name, binds: binds.dup, connection: connection, &operation)
     else
       operation.call
     end
