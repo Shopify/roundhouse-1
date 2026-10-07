@@ -170,6 +170,15 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
     for model in &app.models {
         includes.insert(model.name.clone(), crate::analyze::model_includes(model));
     }
+    // Each owner's own methods, indexed once. Scanning every signature
+    // in the app for every class on every class's ancestry was
+    // |classes| * depth * |methods|: 465 s of post-analyze on the v3.1
+    // Core slice. A (owner, name) key is unique, so within one owner the
+    // order these are visited in cannot change which entry wins.
+    let mut by_owner: HashMap<&ClassId, Vec<(&Symbol, &Vec<Param>)>> = HashMap::new();
+    for ((owner, name), params) in &sigs.methods {
+        by_owner.entry(owner).or_default().push((name, params));
+    }
     let view_of = |id: &ClassId| -> HashMap<Symbol, Vec<Param>> {
         let mut out: HashMap<Symbol, Vec<Param>> = HashMap::new();
         let mut queue: Vec<ClassId> = vec![id.clone()];
@@ -178,12 +187,10 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
             if !seen.insert(cid.clone()) {
                 continue;
             }
-            for ((owner, name), params) in &sigs.methods {
-                if *owner == cid {
-                    // Nearest definition wins: the class itself is
-                    // visited first, then what it reaches.
-                    out.entry(name.clone()).or_insert_with(|| params.clone());
-                }
+            for (name, params) in by_owner.get(&cid).map(Vec::as_slice).unwrap_or_default() {
+                // Nearest definition wins: the class itself is
+                // visited first, then what it reaches.
+                out.entry((*name).clone()).or_insert_with(|| (*params).clone());
             }
             if let Some(parent) = sigs.parents.get(&cid) {
                 queue.push(parent.clone());

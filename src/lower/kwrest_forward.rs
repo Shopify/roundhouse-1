@@ -129,11 +129,27 @@ pub fn apply_kwrest_forward_lowering(app: &mut App) -> Vec<Diagnostic> {
 /// and the declared defaults, not just the arity.
 fn helper_signatures(app: &App) -> HashMap<Symbol, Vec<Param>> {
     let mut out: HashMap<Symbol, Vec<Param>> = HashMap::new();
+    // The FIRST library class of a name, and the FIRST method of a name
+    // in it, as the linear `find`s this replaced answered, indexed once:
+    // a scan per helper was |helpers| * |classes| on full Core.
+    let mut class_index: HashMap<&crate::ident::ClassId, usize> = HashMap::new();
+    for (i, lc) in app.library_classes.iter().enumerate() {
+        class_index.entry(&lc.name).or_insert(i);
+    }
+    let mut method_index: HashMap<usize, HashMap<&Symbol, &crate::dialect::MethodDef>> =
+        HashMap::new();
     for (name, owner) in &app.helper_method_index {
-        let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {
+        let Some(&ci) = class_index.get(owner) else {
             continue;
         };
-        let Some(m) = lc.methods.iter().find(|m| &m.name == name) else {
+        let methods = method_index.entry(ci).or_insert_with(|| {
+            let mut by_name = HashMap::new();
+            for m in &app.library_classes[ci].methods {
+                by_name.entry(&m.name).or_insert(m);
+            }
+            by_name
+        });
+        let Some(&m) = methods.get(name) else {
             continue;
         };
         // A `*rest` absorbs any number of positionals, so no slot has a

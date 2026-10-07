@@ -263,11 +263,27 @@ fn slot_of(p: &crate::dialect::Param) -> Slot {
 fn helper_param_names(app: &App) -> HashMap<Symbol, Vec<Slot>> {
     let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::new();
     let mut ambiguous: Vec<Symbol> = Vec::new();
+    // First-wins indexes, the same answer as a linear `find` over
+    // `library_classes` and then the class's `methods`, without the scan
+    // per helper (Core has thousands of each).
+    let mut class_index: HashMap<&crate::ident::ClassId, usize> = HashMap::new();
+    for (i, c) in app.library_classes.iter().enumerate() {
+        class_index.entry(&c.name).or_insert(i);
+    }
+    let mut method_index: HashMap<usize, HashMap<&Symbol, &crate::dialect::MethodDef>> =
+        HashMap::new();
     for (name, owner) in &app.helper_method_index {
-        let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {
+        let Some(&ci) = class_index.get(owner) else {
             continue;
         };
-        let Some(m) = lc.methods.iter().find(|m| &m.name == name) else {
+        let methods = method_index.entry(ci).or_insert_with(|| {
+            let mut by_name = HashMap::new();
+            for m in &app.library_classes[ci].methods {
+                by_name.entry(&m.name).or_insert(m);
+            }
+            by_name
+        });
+        let Some(&m) = methods.get(name) else {
             continue;
         };
         // A `rest` parameter and the positional story stops being a
