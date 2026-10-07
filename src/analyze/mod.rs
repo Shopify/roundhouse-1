@@ -156,6 +156,9 @@ pub struct Analyzer {
     const_resolver: std::sync::Arc<body::ConstResolver>,
     /// Explicit source-free API mode never certifies source indexing.
     source_indexed: bool,
+    /// What the natively loaded gems' installed sources declare
+    /// (`GemBoundary::source_constants`).
+    gem_sources: std::sync::Arc<crate::gem_boundary::GemSourceConstants>,
     /// Inferred values keyed by Rubydex declaration IDs, not by names.
     typed_constants: IdentityHashMap<DeclarationId, Ty>,
     /// Literal Data constants on library classes, keyed by source span.
@@ -1221,6 +1224,7 @@ impl Analyzer {
                 .collect(),
             const_resolver,
             source_indexed: !app.sources.is_empty(),
+            gem_sources: std::sync::Arc::new(app.gem_boundary.source_constants.clone()),
             typed_constants: IdentityHashMap::default(),
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
@@ -1243,7 +1247,8 @@ impl Analyzer {
             .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
             .with_typed_constants(&self.typed_constants)
-            .with_data_factories(&self.data_factories);
+            .with_data_factories(&self.data_factories)
+            .with_gem_sources(self.gem_sources.clone());
         if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer }
     }
 
@@ -2193,7 +2198,8 @@ impl Analyzer {
                 .with_inquirers(&self.inquirers)
             .with_load_hook_bases(&self.load_hook_bases)
                 .with_typed_constants(&resolved)
-                .with_data_factories(&self.data_factories);
+                .with_data_factories(&self.data_factories)
+                .with_gem_sources(self.gem_sources.clone());
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
             for (index, (self_ty, name, id, source, production)) in entries.iter().enumerate() {
                 let clean = last[index]

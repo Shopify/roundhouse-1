@@ -59,6 +59,7 @@ pub(crate) mod sorbet_check;
 pub mod sources;
 pub mod type_ascription;
 pub mod initializers;
+pub mod gem_source_constants;
 mod initializer_constants;
 pub mod initializer_programs;
 pub mod sql_functions;

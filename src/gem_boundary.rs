@@ -72,6 +72,167 @@ pub struct GemBoundary {
     /// named raise where the source has the include.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused_includes: Vec<RefusedInclude>,
+    /// What the installed sources of the `loaded` gems declare, read
+    /// from the gem home the CRuby tree resolves them in
+    /// (`crate::ingest::gem_source_constants`). Unlike the RBIs this needs
+    /// no `sorbet/` directory: it is the code that runs.
+    #[serde(default, skip_serializing_if = "GemSourceConstants::is_empty")]
+    pub source_constants: GemSourceConstants,
+}
+
+/// The constants the installed `lib/**/*.rb` of each natively loaded gem
+/// declares, fully qualified: `module`/`class` nesting, `X = ...` writes,
+/// `autoload :X` and `const_set(:X, ...)` with a literal name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GemSourceConstants {
+    /// The gem home the sources were read from.
+    pub home: String,
+    /// Each gem read, by lockfile spec name.
+    pub scans: std::collections::BTreeMap<String, GemSourceScan>,
+    /// Fully qualified constant -> gem -> the gem-relative file that
+    /// first declares it (in sorted file order).
+    pub declared: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Namespace -> gem -> the file that creates constants in it under a
+    /// computed name (`const_set(name, ...)`): what the gem puts there
+    /// cannot be read from the source, only that it puts something.
+    pub dynamic: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// One gem's read: where, how much, and whether the bounds cut it short.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GemSourceScan {
+    pub version: String,
+    /// The gem's directory under the gem home.
+    pub dir: String,
+    pub files: usize,
+    pub bytes: u64,
+    /// False when the file or byte bound stopped the walk: a constant
+    /// the read did not see may still be declared.
+    pub complete: bool,
+    /// The gem builds a native extension (`ext/`, or its gemspec's
+    /// `extensions`), whose classes no Ruby file declares
+    /// (google-protobuf's `Google::Protobuf::DescriptorPool`).
+    #[serde(default)]
+    pub native: bool,
+}
+
+/// How a natively loaded gem provides a constant, by its source.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SourceProvider<'a> {
+    /// The gem's source declares exactly this constant (`name`, the
+    /// fully qualified form the written one resolved to).
+    Declared { name: String, gem: &'a str, file: &'a str },
+    /// The gem creates constants under a computed name in `namespace`.
+    Dynamic { namespace: String, gem: &'a str, file: &'a str },
+    /// The gem's native extension may define it: `namespace` is the
+    /// gem's own (named after it, `Google::Protobuf` for google-protobuf)
+    /// and no Ruby file declares the constant.
+    Native { namespace: String, gem: &'a str },
+}
+
+impl SourceProvider<'_> {
+    pub fn gem(&self) -> &str {
+        match self {
+            SourceProvider::Declared { gem, .. } | SourceProvider::Dynamic { gem, .. } | SourceProvider::Native { gem, .. } => gem,
+        }
+    }
+
+    /// The fact, for a diagnostic about `written`, with the gem's version.
+    pub fn describe(&self, written: &str, sources: &GemSourceConstants) -> String {
+        let version = |gem: &str| sources.scans.get(gem).map(|s| s.version.clone()).unwrap_or_default();
+        match self {
+            SourceProvider::Declared { name, gem, file } => format!("{gem} {} declares {name} ({file})", version(gem)),
+            SourceProvider::Dynamic { namespace, gem, file } => format!(
+                "{gem} {} declares no {written}, but creates constants in {namespace} under computed names ({file}: const_set), so {written} is taken as that gem's by namespace ownership",
+                version(gem)
+            ),
+            SourceProvider::Native { namespace, gem } => format!(
+                "{gem} {} declares no {written} in Ruby, but builds a native extension and owns {namespace}, so {written} is taken as that gem's by namespace ownership",
+                version(gem)
+            ),
+        }
+    }
+}
+
+/// Whether `namespace` is named after `gem`, ignoring case, `::`, `_`
+/// and `-` (`Google::Protobuf` and google-protobuf; `Google` is not).
+fn namespace_named_after(namespace: &str, gem: &str) -> bool {
+    let fold = |s: &str| s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+    let space = fold(namespace);
+    !space.is_empty() && fold(gem) == space
+}
+
+impl GemSourceConstants {
+    pub fn is_empty(&self) -> bool {
+        self.scans.is_empty()
+    }
+
+    /// How the scanned gems provide `written`, a constant as written in
+    /// lexical `scope` (`"A::B"`, or `""` at the top level): the nearest
+    /// lexical candidate a gem declares exactly, else the nearest
+    /// enclosing namespace of one that a gem fills dynamically.
+    pub fn provider(&self, written: &str, scope: &str) -> Option<SourceProvider<'_>> {
+        let written = written.strip_prefix("::").unwrap_or(written);
+        let mut candidates = Vec::new();
+        let mut outer = scope;
+        while !outer.is_empty() {
+            candidates.push(format!("{outer}::{written}"));
+            outer = outer.rsplit_once("::").map_or("", |(o, _)| o);
+        }
+        candidates.push(written.to_string());
+        for name in &candidates {
+            if let Some((gem, file)) = self.declared.get(name).and_then(|gems| gems.iter().next()) {
+                return Some(SourceProvider::Declared { name: name.clone(), gem, file });
+            }
+        }
+        for name in &candidates {
+            let mut namespace = name.as_str();
+            while let Some((outer, _)) = namespace.rsplit_once("::") {
+                namespace = outer;
+                if let Some((gem, file)) = self.dynamic.get(namespace).and_then(|gems| gems.iter().next()) {
+                    return Some(SourceProvider::Dynamic { namespace: namespace.to_string(), gem, file });
+                }
+            }
+        }
+        for name in &candidates {
+            let mut namespace = name.as_str();
+            while let Some((outer, _)) = namespace.rsplit_once("::") {
+                namespace = outer;
+                let Some(gems) = self.declared.get(namespace) else { continue };
+                let native = gems.keys().find(|gem| {
+                    self.scans.get(*gem).is_some_and(|s| s.native)
+                        && namespace.match_indices("::").map(|(i, _)| &namespace[..i]).chain([namespace])
+                            .any(|owned| namespace_named_after(owned, gem))
+                });
+                if let Some(gem) = native {
+                    return Some(SourceProvider::Native { namespace: namespace.to_string(), gem });
+                }
+            }
+        }
+        None
+    }
+
+    /// The scanned gem whose source declares exactly `name` (fully
+    /// qualified).
+    pub fn gem_of(&self, name: &str) -> Option<&str> {
+        self.declared.get(name.strip_prefix("::").unwrap_or(name))?.keys().next().map(String::as_str)
+    }
+
+    /// The scanned gem whose source declares the nearest enclosing
+    /// namespace of `name`, when every gem declaring it was read whole:
+    /// then that the constant is absent is a fact about the installed
+    /// code, not a gap in the read.
+    pub fn complete_namespace_owner(&self, name: &str) -> Option<&str> {
+        let mut namespace = name.strip_prefix("::").unwrap_or(name);
+        while let Some((outer, _)) = namespace.rsplit_once("::") {
+            namespace = outer;
+            if let Some(gems) = self.declared.get(namespace) {
+                let complete = gems.keys().all(|gem| self.scans.get(gem).is_some_and(|s| s.complete));
+                return complete.then(|| gems.keys().next().map(String::as_str)).flatten();
+            }
+        }
+        None
+    }
 }
 
 /// One refused include: the including class or module, the module as

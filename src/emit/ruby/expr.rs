@@ -104,7 +104,7 @@ pub fn emit_expr(e: &Expr) -> String {
     // declaration's diagnostic, and `project` refuses it on every tree
     // but CRuby's.
     let runtime_declared_type = e.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0
-        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "declared type");
+        && matches!(&e.diagnostic, Some(DiagnosticKind::Unsupported { construct, .. }) if matches!(construct.as_str(), "declared type" | "constant"));
     if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e.diagnostic.as_ref().filter(|_| !runtime_declared_type) {
         // This is an expression, including in a rescue list or a binary
         // operand. A bare command-style `raise` is not valid there.

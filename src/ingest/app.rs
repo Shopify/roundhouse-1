@@ -331,6 +331,23 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             app.gem_lock = Some(lock);
             if let Some(lock) = &app.gem_lock {
                 app.gem_boundary = super::rbi::load_gem_boundary(vfs, dir, lock);
+                // What the natively loaded gems' installed sources
+                // declare, when the tree names the gem home they resolve
+                // in: the lock's Bundler.require closure, and the gems the
+                // runtime's facades require. A gem the app carries as
+                // source is its own code.
+                if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
+                    let gems: std::collections::BTreeSet<String> = app
+                        .gem_boundary
+                        .loaded
+                        .iter()
+                        .chain(lock.specs.iter().map(|(name, _)| name).filter(|gem| crate::project::ruby_tree_loads_gem(gem)))
+                        .filter(|gem| !lock.is_in_repo(gem) && crate::project::gem_requires_rails(gem).is_none())
+                        .cloned()
+                        .collect();
+                    app.gem_boundary.source_constants =
+                        crate::timings::phase("gem sources: scan", || super::gem_source_constants::scan(vfs, &home, lock, &gems));
+                }
             }
         }
     }
@@ -5340,6 +5357,21 @@ struct RoundhouseConfig {
     /// The adapter the program is compiled for when `config/database.yml`
     /// is resolved at boot without a manifest (`ingest::database_yml`).
     database_adapter: Option<String>,
+    /// The absolute gem home the CRuby tree's Bundler resolves the
+    /// natively loaded gems in (`ingest::gem_source_constants`).
+    gem_home: Option<PathBuf>,
+}
+
+/// `roundhouse.yml`'s `gem_home:`, which must be absolute.
+fn configured_gem_home<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<Option<PathBuf>> {
+    let Some((config, _)) = roundhouse_config(vfs, dir)? else { return Ok(None) };
+    match config.gem_home {
+        Some(home) if !home.is_absolute() => Err(IngestError::Parse {
+            file: dir.join("roundhouse.yml").display().to_string(),
+            message: format!("gem_home must be an absolute directory: {home:?}"),
+        }),
+        home => Ok(home),
+    }
 }
 
 /// `roundhouse.yml`'s `database_adapter:` with the span of its key.

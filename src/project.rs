@@ -5851,11 +5851,11 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         // A declared type only such a gem provides at runtime
         // (`DECLARED_TYPE_RUNTIME_CONSTANT`), refused the same way.
         if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 && target != BuildTarget::Ruby {
-            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, .. }) = &expr.diagnostic {
+            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, construct, .. }) = &expr.diagnostic {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target.as_str(),
-                    "declared type",
+                    construct.as_str(),
                     format!("{detail}; the {} tree does not load the gem", target.as_str()),
                 );
             }
@@ -5863,7 +5863,9 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
             if let crate::expr::ExprNode::Const { path } = &*expr.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-                let gem = app.gem_boundary.gem_of(&name).unwrap_or("its");
+                let gem = app.gem_boundary.gem_of(&name)
+                    .or_else(|| app.gem_boundary.source_constants.gem_of(&name))
+                    .unwrap_or("its");
                 if target != BuildTarget::Ruby {
                     emit::diagnostics::report_unsupported(
                         expr.span,
