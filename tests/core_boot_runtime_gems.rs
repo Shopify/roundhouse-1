@@ -479,6 +479,8 @@ fn the_service_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
             "{gem}: {errors:#?}"
         );
     }
+}
+
 /// Core's trilogy: its C extension requires "bigdecimal" with its own
 /// `rb_require`, which RubyGems cannot activate a gem for, so on plain
 /// RubyGems it fails although bigdecimal is installed. The bundled gems
