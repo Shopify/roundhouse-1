@@ -180,3 +180,17 @@ fn a_reassigned_name_is_refused() {
         errors.join("\n")
     );
 }
+
+/// A name app code also assigns: a named gap, not two writers.
+#[test]
+fn a_name_app_code_declares_is_refused() {
+    let (_dir, errors) = app()
+        .write("app/models/clash.rb", "Clash = 1\n")
+        .write("config/initializers/30_clash.rb", "Clash = 2\n")
+        .emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("`Clash` is also declared by app code; the two are not merged")),
+        "{}",
+        errors.join("\n")
+    );
+}

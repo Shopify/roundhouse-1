@@ -134,6 +134,8 @@ pub(super) fn keep(app: &mut App, dir: &std::path::Path, candidates: Vec<Candida
         .library_classes
         .iter()
         .map(|c| c.name.0.as_str().to_string())
+        // A file-level constant an app file wrote, carried on its first class.
+        .chain(app.library_classes.iter().flat_map(|c| c.top_level_constants.iter().map(|t| t.name.as_str().to_string())))
         .chain(app.models.iter().map(|m| m.name.0.as_str().to_string()))
         .chain(app.controllers.iter().map(|c| c.name.0.as_str().to_string()))
         .collect();
