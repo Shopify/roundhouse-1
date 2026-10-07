@@ -2376,7 +2376,12 @@ fn walk_decl_body_with_visibility<'pr>(
 /// * a lambda literal that closes over nothing (no read of an outer
 ///   local), read only as the receiver of `.call` — every reader calls
 ///   a lambda with the same body and no captured state;
-/// * an immediate literal (Integer, Float, Symbol, true, false, nil).
+/// * an immediate literal (Integer, Float, Symbol, true, false, nil);
+/// * a frozen string literal (`# frozen_string_literal: true`, no
+///   interpolation; Core's GraphQL descriptions are heredocs): no reader
+///   can mutate it and CRuby deduplicates it, so every read is the same
+///   object. Each read becomes `"…".freeze`, which CRuby compiles to that
+///   same object whatever the emitted file's magic comment.
 ///
 /// Anything else (`client = Client.new`, a string a reader might mutate,
 /// a lambda passed as a value, a local assigned twice) is refused by
@@ -2447,11 +2452,49 @@ fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> Ingest
     if immediate {
         return Ok(BodyLocal { name, value: Ok(ingest_expr(&value, file)?), lambda: false });
     }
+    if let Some(text) = frozen_string_literal(&value) {
+        let location = value.location();
+        let span = Span {
+            file: super::sources::file_id(file),
+            start: location.start_offset() as u32,
+            end: location.end_offset() as u32,
+        };
+        let literal = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: text } });
+        let frozen = ExprNode::Send {
+            recv: Some(literal),
+            method: Symbol::from("freeze"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        };
+        return Ok(BodyLocal { name, value: Ok(Expr::new(span, frozen)), lambda: false });
+    }
     Ok(BodyLocal {
         name,
         value: Err("holds a value that is not a closure-free lambda or an immediate literal".to_string()),
         lambda: false,
     })
+}
+
+/// The text of a string literal prism marks frozen (the file's
+/// `# frozen_string_literal: true`, no interpolation), a static heredoc
+/// or adjacent literals included.
+fn frozen_string_literal(node: &ruby_prism::Node<'_>) -> Option<String> {
+    fn text(node: &ruby_prism::Node<'_>, out: &mut String) -> Option<()> {
+        if let Some(s) = node.as_string_node() {
+            out.push_str(&String::from_utf8_lossy(s.unescaped()));
+            return Some(());
+        }
+        let parts = node.as_interpolated_string_node()?;
+        for part in parts.parts().iter() {
+            text(&part, out)?;
+        }
+        Some(())
+    }
+    let frozen = node.as_string_node().is_some_and(|s| s.is_frozen())
+        || node.as_interpolated_string_node().is_some_and(|s| s.is_frozen());
+    let mut out = String::new();
+    (frozen && text(node, &mut out).is_some()).then_some(out)
 }
 
 /// Replace each read of a body local in `expr` by its value (see
@@ -2504,7 +2547,11 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
                         ),
                     }));
                 }
+                // At the read's span: a constant's value span is how the
+                // analyzer finds its declaration (`N = n` is typed by N's).
+                let span = expr.span;
                 *expr = value.clone();
+                expr.span = span;
                 return Ok(());
             }
         }
