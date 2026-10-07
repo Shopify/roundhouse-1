@@ -5967,6 +5967,12 @@ const GEM_REQUIRES: &[&str] = &[
     "ostruct",
     "dalli",
     "google/protobuf",
+    // Shopify Core's Bundler.require, in its Gemfile order.
+    "panama_client",
+    "redis",
+    "hiredis-client",
+    "snappy",
+    "panama_metadata",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -6261,7 +6267,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 22] = [
+    const RUNTIME_GEMS: [(Marker, &str); 28] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6375,6 +6381,23 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // Island at boot), so it is declared here and not in GEM_REQUIRES.
         // It depends on google-protobuf.
         (Marker::Constant("Proto::Shopify"), "proto"),
+        // Shopify Core's Redis clients, all Bundler.required. Essentials'
+        // test config boots an in-process Redis and rescues
+        // `Redis::CommandError`; the engine registers middleware on
+        // `RedisClient`. hiredis-client has no constant of its own:
+        // loading it makes hiredis RedisClient's default driver, as on
+        // Core.
+        (Marker::Constant("Redis"), "redis"),
+        (Marker::Constant("RedisClient"), "redis-client"),
+        (Marker::Constant("Redis"), "hiredis-client"),
+        // Core's test config builds `PanamaClient::TestFakeClient` (Core
+        // reopens the gem's module) over the gem's `PanamaMetadata`
+        // registry. Neither gem depends on Rails.
+        (Marker::Constant("PanamaClient"), "panama_client"),
+        (Marker::Constant("PanamaMetadata"), "panama_metadata"),
+        // Online Store's theme bodies and Paquito's codecs compress
+        // through it.
+        (Marker::Constant("Snappy"), "snappy"),
     ];
     &RUNTIME_GEMS
 }
