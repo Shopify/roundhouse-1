@@ -465,6 +465,7 @@ impl Analyzer {
         let model_parents: HashMap<&ClassId, Option<&ClassId>> =
             app.models.iter().map(|m| (&m.name, m.parent.as_ref())).collect();
         let belongs_to_wrappers = belongs_to_wrappers(app);
+        let class_eval_defs = class_eval_def_macros(app);
         let models = merged_reopened_models(&app.models);
 
         for model in models.iter().map(|m| &**m) {
@@ -774,6 +775,8 @@ impl Analyzer {
             // An app macro that declares its association through
             // `belongs_to` (Core's `belongs_to_with_query_constraints`).
             register_wrapped_belongs_to(&model.body, &belongs_to_wrappers, &mut cls.instance_methods);
+            // An app macro that `class_eval`s `def trusted_#{name}`.
+            register_class_eval_defs(&model.body, &class_eval_defs, &mut cls.instance_methods);
             // `generates_token_for :purpose` — the token round-trip
             // Rails 7.1 added (the guide's unsubscribe link).
             register_generates_token_for(&model.body, &mut cls.instance_methods, &mut cls.class_methods, &self_ty);
@@ -8663,6 +8666,72 @@ fn register_wrapped_belongs_to(body: &[ModelBodyItem], wrappers: &BTreeSet<Symbo
         methods.entry(reader).or_insert(ty);
         for (member, ty) in association_builder_members(&assoc) {
             methods.entry(member).or_insert(ty);
+        }
+    }
+}
+
+/// Library methods that define an instance method named after their first
+/// parameter by evaluating source: Core's `trusted_id_attribute(attr_name,
+/// ...)` runs `class_eval(<<-RUBY)` with `def trusted_#{attr_name}`, so
+/// `trusted_id_attribute :id` gives Shop `trusted_id` (55 refusals of it).
+/// Maps the macro to the `(prefix, suffix)` around the parameter in each
+/// such `def`. A `def self.` one defines a class method and is skipped.
+fn class_eval_def_macros(app: &App) -> HashMap<Symbol, Vec<(String, String)>> {
+    let mut out: HashMap<Symbol, Vec<(String, String)>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        for method in &lc.methods {
+            let Some(first) = method.params.first().filter(|p| !p.keyword && !p.name.as_str().is_empty()) else { continue };
+            let mut names = Vec::new();
+            walk_expr(&method.body, &mut |e| {
+                let ExprNode::Send { method: called, args, .. } = &*e.node else { return };
+                if !matches!(called.as_str(), "class_eval" | "module_eval" | "class_exec") {
+                    return;
+                }
+                let Some(ExprNode::StringInterp { parts }) = args.first().map(|a| &*a.node) else { return };
+                for (i, part) in parts.iter().enumerate() {
+                    let crate::expr::InterpPart::Expr { expr } = part else { continue };
+                    let ExprNode::Var { name, .. } = &*expr.node else { continue };
+                    if name != &first.name {
+                        continue;
+                    }
+                    let Some(crate::expr::InterpPart::Text { value: before }) = i.checked_sub(1).and_then(|j| parts.get(j)) else { continue };
+                    let Some(at) = before.rfind("def ") else { continue };
+                    let prefix = &before[at + 4..];
+                    if !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let suffix: String = match parts.get(i + 1) {
+                        Some(crate::expr::InterpPart::Text { value }) => {
+                            value.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '?' | '!')).collect()
+                        }
+                        _ => String::new(),
+                    };
+                    names.push((prefix.to_string(), suffix));
+                }
+            });
+            if !names.is_empty() {
+                out.entry(method.name.clone()).or_default().extend(names);
+            }
+        }
+    }
+    out
+}
+
+/// The methods a [`class_eval_def_macros`] call with a literal symbol
+/// defines, as gradual: the source is evaluated, so its return type is
+/// not read here. Typing only; the macro call stays in the body and runs.
+/// `or_insert`, so a real `def` of the same name still wins.
+fn register_class_eval_defs(body: &[ModelBodyItem], macros: &HashMap<Symbol, Vec<(String, String)>>, methods: &mut HashMap<Symbol, Ty>) {
+    if macros.is_empty() {
+        return;
+    }
+    for item in body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        let Some(defs) = macros.get(method) else { continue };
+        let Some(name) = args.first().and_then(symbol_arg) else { continue };
+        for (prefix, suffix) in defs {
+            methods.entry(Symbol::from(format!("{prefix}{}{suffix}", name.as_str()))).or_insert(Ty::Untyped);
         }
     }
 }
