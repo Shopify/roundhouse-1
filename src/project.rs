@@ -3468,13 +3468,33 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
 
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
 /// guarded: a gem source's dependency is a dependency of the app, and
-/// its absence is a boot failure, as under Bundler. Each require is
-/// checked for loading Rails itself (a gem in the gem home under
-/// `activesupport-*`, `railties-*`, ...): Rails' own code cannot run
-/// over this tree's ports, so that is error[gem_requires_rails], at
-/// boot, naming the feature.
+/// its absence is a boot failure, as under Bundler.
+///
+/// Two kinds of feature are never loaded from the gem home, and each is
+/// named on stderr at boot instead:
+/// - a file of one of the app's own gems (a gem source, or a path gem)
+///   that this tree does not carry compiled (a capped slice leaves some
+///   out): the gem home's copy is the real gem, over the compiled one.
+///   A path gem's is known here by its name (`identifications`,
+///   `identifications/...`); a gem source's by the gem home's spec that
+///   owns the feature (`Gem::Specification.find_by_path`), since its
+///   files need not be under its name (shopify-money's `money/...`).
+/// - a feature whose gem depends on a Rails gem (error[gem_requires_rails]):
+///   Rails' own code cannot run over this tree's ports.
+/// A require that loads Rails anyway (a gem in the gem home under
+/// `activesupport-*`, ...) is error[gem_requires_rails], raised at boot.
 fn gem_source_dependency_block(app: &App) -> String {
-    let (native, framework) = gem_source_dependencies(app);
+    let (all_native, framework) = gem_source_dependencies(app);
+    let in_repo: Vec<String> = app.gem_lock.as_ref().map(|l| l.in_repo.clone()).unwrap_or_default();
+    let owned_by_path_gem = |feature: &str| {
+        in_repo.iter().any(|name| {
+            let slashed = name.replace('-', "/");
+            [name.as_str(), slashed.as_str()]
+                .iter()
+                .any(|stem| feature == *stem || feature.strip_prefix(stem).is_some_and(|rest| rest.starts_with('/')))
+        })
+    };
+    let (uncarried, native): (Vec<String>, Vec<String>) = all_native.into_iter().partition(|f| owned_by_path_gem(f));
     if native.is_empty() && framework.is_empty() {
         return String::new();
     }
@@ -3489,13 +3509,44 @@ fn gem_source_dependency_block(app: &App) -> String {
             names.join(", ")
         ));
     }
+    for feature in &uncarried {
+        out.push_str(&format!(
+            "warn \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
+            format!("{feature:?}").replace('"', "\\\"")
+        ));
+    }
     if native.is_empty() {
         return out;
     }
     let names: Vec<String> = native.iter().map(|f| format!("{f:?}")).collect();
+    let compiled: Vec<String> = in_repo.iter().map(|g| format!("{g:?}")).collect();
+    out.push_str(&format!("__rh_compiled_gems = [{}].freeze\n", compiled.join(", ")));
+    out.push_str(
+        "__rh_rails_gems = %w[activesupport activerecord activemodel actionpack actionview activejob railties].freeze\n\
+         __rh_rails_dependency = lambda do |spec, seen|\n  \
+         spec.runtime_dependencies.each do |dep|\n    \
+         return \"#{spec.name} depends on #{dep.name}\" if __rh_rails_gems.include?(dep.name)\n    \
+         next if seen.include?(dep.name)\n    \
+         seen << dep.name\n    \
+         sub = begin\n      dep.to_spec\n    rescue Gem::MissingSpecError\n      nil\n    end\n    \
+         found = sub && __rh_rails_dependency.(sub, seen)\n    \
+         return found if found\n  \
+         end\n  \
+         nil\n\
+         end\n",
+    );
     out.push_str(&format!("[{}].each do |feature|\n", names.join(", ")));
     out.push_str(
-        "  loaded = $LOADED_FEATURES.size\n  \
+        "  spec = Gem::Specification.find_by_path(feature)\n  \
+         if spec && __rh_compiled_gems.include?(spec.name)\n    \
+         warn \"roundhouse: warning[gem_source_file_not_compiled]: #{feature.inspect}, which a gem source requires, is a file of the #{spec.name} gem this tree carries as source, and this tree does not carry it compiled; it is not loaded\"\n    \
+         next\n  \
+         end\n  \
+         if spec && (rails = __rh_rails_dependency.(spec, []))\n    \
+         warn \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, is not loaded: #{rails}\"\n    \
+         next\n  \
+         end\n  \
+         loaded = $LOADED_FEATURES.size\n  \
          require feature\n  \
          rails = $LOADED_FEATURES[loaded..].find { |f| f.match?(%r{/gems/(?:activesupport|activerecord|activemodel|actionpack|actionview|activejob|railties)-\\d}) }\n  \
          raise \"roundhouse: error[gem_requires_rails]: #{feature.inspect}, which a gem source requires, loads Rails itself (#{rails})\" if rails\n\

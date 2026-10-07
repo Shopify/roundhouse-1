@@ -10,7 +10,7 @@ mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 
-const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    opentelemetry-shopify (1.22.0)\n    rotp (6.3.0)\n\nDEPENDENCIES\n  opentelemetry-shopify\n  rotp\n";
+const LOCK: &str = "PATH\n  remote: components/essentials\n  specs:\n    essentials (0.1.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    opentelemetry-shopify (1.22.0)\n    rotp (6.3.0)\n\nDEPENDENCIES\n  opentelemetry-shopify\n  rotp\n";
 
 fn app(gem_sources: &str) -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -60,7 +60,7 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
         )
         .write(
             "vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify.rb",
-            "require 'opentelemetry/sdk'\nrequire 'forwardable'\nrequire 'oracle'\nrequire 'opentelemetry/shopify/version'\n\nmodule OtelShim\n  require 'opentelemetry-common'\n  autoload :Lazy, 'opentelemetry/shopify/lazy'\n\n  def self.on?\n    require 'only/when/called'\n    true\n  end\nend\n",
+            "require 'opentelemetry/sdk'\nrequire 'forwardable'\nrequire 'oracle'\nrequire 'essentials/uncarried'\nrequire 'opentelemetry/shopify/version'\n\nmodule OtelShim\n  require 'opentelemetry-common'\n  autoload :Lazy, 'opentelemetry/shopify/lazy'\n\n  def self.on?\n    require 'only/when/called'\n    true\n  end\nend\n",
         )
         .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/opentelemetry/shopify/version.rb", "require_relative '../../deep/dep'\nmodule OtelShim\n  VERSION = '1'\nend\n")
         .write("vendor/gems/opentelemetry-shopify-1.22.0/lib/deep/dep.rb", "require 'json'\nmodule Deep\nend\n")
@@ -80,4 +80,12 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     assert!(facades.contains("error[gem_requires_rails]"), "{facades}");
     // After the gems that tree loads natively.
     assert!(facades.find("require gem_name").unwrap() < facades.find(block).unwrap());
+    // A path gem's file the tree does not carry compiled is named, not
+    // loaded from the gem home; so is a gem source's (by the gem home's
+    // spec that owns it), and a feature whose gem depends on Rails.
+    assert!(facades.contains(r#"warn "roundhouse: warning[gem_source_file_not_compiled]: \"essentials/uncarried\""#), "{facades}");
+    assert!(facades.contains("__rh_compiled_gems = [\"essentials\", \"opentelemetry-shopify\"].freeze"), "{facades}");
+    assert!(facades.contains("Gem::Specification.find_by_path(feature)"), "{facades}");
+    let check = emit_and_run::ruby().args(["-c", "runtime/gem_facades.rb"]).current_dir(&*dir).output().expect("ruby -c");
+    assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
 }
