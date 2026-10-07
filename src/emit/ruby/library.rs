@@ -8973,7 +8973,17 @@ pub(super) fn emit_file_program(
                 }
                 ProgramItem::ClassEval { receiver, method, parts } => {
                     writeln!(s, "{pad}{}.{method} do", super::emit_expr(receiver)).unwrap();
-                    class_eval_parts(parts, &format!("{pad}  "), app, out_path, method, s);
+                    // A model's class-body macros are the lowering's (see
+                    // `replays_foreign_class_body`); any other receiver
+                    // runs its body's calls itself.
+                    let replays = match &*receiver.node {
+                        ExprNode::Const { path } => {
+                            let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                            !is_model_named(name.trim_start_matches("::"), app)
+                        }
+                        _ => false,
+                    };
+                    class_eval_parts(parts, &format!("{pad}  "), app, out_path, method, replays, s);
                     writeln!(s, "{pad}end").unwrap();
                 }
                 // A condition that raises runs neither branch, named.
@@ -9014,21 +9024,40 @@ pub(super) fn emit_file_program(
 
 /// A `class_eval` body's parts (`ProgramItem::ClassEval`): each body the
 /// module's, without its `module`/`end`; each branch an `if`/`unless`.
+/// `replays`: the body's uncaptured class-body calls run on the receiver
+/// (any receiver but a model).
 fn class_eval_parts(
     parts: &[crate::app::ClassEvalPart],
     pad: &str,
     app: &App,
     out_path: &Path,
     method: &str,
+    replays: bool,
     s: &mut String,
 ) {
     use crate::app::ClassEvalPart;
     for part in parts {
         match part {
             ClassEvalPart::Body(lc) => {
-                let rendered = emit_library_class_decl(lc, app, out_path.to_path_buf()).content;
+                // Not analyzed or lowered, as an inline declaration is
+                // not: its class-body calls (asset_cloud's
+                // `callback_methods :write, :delete`, a macro an included
+                // module extends the receiver with) replay as the source
+                // has them, on the receiver.
+                let rendered = {
+                    let _inline = replays.then(InlineDeclaration::enter);
+                    emit_library_class_decl(lc, app, out_path.to_path_buf()).content
+                };
                 let header = format!("module {}", crate::ingest::library_class::CLASS_EVAL_BODY);
-                let body: Vec<&str> = rendered.lines().collect();
+                let mut body: Vec<&str> = rendered.lines().collect();
+                // The load-time requires the body's constants need
+                // (written relative to this file program), run first
+                // inside the block, where `require_relative` resolves
+                // from this file as at its top.
+                let lead = body.iter().take_while(|l| **l != header && (l.is_empty() || l.starts_with("require"))).count();
+                for line in body.drain(..lead).filter(|l| !l.is_empty()) {
+                    writeln!(s, "{pad}{line}").unwrap();
+                }
                 match body.as_slice() {
                     [first, inner @ .., "end"] if *first == header => {
                         for line in inner {
@@ -9051,10 +9080,10 @@ fn class_eval_parts(
             ClassEvalPart::Branch { cond, negate, then_parts, else_parts } => {
                 let keyword = if *negate { "unless" } else { "if" };
                 writeln!(s, "{pad}{keyword} {}", super::emit_expr(cond)).unwrap();
-                class_eval_parts(then_parts, &format!("{pad}  "), app, out_path, method, s);
+                class_eval_parts(then_parts, &format!("{pad}  "), app, out_path, method, replays, s);
                 if !else_parts.is_empty() {
                     writeln!(s, "{pad}else").unwrap();
-                    class_eval_parts(else_parts, &format!("{pad}  "), app, out_path, method, s);
+                    class_eval_parts(else_parts, &format!("{pad}  "), app, out_path, method, replays, s);
                 }
                 writeln!(s, "{pad}end").unwrap();
             }
