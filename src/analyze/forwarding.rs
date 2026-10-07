@@ -85,7 +85,11 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             walk(app, &contracts, owner, method, default, &mut out);
         }
     }
-    out.extend(keyword_splats_into_nameless_rest_with_index(app, &contracts));
+    out.extend(
+        keyword_splats_into_nameless_rest_with_index(app, &contracts)
+            .into_iter()
+            .filter(|d| !off_ruby_family(d)),
+    );
     for (span, policy) in keyword_calls_with_index(app, &contracts) {
         if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
             out.push(keyword_refusal(span, policy));
@@ -108,8 +112,47 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// An implicit `super` in an override of such a selector with keyword
 /// parameters (kept or flattened) passes the override's lowered
 /// keywords as positionals, so it is refused too.
+///
+/// Two of these refusals hold only off the CRuby tree
+/// ([`OFF_RUBY_FAMILY`]); this returns the rest, which hold on every
+/// target. [`nameless_rest_refusals_off_ruby`] returns those two.
 pub(crate) fn keyword_splats_into_nameless_rest(app: &App) -> Vec<Diagnostic> {
     keyword_splats_into_nameless_rest_with_index(app, &SourceContractIndex::new(app))
+        .into_iter()
+        .filter(|d| !off_ruby_family(d))
+        .collect()
+}
+
+/// Refusals whose whole cause is the shared lowering's erased `**value`.
+/// The Ruby emitter writes every keyword splat back (`KeywordSplat` as
+/// written, a legacy-erased one through `ERASED_KEYWORD_SPLAT`), keeps
+/// keyword arguments as keywords, and writes an admitted `def m(a, *, **)`
+/// as written. So a reified or dispatched call reaches the rest exactly as
+/// native Ruby's does, and the CRuby tree runs it as written. Every other
+/// target refuses the nameless rest declaration itself (`project.rs`);
+/// these name the call sites there too.
+const OFF_RUBY_FAMILY: [&str; 2] = [
+    "method object of an anonymous positional rest",
+    "keyword splat into an anonymous positional rest",
+];
+
+fn off_ruby_family(d: &Diagnostic) -> bool {
+    matches!(&d.kind, crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+        if OFF_RUBY_FAMILY.contains(&construct.as_str()))
+}
+
+/// Call sites that reach an admitted nameless rest through a reified
+/// method or with an erased keyword splat. Reported per target for every
+/// target but the CRuby tree (see [`OFF_RUBY_FAMILY`]). Also runs on the
+/// lowered app, where a legacy `**value` is a positional marked
+/// `ERASED_KEYWORD_SPLAT`.
+pub fn nameless_rest_refusals_off_ruby(app: &App) -> Vec<Diagnostic> {
+    let mut seen = HashSet::new();
+    keyword_splats_into_nameless_rest_with_index(app, &SourceContractIndex::new(app))
+        .into_iter()
+        .filter(off_ruby_family)
+        .filter(|d| seen.insert((d.span, d.message.clone())))
+        .collect()
 }
 
 fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceContractIndex<'_>) -> Vec<Diagnostic> {
@@ -199,7 +242,10 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
             ));
         }
         if reaches
-            && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. }))
+            && args.iter().any(|a| {
+                matches!(&*a.node, ExprNode::KeywordSplat { .. })
+                    || a.decisions & crate::expr::ERASED_KEYWORD_SPLAT != 0
+            })
             && !proven_without_rest(app, contracts, context, e)
             && !reach.constant_receiver_reaches_none(contracts, e)
         {

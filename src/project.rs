@@ -1294,6 +1294,15 @@ pub fn target_files(
             );
         }
     }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
+        // The CRuby tree writes these calls as written; elsewhere the
+        // erased `**` and reified methods are not shown to reach `*` so.
+        for d in crate::analyze::nameless_rest_refusals_off_ruby(app) {
+            if let crate::diagnostic::DiagnosticKind::Unsupported { construct, detail, .. } = d.kind {
+                crate::emit::diagnostics::report_unsupported(d.span, target.as_str(), construct, detail);
+            }
+        }
+    }
     // A keyword parameter is carried by the ruby family and by nothing
     // else yet. No other emitter reads `Param::keyword`, so a `def`
     // that declares one renders POSITIONALLY while its call site

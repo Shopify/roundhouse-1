@@ -1178,20 +1178,20 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// Lowerings that copy the parameters into a generated method (job and
 /// mailer wrappers) refuse it themselves.
 ///
-/// Nothing but a block may accompany the `*`. Every argument a call
-/// passes, its keywords lowered to a trailing positional hash included,
-/// then lands in the rest, where no body can read it, as Ruby does for
-/// a method that accepts no keywords. That holds however the call
-/// reaches the method (`method_missing`, a reified or dispatched method,
-/// a block), so no call site has to be found. Any other parameter could
-/// bind that hash (a required positional takes the caller's hash object
-/// where Ruby passes a copy), and the paths that reach a method unnamed
-/// are open-ended, so those stay refused.
+/// Any other parameter may accompany it (`def script(subcommand, *)`,
+/// `def m(*, **)`, `def m(a, *, k: 1)`): with a rest in the signature
+/// ingest keeps the keyword group as keywords, so the def is written as
+/// the source wrote it. The CRuby tree writes every call's keywords and
+/// keyword splats as written too (`ERASED_KEYWORD_SPLAT`), so a call
+/// binds the positionals and the rest as native Ruby does, however it
+/// reaches the method. The other targets do not show that and refuse
+/// the declaration (`project.rs`), and name the reified and keyword-splat
+/// calls that reach it (`analyze::forwarding::OFF_RUBY_FAMILY`).
 fn admit_nameless_rest(methods: &mut [MethodDef]) {
     for m in methods {
         if m.unsupported_formals == Some(crate::dialect::UnsupportedFormal::AnonymousRest)
             && m.receiver == MethodReceiver::Instance
-            && matches!(m.params.as_slice(), [only] if only.is_nameless_rest())
+            && m.params.iter().any(|p| p.is_nameless_rest())
         {
             m.unsupported_formals = None;
         }

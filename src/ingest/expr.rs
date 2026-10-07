@@ -1109,7 +1109,20 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let args: Vec<Expr> = if let Some(a) = y.arguments() {
                 a.arguments()
                     .iter()
-                    .map(|arg| ingest_expr(&arg, file))
+                    .map(|arg| {
+                        let mut value = ingest_expr(&arg, file)?;
+                        // `yield(**h)` ingests as the positional hash every
+                        // target but Ruby passes. Mark it so the Ruby
+                        // emitter writes the splat back: a block or method
+                        // object taking keywords binds none from a
+                        // positional Hash in Ruby 3.
+                        if arg.as_keyword_hash_node().is_some_and(|hash| {
+                            hash.elements().iter().any(|e| e.as_assoc_splat_node().is_some())
+                        }) {
+                            value.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
+                        }
+                        Ok(value)
+                    })
                     .collect::<IngestResult<_>>()?
             } else {
                 vec![]
