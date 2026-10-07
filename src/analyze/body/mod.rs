@@ -2004,7 +2004,10 @@ impl<'a> BodyTyper<'a> {
                 let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
                     || (recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
                         && send::is_module_protocol(method) && self.self_is_module_instance(ctx))
-                    || send::is_module_query_on_module_value(method, recv_ty.as_ref());
+                    || send::is_module_query_on_module_value(method, recv_ty.as_ref())
+                    // `x.class` is a class object, though not a known one:
+                    // enough for a query, not for `define_method`.
+                    || (send::is_module_query(method) && recv.as_ref().is_some_and(|r| self.is_class_of_value(r, ctx)));
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {

@@ -235,29 +235,35 @@ impl Ty {
     /// `f`. Structure (containers, unions, signatures) is preserved;
     /// only `Ty::Class` ids change.
     pub fn map_class_ids(&self, f: &dyn Fn(&ClassId) -> ClassId) -> Ty {
+        self.map_class_ids_with_args(&|id, _| f(id))
+    }
+
+    /// [`Ty::map_class_ids`], where `f` also sees the type arguments the
+    /// class is applied to.
+    pub fn map_class_ids_with_args(&self, f: &dyn Fn(&ClassId, &[Ty]) -> ClassId) -> Ty {
         match self {
             Ty::Class { id, args } => Ty::Class {
-                id: f(id),
-                args: args.iter().map(|t| t.map_class_ids(f)).collect(),
+                id: f(id, args),
+                args: args.iter().map(|t| t.map_class_ids_with_args(f)).collect(),
             },
-            Ty::Array { elem } => Ty::Array { elem: Box::new(elem.map_class_ids(f)) },
+            Ty::Array { elem } => Ty::Array { elem: Box::new(elem.map_class_ids_with_args(f)) },
             Ty::Hash { key, value } => Ty::Hash {
-                key: Box::new(key.map_class_ids(f)),
-                value: Box::new(value.map_class_ids(f)),
+                key: Box::new(key.map_class_ids_with_args(f)),
+                value: Box::new(value.map_class_ids_with_args(f)),
             },
             Ty::Tuple { elems } => {
-                Ty::Tuple { elems: elems.iter().map(|t| t.map_class_ids(f)).collect() }
+                Ty::Tuple { elems: elems.iter().map(|t| t.map_class_ids_with_args(f)).collect() }
             }
             Ty::Union { variants } => {
-                Ty::Union { variants: variants.iter().map(|t| t.map_class_ids(f)).collect() }
+                Ty::Union { variants: variants.iter().map(|t| t.map_class_ids_with_args(f)).collect() }
             }
             Ty::Fn { params, block, ret, effects } => Ty::Fn {
                 params: params
                     .iter()
-                    .map(|p| Param { name: p.name.clone(), ty: p.ty.map_class_ids(f), kind: p.kind.clone() })
+                    .map(|p| Param { name: p.name.clone(), ty: p.ty.map_class_ids_with_args(f), kind: p.kind.clone() })
                     .collect(),
-                block: block.as_ref().map(|b| Box::new(b.map_class_ids(f))),
-                ret: Box::new(ret.map_class_ids(f)),
+                block: block.as_ref().map(|b| Box::new(b.map_class_ids_with_args(f))),
+                ret: Box::new(ret.map_class_ids_with_args(f)),
                 effects: effects.clone(),
             },
             other => other.clone(),
