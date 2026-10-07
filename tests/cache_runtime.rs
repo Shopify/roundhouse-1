@@ -1,6 +1,7 @@
 // ActiveSupport::Cache (runtime/spinel/active_support_cache.rb: Store,
-// Entry, Coder, LocalCache, MemoryStore, NullStore) against activesupport
-// 8.1.4: tests/cache_runtime.rb runs the same observations natively and
+// Entry, Coder, LocalCache, MemoryStore, NullStore) against the activesupport
+// native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha;
+// tests/support/rails_oracle.rb): tests/cache_runtime.rb runs the same observations natively and
 // on the runtime port and requires them equal.
 
 use std::path::Path;

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-# ActiveSupport::Cache, ported from activesupport 8.1.4 for the CRuby and
-# JRuby trees: the Store base class (fetch / read / write / delete /
+# ActiveSupport::Cache, ported from the activesupport native Core runs
+# (Shopify/rails 5813559f4aed, 8.2.0.alpha) for the CRuby and JRuby trees: the Store base class (fetch / read / write / delete /
 # exist? and their _multi forms, namespaces, versions, expiry, race
 # condition TTL, key expansion and truncation, instrumentation), Entry,
 # Coder and SerializerWithFallback (the 7.0 / 7.1 cache formats),
@@ -9,7 +9,7 @@
 # NullStore and WriteOptions, plus the two support classes the stores
 # read: IsolatedExecutionState and Digest.
 #
-# Each method follows the 8.1.4 source (lib/active_support/cache.rb,
+# Each method follows that source (lib/active_support/cache.rb,
 # cache/{entry,coder,serializer_with_fallback,memory_store,null_store}.rb,
 # cache/strategy/local_cache{,_middleware}.rb, isolated_execution_state.rb,
 # digest.rb); tests/cache_runtime.rb runs the same observations against
@@ -146,15 +146,26 @@ module ActiveSupport
       :skip_nil,
       :raw,
       :max_key_size,
-    ]
+    ].freeze
 
     OPTION_ALIASES = {
-      expires_in: [:expire_in, :expired_in]
+      expires_in: [:expire_in, :expired_in].freeze
     }.freeze
 
     DEFAULT_COMPRESS_LIMIT = 1024 # 1.kilobyte
 
     DeserializationError = Class.new(StandardError)
+
+    # `ActiveSupport.error_reporter.report(error, source: "active_support.cache")`,
+    # where the tree carries the reporter (runtime/active_support_reporters.rb,
+    # which every Ruby-family tree naming Rails.error has). Returns nil, as
+    # ErrorReporter#report does.
+    def self.report_error(error)
+      if ActiveSupport.respond_to?(:error_reporter) && (reporter = ActiveSupport.error_reporter)
+        reporter.report(error, source: "active_support.cache")
+      end
+      nil
+    end
 
     # The stores this file defines, by `lookup_store` symbol.
     PORTED_STORES = %i(memory_store null_store).freeze
@@ -408,22 +419,31 @@ module ActiveSupport
         version = dump_version(entry.version) if entry.version
         version_length = version&.bytesize || -1
 
-        packed = SIGNATURE.b
-        packed << [type, expires_at, version_length].pack(PACKED_TEMPLATE)
-        packed << version if version
-        packed << payload
+        header = [type, expires_at, version_length].pack(PACKED_TEMPLATE)
+        "#{SIGNATURE}#{header}#{version}#{payload}".freeze
       end
 
       def load(dumped)
-        return @serializer.load(dumped) if !signature?(dumped)
+        unless signature?(dumped)
+          return begin
+            @serializer.load(dumped)
+          rescue => error
+            Cache.report_error(error)
+          end
+        end
 
-        type = dumped.unpack1(PACKED_TYPE_TEMPLATE)
-        expires_at = dumped.unpack1(PACKED_EXPIRES_AT_TEMPLATE)
-        version_length = dumped.unpack1(PACKED_VERSION_LENGTH_TEMPLATE)
+        begin
+          type = dumped.unpack1(PACKED_TYPE_TEMPLATE)
+          expires_at = dumped.unpack1(PACKED_EXPIRES_AT_TEMPLATE)
+          version_length = dumped.unpack1(PACKED_VERSION_LENGTH_TEMPLATE)
 
-        expires_at = nil if expires_at < 0
-        version = load_version(dumped.byteslice(PACKED_VERSION_INDEX, version_length)) if version_length >= 0
-        payload = dumped.byteslice((PACKED_VERSION_INDEX + [version_length, 0].max)..)
+          expires_at = nil if expires_at < 0
+          version = load_version(dumped.byteslice(PACKED_VERSION_INDEX, version_length)) if version_length >= 0
+          payload = dumped.byteslice((PACKED_VERSION_INDEX + [version_length, 0].max)..)
+        rescue ArgumentError, TypeError => error
+          Cache.report_error(error)
+          return
+        end
 
         compressor = @compressor if type & COMPRESSED_FLAG > 0
         serializer = STRING_DESERIALIZERS[type & ~COMPRESSED_FLAG] || @serializer
@@ -439,14 +459,14 @@ module ActiveSupport
         0x02 => Encoding::UTF_8,
         0x03 => Encoding::BINARY,
         0x04 => Encoding::US_ASCII,
-      }
+      }.freeze
 
       COMPRESSED_FLAG = 0x80
 
       PACKED_TEMPLATE = "CEl<"
-      PACKED_TYPE_TEMPLATE = "@#{SIGNATURE.bytesize}C"
-      PACKED_EXPIRES_AT_TEMPLATE = "@#{[0].pack(PACKED_TYPE_TEMPLATE).bytesize}E"
-      PACKED_VERSION_LENGTH_TEMPLATE = "@#{[0].pack(PACKED_EXPIRES_AT_TEMPLATE).bytesize}l<"
+      PACKED_TYPE_TEMPLATE = "@#{SIGNATURE.bytesize}C".freeze
+      PACKED_EXPIRES_AT_TEMPLATE = "@#{[0].pack(PACKED_TYPE_TEMPLATE).bytesize}E".freeze
+      PACKED_VERSION_LENGTH_TEMPLATE = "@#{[0].pack(PACKED_EXPIRES_AT_TEMPLATE).bytesize}l<".freeze
       PACKED_VERSION_INDEX = [0].pack(PACKED_VERSION_LENGTH_TEMPLATE).bytesize
 
       MARSHAL_SIGNATURE = "\x04\x08".b.freeze
@@ -473,7 +493,12 @@ module ActiveSupport
 
         def value
           if !@resolved
-            @value = @serializer.load(@compressor ? @compressor.inflate(@value) : @value)
+            @value = begin
+              @serializer.load(@compressor ? @compressor.inflate(@value) : @value)
+            rescue => error
+              Cache.report_error(error)
+              raise DeserializationError, error.message
+            end
             @resolved = true
           end
           @value
@@ -602,7 +627,13 @@ module ActiveSupport
 
         def _load(marked)
           dumped = marked.byteslice(1..-1)
-          dumped = Zlib::Inflate.inflate(dumped) if marked.start_with?(MARK_COMPRESSED)
+          if marked.start_with?(MARK_COMPRESSED)
+            dumped = begin
+              Zlib::Inflate.inflate(dumped)
+            rescue Zlib::Error => error
+              raise Cache::DeserializationError, "#{error.class}: #{error.message}"
+            end
+          end
           Cache::Entry.unpack(marshal_load(dumped))
         end
 
@@ -645,7 +676,7 @@ module ActiveSupport
         passthrough: PassthroughWithFallback,
         marshal_7_0: Marshal70WithFallback,
         marshal_7_1: Marshal71WithFallback,
-      }
+      }.freeze
 
     end
 
@@ -728,6 +759,11 @@ module ActiveSupport
           end
         end
 
+        def initialize(...)
+          super
+          @local_cache_key = "#{ActiveSupport::Cache.underscore(self.class.name)}_local_cache_#{object_id}".gsub(/[\/-]/, "_").to_sym
+        end
+
         def with_local_cache(&block)
           use_temporary_local_cache(LocalStore.new, &block)
         end
@@ -768,14 +804,14 @@ module ActiveSupport
 
         def increment(name, amount = 1, **options) # :nodoc:
           return super unless local_cache
-          value = bypass_local_cache { super }
+          value = super
           write_cache_value(name, value, raw: true, **options)
           value
         end
 
         def decrement(name, amount = 1, **options) # :nodoc:
           return super unless local_cache
-          value = bypass_local_cache { super }
+          value = super
           write_cache_value(name, value, raw: true, **options)
           value
         end
@@ -786,23 +822,7 @@ module ActiveSupport
           options = names.last.instance_of?(Hash) ? names.pop : {}
           options = merged_options(options)
 
-          keys_to_names = names.each_with_object({}) { |name, map| map[normalize_key(name, options)] = name }
-
-          local_entries = local_cache.read_multi_entries(keys_to_names.keys)
-          results = local_entries.each_with_object({}) do |(key, value), result|
-            next if value.nil?
-
-            entry = deserialize_entry(value, **options)
-
-            normalized_key = keys_to_names[key]
-            if entry.nil?
-              result[normalized_key] = nil
-            elsif entry.expired? || entry.mismatched?(normalize_version(normalized_key, options))
-              local_cache.delete_entry(key)
-            else
-              result[normalized_key] = entry.value
-            end
-          end
+          results = read_multi_entries_from_local_cache(names, options)
 
           if results.size < names.size
             results.merge!(super(*(names - results.keys), options, &block))
@@ -812,27 +832,33 @@ module ActiveSupport
         end
 
         private
+          attr_reader :local_cache_key
+
           def read_serialized_entry(key, raw: false, **options)
             if (cache = local_cache)
-              hit = true
-              entry = cache.fetch_entry(key) do
-                hit = false
-                super
+              if options[:delete]
+                entry = super
+                cache.delete_entry(key)
+                entry
+              else
+                hit = true
+                entry = cache.fetch_entry(key) do
+                  hit = false
+                  super
+                end
+                options[:event][:store] = cache.class.name if hit && options[:event]
+                entry
               end
-              options[:event][:store] = cache.class.name if hit && options[:event]
-              entry
             else
               super
             end
           end
 
-          def read_multi_entries(names, **options)
-            return super unless local_cache
-
+          def read_multi_entries_from_local_cache(names, options)
             keys_to_names = names.each_with_object({}) { |name, map| map[normalize_key(name, options)] = name }
 
             local_entries = local_cache.read_multi_entries(keys_to_names.keys)
-            results = local_entries.each_with_object({}) do |(key, value), result|
+            local_entries.each_with_object({}) do |(key, value), result|
               next if value.nil? # recorded cache miss
 
               entry = deserialize_entry(value, **options)
@@ -846,12 +872,18 @@ module ActiveSupport
                 result[normalized_key] = entry.value
               end
             end
+          end
+
+          def read_multi_entries(names, **options)
+            return super unless local_cache
+
+            results = read_multi_entries_from_local_cache(names, options)
 
             if results.size < names.size
               results.merge!(super(names - results.keys, **options))
             end
 
-            results
+            results.slice(*names)
           end
 
           def write_serialized_entry(key, payload, **)
@@ -878,14 +910,6 @@ module ActiveSupport
             end
           end
 
-          def local_cache_key
-            @local_cache_key ||= "#{ActiveSupport::Cache.underscore(self.class.name)}_local_cache_#{object_id}".gsub(/[\/-]/, "_").to_sym
-          end
-
-          def bypass_local_cache(&block)
-            use_temporary_local_cache(nil, &block)
-          end
-
           def use_temporary_local_cache(temporary_cache)
             save_cache = LocalCacheRegistry.cache_for(local_cache_key)
             begin
@@ -903,26 +927,25 @@ module ActiveSupport
       DEFAULT_POOL_OPTIONS = { size: 5, timeout: 5 }.freeze
       MAX_KEY_SIZE = 250
 
-      # cattr_accessor :logger, instance_writer: true
-      @@logger = nil
-      def self.logger = @@logger
-      def self.logger=(logger)
-        @@logger = logger
-      end
-      def logger = @@logger
-      def logger=(logger)
-        @@logger = logger
-      end
-
-      # cattr_accessor :raise_on_invalid_cache_expiration_time, default: false
-      @@raise_on_invalid_cache_expiration_time = false
-      def self.raise_on_invalid_cache_expiration_time = @@raise_on_invalid_cache_expiration_time
-      def self.raise_on_invalid_cache_expiration_time=(value)
-        @@raise_on_invalid_cache_expiration_time = value
-      end
-      def raise_on_invalid_cache_expiration_time = @@raise_on_invalid_cache_expiration_time
-      def raise_on_invalid_cache_expiration_time=(value)
-        @@raise_on_invalid_cache_expiration_time = value
+      # class_attribute :logger, instance_predicate: false
+      # class_attribute :raise_on_invalid_cache_expiration_time, instance_predicate: false, default: false
+      #
+      # A class reads the value the nearest class at or above it set; a
+      # writer on a subclass sets it for that subclass only. An instance
+      # reads its own value once written, else its class's.
+      %i[logger raise_on_invalid_cache_expiration_time].each do |name|
+        ivar = :"@__class_attr_#{name}"
+        instance_variable_set(ivar, name == :logger ? nil : false)
+        singleton_class.define_method(name) do
+          owner = self
+          owner = owner.superclass until owner.instance_variable_defined?(ivar)
+          owner.instance_variable_get(ivar)
+        end
+        singleton_class.define_method(:"#{name}=") { |value| instance_variable_set(ivar, value) }
+        define_method(name) do
+          instance_variable_defined?(:"@#{name}") ? instance_variable_get(:"@#{name}") : self.class.public_send(name)
+        end
+        attr_writer name
       end
 
       attr_reader :silence, :options
@@ -1016,7 +1039,7 @@ module ActiveSupport
           end
 
           if entry
-            get_entry_value(entry, name, options)
+            get_entry_value(entry, key, options)
           else
             save_block_result_to_cache(name, key, options, &block)
           end
@@ -1153,7 +1176,7 @@ module ActiveSupport
         options = merged_options(options)
         key = normalize_key(name, options)
 
-        instrument(:exist?, key) do |payload|
+        instrument(:exist?, key, options) do |payload|
           entry = read_entry(key, **options, event: payload)
           (entry && !entry.expired? && !entry.mismatched?(normalize_version(name, options))) || false
         end
@@ -1313,7 +1336,7 @@ module ActiveSupport
 
         def handle_invalid_expires_in(message)
           error = ArgumentError.new(message)
-          if ActiveSupport::Cache::Store.raise_on_invalid_cache_expiration_time
+          if raise_on_invalid_cache_expiration_time
             raise error
           else
             ActiveSupport.error_reporter&.report(error, handled: true, severity: :warning) if ActiveSupport.respond_to?(:error_reporter)
@@ -1355,7 +1378,7 @@ module ActiveSupport
         end
 
         def expand_and_namespace_key(key, options = nil)
-          str_key = expanded_key(key)
+          str_key = key.class == ::String ? key : expanded_key(key)
           raise(ArgumentError, "key cannot be blank") if !str_key || str_key.empty?
 
           namespace_key str_key, options
@@ -1427,32 +1450,46 @@ module ActiveSupport
         end
 
         def instrument(operation, key, options = nil, &block)
-          _instrument(operation, key: key, options: options, &block)
-        end
-
-        def instrument_multi(operation, keys, options = nil, &block)
-          _instrument(operation, multi: true, key: keys, options: options, &block)
-        end
-
-        def _instrument(operation, multi: false, options: nil, **payload, &block)
-          if logger && logger.debug? && !silence?
-            debug_key =
-              if multi
-                ": #{payload[:key].size} key(s) specified"
-              elsif payload[:key]
-                ": #{payload[:key]}"
-              end
-
-            blank = options.nil? || options == false || (options.respond_to?(:empty?) && options.empty?)
-            debug_options = " (#{options.inspect})" unless blank
-            logger.debug "Cache #{operation}#{debug_key}#{debug_options}"
+          unless silence?
+            logger&.debug do
+              debug_key = ": #{key}" if key
+              debug_options = " (#{options.inspect})" unless cache_blank?(options)
+              "Cache #{operation}#{debug_key}#{debug_options}"
+            end
           end
 
-          payload[:store] = self.class.name
+          payload = {
+            store: self.class.name,
+            key: key
+          }
           payload.merge!(options) if options.is_a?(Hash)
           ActiveSupport::Notifications.instrument("cache_#{operation}.active_support", payload) do
             block&.call(payload)
           end
+        end
+
+        def instrument_multi(operation, keys, options = nil, &block)
+          unless silence?
+            logger&.debug do
+              debug_key = ": #{keys.size} key(s) specified"
+              debug_options = " (#{options.inspect})" unless cache_blank?(options)
+              "Cache #{operation}#{debug_key}#{debug_options}"
+            end
+          end
+
+          payload = {
+            store: self.class.name,
+            key: keys
+          }
+          payload.merge!(options) if options.is_a?(Hash)
+          ActiveSupport::Notifications.instrument("cache_#{operation}.active_support", payload) do
+            block&.call(payload)
+          end
+        end
+
+        # `options.blank?`
+        def cache_blank?(options)
+          options.nil? || options == false || (options.respond_to?(:empty?) && options.empty?)
         end
 
         def handle_expired_entry(entry, key, options)
@@ -1469,8 +1506,8 @@ module ActiveSupport
           entry
         end
 
-        def get_entry_value(entry, name, options)
-          instrument(:fetch_hit, name, options)
+        def get_entry_value(entry, key, options)
+          instrument(:fetch_hit, key, options)
           entry.value
         end
 
@@ -1594,7 +1631,7 @@ module ActiveSupport
 
       def cleanup(options = nil)
         options = merged_options(options)
-        _instrument(:cleanup, size: @data.size) do
+        instrument(:cleanup, nil, size: @data.size) do
           keys = synchronize { @data.keys }
           keys.each do |key|
             entry = deserialize_entry(@data[key])
@@ -1626,13 +1663,13 @@ module ActiveSupport
       end
 
       def increment(name, amount = 1, **options)
-        instrument(:increment, name, amount: amount) do
+        instrument(:increment, normalize_key(name, options), amount: amount) do
           modify_value(name, amount, **options)
         end
       end
 
       def decrement(name, amount = 1, **options)
-        instrument(:decrement, name, amount: amount) do
+        instrument(:decrement, normalize_key(name, options), amount: amount) do
           modify_value(name, -amount, **options)
         end
       end
@@ -1745,11 +1782,26 @@ module ActiveSupport
       def delete_matched(matcher, options = nil)
       end
 
-      def inspect # :nodoc:
-        "#<#{self.class.name} options=#{@options.inspect}>"
+      # ActiveSupport::InspectBackport.apply(self): Ruby 4's Kernel#inspect
+      # reads instance_variables_to_inspect; an older Ruby gets the same
+      # rendering defined here.
+      if RUBY_VERSION < "4"
+        def inspect # :nodoc:
+          ivars = instance_variables_to_inspect
+          klass = self.class.name || self.class.inspect
+          addr = "0x%x" % object_id
+          pairs = ivars.filter_map do |ivar|
+            "#{ivar}=#{instance_variable_get(ivar).inspect}" if instance_variable_defined?(ivar)
+          end
+          pairs.empty? ? "#<#{klass}:#{addr}>" : "#<#{klass}:#{addr} #{pairs.join(", ")}>"
+        end
       end
 
       private
+        def instance_variables_to_inspect
+          [:@options].freeze
+        end
+
         def read_entry(key, **s)
           deserialize_entry(read_serialized_entry(key))
         end

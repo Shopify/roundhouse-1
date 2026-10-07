@@ -1,4 +1,5 @@
-# Native ActiveSupport 8.1.4 oracle for ActiveSupport::Cache (Store,
+# Native ActiveSupport oracle (the Rails native Core runs; tests/support/
+# rails_oracle.rb) for ActiveSupport::Cache (Store,
 # Entry, Coder, SerializerWithFallback, Strategy::LocalCache, MemoryStore,
 # NullStore, WriteOptions, IsolatedExecutionState, Digest) against
 # runtime/spinel/active_support_cache.rb. Each mode prints one line per
@@ -11,6 +12,7 @@
 # merged_options, instrument, serialize_entry / deserialize_entry,
 # local_cache, use_temporary_local_cache).
 require "json"
+require_relative "support/rails_oracle"
 
 if ARGV.first == "compare"
   require "open3"
@@ -25,13 +27,13 @@ if ARGV.first == "compare"
     abort "caches differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and the emitted ActiveSupport::Cache agree"
+  puts "Native ActiveSupport and the emitted ActiveSupport::Cache agree (#{RailsOracle.label})"
   exit
 end
 
 require "rack"
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/cache"
   require "active_support/cache/memory_store"
@@ -42,9 +44,11 @@ if ARGV.first == "native"
   require "active_support/notifications"
   # Every Rails process has Object#blank?; the cache's debug log calls it.
   require "active_support/core_ext/object/blank"
+  require "active_support/error_reporter"
 else
   require_relative "../runtime/ruby/rails"
   require_relative "../runtime/spinel/active_support_notifications"
+  require_relative "../runtime/ruby/active_support_reporters"
   require_relative "../runtime/spinel/active_support_cache"
 end
 
@@ -92,10 +96,11 @@ class Lines
     @lines = []
   end
 
+  # ::Logger's forms: a message, or a block that builds it.
   def debug? = true
-  def debug(message) = @lines << [:debug, message]
-  def error(message) = @lines << [:error, message]
-  def warn(message) = @lines << [:warn, message]
+  def debug(message = nil, &block) = @lines << [:debug, block ? block.call : message]
+  def error(message = nil, &block) = @lines << [:error, block ? block.call : message]
+  def warn(message = nil, &block) = @lines << [:warn, block ? block.call : message]
 end
 
 # A coder of the shape Core's VersionedMemcacheCoder has: dump an Entry
@@ -358,7 +363,8 @@ local.with_local_cache do
   show("local read_multi", local.read_multi("l", "l2", "l3"))
   show("local fetch_multi", local.fetch_multi("l", "l4") { |name| "#{name}~" })
   show("local increment", [local.increment("lc"), local.increment("lc", 2), local.read("lc", raw: true)])
-  local.send(:bypass_local_cache) { show("bypassed", local.local_cache.inspect) }
+  local.write("l5", 5)
+  show("local read_multi order", local.read_multi("l3", "l5", "l", "l6"))
   show("local delete", [local.delete("l"), local.read("l")])
   show("local clear", [local.clear, local.read("l2")])
 end
@@ -383,7 +389,7 @@ events
 
 # --- NullStore and lookup_store -----------------------------------------
 null = ActiveSupport::Cache::NullStore.new
-show("null store", [null.write("k", 1), null.read("k"), null.exist?("k"), null.increment("k"), null.delete("k"), null.clear, null.inspect])
+show("null store", [null.write("k", 1), null.read("k"), null.exist?("k"), null.increment("k"), null.delete("k"), null.clear, null.inspect.sub(/0x\h+/, "0x")])
 null.with_local_cache { show("null local", [null.write("k", 1), null.read("k"), null.fetch("k2") { 2 }, null.read("k2")]) }
 show("lookup nil", ActiveSupport::Cache.lookup_store.class.name)
 show("lookup symbol", [ActiveSupport::Cache.lookup_store(:memory_store, size: 10).class.name, ActiveSupport::Cache.lookup_store(:memory_store, size: 10).instance_variable_get(:@max_size)])
@@ -418,3 +424,67 @@ state.isolation_level = :thread
 show("back to thread", [state[:f], state.isolation_level])
 state.clear
 show("events at end", events)
+
+# --- 8.2: class_attribute settings, report-and-recover loads -------------
+# `logger` and `raise_on_invalid_cache_expiration_time` are class
+# attributes: a subclass's setting is its own, an instance's its own.
+class SubStore < ActiveSupport::Cache::MemoryStore; end
+class SubSubStore < SubStore; end
+base_logger = Lines.new
+sub_logger = Lines.new
+ActiveSupport::Cache::Store.logger = base_logger
+SubStore.logger = sub_logger
+show("class attribute logger", [ActiveSupport::Cache::MemoryStore.logger.equal?(base_logger), SubStore.logger.equal?(sub_logger), SubSubStore.logger.equal?(sub_logger), ActiveSupport::Cache::Store.logger.equal?(base_logger)])
+instance = SubStore.new
+instance_logger = Lines.new
+instance.logger = instance_logger
+show("instance logger", [instance.logger.equal?(instance_logger), SubStore.new.logger.equal?(sub_logger), SubStore.logger.equal?(sub_logger)])
+instance.write("il", 1)
+show("instance logger lines", [instance_logger.lines, sub_logger.lines, base_logger.lines])
+ActiveSupport::Cache::Store.logger = nil
+SubStore.logger = nil
+show("logger reset", [SubSubStore.logger, ActiveSupport::Cache::MemoryStore.logger])
+SubStore.raise_on_invalid_cache_expiration_time = true
+show("raise per class", [outcome { SubStore.new.write("neg", 1, expires_in: -1) }, ActiveSupport::Cache::MemoryStore.new.write("neg", 1, expires_in: -1), ActiveSupport::Cache::Store.raise_on_invalid_cache_expiration_time])
+quiet = SubStore.new
+quiet.raise_on_invalid_cache_expiration_time = false
+show("raise per instance", [quiet.write("neg", 1, expires_in: -1), SubStore.raise_on_invalid_cache_expiration_time])
+SubStore.raise_on_invalid_cache_expiration_time = false
+events
+
+# Payload keys: fetch hits name the normalized key, exist? carries its
+# options, counters their normalized key, cleanup a nil key.
+keyed = ActiveSupport::Cache::MemoryStore.new(namespace: "kp")
+keyed.write("hit", 1)
+keyed.fetch("hit") { 2 }
+keyed.exist?("hit", version: "v")
+keyed.increment("cnt")
+keyed.decrement("cnt")
+keyed.cleanup
+show("payload keys", events.map { |name, payload| [name, payload.to_h[:key], payload.to_h.keys.sort] })
+show("payload debug", [keyed.logger, (keyed.logger = Lines.new; keyed.exist?("hit", version: "v"); keyed.read_multi("hit", "x"); keyed.logger.lines)])
+events
+
+# The coder reports what it cannot load and recovers.
+REPORTED = []
+class Recorder
+  def report(error, handled:, severity:, context:, source:)
+    REPORTED << [error.class.name, error.message.lines.first.to_s.strip[0, 60], handled, severity, source]
+  end
+end
+ActiveSupport.error_reporter.subscribe(Recorder.new)
+module RaisingSerializer
+  def self.dump(value) = Marshal.dump(value)
+  def self.load(payload) = raise(TypeError, "cannot load #{payload.bytesize} bytes")
+end
+reporting = ActiveSupport::Cache::Coder.new(RaisingSerializer, nil)
+show("coder unsigned raise", [outcome { reporting.load("plain") }, REPORTED.last])
+show("coder truncated header", [outcome { reporting.load("\x00\x11\x01".b) }, REPORTED.last])
+dumped = ActiveSupport::Cache::Coder.new(ActiveSupport::Cache::SerializerWithFallback[:marshal_7_1], nil).dump(ActiveSupport::Cache::Entry.new({ a: 1 }, version: "v"))
+show("coder dump", [dumped.frozen?, dumped.encoding.to_s, dumped.bytesize])
+lazy = reporting.load(dumped)
+show("lazy entry raise", [lazy.class.name, outcome { lazy.value }, REPORTED.last, lazy.mismatched?("v")])
+corrupt = ActiveSupport::Cache::SerializerWithFallback[:marshal_7_0]
+bad_zlib = "\x01".b + "not zlib".b
+show("marshal 7.0 bad zlib", outcome { corrupt.load(bad_zlib) })
+show("reported", REPORTED.size)
