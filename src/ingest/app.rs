@@ -2682,6 +2682,17 @@ fn splice_concerns_into_models(app: &mut App) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
 
+    // Every constant the app defines, fully qualified: a carried
+    // statement's bare constant resolves in the concern's lexical scope.
+    let mut defined: crate::det::HashSet<String> = crate::det::HashSet::default();
+    for lc in &app.library_classes {
+        defined.insert(lc.name.0.as_str().to_string());
+        for (name, _) in &lc.constants {
+            defined.insert(format!("{}::{}", lc.name.0.as_str(), name.as_str()));
+        }
+    }
+    defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
+
     for model in &mut app.models {
         // Concerns already spliced into this model. A spliced item may
         // itself be an `include` (a concern's `included do include
@@ -2726,7 +2737,11 @@ fn splice_concerns_into_models(app: &mut App) {
                 .filter(|id| spliced.insert((*id).clone()))
                 .filter_map(|id| app.concern_model_items.get(id).map(|items| (id, items)))
                 .flat_map(|(id, items)| {
-                    items.iter().map(|item| rehome_default_fk(item, id, &model_name))
+                    let class_attributes = super::class_attribute::declared_names(items);
+                    let (model_name, defined) = (&model_name, &defined);
+                    items.iter().map(move |item| {
+                        rehome_carried(rehome_default_fk(item, id, model_name), id, model_name, &class_attributes, defined)
+                    })
                 })
                 .collect();
             if items.is_empty() {
@@ -2737,6 +2752,59 @@ fn splice_concerns_into_models(app: &mut App) {
             i += 1;
         }
     }
+}
+
+/// A carried `included do` statement or `class_attribute` def, as it
+/// stands in the includer. A `class_attribute` def (one of the
+/// concern's `class_attributes`, synthesized) belongs to the includer,
+/// as Rails defines it there. Rails runs the
+/// block with the concern's lexical scope, so a bare constant the concern
+/// can see (`Gate` in `MutationGuard`, meaning `MutationGuard::Gate`) is
+/// written qualified; in the includer's body it would resolve elsewhere.
+fn rehome_carried(
+    mut item: crate::dialect::ModelBodyItem,
+    concern: &crate::ident::ClassId,
+    model: &crate::ident::ClassId,
+    class_attributes: &[crate::ident::Symbol],
+    defined: &crate::det::HashSet<String>,
+) -> crate::dialect::ModelBodyItem {
+    use crate::dialect::ModelBodyItem;
+    use crate::expr::{Expr, ExprNode};
+    fn qualify(e: &mut Expr, scopes: &[String], defined: &crate::det::HashSet<String>) {
+        if let ExprNode::Const { path } = &mut *e.node
+            && let Some(first) = path.first()
+            && !first.as_str().is_empty()
+        {
+            let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            if let Some(scope) = scopes.iter().find(|scope| defined.contains(&format!("{scope}::{written}"))) {
+                let mut full: Vec<crate::ident::Symbol> =
+                    scope.split("::").map(crate::ident::Symbol::from).collect();
+                full.append(path);
+                *path = full;
+            }
+            return;
+        }
+        e.node.for_each_child_mut(&mut |child| qualify(child, scopes, defined));
+    }
+    match &mut item {
+        ModelBodyItem::Method { method, .. }
+            if method.name_span.is_synthetic()
+                && class_attributes.iter().any(|n| {
+                    method.name.as_str().trim_end_matches(['=', '?']) == n.as_str()
+                }) =>
+        {
+            method.enclosing_class = Some(model.0.clone())
+        }
+        ModelBodyItem::ClassBody { expr, .. } | ModelBodyItem::Unknown { expr, .. } => {
+            // Not the concern itself: the includer reaches the concern's
+            // own constants through its ancestry, as Rails does.
+            let segments: Vec<&str> = concern.0.as_str().split("::").collect();
+            let scopes: Vec<String> = (1..segments.len()).rev().map(|n| segments[..n].join("::")).collect();
+            qualify(expr, &scopes, defined);
+        }
+        _ => {}
+    }
+    item
 }
 
 /// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a

@@ -4717,6 +4717,38 @@ const CONCERN_MODEL_MACROS: &[&str] = &[
     "include",
 ];
 
+/// An ActiveSupport::Concern's `included do` statement that no DSL
+/// lowering claims, carried into each including model's class body as
+/// the includer's own statement. Not a visibility or definition
+/// statement: those shape the includer's methods, which the emitted
+/// body defines apart from its class-body statements, so they keep
+/// their refusal.
+fn carries_to_includer(item: &crate::dialect::ModelBodyItem) -> bool {
+    use crate::expr::ExprNode;
+    let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return false };
+    match &*expr.node {
+        ExprNode::Send { recv: None, method, .. } => !matches!(
+            method.as_str(),
+            "private"
+                | "protected"
+                | "public"
+                | "private_class_method"
+                | "public_class_method"
+                | "module_function"
+                | "private_constant"
+                | "public_constant"
+                | "attr_reader"
+                | "attr_writer"
+                | "attr_accessor"
+                | "alias_method"
+                | "define_method"
+                | "remove_method"
+                | "undef_method"
+        ),
+        _ => true,
+    }
+}
+
 /// True when an Unknown body item is one of [`CONCERN_MODEL_MACROS`].
 /// The block form counts — `has_one_attached :avatar do |attachable|
 /// attachable.variant … end` declares variants we don't model, and the
@@ -4808,6 +4840,18 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
         let Some(body) = module.body() else { continue };
         let mut items: Vec<ModelBodyItem> = Vec::new();
         let mut enums: Vec<ConcernEnumDecl> = Vec::new();
+        let is_concern = module.body().is_some_and(|b| flatten_statements(b).iter().any(|stmt| {
+            stmt.as_call_node().is_some_and(|call| {
+                call.receiver().is_none()
+                    && call.block().is_none()
+                    && constant_id_str(&call.name()) == "extend"
+                    && call.arguments().is_some_and(|args| {
+                        args.arguments().iter().any(|arg| {
+                            constant_path_of(&arg).is_some_and(|p| p.join("::") == "ActiveSupport::Concern")
+                        })
+                    })
+            })
+        }));
         for stmt in flatten_statements(body) {
             let Some(call) = stmt.as_call_node() else { continue };
             if call.receiver().is_some() || constant_id_str(&call.name()) != "included" {
@@ -4862,6 +4906,12 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                 // per attribute, and a concern splices ALL of them into
                 // every includer — keeping only the first would fault
                 // one field of several.
+                let is_direct = direct.iter().any(|stmt| stmt.location().start_offset() == inner.location().start_offset());
+                // `class_attribute` runs on the includer: its defs and
+                // its seed are carried like the model's own declaration.
+                let class_attribute = inner
+                    .as_call_node()
+                    .is_some_and(|call| super::class_attribute::parse(&call, file).is_some());
                 match super::model::ingest_model_body_items(&inner, &id, file, Vec::new(), None) {
                     Ok(parsed) => {
                         for mut item in parsed {
@@ -4870,6 +4920,11 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                                 | ModelBodyItem::Scope { .. }
                                 | ModelBodyItem::Validation { .. }
                                 | ModelBodyItem::Callback { .. } => items.push(item),
+                                ModelBodyItem::Method { .. } | ModelBodyItem::ClassBody { .. }
+                                    if class_attribute && is_direct && is_concern =>
+                                {
+                                    items.push(item)
+                                }
                                 // Block-form lifecycle callbacks
                                 // (`after_initialize do … end` —
                                 // lobsters' Token concern generates its
@@ -4892,9 +4947,21 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                                         || is_candidate(&item)
                                     {
                                         items.push(item);
-                                    } else if !matches!(&item, ModelBodyItem::Unknown { expr, .. }
+                                    } else if matches!(&item, ModelBodyItem::Unknown { expr, .. }
                                         if matches!(&*expr.node, crate::expr::ExprNode::Lit { .. }))
                                     {
+                                    } else if is_concern && is_direct && carries_to_includer(&item) {
+                                        // Rails runs the block in the
+                                        // includer's class body: carried
+                                        // there, in source order, as the
+                                        // includer's own statement. What
+                                        // the model lowering claims of it
+                                        // runs (a write through a carried
+                                        // `class_attribute`, a replayed
+                                        // inherited class-method call);
+                                        // the rest is reported there.
+                                        items.push(item);
+                                    } else {
                                         unclaimed = true;
                                     }
                                 }
