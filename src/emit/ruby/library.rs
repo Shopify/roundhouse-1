@@ -6857,7 +6857,7 @@ fn emit_library_class_decl_inner(
         }
     }
     let railtie_root = app.railties.iter().find(|r| r.name == lc.name).and_then(|r| r.root.clone());
-    let mut sources: Option<BTreeMap<String, String>> = None;
+    let mut sources: Option<std::rc::Rc<CarriedSources>> = None;
     for effect in &body_effects {
         let text = if railtie {
             super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
@@ -7364,6 +7364,8 @@ struct NameIndex {
     /// Each library class => the source files that declare it
     /// (`declared_files`).
     declared_in: HashMap<String, Vec<u32>>,
+    /// `carried_sources`, on first use.
+    carried: std::cell::OnceCell<std::rc::Rc<CarriedSources>>,
 }
 
 thread_local! {
@@ -7391,6 +7393,7 @@ impl NameIndex {
             controllers: app.controllers.iter().map(|c| c.name.0.as_str().to_string()).collect(),
             library_classes,
             declared_in: declaring_files(app),
+            carried: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -7762,7 +7765,7 @@ fn relative_source_path<'a>(app: &App, path: &'a str) -> &'a str {
 /// (`models/<stem>`, an app/models.rb anchor) its classes and modules
 /// are in. A file that reopens a class carried from several sources maps
 /// to that one emitted file.
-fn carried_source_files(app: &App) -> BTreeMap<String, String> {
+fn carried_source_files(app: &App) -> CarriedSources {
     let mut table: BTreeMap<String, String> = BTreeMap::new();
     // A file with a file program loads as that program, which loads its
     // declarations in turn.
@@ -7795,7 +7798,24 @@ fn carried_source_files(app: &App) -> BTreeMap<String, String> {
                 .or_insert_with(|| format!("models/{}", super::library_file_stem(first.0.as_str(), app)));
         }
     }
-    table
+    let app_files = app.sources.iter().map(|f| relative_source_path(app, &f.path).to_string()).collect();
+    CarriedSources { anchors: table, app_files }
+}
+
+/// `carried_source_files`, with every app source's root-relative path.
+pub(super) struct CarriedSources {
+    anchors: BTreeMap<String, String>,
+    app_files: crate::det::HashSet<String>,
+}
+
+/// `carried_source_files`, built once per `App` while the lookup indexes
+/// are installed: every file program and carried railtie asks, and the
+/// table walks every library class.
+fn carried_sources(app: &App) -> std::rc::Rc<CarriedSources> {
+    match NameIndex::current(app) {
+        Some(index) => index.carried.get_or_init(|| std::rc::Rc::new(carried_source_files(app))).clone(),
+        None => std::rc::Rc::new(carried_source_files(app)),
+    }
 }
 
 /// Where a file program's `require`/`require_relative` of `feature`
@@ -7804,11 +7824,10 @@ fn carried_source_files(app: &App) -> BTreeMap<String, String> {
 /// for it), `None` a feature outside the app (a gem's, the stdlib's).
 /// `rel` is the program's source, relative to the app root.
 fn program_require(
-    app: &App,
     rel: &str,
     feature: &str,
     relative: bool,
-    table: &BTreeMap<String, String>,
+    table: &CarriedSources,
 ) -> Option<Result<String, String>> {
     let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
     let source = if relative {
@@ -7825,16 +7844,17 @@ fn program_require(
         }
         Some(parts.join("/"))
     } else {
-        let mut hits = table.keys().filter(|src| **src == format!("lib/{rb}") || src.ends_with(&format!("/lib/{rb}")));
+        let (lib, nested) = (format!("lib/{rb}"), format!("/lib/{rb}"));
+        let mut hits = table.anchors.keys().filter(|src| **src == lib || src.ends_with(&nested));
         match (hits.next(), hits.next()) {
             (Some(src), None) => Some(src.clone()),
             _ => None,
         }
     };
-    if let Some(anchor) = source.as_ref().and_then(|src| table.get(src)) {
+    if let Some(anchor) = source.as_ref().and_then(|src| table.anchors.get(src)) {
         return Some(Ok(anchor.clone()));
     }
-    let app_file = source.as_ref().is_some_and(|src| app.sources.iter().any(|f| relative_source_path(app, &f.path) == src));
+    let app_file = source.as_ref().is_some_and(|src| table.app_files.contains(src));
     (app_file || relative).then(|| Err(source.unwrap_or_default()))
 }
 
@@ -7842,7 +7862,7 @@ fn program_require(
 /// an app file, resolved as `ProgramItem::Require` is: the emitted file,
 /// or a named error for one the tree does not carry. A feature outside
 /// the app stays as written.
-fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Option<BTreeMap<String, String>>) {
+fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Option<std::rc::Rc<CarriedSources>>) {
     if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*e.node {
         let relative = method.as_str() == "require_relative";
         let feature = match args.as_slice() {
@@ -7853,14 +7873,14 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
             _ => None,
         };
         if let (true, Some(feature)) = (relative || method.as_str() == "require", feature) {
-            let table = sources.get_or_insert_with(|| carried_source_files(app));
+            let table = sources.get_or_insert_with(|| carried_sources(app));
             let span = e.span;
             let mk = |node: ExprNode| Expr::new(span, node);
             let lit = |value: String| mk(ExprNode::Lit { value: crate::expr::Literal::Str { value } });
             let call = |recv: Option<Expr>, method: &str, args: Vec<Expr>, parenthesized: bool| {
                 mk(ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized })
             };
-            match program_require(app, rel, &feature, relative, table) {
+            match program_require(rel, &feature, relative, table) {
                 Some(Ok(anchor)) => {
                     let path = call(Some(mk(ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })), "path", vec![lit(anchor)], true);
                     *e = call(None, "require", vec![path], false);
@@ -7892,7 +7912,7 @@ fn carried_loads(
     e: &Expr,
     app: &App,
     root: Option<&str>,
-    sources: &mut Option<BTreeMap<String, String>>,
+    sources: &mut Option<std::rc::Rc<CarriedSources>>,
 ) -> Expr {
     let mut e = e.clone();
     rewrite_carried_loads(&mut e, app, root, sources);
@@ -7903,7 +7923,7 @@ fn rewrite_carried_loads(
     e: &mut Expr,
     app: &App,
     root: Option<&str>,
-    sources: &mut Option<BTreeMap<String, String>>,
+    sources: &mut Option<std::rc::Rc<CarriedSources>>,
 ) {
     let str_arg = |args: &[Expr]| -> Option<String> {
         match args {
@@ -7937,11 +7957,12 @@ fn rewrite_carried_loads(
         let span = e.span;
         if recv.is_none() && method.as_str() == "require" {
             if let Some(feature) = str_arg(args) {
-                let table = sources.get_or_insert_with(|| carried_source_files(app));
+                let table = sources.get_or_insert_with(|| carried_sources(app));
                 let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
                 let own = format!("{prefix}lib/{rb}");
-                let anchor = table.get(&own).or_else(|| {
-                    let mut hits = table.iter().filter(|(src, _)| *src == &format!("lib/{rb}") || src.ends_with(&format!("/lib/{rb}")));
+                let (lib, nested) = (format!("lib/{rb}"), format!("/lib/{rb}"));
+                let anchor = table.anchors.get(&own).or_else(|| {
+                    let mut hits = table.anchors.iter().filter(|(src, _)| **src == lib || src.ends_with(&nested));
                     match (hits.next(), hits.next()) {
                         (Some((_, a)), None) => Some(a),
                         _ => None,
@@ -7986,7 +8007,7 @@ fn rewrite_carried_loads(
             let supported = |p: &str| !p.contains(['?', '{', '}', '[', ']', '\\']);
             if let Some(pattern) = pattern.filter(|p| supported(p)) {
                 let full = format!("{prefix}{}", pattern.trim_start_matches('/'));
-                let table = sources.get_or_insert_with(|| carried_source_files(app));
+                let table = sources.get_or_insert_with(|| carried_sources(app));
                 let mut matched: Vec<String> = app
                     .sources
                     .iter()
@@ -7998,7 +8019,7 @@ fn rewrite_carried_loads(
                 let mut anchors: Vec<Expr> = Vec::new();
                 let mut missing: Vec<Expr> = Vec::new();
                 for source in &matched {
-                    match table.get(source) {
+                    match table.anchors.get(source) {
                         Some(anchor) => {
                             if !anchors.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Str { value } } if value == anchor)) {
                                 anchors.push(lit(span, anchor));
@@ -8049,7 +8070,7 @@ pub(super) fn emit_file_program(
     emitted: &BTreeSet<String>,
 ) -> String {
     use crate::app::ProgramItem;
-    let mut sources: Option<BTreeMap<String, String>> = None;
+    let mut sources: Option<std::rc::Rc<CarriedSources>> = None;
     let rel = relative_source_path(app, &program.source).to_string();
     let mut s = format!(
         "# The file-level program of {rel}: what Ruby runs when it loads\n\
@@ -8083,7 +8104,7 @@ pub(super) fn emit_file_program(
         rel: &str,
         out_path: &Path,
         emitted: &BTreeSet<String>,
-        sources: &mut Option<BTreeMap<String, String>>,
+        sources: &mut Option<std::rc::Rc<CarriedSources>>,
         loaded: &mut BTreeSet<String>,
         s: &mut String,
     ) {
@@ -8124,9 +8145,9 @@ pub(super) fn emit_file_program(
                     writeln!(s, "{pad}end").unwrap();
                 }
                 ProgramItem::Require { span, feature, relative } => {
-                    let table = sources.get_or_insert_with(|| carried_source_files(app));
+                    let table = sources.get_or_insert_with(|| carried_sources(app));
                     let site = statement_site(app, *span);
-                    match program_require(app, rel, feature, *relative, table) {
+                    match program_require(rel, feature, *relative, table) {
                         Some(Ok(anchor)) => {
                             if loaded.insert(anchor.clone()) {
                                 require_anchor(s, &anchor);
