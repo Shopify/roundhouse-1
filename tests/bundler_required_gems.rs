@@ -92,3 +92,49 @@ fn the_emitted_bundler_require_list_boots() {
     assert_eq!(run.stdout, "booted\n", "{}", run.stderr);
     assert!(!run.stderr.contains("roundhouse: require"), "{}", run.stderr);
 }
+
+/// Ruby 4.0's stdlib cgi.rb is a stub (cgi/escape only, and a warning
+/// under $VERBOSE) that a plain `require "cgi"` finds before the gem.
+/// Under Bundler the lock's cgi is on the load path; vcr 6.3.1, in Core's
+/// test group, calls `CGI.method(:parse)` as it loads. The emitted tree
+/// activates the locked cgi before the Bundler.require list runs.
+#[test]
+fn a_bundler_required_gem_loads_the_locked_cgi_not_the_stdlib_stub() {
+    let lock = LOCK
+        .replace("    ci-queue (0.101.0)\n", "    cgi (0.4.2)\n    ci-queue (0.101.0)\n")
+        .replace("    rbi (0.3.6)\n", "    rbi (0.3.6)\n      cgi\n");
+    let (dir, errors) = app().write("Gemfile.lock", &lock).emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("RBI::Tree")), "{errors:#?}");
+    let pins = std::fs::read_to_string(dir.join("runtime/bundled_gems.rb")).expect("bundled_gems.rb");
+    assert!(pins.contains("  [\"cgi\", \"0.4.2\"],\n"), "{pins}");
+
+    // A gem home with the locked cgi and an rbi whose entry needs the
+    // gem's CGI.parse, ahead of the interpreter's own gems.
+    let home = dir.join("tmp-gem-home");
+    let gem = |name: &str, version: &str, file: &str, body: &str| {
+        let lib = home.join(format!("gems/{name}-{version}/lib"));
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join(file), body).unwrap();
+        std::fs::create_dir_all(home.join("specifications")).unwrap();
+        std::fs::write(
+            home.join(format!("specifications/{name}-{version}.gemspec")),
+            format!("Gem::Specification.new do |s|\n  s.name = {name:?}\n  s.version = {version:?}\n  s.summary = \"x\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"lib\"]\nend\n"),
+        )
+        .unwrap();
+    };
+    gem("cgi", "0.4.2", "cgi.rb", "class CGI\n  def self.parse(query) = {\"q\" => [query]}\nend\n");
+    gem("rbi", "0.3.6", "rbi.rb", "require \"cgi\"\nmodule RBI\n  PARSER = CGI.method(:parse)\nend\n");
+    let own = emit_and_run::ruby().args(["-e", "print Gem.path.join(File::PATH_SEPARATOR)"]).output().expect("ruby");
+    let gem_path = format!("{}:{}", home.display(), String::from_utf8_lossy(&own.stdout));
+    let out = std::process::Command::new("ruby")
+        .current_dir(&dir)
+        .env("GEM_PATH", &gem_path)
+        .env("BLOG_DB", ":memory:")
+        .args(["-W1", "-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\np RBI::PARSER.call(\"x\")\n"])
+        .output()
+        .expect("spawn ruby");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"q\" => [\"x\"]}\n", "{stderr}");
+    assert!(!stderr.contains("CGI library is removed"), "{stderr}");
+}

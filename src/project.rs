@@ -9705,6 +9705,15 @@ const RUBY_BUNDLED_GEMS: [&str; 23] = [
     "benchmark", "irb", "reline", "tsort",
 ];
 
+/// Libraries Ruby 4.0 removed from its default gems, leaving a stdlib
+/// stub a plain `require` finds before the gem: lib/ruby/4.0.0/cgi.rb
+/// keeps only cgi/escape (and warns under $VERBOSE). Under Bundler the
+/// lock's cgi gem is on the load path instead; vcr 6.3.1, which Core's
+/// test group Bundler.requires, calls `CGI.method(:parse)` as it loads.
+/// Activated at the locked version as `RUBY_BUNDLED_GEMS` are, before
+/// boot.rb's `require "cgi"`.
+const RUBY_REMOVED_DEFAULT_GEMS: [&str; 1] = ["cgi"];
+
 /// So runtime/bundled_gems.rb activates the bundled gems the lock pins,
 /// at the pinned version, as Bundler.setup would, and runtime/gem_facades.rb
 /// requires it first. A pinned version that is not installed is left to
@@ -9713,6 +9722,7 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
     let Some(lock) = lock else { return };
     let entries: String = RUBY_BUNDLED_GEMS
         .iter()
+        .chain(&RUBY_REMOVED_DEFAULT_GEMS)
         .filter_map(|gem| {
             let version = lock.version_of(gem)?;
             // A platform spec (`1.1.8-x86_64-linux`) is pinned by its version.
@@ -9743,6 +9753,14 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
     let facades = &mut files[idx].1;
     if !facades.contains("require_relative \"bundled_gems\"") {
         facades.insert_str(0, "require_relative \"bundled_gems\"\n");
+    }
+    // Before boot.rb's own stdlib requires: its `require "cgi"` would
+    // otherwise load Ruby 4.0's stub, and the activated gem's cgi.rb
+    // would never load.
+    if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
+        if !boot.contains("require_relative \"runtime/bundled_gems\"") {
+            boot.insert_str(0, "require_relative \"runtime/bundled_gems\"\n");
+        }
     }
 }
 
