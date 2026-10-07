@@ -1,5 +1,6 @@
-# Native ActiveSupport 8.1.4 oracle for ActiveSupport::Testing::TimeHelpers
-# against runtime/spinel/active_support_testing_time_helpers.rb. Each mode
+# Native ActiveSupport oracle for ActiveSupport::Testing::TimeHelpers
+# against runtime/spinel/active_support_testing_time_helpers.rb. The
+# oracle is the Rails native Core runs (tests/support/rails_oracle.rb). Each mode
 # prints one line per observation; `compare` requires them equal.
 #
 # Both modes run in one zone (TZ=America/New_York, and natively Time.zone
@@ -8,6 +9,7 @@
 # are shown as instants with their offsets, not as TimeWithZone or Time
 # inspections, which differ by class alone.
 require "json"
+require_relative "support/rails_oracle"
 
 ZONE = "America/New_York"
 
@@ -26,7 +28,7 @@ if ARGV.first == "compare"
     abort "time helpers differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and the emitted TimeHelpers agree"
+  puts "Native ActiveSupport and the emitted TimeHelpers agree (#{RailsOracle.label})"
   exit
 end
 
@@ -34,7 +36,7 @@ abort "run under TZ=#{ZONE}" unless ENV["TZ"] == ZONE
 abort "TZ=#{ZONE} is not in effect (set TZDIR)" unless Time.utc(2001, 2, 3).getlocal.utc_offset == -5 * 3600
 
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/time"
   require "active_support/testing/time_helpers"
@@ -114,6 +116,8 @@ show "back to real", Time.now.to_i >= real_start
 
 host.travel_to(target, with_usec: true)
 show "with_usec", at(Time.now)
+# 8.2 carries the sub-second part into DateTime.now (8.1 dropped it).
+show "with_usec datetime", [DateTime.now.sec_fraction, DateTime.now.iso8601(6)]
 host.travel_back
 
 host.travel_to(Date.new(2004, 11, 24))
