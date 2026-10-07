@@ -317,7 +317,15 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         };
         let assoc = first.as_assoc_node()?;
         let key_ty = type_of_literal_node(&assoc.key())?;
-        let value_ty = type_of_literal_node(&assoc.value())?;
+        // A table of lists or of tables (`OPTION_ALIASES = { expires_in:
+        // [:expire_in, :expired_in] }`) types by the same rules, one
+        // level in.
+        let value = assoc.value();
+        let value_ty = type_of_literal_node(&value).or_else(|| {
+            (value.as_array_node().is_some() || value.as_hash_node().is_some())
+                .then(|| type_of_const_literal(&value))
+                .flatten()
+        })?;
         return Some(Ty::Hash {
             key: Box::new(key_ty),
             value: Box::new(value_ty),
@@ -1513,6 +1521,22 @@ mod tests {
         let mut methods = parse_methods(src).expect("parses");
         assert_eq!(methods.len(), 1, "expected exactly one method");
         methods.remove(0)
+    }
+
+    #[test]
+    fn a_table_of_lists_types_its_values() {
+        let types = parse_module_constants(
+            "module Cache\n  OPTION_ALIASES = {\n    expires_in: [:expire_in, :expired_in]\n  }.freeze\n  POOL = { size: 5 }.freeze\nend\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            types.get(&Symbol::from("OPTION_ALIASES")),
+            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Array { elem: Box::new(Ty::Sym) }) })
+        );
+        assert_eq!(
+            types.get(&Symbol::from("POOL")),
+            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Int) })
+        );
     }
 
     #[test]

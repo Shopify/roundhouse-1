@@ -35,6 +35,7 @@ module Rails
     def to_s: () -> String
     def to_str: () -> String
     def to_sym: () -> Symbol
+    def capitalize: () -> String
     def inspect: () -> String
     def ==: (Object other) -> bool
     def eql?: (Object other) -> bool
