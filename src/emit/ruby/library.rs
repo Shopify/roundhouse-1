@@ -6615,11 +6615,33 @@ fn emit_library_class_decl_inner(
         }
         _ => lc,
     };
-    let carrier_extends: Vec<&crate::ident::ClassId> = carrier_splices
+    let spliced_extends: Vec<&crate::ident::ClassId> = carrier_splices
         .into_iter()
         .flatten()
         .filter(|splice| splice.extend)
         .map(|splice| &splice.carrier)
+        .collect();
+    // A `class_eval` body is no library class the ingest spliced
+    // concerns into, so its includes' carriers are found here, each
+    // include's extended right after it, as its `append_features` does.
+    let mut include_extends: Vec<(&ClassId, Vec<ClassId>)> = Vec::new();
+    if name_is_class_eval_body(lc) {
+        let mut extended: Vec<ClassId> = Vec::new();
+        for inc in &lc.includes {
+            let carriers: Vec<ClassId> = concern_carrier_extends(std::slice::from_ref(inc), app)
+                .into_iter()
+                .filter(|c| !extended.contains(c))
+                .collect();
+            extended.extend(carriers.iter().cloned());
+            if !carriers.is_empty() {
+                include_extends.push((inc, carriers));
+            }
+        }
+    }
+    let carrier_extends: Vec<&crate::ident::ClassId> = spliced_extends
+        .iter()
+        .copied()
+        .chain(include_extends.iter().flat_map(|(_, carriers)| carriers.iter()))
         .collect();
     if !lc.top_level_constants.is_empty() {
         return emit_with_top_level_constants(lc, app, out_path, synthesized_siblings);
@@ -6977,14 +6999,24 @@ fn emit_library_class_decl_inner(
             positioned.push((at, inc));
         }
     }
+    let write_extend = |s: &mut String, carrier: &ClassId| {
+        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
+    };
+    let extends_of = |inc: &ClassId| -> Vec<ClassId> {
+        include_extends.iter().filter(|(i, _)| *i == inc).flat_map(|(_, c)| c.iter().cloned()).collect()
+    };
     for inc in &lc.includes {
         if positioned.iter().any(|(_, p)| *p == inc) {
             continue;
         }
         write_include(&mut s, inc);
+        extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
     }
-    for carrier in &carrier_extends {
-        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
+    for carrier in &spliced_extends {
+        write_extend(&mut s, carrier);
+    }
+    for (_, inc) in &positioned {
+        extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
     }
     if (lc.includes.len() > positioned.len() || !carrier_extends.is_empty()) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
@@ -8103,6 +8135,55 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
         parent = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.as_ref());
     }
     false
+}
+
+/// Whether `lc` is a `class_eval` block's body (`ProgramItem::ClassEval`).
+fn name_is_class_eval_body(lc: &LibraryClass) -> bool {
+    lc.name.0.as_str() == crate::ingest::library_class::CLASS_EVAL_BODY
+}
+
+/// Whether a module body `extend`s ActiveSupport::Concern.
+fn extends_concern(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| matches!(&*call.node,
+        ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "extend"
+            && args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path }
+                if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern"))))
+}
+
+/// The nested `ClassMethods` modules that ActiveSupport::Concern's
+/// `append_features` extends a receiver with when it includes
+/// `includes`, in the order Ruby extends them, as the ingest's
+/// `splice_concern_class_methods_into_includers` finds them for a
+/// library class (`App::class_methods_carrier_splices`): through
+/// Concerns only, since a Concern defers its own includes to its
+/// includer and a plain module performs them on itself, whose authored
+/// `included` hook does any extending. asset_cloud's
+/// `AssetCloud::Base.class_eval do include AssetCloud::Callbacks;
+/// callback_methods :write, :delete end`: the macro is a method of the
+/// Concern's `ClassMethods`.
+fn concern_carrier_extends(includes: &[ClassId], app: &App) -> Vec<ClassId> {
+    let is_concern = |name: &str| library_classes_named(name, app).iter().any(|c| c.is_module && extends_concern(c));
+    let mut queue: std::collections::VecDeque<(String, bool)> =
+        includes.iter().map(|i| (i.0.as_str().trim_start_matches("::").to_string(), true)).collect();
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut out: Vec<ClassId> = Vec::new();
+    while let Some((name, via)) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let concern = via && is_concern(&name);
+        for c in library_classes_named(&name, app) {
+            queue.extend(c.includes.iter().map(|n| (n.0.as_str().trim_start_matches("::").to_string(), concern)));
+        }
+        let carrier = format!("{name}::ClassMethods");
+        if concern && library_classes_named(&carrier, app).iter().any(|c| c.is_module) {
+            out.push(ClassId(Symbol::from(carrier.as_str())));
+        }
+    }
+    // Ruby runs a Concern's deferred includes before its own extend, and
+    // `include A, B` includes B first; the last extend has precedence.
+    out.reverse();
+    out
 }
 
 /// Whether a module body uses ActiveSupport::Concern's hooks, which
