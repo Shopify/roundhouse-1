@@ -1,7 +1,7 @@
 // ActiveModel's attribute types and ActiveRecord::Type's names over them
 // (runtime/spinel/active_model_type.rb: Type::{Value,ImmutableString,
-// String,Integer,BigInteger,Binary,Boolean,DateTime} with their helpers, ActiveRecord::
-// Type::{Text,DateTime}) against activemodel / activerecord 8.2.0.alpha
+// String,Integer,BigInteger,Binary,Boolean,DateTime,Decimal} with their helpers,
+// ActiveRecord::Type::{Text,DateTime}) against activemodel / activerecord 8.2.0.alpha
 // (Core's pinned Shopify/rails 5813559f, from CORE_GEM_HOME):
 // tests/active_model_type_runtime.rb runs the same observations natively
 // and on the port and requires every observation equal.
@@ -37,6 +37,10 @@ fn attribute_types_answer_like_activemodel() {
         "QueryPredicates type?: [true, false, true, false, true, false]",
         "AR::BigInteger serialize 9223372036854775808: 9223372036854775808",
         "AR::Binary type: :binary",
+        "AR::Decimal type: :decimal",
+        "AR::Decimal(precision: 20, scale: 3) cast \"1.7\": BigDecimal(0.17e1 precision=2 frozen=true)",
+        "Decimal#1 cast BigDecimal(0.123456e1): \"BigDecimal(0.1235e1 precision=4 frozen=true)\"",
+        "MoneyColumn-like serialize: [nil, BigDecimal(0.12e2 precision=2 frozen=true), BigDecimal(0.35e1 precision=2 frozen=true), BigDecimal(0.725e1 precision=3 frozen=true), :decimal, false]",
         r#"Binary serialize: "[\"ActiveModel::Type::Binary::Data\""#,
         "AR::DateTime(timezone: :local, precision: 3) as_schema_json: {\"precision\" => 3, \"scale\" => nil, \"limit\" => nil, \"timezone\" => :local}",
     ] {

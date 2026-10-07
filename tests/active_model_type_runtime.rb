@@ -13,7 +13,9 @@
 # DateTime and BigDecimal values are not in the battery: what the types
 # answer for one comes from ActiveSupport's extensions of those classes
 # (DateTime#to_i / #nsec / #getutc, BigDecimal#to_s), which the tree
-# does not carry, not from the types.
+# does not carry, not from the types. A BigDecimal RESULT (Decimal's
+# cast) prints through `to_s("E")` and `precision`, which neither side
+# reopens; Decimal's BigDecimal inputs are observed separately below.
 #
 # The process runs in a fixed non-UTC zone so the :local timezone
 # branches are observed too.
@@ -92,6 +94,8 @@ def describe(value)
     "Time(#{value.strftime("%Y-%m-%d %H:%M:%S.%N %z")} utc=#{value.utc?} zone=#{value.zone.inspect})"
   when ::Array
     "[#{value.map { |v| describe(v) }.join(", ")}]"
+  when ::BigDecimal
+    "BigDecimal(#{value.to_s("E")} precision=#{value.precision} frozen=#{value.frozen?})"
   else
     value.inspect.gsub(/0x\h+/, "0x")
   end
@@ -130,6 +134,15 @@ TYPES = {
   "AR::DateTime(timezone: :local, precision: 3)" => -> { AR::DateTime.new(timezone: :local, precision: 3) },
   "AM::DateTime(precision: 6)" => -> { AM::DateTime.new(precision: 6) },
   "AR::Boolean" => -> { AR::Boolean.new },
+  # shopify-money's MoneyColumn::ActiveRecordType / Money::Type build
+  # `.new` with no options; the rest are the column shapes a decimal
+  # column takes.
+  "AR::Decimal" => -> { AR::Decimal.new },
+  "AR::Decimal(precision: 20, scale: 3)" => -> { AR::Decimal.new(precision: 20, scale: 3) },
+  "AR::Decimal(precision: 5)" => -> { AR::Decimal.new(precision: 5) },
+  "AR::Decimal(precision: 30)" => -> { AR::Decimal.new(precision: 30) },
+  "AR::Decimal(scale: 2)" => -> { AR::Decimal.new(scale: 2) },
+  "AM::Decimal(precision: 10, scale: 0)" => -> { AM::Decimal.new(precision: 10, scale: 0) },
   "AR::Value(precision: 1, scale: 2, limit: 3)" => -> { AR::Value.new(precision: 1, scale: 2, limit: 3) },
 }
 
@@ -203,7 +216,7 @@ show "AR::DateTime vs AM::DateTime", AR::DateTime.new == AM::DateTime.new
 show "AR::DateTime timezone", AR::DateTime.new(timezone: :local) == AR::DateTime.new(timezone: :utc)
 show "AR::DateTime same timezone", AR::DateTime.new(timezone: :local) == AR::DateTime.new(timezone: :local)
 show "hash differs by limit", AR::Integer.new(limit: 8).hash == AR::Integer.new.hash
-show "aliases", [AR::BigInteger.equal?(AM::BigInteger), AR::Binary.equal?(AM::Binary), AR::Integer.equal?(AM::Integer), AR::String.equal?(AM::String), AR::Boolean.equal?(AM::Boolean), AR::Value.equal?(AM::Value), AR::ImmutableString.equal?(AM::ImmutableString)]
+show "aliases", [AR::Decimal.equal?(AM::Decimal), AR::BigInteger.equal?(AM::BigInteger), AR::Binary.equal?(AM::Binary), AR::Integer.equal?(AM::Integer), AR::String.equal?(AM::String), AR::Boolean.equal?(AM::Boolean), AR::Value.equal?(AM::Value), AR::ImmutableString.equal?(AM::ImmutableString)]
 show "Text superclass", AR::Text.superclass.name
 show "AR::DateTime superclass", AR::DateTime.superclass.name
 show "RangeError ancestry", ActiveModel::RangeError.ancestors.take_while { |m| m != Exception }.map(&:name)
@@ -262,4 +275,28 @@ show "Binary serialize", outcome { s = AR::Binary.new.serialize("ab"); [s.class.
 show "Binary serialize Data", outcome { s = AR::Binary.new.serialize(DATA.new("ab")); [s.class.name, s.to_s] }
 show "Binary cast Data", outcome { v = AR::Binary.new.cast(DATA.new("é")); [v, v.encoding.name] }
 show "Binary changed_in_place?", [AR::Binary.new.changed_in_place?("ab", "ab"), AR::Binary.new.changed_in_place?("ab", "ac"), AR::Binary.new.changed_in_place?(DATA.new("ab"), "ab")]
+# Decimal over BigDecimal inputs and its constants.
+show "Decimal BIGDECIMAL_PRECISION", AM::Decimal::BIGDECIMAL_PRECISION
+show "Decimal private", [:cast_value, :convert_float_to_big_decimal, :float_precision, :apply_scale].map { |m| AR::Decimal.private_method_defined?(m) }
+[AR::Decimal.new, AR::Decimal.new(precision: 20, scale: 3), AR::Decimal.new(precision: 4), AR::Decimal.new(scale: 0)].each_with_index do |type, i|
+  [BigDecimal("1.23456"), BigDecimal("-0.0005"), BigDecimal("123456789012345678901234.5"), BigDecimal("NaN"), BigDecimal("Infinity"), BigDecimal("-0")].each do |value|
+    show "Decimal##{i} cast BigDecimal(#{value.to_s("E")})", outcome { type.cast(value) }
+    show "Decimal##{i} serialize BigDecimal(#{value.to_s("E")})", outcome { type.serialize(value) }
+    show "Decimal##{i} changed?(x, x, x) BigDecimal(#{value.to_s("E")})", outcome { type.changed?(value, value, value) }
+  end
+  show "Decimal##{i} cast to_d object", outcome { o = Object.new; def o.to_d = BigDecimal("4.56789"); type.cast(o) }
+  show "Decimal##{i} cast 0.1 + 0.2", outcome { type.cast(0.1 + 0.2) }
+  show "Decimal##{i} cast 2**70", outcome { type.cast(2**70) }
+  show "Decimal##{i} cast Rational(1, 3)", outcome { type.cast(Rational(1, 3)) }
+end
+show "Decimal changed? string to number", [AR::Decimal.new.changed?(BigDecimal("1"), BigDecimal("1"), "1.0"), AR::Decimal.new.changed?(BigDecimal("1"), nil, "wibble")]
+# The shape of shopify-money's MoneyColumn::ActiveRecordType: a subclass
+# whose serialize hands `money.to_d` to Decimal's.
+class MoneyColumnProbe < ActiveRecord::Type::Decimal
+  def serialize(money)
+    return unless money
+    super(money.to_d)
+  end
+end
+show "MoneyColumn-like serialize", [MoneyColumnProbe.new.serialize(nil), MoneyColumnProbe.new.serialize(12), MoneyColumnProbe.new.serialize("3.5"), MoneyColumnProbe.new.cast("7.25"), MoneyColumnProbe.new.type, MoneyColumnProbe.serialize_cast_value_compatible?]
 show "Binary string binary cast keeps object", outcome { s = "ab".b; AR::Binary.new.cast(s).equal?(s) }
