@@ -185,12 +185,18 @@ pub struct FixpointRounds {
 /// Rounds a whole-program fixpoint loop may run.
 pub const FIXPOINT_CAP: usize = 12;
 
+/// [`FIXPOINT_CAP`], or `ROUNDHOUSE_FIXPOINT_CAP` when set: a diagnostic
+/// for asking whether a loop that reaches the cap would settle later.
+pub fn fixpoint_cap() -> usize {
+    std::env::var("ROUNDHOUSE_FIXPOINT_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(FIXPOINT_CAP)
+}
+
 impl std::fmt::Display for FixpointRounds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let one = |name: &str, n: Option<usize>| match n {
             Some(0) => format!("{name} not run"),
-            Some(n) => format!("{name} settled in {n} of {FIXPOINT_CAP}"),
-            None => format!("{name} at cap {FIXPOINT_CAP}, still moving"),
+            Some(n) => format!("{name} settled in {n} of {}", fixpoint_cap()),
+            None => format!("{name} at cap {}, still moving", fixpoint_cap()),
         };
         write!(
             f,
@@ -1163,7 +1169,7 @@ impl Analyzer {
         // settles on round 9.
         let mut prev_sig = self.capture_inference_sig();
         let mut cycles = cycles::CycleWidening::default();
-        for round in 0..FIXPOINT_CAP {
+        for round in 0..fixpoint_cap() {
             crate::timings::phase(format_args!("round {round}: harvest returns"), || {
                 self.harvest_returns_to_registry(app, false)
             });
@@ -1212,8 +1218,8 @@ impl Analyzer {
         // harvested helper surface rather than leftover untyped.
         let production_sig = prev_sig.clone();
         let mut production_view_params = None;
-        let mut cycles = cycles::CycleWidening::default();
-        for round in 0..FIXPOINT_CAP {
+        let mut cycles = cycles.next_loop();
+        for round in 0..fixpoint_cap() {
             crate::timings::phase(
                 if round == 0 {
                     "typing passes (views after fixpoint)".to_string()
@@ -1268,8 +1274,8 @@ impl Analyzer {
         }
         if !self.inference_matches(&production_sig) {
             let mut absorb_sig = self.capture_inference_sig();
-            let mut cycles = cycles::CycleWidening::default();
-            for round in 0..FIXPOINT_CAP {
+            let mut cycles = cycles.next_loop();
+            for round in 0..fixpoint_cap() {
                 crate::timings::phase(
                     if round == 0 {
                         "typing passes (after view unify)".to_string()
@@ -1322,6 +1328,7 @@ impl Analyzer {
                 )
             });
             self.harvest_returns_to_registry(app, true);
+            self.limit_depths(&mut cycles);
         }
         crate::timings::note(format_args!("fixpoint rounds: {}", self.fixpoint_rounds));
         // Wave 12 types views once against production-only helper
