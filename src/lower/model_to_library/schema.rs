@@ -102,7 +102,7 @@ pub(super) fn push_schema_methods(
         }
         if is_generic_json_col(col, model) {
             // Hydration writes stored JSON text without dump; the public
-            // `<col>=` writer always goes through JsonColumn.dump.
+            // `<col>=` writer always goes through RoundhouseJsonColumn.dump.
             methods.push(synth_json_storage_writer(owner, col));
         }
         if is_temporal_col(col) {
@@ -992,7 +992,7 @@ fn synth_attr_reader(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
     }
 }
 
-/// A column whose public accessors go through `JsonColumn` load/dump:
+/// A column whose public accessors go through `RoundhouseJsonColumn` load/dump:
 /// schema `t.json` / `t.jsonb` (except `has_json` keyed schemas), or an
 /// ActiveRecord `serialize …, coder: JSON` declaration on text/string/json.
 fn is_generic_json_col(col: &Column, model: &Model) -> bool {
@@ -1005,7 +1005,7 @@ fn is_generic_json_col(col: &Column, model: &Model) -> bool {
             .any(|decl| decl.column == col.name)
 }
 
-/// `JsonColumn.load(@<col>)` — decode serialized DB text at the public
+/// `RoundhouseJsonColumn.load(@<col>)` — decode serialized DB text at the public
 /// accessor boundary. JSON is schema-less, so the logical value is the
 /// deliberate gradual type while the backing slot remains String.
 fn json_reader_body(col: &Column) -> Expr {
@@ -1016,7 +1016,7 @@ fn json_reader_body(col: &Column) -> Expr {
             ExprNode::Send {
                 recv: Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Const { path: vec![Symbol::from("JsonColumn")] },
+                    ExprNode::Const { path: vec![Symbol::from("RoundhouseJsonColumn")] },
                 )),
                 method: Symbol::from("load"),
                 args: vec![stored],
@@ -1035,7 +1035,7 @@ fn json_dump_value(col: &Column, value: Expr) -> Expr {
             ExprNode::Send {
                 recv: Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Const { path: vec![Symbol::from("JsonColumn")] },
+                    ExprNode::Const { path: vec![Symbol::from("RoundhouseJsonColumn")] },
                 )),
                 method: Symbol::from("dump"),
                 args: vec![value],
@@ -1354,7 +1354,7 @@ fn synth_enum_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
 }
 
 /// Internal JSON hydration writes already-serialized DB text into the
-/// String slot without `JsonColumn.dump` (which would double-encode).
+/// String slot without `RoundhouseJsonColumn.dump` (which would double-encode).
 fn synth_json_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
     let value = Symbol::from("value");
     let slot_ty = super::ty_of_column_slot(col);
@@ -3055,7 +3055,7 @@ fn synth_index_read(owner: &ClassId, table: &Table, model: &Model) -> MethodDef 
     // `attributes` and the raw Date reader still expose stored text.
     // JSON columns are another exception: a
     // `has_json` declaration builds its typed Hash from the flat readers; a
-    // schema-less column decodes through `JsonColumn.load`.
+    // schema-less column decodes through `RoundhouseJsonColumn.load`.
     let arms: Vec<crate::expr::Arm> = table
         .columns
         .iter()
