@@ -1,6 +1,6 @@
 // ActiveModel's attribute types and ActiveRecord::Type's names over them
 // (runtime/spinel/active_model_type.rb: Type::{Value,ImmutableString,
-// String,Integer,Boolean,DateTime} with their helpers, ActiveRecord::
+// String,Integer,BigInteger,Binary,Boolean,DateTime} with their helpers, ActiveRecord::
 // Type::{Text,DateTime}) against activemodel / activerecord 8.2.0.alpha
 // (Core's pinned Shopify/rails 5813559f, from CORE_GEM_HOME):
 // tests/active_model_type_runtime.rb runs the same observations natively
@@ -35,6 +35,9 @@ fn attribute_types_answer_like_activemodel() {
         "utc=false zone=\"ABC\"",
         "AR::DateTime(timezone: :local, precision: 3) from schema json: [true, true, nil, true, ",
         "QueryPredicates type?: [true, false, true, false, true, false]",
+        "AR::BigInteger serialize 9223372036854775808: 9223372036854775808",
+        "AR::Binary type: :binary",
+        r#"Binary serialize: "[\"ActiveModel::Type::Binary::Data\""#,
         "AR::DateTime(timezone: :local, precision: 3) as_schema_json: {\"precision\" => 3, \"scale\" => nil, \"limit\" => nil, \"timezone\" => :local}",
     ] {
         assert!(stdout.contains(seen), "missing observation {seen:?}");

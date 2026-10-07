@@ -5,9 +5,9 @@
 # 5813559f, the version Core pins) for the CRuby and JRuby
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
-# Type::{ImmutableString,String,Integer,Boolean,DateTime}, and
-# ActiveRecord::Type::{Value,ImmutableString,String,Integer,Boolean} (the
-# same classes), ActiveRecord::Type::Text, ActiveRecord::Type::DateTime
+# Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime},
+# and ActiveRecord::Type::{Value,ImmutableString,String,Integer,BigInteger,
+# Binary,Boolean} (the same classes), ActiveRecord::Type::Text, ActiveRecord::Type::DateTime
 # with Internal::Timezone. An app that builds column types itself needs
 # them, for example Core's DeveloperDashboard::FastDev::TablelessSchema,
 # which builds `ActiveRecord::Type::Integer.new(limit: 8)` and its
@@ -15,7 +15,7 @@
 #
 # Each method follows the 8.2.0.alpha source (activemodel
 # lib/active_model/type/{value,serialize_cast_value,immutable_string,
-# string,integer,boolean,date_time}.rb and type/helpers/*.rb; activerecord
+# string,integer,big_integer,binary,boolean,date_time}.rb and type/helpers/*.rb; activerecord
 # lib/active_record/type/{text,date_time}.rb and type/internal/
 # timezone.rb). tests/active_model_type_runtime.rb runs the same
 # observations against that native ActiveModel and this file and
@@ -34,8 +34,10 @@
 #   no zone), so every time casts in UTC.
 # - The type registries (`ActiveModel::Type.lookup` / `register`,
 #   ActiveRecord's AdapterSpecificRegistry) and the other types (Date,
-#   Time, Decimal, Float, BigInteger, Binary, Json, Serialized) are not
+#   Time, Decimal, Float, Json, Serialized) are not
 #   ported. No code the tree carries reaches them yet.
+# - Binary::Data#as_json answers String#as_json's value (the string
+#   itself) where the tree does not define String#as_json.
 # - SerializeCastValue extends its ClassMethods in `included`, which is
 #   what ActiveSupport::Concern does for it. Its compatibility flag is
 #   computed in place: `ActiveSupport::Ractors.on_main` does exactly that
@@ -626,6 +628,94 @@ module ActiveModel
         end
     end
 
+    class BigInteger < Integer
+      def serialize(value) # :nodoc:
+        case value
+        when ::Integer
+          # noop
+        when ::String
+          int = value.to_i
+          if int.zero? && value != "0"
+            return if non_numeric_string?(value)
+          end
+          value = int
+        else
+          value = super
+        end
+
+        value
+      end
+
+      def serialize_cast_value(value) # :nodoc:
+        value
+      end
+
+      def serializable?(value, &)
+        true
+      end
+
+      private
+        def max_value
+          ::Float::INFINITY
+        end
+    end
+
+    class Binary < Value
+      def type
+        :binary
+      end
+
+      def binary?
+        true
+      end
+
+      def cast(value)
+        if value.is_a?(Data)
+          value.to_s
+        else
+          value = super
+          value = value.b if ::String === value && value.encoding != Encoding::BINARY
+          value
+        end
+      end
+
+      def serialize(value)
+        return if value.nil?
+        Data.new(super)
+      end
+
+      def changed_in_place?(raw_old_value, value)
+        old_value = deserialize(raw_old_value)
+        old_value != value
+      end
+
+      class Data # :nodoc:
+        def initialize(value)
+          value = value.to_s
+          value = value.b unless value.encoding == Encoding::BINARY
+          @value = value
+        end
+
+        def to_s
+          @value
+        end
+        alias_method :to_str, :to_s
+
+        # String#as_json (core_ext/object/json) answers the string itself.
+        def as_json(options = nil)
+          @value.respond_to?(:as_json) ? @value.as_json(options) : @value
+        end
+
+        def hex
+          @value.unpack1("H*")
+        end
+
+        def ==(other)
+          other == to_s || super
+        end
+      end
+    end
+
     class Boolean < Value
       include Helpers::Immutable
 
@@ -755,6 +845,8 @@ module ActiveRecord
 
     Boolean = ActiveModel::Type::Boolean
     Integer = ActiveModel::Type::Integer
+    BigInteger = ActiveModel::Type::BigInteger
+    Binary = ActiveModel::Type::Binary
     ImmutableString = ActiveModel::Type::ImmutableString
     String = ActiveModel::Type::String
     Value = ActiveModel::Type::Value

@@ -114,6 +114,10 @@ TYPES = {
   "AR::Integer(limit: 8)" => -> { AR::Integer.new(limit: 8) },
   "AR::Integer" => -> { AR::Integer.new },
   "AR::Integer(limit: 2)" => -> { AR::Integer.new(limit: 2) },
+  "AR::BigInteger" => -> { AR::BigInteger.new },
+  "AR::BigInteger(limit: 8)" => -> { AR::BigInteger.new(limit: 8) },
+  "AR::Binary" => -> { AR::Binary.new },
+  "AR::Binary(limit: 16)" => -> { AR::Binary.new(limit: 16) },
   "AR::String(limit: 255)" => -> { AR::String.new(limit: 255) },
   "AR::String(limit: 12)" => -> { AR::String.new(limit: 12) },
   "AR::String(limit: 20)" => -> { AR::String.new(limit: 20) },
@@ -134,11 +138,11 @@ LOCAL = Time.new(2020, 6, 20, 10, 20, 30.5r, "+09:00")
 
 VALUES = [
   nil, "", " ", "\t\n", "0", "12", " 12 ", "+12", "-7", "12abc", "abc", "1.7", "1e3",
-  "99999999999999999999", "2147483648", "-2147483648", "32767",
+  "99999999999999999999", "123456789012345678901234", "été", "\xFF\x00".b, "2147483648", "-2147483648", "32767",
   0, 1, -1, 12, 2**15, 2**31, -(2**31), 2**31 - 1, 2**63, -(2**63), 2**63 - 1,
   1.7, -1.2, Float::INFINITY, Float::NAN, Rational(7, 2),
   true, false, :sym, :"0", :f, :off, :FALSE, "f", "F", "false", "off", "OFF", "t", "true", "on", "yes", "no",
-  [], [1], {}, Object.new.tap { |o| def o.inspect = "#<Object>" },
+  AM::Binary::Data.new("ab"), [], [1], {}, Object.new.tap { |o| def o.inspect = "#<Object>" },
   TIME, LOCAL, Time.at(0), Date.new(2020, 6, 20),
   "2020-06-20T10:20:30.123456789Z", "2020-06-20 10:20:30+09:00", "2020-06-20 10:20:30.5-05:30",
   "2020-06-20 10:20:30", "2020-06-20T10:20:30Z", "2020-06-20", "June 20 2020 10:20", "20 Jun 2020",
@@ -199,7 +203,7 @@ show "AR::DateTime vs AM::DateTime", AR::DateTime.new == AM::DateTime.new
 show "AR::DateTime timezone", AR::DateTime.new(timezone: :local) == AR::DateTime.new(timezone: :utc)
 show "AR::DateTime same timezone", AR::DateTime.new(timezone: :local) == AR::DateTime.new(timezone: :local)
 show "hash differs by limit", AR::Integer.new(limit: 8).hash == AR::Integer.new.hash
-show "aliases", [AR::Integer.equal?(AM::Integer), AR::String.equal?(AM::String), AR::Boolean.equal?(AM::Boolean), AR::Value.equal?(AM::Value), AR::ImmutableString.equal?(AM::ImmutableString)]
+show "aliases", [AR::BigInteger.equal?(AM::BigInteger), AR::Binary.equal?(AM::Binary), AR::Integer.equal?(AM::Integer), AR::String.equal?(AM::String), AR::Boolean.equal?(AM::Boolean), AR::Value.equal?(AM::Value), AR::ImmutableString.equal?(AM::ImmutableString)]
 show "Text superclass", AR::Text.superclass.name
 show "AR::DateTime superclass", AR::DateTime.superclass.name
 show "RangeError ancestry", ActiveModel::RangeError.ancestors.take_while { |m| m != Exception }.map(&:name)
@@ -245,3 +249,17 @@ show "QueryPredicates type?", [QP.type?(NormalizedProbe.new), QP.type?(AR::Strin
 show "QueryPredicates expressions", [NormalizedProbe.new.comparison_expression(:col), DecoratedProbe.new(NormalizedProbe.new).comparison_expression(:col), NormalizedValueProbe.new(NormalizedProbe.new).comparison_expression(:col), outcome { DecoratedProbe.new(AR::String.new).comparison_expression(:col) }]
 show "QueryPredicates subtype", [NormalizedProbe.new.query_predicates?, NormalizedProbe.new.cast(" Ab "), NormalizedProbe.new.type, NormalizedProbe.new == AR::String.new]
 show "Integer serializable? yields", outcome { y = nil; [AR::Integer.new(limit: 2).serializable?("40000") { |x| y = x }, y] }
+# Binary's serialized value, the way an adapter receives it.
+DATA = AM::Binary::Data
+show "BigInteger superclass", AR::BigInteger.superclass.name
+show "BigInteger serialize 2**80", outcome { AR::BigInteger.new.serialize(2**80) }
+show "BigInteger serialize_cast_value", outcome { AR::BigInteger.new(limit: 8).serialize_cast_value(2**70) }
+show "BigInteger serializable? no yield", outcome { y = :none; [AR::BigInteger.new.serializable?(2**90) { |x| y = x }, y] }
+show "BigInteger SerializeCastValue", outcome { AM::SerializeCastValue.serialize(AR::BigInteger.new, 2**70) }
+show "Binary::Data", outcome { d = DATA.new("é"); [d.to_s, d.to_str, d.hex, d == "é".b, d == "é", d == DATA.new("x"), d == d, d.as_json, d.to_s.encoding.name] }
+show "Binary::Data of non-string", outcome { d = DATA.new(12); [d.to_s, d.hex, d == "12"] }
+show "Binary serialize", outcome { s = AR::Binary.new.serialize("ab"); [s.class.name, s.to_s, s.to_s.encoding.name] }
+show "Binary serialize Data", outcome { s = AR::Binary.new.serialize(DATA.new("ab")); [s.class.name, s.to_s] }
+show "Binary cast Data", outcome { v = AR::Binary.new.cast(DATA.new("é")); [v, v.encoding.name] }
+show "Binary changed_in_place?", [AR::Binary.new.changed_in_place?("ab", "ab"), AR::Binary.new.changed_in_place?("ab", "ac"), AR::Binary.new.changed_in_place?(DATA.new("ab"), "ab")]
+show "Binary string binary cast keeps object", outcome { s = "ab".b; AR::Binary.new.cast(s).equal?(s) }
