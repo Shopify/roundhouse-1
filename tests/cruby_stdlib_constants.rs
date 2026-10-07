@@ -31,7 +31,7 @@ const STORE: &str = r#"class Store
 
   def quick
     Timeout.timeout(5) { 42 }
-  rescue Timeout::Error, Interrupt
+  rescue Timeout::Error, Interrupt, IO::TimeoutError
     nil
   end
 end
