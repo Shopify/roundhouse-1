@@ -5311,25 +5311,42 @@ fn qualify_relative_includes(app: &mut App) {
 /// `Shipping::Measurement`, then `Measurement`. A written
 /// `class_name:` is resolved the same way, except a rooted
 /// `"::Measurement"`, which only loses its `::`.
+///
+/// A concern's own items (`concern_model_items`, which the analyzer also
+/// reads per includer) have no single owner, so they are only unrooted.
 fn qualify_association_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
     use crate::ident::{ClassId, Symbol};
 
+    fn target_of(item: &mut ModelBodyItem) -> Option<&mut ClassId> {
+        let ModelBodyItem::Association { assoc, .. } = item else { return None };
+        let (Association::BelongsTo { target, .. }
+        | Association::HasOne { target, .. }
+        | Association::HasMany { target, .. }
+        | Association::HasAndBelongsToMany { target, .. }) = assoc;
+        Some(target)
+    }
+    /// Drops a rooted target's `::`; answers whether it was rooted.
+    fn unroot(target: &mut ClassId) -> bool {
+        let Some(rooted) = target.0.as_str().strip_prefix("::") else { return false };
+        *target = ClassId(Symbol::from(rooted));
+        true
+    }
+
+    for items in app.concern_model_items.values_mut() {
+        for target in items.iter_mut().filter_map(target_of) {
+            unroot(target);
+        }
+    }
     let models: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
         let scope: Vec<String> = model.name.0.as_str().split("::").map(str::to_string).collect();
-        for item in &mut model.body {
-            let ModelBodyItem::Association { assoc, .. } = item else { continue };
-            let (Association::BelongsTo { target, .. }
-            | Association::HasOne { target, .. }
-            | Association::HasMany { target, .. }
-            | Association::HasAndBelongsToMany { target, .. }) = assoc;
-            let written = target.0.as_str();
-            if let Some(rooted) = written.strip_prefix("::") {
-                *target = ClassId(Symbol::from(rooted));
+        for target in model.body.iter_mut().filter_map(target_of) {
+            if unroot(target) {
                 continue;
             }
+            let written = target.0.as_str();
             let found = (1..=scope.len())
                 .rev()
                 .map(|depth| format!("{}::{written}", scope[..depth].join("::")))

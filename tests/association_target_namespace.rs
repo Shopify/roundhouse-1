@@ -51,6 +51,16 @@ module Shipping
 end
 "#;
 
+const WEIGHED: &str = r#"
+module Weighed
+  extend ActiveSupport::Concern
+
+  included do
+    has_one :weight, class_name: "::Measurement"
+  end
+end
+"#;
+
 fn app() -> roundhouse::App {
     let tree: HashMap<PathBuf, Vec<u8>> = [
         ("db/schema.rb", SCHEMA),
@@ -59,6 +69,7 @@ fn app() -> roundhouse::App {
         ("app/models/measurement.rb", "class Measurement < ApplicationRecord\nend\n"),
         ("app/models/shipping/box.rb", BOX),
         ("app/models/shipping/box/measurement.rb", BOX_MEASUREMENT),
+        ("app/models/concerns/weighed.rb", WEIGHED),
     ]
     .into_iter()
     .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
@@ -101,4 +112,25 @@ fn the_owner_namespace_is_searched_before_the_top_level() {
 #[test]
 fn a_rooted_class_name_is_not_searched() {
     assert_eq!(targets(&app(), "Shipping::Box::Measurement"), ["Shipping::Box", "Measurement"]);
+}
+
+/// A concern's own declaration, which the analyzer reads per includer,
+/// is unrooted too: a `::Measurement` receiver is no class.
+#[test]
+fn a_concern_rooted_class_name_is_unrooted() {
+    let app = app();
+    let items = app
+        .concern_model_items
+        .get(&roundhouse::ClassId(roundhouse::Symbol::from("Weighed")))
+        .expect("concern items");
+    let targets: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            roundhouse::dialect::ModelBodyItem::Association {
+                assoc: Association::HasOne { target, .. }, ..
+            } => Some(target.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(targets, ["Measurement"]);
 }
