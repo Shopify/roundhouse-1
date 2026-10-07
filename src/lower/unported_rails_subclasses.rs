@@ -66,8 +66,23 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
             _ => String::new(),
         };
         // A `LibraryClass` carries no span of its own; its first method
-        // points the line at the right file.
-        let span = lc.methods.first().map(|m| m.name_span).unwrap_or_else(Span::synthetic);
+        // (or, for a Railtie, its first `initializer`) points the line at
+        // the right file.
+        let initializers = railtie_initializers(lc);
+        let span = initializers
+            .first()
+            .map(|(_, span)| *span)
+            .or_else(|| lc.methods.first().map(|m| m.name_span))
+            .unwrap_or_else(Span::synthetic);
+        // A gem's Railtie is how it configures itself at boot. Its
+        // initializer blocks are named: none of them runs in the emitted
+        // app, so whatever they set stays at the gem's own defaults.
+        let not_run = if initializers.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = initializers.iter().map(|(name, _)| format!("{name:?}")).collect();
+            format!("; its initializers {} do not run at boot", names.join(", "))
+        };
         diags.push(super::residue_diagnostic(
             "unported_rails_subclasses",
             lc.name.0.as_str(),
@@ -75,7 +90,7 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
             "unported base",
             format!(
                 "class dropped: `{}` extends `{}`{via}, a Rails base the runtime does not \
-                 port — no emitted tree defines that constant, so the class cannot load",
+                 port — no emitted tree defines that constant, so the class cannot load{not_run}",
                 lc.name.0.as_str(),
                 base.as_str(),
             ),
@@ -83,4 +98,22 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
     }
     app.library_classes.retain(|lc| !doomed.contains_key(&lc.name.0));
     diags
+}
+
+/// The `initializer "name" do … end` calls in a class body (a
+/// `Rails::Railtie`'s or `Rails::Engine`'s boot hooks), with their spans.
+fn railtie_initializers(lc: &crate::dialect::LibraryClass) -> Vec<(String, Span)> {
+    use crate::expr::{ExprNode, Literal};
+    lc.unknown_calls
+        .iter()
+        .filter_map(|call| match &*call.node {
+            ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "initializer" => {
+                match args.first().map(|a| &*a.node) {
+                    Some(ExprNode::Lit { value: Literal::Str { value } }) => Some((value.clone(), call.span)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
 }

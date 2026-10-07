@@ -171,3 +171,38 @@ fn a_gem_base_under_a_rails_namespace_is_kept() {
     assert!(dropped(&app, &diags).is_empty());
     assert_eq!(library_class_names(&app), vec!["CommentSerializer"]);
 }
+
+/// A gem's Railtie (opentelemetry-shopify 1.22.0's, app_profiler 0.6.0's,
+/// compiled as gem sources) is dropped the same way, and the line names
+/// each `initializer` that therefore does not run at boot, at the first
+/// one's site: the gem's configuration stays at its own defaults, and the
+/// ledger says so rather than implying the hook ran.
+#[test]
+fn a_railtie_is_dropped_and_its_initializers_are_named_as_not_run() {
+    let mut app = ingest(&[(
+        "lib/tracing/railtie.rb",
+        r#"module Tracing
+  class Railtie < Rails::Railtie
+    initializer "tracing.configure" do |app|
+      Tracing.configure(app.config.filter_parameters)
+    end
+
+    initializer "tracing.middleware" do |app|
+      app.middleware.use(Tracing)
+    end
+  end
+end
+"#,
+    )]);
+    assert_eq!(library_class_names(&app), vec!["Tracing::Railtie"]);
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert!(library_class_names(&app).is_empty());
+    let gaps = dropped(&app, &diags);
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].contains("`Tracing::Railtie` extends `Rails::Railtie`"), "{gaps:?}");
+    assert!(
+        gaps[0].contains(r#"its initializers "tracing.configure", "tracing.middleware" do not run at boot"#),
+        "{gaps:?}"
+    );
+    assert!(gaps[0].contains("lib/tracing/railtie.rb:3"), "{gaps:?}");
+}

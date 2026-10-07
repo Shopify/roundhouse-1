@@ -2961,6 +2961,17 @@ fn ruby_family_files(
     // conditional on the app naming the constant, not on the require
     // graph's shape (which is what kept the blog's JRuby tree booting
     // with no jars).
+    // A gem the app carries as source (`gem_sources:` in roundhouse.yml,
+    // or a lockfile PATH gem) is compiled with the app: requiring the
+    // installed gem as well would load a second copy under the compiled
+    // one (opentelemetry-shopify's `private_constant`s, then the compiled
+    // reopen's qualified reads of them, raised NameError at boot).
+    let compiled_gems: Vec<&str> = app
+        .gem_lock
+        .as_ref()
+        .map(|lock| lock.in_repo.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let jruby_excluded: Vec<&str> = std::iter::once("markly").chain(compiled_gems.iter().copied()).collect();
     let gem_facades = match flavor {
         RubyFlavor::CRuby => format!(
             "# Gem façades are spinel-only (no native gems there). On the CRuby\n\
@@ -2977,7 +2988,7 @@ fn ruby_family_files(
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
              {}{}",
-            gem_require_block(&[], app.gem_lock.as_ref()),
+            gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -3002,7 +3013,7 @@ fn ruby_family_files(
              require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
-                gem_require_block(&["markly"], app.gem_lock.as_ref()),
+                gem_require_block(&jruby_excluded, app.gem_lock.as_ref()),
                 WEB_PUSH_STUB_REOPEN
             )
         }
@@ -6958,7 +6969,7 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
     let gated = LOCK_GATED_REQUIRES
         .iter()
-        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)))
+        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)) && !exclude.contains(gem))
         .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
         .iter()
