@@ -29,6 +29,7 @@
 # commands, never in a test process, and so does this tree.
 require "tsort"
 require_relative "active_support_ordered_options"
+require_relative "rails"
 
 module Rails
   # railties/lib/rails/gem_version.rb.
@@ -47,6 +48,62 @@ module Rails
 
   def self.version
     VERSION::STRING
+  end
+
+  # railties rails.rb: `class << self; ... alias :app :application`.
+  def self.app
+    application
+  end
+
+  # Pathname#read (`Rails.root.join("REVISION").read`): File.read of the
+  # path, raising Errno::ENOENT when it is absent. The shared runtime's
+  # Rails.root is an AppPath, not a Pathname (rails.rb).
+  AppPath.class_eval do
+    def read(*args, **kwargs)
+      File.read(@base, *args, **kwargs)
+    end
+  end
+
+  # railties 8.2.0.alpha application.rb:396-424, `Application#revision`
+  # and its internal writer. The runtime's `Rails.application` answers a
+  # fresh Application per call (rails.rb), so the once-per-process memo
+  # Rails keeps in the singleton's `@revision` / `@revision_initialized`
+  # lives on the class instead. `root` is `Rails.root`, as the
+  # application's config.root is.
+  class << Application
+    def revision_state # :nodoc:
+      @revision_state ||= {}
+    end
+  end
+
+  Application.class_eval do
+    # Returns the application's revision (deployment identifier).
+    # Set via config.revision (string), ENV["REVISION"], or REVISION file.
+    # Always either a String or +nil+.
+    def revision
+      state = Rails::Application.revision_state
+      unless state[:initialized]
+        state[:revision] = begin
+          ENV["REVISION"].presence ||
+            Rails.root.join("REVISION").read.strip.presence
+        rescue SystemCallError
+          r, w = IO.pipe
+          success = system("git", "-C", Rails.root.to_s, "rev-parse", "HEAD", in: File::NULL, err: File::NULL, out: w)
+          w.close
+          rev = r.read.strip
+          r.close
+          rev if success
+        end
+        state[:initialized] = true
+      end
+      state[:revision]
+    end
+
+    def revision=(rev) # :nodoc:
+      state = Rails::Application.revision_state
+      state[:revision] = rev&.to_s
+      state[:initialized] = true
+    end
   end
 
   module Initializable

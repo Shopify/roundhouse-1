@@ -431,3 +431,55 @@ fn a_railtie_cannot_load_the_gem_home_copy_of_a_compiled_gem() {
     );
     assert!(!stderr.contains("already initialized constant"), "{stderr}");
 }
+
+/// `Rails.app` / `Application#revision` / `Rails.version` (railties
+/// 8.2.0.alpha rails.rb, application.rb:396-424, gem_version.rb), on the
+/// emitted runtime. Each case runs in its own process (the revision is
+/// read once per process) from a scratch Rails.root; the expected lines
+/// are what native railties 5813559f answers for the same root and env.
+#[test]
+fn rails_app_revision_reads_env_then_the_revision_file_then_git() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_railtie_port\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let script = "require File.join(ARGV[0], 'runtime/active_support_core_ext')\n\
+                  require File.join(ARGV[0], 'runtime/rails_railtie')\n\
+                  p [Rails.version, Rails.gem_version.to_s, Rails.app.is_a?(Rails::Application)]\n\
+                  p Rails.app.revision\n\
+                  p Rails.application.revision\n\
+                  Rails.app.revision = 42\n\
+                  p Rails.app.revision\n";
+    let case = |revision_env: Option<&str>, revision_file: Option<&str>| {
+        let root = std::env::temp_dir().join(format!(
+            "rh-rails-revision-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        if let Some(body) = revision_file {
+            std::fs::write(root.join("REVISION"), body).unwrap();
+        }
+        let mut cmd = emit_and_run::ruby();
+        cmd.current_dir(&root).env_remove("REVISION").args(["-e", script, &dir.to_string_lossy()]);
+        if let Some(v) = revision_env {
+            cmd.env("REVISION", v);
+        }
+        let out = cmd.output().expect("ruby");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let head = "[\"8.2.0.alpha\", \"8.2.0.alpha\", true]\n";
+    assert_eq!(case(Some("abc123"), None), format!("{head}\"abc123\"\n\"abc123\"\n\"42\"\n"));
+    // A blank ENV["REVISION"] falls through to the file, stripped.
+    assert_eq!(case(Some("   "), Some("  rev-file \n")), format!("{head}\"rev-file\"\n\"rev-file\"\n\"42\"\n"));
+    // A blank file is nil, with no git fallback (only a read error falls back).
+    assert_eq!(case(None, Some("\n")), format!("{head}nil\nnil\n\"42\"\n"));
+    // No file and a root outside any git checkout: git fails, nil.
+    assert_eq!(case(None, None), format!("{head}nil\nnil\n\"42\"\n"));
+}

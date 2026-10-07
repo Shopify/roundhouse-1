@@ -17,7 +17,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // propagate through dispatch without bottoming out at Var.
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
-    for m in ["application", "logger", "cache", "configuration", "root"] {
+    // `Rails.app` is railties' alias of `application`.
+    for m in ["application", "app", "logger", "cache", "configuration", "root", "gem_version"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
@@ -30,6 +31,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             args: vec![],
         },
     );
+    // `Rails.version` (railties gem_version.rb): "8.2.0.alpha".
+    rails_cls.class_methods.insert(Symbol::from("version"), Ty::Str);
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
 
     // `Rails.event` / `Rails.error` — ActiveSupport's EventReporter and
