@@ -2833,14 +2833,11 @@ fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpan
                     {
                         args.iter()
                             .filter_map(|arg| match &*arg.node {
-                                ExprNode::Const { path } => {
-                                    Some(crate::ident::ClassId(crate::ident::Symbol::from(
-                                        path.iter()
-                                            .map(|s| s.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("::"),
-                                    )))
-                                }
+                                ExprNode::Const { path } => Some(concern_named(
+                                    model.name.0.as_str(),
+                                    path,
+                                    &app.concern_model_items,
+                                )),
                                 _ => None,
                             })
                             .collect()
@@ -2873,6 +2870,33 @@ fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpan
             i += 1;
         }
     }
+}
+
+/// The concern an `include` arg written inside `owner` names. A rooted
+/// `::Ms::Concerns::X` (a leading empty segment) names the top-level
+/// `Ms::Concerns::X`, with no lexical lookup. A relative `Concerns::X`
+/// resolves from the owner's namespace outward (`Ms::Price::Concerns::X`,
+/// then `Ms::Concerns::X`), innermost first, falling back to the path as
+/// written. Keyed by the written path, a rooted include matched no
+/// concern and its `included do` block vanished from the includer.
+fn concern_named<V>(
+    owner: &str,
+    path: &[crate::ident::Symbol],
+    concerns: &crate::det::HashMap<crate::ident::ClassId, V>,
+) -> crate::ident::ClassId {
+    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    if let Some(top) = written.strip_prefix("::") {
+        return crate::ident::ClassId(crate::ident::Symbol::from(top));
+    }
+    let mut scope = Some(owner);
+    while let Some(prefix) = scope {
+        let id = crate::ident::ClassId(crate::ident::Symbol::from(format!("{prefix}::{written}")));
+        if concerns.contains_key(&id) {
+            return id;
+        }
+        scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+    }
+    crate::ident::ClassId(crate::ident::Symbol::from(written))
 }
 
 /// A carried `included do` statement or `class_attribute` def, as it
@@ -5161,9 +5185,35 @@ fn qualify_relative_includes(app: &mut App) {
     // app/controllers/concerns/authentication/session_lookup.rb.
     // Unqualified, the emitted `include SessionLookup` raises NameError
     // at load time (and nothing pulls the file into the require graph).
+    //
+    // A rooted `include ::A::B` names the top-level `A::B` and is never
+    // resolved lexically. Its root is kept only where the lexical lookup
+    // of `A` would find something else (`Owner::A` is declared), so the
+    // emit writes `include ::A::B`. Elsewhere the root is dropped, as
+    // every by-name consumer of `includes` expects.
+    let namespaces: crate::det::HashSet<&str> = known
+        .iter()
+        .flat_map(|id| {
+            let name = id.0.as_str();
+            name.match_indices("::").map(move |(at, _)| &name[..at]).chain(std::iter::once(name))
+        })
+        .collect();
     for lc in &mut app.library_classes {
         let owner = lc.name.0.as_str().to_string();
         for inc in &mut lc.includes {
+            if let Some(top) = inc.0.as_str().strip_prefix("::") {
+                let first = top.split("::").next().unwrap_or(top);
+                let mut scope = Some(owner.as_str());
+                let mut shadowed = false;
+                while let Some(prefix) = scope {
+                    shadowed |= namespaces.contains(format!("{prefix}::{first}").as_str());
+                    scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+                }
+                if !shadowed {
+                    *inc = crate::ident::ClassId(crate::ident::Symbol::from(top));
+                }
+                continue;
+            }
             let path: Vec<crate::ident::Symbol> =
                 inc.0.as_str().split("::").map(crate::ident::Symbol::from).collect();
             if let Some(qualified) = resolve(&owner, &path, &known) {

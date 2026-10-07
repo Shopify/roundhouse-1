@@ -186,15 +186,27 @@ fn consumed_class_includes_use_original_literal_source_without_guessing() {
         assert_eq!(diags[0].severity, expected, "{body}: {}", diags[0].message);
         assert_eq!(app, before);
     }
-    // Restoring a precise source edge must not erase an ambiguous retained
-    // IR edge, whose rootedness was lost. Both kinds of evidence stay visible.
-    // The lost `::` can also surface as a lexically qualified IR edge
-    // (`ArticleResource::QuartzSerializer::Resource`, since the empty nested
-    // module is retained as a marker): it stays ambiguous, not local.
-    let app = app("class ArticleResource\n module QuartzSerializer; module Resource; end; end\n include ::QuartzSerializer::Resource\nend\n", Some(QUARTZ_LOCK));
+    // Ingest keeps the root where `ArticleResource::QuartzSerializer`
+    // shadows `QuartzSerializer`, so the retained IR edge is the precise
+    // `::QuartzSerializer::Resource` and the top-level gem module is reached.
+    let source = "class ArticleResource\n module QuartzSerializer; module Resource; end; end\n include ::QuartzSerializer::Resource\nend\n";
+    let mut app = app(source, Some(QUARTZ_LOCK));
+    let resource = |app: &App| app.library_classes.iter().position(|c| c.name == ClassId(Symbol::from("ArticleResource"))).unwrap();
+    let at = resource(&app);
+    assert_eq!(app.library_classes[at].includes, vec![ClassId(Symbol::from("::QuartzSerializer::Resource"))]);
     let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
     attribute_unknown_gems(&mut diags, &app);
-    assert_eq!(diags[0].severity, Severity::Error);
+    assert_eq!(diags[0].severity, Severity::Info, "{}", diags[0].message);
+    // Restoring a precise source edge must not erase an ambiguous retained
+    // IR edge, whose rootedness was lost: an unqualified edge beside a local
+    // namespace, or one lexically qualified to the local module while a gem
+    // claims its unqualified reading. Both kinds of evidence stay visible.
+    for lossy in ["QuartzSerializer::Resource", "ArticleResource::QuartzSerializer::Resource"] {
+        app.library_classes[at].includes = vec![ClassId(Symbol::from(lossy))];
+        let mut diags = vec![failed_call(class("ArticleResource"), "encode_record")];
+        attribute_unknown_gems(&mut diags, &app);
+        assert_eq!(diags[0].severity, Severity::Error, "{lossy}: {}", diags[0].message);
+    }
 }
 
 #[test]
@@ -292,27 +304,21 @@ fn module_supplements_preserve_reopens_roots_and_declarative_boundaries() {
             "module SerializerBridge\n  include QuartzSerializer::Resource\nend\nmodule SerializerBridge\n  def helper; 1; end\nend\n",
             Severity::Info,
         ),
-        // The empty nested `Resource` is now kept as a marker module, so
-        // the bridge is retained in IR too, with the same ambiguous IR
-        // edge as the `def helper` case below: ingest drops the rooted
-        // `::` and the lexical qualification reads the edge as
-        // `SerializerBridge::QuartzSerializer::Resource`. A rooted
-        // source edge alone, with no retained IR edge, is still a note:
-        // see consumed_class_includes_use_original_literal_source_without_guessing.
         (
             "module SerializerBridge\n  module QuartzSerializer\n    module Resource\n    end\n  end\n  include ::QuartzSerializer::Resource\nend\n",
-            Severity::Error,
+            Severity::Info,
         ),
         (
             "module SerializerBridge\n  module QuartzSerializer\n    module Resource\n    end\n  end\n  include QuartzSerializer::Resource\nend\n",
             Severity::Error,
         ),
-        // A retained module has a lossy IR edge as well as this rooted
-        // source edge. Do not discard IR provenance merely because a precise
-        // source edge exists: another declaration may have contributed it.
+        // A retained module's IR edge keeps the root where the nested
+        // `SerializerBridge::QuartzSerializer` shadows it, so it agrees with
+        // the rooted source edge. Lossy retained IR edges stay errors: see
+        // consumed_class_includes_use_original_literal_source_without_guessing.
         (
             "module SerializerBridge\n  def helper; 1; end\n  module QuartzSerializer\n    module Resource\n    end\n  end\n  include ::QuartzSerializer::Resource\nend\n",
-            Severity::Error,
+            Severity::Info,
         ),
         (
             "module SerializerBridge\n  include QuartzSerializer::Resource if enabled?\nend\n",

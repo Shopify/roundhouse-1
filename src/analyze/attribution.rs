@@ -123,16 +123,19 @@ pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[Ingest
     // Sites of constants whose declaring file recorded a gap, for the ivar pass below.
     let mut constant_sites: Vec<(FileId, u32, String)> = Vec::new();
     for d in diags.iter_mut() {
-        if let Some(cause) = ctx.constant_cause(d) {
-            constant_sites.push((d.span.file, d.span.start, cause.clone()));
-            mark_gap(d, cause, None);
-            continue;
-        }
+        // A reference to a definition survey ingest dropped is the gap's
+        // shadow: a coverage note naming the file and the gap that dropped
+        // it. A definition the IR holds (another file compiled it, or the
+        // file's gap was absorbed) is not a shadow, so its refusal stays an
+        // error with its own message. Already a note: nothing to add.
         if is_constant_refusal(d) {
-            if let Some(cause) = dropped.as_ref().and_then(|dropped| dropped.cause_for(d)) {
-                if !d.message.contains(&cause) {
-                    d.message.push_str(&cause);
-                }
+            if d.severity == Severity::Info {
+                continue;
+            }
+            if let Some((cause, ivar_cause)) = dropped.as_ref().and_then(|dropped| dropped.cause_for(d)) {
+                constant_sites.push((d.span.file, d.span.start, ivar_cause));
+                d.severity = Severity::Info;
+                d.message.push_str(&cause);
             }
             continue;
         }
@@ -243,7 +246,13 @@ impl<'a> DroppedDefinitions<'a> {
         for drop in &app.dropped_files {
             drops.entry(drop.file.as_str()).or_insert(drop);
         }
-        let mut by_name = HashMap::default();
+        // A name several dropped files define names one cause, the same on
+        // every run: the file Rails would autoload it from, else the first
+        // in source order.
+        let conventional = |name: &str, path: &str| {
+            path.ends_with(&format!("/{}.rb", crate::naming::underscore(name.trim_start_matches("::"))))
+        };
+        let mut by_name: HashMap<&str, DroppedDefinition> = HashMap::default();
         for (i, source) in app.sources.iter().enumerate() {
             let Some(drop) = drops.get(source.path.as_str()).copied() else { continue };
             let file = FileId(i as u32 + 1);
@@ -252,7 +261,10 @@ impl<'a> DroppedDefinitions<'a> {
             let whole_file = !resolver.class_definitions(file).any(|name| ingested.contains(name));
             let dropped = DroppedDefinition { path, drop, whole_file };
             for name in resolver.class_definitions(file).chain(resolver.constant_definitions(file)) {
-                by_name.entry(name).or_insert(dropped);
+                let slot = by_name.entry(name).or_insert(dropped);
+                if conventional(name, path) && !conventional(name, slot.path) {
+                    *slot = dropped;
+                }
             }
         }
         DroppedDefinitions { resolver, by_name, ingested }
@@ -260,8 +272,9 @@ impl<'a> DroppedDefinitions<'a> {
 
     /// For a `constant` refusal that resolves to a definition a dropped
     /// file holds and the IR lacks — the class itself, or a value's
-    /// lexical owner — the text naming that file and its gap.
-    fn cause_for(&self, d: &Diagnostic) -> Option<String> {
+    /// lexical owner — the text naming that file and its gap, and the
+    /// `path: gap` cause for the ivars assigned from it.
+    fn cause_for(&self, d: &Diagnostic) -> Option<(String, String)> {
         let DiagnosticKind::Unsupported { detail, .. } = &d.kind else { return None };
         // Other constant refusals carry a sentence, not the written path.
         let path: Vec<Symbol> = detail.split("::").map(Symbol::from).collect();
@@ -282,10 +295,13 @@ impl<'a> DroppedDefinitions<'a> {
             (true, Some((owner, _))) => self.ingested.contains(owner),
             (true, None) => !dropped.whole_file,
         };
-        (!compiled).then(|| format!(
-            " — dropped by ingest gap: {name} is defined in {} but was not compiled: {}",
-            dropped.path,
-            survey::bucket_message(&dropped.drop.message),
+        let gap = survey::bucket_message(&dropped.drop.message);
+        (!compiled).then(|| (
+            format!(
+                " — likely roundhouse coverage, not an app error (ingest gap in {}: {name} was not compiled: {gap})",
+                dropped.path,
+            ),
+            format!("{}: {gap}", dropped.path),
         ))
     }
 }
@@ -324,15 +340,11 @@ struct AttributionCtx<'a> {
     /// Whether any controller at all is tainted — the layout rule
     /// (layouts are fed by every controller).
     any_controller_tainted: Option<&'a str>,
-    /// Namespace (fully qualified) → gap path, for every `class` / `module`
-    /// a gap file declares. Survey mode may drop such a class wholesale, and
-    /// each reference to it then reports an unsupported constant.
-    gap_namespaces: HashMap<String, &'a str>,
-    /// `gap_namespaces` less aliases, for a dispatch receiver: a gap file's
-    /// `Alias = Bar` does not make a `class Alias` reopened elsewhere a gap.
+    /// Class or module (fully qualified, less aliases) → gap path, for a
+    /// dispatch receiver: survey mode may drop such a class wholesale. A
+    /// gap file's `Alias = Bar` does not make a `class Alias` reopened
+    /// elsewhere a gap.
     gap_receivers: HashMap<String, &'a str>,
-    /// Rubydex's answers, to name the declaration a constant reference means.
-    resolver: Option<std::sync::Arc<super::body::ConstResolver>>,
 }
 
 impl<'a> AttributionCtx<'a> {
@@ -431,7 +443,6 @@ impl<'a> AttributionCtx<'a> {
             .find_map(|c| tainted_classes.get(&c.name))
             .copied();
 
-        let mut gap_namespaces: HashMap<String, &str> = HashMap::default();
         let mut gap_receivers: HashMap<String, &str> = HashMap::default();
         let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
         if let Some(resolver) = &resolver {
@@ -446,12 +457,6 @@ impl<'a> AttributionCtx<'a> {
             let mut files: Vec<(&FileId, &&str)> = tainted_files.iter().collect();
             files.sort_by_key(|(_, path)| **path);
             for (file, path) in files {
-                for name in resolver.namespaces_declared_in(*file) {
-                    let slot = gap_namespaces.entry(name.to_string()).or_insert(path);
-                    if rank(name, path) < rank(name, slot) {
-                        *slot = path;
-                    }
-                }
                 for name in resolver.receivers_declared_in(*file) {
                     let slot = gap_receivers.entry(name.to_string()).or_insert(path);
                     if rank(name, path) < rank(name, slot) {
@@ -468,29 +473,8 @@ impl<'a> AttributionCtx<'a> {
             tainted_classes,
             view_by_file,
             any_controller_tainted,
-            gap_namespaces,
             gap_receivers,
-            resolver,
         }
-    }
-
-    /// The rendered cause for an unsupported constant a gap file declares.
-    /// The name is the declaration Rubydex resolved the reference to (a
-    /// relative `Slack` inside `module Util` is `Util::Slack`), never the
-    /// path as written: `::Article` is not `Admin::Article`, and an
-    /// unresolved `LIMIT` is not a gap file's top-level `LIMIT`.
-    fn constant_cause(&self, d: &Diagnostic) -> Option<&String> {
-        let DiagnosticKind::Unsupported { construct, detail, .. } = &d.kind else {
-            return None;
-        };
-        if construct.as_str() != "constant" || d.severity == Severity::Info {
-            return None;
-        }
-        let segments: Vec<crate::ident::Symbol> =
-            detail.trim_start_matches("::").split("::").map(crate::ident::Symbol::from).collect();
-        let resolved = self.resolver.as_ref()?.declaration_name(d.span, &segments)?;
-        let path = self.gap_namespaces.get(resolved.trim_start_matches("::"))?;
-        self.gap_by_path.get(*path)
     }
 
     /// The rendered cause when `d` is attributable to a gap, else `None`.

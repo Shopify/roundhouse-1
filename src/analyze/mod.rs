@@ -1479,7 +1479,12 @@ impl Analyzer {
         // surface. Keep it in the class-body ledger even when no method is called.
         app.gem_boundary.refused_includes.clear();
         for class in &mut app.library_classes {
-            for included in &class.includes {
+            for written in &class.includes {
+                // `::A::B` (ingest keeps the root where `A` is shadowed)
+                // names the top-level `A::B`, with no lexical lookup.
+                let rooted = written.0.as_str().starts_with("::");
+                let top = ClassId(Symbol::from(written.0.as_str().trim_start_matches("::")));
+                let included = &top;
                 if let Some(detail) = rails_dependent_include(&self.classes, included, &class.name) {
                     app.gem_boundary.refused_includes.push(crate::gem_boundary::RefusedInclude {
                         class: class.name.clone(), include: included.clone(), detail: detail.clone(),
@@ -1494,7 +1499,7 @@ impl Analyzer {
                 // TimeHelpers) is resolved here and gated per target by
                 // `project` (report_unsupported_runtime_reads).
                 let known = self.classes.contains_key(included)
-                    || body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
+                    || (!rooted && body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str())
                     // A Ruby-family runtime port's module
                     // (`ActiveRecord::Type::QueryPredicates`); its tree
@@ -1508,11 +1513,11 @@ impl Analyzer {
                     // declares (an RBI-free tree: Core's slice has no
                     // `sorbet/`), named from the class's scope outwards.
                     || matches!(
-                        self.gem_sources.provider(included.0.as_str(), class.name.0.as_str()),
+                        self.gem_sources.provider(included.0.as_str(), if rooted { "" } else { class.name.0.as_str() }),
                         Some(crate::gem_boundary::SourceProvider::Declared { .. })
                     );
                 if known { continue; }
-                let detail = format!("{} includes unresolved {}", class.name.0, included.0);
+                let detail = format!("{} includes unresolved {}", class.name.0, written.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }

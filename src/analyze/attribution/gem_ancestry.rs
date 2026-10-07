@@ -50,10 +50,18 @@ impl GemAncestry {
                     .into_iter()
                     .map(|target| (target, true))
                     .chain(includes.into_iter().map(|target| (target, false)))
-                    .map(|(target, parent)| AncestryEdge {
-                        target,
-                        parent,
-                        scopes: None,
+                    .map(|(target, parent)| match target.0.as_str().strip_prefix("::") {
+                        // Ingest kept this include's root: precise, not lossy.
+                        Some(top) => AncestryEdge {
+                            target: ClassId(Symbol::from(top)),
+                            parent,
+                            scopes: Some(vec![]),
+                        },
+                        None => AncestryEdge {
+                            target,
+                            parent,
+                            scopes: None,
+                        },
                     }),
             );
         };
