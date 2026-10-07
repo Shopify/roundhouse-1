@@ -75,6 +75,13 @@ pub fn is_self_binding(expr: &Expr) -> bool {
 /// reaches the files carried there. Other targets emit the literal.
 pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 
+/// A [`SOURCE_TYPE_ASCRIPTION`] cast whose declared type a typer's registry
+/// resolved, the analyzer's own (what `roundhouse check` reports) first.
+/// A lowerer's reduced registry that retypes the body later does not
+/// re-decide it: its registry names the lowered classes and runtime stubs,
+/// not every class the app's declaration may name.
+pub const DECLARED_TYPE_INDEXED: u64 = 1 << 14;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -1516,6 +1523,7 @@ mod tests {
             RESOLVED_CLASS_REF, RESOLVED_DATA_FACTORY, GENERATED_CONST_REF, CLASS_OBJECT_VALUE,
             RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
+            DECLARED_TYPE_INDEXED,
         ];
         let mut seen = 0u64;
         for bit in bits {
