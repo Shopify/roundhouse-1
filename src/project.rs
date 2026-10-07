@@ -9330,6 +9330,23 @@ fn names_constant(src: &str, konst: &str) -> bool {
                 return true;
             }
         }
+        // ... and as the argument of an explicit receiver's mixin call,
+        // `klass.extend(Forwardable)` (a `Class.new` value): there the
+        // name ends at `)` or `,`, which the punctuation rule rejects.
+        for kw in [".extend(", ".include(", ".prepend("] {
+            let mut from = 0;
+            while let Some(off) = trimmed[from..].find(kw) {
+                let args_at = from + off + kw.len();
+                let args = trimmed[args_at..].split(')').next().unwrap_or("");
+                if args.split(',').any(|module| {
+                    let module = module.trim();
+                    module.strip_prefix("::").unwrap_or(module) == konst
+                }) {
+                    return true;
+                }
+                from = args_at;
+            }
+        }
         let b = line.as_bytes();
         let mut i = 0;
         while let Some(off) = line[i..].find(konst) {
