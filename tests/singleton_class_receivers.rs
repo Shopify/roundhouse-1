@@ -1,4 +1,5 @@
-//! `x.singleton_class` is a proven class object receiver.
+//! `x.singleton_class`, `Module.new` and self in an instance method of
+//! a `Module` subclass are proven class object receivers.
 //!
 //! Core's `RandomBoundaryCheck` saves and restores `Kernel.rand` with
 //! `Kernel.singleton_class.instance_method(:rand)` and
@@ -12,9 +13,16 @@ mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 
-const PATCH: &str = r#"module Patch
+const PATCH: &str = r##"module Patch
   class Box
     def label = "box"
+  end
+
+  class Recorder < Module
+    def initialize(name)
+      define_method(name) { :recorded }
+      self.define_method(:"#{name}?") { true }
+    end
   end
 
   def self.report
@@ -24,10 +32,17 @@ const PATCH: &str = r#"module Patch
     Patch.singleton_class.define_method(:extra) { :extra }
     names = Patch.singleton_class.instance_methods(false).sort
     Patch.singleton_class.send(:remove_method, :extra)
-    [box.label, Box.new.label, names, saved.name, Patch.respond_to?(:extra)]
+    fresh = Module.new
+    [:a, :b].each { |n| fresh.define_method(n) { n } }
+    holder_class = Class.new
+    holder_class.include(fresh)
+    holder_class.include(Recorder.new(:rec))
+    holder = holder_class.new
+    [box.label, Box.new.label, names, saved.name, Patch.respond_to?(:extra),
+     holder.public_send(:a), holder.public_send(:b), holder.public_send(:rec), holder.public_send(:rec?)]
   end
 end
-"#;
+"##;
 
 const REPORT: &str = "p Patch.report\n";
 
@@ -45,7 +60,7 @@ fn singleton_class_receivers_run_as_in_native_ruby() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
     let expected = String::from_utf8_lossy(&native.stdout).into_owned();
-    assert_eq!(expected, "[\"patched\", \"box\", [:extra, :report], :report, false]\n", "native control");
+    assert_eq!(expected, "[\"patched\", \"box\", [:extra, :report], :report, false, :a, :b, :recorded, true]\n", "native control");
 
     let (emitted, errors) = emit_and_run::empty_app()
         .write("roundhouse.yml", "test_paths:\n  - test\n")
@@ -54,7 +69,7 @@ fn singleton_class_receivers_run_as_in_native_ruby() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
     let output = emit_and_run::ruby()
         .arg("-e")
-        .arg(format!("require \"./app/models/patch\"\nrequire \"./app/models/patch/box\"\n{REPORT}"))
+        .arg(format!("require \"./app/models/patch\"\nrequire \"./app/models/patch/box\"\nrequire \"./app/models/patch/recorder\"\n{REPORT}"))
         .current_dir(&emitted)
         .output()
         .expect("spawn ruby");
