@@ -1,4 +1,4 @@
-# Native ActiveSupport 8.1.4 oracle for the signed and encrypted messages
+# Native ActiveSupport 8.2.0.alpha oracle for the signed and encrypted messages
 # port (runtime/spinel/active_support_messages.rb, with the ActiveSupport::JSON
 # coder of runtime/spinel/active_support_json.rb).
 #
@@ -25,10 +25,30 @@ require "json"
 require "tmpdir"
 require "fileutils"
 
+# The native side is the Rails Core pins: Shopify/rails 5813559f
+# (8.2.0.alpha) from Core's bundle, run with Core's gem home
+# (CORE_GEM_HOME, default the one bin/check-target uses) so its
+# dependencies are Core's too.
+CORE_GEM_HOME = ENV.fetch("CORE_GEM_HOME", "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0")
+RAILS_CHECKOUT = File.join(CORE_GEM_HOME, "bundler/gems/rails-5813559f4aed")
+RAILS_LIBS = %w[activesupport activemodel activerecord].map { |lib| File.join(RAILS_CHECKOUT, lib, "lib") }
+
+def ruby_command(mode)
+  return [{}, RbConfig.ruby] unless mode == "native"
+  abort "native: Core's Rails checkout #{RAILS_CHECKOUT} is missing (set CORE_GEM_HOME)" unless File.directory?(RAILS_CHECKOUT)
+  [{ "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
+end
+
+# Loaded from the checkout, not from some other installed Rails.
+def require_native_rails
+  abort "native: ActiveSupport #{ActiveSupport.gem_version} from #{$LOADED_FEATURES.grep(/active_support\/version/).first}" unless
+    ActiveSupport.gem_version.to_s == "8.2.0.alpha" && $LOADED_FEATURES.any? { |f| f.start_with?(RAILS_CHECKOUT) && f.end_with?("active_support/version.rb") }
+end
+
 if ARGV.first == "compare"
   require "open3"
   run = lambda do |mode, out, other|
-    stdout, stderr, status = Open3.capture3(RbConfig.ruby, __FILE__, mode, out, *other)
+    stdout, stderr, status = Open3.capture3(*ruby_command(mode), __FILE__, mode, out, *other)
     abort "#{mode}: #{stderr}" unless status.success?
     stdout
   end
@@ -55,8 +75,8 @@ end
 MODE, MADE_PATH, OTHER_PATH = ARGV
 
 if MODE == "native"
-  gem "activesupport", "8.1.4"
   require "active_support"
+  require_native_rails
   require "active_support/notifications"
   require "active_support/json"
   require "active_support/core_ext/object/json"
@@ -139,6 +159,10 @@ caching = ActiveSupport::CachingKeyGenerator.new(kg)
 first = caching.generate_key("salt", 32)
 show("caching", [first == kg.generate_key("salt", 32), caching.generate_key("salt", 32).equal?(first), caching.generate_key("salt").bytesize])
 show("key inspect", kg.inspect.sub(/0x\h+/, "0x"))
+# A frozen caching generator (Rails freezes the app's) keeps caching.
+frozen_caching = ActiveSupport::CachingKeyGenerator.new(kg).freeze
+frozen_key = frozen_caching.generate_key("salt", 32)
+show("frozen caching", [frozen_caching.frozen?, frozen_key == first, frozen_caching.generate_key("salt", 32).equal?(frozen_key), ActiveSupport::CachingKeyGenerator.new(kg).generate_key("salt", 32).equal?(frozen_key)])
 show("key_len", [ActiveSupport::MessageEncryptor.key_len, ActiveSupport::MessageEncryptor.key_len("aes-256-gcm"), ActiveSupport::MessageEncryptor.key_len("aes-128-gcm")])
 
 # --- MessageVerifier --------------------------------------------------------
@@ -169,6 +193,17 @@ show("url_safe", [url.generate("?>?>~~~"), url.verify(url.generate("?>?>~~~")), 
 
 # Metadata: the legacy envelope (use_message_serializer_for_metadata unset).
 show("use_message_serializer_for_metadata", ActiveSupport::Messages::Metadata.use_message_serializer_for_metadata)
+# Natively the first format check loads ActiveSupport::MessagePack (Core's
+# bundle has msgpack), whose on_load hook appends it to both lists; the
+# tree does not carry it (the port refuses MessagePack, see its header).
+without_message_pack = ->(list) { list.map(&:name) - ["ActiveSupport::MessagePack"] }
+show("metadata serializer lists", [
+  without_message_pack.(ActiveSupport::Messages::Metadata.envelope_serializers),
+  without_message_pack.(ActiveSupport::Messages::Metadata.timestamp_serializers),
+  ActiveSupport::Messages::Metadata.envelope_serializers.frozen?,
+  ActiveSupport::Messages::Metadata.timestamp_serializers.frozen?,
+  ActiveSupport::Messages::SerializerWithFallback::SERIALIZERS.frozen?,
+])
 purposed = verifier.generate("data", purpose: :login)
 show("purpose", [purposed, verifier.verify(purposed, purpose: :login), verifier.verify(purposed, purpose: "login"), verifier.verified(purposed), verifier.verified(purposed, purpose: :other)])
 show("purpose raises", [outcome { verifier.verify(purposed) }, outcome { verifier.verify(purposed, purpose: :other) }, outcome { verifier.verify(token, purpose: :login) }])
@@ -208,8 +243,9 @@ show("default_serializer", [ActiveSupport::Messages::Codec.default_serializer, A
 ActiveSupport::MessageVerifier.default_serializer = :json
 show("subclass default_serializer", [ActiveSupport::Messages::Codec.default_serializer, ActiveSupport::MessageVerifier.default_serializer, ActiveSupport::MessageEncryptor.default_serializer, ActiveSupport::MessageVerifier.new(SECRET).generate("x")])
 ActiveSupport::MessageVerifier.default_serializer = :marshal
-# :message_pack is not compared: it needs the msgpack gem, which the
-# tree does not carry (the port raises LoadError, as natively without it).
+# :message_pack is not compared: it needs ActiveSupport::MessagePack and
+# the msgpack gem, which the tree does not carry; the port refuses it
+# with a LoadError naming that.
 show("unknown serializer", outcome { ActiveSupport::MessageVerifier.new(SECRET, serializer: :yaml) })
 
 # Rotation, the way Shopify::Secrets.build_rotation builds it.
@@ -314,8 +350,13 @@ show("derived key", derived_enc.decrypt_and_verify(derived_enc.encrypt_and_sign(
 show("encryptor inspect", cbc.inspect.sub(/0x\h+/, "0x"))
 show("encryptor ancestors", ActiveSupport::MessageEncryptor.ancestors.take_while { |m| m != Object }.map(&:name))
 show("encryptor constants", [ActiveSupport::MessageEncryptor::OpenSSLCipherError.equal?(OpenSSL::Cipher::CipherError), ActiveSupport::MessageEncryptor::SEPARATOR, ActiveSupport::MessageEncryptor::AUTH_TAG_LENGTH, ActiveSupport::MessageEncryptor::InvalidMessage.superclass.name])
+encryptor_subclass = Class.new(ActiveSupport::MessageEncryptor)
 ActiveSupport::MessageEncryptor.use_authenticated_message_encryption = true
 show("authenticated default", [ActiveSupport::MessageEncryptor.default_cipher, ActiveSupport::MessageEncryptor.key_len, ActiveSupport::MessageEncryptor.new(KEY).encrypt_and_sign("a").count("-")])
+# A class attribute of MessageEncryptor alone: a subclass does not see it.
+show("authenticated subclass", [encryptor_subclass.use_authenticated_message_encryption, encryptor_subclass.default_cipher, encryptor_subclass.new(KEY).encrypt_and_sign("a").count("-")])
+encryptor_subclass.use_authenticated_message_encryption = true
+show("authenticated subclass set", [encryptor_subclass.default_cipher, ActiveSupport::MessageEncryptor.use_authenticated_message_encryption])
 ActiveSupport::MessageEncryptor.use_authenticated_message_encryption = false
 
 made["encryptor"] = {
@@ -360,6 +401,16 @@ show("json encode", [
   ActiveSupport::JSON.dump([1]),
 ])
 show("json decode", [ActiveSupport::JSON.decode('{"a":[1,2.5,null,"x"]}'), ActiveSupport::JSON.load("[1]"), ActiveSupport::JSON.decode('"2020-01-01"'), outcome { ActiveSupport::JSON.decode("{") }.split(":").first, ActiveSupport::JSON.parse_error.name])
+show("json decode options", [ActiveSupport::JSON.decode('{"a":{"b":1}}', symbolize_names: true), ActiveSupport::JSON.decode("[1.5]", decimal_class: Rational), ActiveSupport::JSON.decode("[]", {})])
+show("json frozen tables", [
+  ActiveSupport::JSON::Encoding::ESCAPED_CHARS.frozen?,
+  ActiveSupport::JSON::Encoding::ESCAPED_CHARS.values.all?(&:frozen?),
+  [ActiveSupport::JSON::Encoding::HTML_ENTITIES_REGEX, ActiveSupport::JSON::Encoding::FULL_ESCAPE_REGEX, ActiveSupport::JSON::Encoding::JS_SEPARATORS_REGEX].map(&:frozen?),
+  ActiveSupport::JSON::Encoding::JSONGemEncoder.new.options,
+  ActiveSupport::JSON::Encoding::JSONGemEncoder.new.options.frozen?,
+  ActiveSupport::JSON::Encoding::JSONGemEncoder.new(escape: false).options.frozen?,
+  ActiveSupport::JSON::Encoding::JSONGemEncoder.new(escape: false).encode("<\u2028"),
+])
 show("json switches", [ActiveSupport.escape_html_entities_in_json, ActiveSupport.use_standard_json_time_format, ActiveSupport.time_precision, ActiveSupport.parse_json_times])
 
 # --- The other side's messages --------------------------------------------

@@ -1,20 +1,18 @@
 # frozen_string_literal: true
 
 # ActiveSupport's signed and encrypted messages, ported from activesupport
-# 8.1.4 for the CRuby and JRuby trees: SecurityUtils, KeyGenerator and
+# 8.2.0.alpha (Shopify/rails 5813559f, the version Core pins) for the
+# CRuby and JRuby trees: SecurityUtils, KeyGenerator and
 # CachingKeyGenerator, Messages::Metadata, Messages::SerializerWithFallback,
 # Messages::Codec, Messages::Rotator, MessageVerifier, MessageEncryptor and
 # SecureCompareRotator. Real OpenSSL does the HMAC, the ciphers and PBKDF2.
 #
-# Each method follows the 8.1.4 source (lib/active_support/{security_utils,
-# key_generator,message_verifier,message_encryptor,secure_compare_rotator}.rb
-# and messages/{metadata,serializer_with_fallback,codec,rotator}.rb);
-# tests/messages_runtime.rb runs the same observations against native
-# ActiveSupport and this file, decrypts each side's messages on the other,
-# and requires them equal. Core pins Shopify/rails 5813559f (8.2.0.alpha);
-# its copies of these files differ from 8.1.4 only in `inspect` (the
-# InspectBackport), Ractor-shareable key caches and Metadata's serializer
-# lists becoming frozen class attributes, none of which a message sees.
+# Each method follows the 8.2.0.alpha source (lib/active_support/{inspect_backport,
+# security_utils,key_generator,message_verifier,message_encryptor,
+# secure_compare_rotator}.rb and messages/{metadata,serializer_with_fallback,
+# codec,rotator}.rb); tests/messages_runtime.rb runs the same observations
+# against that native ActiveSupport and this file, decrypts each side's
+# messages on the other, and requires them equal.
 #
 # runtime/spinel/active_support_json.rb (ActiveSupport::JSON's coder) is
 # required first: the legacy metadata envelope and an
@@ -33,11 +31,17 @@
 #   application.rb configures exactly these values.)
 # - The MessagePack serializers (:message_pack, :message_pack_allow_marshal)
 #   need ActiveSupport::MessagePack and the msgpack gem, which the tree
-#   does not carry: selecting one raises, and a MessagePack payload is not
-#   recognized on load (native behavior without msgpack installed).
+#   does not carry: selecting one raises a LoadError naming that, and so
+#   does loading a payload that carries the MessagePack signature. (Under
+#   Core's bundle, which has msgpack, native Rails loads
+#   ActiveSupport::MessagePack on the first format check and decodes such
+#   a payload; Core configures :marshal and produces none.)
 # - CachingKeyGenerator caches in a Hash rather than a Concurrent::Map:
 #   under the GVL `[]` / `||=` behave the same (both may derive a key
-#   twice under a race; neither loses one).
+#   twice under a race; neither loses one). A frozen one keeps it in
+#   `Ractor[]` storage as natively (ActiveSupport::Ractors is not ported).
+# - Metadata's `on_load(:message_pack)` hook is not registered (no
+#   MessagePack, above).
 # - Rails.application.message_verifier(s), MessageVerifiers /
 #   MessageEncryptors and the RotationConfiguration / RotationCoordinator
 #   behind them are not ported; no code the tree carries calls them yet.
@@ -50,6 +54,40 @@ require_relative "active_support_json"
 require_relative "active_support_notifications"
 
 module ActiveSupport
+  # inspect_backport.rb: Ruby 4's Kernel#inspect lists the instance
+  # variables `instance_variables_to_inspect` names; older Rubies get the
+  # same output from this `inspect`.
+  module InspectBackport # :nodoc:
+    class << self
+      if RUBY_VERSION < "4"
+        def apply(klass)
+          klass.define_method(:inspect, instance_method(:inspect))
+        end
+      else
+        def apply(_)
+          # noop
+        end
+      end
+    end
+
+    def inspect
+      ivars = instance_variables_to_inspect
+      klass = self.class.name || self.class.inspect
+      addr = "0x%x" % object_id
+
+      if ivars.empty?
+        "#<#{klass}:#{addr}>"
+      else
+        pairs = ivars.filter_map do |ivar|
+          if instance_variable_defined?(ivar)
+            "#{ivar}=#{instance_variable_get(ivar).inspect}"
+          end
+        end
+        "#<#{klass}:#{addr} #{pairs.join(", ")}>"
+      end
+    end
+  end
+
   module SecurityUtils
     if defined?(OpenSSL.fixed_length_secure_compare)
       def fixed_length_secure_compare(a, b)
@@ -99,20 +137,43 @@ module ActiveSupport
       OpenSSL::PKCS5.pbkdf2_hmac(@secret, salt, @iterations, key_size, @hash_digest_class.new)
     end
 
-    def inspect # :nodoc:
-      "#<#{self.class.name}:#{'%#016x' % (object_id << 1)}>"
-    end
+    InspectBackport.apply(self)
+
+    private
+      def instance_variables_to_inspect
+        [].freeze
+      end
   end
 
   class CachingKeyGenerator
     def initialize(key_generator)
       @key_generator = key_generator
       @cache_keys = {}
+      @ractor_key = nil
+    end
+
+    # Ractor-local storage (`Ractor[]`), or one process-wide table on a
+    # Ruby without Ractors.
+    LOCAL_STORAGE = defined?(::Ractor) && ::Ractor.respond_to?(:[]) ? ::Ractor : {}
+    private_constant :LOCAL_STORAGE
+
+    # Freezing moves the cache into Ractor-local storage, so a frozen
+    # generator still caches (per Ractor).
+    def freeze
+      @ractor_key = "_caching_key_generator_#{object_id}".to_sym
+      LOCAL_STORAGE[@ractor_key] = @cache_keys
+      @cache_keys = nil
+      super
     end
 
     def generate_key(*args)
-      @cache_keys[args.join("|")] ||= @key_generator.generate_key(*args)
+      cache_keys[args.join("|")] ||= @key_generator.generate_key(*args)
     end
+
+    private
+      def cache_keys
+        @cache_keys || (LOCAL_STORAGE[@ractor_key] ||= {})
+      end
   end
 
   module Messages # :nodoc:
@@ -236,12 +297,19 @@ module ActiveSupport
             ActiveSupport::MessagePack.load(dumped)
           end
 
+          # ActiveSupport::MessagePack is not carried (see the header).
+          # Natively, under a bundle with msgpack (Core's), a payload with
+          # its signature decodes; here it is refused rather than handed
+          # to another format.
           def dumped?(dumped)
-            available? && ActiveSupport::MessagePack.signature?(dumped)
+            return ActiveSupport::MessagePack.signature?(dumped) if available?
+            if dumped.getbyte(0) == 0xCC && dumped.getbyte(1) == 0x80
+              raise LoadError, "a MessagePack-serialized message needs ActiveSupport::MessagePack and the msgpack gem, which this tree does not carry"
+            end
+            false
           end
 
           private
-            # ActiveSupport::MessagePack is not carried (see the header).
             def available?
               return @available if defined?(@available)
               @available = defined?(ActiveSupport::MessagePack) ? true : false
@@ -260,23 +328,23 @@ module ActiveSupport
           json_allow_marshal: JsonWithFallbackAllowMarshal,
           message_pack: MessagePackWithFallback,
           message_pack_allow_marshal: MessagePackWithFallbackAllowMarshal,
-        }
+        }.freeze
     end
 
     module Metadata # :nodoc:
-      singleton_class.attr_accessor :use_message_serializer_for_metadata
+      singleton_class.attr_accessor :use_message_serializer_for_metadata, :envelope_serializers, :timestamp_serializers
 
-      ENVELOPE_SERIALIZERS = [
+      self.envelope_serializers = [
         *SerializerWithFallback::SERIALIZERS.values,
         ActiveSupport::JSON,
         ::JSON,
         Marshal,
-      ]
+      ].freeze
 
-      TIMESTAMP_SERIALIZERS = [
+      self.timestamp_serializers = [
         SerializerWithFallback::SERIALIZERS.fetch(:message_pack),
         SerializerWithFallback::SERIALIZERS.fetch(:message_pack_allow_marshal),
-      ]
+      ].freeze
 
       private
         def serialize_with_metadata(data, **metadata)
@@ -310,7 +378,7 @@ module ActiveSupport
         end
 
         def use_message_serializer_for_metadata?
-          Metadata.use_message_serializer_for_metadata && Metadata::ENVELOPE_SERIALIZERS.include?(serializer)
+          Metadata.use_message_serializer_for_metadata && Metadata.envelope_serializers.include?(serializer)
         end
 
         def wrap_in_metadata_envelope(hash, expires_at: nil, expires_in: nil, purpose: nil)
@@ -359,7 +427,7 @@ module ActiveSupport
             Time.now.utc + expires_in
           end
 
-          unless Metadata::TIMESTAMP_SERIALIZERS.include?(serializer)
+          unless Metadata.timestamp_serializers.include?(serializer)
             expiry = expiry&.iso8601(3)
           end
 
@@ -607,11 +675,13 @@ module ActiveSupport
       deserialize_with_metadata(decode(extract_encoded(message)), **options)
     end
 
-    def inspect # :nodoc:
-      "#<#{self.class.name}:#{'%#016x' % (object_id << 1)}>"
-    end
+    InspectBackport.apply(self)
 
     private
+      def instance_variables_to_inspect
+        [].freeze
+      end
+
       def decode(encoded, url_safe: @url_safe)
         catch :invalid_message_format do
           return super
@@ -672,18 +742,10 @@ module ActiveSupport
   class MessageEncryptor < Messages::Codec
     prepend Messages::Rotator
 
-    # cattr_accessor :use_authenticated_message_encryption,
-    #   instance_accessor: false, default: false
-    @@use_authenticated_message_encryption = false
+    @use_authenticated_message_encryption = false
 
     class << self
-      def use_authenticated_message_encryption
-        @@use_authenticated_message_encryption
-      end
-
-      def use_authenticated_message_encryption=(value)
-        @@use_authenticated_message_encryption = value
-      end
+      attr_accessor :use_authenticated_message_encryption
 
       def default_cipher # :nodoc:
         if use_authenticated_message_encryption
@@ -746,11 +808,13 @@ module ActiveSupport
       deserialize_with_metadata(decrypt(verify(message)), **options)
     end
 
-    def inspect # :nodoc:
-      "#<#{self.class.name}:#{'%#016x' % (object_id << 1)}>"
-    end
+    InspectBackport.apply(self)
 
     private
+      def instance_variables_to_inspect
+        [].freeze
+      end
+
       def sign(data)
         @verifier ? @verifier.create_message(data) : data
       end
