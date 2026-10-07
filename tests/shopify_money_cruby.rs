@@ -24,8 +24,11 @@
 //! `Money::Converters.register(…)` call, which the tree does not run
 //! (reported as `file_statement_unsupported`, as is `deprecations.rb`'s
 //! file-level `Money.class_eval do … end`). Analysis also still
-//! refuses `Money::Helpers::DECIMAL_ZERO`, `Float::EPSILON`, `Rational`,
-//! a keyword splat passed to `super`, and the probe's `as_json`.
+//! refuses the probe's `as_json`. `Money::Helpers::DECIMAL_ZERO`
+//! (`BigDecimal(0).freeze`), `Float::EPSILON` and `Rational` in
+//! `Money::Allocator < SimpleDelegator`, and `Accounting#parse`'s
+//! `super(..., **options)` now analyze; see
+//! `kernel_conversion_constants_cruby` and `namespaced_superclass_cruby`.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
