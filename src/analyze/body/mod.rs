@@ -306,6 +306,16 @@ pub(crate) fn lexical_class(
     classes.contains_key(written).then(|| written.clone())
 }
 
+/// A stdlib generic applied to type arguments names the stdlib's class,
+/// whatever the scope holds, so it is not resolved lexically. Sorbet
+/// reads Core's `#: -> Set[String]` inside `module Metafields` as
+/// `T::Set[String]`, not as the non-generic `Metafields::Set` model,
+/// and RBS would refuse the arity.
+pub(crate) fn is_applied_stdlib_generic(id: &ClassId, args: &[Ty]) -> bool {
+    !args.is_empty()
+        && matches!(id.0.as_str(), "Set" | "Range" | "Enumerable" | "Enumerator" | "Class" | "Module")
+}
+
 /// `ty` with every sorbet type alias it names (`Name = T.type_alias { X }`,
 /// in `ClassInfo::type_aliases`) replaced by the type the alias names.
 /// An alias is found the way `lexical_class` finds a class, innermost
@@ -2532,7 +2542,10 @@ impl<'a> BodyTyper<'a> {
                     _ => expand_type_aliases(target_ty, "", self.classes()),
                 };
                 let resolved = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
-                    Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
+                    Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids_with_args(&|id, args| {
+                        if is_applied_stdlib_generic(id, args) {
+                            return id.clone();
+                        }
                         lexical_class(id, scope.0.as_str(), self.classes()).unwrap_or_else(|| id.clone())
                     }),
                 _ => target_ty.clone(),

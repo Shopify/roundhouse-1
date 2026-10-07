@@ -1155,13 +1155,17 @@ impl Analyzer {
 
         // A class named in a signature means the lexically nearest one
         // (`Capabilities::Charge` inside `ShopifyPayments::Capability`),
-        // which is only knowable once every class is registered.
+        // which is only knowable once every class is registered. An
+        // applied stdlib generic (`Set[String]`) is never rescoped.
         let resolved: Vec<(ClassId, Symbol, Ty, Ty)> = app
             .rbs_signatures
             .iter()
             .flat_map(|(class_id, methods)| {
                 methods.iter().map(|(name, ty)| {
-                    let scoped = ty.map_class_ids(&|id| {
+                    let scoped = ty.map_class_ids_with_args(&|id, args| {
+                        if body::is_applied_stdlib_generic(id, args) {
+                            return id.clone();
+                        }
                         body::lexical_class(id, class_id.0.as_str(), body::Classes::new(&classes, None))
                             .unwrap_or_else(|| id.clone())
                     });
