@@ -2281,7 +2281,7 @@ end
             && lc.origin.is_none();
         !(bodiless && model_names.contains(lc.name.0.as_str()))
     });
-    app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes);
+    app.library_class_reopens = merge_library_class_reopens(&mut app.library_classes, &sources);
 
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.
@@ -4511,18 +4511,28 @@ fn map_enum_labels(app: &mut App) {
 /// empty reopen from the last of them replaced the 51-method body from
 /// `money.rb`. No diagnostic was reported.
 ///
-/// Members are merged in walk order into the first member's position.
-/// That keeps each file's own order: a later def of a method still
-/// overrides an earlier one, and an alias still follows its original.
-/// A group is left alone when Ruby itself would refuse it or the IR
-/// cannot express one body: a class reopened as a module, two
+/// Members are merged in LOAD order (see `load_order`) into the first
+/// member's position. That keeps each file's own order: a later def of a
+/// method still overrides an earlier one, and an alias still follows its
+/// original. A group is left alone when Ruby itself would refuse it or
+/// the IR cannot express one body: a class reopened as a module, two
 /// different superclasses, or a synthesized origin.
 ///
-/// Walk order is not always Ruby's load order. Returned is how many
-/// declarations each merged class came from, which the analysis keeps
-/// counting as fragments where the order matters.
+/// Walk order is a sorted path list, not Ruby's load order: the path
+/// component `cardinal` sorts before `cardinal.rb`, so every reopen in
+/// `cardinal/*.rb` came before the file that owns the module and
+/// requires them after its body. Merged that way, graphql-cardinal's
+/// `UNREPORTED_ERROR = ExecutionError.new(...)` (from `cardinal/errors`)
+/// ran before `cardinal.rb`'s `EMPTY_ARRAY`, which `initialize` reads
+/// through a default argument: `NameError` at load. Constants are then
+/// ordered one by one, so a require between two of a body's constants
+/// places the required file's constants between them.
+///
+/// Returned is how many declarations each merged class came from, which
+/// the analysis keeps counting as fragments where the order matters.
 fn merge_library_class_reopens(
     classes: &mut Vec<LibraryClass>,
+    sources: &[crate::span::SourceFile],
 ) -> crate::det::HashMap<crate::ident::ClassId, usize> {
     let mut members: crate::det::HashMap<crate::ident::ClassId, Vec<usize>> = crate::det::HashMap::default();
     for (index, lc) in classes.iter().enumerate() {
@@ -4535,47 +4545,90 @@ fn merge_library_class_reopens(
         group.iter().all(|&i| classes[i].is_module == first.is_module && classes[i].origin.is_none())
             && parents.all(|p| Some(p) == parent)
     };
-    let mut absorbed: crate::det::HashMap<usize, usize> = crate::det::HashMap::default();
     let mut merged: crate::det::HashMap<crate::ident::ClassId, usize> = crate::det::HashMap::default();
+    let mut groups: Vec<&Vec<usize>> = Vec::new();
     for (name, group) in &members {
         if group.len() > 1 && mergeable(group) {
             merged.insert(name.clone(), group.len());
-            for &later in &group[1..] {
-                absorbed.insert(later, group[0]);
-            }
+            groups.push(group);
         }
     }
-    if absorbed.is_empty() {
+    if groups.is_empty() {
         return merged;
     }
+    let load_order = super::load_order::LoadOrder::new(sources);
     let mut slots: Vec<Option<LibraryClass>> = std::mem::take(classes).into_iter().map(Some).collect();
-    for index in 0..slots.len() {
-        let Some(&into) = absorbed.get(&index) else { continue };
-        let reopen = slots[index].take().expect("each member is absorbed once");
-        let target = slots[into].as_mut().expect("the first member is never absorbed");
-        if target.parent.is_none() {
-            target.parent = reopen.parent;
-        }
-        for include in reopen.includes {
-            if !target.includes.contains(&include) {
-                target.includes.push(include);
+    for group in groups {
+        let mut order: Vec<(Option<(u32, u32)>, usize)> = group
+            .iter()
+            .map(|&i| (library_class_load_key(slots[i].as_ref().expect("one group per member"), &load_order), i))
+            .collect();
+        // A member with no real position (only nested classes) keeps its
+        // walk place relative to the others by sorting stably on the key
+        // of the member before it.
+        let mut last = None;
+        for entry in &mut order {
+            if entry.0.is_none() {
+                entry.0 = last;
             }
+            last = entry.0;
         }
-        for column in reopen.nullable_columns {
-            if !target.nullable_columns.contains(&column) {
-                target.nullable_columns.push(column);
-            }
+        order.sort_by_key(|&(key, _)| key);
+        let mut taken = order.iter().map(|&(_, i)| slots[i].take().expect("each member is absorbed once"));
+        let mut target = taken.next().expect("a group has members");
+        for reopen in taken {
+            absorb_library_class_reopen(&mut target, reopen);
         }
-        target.methods.extend(reopen.methods);
-        target.class_ivar_initializers.extend(reopen.class_ivar_initializers);
-        target.constants.extend(reopen.constants);
-        target.unknown_calls.extend(reopen.unknown_calls);
-        target.visibility_overrides.extend(reopen.visibility_overrides);
-        target.method_aliases.extend(reopen.method_aliases);
-        target.top_level_constants.extend(reopen.top_level_constants);
+        let mut keyed: Vec<(Option<(u32, u32)>, (crate::ident::Symbol, crate::expr::Expr))> = Vec::new();
+        let mut last = None;
+        for constant in std::mem::take(&mut target.constants) {
+            let key = load_order.key(constant.1.span).or(last);
+            last = key;
+            keyed.push((key, constant));
+        }
+        keyed.sort_by_key(|(key, _)| *key);
+        target.constants = keyed.into_iter().map(|(_, c)| c).collect();
+        slots[group[0]] = Some(target);
     }
     *classes = slots.into_iter().flatten().collect();
     merged
+}
+
+/// Where a library-class declaration runs in load order: its earliest
+/// positioned member.
+fn library_class_load_key(lc: &LibraryClass, load_order: &super::load_order::LoadOrder) -> Option<(u32, u32)> {
+    let spans = lc
+        .constants
+        .iter()
+        .map(|(_, e)| e.span)
+        .chain(lc.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
+        .chain(lc.unknown_calls.iter().map(|e| e.span))
+        .chain(lc.class_ivar_initializers.iter().map(|e| e.span));
+    spans.filter_map(|span| load_order.key(span)).min()
+}
+
+fn absorb_library_class_reopen(target: &mut LibraryClass, reopen: LibraryClass) {
+    if target.parent.is_none() {
+        target.parent = reopen.parent;
+    }
+    for include in reopen.includes {
+        if !target.includes.contains(&include) {
+            target.includes.push(include);
+        }
+    }
+    for column in reopen.nullable_columns {
+        if !target.nullable_columns.contains(&column) {
+            target.nullable_columns.push(column);
+        }
+    }
+    target.methods.extend(reopen.methods);
+    target.class_ivar_initializers.extend(reopen.class_ivar_initializers);
+    target.constants.extend(reopen.constants);
+    target.unknown_calls.extend(reopen.unknown_calls);
+    target.visibility_overrides.extend(reopen.visibility_overrides);
+    target.method_aliases.extend(reopen.method_aliases);
+    target.top_level_constants.extend(reopen.top_level_constants);
+    target.conditional_definitions.extend(reopen.conditional_definitions);
 }
 
 /// Resolve a controller's relative superclass against Ruby's lexical

@@ -61,6 +61,7 @@ pub mod type_ascription;
 pub mod initializers;
 pub mod gem_source_constants;
 mod initializer_constants;
+mod load_order;
 pub mod initializer_programs;
 pub mod sql_functions;
 pub mod structure_sql;
