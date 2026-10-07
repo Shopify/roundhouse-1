@@ -27,6 +27,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
+    ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands
@@ -222,6 +223,13 @@ mod tests {
             ("ActiveSupport::KeyGenerator", "runtime/active_support_messages.rb"),
             ("ActiveSupport::CachingKeyGenerator", "runtime/active_support_messages.rb"),
             ("ActiveSupport::Messages::Rotator", "runtime/active_support_messages.rb"),
+            ("ActiveModel::Type::Integer", "runtime/active_model_type.rb"),
+            ("ActiveModel::Type::DateTime", "runtime/active_model_type.rb"),
+            ("ActiveModel::Type::Helpers::AcceptsMultiparameterTime", "runtime/active_model_type.rb"),
+            ("ActiveRecord::Type::Text", "runtime/active_model_type.rb"),
+            ("ActiveRecord::Type::DateTime", "runtime/active_model_type.rb"),
+            ("ActiveRecord::Type::Internal::Timezone", "runtime/active_model_type.rb"),
+            ("ActiveModel::RangeError", "runtime/active_model_type.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }

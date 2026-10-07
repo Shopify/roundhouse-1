@@ -2714,6 +2714,23 @@ fn ruby_family_runtime_files(
         }
         replace_message_verifier_stand_in(&mut files)?;
     }
+    // ActiveModel's attribute types and ActiveRecord::Type's names over
+    // them (Value, ImmutableString, String, Text, Integer, Boolean,
+    // DateTime), ported from activemodel / activerecord 8.1.4 (see the
+    // file's header; tests/active_model_type_runtime.rb holds it to
+    // native ActiveModel). A Module subclass that defines methods from a
+    // block and ancestor-index dispatch, so ruby-family only, and carried
+    // only where the app's own code names a type: an app that builds its
+    // columns (Core's TablelessSchema) needs the real classes.
+    // gem_facades.rb requires it, before any app file loads.
+    let carries_types = carries_active_model_type(&files);
+    if carries_types {
+        files.push((
+            "runtime/active_model_type.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_model_type.rb")
+                .map_err(|e| format!("read runtime/spinel/active_model_type.rb: {e}"))?,
+        ));
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2799,6 +2816,11 @@ fn ruby_family_runtime_files(
     };
     let gem_facades = if carries_cache {
         format!("{gem_facades}require_relative \"active_support_cache\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_types {
+        format!("{gem_facades}require_relative \"active_model_type\"\n")
     } else {
         gem_facades
     };
@@ -5303,6 +5325,9 @@ fn spinel_files_with_assertions(
     // And for the messages port and its JSON coder (OpenSSL, Marshal),
     // pushed back by the two ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
+    // And for the attribute types, pushed back by the two ruby-family
+    // forks where the app names one.
+    files.retain(|(p, _)| p != "runtime/active_model_type.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -7033,6 +7058,23 @@ fn carries_active_support_messages(files: &[(String, String)]) -> bool {
     })
 }
 
+/// The namespaces runtime/spinel/active_model_type.rb declares that an
+/// app reaches by name: `ActiveRecord::Type::Integer`,
+/// `ActiveModel::Type::Value`, a `< ActiveRecord::Type::Value` subclass.
+const ACTIVE_MODEL_TYPE_NAMES: &[&str] = &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError"];
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names a namespace the type port declares, in any position a
+/// constant takes (`mentions_messages_constant`).
+fn carries_active_model_type(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_MODEL_TYPE_NAMES.iter().any(|name| mentions_messages_constant(content, name))
+    })
+}
+
 /// `konst` as a whole constant path outside whole-line comments: no
 /// identifier or `Outer::` before it (`::Name` is top-level), no
 /// identifier character after it, and not `MessageVerifier::InvalidSignature`.
@@ -8515,6 +8557,33 @@ mod tests {
         let port = crate::runtime_files::read_to_string("runtime/spinel/active_support_messages.rb").unwrap();
         let declared = crate::analyze::test_constants::declared_namespaces(&port);
         assert!(declared.contains("ActiveSupport::MessageVerifier::InvalidSignature"), "{declared:?}");
+    }
+
+    #[test]
+    fn an_app_naming_an_attribute_type_carries_the_type_port() {
+        let files = vec![
+            ("runtime/active_record/connection.rb".to_string(), "# ActiveModel::Type::Integer serializes\nActiveRecord::Type::Integer.new\n".to_string()),
+            ("test/models/schema_test.rb".to_string(), "ActiveRecord::Type::String.new\n".to_string()),
+            ("app/models/b.rb".to_string(), "# ActiveRecord::Type::Text.new\nActiveRecord::Types\nFoo::ActiveModel::Type::Value\nMyActiveRecord::Type\n".to_string()),
+        ];
+        assert!(!carries_active_model_type(&files), "runtime, test bodies, comments, longer and nested names");
+        for use_site in [
+            "BIGINT = ActiveRecord::Type::Integer.new(limit: 8)\n",
+            "class Money < ::ActiveRecord::Type::Value\n",
+            "x = y #: ActiveModel::Type::DateTime\n",
+            "rescue ActiveModel::RangeError\n",
+            "TYPES = [ActiveRecord::Type::Text, ActiveModel::Type::Boolean]\n",
+        ] {
+            let mut with = files.clone();
+            with.push(("components/x/lib/schema.rb".to_string(), use_site.to_string()));
+            assert!(carries_active_model_type(&with), "{use_site}");
+        }
+        // The port declares the names the app reaches.
+        let port = crate::runtime_files::read_to_string("runtime/spinel/active_model_type.rb").unwrap();
+        let declared = crate::analyze::test_constants::declared_namespaces(&port);
+        for name in ["ActiveModel::Type::Integer", "ActiveModel::Type::String", "ActiveModel::Type::Boolean", "ActiveModel::Type::DateTime", "ActiveRecord::Type::Text", "ActiveRecord::Type::DateTime"] {
+            assert!(declared.contains(name), "{name}: {declared:?}");
+        }
     }
 
     #[test]

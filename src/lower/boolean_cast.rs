@@ -1,4 +1,4 @@
-// Not an `ActiveModel::Type::Boolean` instance: no ruby-family runtime ships the class, so the cast grounds to `ActiveSupport.cast_boolean`.
+// Not an `ActiveModel::Type::Boolean` instance: a ruby-family tree carries the class only where the app names a type (runtime/active_model_type.rb) and no other runtime ships it, so the cast grounds to `ActiveSupport.cast_boolean`.
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
