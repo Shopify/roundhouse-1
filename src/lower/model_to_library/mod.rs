@@ -935,56 +935,105 @@ pub(crate) fn model_defines_writer(model: &Model, field: &crate::ident::Symbol) 
     model_defines_instance_method(model, &writer)
 }
 
-/// Survey the same untyped synthesis used by emission. Source lookup stays
-/// with the caller: inherited library contracts can also be forwarding
-/// destinations, even when neither they nor the model declare `...`.
-pub(crate) fn unretained_model_contracts<'a>(
+/// The untyped model synthesis emission uses, built per model the first
+/// time a forwarding contract question needs it, and the two questions.
+///
+/// The forwarding analysis asks whether synthesis keeps a source
+/// contract: a model's own forwarding method, or a method it inherits that
+/// a synthesized override could shadow. Building every model that could be
+/// asked about cost seconds per forwarding pass on Core, where the passes
+/// ask about few declarations; so the analysis finds the models a span
+/// concerns and asks only about those. Each answer is the one the whole-
+/// model check gave for that source.
+///
+/// Source lookup stays with the caller: inherited library contracts can
+/// also be forwarding destinations, even when neither they nor the model
+/// declare `...`.
+pub(crate) struct ModelSynthesis<'a> {
     app: &'a crate::App,
-    mut inherited: impl FnMut(&'a Model) -> Vec<&'a MethodDef>,
-) -> HashSet<Span> {
-    // Synthesis can report incidental emit warnings. A survey must neither
-    // publish those nor consume an enclosing transpile's diagnostic buffer.
-    crate::emit::diagnostics::scope(|| {
-        let mut specs = crate::lower::controller_to_library::params::collect_specs(&app.controllers);
-        specs.mark_file_fields(&app.models);
-        let mut missing = HashSet::default();
-        for model in &app.models {
-            let inherited = inherited(model);
-            if inherited.is_empty()
-                && !model.methods().any(|m| m.params.iter().any(|p| p.forwarding))
-            {
-                continue;
-            }
-            let built = build_methods(model, &app.models, &app.schema, &specs);
-            let preserved = |source: &MethodDef, built: &MethodDef| {
-                built.name_span == source.name_span
-                    && built.params == source.params
-                    && built.block_param == source.block_param
-            };
-            for source in model.methods().filter(|m| m.params.iter().any(|p| p.forwarding)) {
-                let matches = |m: &&MethodDef| {
-                    m.name == source.name && m.receiver == source.receiver
-                };
-                let effective = model.methods().filter(matches).last().unwrap();
-                let retained = built.iter().rev().find(matches);
-                if effective.name_span != source.name_span
-                    || retained.is_none_or(|m| !preserved(source, m))
-                {
-                    missing.insert(source.name_span);
-                }
-            }
-            for source in inherited {
-                // No own method means normal inheritance survives. An own
-                // synthesized override must retain the source contract.
-                if built.iter().rev().find(|m| {
-                    m.name == source.name && m.receiver == source.receiver
-                }).is_some_and(|m| !preserved(source, m)) {
-                    missing.insert(source.name_span);
-                }
-            }
+    specs: std::cell::OnceCell<crate::lower::controller_to_library::params::ParamsSpecs>,
+    /// Per model position, its synthesized methods.
+    built: std::cell::RefCell<HashMap<usize, std::rc::Rc<Vec<MethodDef>>>>,
+    /// Time spent synthesizing, for `ROUNDHOUSE_TIMINGS`.
+    spent: std::cell::Cell<std::time::Duration>,
+}
+
+impl<'a> ModelSynthesis<'a> {
+    pub(crate) fn new(app: &'a crate::App) -> Self {
+        ModelSynthesis {
+            app,
+            specs: std::cell::OnceCell::new(),
+            built: std::cell::RefCell::new(HashMap::default()),
+            spent: std::cell::Cell::new(std::time::Duration::ZERO),
         }
-        missing
-    }).0
+    }
+
+    /// Time spent synthesizing so far.
+    pub(crate) fn time_spent(&self) -> std::time::Duration {
+        self.spent.get()
+    }
+
+    /// How many models have been synthesized so far.
+    pub(crate) fn models_built(&self) -> usize {
+        self.built.borrow().len()
+    }
+
+    fn built(&self, position: usize) -> std::rc::Rc<Vec<MethodDef>> {
+        if let Some(built) = self.built.borrow().get(&position) {
+            return built.clone();
+        }
+        let app = self.app;
+        let started = std::time::Instant::now();
+        // Synthesis can report incidental emit warnings. A survey must neither
+        // publish those nor consume an enclosing transpile's diagnostic buffer.
+        let built = crate::emit::diagnostics::scope(|| {
+            let specs = self.specs.get_or_init(|| {
+                let mut specs =
+                    crate::lower::controller_to_library::params::collect_specs(&app.controllers);
+                specs.mark_file_fields(&app.models);
+                specs
+            });
+            build_methods(&app.models[position], &app.models, &app.schema, specs)
+        })
+        .0;
+        self.spent.set(self.spent.get() + started.elapsed());
+        let built = std::rc::Rc::new(built);
+        self.built.borrow_mut().insert(position, built.clone());
+        built
+    }
+
+    fn preserved(source: &MethodDef, built: &MethodDef) -> bool {
+        built.name_span == source.name_span
+            && built.params == source.params
+            && built.block_param == source.block_param
+    }
+
+    /// Does the model at `position` lose its own forwarding method
+    /// `source`: is another of its definitions the effective one, or does
+    /// the synthesized class not keep this one's contract?
+    pub(crate) fn drops_own(&self, position: usize, source: &MethodDef) -> bool {
+        let model = &self.app.models[position];
+        let matches = |m: &&MethodDef| m.name == source.name && m.receiver == source.receiver;
+        let effective = model.methods().filter(matches).last().unwrap();
+        effective.name_span != source.name_span
+            || self
+                .built(position)
+                .iter()
+                .rev()
+                .find(matches)
+                .is_none_or(|m| !Self::preserved(source, m))
+    }
+
+    /// Does a synthesized method of the model at `position` override the
+    /// inherited `source` without its contract? No own method means normal
+    /// inheritance survives.
+    pub(crate) fn drops_inherited(&self, position: usize, source: &MethodDef) -> bool {
+        self.built(position)
+            .iter()
+            .rev()
+            .find(|m| m.name == source.name && m.receiver == source.receiver)
+            .is_some_and(|m| !Self::preserved(source, m))
+    }
 }
 
 pub(crate) fn build_methods(

@@ -69,7 +69,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
                         .any(|d| &d.model == owner && d.method == method.name))
             {
                 Some("full forwarding cannot use the relation-threading argument ABI")
-            } else if contracts.unretained().contains(&method.name_span) {
+            } else if contracts.unretained(&method.name_span) {
                 Some("model method synthesis does not preserve this source declaration")
             } else {
                 None
@@ -595,7 +595,7 @@ fn walk(
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
-            || contracts.unretained().contains(&enclosing.name_span)
+            || contracts.unretained(&enclosing.name_span)
             || !contracts.verified(owner)
         {
             Some("anonymous keyword forwarding source declaration cannot be verified")
@@ -690,7 +690,7 @@ fn keyword_contract_error(
     if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
         return Some("forwarding destination has flattened keyword parameters");
     }
-    if contracts.unretained().contains(&method.name_span) {
+    if contracts.unretained(&method.name_span) {
         return Some("model method synthesis does not preserve this source declaration");
     }
     let Ok(destinations) = virtual_destinations(contracts, context, call) else {
@@ -701,7 +701,7 @@ fn keyword_contract_error(
             !accepts_keywords(candidate)
                 || candidate.unsupported_formals.is_some()
                 || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
-                || contracts.unretained().contains(&candidate.name_span)
+                || contracts.unretained(&candidate.name_span)
         })
     {
         return Some("forwarding destination has no verified keyword parameter ABI");
@@ -824,7 +824,7 @@ fn contract_error(
     if let Some(error) = declaration_error(resolved) {
         return Some(error);
     }
-    if contracts.unretained().contains(&resolved.0.name_span) {
+    if contracts.unretained(&resolved.0.name_span) {
         return Some("model method synthesis does not preserve this source declaration");
     }
     // A self-send in a base method dispatches on the actual subclass.
@@ -835,7 +835,7 @@ fn contract_error(
     };
     for candidate in candidates {
         if declaration_error(candidate).is_some()
-            || contracts.unretained().contains(&candidate.0.name_span)
+            || contracts.unretained(&candidate.0.name_span)
         {
             return Some("forwarding self-dispatch may reach an unpreserved subclass contract");
         }
@@ -1127,7 +1127,7 @@ struct SourceContractIndex<'a> {
     virtual_owners: Vec<&'a ClassId>,
     full_selectors: HashSet<Symbol>,
     app: &'a App,
-    unretained: OnceCell<HashSet<Span>>,
+    unretained: OnceCell<Unretained<'a>>,
     /// Reverse lookup edges: the fragments naming a class as their
     /// superclass or including it as a module.
     children: HashMap<ClassId, Vec<ClassId>>,
@@ -1253,51 +1253,110 @@ impl<'a> SourceContractIndex<'a> {
         self.includes.get(owner).map_or(&[], Vec::as_slice)
     }
 
-    /// Spans of model source contracts that model synthesis does not
-    /// preserve. Computed on first use: it synthesizes every model that
-    /// inherits a full or forwarded-to selector, and a walk that never
-    /// reaches a full destination never asks. Synthesis runs in its own
-    /// diagnostic scope, so computing it later changes nothing else.
-    fn unretained(&self) -> &HashSet<Span> {
-        self.unretained.get_or_init(|| {
-            if self.full_selectors.is_empty() {
-                return HashSet::default();
+    /// Is the source contract declared at `span` one that model synthesis
+    /// does not preserve? A model's own forwarding method counts when the
+    /// synthesized class drops its contract; a method a model inherits
+    /// under a selector some packet is sent to (a full selector, or one a
+    /// forwarding send names) counts when a synthesized override drops it.
+    ///
+    /// Answered per span: only the models that declare `span` or reach its
+    /// declaring class through superclass/include edges can contribute, and
+    /// only those are synthesized, once each. The answer is the one a survey
+    /// of every model would give for that span. Synthesis runs in its own
+    /// diagnostic scope, so asking later changes nothing else.
+    fn unretained(&self, span: &Span) -> bool {
+        if self.full_selectors.is_empty() {
+            return false;
+        }
+        let survey = self.unretained.get_or_init(|| Unretained::new(self));
+        survey.queries.set(survey.queries.get() + 1);
+        if let Some(&known) = survey.answers.borrow().get(span) {
+            return known;
+        }
+        let answer = self.unretained_span(survey, span);
+        survey.answers.borrow_mut().insert(*span, answer);
+        answer
+    }
+
+    fn unretained_span(&self, survey: &Unretained<'a>, span: &Span) -> bool {
+        for &(position, source) in survey.own.get(span).into_iter().flatten() {
+            if survey.synthesis.drops_own(position, source) {
+                return true;
             }
-            // Ordinary inherited contracts matter only when a packet is sent
-            // to them. Looking up every unrelated selector for every model
-            // makes large-app transpilation quadratic in the source inventory.
-            let mut names = self.full_selectors.clone();
-            fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
-                if let ExprNode::Send { method, args, .. } = &*e.node
-                    && has_forwarding(args)
+        }
+        let Some(declared) = survey.declared.get(span) else {
+            return false;
+        };
+        let names = survey.names.get_or_init(|| self.forwarded_selectors());
+        for (owner, source) in declared {
+            if !names.contains(&source.name) {
+                continue;
+            }
+            // Lookup from a model reaches `owner` only along the edges
+            // `children` reverses; the walk below keeps the models whose
+            // lookup actually resolves to this declaration.
+            let mut reached: HashSet<&ClassId> = HashSet::default();
+            reached.insert(owner);
+            let mut pending = vec![owner];
+            while let Some(node) = pending.pop() {
+                for child in self.children.get(node).into_iter().flatten() {
+                    if reached.insert(child) {
+                        pending.push(child);
+                    }
+                }
+            }
+            let mut positions: Vec<usize> = reached
+                .into_iter()
+                .flat_map(|class| survey.models_named.get(class).into_iter().flatten().copied())
+                .collect();
+            positions.sort_unstable();
+            for position in positions {
+                let model = &self.app.models[position];
+                let Some((found, _)) = self.declaration(
+                    &model.name,
+                    &source.name,
+                    source.receiver,
+                    &mut HashSet::default(),
+                ) else {
+                    continue;
+                };
+                if std::ptr::eq(found, *source)
+                    && !model.methods().any(|own| std::ptr::eq(own, found))
+                    && survey.synthesis.drops_inherited(position, source)
                 {
-                    names.insert(method.clone());
-                    if method.as_str() == "new" {
-                        names.insert(Symbol::from("initialize"));
-                    }
-                }
-                e.node.for_each_child(&mut |child| collect(child, names));
-            }
-            for (_, method) in methods(self.app) {
-                collect(&method.body, &mut names);
-                for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-                    collect(default, &mut names);
+                    return true;
                 }
             }
-            crate::lower::model_to_library::unretained_model_contracts(self.app, |model| {
-                let mut inherited = Vec::new();
-                for name in &names {
-                    for receiver in [MethodReceiver::Instance, MethodReceiver::Class] {
-                        if let Some((method, _)) = self.declaration(
-                            &model.name, name, receiver, &mut HashSet::default(),
-                        ) && !model.methods().any(|own| std::ptr::eq(own, method)) {
-                            inherited.push(method);
-                        }
-                    }
+        }
+        false
+    }
+
+    /// Selectors a packet may be sent to: every full (`...`) selector, and
+    /// every selector a forwarding send names (`new` also reaches
+    /// `initialize`). Ordinary inherited contracts matter only for these;
+    /// looking up every unrelated selector would make the question
+    /// quadratic in the source inventory.
+    fn forwarded_selectors(&self) -> HashSet<Symbol> {
+        let _span = crate::timings::begin("forwarding unretained: selectors");
+        let mut names = self.full_selectors.clone();
+        fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
+            if let ExprNode::Send { method, args, .. } = &*e.node
+                && has_forwarding(args)
+            {
+                names.insert(method.clone());
+                if method.as_str() == "new" {
+                    names.insert(Symbol::from("initialize"));
                 }
-                inherited
-            })
-        })
+            }
+            e.node.for_each_child(&mut |child| collect(child, names));
+        }
+        for (_, method) in methods(self.app) {
+            collect(&method.body, &mut names);
+            for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
+                collect(default, &mut names);
+            }
+        }
+        names
     }
 
     /// `verified_hierarchy` from a fresh walk, memoized.
@@ -1435,5 +1494,64 @@ impl<'a> SourceContractIndex<'a> {
                     })
                     .flatten()
             })
+    }
+}
+
+/// What `SourceContractIndex::unretained` needs to answer per span: where
+/// each source contract is declared, and the synthesis of the models asked
+/// about so far.
+struct Unretained<'a> {
+    synthesis: crate::lower::model_to_library::ModelSynthesis<'a>,
+    /// Own forwarding methods by span, with the model's position.
+    own: HashMap<Span, Vec<(usize, &'a MethodDef)>>,
+    /// Indexed declarations by span, with their owner.
+    declared: HashMap<Span, Vec<(ClassId, &'a MethodDef)>>,
+    /// `forwarded_selectors`, computed when an inherited candidate is first
+    /// asked about.
+    names: OnceCell<HashSet<Symbol>>,
+    /// Model positions by name.
+    models_named: HashMap<ClassId, Vec<usize>>,
+    answers: RefCell<HashMap<Span, bool>>,
+    queries: std::cell::Cell<usize>,
+}
+
+impl<'a> Unretained<'a> {
+    fn new(index: &SourceContractIndex<'a>) -> Self {
+        let _span = crate::timings::begin("forwarding unretained: index");
+        let app = index.app;
+        let mut own: HashMap<Span, Vec<(usize, &'a MethodDef)>> = HashMap::default();
+        let mut models_named: HashMap<ClassId, Vec<usize>> = HashMap::default();
+        for (position, model) in app.models.iter().enumerate() {
+            models_named.entry(model.name.clone()).or_default().push(position);
+            for method in model.methods().filter(|m| m.params.iter().any(|p| p.forwarding)) {
+                own.entry(method.name_span).or_default().push((position, method));
+            }
+        }
+        let mut declared: HashMap<Span, Vec<(ClassId, &'a MethodDef)>> = HashMap::default();
+        for ((owner, _), (method, _)) in index.instance.iter().chain(index.class.iter()) {
+            declared.entry(method.name_span).or_default().push((owner.clone(), *method));
+        }
+        Unretained {
+            synthesis: crate::lower::model_to_library::ModelSynthesis::new(app),
+            own,
+            declared,
+            names: OnceCell::new(),
+            models_named,
+            answers: RefCell::default(),
+            queries: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl Drop for Unretained<'_> {
+    fn drop(&mut self) {
+        crate::timings::note(&format!(
+            "forwarding unretained: {} asks, {} spans, {} of {} models built in {:.2}s",
+            self.queries.get(),
+            self.answers.borrow().len(),
+            self.synthesis.models_built(),
+            self.models_named.values().map(Vec::len).sum::<usize>(),
+            self.synthesis.time_spent().as_secs_f64(),
+        ));
     }
 }
