@@ -97,7 +97,10 @@ fn app() -> emit_and_run::Overlay {
 
 /// Run `program` in a scratch directory holding `lib/blanks.rb`.
 fn ruby_in_scratch(name: &str, program: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("rh_as_blank_{name}_{}", std::process::id()));
+    // Both tests run the native oracle; each call needs its own directory.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rh_as_blank_{name}_{}_{seq}", std::process::id()));
     std::fs::create_dir_all(dir.join("lib")).unwrap();
     std::fs::write(dir.join("lib/blanks.rb"), LIB).unwrap();
     std::fs::write(dir.join("main.rb"), program).unwrap();
