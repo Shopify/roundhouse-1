@@ -26,6 +26,7 @@ mod database_ownership;
 pub mod database_yml;
 pub mod controller;
 pub mod environments;
+mod engine_config;
 pub mod expr;
 mod factory_class;
 pub mod fixture;

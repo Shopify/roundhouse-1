@@ -2660,6 +2660,14 @@ fn ruby_family_runtime_files(
         crate::runtime_files::read_to_string("runtime/spinel/module_delegate.rb")
             .map_err(|e| format!("read runtime/spinel/module_delegate.rb: {e}"))?,
     ));
+    // `Rails.configuration` / `Rails.application.config` answering the
+    // lifted config keys (see the file's header): computed-name dispatch,
+    // so ruby-family only, and required beside module_delegate below.
+    files.push((
+        "runtime/rails_configuration.rb".to_string(),
+        crate::runtime_files::read_to_string("runtime/spinel/rails_configuration.rb")
+            .map_err(|e| format!("read runtime/spinel/rails_configuration.rb: {e}"))?,
+    ));
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2711,6 +2719,7 @@ fn ruby_family_runtime_files(
              # commonmark-java Markly shim — from the same list, minus that\n\
              # one name.)\n\
              require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
              {}{}",
             gem_require_block(&[]),
             WEB_PUSH_STUB_REOPEN
@@ -2734,6 +2743,7 @@ fn ruby_family_runtime_files(
                  # than carrying a second copy.\n\
                  {}\
                  require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
                 gem_require_block(&["markly"]),
@@ -5207,6 +5217,11 @@ fn spinel_files_with_assertions(
     // `delegate` is lowered at ingest. Injected only by
     // `ruby_runtime_files` / `jruby_runtime_files`.
     files.retain(|(p, _)| p != "runtime/module_delegate.rb");
+    // And for `rails_configuration.rb` (`Rails.configuration`), for the
+    // same reason: computed-name dispatch, pushed back by the two
+    // ruby-family forks only. A tree without it refuses the read
+    // (`report_unsupported_runtime_reads`).
+    files.retain(|(p, _)| p != "runtime/rails_configuration.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
