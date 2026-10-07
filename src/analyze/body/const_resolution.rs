@@ -54,6 +54,9 @@ pub(super) enum ResolvedConstant {
 struct FileAnswers {
     /// Keyed by the byte offset where each written constant name starts.
     references: HashMap<u32, Option<ResolvedConstant>>,
+    /// For each reference Rubydex leaves unresolved, the full names of
+    /// the namespaces it is lexically written in, innermost first.
+    unresolved_nesting: HashMap<u32, Vec<Box<str>>>,
     /// Each constant definition as (offset where its name ends, name,
     /// declaration), sorted by offset.
     constants: Vec<(u32, Box<str>, DeclarationId)>,
@@ -328,6 +331,27 @@ fn hoisted_name(name: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
+/// The full names of the namespaces the first segment of a written path
+/// is lexically nested in, innermost first. Empty for a rooted path.
+fn lexical_nesting(graph: &Graph, mut name_id: NameId) -> Vec<Box<str>> {
+    let mut scope = loop {
+        let Some(name) = graph.names().get(&name_id) else { return Vec::new() };
+        match name.parent_scope() {
+            ParentScope::Some(parent) => name_id = *parent,
+            ParentScope::None => break *name.nesting(),
+            ParentScope::TopLevel | ParentScope::Attached(_) => return Vec::new(),
+        }
+    };
+    let mut nesting = Vec::new();
+    while let Some(id) = scope {
+        if let Some(namespace) = resolved_namespace(graph, id) {
+            nesting.push(Box::from(namespace.name()));
+        }
+        scope = graph.names().get(&id).and_then(|name| *name.nesting());
+    }
+    nesting
+}
+
 fn resolved_namespace(graph: &Graph, name: NameId) -> Option<&Declaration> {
     let id = graph.name_id_to_declaration_id(name)?;
     let id = graph.resolve_alias(id).unwrap_or(*id);
@@ -471,6 +495,17 @@ impl ConstResolver {
             .references
             .get(&start)
             .map(Option::as_ref)
+    }
+
+    /// The lexical scopes of a reference Rubydex left unresolved, as full
+    /// namespace names, innermost first.
+    pub(super) fn unresolved_nesting(&self, span: Span, path: &[Symbol]) -> &[Box<str>] {
+        let start = path.last()
+            .and_then(|last| u32::try_from(last.as_str().len()).ok())
+            .and_then(|length| span.end.checked_sub(length));
+        start
+            .and_then(|start| self.file(span.file)?.unresolved_nesting.get(&start))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Exact source-resolved namespace, also used by ingest admission gates
@@ -925,6 +960,12 @@ fn answer_file(
                 .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None))
         {
             bare_values.push((offset.start(), *reference.name_id(), *declaration));
+        }
+        if target.is_none() {
+            let nesting = lexical_nesting(graph, *reference.name_id());
+            if !nesting.is_empty() {
+                answers.unresolved_nesting.insert(offset.start(), nesting);
+            }
         }
         match answers.references.entry(offset.start()) {
             Entry::Vacant(slot) => {

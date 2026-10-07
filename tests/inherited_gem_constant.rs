@@ -22,6 +22,28 @@ class ShopifyMetrics::Middlewares::RequestMetrics
   def call(env); end
 end
 ShopifyMetrics::Middlewares::RequestMetrics::REQUEST_TIME = T.let(T.unsafe(nil), String)
+module ShopifyMetrics::KeyUtilities
+  sig { params(x: String).returns(String) }
+  def self.convert(x); end
+end
+ShopifyMetrics::KeyUtilities::CURVE = T.let(T.unsafe(nil), String)
+"#;
+
+/// Core's `TokenProtocol::Crypto` patch reopens the gem's namespace and
+/// reads its `KeyUtilities` lexically.
+const PATCH: &str = r#"
+module ShopifyMetrics
+  class CacheEntry
+    #: -> String
+    def a = KeyUtilities.convert("x")
+
+    #: -> untyped
+    def b = KeyUtilities::CURVE
+
+    #: -> untyped
+    def c = KeyUtilities::NOPE
+  end
+end
 "#;
 
 const MIDDLEWARE: &str = r#"
@@ -46,6 +68,7 @@ fn errors() -> Vec<String> {
         ("Gemfile.lock", LOCK),
         ("sorbet/rbi/gems/shopify_metrics@2.0.0.rbi", RBI),
         ("app/models/stats_middleware.rb", MIDDLEWARE),
+        ("app/models/shopify_metrics/cache_entry.rb", PATCH),
     ]
     .into_iter()
     .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
@@ -65,4 +88,11 @@ fn a_bare_constant_resolves_on_a_gem_superclass() {
 fn a_name_no_ancestor_declares_stays_refused() {
     let errors = errors();
     assert!(errors.iter().any(|e| e.contains("NOT_THERE")), "{errors:?}");
+}
+
+#[test]
+fn a_gem_declaration_resolves_from_an_enclosing_scope() {
+    let errors = errors();
+    assert!(!errors.iter().any(|e| e.contains("KeyUtilities\n") || e.ends_with("KeyUtilities") || e.contains("CURVE")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("KeyUtilities::NOPE")), "{errors:?}");
 }

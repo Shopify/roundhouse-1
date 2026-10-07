@@ -484,6 +484,29 @@ impl<'a> BodyTyper<'a> {
         self.typed_constants.and_then(|values| values.get(declaration))
     }
 
+    /// The full name `path` has in the innermost of its Ruby lexical
+    /// scopes (Rubydex's nesting, so `class A::B` does not search `A`)
+    /// that models it, as a class or as a constant of the scope's table.
+    /// Top-level names are left to the exact lookup.
+    fn lexical_external_constant(&self, span: crate::span::Span, path: &[Symbol]) -> Option<ClassId> {
+        let (name, owner) = path.split_last()?;
+        let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+        for scope in self.const_resolver.as_ref()?.unresolved_nesting(span, path) {
+            let candidate = ClassId(Symbol::from(format!("{scope}::{written}").as_str()));
+            if self.classes().contains_key(&candidate) {
+                return Some(candidate);
+            }
+            let holder = match owner {
+                [] => scope.to_string(),
+                _ => format!("{scope}::{}", owner.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::")),
+            };
+            if self.classes().get(&ClassId(Symbol::from(holder.as_str()))).is_some_and(|info| info.constants.contains_key(name)) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     /// The nearest superclass of the enclosing class whose modeled
     /// constant table has `name`.
     fn inherited_constant_owner(&self, ctx: &Ctx, name: &Symbol) -> Option<ClassId> {
@@ -1163,15 +1186,19 @@ impl<'a> BodyTyper<'a> {
                     }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time), or
-                    // a bare constant Ruby finds on a modeled ancestor
-                    // the source index cannot see (`REQUEST_TIME` in a
-                    // subclass of shopify_metrics' `RequestMetrics`,
-                    // whose RBI declares it): read at its full name.
+                    // a declaration the source index cannot see, found as
+                    // Ruby finds it: in an enclosing scope (`KeyUtilities`
+                    // inside a reopened `TokenProtocol::Crypto`, whose
+                    // gem RBI declares it), then on a superclass
+                    // (`REQUEST_TIME` in a subclass of shopify_metrics'
+                    // `RequestMetrics`). Read at its full name.
                     Some(None) => {
-                        if let [name] = path.as_slice()
-                            && let Some(owner) = self.inherited_constant_owner(ctx, name)
-                        {
-                            let full = ClassId(Symbol::from(format!("{}::{}", owner.0, name).as_str()));
+                        let full = self.lexical_external_constant(expr_span, path).or_else(|| match path.as_slice() {
+                            [name] => self.inherited_constant_owner(ctx, name)
+                                .map(|owner| ClassId(Symbol::from(format!("{}::{}", owner.0, name).as_str()))),
+                            _ => None,
+                        });
+                        if let Some(full) = full {
                             qualify_resolved_path(path, &full);
                         }
                         exact_modeled_class(path)
