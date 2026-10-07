@@ -204,6 +204,8 @@ fn tiny_blog_round_trips() {
         railties: Vec::new(),
         file_statement_gaps: Vec::new(),
         file_programs: Vec::new(),
+        boot_loads: Vec::new(),
+        boot_conditional_loads: Vec::new(),
         library_class_files: Vec::new(),
         library_class_reopens: Default::default(),
     };
