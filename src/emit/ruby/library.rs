@@ -6503,7 +6503,9 @@ fn emit_library_class_decl_inner(
     // so emit works correctly from any output directory.
     let mut requires: Vec<String> = Vec::new();
     if let Some(parent) = lc.parent.as_ref() {
-        let parent = lexical_parent(name, parent, app);
+        let written = ClassId(Symbol::from(written_parent(lc, parent, app).as_str()));
+        let parent = lexical_parent(name, &written, app);
+        let parent = ClassId(Symbol::from(parent.0.as_str().trim_start_matches("::")));
         if let Some(anchor) = require_path_for_parent(&parent, app) {
             if anchor != self_anchor {
                 requires.push(relpath(&out_dir, &anchor));
@@ -6779,7 +6781,7 @@ fn emit_library_class_decl_inner(
                 (Some(crate::dialect::LibraryClassOrigin::FactoryClass { factory }), _) => {
                     writeln!(s, "{pad}{last} = {} do", super::emit_expr(factory)).unwrap()
                 }
-                (_, Some(p)) => writeln!(s, "{pad}class {last} < {}", p.0.as_str()).unwrap(),
+                (_, Some(p)) => writeln!(s, "{pad}class {last} < {}", written_parent(lc, p, app)).unwrap(),
                 (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
             }
         }
@@ -7960,7 +7962,7 @@ fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a Libr
     let mut ancestors: Vec<&LibraryClass> = Vec::new();
     let mut at = lc;
     while let Some(parent) = at.parent.as_ref() {
-        let Some(next) = app_library_superclass(at, parent.0.as_str(), app) else { break };
+        let Some(next) = app_library_superclass(at, &written_parent(at, parent, app), app) else { break };
         if ancestors.iter().any(|a| std::ptr::eq(*a, next)) || std::ptr::eq(next, lc) {
             break;
         }
@@ -7970,17 +7972,37 @@ fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a Libr
     ancestors
 }
 
+/// `lc`'s superclass `parent` as the source spells it: with the leading
+/// `::` when the source writes it from the top level (`class Track <
+/// ::Operation`, read back from `parent_span`). Ingest keeps a superclass
+/// as its path segments, without the `::`, yet the two spellings name
+/// different classes: inside `module Delivery`, `::Operation` is the
+/// top-level class and `Operation` is `Delivery::Operation` once that
+/// exists. Core's delivery operations subclass both.
+fn written_parent(lc: &LibraryClass, parent: &ClassId, app: &App) -> String {
+    let text = parent.0.as_str();
+    let span = lc.parent_span;
+    let rooted = !text.starts_with("::")
+        && !span.is_synthetic()
+        && (span.file.0 as usize)
+            .checked_sub(1)
+            .and_then(|i| app.sources.get(i))
+            .and_then(|file| file.text.get(span.start as usize..span.end as usize))
+            .is_some_and(|written| written.trim_start().starts_with("::") && written.trim_start().trim_start_matches("::") == text);
+    if rooted { format!("::{text}") } else { text.to_string() }
+}
+
 /// The body calls that name a class-side method a loaded gem's module
 /// gives the class, which Ruby runs on the class through that module:
-/// - after `include G`, where `G`'s RBI says `mixes_in_class_methods M`
-///   (Core's `include SmartProperties` then `property! :name, accepts:
-///   String`: the gem's `included(base)` hook runs `base.extend
-///   (ClassMethods)`), the instance methods of `M`
+/// - after `include G`, where `G`'s RBI says `mixes_in_class_methods M`,
+///   or, with no RBI, its installed source's `included(base)` hook runs
+///   `base.extend(M)` (Core's `include SmartProperties` then `property!
+///   :name, accepts: String`), the instance methods of `M`
 ///   (`GemBoundary::loaded_mixed_in_class_methods`);
 /// - after `extend G`, `G`'s instance methods, and the `extend` itself.
 ///
 /// `G` is a module of a gem the emitted tree loads, outside Ruby's core
-/// and standard library (`GemBoundary::loaded_reopen`), named as Ruby
+/// and standard library (`GemBoundary::is_loaded_gem_module`), named as Ruby
 /// resolves it from the class's namespace outwards; an app constant of
 /// that name hides it. The gem itself runs the hook and defines the
 /// method, so replaying the call is what Ruby runs. An app superclass's
@@ -7993,7 +8015,7 @@ fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a Libr
 /// Anything else stays dropped and reported.
 fn gem_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let boundary = &app.gem_boundary;
-    if boundary.is_empty() {
+    if boundary.is_empty() && boundary.source_constants.mixins.is_empty() {
         return Vec::new();
     }
     let included = |c: &LibraryClass| -> BTreeSet<Symbol> {
@@ -8046,7 +8068,7 @@ fn gem_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     out
 }
 
-/// The module of a loaded gem (`GemBoundary::loaded_reopen`) that the
+/// The module of a loaded gem (`GemBoundary::is_loaded_gem_module`) that the
 /// constant `written` in `lc`'s body names, resolved as Ruby does from
 /// `lc`'s namespace outwards: the first enclosing scope that has the
 /// name decides, so an app class or module of that name (one that is
@@ -8059,8 +8081,9 @@ fn loaded_gem_module(lc: &LibraryClass, written: &str, app: &App) -> Option<Clas
         let candidate =
             if scope.is_empty() { written.to_string() } else { format!("{}::{written}", scope.join("::")) };
         let id = ClassId(Symbol::from(candidate.as_str()));
-        if let Some(gem) = app.gem_boundary.loaded_reopen(&id) {
-            return gem.is_module.then_some(id);
+        let boundary = &app.gem_boundary;
+        if boundary.loaded_reopen(&id).is_some() || boundary.loaded_source_reopen(&id).is_some() {
+            return boundary.is_loaded_gem_module(&id).then_some(id);
         }
         if is_model_named(&candidate, app) || !library_classes_named(&candidate, app).is_empty() {
             return None;

@@ -12,8 +12,10 @@
 //! scratch gem home, with the real gem's mixin shape (an `included` hook
 //! extending the includer with `ClassMethods`, whose `property` defines
 //! the accessors): the CRuby tree requires it because the lockfile pins
-//! it (`project.rs::LOCK_GATED_REQUIRES`), and its RBI declares it. The
-//! emitted tree must print what CRuby prints, line for line.
+//! it (`project.rs::LOCK_GATED_REQUIRES`), and its RBI declares it, or,
+//! with no `sorbet/` (the RBI-free Core slice), its installed source in
+//! `gem_home:` does (`GemSourceConstants::mixins`). The emitted tree must
+//! print what CRuby prints, line for line.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -61,8 +63,20 @@ const GEM_LIB: &str = r##"module SmartProperties
     end
   end
 
-  def self.included(base)
-    base.extend(ClassMethods)
+  module ModuleMethods
+    def included(target)
+      super
+      target.include(SmartProperties)
+    end
+  end
+
+  class << self
+    private
+
+    def included(base)
+      base.extend(ClassMethods)
+      base.extend(ModuleMethods) unless base.is_a?(Class)
+    end
   end
 
   def initialize(**attrs)
@@ -132,6 +146,17 @@ const SHIPMENT: &str = r#"class Shipment < Described
 end
 "#;
 
+/// Core's delivery operations: a top-level `Operation` includes the gem,
+/// and subclasses name it from the top level inside a namespace that has
+/// its own `Operation` (`< ::Operation`, `< ::Delivery::Operation`).
+const OPERATION: &str = "class Operation\n  include SmartProperties\nend\n";
+
+const DELIVERY_OPERATION: &str = "module Delivery\n  class Operation < ::Operation\n    property :shop_id\n  end\nend\n";
+
+const TRACK: &str = "module Delivery\n  module Processes\n    class Track < ::Operation\n      property! :code\n    end\n  end\nend\n";
+
+const RATE: &str = "module Delivery\n  module Processes\n    class Rate < ::Delivery::Operation\n      property :amount, default: 1\n    end\n  end\nend\n";
+
 /// `extend` of the gem's class-methods module directly.
 const CAPABILITIES: &str = r#"module Billing
   class Capabilities
@@ -163,6 +188,10 @@ puts [s.id, Shipment.describe].inspect
 c = Billing::Capabilities.new
 puts c.flags.inspect
 puts Billing::Capabilities.properties.keys.inspect
+t = Delivery::Processes::Track.new(code: "z")
+puts [t.code, Delivery::Processes::Track.superclass, Delivery::Processes::Track.properties.keys].inspect
+r = Delivery::Processes::Rate.new
+puts [r.amount, Delivery::Processes::Rate.superclass, Delivery::Processes::Rate.properties.keys].inspect
 "##;
 
 /// A gem home holding the fixture `smart_properties` 1.17.0, as `gem
@@ -188,8 +217,8 @@ fn gem_path(home: &Path) -> String {
     format!("{}:{}", home.display(), String::from_utf8_lossy(&out.stdout))
 }
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("roundhouse-gem-mixin-macro-{}", std::process::id()));
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("roundhouse-gem-mixin-macro-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -201,10 +230,21 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 
 #[test]
 fn a_loaded_gem_mixin_s_class_macros_run_in_the_class_body_as_in_cruby() {
-    let root = scratch();
+    mixin_macros_run_as_in_cruby(true);
+}
+
+/// With no RBI: the hook's `base.extend(ClassMethods)` and the module's
+/// `def`s are read from the gem's installed source.
+#[test]
+fn the_mixin_is_known_from_the_installed_source_without_an_rbi() {
+    mixin_macros_run_as_in_cruby(false);
+}
+
+fn mixin_macros_run_as_in_cruby(rbi: bool) {
+    let root = scratch(if rbi { "rbi" } else { "source" });
     let home = gem_home(&root);
     let gem_path = gem_path(&home);
-    let sources = [ENTITLEMENTS, OPTION, DESCRIBED, SHIPMENT, CAPABILITIES].join("\n");
+    let sources = [ENTITLEMENTS, OPTION, DESCRIBED, SHIPMENT, CAPABILITIES, OPERATION, DELIVERY_OPERATION, TRACK, RATE].join("\n");
     let native = emit_and_run::ruby()
         .env("GEM_PATH", &gem_path)
         .arg("-e")
@@ -224,18 +264,28 @@ fn a_loaded_gem_mixin_s_class_macros_run_in_the_class_body_as_in_cruby() {
             "[7, \"described\"]",
             "[:base]",
             "[:flags]",
+            "[\"z\", Operation, [:code]]",
+            "[1, Delivery::Operation, [:shop_id, :amount]]",
         ],
         "native control"
     );
 
-    let (tree, errors) = emit_and_run::empty_app()
-        .write("Gemfile.lock", LOCK)
-        .write("sorbet/rbi/gems/smart_properties@1.17.0.rbi", RBI)
+    let app = emit_and_run::empty_app().write("Gemfile.lock", LOCK);
+    let app = if rbi {
+        app.write("sorbet/rbi/gems/smart_properties@1.17.0.rbi", RBI)
+    } else {
+        app.write("roundhouse.yml", &format!("gem_home: {}\n", home.display()))
+    };
+    let (tree, errors) = app
         .write("app/models/entitlements.rb", ENTITLEMENTS)
         .write("app/models/plan_option.rb", OPTION)
         .write("app/models/described.rb", DESCRIBED)
         .write("app/models/shipment.rb", SHIPMENT)
         .write("app/models/billing/capabilities.rb", CAPABILITIES)
+        .write("app/models/operation.rb", OPERATION)
+        .write("app/models/delivery/operation.rb", DELIVERY_OPERATION)
+        .write("app/models/delivery/processes/track.rb", TRACK)
+        .write("app/models/delivery/processes/rate.rb", RATE)
         .emit(BuildTarget::Ruby);
     let run = Command::new("ruby")
         .current_dir(&tree)

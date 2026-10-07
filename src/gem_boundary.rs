@@ -106,6 +106,27 @@ pub struct GemSourceConstants {
     /// statement for it opens it.
     #[serde(default)]
     pub kinds: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceKind>>,
+    /// Module -> gem -> what the gem's source gives it as a mixin
+    /// (`SourceMixin`): the source counterpart of an RBI's methods,
+    /// includes and `mixes_in_class_methods`.
+    #[serde(default)]
+    pub mixins: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceMixin>>,
+}
+
+/// What a gem's installed source says about one of its modules as a
+/// mixin, every body that opens it merged. Names are fully qualified,
+/// resolved against the constants the gem declares as Ruby resolves them
+/// from the body's lexical scope; one the gem does not declare is left out.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceMixin {
+    /// The `def`s and `attr_*` methods of its body: its instance methods.
+    pub instance_methods: BTreeSet<String>,
+    /// `include X` in its body.
+    pub includes: Vec<String>,
+    /// The `X` of each unconditional `base.extend(X)` statement of its
+    /// `self.included(base)` hook (smart_properties' `base.extend
+    /// (ClassMethods)`): what Tapioca writes as `mixes_in_class_methods`.
+    pub mixes_in_class_methods: Vec<String>,
 }
 
 /// How a gem's source opens a class or module: `module`, or `class` with
@@ -317,11 +338,56 @@ impl GemBoundary {
         }
     }
 
+    /// Whether `name` is a module of a gem the tree loads, outside Ruby's
+    /// core and standard library: by its RBI ([`Self::loaded_reopen`]),
+    /// else by its installed source ([`Self::loaded_source_reopen`]).
+    pub fn is_loaded_gem_module(&self, name: &ClassId) -> bool {
+        match self.loaded_reopen(name) {
+            Some(class) => class.is_module,
+            None => self.loaded_source_reopen(name).is_some_and(|(_, kind)| kind.is_module),
+        }
+    }
+
+    /// The loaded gem module `name` as a mixin, names resolved: its
+    /// instance methods, the modules it includes, and its
+    /// `mixes_in_class_methods`. The RBI decides when it declares the
+    /// module; otherwise the gem's installed source (`SourceMixin`).
+    /// `None` when `name` is no loaded gem's module.
+    pub fn loaded_mixin(&self, name: &ClassId) -> Option<LoadedMixin> {
+        if let Some(class) = self.loaded_reopen(name) {
+            if !class.is_module {
+                return None;
+            }
+            let resolve = |list: &[ClassId]| -> Vec<ClassId> {
+                list.iter().filter_map(|w| self.resolve_written(name.0.as_str(), w)).collect()
+            };
+            return Some(LoadedMixin {
+                instance_methods: class.instance_methods.keys().cloned().collect(),
+                includes: resolve(&class.includes),
+                mixes_in_class_methods: resolve(&class.mixes_in_class_methods),
+            });
+        }
+        let (gem, kind) = self.loaded_source_reopen(name)?;
+        if !kind.is_module {
+            return None;
+        }
+        let text = name.0.as_str().trim_start_matches("::");
+        let Some(mixin) = self.source_constants.mixins.get(text).and_then(|gems| gems.get(gem)) else {
+            return Some(LoadedMixin::default());
+        };
+        let ids = |list: &[String]| -> Vec<ClassId> { list.iter().map(|n| ClassId(Symbol::from(n.as_str()))).collect() };
+        Some(LoadedMixin {
+            instance_methods: mixin.instance_methods.iter().map(|m| Symbol::from(m.as_str())).collect(),
+            includes: ids(&mixin.includes),
+            mixes_in_class_methods: ids(&mixin.mixes_in_class_methods),
+        })
+    }
+
     /// The instance methods of the loaded gem module `module` and of the
     /// loaded gem modules it includes, transitively: what `extend module`
     /// gives the extended object as its singleton methods. Modules outside
-    /// a loaded gem (`GemBoundary::loaded_reopen`) contribute nothing;
-    /// the walk stops after [`MIXIN_WALK_LIMIT`] modules.
+    /// a loaded gem ([`Self::loaded_mixin`]) contribute nothing; the walk
+    /// stops after [`MIXIN_WALK_LIMIT`] modules.
     pub fn loaded_instance_surface(&self, module: &ClassId) -> BTreeSet<Symbol> {
         let mut out = BTreeSet::new();
         let mut seen: Vec<ClassId> = Vec::new();
@@ -331,30 +397,23 @@ impl GemBoundary {
                 continue;
             }
             seen.push(id.clone());
-            let Some(class) = self.loaded_reopen(&id) else { continue };
-            if !class.is_module {
-                continue;
-            }
-            out.extend(class.instance_methods.keys().cloned());
-            queue.extend(class.includes.iter().rev().filter_map(|inc| self.resolve_written(id.0.as_str(), inc)));
+            let Some(mixin) = self.loaded_mixin(&id) else { continue };
+            out.extend(mixin.instance_methods);
+            queue.extend(mixin.includes.into_iter().rev());
         }
         out
     }
 
     /// The class-side methods `include module` gives the includer when
-    /// `module` is a loaded gem module whose RBI says
-    /// `mixes_in_class_methods M`: Ruby runs the gem's `included(base)`
-    /// hook, which extends `base` with `M`, so `M`'s instance surface
+    /// `module` is a loaded gem module that mixes class methods in
+    /// (`mixes_in_class_methods M` in its RBI, `base.extend(M)` in its
+    /// source's `included(base)` hook): Ruby runs the gem's hook, which
+    /// extends `base` with `M`, so `M`'s instance surface
     /// ([`Self::loaded_instance_surface`]) becomes the includer's class
     /// methods. Empty for anything else.
     pub fn loaded_mixed_in_class_methods(&self, module: &ClassId) -> BTreeSet<Symbol> {
-        let Some(class) = self.loaded_reopen(module).filter(|c| c.is_module) else { return BTreeSet::new() };
-        class
-            .mixes_in_class_methods
-            .iter()
-            .filter_map(|m| self.resolve_written(module.0.as_str(), m))
-            .flat_map(|m| self.loaded_instance_surface(&m))
-            .collect()
+        let Some(mixin) = self.loaded_mixin(module) else { return BTreeSet::new() };
+        mixin.mixes_in_class_methods.iter().flat_map(|m| self.loaded_instance_surface(m)).collect()
     }
 
     /// [`Self::loaded_reopen`] for a tree with no RBI for the gem: the
@@ -394,6 +453,16 @@ impl GemBoundary {
         }
         Some(path.match_indices("::").any(|(i, _)| owned.contains(&path[..i])))
     }
+}
+
+/// A loaded gem module as a mixin ([`GemBoundary::loaded_mixin`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadedMixin {
+    pub instance_methods: Vec<Symbol>,
+    /// Included modules, fully qualified.
+    pub includes: Vec<ClassId>,
+    /// `mixes_in_class_methods` modules, fully qualified.
+    pub mixes_in_class_methods: Vec<ClassId>,
 }
 
 /// One class or module as an RBI declares it.

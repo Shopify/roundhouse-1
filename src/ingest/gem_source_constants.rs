@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ruby_prism::Node;
 
-use crate::gem_boundary::{GemSourceConstants, GemSourceScan, SourceKind};
+use crate::gem_boundary::{GemSourceConstants, GemSourceScan, SourceKind, SourceMixin};
 use crate::gems::Lockfile;
 use crate::vfs::Vfs;
 
@@ -54,6 +54,11 @@ struct DirScan {
     dynamic: BTreeMap<String, String>,
     /// Class or module -> how its first `class`/`module` statement opens it.
     kinds: BTreeMap<String, SourceKind>,
+    /// Module -> what its bodies give it as a mixin (`SourceMixin`),
+    /// names resolved once the whole gem is read.
+    mixins: BTreeMap<String, SourceMixin>,
+    /// The mixin references the walk saw, resolved by `resolve_mixins`.
+    pending: Vec<PendingMixin>,
     files: usize,
     bytes: u64,
     complete: bool,
@@ -105,6 +110,9 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         }
         for (name, kind) in &read.kinds {
             out.kinds.entry(name.clone()).or_default().insert(gem.clone(), kind.clone());
+        }
+        for (name, mixin) in &read.mixins {
+            out.mixins.entry(name.clone()).or_default().insert(gem.clone(), mixin.clone());
         }
         out.scans.insert(
             gem.clone(),
@@ -207,6 +215,9 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     for (name, gems) in read.kinds {
         sources.kinds.entry(name).or_default().extend(gems);
     }
+    for (name, gems) in read.mixins {
+        sources.mixins.entry(name).or_default().extend(gems);
+    }
     sources.scans.extend(read.scans);
 }
 
@@ -294,7 +305,46 @@ fn scan_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path, require_paths: &[String]) -> D
         let relative = file.strip_prefix(dir).unwrap_or(&file).display().to_string();
         read_file(&source, &relative, &mut out);
     }
+    resolve_mixins(&mut out);
     out
+}
+
+/// A constant a module body names as a mixin (`include X`, or the `X` of
+/// its `included` hook's `base.extend(X)`), with the body's lexical
+/// scopes, innermost first.
+#[derive(Debug)]
+struct PendingMixin {
+    module: String,
+    extend_from_hook: bool,
+    rooted: bool,
+    written: String,
+    scopes: Vec<String>,
+}
+
+/// Resolve each pending mixin reference against the gem's declared
+/// constants, as Ruby looks the name up from the body's scope outwards
+/// (`ClassMethods` in `module SmartProperties` is
+/// `SmartProperties::ClassMethods`); one the gem does not declare is
+/// another gem's or the app's, and is left out.
+fn resolve_mixins(out: &mut DirScan) {
+    for pending in std::mem::take(&mut out.pending) {
+        let candidates: Vec<String> = if pending.rooted {
+            vec![pending.written.clone()]
+        } else {
+            pending
+                .scopes
+                .iter()
+                .map(|scope| format!("{scope}::{}", pending.written))
+                .chain(std::iter::once(pending.written.clone()))
+                .collect()
+        };
+        let Some(found) = candidates.into_iter().find(|c| out.declared.contains_key(c)) else { continue };
+        let entry = out.mixins.entry(pending.module).or_default();
+        let list = if pending.extend_from_hook { &mut entry.mixes_in_class_methods } else { &mut entry.includes };
+        if !list.contains(&found) {
+            list.push(found);
+        }
+    }
 }
 
 fn collect<V: Vfs + ?Sized>(vfs: &V, dir: &Path, depth: usize, out: &mut Vec<PathBuf>, complete: &mut bool) {
@@ -402,6 +452,50 @@ impl Walker<'_> {
         }
     }
 
+    /// The module whose body the walk is directly in, if it is a module
+    /// (not a class, a singleton class or a method).
+    fn module_body(&self) -> Option<&str> {
+        let current = self.current()?;
+        (self.in_def == 0 && self.out.kinds.get(current).is_some_and(|k| k.is_module)).then_some(current)
+    }
+
+    fn pending(&mut self, module: &str, extend_from_hook: bool, node: &Node<'_>) {
+        let Some((rooted, written)) = written_path(node) else { return };
+        let scopes = self.scope.iter().rev().cloned().collect();
+        self.out.pending.push(PendingMixin { module: module.to_string(), extend_from_hook, rooted, written, scopes });
+    }
+
+    /// `def self.included(base)` (or `def included(base)` in `class <<
+    /// self`): each statement of its body that is `base.extend(X, ...)`
+    /// with constant arguments, unconditionally, names a module Ruby
+    /// extends every includer with. A conditional one (`base.extend
+    /// (ModuleMethods) unless base.is_a?(Class)`) is not read.
+    fn included_hook(&mut self, module: &str, node: &ruby_prism::DefNode<'_>) {
+        let Some(params) = node.parameters() else { return };
+        let required: Vec<_> = params.requireds().iter().collect();
+        let [base] = required.as_slice() else { return };
+        let Some(base) = base.as_required_parameter_node() else { return };
+        let base = constant_id_str(&base.name()).to_string();
+        let Some(body) = node.body() else { return };
+        let Some(statements) = body.as_statements_node() else { return };
+        for statement in statements.body().iter() {
+            let Some(call) = statement.as_call_node() else { continue };
+            if call.name().as_slice() != b"extend" || call.block().is_some() {
+                continue;
+            }
+            let on_base = call
+                .receiver()
+                .and_then(|r| r.as_local_variable_read_node())
+                .is_some_and(|r| constant_id_str(&r.name()) == base);
+            if !on_base {
+                continue;
+            }
+            for arg in call.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default() {
+                self.pending(module, true, &arg);
+            }
+        }
+    }
+
     fn nested(&mut self, path: &Node<'_>, body: Option<Node<'_>>, kind: SourceKind) {
         let Some((rooted, written)) = written_path(path) else { return };
         let name = self.qualify(rooted, &written);
@@ -451,12 +545,40 @@ impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
     }
 
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // `class << self` directly in a module body: its `def included`
+        // is the module's hook.
+        if node.expression().as_self_node().is_some() && self.singleton == 0 {
+            if let Some(module) = self.module_body().map(str::to_string) {
+                let statements = node.body().and_then(|b| b.as_statements_node());
+                for statement in statements.iter().flat_map(|s| s.body().iter()) {
+                    if let Some(def) = statement.as_def_node() {
+                        if def.receiver().is_none() && def.name().as_slice() == b"included" {
+                            self.included_hook(&module, &def);
+                        }
+                    }
+                }
+            }
+        }
         self.singleton += 1;
         ruby_prism::visit_singleton_class_node(self, node);
         self.singleton -= 1;
     }
 
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if self.singleton == 0 {
+            if let Some(module) = self.module_body().map(str::to_string) {
+                match node.receiver() {
+                    None => {
+                        let name = constant_id_str(&node.name()).to_string();
+                        self.out.mixins.entry(module).or_default().instance_methods.insert(name);
+                    }
+                    Some(r) if r.as_self_node().is_some() && node.name().as_slice() == b"included" => {
+                        self.included_hook(&module, node);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         self.in_def += 1;
         ruby_prism::visit_def_node(self, node);
         self.in_def -= 1;
@@ -495,6 +617,31 @@ impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         let method = node.name().as_slice();
+        // A module body's `include X` and `attr_*` methods.
+        if self.singleton == 0 && node.receiver().is_none() {
+            if let Some(module) = self.module_body().map(str::to_string) {
+                let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                match method {
+                    b"include" => {
+                        for arg in &args {
+                            self.pending(&module, false, arg);
+                        }
+                    }
+                    b"attr_reader" | b"attr_writer" | b"attr_accessor" => {
+                        let entry = self.out.mixins.entry(module).or_default();
+                        for name in args.iter().filter_map(literal_name) {
+                            if method != b"attr_writer" {
+                                entry.instance_methods.insert(name.clone());
+                            }
+                            if method != b"attr_reader" {
+                                entry.instance_methods.insert(format!("{name}="));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if (method == b"autoload" || method == b"const_set") && self.singleton == 0 {
             let first = node.arguments().and_then(|a| a.arguments().iter().next());
             if let (Some(first), Some(namespace)) = (first, self.receiver_namespace(node.receiver())) {
@@ -546,6 +693,24 @@ mod tests {
                 "Top",
             ]
         );
+    }
+
+    /// smart_properties 1.17.0's shape: the hook in `class << self`
+    /// extends with `ClassMethods` unconditionally and `ModuleMethods`
+    /// only for a module includer, which is not read.
+    #[test]
+    fn an_included_hook_s_extend_is_the_module_s_mixed_in_class_methods() {
+        let mut out = read(
+            "module SmartProperties\n  module ClassMethods\n    def property(name, **o); end\n    def property!(name, **o); end\n    protected :property\n    attr_reader :props\n  end\n  module ModuleMethods\n    def included(t); end\n  end\n  class << self\n    private\n    def included(base)\n      base.extend(ClassMethods)\n      base.extend(ModuleMethods) unless base.is_a?(Class)\n    end\n  end\n  include Comparable\n  def initialize(*args); end\nend\nmodule Other\n  def self.included(base)\n    base.extend(::SmartProperties::ClassMethods)\n    other.extend(Unrelated)\n  end\nend\n",
+        );
+        resolve_mixins(&mut out);
+        let sp = &out.mixins["SmartProperties"];
+        assert_eq!(sp.mixes_in_class_methods, ["SmartProperties::ClassMethods"]);
+        assert!(sp.includes.is_empty(), "Comparable is not the gem's: {:?}", sp.includes);
+        assert_eq!(sp.instance_methods.iter().collect::<Vec<_>>(), ["initialize"]);
+        let class_methods = &out.mixins["SmartProperties::ClassMethods"];
+        assert_eq!(class_methods.instance_methods.iter().collect::<Vec<_>>(), ["property", "property!", "props"]);
+        assert_eq!(out.mixins["Other"].mixes_in_class_methods, ["SmartProperties::ClassMethods"]);
     }
 
     #[test]

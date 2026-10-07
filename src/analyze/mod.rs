@@ -1435,7 +1435,14 @@ impl Analyzer {
                     // A gem runtime port's module (`Semian::AdapterError`);
                     // `project` gates it on the tree carrying the port file
                     // (report_unloaded_gem_constants).
-                    || crate::project::gem_port_declaring(included.0.as_str()).is_some();
+                    || crate::project::gem_port_declaring(included.0.as_str()).is_some()
+                    // A module the installed source of a gem the tree loads
+                    // declares (an RBI-free tree: Core's slice has no
+                    // `sorbet/`), named from the class's scope outwards.
+                    || matches!(
+                        self.gem_sources.provider(included.0.as_str(), class.name.0.as_str()),
+                        Some(crate::gem_boundary::SourceProvider::Declared { .. })
+                    );
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
