@@ -337,7 +337,7 @@ module EmittedSide
     require "pg"
     root = File.expand_path("..", __dir__)
     require File.join(root, "runtime/ruby/active_record/errors")
-    require File.join(root, "runtime/ruby/active_record/connection_not_established")
+    require File.join(root, "runtime/ruby/active_record/error_classes")
     require File.join(root, "runtime/ruby/active_record/connection")
     require File.join(root, "runtime/spinel/db_pg_cruby")
     # The adapter and its connection handling sit side by side in the

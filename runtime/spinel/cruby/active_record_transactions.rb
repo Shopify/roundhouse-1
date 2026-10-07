@@ -31,11 +31,8 @@ require "monitor"
 require "securerandom"
 
 module ActiveRecord
-  # errors.rb.
-  class Rollback < StandardError; end unless defined?(Rollback)
-  class TransactionRollbackError < StatementInvalid; end unless defined?(TransactionRollbackError)
-  class SerializationFailure < TransactionRollbackError; end unless defined?(SerializationFailure)
-  class Deadlocked < TransactionRollbackError; end unless defined?(Deadlocked)
+  # Rollback, TransactionRollbackError, SerializationFailure, Deadlocked
+  # and TransactionIsolationError are runtime/ruby/active_record/error_classes.rb's.
 
   # active_record.rb: `singleton_class.attr_accessor
   # :default_transaction_isolation_level` (nil).
@@ -208,9 +205,8 @@ module ActiveRecord
     end
 
     class Transaction # :nodoc:
-      # Rails raises ActiveRecordError, which this runtime does not define
-      # (semian's port keys on its absence).
-      FinalizedTransactionError = defined?(ActiveRecord::ActiveRecordError) ? ActiveRecord::ActiveRecordError : StandardError
+      # Rails raises ActiveRecordError.
+      FinalizedTransactionError = ActiveRecord::ActiveRecordError
 
       class Callback # :nodoc:
         def initialize(event, callback)

@@ -83,9 +83,11 @@ for (const [count, expected] of [
     assert!(run.status.success(), "{emitted}\n{}", String::from_utf8_lossy(&run.stderr));
 }
 
-/// Phase 1 second target: errors.rb has five classes (RecordNotFound,
-/// StatementInvalid, and under it ValueTooLong and RecordNotUnique, as in
-/// Rails; RecordInvalid), one with a synth attr_reader
+/// Phase 1 second target: errors.rb has eight classes, in Rails'
+/// hierarchy: ActiveRecordError, under it AdapterError, RecordNotFound
+/// and RecordInvalid; StatementInvalid under AdapterError; ValueTooLong
+/// and WrappedDatabaseException under StatementInvalid, RecordNotUnique
+/// under WrappedDatabaseException. RecordInvalid has a synth attr_reader
 /// (`record`) and an `initialize` that calls `super(...)`. Validates parent extends
 /// (StandardError → Error), constructor synthesis, attr_reader-as-
 /// field detection, and `@ivar` → `this.x` in the constructor body.
@@ -99,7 +101,17 @@ fn errors_rb_transpiles_to_typescript_classes() {
     let classes = parse_library_with_rbs(&ruby, &rbs, "runtime/ruby/active_record/errors.rb")
         .expect("parse_library_with_rbs");
 
-    assert_eq!(classes.len(), 5, "expected 5 classes; got {}", classes.len());
+    assert_eq!(classes.len(), 8, "expected 8 classes; got {}", classes.len());
+
+    let root = classes
+        .iter()
+        .find(|c| c.name.0.as_str() == "ActiveRecord::ActiveRecordError")
+        .expect("ActiveRecord::ActiveRecordError");
+    let root_ts = emit_library_class(root).expect("emit ActiveRecordError");
+    assert!(
+        root_ts.contains("export class ActiveRecordError extends Error"),
+        "ActiveRecordError: {root_ts}"
+    );
 
     let invalid_statement = classes
         .iter()
@@ -107,7 +119,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::StatementInvalid");
     let si_ts = emit_library_class(invalid_statement).expect("emit StatementInvalid");
     assert!(
-        si_ts.contains("export class StatementInvalid extends Error"),
+        si_ts.contains("export class StatementInvalid extends AdapterError"),
         "StatementInvalid: {si_ts}"
     );
 
@@ -117,7 +129,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::RecordNotFound");
     let nf_ts = emit_library_class(not_found).expect("emit RecordNotFound");
     assert!(
-        nf_ts.contains("export class RecordNotFound extends Error"),
+        nf_ts.contains("export class RecordNotFound extends ActiveRecordError"),
         "RecordNotFound: {nf_ts}"
     );
 
@@ -137,7 +149,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::RecordNotUnique");
     let nu_ts = emit_library_class(not_unique).expect("emit RecordNotUnique");
     assert!(
-        nu_ts.contains("export class RecordNotUnique extends StatementInvalid"),
+        nu_ts.contains("export class RecordNotUnique extends WrappedDatabaseException"),
         "RecordNotUnique: {nu_ts}"
     );
 
@@ -147,7 +159,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
         .expect("ActiveRecord::RecordInvalid");
     let inv_ts = emit_library_class(invalid).expect("emit RecordInvalid");
     assert!(
-        inv_ts.contains("export class RecordInvalid extends Error"),
+        inv_ts.contains("export class RecordInvalid extends ActiveRecordError"),
         "missing class header: {inv_ts}"
     );
     assert!(

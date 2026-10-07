@@ -1,12 +1,27 @@
 module ActiveRecord
+  # Rails' root Active Record exception.
+  class ActiveRecordError < StandardError
+    def initialize: (?String message) -> void
+  end
+
+  # Rails' superclass for the errors an adapter raises.
+  class AdapterError < ActiveRecordError
+    def initialize: (?String message) -> void
+  end
+
   # Raised by `Base.find` when no row matches the given id.
-  class RecordNotFound < StandardError
+  class RecordNotFound < ActiveRecordError
     def initialize: (?String message) -> void
   end
 
   # Raised for a statement the database refused; the parent of the
   # statement errors below, as in Rails.
-  class StatementInvalid < StandardError
+  class StatementInvalid < AdapterError
+    def initialize: (?String message) -> void
+  end
+
+  # Rails' defunct wrapper, RecordNotUnique's parent.
+  class WrappedDatabaseException < StatementInvalid
     def initialize: (?String message) -> void
   end
 
@@ -17,13 +32,13 @@ module ActiveRecord
 
   # Raised when an INSERT/UPDATE trips a unique index; each `Db` raises
   # it (see the .rb).
-  class RecordNotUnique < StatementInvalid
+  class RecordNotUnique < WrappedDatabaseException
     def initialize: (?String message) -> void
   end
 
   # Raised by `Base#save!` when validation fails. `record` is the
   # invalid model; `attr_reader :record` lowers to a getter at ingest.
-  class RecordInvalid < StandardError
+  class RecordInvalid < ActiveRecordError
     def record: () -> Base
     def initialize: (Base record) -> void
   end

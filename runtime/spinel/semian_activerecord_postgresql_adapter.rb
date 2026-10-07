@@ -26,11 +26,6 @@
 #   Db.configure_database, so this file must load before it; loading it
 #   afterwards raises, since adapters built earlier would carry no semian
 #   identity (the gem's on_load hook guarantees the same order in Rails).
-# * ADAPTER ERROR. The gem includes Semian::AdapterError into
-#   ActiveRecord::ActiveRecordError. This runtime has no ActiveRecordError
-#   (runtime/ruby/active_record/errors.rb), so it is included into the
-#   roots the runtime's adapter raises: StatementInvalid,
-#   ConnectionNotEstablished and TransactionIsolationError.
 # * RAILS 8.2's `execute_intent` branch is not ported; the runtime's
 #   adapter is Rails 8.1's `raw_execute` shape.
 require_relative "semian"
@@ -163,13 +158,7 @@ end
 module ActiveRecord
   module ConnectionAdapters
     class PostgreSQLAdapter
-      if defined?(ActiveRecord::ActiveRecordError)
-        ActiveRecord::ActiveRecordError.include(::Semian::AdapterError)
-      else
-        ActiveRecord::StatementInvalid.include(::Semian::AdapterError)
-        ActiveRecord::ConnectionNotEstablished.include(::Semian::AdapterError)
-        ActiveRecord::TransactionIsolationError.include(::Semian::AdapterError)
-      end
+      ActiveRecord::ActiveRecordError.include(::Semian::AdapterError)
       ::PG::ConnectionBad.include(::Semian::AdapterError)
 
       class SemianError < ConnectionNotEstablished

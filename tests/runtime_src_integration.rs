@@ -832,7 +832,22 @@ fn every_runtime_method_body_concretely_typed() {
     // `super(message)` is gradual, as in `ParameterMissing`.
     // `Timeout.timeout` (Spinel port for Campfire tip) adds 3: Pattern D
     // block/return gradual after `sec: Integer | Float` — polymorphic yield.
-    const CEILING: usize = 495;
+    // 495 -> 520 MEASURED, +25: Rails 8.2's Active Record exception
+    // hierarchy. +3 (active_record/errors.rb 6 -> 9): the new shared
+    // roots ActiveRecordError, AdapterError and WrappedDatabaseException
+    // each pay the `super(message)` site the other constructors there
+    // pay. +22 (active_record/error_classes.rb, new): the Ruby-family
+    // classes' Rails constructors. Each `super(...)` into the exception
+    // constructor is a site, and so is the method body it ends (13
+    // calls, 20 sites); `record.class.name` in StaleObjectError and
+    // AssociationNotFoundError is the other 2. Parameters and readers
+    // are typed (pool, record, model class, names). What it bought:
+    // every class Rails' errors.rb defines resolves under Rails'
+    // superclass, so Core's `rescue ActiveRecord::StatementTimeout`
+    // (and LockWaitTimeout, RecordNotSaved, ...) clauses name real
+    // classes and rescue by Rails' ancestry
+    // (tests/active_record_errors_hierarchy.rs).
+    const CEILING: usize = 520;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",
