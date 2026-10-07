@@ -166,6 +166,19 @@ class String
 end
 
 class Array
+  # AS core_ext/array/wrap.rb (8.1.4). lower/enumerable_ext.rs folds an
+  # `Array.wrap` whose argument has a closed type; an untyped argument
+  # (`Shopify::Secrets.build_rotation`'s `secrets`) keeps the call.
+  def self.wrap(object)
+    if object.nil?
+      []
+    elsif object.respond_to?(:to_ary)
+      object.to_ary || [object]
+    else
+      [object]
+    end
+  end
+
   # AS `to_sentence` with its three connector options, :en defaults:
   # "a", "a and b", "a, b, and c".
   def to_sentence(words_connector: ", ", two_words_connector: " and ", last_word_connector: ", and ")

@@ -2289,7 +2289,11 @@ impl<'a> BodyTyper<'a> {
                         if !self.classes.contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
                             && !self.const_resolver.as_ref().is_some_and(|r| {
                                 r.has_source_namespace(id.0.as_str()) || r.has_stdlib_namespace(id.0.as_str())
-                            }) {
+                            })
+                            // A Ruby-family runtime port's class
+                            // (`ActiveSupport::MessageEncryptor`); its
+                            // reads are gated per target (runtime_reads).
+                            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(id.0.as_str()) {
                             missing.borrow_mut().push(id.0.as_str().to_owned());
                         }
                         id.clone()

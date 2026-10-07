@@ -28,21 +28,54 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
     ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
+    ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
 ];
+
+/// Shared runtime every target carries: `active_support_ext.rb` stands
+/// `ActiveSupport::MessageVerifier::InvalidSignature` in for a signed-id
+/// rescue, and `security_utils.rb` answers
+/// `ActiveSupport::SecurityUtils.secure_compare`. A name either declares
+/// stays ungated though a gated port declares it too.
+const SHARED_RUNTIME: &[&str] = &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb"];
 
 /// Each gated namespace and the finished-tree file that declares it.
 pub(crate) fn ruby_family_runtime_names() -> &'static HashMap<String, &'static str> {
     static NAMES: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
     NAMES.get_or_init(|| {
+        let shared: HashSet<String> = SHARED_RUNTIME.iter()
+            .flat_map(|source| {
+                let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+                super::test_constants::declared_namespaces(&text)
+            })
+            .collect();
         let mut names = HashMap::new();
         for (source, emitted) in RUBY_FAMILY_RUNTIME {
             let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
             for name in super::test_constants::declared_namespaces(&text) {
-                names.insert(name, *emitted);
+                if !shared.contains(&name) {
+                    names.insert(name, *emitted);
+                }
             }
         }
         names
     })
+}
+
+/// Whether a Ruby-family runtime file this module knows declares the
+/// namespace: a gated port or the shared runtime beside it. A declared
+/// type (`#: ActiveSupport::MessageEncryptor`) naming one is a modeled
+/// dependency; whether a target's tree carries it is decided at its
+/// reads, as for every other gated name.
+pub(crate) fn is_runtime_declared_namespace(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        RUBY_FAMILY_RUNTIME.iter().map(|(source, _)| *source).chain(SHARED_RUNTIME.iter().copied())
+            .flat_map(|source| {
+                let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+                super::test_constants::declared_namespaces(&text)
+            })
+            .collect()
+    }).contains(name)
 }
 
 /// One read of a gated name.
@@ -223,11 +256,26 @@ mod tests {
             ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
             ("ActiveSupport::Testing::TimeHelpers", "runtime/active_support_testing_time_helpers.rb"),
             ("ActiveSupport::Testing::SimpleStubs", "runtime/active_support_testing_time_helpers.rb"),
+            ("ActiveSupport::MessageEncryptor", "runtime/active_support_messages.rb"),
+            ("ActiveSupport::MessageEncryptor::InvalidMessage", "runtime/active_support_messages.rb"),
+            ("ActiveSupport::SecureCompareRotator", "runtime/active_support_messages.rb"),
+            ("ActiveSupport::KeyGenerator", "runtime/active_support_messages.rb"),
+            ("ActiveSupport::CachingKeyGenerator", "runtime/active_support_messages.rb"),
+            ("ActiveSupport::Messages::Rotator", "runtime/active_support_messages.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }
         assert!(!names.contains_key("ActiveSupport"), "{names:?}");
         assert!(!names.contains_key("Rails"), "{names:?}");
         assert!(!names.contains_key("Rails::Application"), "{names:?}");
+        // active_support_ext.rb and security_utils.rb declare these for
+        // every target.
+        assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");
+        assert!(!names.contains_key("ActiveSupport::MessageVerifier::InvalidSignature"), "{names:?}");
+        assert!(!names.contains_key("ActiveSupport::SecurityUtils"), "{names:?}");
+        for name in ["ActiveSupport::MessageVerifier", "ActiveSupport::MessageEncryptor", "ActiveSupport::Cache::MemoryStore"] {
+            assert!(is_runtime_declared_namespace(name), "{name}");
+        }
+        assert!(!is_runtime_declared_namespace("ActiveSupport::MessageVerifiers"));
     }
 }
