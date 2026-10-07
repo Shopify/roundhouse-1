@@ -299,6 +299,57 @@ end
     assert_eq!(refused.len(), 1, "{refused:?}");
 }
 
+/// A constant written in a factory block is the ENCLOSING scope's:
+/// the block keeps its cref, so `HDR` below is `Conf::Patch::HDR` and
+/// `TOP` is `Object::TOP` (Core's `CI::TestOnboarding::ChangedTestFile`
+/// with its `HUNK_HEADER`). The class's methods read them lexically.
+#[test]
+fn constants_in_a_factory_block_belong_to_the_enclosing_scope() {
+    const PATCH: &str = r##"module Conf
+  module Patch
+    Hunk = Data.define(:line) do
+      HDR = /\A@@ -(\d+)/
+
+      class << self
+        #: (String text) -> Hunk?
+        def parse(text)
+          match = HDR.match(text)
+          match ? new(line: match[1].to_i) : nil
+        end
+      end
+
+      def next_line = line + STEP
+
+      STEP = 1
+    end
+  end
+end
+"##;
+    const TALLY: &str = r##"Tally = Struct.new(:count) do
+  TOP = 10
+
+  def room = TOP - count
+end
+"##;
+    let script = "p Conf::Patch::HDR, Conf::Patch::Hunk.parse(\"@@ -7,2\").next_line, \
+                  Conf::Patch::Hunk.const_defined?(:HDR, false), Tally.new(3).room, TOP\n";
+    let native = Command::new("ruby")
+        .arg("-e")
+        .arg(format!("{PATCH}\n{TALLY}\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = "/\\A@@ -(\\d+)/\n8\nfalse\n7\n10\n";
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+
+    let run = emit_and_run::real_blog()
+        .write("app/lib/conf/patch.rb", PATCH)
+        .write("app/lib/tally.rb", TALLY)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+}
+
 /// Shapes the class model does not carry are named, not dropped.
 #[test]
 fn unmodeled_factory_block_shapes_are_named_refusals() {
@@ -312,8 +363,12 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
             "block parameters on a Data factory body are not modeled",
         ),
         (
-            "X = Struct.new(:a) do\n  LIMIT = 3\n  def capped = [a, LIMIT].min\nend\n",
+            "X = Struct.new(:a) do\n  @@limit = 3\n  def capped = [a, @@limit].min\nend\n",
             "constant or class variable assigned inside a Struct.new/Data.define body block",
+        ),
+        (
+            "X = Struct.new(:a) do\n  Inner = Data.define(:b) do\n    def c = b\n  end\n  def d = a\nend\n",
+            "Struct.new/Data.define body block nested in another one is not modeled",
         ),
     ] {
         survey::activate();
