@@ -1043,3 +1043,67 @@ fn a_keyword_splat_whose_exact_destination_has_no_nameless_rest_is_admitted() {
         assert!(refused(&format!("{REST}{source}")), "{source}");
     }
 }
+
+/// A receiver constant whose Ruby method lookup cannot reach any rest
+/// owner of the selector is admitted even when its destination is an
+/// unmodeled ancestor (Core's `BuildEventContext < Operation`, which
+/// takes `initialize` from the `SmartProperties` gem). Reachable owners
+/// stay refused: one in the receiver's superclass chain, any module
+/// (mixins are also applied by calls), `Object`/`Kernel`, a reopened
+/// owner, a class-side `new`, and, past an unmodeled superclass, an
+/// owner gem code can name (installed gem source, a core class).
+#[test]
+fn a_keyword_splat_whose_receiver_lookup_cannot_reach_a_nameless_rest_is_admitted() {
+    // Native controls: the unrelated rest is not reached; an owner mixed
+    // in by a call, which no class body shows, is.
+    native_result(
+        "class Loose; def initialize(*a); @a = a; end; end; module SmartProperties; def initialize(**kw); @kw = kw; end; end; class Operation; include SmartProperties; end; module AccessAndAuth; class BuildEventContext < Operation; end; end",
+        "p AccessAndAuth::BuildEventContext.new(**{}).instance_variable_get(:@kw)",
+        "{}\n",
+    );
+    native_result(
+        "module Rest; def initialize(*a); @a = a; end; end; class Point; end; Point.include(Rest)",
+        "p Point.new(**{}).instance_variable_get(:@a)",
+        "[]\n",
+    );
+    const REST: &str = "class Loose; def initialize(*, **kw); @kw = kw; end; end; ";
+    const GEM: &str = "class GemError < StandardError; def initialize(*); super('gem'); end; end";
+    let refused = |source: &str, vendored: Option<&str>| {
+        let mut tree = HashMap::from([(PathBuf::from("app/lib/probe.rb"), format!("{REST}{source}").into_bytes())]);
+        if let Some(gem) = vendored {
+            tree.insert(PathBuf::from("app/lib/vendor/gems/kit-1.0.0/gem_error.rb"), gem.as_bytes().to_vec());
+        }
+        let mut app = ingest_app_from_tree(tree).expect("ingest synthetic forwarding source");
+        Analyzer::new(&app).analyze(&mut app);
+        diagnose(&app)
+            .into_iter()
+            .any(|d| d.severity == Severity::Error && d.message.contains("keyword splat into an anonymous positional rest"))
+    };
+    const MAKER: &str = "class Maker; def go(h); AccessAndAuth::BuildEventContext.new(request_schema: 1, **h); end; end";
+    for (source, vendored) in [
+        (format!("module AccessAndAuth; class BuildEventContext < Operation; end; end; {MAKER}"), None),
+        (format!("class Operation; include SmartProperties; end; module AccessAndAuth; class BuildEventContext < Operation; end; end; {MAKER}"), None),
+        ("class Other; def self.make(*); end; end; class Maker < ExternalBase; end; class Caller; def go(h); Maker.make(**h); end; end".to_string(), None),
+        ("class Point; end; class Maker; def go(h); Point.new(**h); end; end".to_string(), Some(GEM)),
+    ] {
+        assert!(!refused(&source, vendored), "{source}");
+    }
+    for (source, vendored) in [
+        ("class Kid < Loose; end; class Maker; def go(h); Kid.new(**h); end; end", None),
+        ("class Mid < Loose; end; class Kid < Mid; end; class Maker; def go(h); Kid.new(**h); end; end", None),
+        ("module A; class Base; def initialize(*); end; end; class Kid < Base; end; end; class Maker; def go(h); A::Kid.new(**h); end; end", None),
+        ("module Rest; def initialize(*); end; end; class Point; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("module Rest; def initialize(*); end; end; class Point; include Rest; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("module Factory; def new(*); super(); end; end; class Point; extend Factory; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("class Object; def initialize(*); end; end; class Point; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("module Kernel; def initialize(*); end; end; class Point; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("class Loose; def other; end; end; class Point < Operation; end; class Maker; def go(h); Point.new(**h); end; end", None),
+        ("class Base; def self.new(*); super(); end; end; class Kid < Base; end; class Maker; def go(h); Kid.new(**h); end; end", None),
+        ("class Point < External; end; class Maker; def go(h); Point.new(**h); end; end", Some(GEM)),
+        ("class StandardError; def initialize(*); end; end; class Failure < RuntimeError; end; class Maker; def go(h); Failure.new(**h); end; end", None),
+        ("class Holder; Base = Builder.make; end; class Kid < Holder::Base; end; class Maker; def go(h); Kid.new(**h); end; end", None),
+        ("class Point; end; class Maker; def go(h); Point.send(:new, **h); end; end", None),
+    ] {
+        assert!(refused(source, vendored), "{source}");
+    }
+}
