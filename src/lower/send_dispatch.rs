@@ -121,26 +121,54 @@ fn apply_param_selector_dispatch(
     if targets.is_empty() {
         return;
     }
-    let class_names: Vec<ClassId> = app
+    // A constant path resolves to the ONE app class whose name is the
+    // path or ends with `::path`; two candidates (a duplicate name
+    // counts twice) resolve to nothing. Indexed once by every such tail,
+    // with its candidate count, instead of scanning every class name for
+    // every constant-receiver send (|sends| * |classes| on full Core).
+    // The tails of a name are the name itself and what follows each
+    // `::` occurrence, overlapping ones included, which is exactly the
+    // set of strings `joined` for which `c == joined ||
+    // c.ends_with(&format!("::{joined}"))`.
+    let mut by_tail: HashMap<String, (usize, ClassId)> = HashMap::new();
+    for c in app
         .library_classes
         .iter()
-        .map(|lc| lc.name.clone())
-        .chain(app.models.iter().map(|m| m.name.clone()))
-        .collect();
-    let resolve = |path: &[Symbol]| -> Option<ClassId> {
-        let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-        let suffix = format!("::{joined}");
-        let mut found: Option<ClassId> = None;
-        for c in &class_names {
-            if c.0.as_str() == joined || c.0.as_str().ends_with(&suffix) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(c.clone());
+        .map(|lc| &lc.name)
+        .chain(app.models.iter().map(|m| &m.name))
+    {
+        let name = c.0.as_str();
+        let bytes = name.as_bytes();
+        let mut tails: Vec<&str> = vec![name];
+        for i in 0..bytes.len().saturating_sub(1) {
+            if bytes[i] == b':' && bytes[i + 1] == b':' {
+                tails.push(&name[i + 2..]);
             }
         }
-        found
+        // `c` counts once per tail even when two of its tails coincide.
+        tails.sort_unstable();
+        tails.dedup();
+        for tail in tails {
+            by_tail
+                .entry(tail.to_string())
+                .and_modify(|(n, _)| *n += 1)
+                .or_insert_with(|| (1, c.clone()));
+        }
+    }
+    let resolve = |path: &[Symbol]| -> Option<ClassId> {
+        let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        match by_tail.get(&joined) {
+            Some((1, c)) => Some(c.clone()),
+            _ => None,
+        }
     };
+    // The per-send questions about `targets`, answered from an index.
+    let target_classes: std::collections::HashSet<&ClassId> =
+        targets.keys().map(|k| &k.0).collect();
+    let mut targets_by_method: HashMap<&Symbol, Vec<&Key>> = HashMap::new();
+    for k in targets.keys() {
+        targets_by_method.entry(&k.1).or_default().push(k);
+    }
     let mut seen: HashMap<Key, Vec<Option<Vec<String>>>> = HashMap::new();
     let mut poisoned: std::collections::HashSet<Key> = std::collections::HashSet::new();
     let record = |key: &Key, args: &[Expr], seen: &mut HashMap<Key, Vec<Option<Vec<String>>>>| {
@@ -161,7 +189,8 @@ fn apply_param_selector_dispatch(
                 e: &Expr,
                 owner: Option<&ClassId>,
                 resolve: &dyn Fn(&[Symbol]) -> Option<ClassId>,
-                targets: &HashMap<Key, usize>,
+                target_classes: &std::collections::HashSet<&ClassId>,
+                targets_by_method: &HashMap<&Symbol, Vec<&Key>>,
                 f: &mut dyn FnMut(Key, &[Expr], bool),
             ) {
                 if let ExprNode::Send { recv, method, args, .. } = &*e.node {
@@ -181,20 +210,22 @@ fn apply_param_selector_dispatch(
                         Some((_, ty)) => {
                             let unknown = match ty {
                                 None | Some(Ty::Untyped) | Some(Ty::Var { .. }) => true,
-                                Some(Ty::Class { id, .. }) => targets.keys().any(|k| &k.0 == id),
+                                Some(Ty::Class { id, .. }) => target_classes.contains(id),
                                 _ => false,
                             };
                             if unknown {
-                                for k in targets.keys().filter(|k| &k.1 == method) {
-                                    f(k.clone(), args, true);
+                                for k in targets_by_method.get(method).map(Vec::as_slice).unwrap_or_default() {
+                                    f((*k).clone(), args, true);
                                 }
                             }
                         }
                     }
                 }
-                e.node.for_each_child(&mut |c| walk(c, owner, resolve, targets, f));
+                e.node.for_each_child(&mut |c| {
+                    walk(c, owner, resolve, target_classes, targets_by_method, f)
+                });
             }
-            walk(body, owner, &resolve, &targets, &mut |key, args, poison| {
+            walk(body, owner, &resolve, &target_classes, &targets_by_method, &mut |key, args, poison| {
                 if poison {
                     poisoned.insert(key);
                 } else {
