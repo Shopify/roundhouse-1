@@ -139,6 +139,11 @@ end
 const POSTGRES_DATABASE_YML: &str = "default: &default\n  adapter: postgresql\n  pool: <%= 1 + 2 %>\n  schema_search_path: <%= %w[runtime_test public].join(\",\") %>\n\ntest:\n  <<: *default\n  database: roundhouse_unused\n";
 
 fn postgres_model_app() -> roundhouse::app::App {
+    postgres_model_app_with(None)
+}
+
+/// [`postgres_model_app`], with an authored config/application.rb.
+fn postgres_model_app_with(application_rb: Option<&str>) -> roundhouse::app::App {
     use roundhouse::ident::Symbol;
     use roundhouse::schema::{Column, ColumnType, Schema, Table};
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
@@ -164,6 +169,9 @@ fn postgres_model_app() -> roundhouse::app::App {
     copy_tree(&fixture, &copy.0);
     std::fs::write(copy.0.join("config/database.yml"), POSTGRES_DATABASE_YML).unwrap();
     std::fs::write(copy.0.join("roundhouse.yml"), "database_adapter: postgresql\n").unwrap();
+    if let Some(source) = application_rb {
+        std::fs::write(copy.0.join("config/application.rb"), source).unwrap();
+    }
     let mut app = roundhouse::ingest::ingest_app(&copy.0).expect("ingest fixture");
     assert!(app.database_yml.as_ref().is_some_and(|yml| yml.renderer.is_some()), "{:?}", app.database_refusals);
     let mut schema = Schema::default();
@@ -423,6 +431,109 @@ end
     println!("packaged model: {}", String::from_utf8_lossy(&result.stdout).trim());
     assert!(result.status.success(), "emitted code={script}\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
+/// Shopify Core's setting (config/application.rb): no test schema
+/// maintenance under PostgreSQL, whose database is prepared explicitly.
+const MAINTAIN_TEST_SCHEMA_APPLICATION_RB: &str = "module TinyBlog\n  class Application < Rails::Application\n    config.active_record.maintain_test_schema =\n      ENV[\"DB_ADAPTER\"] != \"postgresql\" && (!ENV[\"CI\"] || !!ENV[\"MAINTAIN_TEST_SCHEMA\"])\n  end\nend\n";
+
+/// Rails runs no schema DDL at boot; in a test, rails/test_help's
+/// `ActiveRecord::Migration.maintain_test_schema!` (activerecord
+/// 8.2.0.alpha migration.rb:736) loads the schema only when
+/// `ActiveRecord.maintain_test_schema` is set. The emitted PostgreSQL boot
+/// does the same, with the app's own setting evaluated when it boots:
+///   - set false (DB_ADAPTER=postgresql): boot runs no DDL against a
+///     database prepared beforehand, and the model uses that schema;
+///   - the same app with the expression true (no DB_ADAPTER): it loads;
+///   - an app that does not set it (the railtie default, true): it loads.
+/// DDL is observed by an event trigger on the real server.
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn postgres_boot_loads_the_schema_only_when_the_app_maintains_it() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    struct ProjectDir(std::path::PathBuf);
+    impl Drop for ProjectDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let package = |name: &str, app: &roundhouse::app::App| {
+        let files = roundhouse::project::target_files(app, &fixture, roundhouse::project::BuildTarget::Ruby)
+            .expect("package PostgreSQL Ruby project");
+        let project = ProjectDir(std::env::temp_dir().join(format!("roundhouse-pg-schema-{name}-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&project.0);
+        for (path, content) in &files {
+            let path = project.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let configuration = files.iter().find(|(p, _)| p == "runtime/database_configuration.rb").unwrap().1.clone();
+        (project, configuration)
+    };
+    let (configured, configured_source) = package("configured", &postgres_model_app_with(Some(MAINTAIN_TEST_SCHEMA_APPLICATION_RB)));
+    let (default, default_source) = package("default", &postgres_model_app());
+    assert!(configured_source.contains("def self.maintain_test_schema\n    Rails.application.active_record_maintain_test_schema\n"), "{configured_source}");
+    assert!(default_source.contains("def self.maintain_test_schema\n    true\n"), "{default_source}");
+    assert!(default_source.contains("Schema.statements.each { |sql| Db.exec(sql) } if maintain_test_schema"), "{default_source}");
+    let script = |project: &std::path::Path, prepared: bool, expect_ddl: bool| {
+        let path = |rel: &str| serde_json::to_string(&project.join(rel)).unwrap();
+        let prepare = if prepared {
+            "Db.exec(%q(CREATE TABLE entries (id serial PRIMARY KEY, \"Title\" text NOT NULL, enabled boolean NOT NULL, prepared boolean NOT NULL DEFAULT true)))"
+        } else {
+            ""
+        };
+        format!(r##"
+require {runtime}
+require {support}
+require {schema}
+require {model}
+ENV["ROUNDHOUSE_DATABASE_URL"] = DB_OPTIONS.merge(dbname: DATABASE_NAMES[0]).compact.map {{ |k,v| "#{{k}}=#{{v}}" }}.join(" ")
+class PostgreSQLRuntimeTest
+  def test_boot_schema_policy
+    # The explicit preparation, before the program boots.
+    {prepare}
+    Db.exec("CREATE TABLE ddl_log (tag text)")
+    Db.exec("CREATE FUNCTION runtime_test.log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO runtime_test.ddl_log VALUES (tg_tag); END $$")
+    Db.exec("CREATE EVENT TRIGGER log_ddl ON ddl_command_start EXECUTE FUNCTION runtime_test.log_ddl()")
+    Db.close
+    require {helper}
+    assert_equal {expect_ddl}, !!DatabaseConfiguration.maintain_test_schema
+    tags = ActiveRecord::Base.connection.execute("SELECT tag FROM ddl_log").to_a.map {{ |row| row["tag"] }}
+    if {expect_ddl}
+      assert_includes tags, "CREATE TABLE"
+    else
+      assert_equal [], tags
+    end
+    first = Entry.create!(Title: "booted", enabled: true)
+    assert_equal 1, first.id
+    assert_equal 1, Entry.named("booted")
+    if {prepared}
+      assert_equal [{{ "prepared" => true }}], ActiveRecord::Base.connection.execute("SELECT prepared FROM entries").to_a
+    end
+  ensure
+    ActiveRecord::Base.connection.execute("DROP EVENT TRIGGER IF EXISTS log_ddl") rescue nil
+  end
+end
+"##,
+            runtime = path("runtime/db.rb"), support = path("runtime/active_support_ext.rb"),
+            schema = path("config/schema.rb"), model = path("app/models/entry.rb"),
+            helper = path("test/test_helper.rb"))
+    };
+    for (project, db_adapter, prepared, expect_ddl) in [
+        (&configured.0, Some("postgresql"), true, false),
+        (&configured.0, None, false, true),
+        (&default.0, Some("postgresql"), false, true),
+    ] {
+        let script = script(project, prepared, expect_ddl);
+        let mut command = std::process::Command::new("ruby");
+        command.args(["-r", "./tests/db_pg_runtime.rb", "-e", &script, "--", "--name", "test_boot_schema_policy"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_remove("CI").env_remove("MAINTAIN_TEST_SCHEMA").env_remove("DB_ADAPTER");
+        if let Some(adapter) = db_adapter {
+            command.env("DB_ADAPTER", adapter);
+        }
+        let result = command.output().expect("ruby");
+        assert!(result.status.success(), "DB_ADAPTER={db_adapter:?} prepared={prepared}\nemitted code={script}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    }
 }
 
 #[test]

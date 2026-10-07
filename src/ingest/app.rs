@@ -7062,6 +7062,32 @@ const INERT_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
     ("assets.precompile", "no asset precompile step in the emitted app"),
 ];
 
+/// Framework config the emitted runtime APPLIES, lifted onto the
+/// `Rails::Application` reopen like an app key (reader `<a>_<b>`, its
+/// `__build` and writer), with the runtime file that reads the value.
+/// The value is the app's own expression, compiled as app code and
+/// evaluated once at runtime, so an ENV-dependent setting answers as it
+/// does when the app boots.
+///
+/// `active_record.maintain_test_schema`: activerecord 8.2.0.alpha
+/// railtie.rb:32 defaults it to true, `active_record.set_configs` copies
+/// it to `ActiveRecord.maintain_test_schema`, and rails/test_help's
+/// `ActiveRecord::Migration.maintain_test_schema!` (migration.rb:736)
+/// loads the schema only when it is set. Shopify Core sets it false
+/// under `DB_ADAPTER=postgresql` (config/application.rb), whose test
+/// database is prepared explicitly.
+pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[(
+    "active_record.maintain_test_schema",
+    "runtime/database_configuration.rb DatabaseConfiguration.maintain_test_schema gates the boot schema load",
+)];
+
+/// The `Rails::Application` reader ingest lifts for an applied
+/// framework key (`active_record.maintain_test_schema` →
+/// `active_record_maintain_test_schema`).
+pub(crate) fn applied_framework_config_reader(key: &str) -> String {
+    key.replace('.', "_")
+}
+
 /// Whether a written config path (`["assets", "version"]`) is one
 /// [`INERT_FRAMEWORK_CONFIG_KEYS`] vouches for.
 fn inert_framework_config(path: &[String]) -> bool {
@@ -7142,7 +7168,15 @@ fn extract_config_assignments(source: &[u8], file: &str) -> Vec<ConfigAssignment
                 return;
             }
         }
-        let Some(prefix) = config_receiver_path(&call.receiver(), app_param) else {
+        // A framework key the runtime applies is lifted like an app key
+        // ([`APPLIED_FRAMEWORK_CONFIG_KEYS`]); any other framework
+        // subsection stays unlifted.
+        let prefix = config_receiver_path(&call.receiver(), app_param).or_else(|| {
+            let prefix = config_path_in(&call.receiver()?, 0, app_param)?;
+            let dotted = format!("{}.{base}", prefix.join("."));
+            APPLIED_FRAMEWORK_CONFIG_KEYS.iter().any(|(key, _)| *key == dotted).then_some(prefix)
+        });
+        let Some(prefix) = prefix else {
             return;
         };
         let Some(args) = call.arguments() else { return };

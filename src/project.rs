@@ -2601,6 +2601,19 @@ fn database_configuration_source(app: &App, yml: &crate::database::DatabaseYml) 
     };
     let path = ruby_data_literal(&serde_json::Value::String(yml.path.clone()));
     let adapter = ruby_data_literal(&serde_json::Value::String(yml.adapter.name().to_string()));
+    // The app's `config.active_record.maintain_test_schema`, lifted
+    // onto the Application reopen (ingest::app
+    // APPLIED_FRAMEWORK_CONFIG_KEYS); without one, the railtie default.
+    let maintain_reader = crate::ingest::app::applied_framework_config_reader("active_record.maintain_test_schema");
+    let maintain_test_schema = if app
+        .rails_application
+        .as_ref()
+        .is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == maintain_reader))
+    {
+        format!("Rails.application.{maintain_reader}")
+    } else {
+        "true".to_string()
+    };
     format!(r#"# Boot-time database configuration, resolved from the app's own
 # config/database.yml by runtime/database_configurations.rb. Holds no
 # credentials: the endpoint is ROUNDHOUSE_DATABASE_URL, read at boot.
@@ -2645,6 +2658,14 @@ module DatabaseConfiguration
     DatabaseConfigurations.pool_entry(db_config, @primary, COMPILED_ADAPTER, ENV, configurations: @configurations)
   end
 
+  # ActiveRecord.maintain_test_schema (activerecord 8.2.0.alpha):
+  # railtie.rb:32 defaults config.active_record.maintain_test_schema to
+  # true and `active_record.set_configs` copies the app's value. Read
+  # at boot, as the app's config evaluates it.
+  def self.maintain_test_schema
+    {maintain_test_schema}
+  end
+
   # The variable naming that pool's endpoint, or the named error.
   def self.endpoint_for(db_config)
     DatabaseConfigurations.pool_endpoint(db_config, @primary, ENV, configurations: @configurations)
@@ -2676,7 +2697,11 @@ module DatabaseConfiguration
       end
       klass.connects_to(database: {{ writing: writing.to_sym, reading: reading&.to_sym }}.compact)
     end
-    Schema.statements.each {{ |sql| Db.exec(sql) }}
+    # rails/test_help's ActiveRecord::Migration.maintain_test_schema!
+    # (migration.rb:736) loads the schema only when maintain_test_schema
+    # is set; otherwise the database is prepared outside the program and
+    # boot runs no DDL.
+    Schema.statements.each {{ |sql| Db.exec(sql) }} if maintain_test_schema
   end
 end
 "#)
