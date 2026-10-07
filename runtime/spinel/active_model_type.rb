@@ -5,9 +5,9 @@
 # 5813559f, the version Core pins) for the CRuby and JRuby
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
-# Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime},
-# and ActiveRecord::Type::{Value,ImmutableString,String,Integer,BigInteger,
-# Binary,Boolean} (the same classes), ActiveRecord::Type::Text, ActiveRecord::Type::DateTime
+# Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime,
+# Decimal}, and ActiveRecord::Type::{Value,ImmutableString,String,Integer,
+# BigInteger,Binary,Boolean,Decimal} (the same classes), ActiveRecord::Type::Text, ActiveRecord::Type::DateTime
 # with Internal::Timezone. An app that builds column types itself needs
 # them, for example Core's DeveloperDashboard::FastDev::TablelessSchema,
 # which builds `ActiveRecord::Type::Integer.new(limit: 8)` and its
@@ -15,7 +15,7 @@
 #
 # Each method follows the 8.2.0.alpha source (activemodel
 # lib/active_model/type/{value,serialize_cast_value,immutable_string,
-# string,integer,big_integer,binary,boolean,date_time}.rb and type/helpers/*.rb; activerecord
+# string,integer,big_integer,binary,boolean,date_time,decimal}.rb and type/helpers/*.rb; activerecord
 # lib/active_record/type/{text,date_time}.rb and type/internal/
 # timezone.rb). tests/active_model_type_runtime.rb runs the same
 # observations against that native ActiveModel and this file and
@@ -34,7 +34,7 @@
 #   no zone), so every time casts in UTC.
 # - The type registries (`ActiveModel::Type.lookup` / `register`,
 #   ActiveRecord's AdapterSpecificRegistry) and the other types (Date,
-#   Time, Decimal, Float, Json, Serialized) are not ported; type.rb's
+#   Time, Float, Json, Serialized) are not ported; type.rb's
 #   `default_value` is. No code the tree carries reaches them yet: the
 #   runtime's `type_for_attribute` raises NotImplementedError for a
 #   column whose type is not here.
@@ -54,6 +54,7 @@
 #   QueryMethods#order and Arel's ToSql do), so a model attribute whose
 #   type rewrites comparisons is not modeled by the queries.
 
+require "bigdecimal/util"
 require "date"
 
 module ActiveModel
@@ -810,6 +811,72 @@ module Type
           super
         end
     end
+
+    # activemodel lib/active_model/type/decimal.rb. shopify-money's
+    # MoneyColumn::ActiveRecordType and Money::Type subclass it (through
+    # ActiveRecord::Type::Decimal) and reach `cast` / `serialize` by super.
+    class Decimal < Value
+      include Helpers::Immutable
+      include Helpers::Numeric
+      BIGDECIMAL_PRECISION = 18
+
+      def type
+        :decimal
+      end
+
+      def type_cast_for_schema(value)
+        value.to_s.inspect
+      end
+
+      private
+        def cast_value(value)
+          casted_value = \
+            case value
+            when ::Float
+              convert_float_to_big_decimal(value)
+            when ::Numeric
+              BigDecimal(value, precision || BIGDECIMAL_PRECISION)
+            when ::String
+              begin
+                value.to_d
+              rescue ArgumentError
+                BigDecimal(0)
+              end
+            else
+              if value.respond_to?(:to_d)
+                value.to_d
+              else
+                cast_value(value.to_s)
+              end
+            end
+
+          apply_scale(casted_value)
+        end
+
+        def convert_float_to_big_decimal(value)
+          if precision
+            BigDecimal(apply_scale(value), float_precision)
+          else
+            value.to_d
+          end
+        end
+
+        def float_precision
+          if precision.to_i > ::Float::DIG + 1
+            ::Float::DIG + 1
+          else
+            precision.to_i
+          end
+        end
+
+        def apply_scale(value)
+          if scale
+            value.round(scale)
+          else
+            value
+          end
+        end
+    end
   end
 end
 
@@ -854,6 +921,7 @@ module ActiveRecord
     Integer = ActiveModel::Type::Integer
     BigInteger = ActiveModel::Type::BigInteger
     Binary = ActiveModel::Type::Binary
+    Decimal = ActiveModel::Type::Decimal
     ImmutableString = ActiveModel::Type::ImmutableString
     String = ActiveModel::Type::String
     Value = ActiveModel::Type::Value
