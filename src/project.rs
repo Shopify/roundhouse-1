@@ -5941,7 +5941,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     for program in &autoloaded_programs {
         let file = format!("app/{program}.rb");
         if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
-            let header: usize = content.split_inclusive('\n').take_while(|l| l.starts_with('#')).map(str::len).sum();
+            // After the program's header comment (through its "else at
+            // boot" line), ahead of any note on its first statement.
+            let comments: Vec<&str> = content.split_inclusive('\n').take_while(|l| l.starts_with('#')).collect();
+            let header_lines = comments.iter().position(|l| l.trim_end().ends_with("else at boot (app/models.rb).")).map_or(comments.len(), |i| i + 1);
+            let header: usize = comments[..header_lines].iter().map(|l| l.len()).sum();
             // An initializer's constant file loads before app/models.rb.
             content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
         }
