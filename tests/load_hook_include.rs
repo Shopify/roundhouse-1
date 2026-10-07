@@ -5,8 +5,12 @@
 //! Core splits Shop, User, ApiClient and others this way; the include
 //! is now lifted into the model body at that site, so the extension's
 //! methods and `included do` associations exist on the model and the
-//! initializer statement is no longer refused. Any other block shape,
-//! or a hook no class body fires, is still named at its site.
+//! initializer statement is no longer refused. An STI subclass
+//! (`RegularUser < User`) takes the include on its include list. A bare
+//! `include ShopBillingSetting::Extension` under `run_load_hooks(:h,
+//! self)` lifts too, since the top level reads that path the same. Any
+//! other block shape, or a hook no class body fires, is still named at
+//! its site.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,13 +20,17 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 const LIFTABLE: &str = "ActiveSupport.on_load(:account) do\n  class Account\n    include Extension\n  end\nend\n";
 
 fn check(initializer: &str, run_hooks: &str) -> String {
+    check_with(initializer, run_hooks, "", &[])
+}
+
+fn check_with(initializer: &str, run_hooks: &str, account_extra: &str, extra: &[(&str, &str)]) -> String {
     let root = std::env::temp_dir().join(format!("rh_load_hook_include_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
-    let model = format!("class Account < ApplicationRecord\n  #: -> untyped\n  def use = [hello.succ, things.first, hello.nope]\n\n  {run_hooks}\nend\n");
+    let model = format!("class Account < ApplicationRecord\n  #: -> untyped\n  def use = [hello.succ, things.first, hello.nope]\n{account_extra}\n  {run_hooks}\nend\n");
     let files = [
         ("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n".to_string()),
         (
             "db/structure.sql",
-            "CREATE TABLE core.accounts (\n    id bigint NOT NULL\n);\nCREATE TABLE core.things (\n    id bigint NOT NULL,\n    account_id bigint\n);\n".to_string(),
+            "CREATE TABLE core.accounts (\n    id bigint NOT NULL,\n    type character varying\n);\nCREATE TABLE core.things (\n    id bigint NOT NULL,\n    account_id bigint\n);\n".to_string(),
         ),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n".to_string()),
         ("app/models/thing.rb", "class Thing < ApplicationRecord\n  belongs_to :account\nend\n".to_string()),
@@ -33,7 +41,8 @@ fn check(initializer: &str, run_hooks: &str) -> String {
         ("app/models/account.rb", model),
         ("config/initializers/model_extensions.rb", initializer.to_string()),
     ];
-    for (path, text) in &files {
+    let files = files.into_iter().chain(extra.iter().map(|(path, text)| (*path, text.to_string())));
+    for (path, text) in files {
         let file = root.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, text).unwrap();
@@ -70,8 +79,42 @@ fn a_hook_no_class_body_fires_stays_refused() {
 }
 
 #[test]
-fn a_bare_include_resolves_from_the_initializer_and_is_not_lifted() {
+fn a_bare_include_of_a_relative_name_is_not_lifted() {
+    // `Extension` in the block is `::Extension`, which does not exist.
     let initializer = "ActiveSupport.on_load(:account) do\n  include Extension\nend\n";
     let text = check(initializer, "ActiveSupport.run_load_hooks(:account, self)");
     assert!(!lifted(&text), "{text}");
+}
+
+#[test]
+fn a_bare_include_of_a_top_level_path_is_lifted() {
+    let initializer = "ActiveSupport.on_load(:account) do\n  include Account::Extension\nend\n";
+    let text = check(initializer, "ActiveSupport.run_load_hooks(:account, self)");
+    assert!(lifted(&text), "{text}");
+    assert!(!text.contains("initializer_unsupported"), "{text}");
+}
+
+#[test]
+fn a_bare_include_under_an_object_base_is_not_lifted() {
+    // Without `self` the block runs in Object, not in Account.
+    let initializer = "ActiveSupport.on_load(:account) do\n  include Account::Extension\nend\n";
+    let text = check(initializer, "ActiveSupport.run_load_hooks(:account)");
+    assert!(!lifted(&text), "{text}");
+}
+
+#[test]
+fn an_sti_subclass_takes_the_include() {
+    let initializer = format!("{LIFTABLE}\nActiveSupport.on_load(:sub) do\n  class Sub\n    include Extension\n  end\nend\n");
+    let sub = "class Sub < Account\n  ActiveSupport.run_load_hooks(:sub)\nend\n";
+    let sub_extension = "class Sub\n  module Extension\n    #: -> Integer\n    def bye = 1\n  end\nend\n";
+    let text = check_with(
+        &initializer,
+        "ActiveSupport.run_load_hooks(:account)",
+        "\n  #: (Sub s) -> untyped\n  def through(s) = [s.bye.succ, s.zzz]\n",
+        &[("app/models/sub.rb", sub), ("app/models/sub/extension.rb", sub_extension)],
+    );
+    assert!(lifted(&text), "{text}");
+    assert!(text.contains("no known method `zzz` on Sub"), "{text}");
+    assert!(!text.contains("`bye`"), "{text}");
+    assert!(!text.contains("initializer_unsupported"), "{text}");
 }

@@ -29,18 +29,23 @@
 //!
 //! * the initializer is one the boot runs, at its top level;
 //! * one class body fires the hook (`initializer_programs::
-//!   class_load_hooks`), and that class is a model;
+//!   class_load_hooks`), and that class is a model, or a class the
+//!   ingest keeps as a library class (an STI subclass, `RegularUser <
+//!   User`), whose include list takes them;
 //! * every statement of the block is a `class <Model>` reopen without a
 //!   superclass whose body is only `include` calls with constant
-//!   arguments.
+//!   arguments, or such an `include` itself (below).
 //!
 //! A constant in the reopen is looked up from `<Model>` outward, as one
 //! written in the model body is, so the lifted include is qualified the
 //! same way (`qualify_relative_includes`). A bare `include M` in the
-//! block (`run_load_hooks(:h, self)` evaluates it in the class) is not
-//! lifted: its constants resolve from the initializer's top level, not
-//! from the class. Any shape not lifted is left as it was: the initializer
-//! scan runs what it can and names the rest at its site
+//! block (`run_load_hooks(:h, self)` evaluates it in the class) also
+//! lifts, but its constants resolve from the initializer's top level, not
+//! from the class: only a path that names a known module as written, and
+//! that no scope of the class also defines, reads the same in the class
+//! body (`include ShopBillingSetting::Extension`; a bare `include
+//! Extension` there stays). Any shape not lifted is left as it was: the
+//! initializer scan runs what it can and names the rest at its site
 //! (`initializer_unsupported`).
 
 use std::path::{Path, PathBuf};
@@ -63,6 +68,9 @@ pub(super) fn lift<V: Vfs + ?Sized>(
 ) {
     let (sites, _) = super::initializer_programs::class_load_hooks(sources, dir, &app.initializer_files);
     let mut lifted_from: crate::det::HashSet<crate::span::FileId> = crate::det::HashSet::default();
+    // What `qualify_relative_includes` resolves against.
+    let known: Known =
+        app.library_classes.iter().map(|lc| lc.name.clone()).chain(app.concern_model_items.keys().cloned()).collect();
     for entry in boot_initializers {
         let Ok(bytes) = vfs.read(entry) else { continue };
         if !bytes.windows(7).any(|w| w == b"on_load") {
@@ -76,11 +84,30 @@ pub(super) fn lift<V: Vfs + ?Sized>(
             let Some((hook, body)) = on_load_block(&stmt) else { continue };
             let mut fired = sites.iter().filter(|site| site.hook == hook);
             let (Some(site), None) = (fired.next(), fired.next()) else { continue };
-            let Some(includes) = literal_includes(&body, site) else { continue };
+            let Some(includes) = literal_includes(&body, site, &known) else { continue };
+            let Some(model) = app.models.iter_mut().find(|m| m.name.0.as_str() == site.class) else {
+                // An STI subclass of a model (`RegularUser < User`) is a
+                // library class here; its includes are a list.
+                let Some(class) =
+                    app.library_classes.iter_mut().find(|lc| !lc.is_module && lc.name.0.as_str() == site.class)
+                else {
+                    continue;
+                };
+                for call in &includes {
+                    for arg in call.arguments().into_iter().flat_map(|args| args.arguments().iter()) {
+                        let Some(path) = constant_path_of(&arg) else { continue };
+                        let id = crate::ident::ClassId(crate::ident::Symbol::from(path.join("::").as_str()));
+                        if !class.includes.contains(&id) {
+                            class.includes.push(id);
+                        }
+                    }
+                }
+                super::initializers::consume_node(&file, &stmt);
+                continue;
+            };
             let Ok(exprs) = includes.iter().map(|call| super::expr::ingest_expr(&call.as_node(), &file)).collect::<Result<Vec<_>, _>>() else {
                 continue;
             };
-            let Some(model) = app.models.iter_mut().find(|m| m.name.0.as_str() == site.class) else { continue };
             let mut at = model
                 .body
                 .iter()
@@ -121,20 +148,44 @@ fn on_load_block<'pr>(stmt: &Node<'pr>) -> Option<(String, Vec<Node<'pr>>)> {
 }
 
 /// The include calls of a block that holds only `class <Model>` reopens
-/// of the class firing the hook, each holding only includes, or `None`
-/// for any other block.
-fn literal_includes<'pr>(body: &[Node<'pr>], site: &ClassLoadHook) -> Option<Vec<CallNode<'pr>>> {
+/// of the class firing the hook, each holding only includes, and, when
+/// the hook's base is that class, bare includes naming modules only the
+/// top level resolves; `None` for any other block.
+fn literal_includes<'pr>(body: &[Node<'pr>], site: &ClassLoadHook, known: &Known) -> Option<Vec<CallNode<'pr>>> {
     let mut out = Vec::new();
     for stmt in body {
-        let class = stmt.as_class_node()?;
-        if class.superclass().is_some() || class_name_path(&class)?.join("::") != site.class {
+        if let Some(class) = stmt.as_class_node() {
+            if class.superclass().is_some() || class_name_path(&class)?.join("::") != site.class {
+                return None;
+            }
+            for inner in class.body().map(flatten_statements).unwrap_or_default() {
+                out.push(include_call(&inner)?);
+            }
+        } else if site.base == site.class {
+            let call = include_call(stmt)?;
+            let args = call.arguments()?.arguments();
+            if !args.iter().all(|arg| constant_path_of(&arg).is_some_and(|path| top_level_only(&path, &site.class, known))) {
+                return None;
+            }
+            out.push(call);
+        } else {
             return None;
-        }
-        for inner in class.body().map(flatten_statements).unwrap_or_default() {
-            out.push(include_call(&inner)?);
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+type Known = crate::det::HashSet<crate::ident::ClassId>;
+
+/// `path`, written in the block, names a known module from the top level
+/// (where the block's constants resolve), and no scope of `class` defines
+/// it, so `qualify_relative_includes` reads it the same in the class body.
+fn top_level_only(path: &[String], class: &str, known: &Known) -> bool {
+    let tail = path.join("::");
+    let id = |name: &str| crate::ident::ClassId(crate::ident::Symbol::from(name));
+    let scope: Vec<&str> = class.split("::").collect();
+    known.contains(&id(&tail))
+        && (1..=scope.len()).all(|depth| !known.contains(&id(&format!("{}::{tail}", scope[..depth].join("::")))))
 }
 
 /// `include M` / `include M, N` with constant arguments.
