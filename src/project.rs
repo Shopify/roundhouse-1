@@ -3143,6 +3143,23 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             files.push((emitted.to_string(), text));
         }
     }
+    // The features themselves, on the load path ahead of any gem, so a
+    // gem loaded natively that requires one (elasticsearch-shopify,
+    // trust_battery_client, cusco ... `require "semian"`) gets the port
+    // and lib/semian.rb never loads over it.
+    for (feature, stem) in SEMIAN_LOAD_PATH_FEATURES {
+        let depth = feature.matches('/').count() + 1;
+        files.push((
+            format!("runtime/features/{feature}.rb"),
+            format!(
+                "# `require {feature:?}` on this tree: semian 0.28.3's file, ported\n\
+                 # (runtime/{stem}.rb). runtime/gem_facades.rb puts this directory\n\
+                 # first on the load path.\n\
+                 require_relative \"{}{stem}\"\n",
+                "../".repeat(depth)
+            ),
+        ));
+    }
     let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
@@ -3173,7 +3190,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         // by `if defined?(ActiveSupport)`). The hooks file depends on
         // nothing, so it goes first.
         if path == "runtime/gem_facades.rb" {
-            content.insert_str(0, "require_relative \"active_support_lazy_load_hooks\"\n");
+            content.insert_str(
+                0,
+                "require_relative \"active_support_lazy_load_hooks\"\n\
+                 # semian's features answer from the runtime ports (runtime/features).\n\
+                 $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
+            );
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -3224,6 +3246,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
 /// (`semian/activerecord_postgresql_adapter` is not here: it is installed
 /// from its load hook, `ingest::on_load_hooks::RUNTIME_PORTS`.)
 pub const SEMIAN_PORT_FEATURES: &[(&str, &str)] = &[("semian/net_http", "semian_net_http")];
+
+/// Every semian feature a port answers, as runtime/features/<feature>.rb
+/// on the load path: lib/semian.rb, lib/semian/adapter.rb, and the
+/// [`SEMIAN_PORT_FEATURES`].
+const SEMIAN_LOAD_PATH_FEATURES: &[(&str, &str)] = &[
+    ("semian", "semian"),
+    ("semian/adapter", "semian_adapter"),
+    ("semian/net_http", "semian_net_http"),
+    ("semian/activerecord_postgresql_adapter", "semian_activerecord_postgresql_adapter"),
+];
 
 /// The [`SEMIAN_PORT_FEATURES`] some ingested file requires at its top
 /// level (a statement in column 0, as opentelemetry-shopify 1.22.0's

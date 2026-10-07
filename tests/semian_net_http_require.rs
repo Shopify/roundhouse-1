@@ -39,6 +39,13 @@ fn a_top_level_semian_net_http_require_loads_the_port_with_the_gems() {
     let (dir, _) = app("require 'semian/net_http'").emit(BuildTarget::Ruby);
     let facades = facades(&dir);
     let hooks = facades.find("require_relative \"active_support_lazy_load_hooks\"").expect("hooks first");
+    // semian's features are the ports for a natively loaded gem too.
+    let features = facades.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))").unwrap_or_else(|| panic!("{facades}"));
+    assert!(hooks < features, "{facades}");
+    for (feature, port) in [("semian", "../semian"), ("semian/net_http", "../../semian_net_http"), ("semian/adapter", "../../semian_adapter")] {
+        let shim = std::fs::read_to_string(dir.join(format!("runtime/features/{feature}.rb"))).expect("feature file");
+        assert!(shim.contains(&format!("require_relative \"{port}\"")), "{shim}");
+    }
     let gems = facades.find("require gem_name").expect("guarded gem requires");
     let port = facades.find("require_relative \"semian_net_http\"").unwrap_or_else(|| panic!("{facades}"));
     assert!(hooks < gems && gems < port, "{facades}");
@@ -67,9 +74,14 @@ fn the_emitted_port_answers_and_the_gem_lib_never_loads() {
         .args([
             "-e",
             // The port as gem_facades.rb loads it (the rest of that file is
-            // the guarded gem list, environment-dependent here).
+            // the guarded gem list, environment-dependent here), then the
+            // gem's own features, as a natively loaded gem requires them.
             "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
              require_relative 'runtime/semian_net_http'\n\
+             require 'semian'\n\
+             require 'semian/adapter'\n\
+             require 'semian/net_http'\n\
              p Net::HTTP.new('127.0.0.1', 1, semian: false).disabled?\n\
              p ActiveSupport.respond_to?(:on_load)\n\
              p $LOADED_FEATURES.grep(%r{/gems/semian-[^/]+/lib/}).map { |f| f[%r{/gems/semian-[^/]+/(lib/.*)}, 1] }\n",
