@@ -80,3 +80,27 @@ fn a_qualified_reference_into_a_sibling_requires_the_siblings_file_not_the_names
     assert!(config.contains("require_relative \"policy\""), "{config}");
     assert!(!config.contains("require_relative \"../guarding\""), "{config}");
 }
+
+/// Core's checkouts/one ProcessingService: a nested class with nested
+/// classes of its own (`InventoryError`, whose `FailedToReserveInventory`
+/// constant builds one of them) is rendered in its own file and then
+/// spliced into its owner's. Its requires were rebased onto the owner's
+/// file, including the one naming that file itself (the constant's), so
+/// the file required itself: a circular require. Spliced, the constant
+/// also ran ahead of the nested class it builds, which the source
+/// defines first.
+#[test]
+fn a_spliced_nested_class_does_not_require_the_file_that_holds_it() {
+    let svc = "class Svc\n  class Error < StandardError\n  end\n\n  class InventoryError < Error\n    class Impl < InventoryError; end\n    Reserved = Impl.new\n\n    class Claim < InventoryError\n      def initialize(reverted)\n        super()\n        @reverted = reverted\n      end\n\n      attr_reader :reverted\n    end\n  end\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "require_relative \"boot\"\n")
+        .write("lib/strict.rb", STRICT)
+        .write("lib/svc.rb", svc)
+        .run_ruby("p Svc::InventoryError::Reserved.class\np Svc::InventoryError::Claim.new(true).reverted\np Svc::InventoryError.superclass\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "Svc::InventoryError::Impl\ntrue\nSvc::Error\n", "{}", run.stderr);
+    let file = std::fs::read_to_string(run.emitted.join("app/models/svc.rb")).expect("svc.rb");
+    assert!(!file.contains("require_relative \"svc\""), "{file}");
+}

@@ -288,21 +288,69 @@ fn splice_nested(
     // where the base must already be defined — the requirement the
     // require between two files used to satisfy. Left to the
     // collection's own order this works by luck.
+    //
+    // A class's constant that builds a class nested in it
+    // (`InventoryError::FailedToReserveInventory =
+    // FailedToReserveInventoryImpl.new`, Core's checkouts/one
+    // ProcessingService) runs, natively, after that class's definition
+    // earlier in the body. Each class is its own block here, so the
+    // nested one's goes first. Its wrapper reopens the enclosing class
+    // with that class's superclass, so it waits for that superclass, not
+    // for the enclosing class's block.
     let kids = {
         let names: crate::det::HashSet<&str> =
             kids.iter().map(|k| k.name.0.as_str()).collect();
+        let parent_of = |name: &str| -> Option<&str> {
+            kids.iter().find(|k| k.name.0.as_str() == name).and_then(|k| k.parent.as_ref()).map(|p| p.0.as_str())
+        };
+        let nested_in = |inner: &str, outer: &str| inner.len() > outer.len() + 2 && inner.starts_with(outer) && inner[outer.len()..].starts_with("::");
+        // The superclass a class's block waits for: one that encloses
+        // it is created by the block's own wrapper, so its superclass.
+        let superclass_wait = |k: &LibraryClass, built: bool| -> Option<String> {
+            let mut wait = k.parent.as_ref().map(|p| p.0.as_str().to_string())?;
+            let mut hops = 0;
+            while built && nested_in(k.name.0.as_str(), &wait) && hops < 8 {
+                wait = parent_of(&wait)?.to_string();
+                hops += 1;
+            }
+            Some(wait)
+        };
+        let builds: Vec<Vec<String>> = kids
+            .iter()
+            .map(|k| {
+                let own = k.name.0.as_str();
+                let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+                for (_, value) in &k.constants {
+                    walk_const_paths(value, &mut paths);
+                }
+                let mut out: Vec<String> = Vec::new();
+                for path in &paths {
+                    for n in 1..=path.len() {
+                        let prefix = path[..n].join("::");
+                        if nested_in(&prefix, own) && names.contains(prefix.as_str()) && !out.contains(&prefix) {
+                            out.push(prefix);
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let builds_of = |k: &LibraryClass| -> &[String] {
+            kids.iter().position(|c| std::ptr::eq(*c, k)).map_or(&[][..], |i| builds[i].as_slice())
+        };
         let mut pending: Vec<&LibraryClass> = kids.to_vec();
         let mut ordered: Vec<&LibraryClass> = Vec::new();
         let mut placed: crate::det::HashSet<String> = crate::det::HashSet::default();
         while !pending.is_empty() {
             let before = pending.len();
             pending.retain(|k| {
-                let waits_for = k
-                    .parent
-                    .as_ref()
-                    .map(|p| p.0.as_str())
-                    .filter(|p| names.contains(p) && !placed.contains(*p));
+                let built = builds.iter().flatten().any(|d| d == k.name.0.as_str());
+                let waits_for = superclass_wait(k, built)
+                    .filter(|p| names.contains(p.as_str()) && !placed.contains(p.as_str()));
                 if waits_for.is_some() {
+                    return true;
+                }
+                if builds_of(k).iter().any(|d| !placed.contains(d.as_str())) {
                     return true;
                 }
                 placed.insert(k.name.0.as_str().to_string());
@@ -344,7 +392,15 @@ fn splice_nested(
             // that nests several.
             let own_dir = format!("{}/", crate::naming::underscore(parent.name.0.as_str()));
             let own_dir = own_dir.rsplit('/').nth(1).map(|d| format!("{d}/"));
-            if own_dir.is_some_and(|d| rebased.starts_with(&d)) {
+            if own_dir.as_ref().is_some_and(|d| rebased.starts_with(d.as_str())) {
+                continue;
+            }
+            // Nor does the file that holds it now, which a nested
+            // class's own file required as its enclosing class's
+            // (`../processing_service`, rebased to `processing_service`):
+            // a file requiring itself is Ruby's circular-require warning
+            // (Core's checkouts/one ProcessingService::ForcedFail).
+            if own_dir.is_some_and(|d| rebased == d.trim_end_matches('/')) {
                 continue;
             }
             hoisted.push(format!("require_relative {rebased:?}"));
