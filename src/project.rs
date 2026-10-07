@@ -3096,7 +3096,8 @@ fn ruby_family_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref());
+    let gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref(), &gem_sources);
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
     // target cannot perform a mixin — see `apply_module_mixins`), and the
@@ -3302,27 +3303,15 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// feature a port answers (`SEMIAN_PORT_FEATURES`) is the port's.
 pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
     use std::collections::{HashMap, HashSet};
-    let Some(lock) = app.gem_lock.as_ref() else { return (Vec::new(), Vec::new()) };
+    if app.gem_lock.is_none() {
+        return (Vec::new(), Vec::new());
+    }
     let by_path: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
     // `<root>/<name>-<version>/lib/<name>.rb`: a gem source is the
     // released gem, vendored at its version. (A lockfile PATH gem is in
     // `in_repo` too, but it is the app's own code, required as the app
     // requires it.)
-    let mut entries: Vec<(String, String)> = Vec::new();
-    for name in &lock.in_repo {
-        let tail = format!("/lib/{name}.rb");
-        for source in &app.sources {
-            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
-            let gem_dir = dir.rsplit('/').next().unwrap_or("");
-            let versioned = gem_dir
-                .strip_prefix(name.as_str())
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
-            if versioned {
-                entries.push((source.path.clone(), format!("{dir}/lib/")));
-            }
-        }
-    }
+    let entries: Vec<(String, String)> = gem_source_entries(app).into_iter().map(|(_, entry, lib)| (entry, lib)).collect();
     // A feature some compiled lib answers (another gem source's, a path
     // gem's, the app's `lib/`): compiled, so not the gem home's.
     let compiled_feature = |feature: &str| {
@@ -3374,6 +3363,30 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
         }
     }
     (native, framework)
+}
+
+/// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
+/// the released gem vendored at its version. (A lockfile PATH gem is in
+/// `in_repo` too, but it is the app's own code, required as the app
+/// requires it.)
+fn gem_source_entries(app: &App) -> Vec<(String, String, String)> {
+    let Some(lock) = app.gem_lock.as_ref() else { return Vec::new() };
+    let mut entries = Vec::new();
+    for name in &lock.in_repo {
+        let tail = format!("/lib/{name}.rb");
+        for source in &app.sources {
+            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
+            let gem_dir = dir.rsplit('/').next().unwrap_or("");
+            let versioned = gem_dir
+                .strip_prefix(name.as_str())
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+            if versioned {
+                entries.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+            }
+        }
+    }
+    entries
 }
 
 /// `a/b/../c.rb` → `a/c.rb`, with `.rb` added when absent.
@@ -7747,7 +7760,12 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
         .copied()
 }
 
-fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
+/// `gem_sources`: the gems carried as source (`gem_source_entries`). They
+/// are compiled, but their own dependencies load from the gem home
+/// (`gem_source_dependency_block`), so a `GIT` gem in their closure is
+/// activated as a runtime gem's is: panama_client 3.2.3 requires
+/// grpc_fork_safety, which depends on Core's grpc fork.
+fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>, gem_sources: &[String]) {
     let mut needed: Vec<&str> = Vec::new();
     for &(ref marker, gem) in runtime_gems() {
         // `app/` only. The runtime tree names several of these itself (the
@@ -7771,10 +7789,10 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     let gated: Vec<&str> = lock
         .map(|l| LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| l.has(gem)).collect())
         .unwrap_or_default();
-    if needed.is_empty() && gated.is_empty() {
+    if needed.is_empty() && gated.is_empty() && gem_sources.is_empty() {
         return;
     }
-    if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile") {
+    if let Some((_, gemfile)) = files.iter_mut().find(|(p, _)| p == "Gemfile").filter(|_| !needed.is_empty()) {
         let mut block = String::from(
             "\n# Gems the emitted app reaches at RUNTIME. runtime/gem_facades.rb\n\
              # guarded-requires these, so a missing one is not a boot failure —\n\
@@ -7805,6 +7823,11 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&cra
     for gem in gated {
         if !activated.contains(&gem) {
             activated.push(gem);
+        }
+    }
+    for gem in gem_sources {
+        if !activated.contains(&gem.as_str()) {
+            activated.push(gem.as_str());
         }
     }
     apply_git_gem_load_paths(files, &activated, lock);

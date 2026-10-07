@@ -89,3 +89,23 @@ fn a_gem_sources_load_time_dependencies_are_required_from_the_gem_home() {
     let check = emit_and_run::ruby().args(["-c", "runtime/gem_facades.rb"]).current_dir(&*dir).output().expect("ruby -c");
     assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
 }
+
+/// A gem source's dependencies load from the gem home, so a `GIT` gem in
+/// its lock closure is activated as Bundler would (runtime/git_gems.rb):
+/// panama_client 3.2.3 requires grpc_fork_safety, which depends on Core's
+/// grpc fork, and RubyGems alone never sees that checkout.
+#[test]
+fn a_git_gem_in_a_gem_sources_closure_is_activated() {
+    let lock = "GIT\n  remote: https://github.com/Shopify/grpc.git\n  revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  specs:\n    grpc (1.85.0.dev)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    grpc_fork_safety (0.1.0)\n      grpc (>= 1.40)\n    panama_client (3.2.3)\n      grpc_fork_safety\n\nDEPENDENCIES\n  grpc!\n  panama_client\n";
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ngem_sources:\n  panama_client: vendor/gems/panama_client-3.2.3\n")
+        .write("Gemfile.lock", lock)
+        .write("vendor/gems/panama_client-3.2.3/lib/panama_client.rb", "require 'grpc_fork_safety'\nmodule PanamaClient\nend\n")
+        .write("lib/oracle.rb", "class Oracle\n  def ask\n    PanamaClient\n  end\nend\n")
+        .emit(BuildTarget::Ruby);
+    let git = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems.rb");
+    assert!(git.contains(r#"["grpc", "grpc-d5dd2a32be6b", "https://github.com/Shopify/grpc.git""#), "{git}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
+    assert!(facades.starts_with("require_relative \"git_gems\"\n"), "{facades}");
+    assert!(facades.contains(r#"["grpc_fork_safety"].each do |feature|"#), "{facades}");
+}
