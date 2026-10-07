@@ -464,6 +464,7 @@ impl Analyzer {
         // model's parent before any single model is seeded.
         let model_parents: HashMap<&ClassId, Option<&ClassId>> =
             app.models.iter().map(|m| (&m.name, m.parent.as_ref())).collect();
+        let belongs_to_wrappers = belongs_to_wrappers(app);
 
         for model in &app.models {
             let self_ty = Ty::Class { id: model.name.clone(), args: vec![] };
@@ -769,6 +770,9 @@ impl Analyzer {
             // `has_secure_password` generates `password=`/
             // `password_confirmation=` writers + `authenticate`.
             register_has_secure_password(&model.body, &mut cls.instance_methods, &mut cls.class_methods, &self_ty);
+            // An app macro that declares its association through
+            // `belongs_to` (Core's `belongs_to_with_query_constraints`).
+            register_wrapped_belongs_to(&model.body, &belongs_to_wrappers, &mut cls.instance_methods);
             // `generates_token_for :purpose` — the token round-trip
             // Rails 7.1 added (the guide's unsubscribe link).
             register_generates_token_for(&model.body, &mut cls.instance_methods, &mut cls.class_methods, &self_ty);
@@ -8524,6 +8528,91 @@ fn register_has_secure_password(
         class_methods
             .entry(Symbol::from(format!("find_by_{attr}_reset_token!")))
             .or_insert(self_ty.clone());
+    }
+}
+
+/// Library methods that declare a `belongs_to` named by their first
+/// parameter: `def belongs_to_with_query_constraints(name, ...)` whose
+/// body runs `belongs_to(name, scope, ..., **options)`. Core's polyfill
+/// for Rails' `query_constraints` option is one (53 uses), and its
+/// associations had no reader, so `order` in OrderRisk fell through to
+/// the AR `order` scope.
+fn belongs_to_wrappers(app: &App) -> BTreeSet<Symbol> {
+    let mut out = BTreeSet::new();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        for method in &lc.methods {
+            let Some(first) = method.params.first().filter(|p| !p.keyword && !p.name.as_str().is_empty()) else { continue };
+            let mut declares = false;
+            walk_expr(&method.body, &mut |e| {
+                let ExprNode::Send { recv: None, method: called, args, .. } = &*e.node else { return };
+                if called.as_str() == "belongs_to"
+                    && let Some(arg) = args.first()
+                    && let ExprNode::Var { name, .. } = &*arg.node
+                    && name == &first.name
+                {
+                    declares = true;
+                }
+            });
+            if declares {
+                out.insert(method.name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Type the association a [`belongs_to_wrappers`] macro declares like
+/// a plain `belongs_to`: reader and writer `Target?` plus the builders,
+/// the target from a literal `class_name:` or the camelized name. This
+/// is typing only; the macro call itself stays in the body and runs.
+/// A polymorphic one is skipped, having no single target.
+/// `or_insert`, so a real `def` of the same name still wins.
+fn register_wrapped_belongs_to(body: &[ModelBodyItem], wrappers: &BTreeSet<Symbol>, methods: &mut HashMap<Symbol, Ty>) {
+    if wrappers.is_empty() {
+        return;
+    }
+    for item in body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+        if !wrappers.contains(method) {
+            continue;
+        }
+        let Some(name) = args.first().and_then(symbol_arg) else { continue };
+        let mut class_name = None;
+        let mut polymorphic = false;
+        for arg in args {
+            let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+            for (k, v) in entries {
+                let ExprNode::Lit { value: crate::expr::Literal::Sym { value: key } } = &*k.node else { continue };
+                match (key.as_str(), &*v.node) {
+                    ("class_name", ExprNode::Lit { value: crate::expr::Literal::Str { value } }) => class_name = Some(value.clone()),
+                    ("polymorphic", ExprNode::Lit { value: crate::expr::Literal::Bool { value: true } }) => polymorphic = true,
+                    _ => {}
+                }
+            }
+        }
+        if polymorphic {
+            continue;
+        }
+        let target = ClassId(Symbol::from(class_name.unwrap_or_else(|| crate::naming::camelize(name.as_str())).trim_start_matches("::")));
+        let assoc = crate::dialect::Association::BelongsTo {
+            name: name.clone(),
+            target,
+            foreign_key: Symbol::from(format!("{}_id", name.as_str())),
+            optional: true,
+            polymorphic: false,
+            polymorphic_targets: Vec::new(),
+            default: None,
+            touch: None,
+            foreign_type: None,
+            primary_key: None,
+        };
+        let (reader, ty) = association_member_ty(&assoc);
+        methods.entry(Symbol::from(format!("{}=", reader.as_str()))).or_insert(ty.clone());
+        methods.entry(reader).or_insert(ty);
+        for (member, ty) in association_builder_members(&assoc) {
+            methods.entry(member).or_insert(ty);
+        }
     }
 }
 
