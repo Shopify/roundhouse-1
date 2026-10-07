@@ -3129,7 +3129,14 @@ fn walk_decl_body_with_visibility<'pr>(
                                     if crate::ingest::util::is_view_helper_marker_include(&segs) {
                                         continue;
                                     }
-                                    out.includes.push(ClassId(Symbol::from(path.join("::"))));
+                                    // `include ::A::B` keeps its root, so the
+                                    // lexical qualification below does not read
+                                    // it as a nested `Owner::A::B`.
+                                    let rooted = arg.as_constant_path_node().is_some_and(|p| {
+                                        crate::ingest::util::constant_path_is_rooted(&p)
+                                    });
+                                    let root = if rooted { "::" } else { "" };
+                                    out.includes.push(ClassId(Symbol::from(format!("{root}{}", path.join("::")))));
                                 } else if crate::ingest::util::is_rails_url_helpers_chain(&arg) {
                                     // `include Rails.application.routes.
                                     // url_helpers` (lobsters' Routes class,

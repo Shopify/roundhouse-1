@@ -5096,9 +5096,35 @@ fn qualify_relative_includes(app: &mut App) {
     // app/controllers/concerns/authentication/session_lookup.rb.
     // Unqualified, the emitted `include SessionLookup` raises NameError
     // at load time (and nothing pulls the file into the require graph).
+    //
+    // A rooted `include ::A::B` names the top-level `A::B` and is never
+    // resolved lexically. Its root is kept only where the lexical lookup
+    // of `A` would find something else (`Owner::A` is declared), so the
+    // emit writes `include ::A::B`. Elsewhere the root is dropped, as
+    // every by-name consumer of `includes` expects.
+    let namespaces: crate::det::HashSet<&str> = known
+        .iter()
+        .flat_map(|id| {
+            let name = id.0.as_str();
+            name.match_indices("::").map(move |(at, _)| &name[..at]).chain(std::iter::once(name))
+        })
+        .collect();
     for lc in &mut app.library_classes {
         let owner = lc.name.0.as_str().to_string();
         for inc in &mut lc.includes {
+            if let Some(top) = inc.0.as_str().strip_prefix("::") {
+                let first = top.split("::").next().unwrap_or(top);
+                let mut scope = Some(owner.as_str());
+                let mut shadowed = false;
+                while let Some(prefix) = scope {
+                    shadowed |= namespaces.contains(format!("{prefix}::{first}").as_str());
+                    scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+                }
+                if !shadowed {
+                    *inc = crate::ident::ClassId(crate::ident::Symbol::from(top));
+                }
+                continue;
+            }
             let path: Vec<crate::ident::Symbol> =
                 inc.0.as_str().split("::").map(crate::ident::Symbol::from).collect();
             if let Some(qualified) = resolve(&owner, &path, &known) {

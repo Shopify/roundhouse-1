@@ -94,9 +94,12 @@ pub(in crate::analyze) fn register(
         // `RequestHelperMethods`, `RequestBuyerSession`, ...), and each
         // reopen is a library class of the same name. Assigning kept only
         // the last file's mixins and lost the methods of every other.
+        // A rooted include (`::A::B`, kept where `A` is shadowed) names
+        // the registry's top-level `A::B`.
         for inc in &lc.includes {
-            if !cls.includes.contains(inc) {
-                cls.includes.push(inc.clone());
+            let inc = ClassId(Symbol::from(inc.0.as_str().trim_start_matches("::")));
+            if !cls.includes.contains(&inc) {
+                cls.includes.push(inc);
             }
         }
         // `include Singleton` provides `.instance` returning the
