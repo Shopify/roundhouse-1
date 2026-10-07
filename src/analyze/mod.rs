@@ -3251,8 +3251,9 @@ impl Analyzer {
             // so it is typed every pass.
             let concern_env_here = concern_ivar_env.get(&lc.name);
             let writes_here = current_attribute_writes.get(&lc.name);
+            let trees_before = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
             let clean = !mailer_names.contains(&lc.name)
-                && self.incremental.is_clean(index, &lc.name, &self_id, concern_env_here, writes_here);
+                && self.incremental.is_clean(index, &lc.name, &self_id, trees_before, concern_env_here, writes_here);
             if clean {
                 self.incremental.pass.clean += 1;
                 if mode == incremental::Mode::On {
@@ -3426,7 +3427,17 @@ impl Analyzer {
                     self.incremental.report_mismatch(&kept, lc);
                 }
             }
-            self.incremental.record(index, &lc_name, &self_id, deps.take(), concern_env_here, writes_here);
+            let trees_after = if mode == incremental::Mode::Off { 0 } else { incremental::trees_print(lc) };
+            self.incremental.record(
+                index,
+                &lc_name,
+                &self_id,
+                deps.take(),
+                trees_before,
+                trees_after,
+                concern_env_here,
+                writes_here,
+            );
         }
         self.incremental.end_pass();
         drop(_typing_library);

@@ -8,7 +8,9 @@
 //! trees again. This module keeps, per library class, what its
 //! typing read ([`super::body::DepRecorder`]) and the round it was
 //! typed, and a change stamp for each registry entry. The library pass
-//! skips a class whose reads are all older than its typing.
+//! skips a class whose reads are all older than its typing, provided
+//! that typing left the class's own trees as it found them (typing
+//! reads them too; see [`trees_print`]).
 //!
 //! The registry changes between passes are found by comparing a 64-bit
 //! structural hash of each entry with the one the previous pass saw
@@ -28,6 +30,7 @@ use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::ids::DeclarationId;
 
 use crate::dialect::LibraryClass;
+use crate::expr::Expr;
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
@@ -198,6 +201,38 @@ fn structure_print(info: &ClassInfo) -> u64 {
     h.finish()
 }
 
+/// What typing wrote into a library class's trees: every expression's
+/// type, decision bits and diagnostic.
+pub(super) fn trees_print(lc: &LibraryClass) -> u64 {
+    fn walk(h: &mut Mix, e: &Expr) {
+        match &e.ty {
+            Some(t) => hash_ty(h, t),
+            None => h.write_u8(0),
+        }
+        h.write_u64(e.decisions);
+        if let Some(d) = &e.diagnostic {
+            h.write(format!("{d:?}").as_bytes());
+        }
+        e.node.for_each_child(&mut |c| walk(h, c));
+    }
+    let mut h = mix();
+    for e in &lc.class_ivar_initializers {
+        walk(&mut h, e);
+    }
+    for (_, e) in &lc.constants {
+        walk(&mut h, e);
+    }
+    for m in &lc.methods {
+        for p in &m.params {
+            if let Some(d) = &p.default {
+                walk(&mut h, d);
+            }
+        }
+        walk(&mut h, &m.body);
+    }
+    h.finish()
+}
+
 /// One method table as the last pass saw it: the whole-table hash, and
 /// the per-method hashes once the table has changed (to name what did).
 #[derive(Default)]
@@ -225,6 +260,15 @@ struct Prints {
 struct Memo {
     name: ClassId,
     typed_at: u64,
+    /// [`trees_print`] after that typing.
+    trees: u64,
+    /// Whether that typing left the trees as it found them. Typing
+    /// reads the class's own earlier trees (a local Hash's value type
+    /// from the values its `[]=` writes were last typed to, a sibling
+    /// method's last return), so a class whose typing still moved its
+    /// trees types differently once more even when no registry read
+    /// changed.
+    settled: bool,
     deps: Vec<u64>,
     self_id: ClassId,
     concern_env: Option<HashMap<Symbol, Ty>>,
@@ -240,6 +284,8 @@ pub(super) struct PassStats {
     pub(super) clean: usize,
     pub(super) changed_keys: usize,
     pub(super) mismatched: usize,
+    /// Typed classes whose trees the typing moved (typed again next pass).
+    pub(super) unsettled: usize,
 }
 
 pub(super) struct Incremental {
@@ -442,6 +488,14 @@ impl Incremental {
             self.passes + 1,
             now.name.0.as_str()
         );
+        if let Some((a, b)) = kept.methods.iter().zip(&now.methods).find(|(a, b)| a != b) {
+            let (a, b) = (format!("{a:?}"), format!("{b:?}"));
+            let at = a.bytes().zip(b.bytes()).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+            let from = a[..at].char_indices().rev().nth(600).map_or(0, |(i, _)| i);
+            let clip = |s: &str| s.get(from..).map(|s| s.chars().take(1400).collect::<String>()).unwrap_or_default();
+            eprintln!("roundhouse-incremental-check:   kept: ...{}", clip(&a));
+            eprintln!("roundhouse-incremental-check:   now:  ...{}", clip(&b));
+        }
     }
 
     /// Whether class `index` would type to the trees it already has.
@@ -450,6 +504,7 @@ impl Incremental {
         index: usize,
         name: &ClassId,
         self_id: &ClassId,
+        trees: u64,
         concern_env: Option<&HashMap<Symbol, Ty>>,
         attribute_writes: Option<&HashMap<Symbol, Ty>>,
     ) -> bool {
@@ -458,6 +513,8 @@ impl Incremental {
         }
         let Some(Some(memo)) = self.memo.get(index) else { return false };
         memo.name == *name
+            && memo.settled
+            && memo.trees == trees
             && memo.self_id == *self_id
             && memo.concern_env.as_ref() == concern_env
             && memo.attribute_writes.as_ref() == attribute_writes
@@ -470,10 +527,15 @@ impl Incremental {
         name: &ClassId,
         self_id: &ClassId,
         deps: Vec<u64>,
+        trees_before: u64,
+        trees_after: u64,
         concern_env: Option<&HashMap<Symbol, Ty>>,
         attribute_writes: Option<&HashMap<Symbol, Ty>>,
     ) {
         self.pass.typed += 1;
+        if trees_before != trees_after {
+            self.pass.unsettled += 1;
+        }
         if self.mode == Mode::Off {
             return;
         }
@@ -481,6 +543,8 @@ impl Incremental {
             *slot = Some(Memo {
                 name: name.clone(),
                 typed_at: self.tick,
+                trees: trees_after,
+                settled: trees_before == trees_after,
                 deps,
                 self_id: self_id.clone(),
                 concern_env: concern_env.cloned(),
@@ -493,9 +557,9 @@ impl Incremental {
     pub(super) fn end_pass(&mut self) {
         self.passes += 1;
         self.mismatches_total += self.pass.mismatched;
-        let PassStats { typed, clean, changed_keys, mismatched } = self.pass;
+        let PassStats { typed, clean, changed_keys, mismatched, unsettled } = self.pass;
         crate::timings::note(format_args!(
-            "library pass {} ({:?}): typed {typed}, clean {clean}, changed registry reads {changed_keys}, check mismatches {mismatched}",
+            "library pass {} ({:?}): typed {typed} ({unsettled} moved their own trees), clean {clean}, changed registry reads {changed_keys}, check mismatches {mismatched}",
             self.passes, self.mode
         ));
 
