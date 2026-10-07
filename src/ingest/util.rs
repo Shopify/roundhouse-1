@@ -409,17 +409,36 @@ fn body_has_constant_receiver_call(body: Option<Node<'_>>) -> bool {
 /// AdyenApi::Responses::AdyenResponse are included by factory classes;
 /// with the module dropped the include could not resolve and the class
 /// body raised at load. Only the statements a member-less module is
-/// written with count: one holding anything else (a nested declaration,
-/// a DSL call) is a namespace or a module the other rules judge.
+/// written with count: one holding anything else (a DSL call) is a
+/// namespace or a module the other rules judge.
+///
+/// A nested class or module declaration counts only beside a Sorbet
+/// marker (`interface!`, `abstract!`, `sealed!`, `final!`): a sealed
+/// interface that nests its own implementations (Core's
+/// `StorefrontCarts::CartCompletion::CompletionAttempt::State`, `extend
+/// T::Helpers; interface!; sealed!; class Failed; include State; …`) is
+/// still the type its classes include. Those nested classes are ingested
+/// as classes on their own, as under any other module. Without a marker,
+/// a body of declarations is a plain namespace.
 fn is_marker_module(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return true };
-    flatten_statements(body).iter().all(|stmt| {
+    let stmts = flatten_statements(body);
+    let mut marked = false;
+    let mut nests = false;
+    let all_marker_statements = stmts.iter().all(|stmt| {
+        if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
+            nests = true;
+            return true;
+        }
         let Some(call) = stmt.as_call_node() else { return false };
         if call.receiver().is_some() || call.block().is_some() {
             return false;
         }
         match constant_id_str(&call.name()) {
-            "interface!" | "abstract!" | "sealed!" | "final!" => call.arguments().is_none(),
+            "interface!" | "abstract!" | "sealed!" | "final!" => {
+                marked = true;
+                call.arguments().is_none()
+            }
             "extend" => call.arguments().is_some_and(|a| {
                 a.arguments().iter().all(|arg| {
                     constant_path_segments_strs(&arg)
@@ -428,7 +447,8 @@ fn is_marker_module(body: Option<Node<'_>>) -> bool {
             }),
             _ => false,
         }
-    })
+    });
+    all_marker_statements && (marked || !nests)
 }
 
 /// A module whose whole content is the route-helper mixin — core's
@@ -490,8 +510,71 @@ pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
 fn body_has_constant_decl(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     flatten_statements(body).iter().any(|stmt| {
-        stmt.as_constant_write_node().is_some() || stmt.as_constant_path_write_node().is_some()
+        stmt.as_constant_write_node().is_some()
+            || stmt.as_constant_path_write_node().is_some()
+            || guarded_constant_write(stmt).is_some()
     })
+}
+
+/// The path a `A::B = value` write names, as written (`"A::B"`, or
+/// `"::A::B"` from the top level), when every segment is a constant. A
+/// write through a computed parent (`self::B`, `klass::B`) is `None`.
+pub(super) fn written_constant_path(target: &ruby_prism::ConstantPathNode<'_>) -> Option<String> {
+    let mut segments = vec![constant_id_str(&target.name()?).to_string()];
+    let mut parent = target.parent();
+    let mut rooted = true;
+    while let Some(node) = parent {
+        if let Some(read) = node.as_constant_read_node() {
+            segments.push(constant_id_str(&read.name()).to_string());
+            rooted = false;
+            break;
+        }
+        let path = node.as_constant_path_node()?;
+        segments.push(constant_id_str(&path.name()?).to_string());
+        parent = path.parent();
+    }
+    segments.reverse();
+    let joined = segments.join("::");
+    Some(if rooted { format!("::{joined}") } else { joined })
+}
+
+/// `NAME = value unless const_defined?(:NAME)` (or `self.const_defined?`,
+/// or the name as a string): a constant write guarded by its own name,
+/// which leaves a value defined before the body runs in place. Core's
+/// `TaxesApi` writes its timeouts this way. Returns the write; the body
+/// walk registers it like an unguarded one and marks the value
+/// (`expr::GUARDED_CONSTANT_WRITE`). A guard with an `else`, an
+/// `inherit` argument, another name, or around a sorbet type alias or a
+/// `Struct.new`/`Data.define` class is not this shape.
+pub(super) fn guarded_constant_write<'pr>(stmt: &Node<'pr>) -> Option<ruby_prism::ConstantWriteNode<'pr>> {
+    let unless = stmt.as_unless_node()?;
+    if unless.else_clause().is_some() {
+        return None;
+    }
+    let body: Vec<Node<'pr>> = unless.statements()?.body().iter().collect();
+    let [only] = body.as_slice() else { return None };
+    let write = only.as_constant_write_node()?;
+    let call = unless.predicate().as_call_node()?;
+    if constant_id_str(&call.name()) != "const_defined?"
+        || call.block().is_some()
+        || call.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let named = match (arg.as_symbol_node(), arg.as_string_node()) {
+        (Some(sym), _) => String::from_utf8_lossy(sym.unescaped()).into_owned(),
+        (_, Some(s)) => String::from_utf8_lossy(s.unescaped()).into_owned(),
+        _ => return None,
+    };
+    if named != constant_id_str(&write.name())
+        || super::library_class::is_sorbet_type_alias(&write.value())
+        || super::factory_class::is_factory_class_write(&write.as_node())
+    {
+        return None;
+    }
+    Some(write)
 }
 
 /// An `included do … end` block marks an ActiveSupport::Concern whose
@@ -544,6 +627,17 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
                     || ["cattr_", "mattr_", "thread_mattr_", "thread_cattr_"].iter().any(|p| {
                         kw.strip_prefix(p).is_some_and(|rest| matches!(rest, "reader" | "writer" | "accessor"))
                     })
+                {
+                    return true;
+                }
+                // Forwarders: Forwardable's `def_delegators :@validation,
+                // :group_id, …` (Core's Apps::Models::UiExtension::Schema::
+                // ValidationDelegation is nothing else) and ActiveSupport's
+                // `delegate :a, to: :b` define methods (`ingest::delegate`).
+                if matches!(
+                    kw,
+                    "def_delegators" | "def_delegator" | "def_instance_delegators" | "def_instance_delegator" | "delegate"
+                ) && call.arguments().is_some()
                 {
                     return true;
                 }

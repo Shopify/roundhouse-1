@@ -2703,6 +2703,11 @@ fn walk_decl_body_with_visibility<'pr>(
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
         order_mark.observe(&mut out);
+        // `NAME = value unless const_defined?(:NAME)` is the constant
+        // write, carrying its guard (`expr::GUARDED_CONSTANT_WRITE`).
+        let guarded = super::util::guarded_constant_write(&statement);
+        let statement = guarded.as_ref().map(|cw| cw.as_node()).unwrap_or(statement);
+        let guarded = guarded.is_some();
         // An `if` / `unless` around a `def`, a visibility marker, or an
         // accessor this walk would otherwise lower is not a statement it
         // can keep. Check the source statement, before a visibility
@@ -2859,9 +2864,27 @@ fn walk_decl_body_with_visibility<'pr>(
                 out.constants.push((name, value));
                 continue;
             }
-            let value = ingest_expr(&cw.value(), file)?;
+            let mut value = ingest_expr(&cw.value(), file)?;
+            if guarded {
+                value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
+            }
             out.constants.push((name, value));
             continue;
+        }
+        // `Ref::Obj = Struct.new(:b)`: a write through a constant path.
+        // Generated protobuf `_pb.rb` files nest every message this way
+        // (`CustomFields::Field = …lookup("….CustomFields.Field").msgclass`
+        // right after `CustomFields = …`). Carried as a constant named by
+        // its written path, in source order among the body's constants,
+        // so the Ruby emit writes `Ref::Obj = value` where the source
+        // does, after `Ref` exists; the registry types it by the
+        // declaration Rubydex records for the write.
+        if let Some(write) = stmt.as_constant_path_write_node() {
+            if let Some(path) = super::util::written_constant_path(&write.target()) {
+                let value = ingest_expr(&write.value(), file)?;
+                out.constants.push((Symbol::from(path), value));
+                continue;
+            }
         }
         // `ZeitwerkLoader.ignore(File.join(__dir__, "tapioca"))`,
         // `ZeitwerkLoader.setup`: applied statically; any other call on
@@ -3338,8 +3361,21 @@ fn walk_decl_body_with_visibility<'pr>(
                                 // original this body does not define (a
                                 // mock reopening a service, Core's
                                 // domains_dobby_service_mock.rb) aliases
-                                // the class method the same way.
-                                if force_class_receiver && matches!(kw, "delegate" | "alias_method") {
+                                // the class method the same way. So does
+                                // Forwardable's `def_delegators` after an
+                                // `extend Forwardable` there (Core's
+                                // `Metafields` registry readers).
+                                if force_class_receiver
+                                    && matches!(
+                                        kw,
+                                        "delegate"
+                                            | "alias_method"
+                                            | "def_delegators"
+                                            | "def_delegator"
+                                            | "def_instance_delegators"
+                                            | "def_instance_delegator"
+                                    )
+                                {
                                     if let ExprNode::Send { recv: recv @ None, .. } = &mut *e.node {
                                         *recv = Some(Expr::new(
                                             e.span,

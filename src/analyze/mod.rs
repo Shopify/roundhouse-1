@@ -2275,7 +2275,18 @@ impl Analyzer {
         for lc in &app.library_classes {
             for (name, value) in &lc.constants {
                 let self_ty = Ty::Class { id: lc.name.clone(), args: vec![] };
-                entries.push((self_ty, name.clone(), declaration_id(name, value), value, true));
+                // A path write (`Ref::Obj = …`, `ingest::library_class`)
+                // is the declaration of its last segment, as a model's
+                // `Assign { Const path }` is above. Not a bare name of
+                // this class, so no generated-expression fallback.
+                match name.as_str().rsplit_once("::") {
+                    Some((_, last)) => {
+                        let last = Symbol::from(last);
+                        let id = declaration_id(&last, value);
+                        entries.push((self_ty, last, id, value, false));
+                    }
+                    None => entries.push((self_ty, name.clone(), declaration_id(name, value), value, true)),
+                }
             }
         }
         // Original source tests use the same DeclarationId contract.

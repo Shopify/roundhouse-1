@@ -7132,20 +7132,38 @@ fn emit_library_class_decl_inner(
                 }
             }
             let (cname, value) = &lc.constants[i];
-            let rendered = super::emit_expr(value);
+            let mut rendered = super::emit_expr(value);
+            if rendered.trim().is_empty() {
+                rendered = "nil".to_string();
+            }
+            // `NAME = value unless const_defined?(:NAME)`, as written
+            // (`expr::GUARDED_CONSTANT_WRITE`): a value defined first
+            // wins. A value over several lines (a heredoc may end one)
+            // takes the guard's statement form, which Ruby runs the same.
+            let guard = (value.decisions & crate::expr::GUARDED_CONSTANT_WRITE != 0)
+                .then(|| format!("unless const_defined?(:{})", cname.as_str()));
+            let multi_line = rendered.trim_end().contains('\n');
+            // The lines keep the unguarded indentation: a heredoc's
+            // content is whitespace-significant.
+            match (&guard, multi_line) {
+                (Some(guard), true) => writeln!(s, "{body_pad}{guard}").unwrap(),
+                (Some(guard), false) => rendered = format!("{} {guard}", rendered.trim_end()),
+                (None, _) => {}
+            }
+            let pad = body_pad.as_str();
             let mut lines = rendered.lines();
-            match lines.next() {
-                Some(first_line) => {
-                    writeln!(s, "{body_pad}{} = {first_line}", cname.as_str()).unwrap();
-                    for line in lines {
-                        if line.is_empty() {
-                            writeln!(s).unwrap();
-                        } else {
-                            writeln!(s, "{body_pad}{line}").unwrap();
-                        }
+            if let Some(first_line) = lines.next() {
+                writeln!(s, "{pad}{} = {first_line}", cname.as_str()).unwrap();
+                for line in lines {
+                    if line.is_empty() {
+                        writeln!(s).unwrap();
+                    } else {
+                        writeln!(s, "{pad}{line}").unwrap();
                     }
                 }
-                None => writeln!(s, "{body_pad}{} = nil", cname.as_str()).unwrap(),
+            }
+            if guard.is_some() && multi_line {
+                writeln!(s, "{body_pad}end").unwrap();
             }
             // A stored class-body local stays out of `constants` and
             // `Foo::NAME`, as the local was (ingest `BodyLocal`).
