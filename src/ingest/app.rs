@@ -908,6 +908,27 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 methods.append(&mut synth);
             }
         }
+        // `load_defaults` and `config.active_support.{cache_format_version,
+        // hash_digest_class}`, which the ActiveSupport::Cache port reads
+        // (its entry coder and key digests). Synthesized on the reopen;
+        // the CRuby overlay's boot.rb applies them where the port is
+        // carried, as activesupport's `set_configs` and
+        // `set_hash_digest_class` initializers do.
+        let (cache_format, digest_name) = extract_active_support_cache_config(&source);
+        if let Some(format) = cache_format {
+            if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                "def active_support_cache_format_version\n  {format}\nend\n"
+            )) {
+                methods.append(&mut synth);
+            }
+        }
+        if let Some(name) = digest_name {
+            if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
+                "def active_support_hash_digest_class_name\n  {name:?}\nend\n"
+            )) {
+                methods.append(&mut synth);
+            }
+        }
         // `config.session_store :cookie_store, key: "..."` — the second
         // config-DSL line the runtime is required to honor, and it lives
         // in `config/initializers/session_store.rb` rather than here
@@ -7177,6 +7198,58 @@ fn extract_default_per_page(source: &[u8], file: &str) -> Option<u64> {
         }
     }
     found
+}
+
+/// The two `config.active_support` settings the ActiveSupport::Cache port
+/// reads, as config/application.rb leaves them: `(cache_format_version,
+/// the hash_digest_class's name under OpenSSL::Digest)`.
+///
+/// `config.load_defaults(v)` sets both through railties' cascade
+/// (application/configuration.rb: "5.2" hash_digest_class SHA1, "7.0"
+/// SHA256 and cache_format_version 7.0, "7.1" cache_format_version 7.1),
+/// and a later explicit `config.active_support.hash_digest_class =
+/// OpenSSL::Digest::X` / `.cache_format_version = n` overrides it, in
+/// file order. Shopify Core writes `load_defaults(8.1)` and then
+/// `hash_digest_class = OpenSSL::Digest::SHA1`: format 7.1, SHA1.
+///
+/// Line-scanned like `extract_config_time_zone`: a value in any other
+/// shape than a numeric literal or an `OpenSSL::Digest::<NAME>` constant
+/// is not lifted, and the setting stays at the port's library default.
+fn extract_active_support_cache_config(source: &[u8]) -> (Option<String>, Option<String>) {
+    let source = String::from_utf8_lossy(source);
+    let mut format: Option<String> = None;
+    let mut digest: Option<String> = None;
+    for line in source.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("config.load_defaults") {
+            let v = rest.trim().trim_start_matches('(').trim_end_matches(')').trim().trim_matches(['"', '\'']);
+            let Ok(version) = v.parse::<f64>() else { continue };
+            if version >= 5.2 {
+                digest = Some(if version >= 7.0 { "SHA256" } else { "SHA1" }.to_string());
+            }
+            if version >= 7.0 {
+                format = Some(if version >= 7.1 { "7.1" } else { "7.0" }.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix("config.active_support.cache_format_version") {
+            let Some(v) = rest.trim_start().strip_prefix('=') else { continue };
+            let v = v.trim();
+            if v.parse::<f64>().is_ok() {
+                format = Some(v.to_string());
+            }
+        } else if let Some(rest) = t.strip_prefix("config.active_support.hash_digest_class") {
+            let Some(v) = rest.trim_start().strip_prefix('=') else { continue };
+            let v = v.trim().trim_start_matches("::");
+            if let Some(name) = v.strip_prefix("OpenSSL::Digest::") {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    digest = Some(name.to_string());
+                }
+            }
+        }
+    }
+    (format, digest)
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {
