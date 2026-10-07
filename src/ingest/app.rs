@@ -744,6 +744,12 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             }
             match super::library_class::ingest_app_library_classes(&source, &path_str) {
                 Ok(classes) => {
+                    // What the file defines conditionally at load is
+                    // named where the source has it, never left silent.
+                    for (start, end, message) in super::library_class::file_level_definition_gaps(&source, &path_str) {
+                        let span = crate::span::Span { file: super::sources::file_id(&path_str), start: start as u32, end: end as u32 };
+                        app.ingest_drops.push(crate::app::IngestDrop { span, message, construct: Some("file_level_definition".into()) });
+                    }
                     if !classes.is_empty() && declarations_only(&source) {
                         loaded_support.insert(entry.clone());
                     }
@@ -2246,7 +2252,7 @@ end
         let Some(index) = app.sources.iter().position(|s| s.path == dropped.file) else { continue };
         let file = crate::span::FileId(index as u32 + 1);
         let span = crate::span::Span { file, start: dropped.start as u32, end: dropped.end as u32 };
-        app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone() });
+        app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone(), construct: None });
     }
     Ok(app)
 }
@@ -2271,7 +2277,7 @@ fn push_ingest_drop(app: &mut App, path: &str, err: &IngestError) {
         IngestError::Io(e) => format!("io error: {e}"),
     };
     let span = crate::span::Span { file: super::sources::file_id(path), start: start as u32, end: end as u32 };
-    app.ingest_drops.push(crate::app::IngestDrop { span, message });
+    app.ingest_drops.push(crate::app::IngestDrop { span, message, construct: None });
 }
 
 /// Source subtrees whose binary files are copied into the emitted tree.

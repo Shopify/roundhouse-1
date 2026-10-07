@@ -359,7 +359,10 @@ pub struct App {
     /// modules or constants are in the emitted app. Each is an
     /// `ingest_unsupported` error at the construct that failed it
     /// (`analyze::ingest_coverage`); survey mode also lists the gap in
-    /// its punch list.
+    /// its punch list. Also each support-file definition the ingest does
+    /// not carry as Ruby runs it: one inside a file-level conditional,
+    /// or after a file-level `return`
+    /// (`ingest::library_class::file_level_definition_gaps`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingest_drops: Vec<IngestDrop>,
     /// `config.eager_load = …` from each `config/environments/<env>.rb`,
@@ -704,6 +707,12 @@ pub struct IngestDrop {
     pub span: crate::span::Span,
     /// What the file's ingest refused.
     pub message: String,
+    /// Set when the file was ingested and only the statement at `span`
+    /// is not carried as Ruby runs it: the `unsupported` construct it
+    /// is reported as (`file_level_definition`), rather than a whole
+    /// file left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub construct: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
