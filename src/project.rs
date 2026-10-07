@@ -2723,7 +2723,7 @@ fn ruby_family_files(
              # one name.)\n\
              require_relative \"module_delegate\"\n\
              {}{}",
-            gem_require_block(&[]),
+            gem_require_block(&[], app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -2747,7 +2747,7 @@ fn ruby_family_files(
                  require_relative \"module_delegate\"\n\
                  {}{}",
                 markly_require,
-                gem_require_block(&["markly"]),
+                gem_require_block(&["markly"], app.gem_lock.as_ref()),
                 WEB_PUSH_STUB_REOPEN
             )
         }
@@ -5624,34 +5624,43 @@ const GEM_REQUIRES: &[&str] = &[
     "ostruct",
     "dalli",
     "google/protobuf",
-    // Shopify Core's Bundler.require, in its Gemfile order.
-    "rack",
-    "panama_client",
-    "redis",
-    "hiredis-client",
-    "stack_frames",
-    "snappy",
-    "faraday",
-    "faraday/gzip",
-    "opentelemetry-instrumentation-trilogy",
-    "opentelemetry-instrumentation-pg",
-    "lru_redux",
-    "secure_headers",
-    "trilogy",
-    "shopify_bots",
-    "shopify_bots/agent_classification_identifier",
-    "shopify_bots/rack/middleware",
-    "shopify_bots/request_extension",
-    "shopify_bots/session/object_agent_classification_record",
-    "shopify_bots/session/agent_classification_updater",
-    "sabertooth",
-    "sabertooth/prelude",
-    "shopify-opensrs",
-    "customer_privacy_api_ruby",
-    "panama_metadata",
-    "opentelemetry-shopify",
-    "magellan-ruby",
-    "shopify-money",
+];
+
+/// Shopify Core's Bundler.require, in its Gemfile order, as (require
+/// path, lockfile gem). Unlike `GEM_REQUIRES` these load only where the
+/// app's Gemfile.lock resolves the gem: the guard rescues LoadError, not
+/// what a gem raises while loading (secure_headers calls
+/// `ActiveSupport.on_load` when required), and a tree whose load set
+/// followed whatever gems the machine has installed would have ambient
+/// dependencies.
+const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
+    ("rack", "rack"),
+    ("panama_client", "panama_client"),
+    ("redis", "redis"),
+    ("hiredis-client", "hiredis-client"),
+    ("stack_frames", "stack_frames"),
+    ("snappy", "snappy"),
+    ("faraday", "faraday"),
+    ("faraday/gzip", "faraday-gzip"),
+    ("opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-trilogy"),
+    ("opentelemetry-instrumentation-pg", "opentelemetry-instrumentation-pg"),
+    ("lru_redux", "lru_redux"),
+    ("secure_headers", "secure_headers"),
+    ("trilogy", "trilogy"),
+    ("shopify_bots", "shopify_bots"),
+    ("shopify_bots/agent_classification_identifier", "shopify_bots"),
+    ("shopify_bots/rack/middleware", "shopify_bots"),
+    ("shopify_bots/request_extension", "shopify_bots"),
+    ("shopify_bots/session/object_agent_classification_record", "shopify_bots"),
+    ("shopify_bots/session/agent_classification_updater", "shopify_bots"),
+    ("sabertooth", "sabertooth"),
+    ("sabertooth/prelude", "sabertooth"),
+    ("shopify-opensrs", "shopify-opensrs"),
+    ("customer_privacy_api_ruby", "customer_privacy_api_ruby"),
+    ("panama_metadata", "panama_metadata"),
+    ("opentelemetry-shopify", "opentelemetry-shopify"),
+    ("magellan-ruby", "magellan-ruby"),
+    ("shopify-money", "shopify-money"),
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5914,10 +5923,15 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
     Some(out)
 }
 
-fn gem_require_block(exclude: &[&str]) -> String {
+fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
+    let gated = LOCK_GATED_REQUIRES
+        .iter()
+        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)))
+        .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
         .iter()
         .filter(|g| !exclude.contains(g))
+        .chain(gated)
         .map(|g| format!("{g:?}"))
         .collect();
     let mut out = format!("[{}].each do |gem_name|\n", names.join(", "));

@@ -349,3 +349,65 @@ fn an_app_s_own_money_does_not_declare_shopify_money() {
     let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
     assert!(!gemfile.contains("shopify-money"), "{gemfile}");
 }
+
+/// Core's Bundler.require list, in its Gemfile order.
+const CORE_REQUIRES: [&str; 27] = [
+    "rack", "panama_client", "redis", "hiredis-client", "stack_frames", "snappy", "faraday", "faraday/gzip",
+    "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux", "secure_headers",
+    "trilogy", "shopify_bots", "shopify_bots/agent_classification_identifier", "shopify_bots/rack/middleware",
+    "shopify_bots/request_extension", "shopify_bots/session/object_agent_classification_record",
+    "shopify_bots/session/agent_classification_updater", "sabertooth", "sabertooth/prelude", "shopify-opensrs",
+    "customer_privacy_api_ruby", "panama_metadata", "opentelemetry-shopify", "magellan-ruby", "shopify-money",
+];
+
+/// A blog-shaped app whose lock names none of Core's gems requires none
+/// of them, whatever the machine has installed: secure_headers 5.2
+/// calls `ActiveSupport.on_load` when required, which the LoadError
+/// guard does not rescue.
+#[test]
+fn an_app_whose_lock_omits_core_s_gems_requires_none_of_them() {
+    for lock in [Some(OWN_MONEY_LOCK), None] {
+        let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+        if let Some(lock) = lock {
+            app = app.write("Gemfile.lock", lock);
+        }
+        let (dir, errors) = app.emit(BuildTarget::Ruby);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+        assert!(facades.contains("\"bcrypt\""), "{facades}");
+        for feature in CORE_REQUIRES {
+            assert!(!facades.contains(&format!("\"{feature}\"")), "{feature} ({lock:?}): {facades}");
+        }
+    }
+}
+
+/// Core's lock gets the whole list, in Gemfile order, though the lock
+/// lists its specs alphabetically.
+#[test]
+fn core_s_lock_requires_its_bundler_require_list_in_gemfile_order() {
+    let mut gems: Vec<&str> = CORE_REQUIRES
+        .iter()
+        .map(|f| match *f {
+            "faraday/gzip" => "faraday-gzip",
+            f if f.starts_with("shopify_bots") => "shopify_bots",
+            f if f.starts_with("sabertooth") => "sabertooth",
+            f => f,
+        })
+        .collect();
+    gems.sort();
+    gems.dedup();
+    let specs: String = gems.iter().map(|g| format!("    {g} (1.0.0)\n")).collect();
+    let deps: String = gems.iter().map(|g| format!("  {g}\n")).collect();
+    let lock = format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nDEPENDENCIES\n{deps}");
+    let (dir, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", &lock)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    let at: Vec<usize> = CORE_REQUIRES
+        .iter()
+        .map(|f| facades.find(&format!("\"{f}\"")).unwrap_or_else(|| panic!("{f}: {facades}")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "out of Gemfile order: {facades}");
+}
