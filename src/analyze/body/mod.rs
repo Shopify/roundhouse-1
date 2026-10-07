@@ -357,10 +357,23 @@ pub(crate) fn expand_type_aliases_by(
                     }
                     Ty::Class { id: (self.class)(id, scope), args: Vec::new() }
                 }
-                Ty::Class { id, args } => Ty::Class {
-                    id: if is_stdlib_generic(id) { id.clone() } else { (self.class)(id, scope) },
-                    args: args.iter().map(|t| self.ty(t, scope, depth)).collect(),
-                },
+                Ty::Class { id, args } => {
+                    let args: Vec<Ty> = args.iter().map(|t| self.ty(t, scope, depth)).collect();
+                    if is_stdlib_generic(id) {
+                        return Ty::Class { id: id.clone(), args };
+                    }
+                    // A constant naming a class (`Results::Result =
+                    // ::Shopify::Adt::Result`) takes the written arguments.
+                    if depth < 8
+                        && let Some((owner, aliased)) = self.find(id, scope)
+                        && matches!(&aliased, Ty::Class { args: none, .. } if none.is_empty())
+                        && let Ty::Class { id: target, args: target_args } = self.ty(&aliased, &owner, depth + 1)
+                        && target_args.is_empty()
+                    {
+                        return Ty::Class { id: target, args };
+                    }
+                    Ty::Class { id: (self.class)(id, scope), args }
+                }
                 Ty::Array { elem } => Ty::Array { elem: Box::new(self.ty(elem, scope, depth)) },
                 Ty::Hash { key, value } => Ty::Hash {
                     key: Box::new(self.ty(key, scope, depth)),

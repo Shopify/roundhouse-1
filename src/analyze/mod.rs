@@ -1180,6 +1180,18 @@ impl Analyzer {
                 alias_table.entry(owner.clone()).or_default().insert(name.clone(), aliased);
             }
         }
+        // A constant naming a class (`module Results; Result =
+        // ::Shopify::Adt::Result; end`) is that class object, so a
+        // signature naming it (`Results::Result[Tokens, Error]`) means
+        // that class, with the written arguments. A cast reads it the
+        // same way (`ClassInfo::type_aliases`).
+        for (owner, name, target) in class_constant_aliases(app, &classes) {
+            let aliased = Ty::Class { id: target, args: Vec::new() };
+            if let Some(info) = classes.get_mut(&owner) {
+                info.type_aliases.entry(name.clone()).or_insert_with(|| aliased.clone());
+            }
+            alias_table.entry(owner).or_default().entry(name).or_insert(aliased);
+        }
         let resolved: Vec<(ClassId, Symbol, Ty, Ty)> = app
             .rbs_signatures
             .iter()
@@ -8748,6 +8760,49 @@ fn symbol_arg(expr: &Expr) -> Option<&Symbol> {
     }
 }
 
+/// `Owner::Name = Target` constants whose value is a bare reference to a
+/// registered class or module (`Results::Result = ::Shopify::Adt::Result`),
+/// read the way Ruby reads the constant: an absolute path as written,
+/// a relative one from the owner's scope outward. Not a constant that is
+/// itself a registered class, and not a value constant (`LIMIT = OTHER`),
+/// whose target is no class.
+fn class_constant_aliases(app: &App, classes: &HashMap<ClassId, ClassInfo>) -> Vec<(ClassId, Symbol, ClassId)> {
+    let mut out = Vec::new();
+    let mut visit = |owner: &ClassId, name: &Symbol, value: &crate::expr::Expr| {
+        let crate::expr::ExprNode::Const { path } = &*value.node else { return };
+        let absolute = path.first().is_some_and(|s| s.as_str().is_empty());
+        let written = path.iter().map(Symbol::as_str).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+        if written.is_empty() {
+            return;
+        }
+        let alias = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), name.as_str()).as_str()));
+        if classes.contains_key(&alias) {
+            return;
+        }
+        let written = ClassId(Symbol::from(written.as_str()));
+        let target = if absolute {
+            classes.contains_key(&written).then_some(written)
+        } else {
+            body::lexical_class(&written, owner.0.as_str(), body::Classes::new(classes, None))
+        };
+        if let Some(target) = target
+            && target != alias
+        {
+            out.push((owner.clone(), name.clone(), target));
+        }
+    };
+    for lc in &app.library_classes {
+        for (name, value) in &lc.constants {
+            visit(&lc.name, name, value);
+        }
+    }
+    for model in &app.models {
+        for (name, value) in crate::lower::model_to_library::collect_model_constants(model) {
+            visit(&model.name, &name, &value);
+        }
+    }
+    out
+}
 
 /// The method table entry for `method` on the side being typed, falling
 /// back to the other side: a sidecar's `def self.x:` still sits in
