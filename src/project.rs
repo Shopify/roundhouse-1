@@ -2709,6 +2709,23 @@ fn ruby_family_runtime_files(
                 .map_err(|e| format!("read runtime/spinel/active_support_mem_cache_store.rb: {e}"))?,
         ));
     }
+    // ActiveSupport::Testing::TimeHelpers (activesupport 8.1.4: Time.now,
+    // Time.new, Date.today and DateTime.now stubbed on their singletons),
+    // where the app or its tests name the module or call `freeze_time`,
+    // which the harness's offset stand-in lacks. Core's test support
+    // classes include it (PanamaClient::TestFakeClient, the fixture
+    // loaders), and its tests freeze time. The harness TestBase then
+    // includes it in place of the stand-in, as ActiveSupport::TestCase
+    // does. Singleton stubbing, so ruby-family only.
+    let carries_time_helpers = carries_time_helpers(&files);
+    if carries_time_helpers {
+        files.push((
+            "runtime/active_support_testing_time_helpers.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_testing_time_helpers.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_testing_time_helpers.rb: {e}"))?,
+        ));
+        use_ported_time_helpers(&mut files)?;
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2799,6 +2816,11 @@ fn ruby_family_runtime_files(
     };
     let gem_facades = if carries_mem_cache {
         format!("{gem_facades}require_relative \"active_support_mem_cache_store\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_time_helpers {
+        format!("{gem_facades}require_relative \"active_support_testing_time_helpers\"\n")
     } else {
         gem_facades
     };
@@ -4590,17 +4612,29 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget) {
 /// `test/test_helper.rb` too, and is refused as a harness name.
 fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(String, String)]) {
     let reads = crate::analyze::runtime_reads::ruby_family_runtime_reads(app);
-    if reads.is_empty() {
+    let includes = crate::analyze::runtime_reads::ruby_family_runtime_includes(app);
+    if reads.is_empty() && includes.is_empty() {
         return;
     }
     let runtime: std::collections::HashSet<String> = files.iter()
         .filter(|(p, _)| p.starts_with("runtime/") && p.ends_with(".rb"))
         .flat_map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
         .collect();
+    let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
+    // `include M` of a runtime module: the analyzer resolved it, and the
+    // class body raises at load wherever the finished tree lacks M.
+    for (span, owner, name) in includes {
+        if runtime.contains(&name) {
+            continue;
+        }
+        let file = names.get(&name).copied().unwrap_or("the Ruby-family runtime");
+        emit::diagnostics::report_unsupported(span, target.as_str(), "include", format!(
+            "{owner} includes {name}, declared by the Ruby-family runtime ({file}), which {} does not emit",
+            target.as_str()));
+    }
     let harness = files.iter().find(|(p, _)| p == "test/test_helper.rb")
         .map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
         .unwrap_or_default();
-    let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
     for read in reads {
         let harness_name = read.in_test && crate::analyze::test_constants::is_harness_namespace(&read.name);
         if runtime.contains(&read.name) || harness_name && harness.contains(&read.name) {
@@ -5301,6 +5335,7 @@ fn spinel_files_with_assertions(
     // ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
     files.retain(|(p, _)| p != "runtime/active_support_mem_cache_store.rb");
+    files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -6980,6 +7015,56 @@ fn drop_harness_memory_store(files: &mut [(String, String)]) -> Result<(), Strin
     Ok(())
 }
 
+/// True where any emitted Ruby outside the runtime names
+/// ActiveSupport::Testing::TimeHelpers (Core's test support includes it
+/// in app-side classes and test helpers alike), or a test calls
+/// `freeze_time` / `unfreeze_time`, which only the port answers.
+fn carries_time_helpers(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && path != "test/test_helper.rb"
+            && (names_constant(content, "ActiveSupport::Testing::TimeHelpers")
+                || (path.starts_with("test/") && calls_bare(content, &["freeze_time", "unfreeze_time"])))
+    })
+}
+
+/// A receiverless call of one of `names` on a non-comment line: the name
+/// as a whole word, not after `.`, `:` or `def `.
+fn calls_bare(src: &str, names: &[&str]) -> bool {
+    let ident = |c: u8| matches!(c, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'?' | b'!');
+    src.lines().filter(|line| !line.trim_start().starts_with('#')).any(|line| {
+        let b = line.as_bytes();
+        names.iter().any(|name| {
+            line.match_indices(name).any(|(at, _)| {
+                let end = at + name.len();
+                let head = at == 0 || !(ident(b[at - 1]) || matches!(b[at - 1], b'.' | b':'));
+                let tail = b.get(end).is_none_or(|c| !ident(*c));
+                head && tail && !line[..at].trim_end().ends_with("def")
+            })
+        })
+    })
+}
+
+/// The harness's TimeHelpers stand-in (an `ActiveSupport.travel` offset)
+/// replaced by `include ActiveSupport::Testing::TimeHelpers`, where the
+/// tree carries the port. The CRuby runner calls `after_teardown`, which
+/// travels back, after each test's teardown.
+fn use_ported_time_helpers(files: &mut [(String, String)]) -> Result<(), String> {
+    const STAND_IN: &str = "  def travel_to(target)\n    ActiveSupport.travel(target.to_i - Time.now.to_i)\n    return unless block_given?\n    begin\n      yield\n    ensure\n      travel_back\n    end\n  end\n\n  def travel(duration)\n    travel_to(Time.now + duration.to_i)\n  end\n\n  def travel_back\n    ActiveSupport.travel(0)\n  end\n";
+    let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") else {
+        return Ok(());
+    };
+    if helper.matches(STAND_IN).count() != 1 {
+        return Err("use_ported_time_helpers: expected one TimeHelpers stand-in in test/test_helper.rb".into());
+    }
+    *helper = helper.replace(
+        STAND_IN,
+        "  # (The stand-in is replaced on this tree: the app or its tests use\n  # ActiveSupport's own TimeHelpers, runtime/active_support_testing_time_helpers.rb.)\n  include ActiveSupport::Testing::TimeHelpers\n",
+    );
+    Ok(())
+}
+
 fn names_constant(src: &str, konst: &str) -> bool {
     // Most files never mention this name. Reject those with the optimized
     // substring search before walking/decoding every line of the runtime.
@@ -8380,6 +8465,22 @@ mod tests {
         let named = vec![("app/models/versioned.rb".to_string(), mem_cache.to_string())];
         assert!(carries_named(&named, &["ActiveSupport::Cache::MemCacheStore"]));
         assert!(carries_active_support_cache(&named));
+
+        let lib = |content: &str| vec![("lib/fake_client.rb".to_string(), content.to_string())];
+        assert!(carries_time_helpers(&lib("class Fake\n  include ActiveSupport::Testing::TimeHelpers\nend\n")));
+        assert!(!carries_time_helpers(&lib("class Fake\n  def travel_to(t) = t\nend\n")));
+        let test = |content: &str| vec![("test/models/a_test.rb".to_string(), content.to_string())];
+        assert!(carries_time_helpers(&test("  def test_x\n    freeze_time\n  end\n")));
+        assert!(carries_time_helpers(&test("    freeze_time(Time.now) { 1 }\n")));
+        assert!(!carries_time_helpers(&test("    travel_to Time.now\n")));
+        assert!(!carries_time_helpers(&test("  def freeze_time\n  end\n    clock.freeze_time\n    # freeze_time\n    :freeze_time_ok\n")));
+        assert!(!carries_time_helpers(&lib("    freeze_time\n")), "app code calling freeze_time is its own method");
+
+        let mut with_harness = vec![("test/test_helper.rb".to_string(), helper.clone())];
+        use_ported_time_helpers(&mut with_harness).unwrap();
+        assert!(with_harness[0].1.contains("  include ActiveSupport::Testing::TimeHelpers\n"));
+        assert!(!with_harness[0].1.contains("ActiveSupport.travel(target.to_i"));
+        assert!(use_ported_time_helpers(&mut with_harness).is_err(), "the stand-in is replaced once");
 
         drop_harness_memory_store(&mut files).unwrap();
         let dropped = &files[0].1;
