@@ -160,14 +160,42 @@ pub struct Analyzer {
 }
 
 /// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
-/// before its signature stopped moving — `None` when it hit the cap
-/// still moving. `absorb` is `Some(0)` when view unification moved no
+/// before its signature stopped moving. `Some(n)` (1-based, at most
+/// [`FIXPOINT_CAP`]) means the n-th round's check found nothing moved;
+/// `None` means all `FIXPOINT_CAP` rounds ran and the last one still
+/// moved. `absorb` is `Some(0)` when view unification moved no
 /// production signature and the absorb loop never ran.
+///
+/// The `ROUNDHOUSE_TIMINGS` span labels count differently: each loop's
+/// first round has its own label (`typing passes (views after
+/// fixpoint)`, `typing passes (after view unify)`), and the rest are
+/// `round 1` … `round 11`, so `round 11: absorb production` is the
+/// twelfth round. The `fixpoint rounds:` timing line prints this value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FixpointRounds {
     pub production: Option<usize>,
     pub tests: Option<usize>,
     pub absorb: Option<usize>,
+}
+
+/// Rounds a whole-program fixpoint loop may run.
+pub const FIXPOINT_CAP: usize = 12;
+
+impl std::fmt::Display for FixpointRounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let one = |name: &str, n: Option<usize>| match n {
+            Some(0) => format!("{name} not run"),
+            Some(n) => format!("{name} settled in {n} of {FIXPOINT_CAP}"),
+            None => format!("{name} at cap {FIXPOINT_CAP}, still moving"),
+        };
+        write!(
+            f,
+            "{}; {}; {}",
+            one("production", self.production),
+            one("tests", self.tests),
+            one("absorb", self.absorb)
+        )
+    }
 }
 
 /// Snapshot of the data the fixpoint refines: per-class instance/class
@@ -1074,7 +1102,6 @@ impl Analyzer {
                 }
             }
         }
-        const FIXPOINT_CAP: usize = 12;
         // View-name and dynamic-render ivar sets are invariant across
         // fixpoint rounds — they read source views, not the registry.
         let mut dynamic_render_ivars: std::collections::HashSet<Symbol> =
@@ -1140,7 +1167,7 @@ impl Analyzer {
             });
             self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("production round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("production round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.production = Some(round + 1);
@@ -1223,7 +1250,7 @@ impl Analyzer {
             );
             self.widen_cycles(&prev_sig, &mut cycles);
             if fixpoint_debug::enabled() {
-                fixpoint_debug::report(&format!("test round {round} (widened {})", cycles.widened_count()), &prev_sig, &self.capture_inference_sig());
+                fixpoint_debug::report(&format!("test round {round} ({})", cycles.round_summary(self, &prev_sig)), &prev_sig, &self.capture_inference_sig());
             }
             if self.inference_matches(&prev_sig) {
                 self.fixpoint_rounds.tests = Some(round + 1);
@@ -1264,7 +1291,7 @@ impl Analyzer {
                 self.overlay_test_params(app);
                 self.widen_cycles(&absorb_sig, &mut cycles);
                 if fixpoint_debug::enabled() {
-                    fixpoint_debug::report(&format!("absorb round {round} (widened {})", cycles.widened_count()), &absorb_sig, &self.capture_inference_sig());
+                    fixpoint_debug::report(&format!("absorb round {round} ({})", cycles.round_summary(self, &absorb_sig)), &absorb_sig, &self.capture_inference_sig());
                 }
                 if self.inference_matches(&absorb_sig) {
                     self.fixpoint_rounds.absorb = Some(round + 1);
@@ -1291,6 +1318,7 @@ impl Analyzer {
             });
             self.harvest_returns_to_registry(app, true);
         }
+        crate::timings::note(format_args!("fixpoint rounds: {}", self.fixpoint_rounds));
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
         // returns therefore settle only after the absorb/harvest above.

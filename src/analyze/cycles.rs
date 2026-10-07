@@ -57,11 +57,40 @@ const VISITED_PER_SLOT: usize = 6;
 pub(super) struct CycleWidening {
     visited: HashMap<Slot, Vec<Ty>>,
     widened: HashMap<Slot, Ty>,
+    /// What the last `widen_cycles` call did, for the debug report.
+    last: WidenRound,
+}
+
+/// Per-round counts of what widening did to the held slots.
+#[derive(Default, Clone, Copy)]
+struct WidenRound {
+    /// Held slot recomputed to a different value inside its join: written
+    /// back to the join, so it is no change.
+    held: usize,
+    /// Held slot recomputed outside its join: the join grew.
+    grew: usize,
+    /// Held slot whose new value cannot be joined (`Fn`, arity change):
+    /// it keeps the recomputed value.
+    unjoinable: usize,
+    /// Slots widened for the first time this round.
+    newly: usize,
 }
 
 impl CycleWidening {
-    pub(super) fn widened_count(&self) -> usize {
-        self.widened.len()
+    /// Debug summary of the last round: what widening did to the held
+    /// slots, and how many of the round's changed slots `changed` are held
+    /// slots (their join grew or could not be joined) versus slots that
+    /// were never widened.
+    pub(super) fn round_summary(&self, analyzer: &Analyzer, prev: &InferenceSig) -> String {
+        let changed = analyzer.changed_slots(prev);
+        let in_held = changed.iter().filter(|(s, ..)| self.widened.contains_key(s)).count();
+        let WidenRound { held, grew, unjoinable, newly } = self.last;
+        format!(
+            "widened {}: held-equal {held}, held-grew {grew}, unjoinable {unjoinable}, newly {newly}; changed {} = {in_held} held + {} unwidened",
+            self.widened.len(),
+            changed.len(),
+            changed.len() - in_held,
+        )
     }
 }
 
@@ -155,6 +184,7 @@ impl Analyzer {
     /// read). Re-joins every slot already widened in this loop, then
     /// widens each slot that has just returned to an earlier value.
     pub(super) fn widen_cycles(&mut self, prev: &InferenceSig, state: &mut CycleWidening) {
+        let mut round = WidenRound::default();
         let widened: Vec<(Slot, Ty)> =
             state.widened.iter().map(|(s, t)| (s.clone(), t.clone())).collect();
         for (slot, acc) in widened {
@@ -162,9 +192,16 @@ impl Analyzer {
             if now == acc {
                 continue;
             }
-            if let Some(joined) = join(&slot, acc, now) {
+            if let Some(joined) = join(&slot, acc.clone(), now) {
+                if joined == acc {
+                    round.held += 1;
+                } else {
+                    round.grew += 1;
+                }
                 self.set_slot(&slot, joined.clone());
                 state.widened.insert(slot, joined);
+            } else {
+                round.unjoinable += 1;
             }
         }
         for (slot, before, now) in self.changed_slots(prev) {
@@ -192,8 +229,10 @@ impl Analyzer {
             if let Some(joined) = joined {
                 self.set_slot(&slot, joined.clone());
                 state.widened.insert(slot, joined);
+                round.newly += 1;
             }
         }
+        state.last = round;
     }
 }
 

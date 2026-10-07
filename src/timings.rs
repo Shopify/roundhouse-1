@@ -51,6 +51,14 @@ pub fn begin(name: impl std::fmt::Display) -> Option<Guard> {
     })
 }
 
+/// Print one `roundhouse-timing:` line that is not a span (a count, a
+/// summary). Nothing when timings are off.
+pub fn note(msg: impl std::fmt::Display) {
+    if *ENABLED {
+        eprintln!("roundhouse-timing: {msg}");
+    }
+}
+
 /// Prints one `roundhouse-timing:` line on drop.
 pub struct Guard {
     name: String,
