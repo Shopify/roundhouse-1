@@ -7846,7 +7846,7 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
 /// Anything else stays dropped and reported (`replays_foreign_class_body`).
 fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     if lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
-        return Vec::new();
+        return inherited_class_macro_calls(lc, app);
     }
     let own_class_side = |name: &str| {
         lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
@@ -7904,6 +7904,67 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
         }
     }
     out
+}
+
+/// The body calls of a class whose superclass is an app library class
+/// that name a class-side method one of its app ancestors defines
+/// (`class TransactionInput < Component::Schema` then `attribute :id,
+/// Integer`, where `Component::Schema` has `class << self; def
+/// attribute(name, type, ...)`). Ruby runs them on the subclass through
+/// that inherited method; the emitted ancestor defines it, so replaying
+/// the call is what Ruby runs. Bare calls and `self.` calls only; a
+/// chain that reaches a model or a non-app class stops there.
+fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let mut ancestors: Vec<&LibraryClass> = Vec::new();
+    let mut at = lc;
+    while let Some(parent) = at.parent.as_ref() {
+        let Some(next) = app_library_superclass(at, parent.0.as_str(), app) else { break };
+        if ancestors.iter().any(|a| std::ptr::eq(*a, next)) || std::ptr::eq(next, lc) {
+            break;
+        }
+        ancestors.push(next);
+        at = next;
+    }
+    if ancestors.is_empty() {
+        return Vec::new();
+    }
+    let inherited = |name: &str| {
+        ancestors.iter().any(|a| {
+            a.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
+        })
+    };
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+            let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+            on_self && inherited(method.as_str())
+        })
+        .collect()
+}
+
+/// The app library class (not a module, not a model) a superclass
+/// spelling names, resolved as Ruby does from the subclass's lexical
+/// namespace outwards (`Component::Schema` written inside `module
+/// Billing` is `Billing::Component::Schema` when that exists).
+fn app_library_superclass<'a>(lc: &LibraryClass, written: &str, app: &'a App) -> Option<&'a LibraryClass> {
+    let rooted = written.starts_with("::");
+    let written = written.trim_start_matches("::");
+    let mut scope: Vec<&str> = if rooted { Vec::new() } else { lc.name.0.as_str().split("::").collect() };
+    scope.pop();
+    loop {
+        let candidate =
+            if scope.is_empty() { written.to_string() } else { format!("{}::{written}", scope.join("::")) };
+        if is_model_named(&candidate, app) {
+            return None;
+        }
+        if let Some(found) = library_classes_named(&candidate, app).into_iter().find(|c| !c.is_module) {
+            return Some(found);
+        }
+        if scope.pop().is_none() {
+            return None;
+        }
+    }
 }
 
 /// A declaration a file program carries inline (`ProgramItem::Inline`:
