@@ -165,6 +165,8 @@ pub struct Analyzer {
     /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
     /// settle; see [`Self::fixpoint_rounds`].
     fixpoint_rounds: FixpointRounds,
+    /// See [`Self::constant_rounds`].
+    constant_rounds: usize,
     /// What each library class's last typing read; lets the library
     /// pass skip classes none of whose reads changed (see `incremental`).
     incremental: incremental::Incremental,
@@ -242,6 +244,43 @@ struct ConstTyping {
 /// How many `build_constant_registry` rounds keep their maps and
 /// typings for the next pass.
 const CONST_MEMO_ROUNDS: usize = 16;
+
+/// A `build_constant_registry` round past which a value still changing
+/// is reported: a chain of `B = A` values settles in about as many
+/// rounds as it is long, and Core's longest takes far fewer.
+const UNSETTLED_CONSTANT_ROUNDS: usize = 64;
+
+/// Name, on stderr, the values whose type the round after
+/// [`UNSETTLED_CONSTANT_ROUNDS`] changes again. A value that changes
+/// every round (one typed from itself) keeps the registry going to its
+/// bound of one round per value, quadratic in the app's constants.
+fn report_unsettled_constants(
+    entries: &[(Ty, Symbol, Option<DeclarationId>, &Expr, bool)],
+    map: &HashMap<Symbol, Ty>,
+    next: &HashMap<Symbol, Ty>,
+    resolved: &IdentityHashMap<DeclarationId, Ty>,
+    next_resolved: &IdentityHashMap<DeclarationId, Ty>,
+) {
+    let mut moving: Vec<String> = entries
+        .iter()
+        .filter(|(_, name, id, _, _)| match id {
+            Some(id) => resolved.get(id) != next_resolved.get(id),
+            None => map.get(name) != next.get(name),
+        })
+        .map(|(self_ty, name, ..)| match self_ty {
+            Ty::Class { id, .. } => format!("{}::{}", id.0.as_str(), name.as_str()),
+            _ => name.as_str().to_string(),
+        })
+        .collect();
+    moving.sort();
+    moving.dedup();
+    let shown = moving.iter().take(20).cloned().collect::<Vec<_>>().join(", ");
+    eprintln!(
+        "roundhouse: warning[constant_unsettled]: {} constant value(s) still change after {UNSETTLED_CONSTANT_ROUNDS} registry rounds: {shown}",
+        moving.len()
+    );
+    crate::timings::note(format_args!("constant_unsettled: {} values: {shown}", moving.len()));
+}
 
 /// The constant-read keys whose answers differ between two rounds' maps.
 fn const_answers_moved(
@@ -1171,6 +1210,7 @@ impl Analyzer {
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
             fixpoint_rounds: FixpointRounds::default(),
+            constant_rounds: 0,
             incremental: incremental::Incremental::new(incremental::Mode::from_env()),
             param_tables: None,
             site_cache: Default::default(),
@@ -1201,17 +1241,23 @@ impl Analyzer {
         &self.classes
     }
 
+    /// Rounds the last [`Self::analyze`]'s fixpoint loops took.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
+    }
+
+    /// The most rounds one constant registry build of the last
+    /// [`Self::analyze`] took to settle its values.
+    pub fn constant_rounds(&self) -> usize {
+        self.constant_rounds
+    }
+
     /// Parameter types unified from call sites for `class#method`
     /// (post-fixpoint when read after [`Self::analyze`]), positionally
     /// aligned with the method's declared params. `None` when no call
     /// site contributed. Read-only companion to [`Self::class_registry`]
     /// for consumers assembling full candidate signatures (the gap
     /// footers' pre-filled RBS).
-    /// Rounds the last [`Self::analyze`]'s fixpoint loops took.
-    pub fn fixpoint_rounds(&self) -> FixpointRounds {
-        self.fixpoint_rounds
-    }
-
     pub fn inferred_param_types(
         &self,
         class: &ClassId,
@@ -1232,6 +1278,7 @@ impl Analyzer {
     /// `FIXPOINT_CAP`) using a structural registry snapshot to detect convergence.
     pub fn analyze(&mut self, app: &mut App) {
         self.param_tables = None;
+        self.constant_rounds = 0;
         self.site_cache = Default::default();
         self.const_memo = Default::default();
         self.init_memo = Vec::new();
@@ -2190,6 +2237,9 @@ impl Analyzer {
             if next == map && next_resolved == resolved {
                 break;
             }
+            if version + 1 == UNSETTLED_CONSTANT_ROUNDS {
+                report_unsettled_constants(&entries, &map, &next, &resolved, &next_resolved);
+            }
             // Stamp the keys whose answer the next round's maps change.
             let next_version = version + 1;
             for (name, ty) in &next {
@@ -2234,6 +2284,7 @@ impl Analyzer {
             });
         }
         self.const_memo = memo;
+        self.constant_rounds = self.constant_rounds.max(rounds);
         crate::timings::note(format_args!(
             "constants ({mode:?}): {} values, {rounds} rounds, typed {typed}, clean {clean_count}, {kept_typings} typings kept from the last pass, kept whole {}, check mismatches {mismatches}",
             entries.len(),

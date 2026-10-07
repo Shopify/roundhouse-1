@@ -13,13 +13,13 @@ use rubydex::diagnostic::{Diagnostic as RubydexDiagnostic, Rule};
 use rubydex::indexing::local_graph::LocalGraph;
 use rubydex::indexing::{IndexerBackend, LanguageId, build_local_graph};
 use rubydex::model::built_in::BUILT_IN_URI;
-use rubydex::model::declaration::Declaration;
+use rubydex::model::declaration::{Ancestor, Ancestors, Declaration, Namespace};
 use rubydex::model::document::Document as RubydexDocument;
 use rubydex::model::definitions::{Definition, Receiver};
 use rubydex::model::graph::Graph;
 use rubydex::model::identity_maps::IdentityHashMap;
 use rubydex::model::name::ParentScope;
-use rubydex::model::ids::{DeclarationId, NameId, UriId};
+use rubydex::model::ids::{DeclarationId, NameId, StringId, UriId};
 use rubydex::resolution::Resolver;
 
 use crate::ident::{ClassId, Symbol};
@@ -704,6 +704,89 @@ fn parenthesized_factory_receivers(text: &str) -> HashSet<u32> {
     receivers.0
 }
 
+/// What a reference resolved to `id` reads: a namespace or a value.
+fn resolved_constant(
+    graph: &Graph,
+    id: DeclarationId,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool, bool)>,
+) -> Option<ResolvedConstant> {
+    let declaration = graph.declarations().get(&id)?;
+    // An RBS class alias is the class it names. The alias
+    // declaration is the signatures' own, so an app that
+    // assigns the name instead keeps its value. So is a
+    // runtime alias of a runtime class
+    // (`ActiveRecord::Type::Integer = ActiveModel::Type::Integer`)
+    // that only the runtime assigns.
+    let stdlib_alias = matches!(declaration, Declaration::ConstantAlias(_))
+        && is_stdlib_only(graph, declaration);
+    let runtime_alias = !stdlib_alias
+        && matches!(declaration, Declaration::ConstantAlias(_))
+        && is_runtime_only(graph, declaration);
+    let aliased = (stdlib_alias || runtime_alias)
+        .then(|| graph.resolve_alias(&id))
+        .flatten()
+        .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
+        .filter(|(_, target)| target.as_namespace().is_some()
+            && (stdlib_alias || is_runtime_declaration(graph, target)));
+    let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
+    let (id, declaration) = aliased.unwrap_or((id, declaration));
+    let resolved = if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
+        let (class, runtime, stdlib) = class_cache.entry(id).or_insert_with(|| {
+            (
+                Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
+                is_runtime_declaration(graph, declaration),
+                is_stdlib_only(graph, declaration),
+            )
+        });
+        ResolvedConstant::Namespace {
+            class: Arc::clone(class),
+            runtime: *runtime,
+            stdlib: *stdlib,
+            alias,
+        }
+    } else {
+        // An app write to the same declaration must never
+        // borrow the runtime's previous literal type.
+        let app_write = declaration.definitions().iter().any(|id| {
+            graph.definitions().get(id).is_some_and(|definition| {
+                matches!(definition, Definition::Constant(_) | Definition::ConstantAlias(_))
+                    && graph.documents().get(definition.uri_id()).is_some_and(|document| {
+                        !document.uri().starts_with(RUNTIME_URI_PREFIX)
+                    })
+            })
+        });
+        let name = declaration.name();
+        let builtin_float = matches!(
+            name,
+            "Float::INFINITY"
+                | "Float::NAN"
+                | "Float::EPSILON"
+                | "Float::MAX"
+                | "Float::MIN"
+        ) && declaration.definitions().iter().all(|id| {
+            graph
+                .definitions()
+                .get(id)
+                .and_then(|definition| graph.documents().get(definition.uri_id()))
+                .is_some_and(|document| document.uri().starts_with(STDLIB_URI_PREFIX))
+        });
+        // Ruby's signatures type a value only they declare;
+        // a runtime implementation's literal types its own.
+        let stdlib = !builtin_float && is_stdlib_only(graph, declaration);
+        let runtime = if builtin_float {
+            Some(Arc::new(Ty::Float))
+        } else if stdlib {
+            crate::stdlib_rbs::value_type(name).cloned()
+        } else if !app_write && is_runtime_declaration(graph, declaration) {
+            runtime_value_types().get(declaration.name()).cloned()
+        } else {
+            None
+        };
+        ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))), runtime, stdlib }
+    };
+    Some(resolved)
+}
+
 fn answer_file(
     graph: &Graph,
     source: &SourceFile,
@@ -721,6 +804,7 @@ fn answer_file(
     } else {
         HashSet::default()
     };
+    let mut bare_values = Vec::new();
     for reference_id in document.constant_references() {
         let Some(reference) = graph.constant_references().get(reference_id) else {
             continue;
@@ -746,82 +830,13 @@ fn answer_file(
         }
         let target = graph
             .name_id_to_declaration_id(*reference.name_id())
-            .and_then(|id| graph.declarations().get(id).map(|decl| (*id, decl)))
-            .map(|(id, declaration)| {
-                // An RBS class alias is the class it names. The alias
-                // declaration is the signatures' own, so an app that
-                // assigns the name instead keeps its value. So is a
-                // runtime alias of a runtime class
-                // (`ActiveRecord::Type::Integer = ActiveModel::Type::Integer`)
-                // that only the runtime assigns.
-                let stdlib_alias = matches!(declaration, Declaration::ConstantAlias(_))
-                    && is_stdlib_only(graph, declaration);
-                let runtime_alias = !stdlib_alias
-                    && matches!(declaration, Declaration::ConstantAlias(_))
-                    && is_runtime_only(graph, declaration);
-                let aliased = (stdlib_alias || runtime_alias)
-                    .then(|| graph.resolve_alias(&id))
-                    .flatten()
-                    .and_then(|target| graph.declarations().get(&target).map(|decl| (target, decl)))
-                    .filter(|(_, target)| target.as_namespace().is_some()
-                        && (stdlib_alias || is_runtime_declaration(graph, target)));
-                let alias = aliased.is_some().then(|| Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))));
-                let (id, declaration) = aliased.unwrap_or((id, declaration));
-                if declaration.as_namespace().is_some() && !is_assigned_value(graph, declaration) {
-                    let (class, runtime, stdlib) = class_cache.entry(id).or_insert_with(|| {
-                        (
-                            Arc::new(ClassId(Symbol::from(hoisted_name(declaration.name()).as_ref()))),
-                            is_runtime_declaration(graph, declaration),
-                            is_stdlib_only(graph, declaration),
-                        )
-                    });
-                    ResolvedConstant::Namespace {
-                        class: Arc::clone(class),
-                        runtime: *runtime,
-                        stdlib: *stdlib,
-                        alias,
-                    }
-                } else {
-                    // An app write to the same declaration must never
-                    // borrow the runtime's previous literal type.
-                    let app_write = declaration.definitions().iter().any(|id| {
-                        graph.definitions().get(id).is_some_and(|definition| {
-                            matches!(definition, Definition::Constant(_) | Definition::ConstantAlias(_))
-                                && graph.documents().get(definition.uri_id()).is_some_and(|document| {
-                                    !document.uri().starts_with(RUNTIME_URI_PREFIX)
-                                })
-                        })
-                    });
-                    let name = declaration.name();
-                    let builtin_float = matches!(
-                        name,
-                        "Float::INFINITY"
-                            | "Float::NAN"
-                            | "Float::EPSILON"
-                            | "Float::MAX"
-                            | "Float::MIN"
-                    ) && declaration.definitions().iter().all(|id| {
-                        graph
-                            .definitions()
-                            .get(id)
-                            .and_then(|definition| graph.documents().get(definition.uri_id()))
-                            .is_some_and(|document| document.uri().starts_with(STDLIB_URI_PREFIX))
-                    });
-                    // Ruby's signatures type a value only they declare;
-                    // a runtime implementation's literal types its own.
-                    let stdlib = !builtin_float && is_stdlib_only(graph, declaration);
-                    let runtime = if builtin_float {
-                        Some(Arc::new(Ty::Float))
-                    } else if stdlib {
-                        crate::stdlib_rbs::value_type(name).cloned()
-                    } else if !app_write && is_runtime_declaration(graph, declaration) {
-                        runtime_value_types().get(declaration.name()).cloned()
-                    } else {
-                        None
-                    };
-                    ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))), runtime, stdlib }
-                }
-            });
+            .and_then(|id| resolved_constant(graph, *id, class_cache));
+        if let Some(ResolvedConstant::Value { declaration, .. }) = &target
+            && graph.names().get(reference.name_id())
+                .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None))
+        {
+            bare_values.push((offset.start(), *reference.name_id(), *declaration));
+        }
         match answers.references.entry(offset.start()) {
             Entry::Vacant(slot) => {
                 slot.insert(target);
@@ -899,7 +914,208 @@ fn answer_file(
         }
     }
     answers.constants.sort_unstable_by_key(|(end, ..)| *end);
+    reresolve_own_value_reads(graph, &text, UriId::from(source.path.as_str()), &bare_values, &mut answers, class_cache);
     answers
+}
+
+/// Ruby evaluates a constant write's value before it binds the name, so
+/// a bare reference to the name inside its own value is not a read of
+/// the binding being made:
+///
+/// ```ruby
+/// module WithFirefoxProfiler
+///   include Command
+///   VALID_COMMANDS = [*VALID_COMMANDS, ["git", "clone"]]
+/// end
+/// ```
+///
+/// reads `Command::VALID_COMMANDS`. Rubydex resolves the reference to the
+/// declaration the write creates. Each such reference is looked up again
+/// without that declaration. Only a write that is the declaration's
+/// first binding is one: every definition of the declaration is in this
+/// file, at or after the write. A later write (`X = X + 1`) reads the
+/// value already bound. A reference in a block, lambda or method in the
+/// value may run after the write binds, so it keeps Rubydex's answer.
+fn reresolve_own_value_reads(
+    graph: &Graph,
+    text: &str,
+    uri: UriId,
+    bare_values: &[(u32, NameId, DeclarationId)],
+    answers: &mut FileAnswers,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool, bool)>,
+) {
+    // A reference can only sit in its declaration's value after that
+    // declaration's name.
+    let first_end = |declaration: &DeclarationId| {
+        answers.constants.iter().find(|(_, _, id)| id == declaration).map(|(end, ..)| *end)
+    };
+    let candidates: Vec<_> = bare_values
+        .iter()
+        .filter(|(start, _, declaration)| first_end(declaration).is_some_and(|end| end <= *start))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let (writes, deferred) = constant_write_values(text);
+    for &&(start, name_id, declaration) in &candidates {
+        let Some(first) = first_end(&declaration) else { continue };
+        // The innermost write whose value holds the reference.
+        let Some(&(write_end, value_start, _)) = writes
+            .iter()
+            .filter(|(_, value_start, value_end)| *value_start <= start && start < *value_end)
+            .max_by_key(|(_, value_start, _)| *value_start)
+        else {
+            continue;
+        };
+        if write_end != first
+            || deferred.iter().any(|(from, to)| value_start <= *from && *from <= start && start < *to)
+        {
+            continue;
+        }
+        let only_here = graph.declarations().get(&declaration).is_some_and(|declaration| {
+            declaration.definitions().iter().all(|id| {
+                graph.definitions().get(id).is_some_and(|definition| *definition.uri_id() == uri)
+            })
+        });
+        if !only_here {
+            continue;
+        }
+        let Some(name) = graph.names().get(&name_id) else { continue };
+        match lookup_without(graph, name.str(), *name.nesting(), declaration) {
+            Lookup::Found(id) => {
+                answers.references.insert(start, resolved_constant(graph, id, class_cache));
+            }
+            Lookup::Missing => {
+                answers.references.insert(start, None);
+            }
+            Lookup::Unknown => {}
+        }
+    }
+}
+
+/// The constant writes in `text`, each as (offset where its written name
+/// ends, value start, value end): the spans Rubydex's constant
+/// definitions name, with the values they leave out. Then the spans of
+/// the blocks, lambdas and methods, whose bodies may run later.
+fn constant_write_values(text: &str) -> (Vec<(u32, u32, u32)>, Vec<(u32, u32)>) {
+    #[derive(Default)]
+    struct Writes {
+        writes: Vec<(u32, u32, u32)>,
+        deferred: Vec<(u32, u32)>,
+    }
+    impl Writes {
+        fn write(&mut self, name: ruby_prism::Location<'_>, value: ruby_prism::Location<'_>) {
+            self.writes.push((name.end_offset() as u32, value.start_offset() as u32, value.end_offset() as u32));
+        }
+        fn defer(&mut self, span: ruby_prism::Location<'_>) {
+            self.deferred.push((span.start_offset() as u32, span.end_offset() as u32));
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes {
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.write(node.name_loc(), node.value().location());
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            self.write(node.target().name_loc(), node.value().location());
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.defer(node.location());
+            ruby_prism::visit_block_node(self, node);
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.defer(node.location());
+            ruby_prism::visit_lambda_node(self, node);
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.defer(node.location());
+            ruby_prism::visit_def_node(self, node);
+        }
+    }
+    let parsed = ruby_prism::parse(text.as_bytes());
+    let mut writes = Writes::default();
+    ruby_prism::Visit::visit(&mut writes, &parsed.node());
+    (writes.writes, writes.deferred)
+}
+
+enum Lookup {
+    Found(DeclarationId),
+    /// The chains are complete and hold no other binding.
+    Missing,
+    /// A scope or ancestor is unresolved, so the answer is not known.
+    Unknown,
+}
+
+/// Rubydex's lookup of a bare constant (`run_resolution`: the lexical
+/// scopes, then the innermost scope's ancestors, then `Object`'s for a
+/// module or the top level) with `skip` left out of every scope.
+fn lookup_without(graph: &Graph, str_id: &StringId, nesting: Option<NameId>, skip: DeclarationId) -> Lookup {
+    let member = |namespace: &DeclarationId| {
+        graph.declarations().get(namespace)
+            .and_then(Declaration::as_namespace)
+            .and_then(|namespace| namespace.member(str_id))
+            .copied()
+            .filter(|member| *member != skip)
+    };
+    let ancestors = |namespace: &DeclarationId| {
+        let Some(chain) = graph.declarations().get(namespace).and_then(Declaration::as_namespace)
+            .map(|namespace| namespace.ancestors())
+        else {
+            return Lookup::Unknown;
+        };
+        let partial = matches!(chain, Ancestors::Partial(_));
+        for ancestor in chain.iter() {
+            match ancestor {
+                Ancestor::Complete(id) => {
+                    if let Some(found) = member(id) {
+                        return Lookup::Found(found);
+                    }
+                }
+                // Rubydex stops at an unresolved ancestor unless it is
+                // the name being looked up.
+                Ancestor::Partial(name) => {
+                    if partial && graph.names().get(name).is_none_or(|name| name.str() != str_id) {
+                        return Lookup::Unknown;
+                    }
+                }
+            }
+        }
+        if partial { Lookup::Unknown } else { Lookup::Missing }
+    };
+    let object = DeclarationId::from("Object");
+    let Some(innermost) = nesting else {
+        return ancestors(&object);
+    };
+    let mut scope = Some(innermost);
+    while let Some(name) = scope {
+        let Some(declaration) = graph.name_id_to_declaration_id(name) else {
+            return Lookup::Unknown;
+        };
+        let namespace = graph.resolve_alias(declaration).unwrap_or(*declaration);
+        if let Some(found) = member(&namespace) {
+            return Lookup::Found(found);
+        }
+        let Some(name) = graph.names().get(&name) else {
+            return Lookup::Unknown;
+        };
+        scope = *name.nesting();
+    }
+    let Some(namespace) = graph.name_id_to_declaration_id(innermost)
+        .map(|declaration| graph.resolve_alias(declaration).unwrap_or(*declaration))
+    else {
+        return Lookup::Unknown;
+    };
+    match ancestors(&namespace) {
+        Lookup::Found(found) => return Lookup::Found(found),
+        Lookup::Unknown => return Lookup::Unknown,
+        Lookup::Missing => {}
+    }
+    let module = matches!(
+        graph.declarations().get(&namespace),
+        Some(Declaration::Namespace(Namespace::Module(_) | Namespace::Todo(_)))
+    );
+    if module { ancestors(&object) } else { Lookup::Missing }
 }
 
 #[cfg(test)]
