@@ -8947,7 +8947,7 @@ pub(super) fn emit_file_program(
                                 "roundhouse: error[file_require_not_carried]: {site}: `require{} {feature:?}` names an app file the tree does not carry; it was not loaded",
                                 if *relative { "_relative" } else { "" }
                             );
-                            writeln!(s, "{pad}warn {message:?}").unwrap();
+                            writeln!(s, "{pad}$stderr.puts {message:?}").unwrap();
                         }
                         // graphql-shopify's `require "active_support/core_ext/
                         // class/attribute"`: the runtime ports are the
@@ -9003,7 +9003,7 @@ pub(super) fn emit_file_program(
                         "roundhouse: error[file_statement_not_carried]: {}: {message}",
                         statement_site(app, *span)
                     );
-                    writeln!(s, "{pad}warn {text:?}").unwrap();
+                    writeln!(s, "{pad}$stderr.puts {text:?}").unwrap();
                 }
             }
         }
@@ -9044,7 +9044,7 @@ fn class_eval_parts(
                         let message = format!(
                             "roundhouse: error[file_statement_not_carried]: a part of this `{method}` body did not emit as a module body; it was not carried"
                         );
-                        writeln!(s, "{pad}warn {message:?}").unwrap();
+                        writeln!(s, "{pad}$stderr.puts {message:?}").unwrap();
                     }
                 }
             }

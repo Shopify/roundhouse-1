@@ -382,7 +382,7 @@ module Rails
           end
         end
         return unless phases.include?(:finish)
-        warn "roundhouse: #{@@not_run} railtie and engine initializer(s), hook(s) and body statement(s) did not run (error[gem_railtie_not_run], error[railtie_body_statement_not_run])" if @@not_run > 0
+        $stderr.puts "roundhouse: #{@@not_run} railtie and engine initializer(s), hook(s) and body statement(s) did not run (error[gem_railtie_not_run], error[railtie_body_statement_not_run])" if @@not_run > 0
       end
 
       def sorted_initializers_of_railties(app) # :nodoc:
@@ -421,7 +421,7 @@ module Rails
       rescue StandardError, LoadError, NotImplementedError => e
         @@not_run += 1
         site = e.backtrace&.find { |line| !line.include?(__FILE__) && !line.include?("active_support_lazy_load_hooks") }
-        warn "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)} (#{site})"
+        $stderr.puts "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)} (#{site})"
         nil
       end
 
@@ -437,7 +437,7 @@ module Rails
         yield
       rescue StandardError, LoadError, NotImplementedError => e
         @@not_run += 1
-        warn "roundhouse: error[railtie_body_statement_not_run]: #{name} body statement at #{site} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)}"
+        $stderr.puts "roundhouse: error[railtie_body_statement_not_run]: #{name} body statement at #{site} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)}"
         nil
       end
 
@@ -545,7 +545,7 @@ module Rails
       def self.refuse_app_middleware! # :nodoc:
         return unless defined?(@@app_middleware)
         @@app_middleware.operations.each do |operation, args|
-          warn "roundhouse: error[gem_railtie_middleware_not_applied]: config.app_middleware.#{operation}(#{args.map(&:inspect).join(", ")}) from a gem's railtie is not applied: the tree has no middleware stack a railtie joins"
+          $stderr.puts "roundhouse: error[gem_railtie_middleware_not_applied]: config.app_middleware.#{operation}(#{args.map(&:inspect).join(", ")}) from a gem's railtie is not applied: the tree has no middleware stack a railtie joins"
         end
       end
 

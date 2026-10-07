@@ -4143,7 +4143,7 @@ fn gem_source_dependency_block(app: &App) -> String {
     }
     for feature in &uncarried {
         out.push_str(&format!(
-            "warn \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
+            "$stderr.puts \"roundhouse: warning[gem_source_file_not_compiled]: {}, which a gem source requires, is a file of the app's own gems that this tree does not carry compiled; it is not loaded\"\n",
             format!("{feature:?}").replace('"', "\\\"")
         ));
     }
@@ -4267,7 +4267,7 @@ fn environment_program_block(app: &App) -> String {
         ));
         for (site, reason) in &program.refused {
             let message = format!("roundhouse: error[environment_statement_not_carried]: {site}: {reason}");
-            out.push_str(&format!("  warn {}\n", ruby_data_literal(&serde_json::Value::String(message))));
+            out.push_str(&format!("  $stderr.puts {}\n", ruby_data_literal(&serde_json::Value::String(message))));
         }
         if let Some(holder) = &program.holder {
             let stem = format!("models/{}", crate::naming::underscore(holder.0.as_str()));
@@ -4418,7 +4418,7 @@ fn apply_extension_gem_load_paths(files: &mut Vec<(String, String)>, declared: &
          [\n{entries}].each do |name, version|\n  \
            spec = Gem::Specification.find_all_by_name(name, \"= #{{version}}\").find {{ |s| Gem::Platform.match_spec?(s) }}\n  \
            if spec.nil?\n    \
-             warn \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
+             $stderr.puts \"roundhouse: extension gem #{{name}} #{{version}} is not installed on Gem.path #{{Gem.path.inspect}}\"\n    \
              next\n  \
            end\n  \
            spec.full_require_paths.each {{ |path| $LOAD_PATH << path unless $LOAD_PATH.include?(path) }}\n\
@@ -9673,7 +9673,7 @@ fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], 
            dir = Gem.path.map {{ |root| File.join(root, \"bundler\", \"gems\", checkout) }}.find {{ |d| File.directory?(d) }}\n  \
            spec = dir && Dir[File.join(dir, \"{{,*,*/*}}.gemspec\")].filter_map {{ |f| Gem::Specification.load(f) }}.find {{ |s| s.name == name }}\n  \
            if spec.nil?\n    \
-             warn \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
+             $stderr.puts \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
              next\n  \
            end\n  \
            spec.full_gem_path = File.dirname(spec.loaded_from)\n  \
