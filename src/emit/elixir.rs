@@ -799,6 +799,7 @@ fn module_funcs_to_library_class(
         })
         .collect();
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: crate::ident::ClassId(crate::ident::Symbol::from(name)),

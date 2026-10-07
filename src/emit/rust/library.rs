@@ -42,6 +42,7 @@ pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
     // on a single-class wrapper. Mirrors the multi-class call sites
     // in `rust.rs::emit`.
     let mut wrap = vec![crate::dialect::LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: crate::ident::ClassId(crate::ident::Symbol::from("__emit_module__")),

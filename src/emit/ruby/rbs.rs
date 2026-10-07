@@ -85,8 +85,17 @@ fn render_class(lc: &LibraryClass) -> String {
         render_data_factory(&mut s, lc, name.as_str(), value, &body_pad);
     }
 
+    // Each branch of a load-time conditional definition defines its
+    // methods; a signature they share is declared once.
+    let mut alternatives: Vec<String> = Vec::new();
     for m in &lc.methods {
         let line = render_method(m, &segments);
+        if lc.conditional_definitions.iter().any(|c| c.contains(m)) {
+            if alternatives.contains(&line) {
+                continue;
+            }
+            alternatives.push(line.clone());
+        }
         writeln!(s, "{body_pad}{line}").unwrap();
     }
 

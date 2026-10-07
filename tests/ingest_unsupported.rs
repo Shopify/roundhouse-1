@@ -57,25 +57,32 @@ fn a_refused_statement_is_an_error_at_the_construct_and_keeps_the_file() {
     assert!(survey.contains("`for` requires enclosing-scope lowering"), "{survey}");
 }
 
-/// Core's `Podding::Database::Concerns::ShardedTable::ClassMethods`
-/// carries a `class << self; def extended(base)` hook. That singleton is
-/// the carrier module's own, not the includers' class side the carrier
-/// is flattened into, so it is refused by name at its line.
+/// A nested `module ClassMethods`'s own `class << self; def
+/// extended(base)` (Core's `Podding::Database::Concerns::ShardedTable`)
+/// is that module's singleton, and is kept (tests/conditional_definitions.rs
+/// runs the hook). A `class_methods do` block has no module of its own
+/// in the emitted app to hold one, so there it is refused by name at its
+/// line.
 #[test]
-fn a_class_methods_carrier_singleton_is_refused_by_name() {
+fn a_class_methods_block_singleton_is_refused_by_name() {
     let root = std::env::temp_dir().join(format!("roundhouse-ingest-carrier-{}", std::process::id()));
     app(&root);
-    let file = root.join("lib/sharded.rb");
     std::fs::write(
-        &file,
+        root.join("lib/sharded.rb"),
         "module Sharded\n  extend ActiveSupport::Concern\n\n  module ClassMethods\n    class << self\n      def extended(base)\n        base\n      end\n    end\n\n    def sharded?\n      true\n    end\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("lib/blocked.rb"),
+        "module Blocked\n  extend ActiveSupport::Concern\n\n  class_methods do\n    class << self\n      def extended(base)\n        base\n      end\n    end\n\n    def blocked?\n      true\n    end\n  end\nend\n",
     )
     .unwrap();
     let (_, text) = check(&root, &[]);
     let (_, survey) = check(&root, &["--continue"]);
     let _ = std::fs::remove_dir_all(&root);
-    let error = "lib/sharded.rb:5:5: error[ingest_unsupported]: `class << self` in a concern's `ClassMethods` defines the carrier module's own singleton methods";
+    assert!(!text.contains("lib/sharded.rb"), "{text}");
+    let error = "lib/blocked.rb:5:5: error[ingest_unsupported]: `class << self` in a `class_methods do` block defines the class-method carrier's own singleton methods";
     assert!(text.contains(error), "{text}");
     // Survey mode absorbs it (the file's classes stay in) and lists it.
-    assert!(survey.contains("`class << self` in a concern's `ClassMethods`"), "{survey}");
+    assert!(survey.contains("`class << self` in a `class_methods do` block"), "{survey}");
 }

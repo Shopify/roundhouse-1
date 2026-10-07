@@ -703,6 +703,7 @@ fn program_branch(
 /// first constant is `first`.
 pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(first.clone()),
@@ -762,6 +763,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(full.join("::"))),
@@ -878,6 +880,12 @@ pub fn ingest_rails_application_singleton_methods(
             continue;
         }
         let body = walk_decl_body(sc.body(), &owner, file, false)?;
+        if !body.conditional_definitions.is_empty() {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "a load-time conditional definition in the Rails application singleton is not modeled".into(),
+            });
+        }
         if !body.class_initializers.is_empty() {
             return Err(IngestError::Unsupported {
                 file: file.into(),
@@ -955,6 +963,7 @@ pub(super) fn library_class_and_struct_base(
         class_initializers,
         visibility_overrides,
         method_aliases,
+        conditional_definitions,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
@@ -1023,6 +1032,7 @@ pub(super) fn library_class_and_struct_base(
     admit_nameless_rest(&mut methods);
     Ok((
         LibraryClass {
+            conditional_definitions,
             method_aliases,
             top_level_constants: Vec::new(),
             name: owner,
@@ -1808,6 +1818,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         block_param: None,
     });
     LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: base,
@@ -1897,11 +1908,20 @@ pub(super) fn library_class_from_module_node_with_scope(
     full_path.extend(name_path);
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
-    let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, method_aliases, .. } =
-        walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    let visibility = Visibility::resolve_library(module.body().as_ref(), file, Some(&owner))?;
+    let DeclBody {
+        includes,
+        methods,
+        constants,
+        unknown_calls,
+        class_initializers,
+        method_aliases,
+        conditional_definitions,
+        ..
+    } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
+        conditional_definitions,
         method_aliases,
         top_level_constants: Vec::new(),
         name: owner,
@@ -1992,6 +2012,9 @@ struct DeclBody {
     visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
     /// Which `methods` are alias copies (see `MethodAlias`).
     method_aliases: Vec<crate::dialect::MethodAlias>,
+    /// Which `methods` a load-time conditional defines (see
+    /// `ConditionalDefinitions`).
+    conditional_definitions: Vec<crate::dialect::ConditionalDefinitions>,
     /// An include, constant or captured class-body call came AFTER a
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
@@ -2007,6 +2030,7 @@ impl DeclBody {
         self.class_initializers.extend(other.class_initializers);
         self.visibility_overrides.extend(other.visibility_overrides);
         self.method_aliases.extend(other.method_aliases);
+        self.conditional_definitions.extend(other.conditional_definitions);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
     }
 
@@ -2352,6 +2376,54 @@ fn is_class_methods_bridge(def: &ruby_prism::DefNode<'_>) -> bool {
         .is_some_and(|c| constant_id_str(&c.name()) == "ClassMethods"))
 }
 
+/// The methods of a load-time conditional definition, every branch's,
+/// and the record of which branch defines each (see
+/// `ConditionalDefinitions`). Each condition is kept as written, for the
+/// Ruby family to evaluate when the body loads.
+fn conditional_definitions(
+    statement: &ruby_prism::Node<'_>,
+    conditional: &visibility::ConditionalDefinition<'_>,
+    owner: &ClassId,
+    file: &str,
+    force_class_receiver: bool,
+    visibility: &Visibility,
+) -> IngestResult<(Vec<MethodDef>, crate::dialect::ConditionalDefinitions)> {
+    let mut methods = Vec::new();
+    let mut arms = Vec::new();
+    for (condition, statements) in &conditional.arms {
+        let condition = condition.as_ref().map(|c| ingest_expr(c, file)).transpose()?;
+        let mut members = Vec::new();
+        for stmt in statements {
+            let Some(def) = visibility::definition(stmt) else {
+                return Err(super::error_site::at(
+                    IngestError::Unsupported {
+                        file: file.into(),
+                        message: "a load-time conditional definition whose branch holds a statement other than \
+                                  a `def` is not modeled"
+                            .into(),
+                    },
+                    stmt,
+                ));
+            };
+            let mut m = ingest_library_method(&def, owner, file)?;
+            visibility.apply(stmt, &mut m);
+            if force_class_receiver {
+                m.receiver = MethodReceiver::Class;
+            }
+            members.push(crate::dialect::ConditionalMember::of(&m));
+            methods.push(m);
+        }
+        arms.push(crate::dialect::ConditionalArm { condition, methods: members });
+    }
+    let location = statement.location();
+    let span = Span {
+        file: super::sources::file_id(file),
+        start: location.start_offset() as u32,
+        end: location.end_offset() as u32,
+    };
+    Ok((methods, crate::dialect::ConditionalDefinitions { span, negated: conditional.negated, arms }))
+}
+
 /// `if enabled; attr_reader :token; end` is a declaration this walk
 /// would lower when it stands alone. Inside a branch it sometimes runs,
 /// which a synthesized method cannot express. Reject it rather than
@@ -2431,8 +2503,23 @@ pub(super) fn factory_class_body(
     owner: &ClassId,
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
-    let DeclBody { includes, mut methods, constants, unknown_calls, class_initializers, visibility_overrides, .. } =
-        walk_decl_body(body, owner, file, false)?;
+    let DeclBody {
+        includes,
+        mut methods,
+        constants,
+        unknown_calls,
+        class_initializers,
+        visibility_overrides,
+        conditional_definitions,
+        ..
+    } = walk_decl_body(body, owner, file, false)?;
+    if !conditional_definitions.is_empty() {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "a load-time conditional definition inside a Struct.new/Data.define body block is not modeled"
+                .into(),
+        });
+    }
     if !constants.is_empty() || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
@@ -2451,7 +2538,7 @@ fn walk_decl_body<'pr>(
     file: &str,
     force_class_receiver: bool,
 ) -> IngestResult<DeclBody> {
-    let visibility = Visibility::resolve(body.as_ref(), file, None)?;
+    let visibility = Visibility::resolve_library(body.as_ref(), file, None)?;
     let mut out = walk_decl_body_with_visibility(body, owner, file, force_class_receiver, &visibility)?;
     out.visibility_overrides = visibility.overrides();
     Ok(out)
@@ -2501,6 +2588,27 @@ fn walk_decl_body_with_visibility<'pr>(
         // branch has neither a `def` nor a marker, so reject it here:
         // skipping it would drop `attr_reader :token` with no error.
         if statement.as_if_node().is_some() || statement.as_unless_node().is_some() {
+            // `if Rails.env.test?; def x = false; else; def x = …; end`:
+            // every branch's methods, and which branch defines each. The
+            // visibility pass admitted only branches of `def`s.
+            if let Some(conditional) = visibility::conditional_definition(&statement) {
+                if module_function_active || extend_self_active {
+                    return Err(super::error_site::at(
+                        IngestError::Unsupported {
+                            file: file.into(),
+                            message: "a load-time conditional definition under `module_function` or `extend self` \
+                                      is not modeled"
+                                .into(),
+                        },
+                        &statement,
+                    ));
+                }
+                let (methods, record) =
+                    conditional_definitions(&statement, &conditional, owner, file, force_class_receiver, visibility)?;
+                out.methods.extend(methods);
+                out.conditional_definitions.push(record);
+                continue;
+            }
             Visibility::reject_conditional_declaration(&statement, file)?;
             reject_conditional_accessor(&statement, file)?;
             continue;
@@ -3089,6 +3197,18 @@ fn walk_decl_body_with_visibility<'pr>(
     // from the module spelling to the instance one. Retarget the
     // sibling bare calls to the module spelling instead, which keeps a
     // single definition and leaves both call sites resolving.
+    // `module_function :name` copies whichever branch defined `name`;
+    // the promotion below reaches only unconditional definitions.
+    if let Some(name) = module_function_named.iter().find(|name| {
+        out.conditional_definitions.iter().any(|c| {
+            c.arms.iter().any(|arm| arm.methods.iter().any(|m| m.name.as_str() == name.as_str()))
+        })
+    }) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("`module_function :{name}` of a method a load-time conditional defines is not modeled"),
+        });
+    }
     if !module_function_named.is_empty() {
         let mut promoted: Vec<Symbol> = Vec::new();
         for pos in &direct_def_positions {

@@ -260,6 +260,7 @@ fn factory_class(
         });
     }
     Ok(LibraryClass {
+        conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: owner,
