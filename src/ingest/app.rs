@@ -301,10 +301,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let vfs = &source_vfs;
     // Every initializer Rails runs at boot, in its load order: each
     // in-repo engine's, then the app's (see `initializers`).
-    let boot_initializers: Vec<std::path::PathBuf> = {
-        let engines = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
-        super::initializers::initializer_files(vfs, dir, &engines)
-    };
+    let engine_dirs = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
+    let boot_initializers: Vec<std::path::PathBuf> =
+        super::initializers::initializer_files(vfs, dir, &engine_dirs);
     let additional_test_paths = additional_test_paths(vfs, dir)?;
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
     let mut app = App::new();
@@ -1191,6 +1190,45 @@ end
                 for a in extract_config_assignments(&bytes, &path) {
                     assignments.push((a.path, a.value));
                     assignment_sites.push((path.clone(), a.start, a.end));
+                }
+            }
+            // Each in-repo engine's class body writes the same config
+            // (see `engine_config`). Engines load before the
+            // application's initializers run, and the first reader of a
+            // key answers below, so they follow the app's own sources:
+            // an initializer that reassigns an engine's key wins, as
+            // its later write does in Rails.
+            {
+                let mut carried: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let names = app.models.iter().map(|m| m.name.0.as_str())
+                    .chain(app.library_classes.iter().map(|c| c.name.0.as_str()));
+                for name in names {
+                    let mut prefix = String::new();
+                    for segment in name.split("::") {
+                        if !prefix.is_empty() {
+                            prefix.push_str("::");
+                        }
+                        prefix.push_str(segment);
+                        carried.insert(prefix.clone());
+                    }
+                }
+                let known = |name: &str| carried.contains(name);
+                for engine in &engine_dirs {
+                    let lib = engine.join("lib");
+                    if !vfs.is_dir(&lib) {
+                        continue;
+                    }
+                    for file in read_rb_files(vfs, &lib).unwrap_or_default() {
+                        let Ok(bytes) = vfs.read(&file) else { continue };
+                        if !bytes.windows(13).any(|w| w == b"Rails::Engine") {
+                            continue;
+                        }
+                        let path = file.display().to_string();
+                        for a in super::engine_config::extract(&bytes, &path, &known) {
+                            assignments.push((a.path, a.value));
+                            assignment_sites.push((path.clone(), a.start, a.end));
+                        }
+                    }
                 }
             }
             // ONCE PER PROCESS. An initializer runs at boot, so the
@@ -6737,7 +6775,7 @@ fn outer_local_read(node: &ruby_prism::Node<'_>) -> Option<String> {
 /// reads back the same way, as a plain method on `Rails::Application`.
 /// `config_reader` flattens the read side identically, so the two halves
 /// meet at the same name.
-fn config_receiver_path(
+pub(super) fn config_receiver_path(
     recv: &Option<ruby_prism::Node<'_>>,
     app_param: Option<&str>,
 ) -> Option<Vec<String>> {

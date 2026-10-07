@@ -141,6 +141,29 @@ fn ruby_family_reporters_are_refused_where_the_runtime_lacks_them() {
     }
 }
 
+/// `Rails.configuration` is the CRuby/JRuby trees' object
+/// (runtime/spinel/rails_configuration.rb), answering the config keys
+/// ingest lifted. A read no lift rewrote reaches that object, so a tree
+/// without the file refuses it by name, as it does `Rails.event`;
+/// spinel's tree is one of them.
+#[test]
+fn rails_configuration_is_refused_where_the_runtime_lacks_it() {
+    let body = "Rails.configuration.probe_setting";
+    let shown = "`Rails.configuration` answers Rails::Configuration";
+    let root = probe_app(body);
+    let (ok, text) = run(&root, &["check"]);
+    assert!(ok, "check refused {body}: {text}");
+    let (ok, text) = run(&root, &["--target", "ruby"]);
+    assert!(ok, "ruby refused {body}: {text}");
+    assert!(root.join("emitted-ruby/runtime/rails_configuration.rb").is_file(), "ruby tree lacks Rails.configuration");
+    for target in ["spinel", "rust"] {
+        let (ok, text) = run(&root, &["--target", target]);
+        assert!(!ok, "{target} accepted {body}: {text}");
+        assert!(text.contains("runtime_constant") && text.contains(shown), "{target} lost named refusal {shown}: {text}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn application_tracers_are_not_global_stdlib() {
     refuses("ShopifyTracer.in_span(\"probe\") { 42 }", "ShopifyTracer");
