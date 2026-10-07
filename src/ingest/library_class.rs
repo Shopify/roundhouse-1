@@ -164,15 +164,12 @@ fn library_classes(
         out.push(lc);
     }
     for (scope, module) in find_all_modules_with_scope(&root) {
-        // A nested `ClassMethods` is not a namespace of its own — it's
-        // ActiveSupport::Concern's class-side carrier, already folded
-        // into its parent as Class-receiver methods by `walk_decl_body`.
-        // Emitting it separately would define every method twice.
-        if !scope.is_empty()
-            && module_name_path(&module).as_deref() == Some(&["ClassMethods".to_string()])
-        {
-            continue;
-        }
+        // A nested `ClassMethods` is a module of its own, as in Ruby:
+        // `Owner.const_defined?(:ClassMethods)`, `k.is_a?(ClassMethods)`
+        // and `base.extend(ClassMethods)` all read it. Its defs are its
+        // INSTANCE methods; they reach an includer only through an
+        // `extend` (the authored `included` hook, or Concern's
+        // `append_features`), never the owner's own singleton.
         out.push(
             library_class_from_module_node_with_scope(&module, &scope, file)
                 .map_err(|err| super::error_site::at(err, &module.as_node()))?,
@@ -1870,10 +1867,12 @@ fn included_hook_parameter(def: &ruby_prism::DefNode<'_>) -> Option<String> {
     Some(constant_id_str(&only_param.name()).to_string())
 }
 
-/// The complete vanilla-Ruby ClassMethods bridge. The carrier splice
-/// replaces its only effect; retaining it would reference the nested
-/// module that ingestion flattened away. Extra statements are NOT safe
-/// to consume, nor is an extend of any other constant or receiver.
+/// The complete vanilla-Ruby ClassMethods bridge
+/// (`def self.included(base) = base.extend(ClassMethods)`). It stays in
+/// the module and extends the includer as authored; the carrier splice
+/// records it so the includer's class side is typed with the carrier's
+/// defs. Extra statements make it an ordinary hook, as does an extend of
+/// any other constant or receiver.
 fn is_class_methods_bridge(def: &ruby_prism::DefNode<'_>) -> bool {
     let Some(param_name) = included_hook_parameter(def) else { return false };
     let Some(body) = def.body() else { return false };
@@ -2032,8 +2031,6 @@ fn walk_decl_body_with_visibility<'pr>(
 
     let statements = flatten_statements(b);
     let mut body_locals: Vec<BodyLocal> = Vec::new();
-    let has_class_methods = statements.iter().any(|stmt| stmt.as_module_node()
-        .is_some_and(|m| module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()])));
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
         order_mark.observe(&mut out);
@@ -2194,9 +2191,6 @@ fn walk_decl_body_with_visibility<'pr>(
                 out.extend(walk_decl_body_with_visibility(Some(singleton_body), owner, file, true, visibility)?);
                 continue;
             }
-            if has_class_methods && is_class_methods_bridge(&def) {
-                continue;
-            }
             let mut m = ingest_library_method(&def, owner, file)?;
             visibility.apply(&statement, &mut m);
             if module_function_active && m.receiver == MethodReceiver::Instance {
@@ -2272,31 +2266,9 @@ fn walk_decl_body_with_visibility<'pr>(
             out.extend(walk_decl_body_with_visibility(sc.body(), owner, file, true, visibility)?);
             continue;
         }
-        // `module ClassMethods … end` — ActiveSupport::Concern's OTHER
-        // spelling for the class side, and the one campfire's
-        // `User::Bot` uses for `create_bot!`/`authenticate_bot`.
-        // `class_methods do` (below) is sugar that Concern turns into
-        // exactly this module, so both have to arrive at the same
-        // place: Class-receiver methods of the enclosing module, which
-        // the registry's concern fold copies onto every includer.
-        // `ingest_library_classes` skips the nested module for this
-        // reason — otherwise the same defs would emit twice.
-        if let Some(m) = stmt.as_module_node() {
-            if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) {
-                let class_methods = walk_decl_body_with_visibility(m.body(), owner, file, true, visibility)?;
-                // The recursive walk has already applied cattr/mattr handling.
-                // A surviving native initializer belongs to ClassMethods, not
-                // the enclosing module where these methods are materialized.
-                if !class_methods.class_initializers.is_empty() {
-                    return Err(IngestError::Unsupported {
-                        file: file.into(),
-                        message: "class-variable initialization in module ClassMethods is not modeled".into(),
-                    });
-                }
-                out.extend(class_methods);
-                continue;
-            }
-        }
+        // `module ClassMethods … end` is not folded here: it is its own
+        // module (see `library_classes`), like any nested module. The
+        // concern splice reads its defs as includer class methods.
         if let Some(alias) = stmt.as_alias_method_node() {
             let to = alias_keyword_name(&alias.new_name());
             let from = alias_keyword_name(&alias.old_name());
@@ -3780,14 +3752,11 @@ pub fn ingest_concern_class_method_spans(
             // above this function) so the concern fold copies these
             // names onto includers exactly as it does for `class_methods
             // do` / `module ClassMethods`.
-            if let Some(singleton) = stmt.as_singleton_class_node() {
-                // `class << self` is a class-method carrier. Record the
-                // defs so an includer receives them. `module_function`
-                // is not this node and stays on the module.
-                if singleton.expression().as_self_node().is_some() {
-                    defs_in(singleton.body(), file, &mut spans);
-                }
-            }
+            // A module-level `class << self` is NOT a carrier: like
+            // `def self.x` and `module_function`, it defines the module's
+            // own singleton, which `include` never carries and
+            // ActiveSupport::Concern never extends
+            // (`C.respond_to?(:x)` is false natively, Concern or not).
             if let Some(def) = super::visibility::definition(&stmt) {
                 if let Some(singleton_body) = included_hook_class_methods_body(&def) {
                     defs_in(Some(singleton_body), file, &mut spans);

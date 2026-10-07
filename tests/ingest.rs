@@ -2021,23 +2021,33 @@ fn case_in_pattern_matching() {
     assert!(matches!(&*e.node, ExprNode::MatchRequired { .. }));
 }
 
+/// A nested `module ClassMethods` is its own module, so a class-variable
+/// initializer in its body stays its own: it is neither relocated onto
+/// the enclosing module (which used to receive the folded defs) nor lost.
 #[test]
 fn nested_class_methods_cannot_relocate_native_initializers() {
     use roundhouse::ingest::ingest_library_classes;
-    let err = ingest_library_classes(
+    let classes = ingest_library_classes(
         b"module Probe; module ClassMethods; @@flag = nil; def flag; @@flag; end; end; end",
         "probe.rb",
-    ).expect_err("ClassMethods owns @@flag, not the enclosing Probe");
-    assert!(err.to_string().contains("class-variable initialization in module ClassMethods is not modeled"), "{err}");
+    ).unwrap();
+    let find = |name: &str| classes.iter().find(|class| class.name.0.as_str() == name)
+        .unwrap_or_else(|| panic!("{name} in {classes:?}"));
+    let (probe, carrier) = (find("Probe"), find("Probe::ClassMethods"));
+    assert!(probe.class_ivar_initializers.is_empty(), "ClassMethods owns @@flag, not the enclosing Probe: {probe:?}");
+    assert!(probe.methods.is_empty(), "{probe:?}");
+    assert!(carrier.is_module);
+    assert_eq!(carrier.class_ivar_initializers.len(), 1, "{carrier:?}");
+    assert!(carrier.methods.iter().any(|m| m.name.as_str() == "flag" && m.receiver == roundhouse::dialect::MethodReceiver::Instance));
 
     // A cattr in the same body keeps its pre-existing storage approximation.
     let classes = ingest_library_classes(
         b"module Probe; module ClassMethods; @@flag = nil; cattr_accessor :flag; def read; @@flag; end; end; end",
         "probe.rb",
     ).unwrap();
-    let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
-    assert!(probe.class_ivar_initializers.is_empty());
-    assert!(probe.methods.iter().any(|method| method.name.as_str() == "read"));
+    let carrier = classes.iter().find(|class| class.name.0.as_str() == "Probe::ClassMethods").unwrap();
+    assert!(carrier.class_ivar_initializers.is_empty());
+    assert!(carrier.methods.iter().any(|method| method.name.as_str() == "read"));
 
     // An initializer actually owned by Probe must not be rejected.
     let classes = ingest_library_classes(

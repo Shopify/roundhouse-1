@@ -31,11 +31,23 @@
 //! and `Foo.extend Bar` (a constant receiver) restructure a CLASS,
 //! which the ingest reads as a body item and the strict targets model
 //! statically; neither reaches this pass as a Send on an object.
+//!
+//! Nor does `base.extend(ClassMethods)` in a module's `included(base)`
+//! hook (or `prepended(base)`, a class's `inherited(sub)`): Ruby passes
+//! the includer — a class or module — as the hook's parameter, so this
+//! too restructures a class, and it is how a concern's `ClassMethods`
+//! reaches its includer. The Ruby family runs it; the targets without
+//! mixins carry the same methods as the concern splice's static copies,
+//! and `project::target_files` stubs the call for them
+//! ([`stub_module_hook_extends`]).
 
 use crate::app::App;
+use crate::det::HashSet;
+use crate::dialect::MethodReceiver;
 use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
-use crate::expr::{Expr, ExprNode, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::Symbol;
+use crate::span::Span;
 
 const CONSTRUCT: &str = "Object#extend";
 const DETAIL: &str = "mixing a module into one live object needs a per-object method \
@@ -43,7 +55,8 @@ const DETAIL: &str = "mixing a module into one live object needs a per-object me
 
 pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |e| stub(e, &mut diags));
+    let class_extends = module_hook_extends(app);
+    super::for_each_hook_body(app, &mut |e| stub_except(e, &class_extends, &mut diags));
     for view in &mut app.views {
         stub(&mut view.body, &mut diags);
     }
@@ -66,9 +79,13 @@ pub fn apply_object_extend_stub(app: &mut App) -> Vec<Diagnostic> {
 }
 
 fn stub(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
-    expr.node.for_each_child_mut(&mut |c| stub(c, diags));
+    stub_except(expr, &HashSet::default(), diags)
+}
+
+fn stub_except(expr: &mut Expr, class_extends: &HashSet<Span>, diags: &mut Vec<Diagnostic>) {
+    expr.node.for_each_child_mut(&mut |c| stub_except(c, class_extends, diags));
     let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node else { return };
-    if method.as_str() != "extend" {
+    if method.as_str() != "extend" || class_extends.contains(&expr.span) {
         return;
     }
     // A constant or `self` receiver is the class-level form.
@@ -90,4 +107,111 @@ fn stub_expr(span: crate::span::Span) -> Expr {
         detail: DETAIL.to_string(),
     });
     e
+}
+
+/// Each `param.extend(Const, …)` in a library module's `included(param)` /
+/// `prepended(param)` hook or a class's `inherited(param)` hook, by span:
+/// Ruby calls these hooks with the class or module being extended, so the
+/// receiver is a class object. Not `extended(param)`, whose parameter is
+/// any object. A body that reassigns the parameter proves nothing.
+fn module_hook_extends(app: &App) -> HashSet<Span> {
+    fn assigns(expr: &Expr, name: &Symbol) -> bool {
+        let here = match &*expr.node {
+            ExprNode::Assign { target: LValue::Var { name: n, .. }, .. }
+            | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => n == name,
+            _ => false,
+        };
+        let mut found = here;
+        expr.node.for_each_child(&mut |c| found |= assigns(c, name));
+        found
+    }
+    fn collect(expr: &Expr, name: &Symbol, out: &mut HashSet<Span>) {
+        expr.node.for_each_child(&mut |c| collect(c, name, out));
+        let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else { return };
+        if method.as_str() == "extend"
+            && matches!(&*recv.node, ExprNode::Var { name: n, .. } if n == name)
+            && !args.is_empty()
+            && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
+        {
+            out.insert(expr.span);
+        }
+    }
+    let mut out = HashSet::default();
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            let hook = match m.name.as_str() {
+                "included" | "prepended" => lc.is_module,
+                "inherited" => !lc.is_module,
+                _ => false,
+            };
+            if !hook || m.receiver != MethodReceiver::Class {
+                continue;
+            }
+            let [param] = m.params.as_slice() else { continue };
+            if param.keyword || param.rest || param.forwarding || param.name.as_str().is_empty() {
+                continue;
+            }
+            if assigns(&m.body, &param.name) {
+                continue;
+            }
+            collect(&m.body, &param.name, &mut out);
+        }
+    }
+    out
+}
+
+/// For a target without mixins: the hook extends [`apply_object_extend_stub`]
+/// kept become the raise stub there, and a hook that did nothing else —
+/// the complete `def self.included(base) base.extend(ClassMethods) end`
+/// bridge — is dropped instead, since the concern splice's copies already
+/// are its whole effect and a hook that raised would fail the include.
+pub fn stub_module_hook_extends(app: &mut App) -> Vec<Diagnostic> {
+    let class_extends = module_hook_extends(app);
+    if class_extends.is_empty() {
+        return Vec::new();
+    }
+    let carriers: HashSet<String> = app.library_classes.iter()
+        .filter(|lc| lc.is_module)
+        .filter_map(|lc| lc.name.0.as_str().strip_suffix("::ClassMethods").map(str::to_string))
+        .collect();
+    // `ClassMethods` as written, or as constant qualification spelled it
+    // (`Owner::ClassMethods`, optionally rooted).
+    let names_carrier = |path: &[crate::ident::Symbol], owner: &str| {
+        let written: Vec<&str> = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        written == ["ClassMethods"] || written.join("::") == format!("{owner}::ClassMethods")
+    };
+    let bridge = |e: &Expr, owner: &str| {
+        class_extends.contains(&e.span)
+            && matches!(&*e.node, ExprNode::Send { args, .. } if args.iter().all(|a| matches!(&*a.node,
+                ExprNode::Const { path } if names_carrier(path, owner))))
+    };
+    for lc in &mut app.library_classes {
+        if !lc.is_module || !carriers.contains(lc.name.0.as_str()) {
+            continue;
+        }
+        let owner = lc.name.0.as_str().to_string();
+        lc.methods.retain(|m| {
+            let only_bridge = match &*m.body.node {
+                ExprNode::Seq { exprs } => !exprs.is_empty() && exprs.iter().all(|e| bridge(e, &owner)),
+                _ => bridge(&m.body, &owner),
+            };
+            !(m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && only_bridge)
+        });
+    }
+    let mut diags = Vec::new();
+    let mut f = |e: &mut Expr| {
+        restub(e, &class_extends, &mut diags);
+    };
+    super::for_each_hook_body(app, &mut f);
+    diags
+}
+
+fn restub(expr: &mut Expr, class_extends: &HashSet<Span>, diags: &mut Vec<Diagnostic>) {
+    expr.node.for_each_child_mut(&mut |c| restub(c, class_extends, diags));
+    if class_extends.contains(&expr.span) && matches!(&*expr.node, ExprNode::Send { .. }) {
+        let mut d = Diagnostic::unsupported(expr.span, None, CONSTRUCT, DETAIL);
+        d.severity = Severity::Warning;
+        diags.push(d);
+        *expr = stub_expr(expr.span);
+    }
 }

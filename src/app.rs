@@ -502,6 +502,18 @@ pub struct App {
     /// descriptions then disagree about the parameter types.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_spliced_class_methods: HashMap<ClassId, HashMap<Symbol, ClassId>>,
+    /// The subset of `concern_spliced_class_methods` on a LIBRARY class
+    /// that came from a concern's nested `module ClassMethods`, keyed
+    /// includer → one entry per carrier module.
+    ///
+    /// In Ruby those methods reach the includer through `extend`, never a
+    /// copy: the authored `def self.included(base) base.extend(ClassMethods)`
+    /// hook, or ActiveSupport::Concern's `append_features`. The copies stay
+    /// in the IR for analysis and for the targets without mixins; the Ruby
+    /// emit writes the includer without them, and with the `extend` that
+    /// only Concern would have run (its `append_features` is not emitted).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub class_methods_carrier_splices: HashMap<ClassId, Vec<ClassMethodsCarrierSplice>>,
     /// Model DSL declared inside a concern module's `included do`
     /// (`Account::Associations` → its `has_many :statuses` etc.),
     /// keyed by the module and classified as the same
@@ -669,6 +681,31 @@ pub enum TimeFormat {
     /// parameter, then `.to_s`, which is what Rails applies to the
     /// call's result above.
     Lambda { method: MethodDef },
+}
+
+/// One concern's nested `module ClassMethods`, as an includer received it
+/// (see `App::class_methods_carrier_splices`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClassMethodsCarrierSplice {
+    /// The carrier module (`Owner::ClassMethods`).
+    pub carrier: ClassId,
+    /// Class-side copies of its defs on the includer: typing only in Ruby.
+    pub methods: Vec<Symbol>,
+    /// Whether the includer itself must `extend` the carrier in Ruby:
+    /// true when only ActiveSupport::Concern's `append_features` (reached
+    /// through a chain of Concerns) extends it; false when the authored
+    /// `included` hook does, or nothing does.
+    pub extend: bool,
+}
+
+/// `Owner` for a module named `Owner::ClassMethods` — the nested carrier
+/// ActiveSupport::Concern (and the vanilla `base.extend(ClassMethods)`
+/// hook) extends an includer with.
+pub fn class_methods_carrier_owner(name: &crate::ident::ClassId) -> Option<crate::ident::ClassId> {
+    name.0.as_str()
+        .strip_suffix("::ClassMethods")
+        .filter(|owner| !owner.is_empty())
+        .map(|owner| crate::ident::ClassId(Symbol::from(owner)))
 }
 
 /// One `X.prepend Y` / `X.include Y` an initializer registers.
@@ -1052,6 +1089,7 @@ impl App {
             graphql_signatures: Vec::new(),
             concern_spliced_actions: HashMap::default(),
             concern_spliced_class_methods: HashMap::default(),
+            class_methods_carrier_splices: HashMap::default(),
             concern_model_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             render_edges: HashMap::default(),

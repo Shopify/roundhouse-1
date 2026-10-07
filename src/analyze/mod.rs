@@ -3900,6 +3900,22 @@ impl Analyzer {
         );
         let mode = self.incremental.mode;
         let mut print_time = std::time::Duration::ZERO;
+        // A nested `module ClassMethods` of a library module is the carrier
+        // ActiveSupport::Concern (or the module's own `included` hook)
+        // `extend`s an includer with: its instance methods run with `self`
+        // the extending class/module object. Ingest used to fold them into
+        // the owner as `def self.x`; the module is real now, and that
+        // reading survives as typing only (`define_method`, `class_eval`,
+        // `self < Base` are Module protocol on that receiver).
+        let library_modules: crate::det::HashSet<&ClassId> =
+            app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
+        let class_methods_carriers: crate::det::HashSet<ClassId> = app.library_classes.iter()
+            .filter(|lc| lc.is_module)
+            .filter(|lc| crate::app::class_methods_carrier_owner(&lc.name)
+                .is_some_and(|owner| library_modules.contains(&owner)))
+            .map(|lc| lc.name.clone())
+            .collect();
+        drop(library_modules);
         for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
                 let created = !self.classes.contains_key(&lc.name);
@@ -3994,7 +4010,9 @@ impl Analyzer {
                         self.body_typer().with_deps(&deps).analyze_expr(default, &class_ctx);
                     }
                 }
-                let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
+                let mut mctx = self.seed_method_params(&class_ctx, &lc_name, method);
+                mctx.class_side |= method.receiver == MethodReceiver::Instance
+                    && class_methods_carriers.contains(&lc_name);
                 self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
             }
 
@@ -4114,7 +4132,9 @@ impl Analyzer {
                     constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false,
                 };
                 for method in &mut lc.methods {
-                    let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method);
+                    let mut mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method);
+                    mctx.class_side |= method.receiver == MethodReceiver::Instance
+                        && class_methods_carriers.contains(&lc_name);
                     self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
                 }
             }
