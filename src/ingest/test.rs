@@ -388,6 +388,14 @@ fn ingest_test_class(
                 let const_name = std::str::from_utf8(cw.name().as_slice())
                     .ok()
                     .map(Symbol::from);
+                // A sorbet type alias is the type object the check reads
+                // (`sorbet_check::alias_value`), or nothing.
+                if super::library_class::is_sorbet_type_alias(&cw.value()) {
+                    if let (Some(const_name), Some(value)) = (const_name, super::sorbet_check::alias_value(&cw.value(), file)?) {
+                        constants.push((const_name, value));
+                    }
+                    continue;
+                }
                 if let Some(const_name) = const_name {
                     let value = ingest_expr(&cw.value(), file)?;
                     constants.push((const_name, value));

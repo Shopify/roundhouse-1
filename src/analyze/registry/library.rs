@@ -113,6 +113,19 @@ pub(in crate::analyze) fn register(
             cls.parent = lc.parent.clone();
         }
     }
+    // Every sorbet type alias, carried or not, on its owner: the
+    // declared type of a cast reads through it (`body::expand_type_aliases`).
+    // A library class's or model's; a test class has no entry here.
+    let owners: crate::det::HashSet<&crate::ident::ClassId> =
+        app.library_classes.iter().map(|lc| &lc.name).chain(app.models.iter().map(|m| &m.name)).collect();
+    for (owner, name, value) in &app.sorbet_type_aliases {
+        if !owners.contains(owner) {
+            continue;
+        }
+        if let Some(aliased) = crate::ingest::sorbet_check::alias_ty(value) {
+            classes.entry(owner.clone()).or_default().type_aliases.insert(name.clone(), aliased);
+        }
+    }
 
     // The Attachment's own readers, on the app's attachable classes.
     // Action Text hands an attachable's partial the ATTACHMENT, which

@@ -2220,6 +2220,8 @@ end
     let late_sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&[], &late_sources);
     app.dropped_files = survey::dropped_files();
+    // After every body exists: which carried aliases a check reads.
+    super::sorbet_check::settle_type_aliases(&mut app);
     // Survey mode goes on past a file whose class ingest failed, as the
     // support-dir walk does outside it: each is an error at the
     // construct that failed it too, not only a punch-list entry.

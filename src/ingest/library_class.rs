@@ -232,7 +232,13 @@ fn file_level_constants(
     };
     for stmt in prog.statements().body().iter() {
         let Some(cw) = stmt.as_constant_write_node() else { continue };
-        if is_sorbet_type_alias(&cw.value()) || super::factory_class::is_factory_class_write(&stmt) {
+        if is_sorbet_type_alias(&cw.value()) {
+            if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
+                out.push((Symbol::from(constant_id_str(&cw.name())), value));
+            }
+            continue;
+        }
+        if super::factory_class::is_factory_class_write(&stmt) {
             continue;
         }
         out.push((
@@ -439,11 +445,10 @@ pub(super) fn library_class_and_struct_base(
 }
 
 /// `NAME = T.type_alias { … }` — a constant holding a TYPE. Unlike
-/// `T::Struct` and `T::Enum` it generates nothing and answers nothing:
-/// the only thing that ever reads it is a `sig`, and those are read
-/// before they are dropped. So the constant goes with them rather than
-/// being carried into an emitted tree that has no sorbet-runtime to
-/// build the type object with.
+/// `T::Struct` and `T::Enum` it generates no class. A `sig` reads it
+/// before sigs are dropped; a sorbet check (`T.let(x, NAME)`) reads it
+/// at runtime, so the CRuby / JRuby trees carry the type object
+/// (`sorbet_check::alias_value`) and every other tree drops it.
 pub(super) fn is_sorbet_type_alias(value: &ruby_prism::Node<'_>) -> bool {
     let Some(call) = value.as_call_node() else { return false };
     match constant_id_str(&call.name()) {
@@ -1746,7 +1751,12 @@ fn walk_decl_body_with_visibility<'pr>(
         }
         // Class-level constant `NAME = <expr>` (e.g. `STORIES_PER_PAGE = 25`).
         if let Some(cw) = stmt.as_constant_write_node() {
+            // A type alias is carried as the type object the sorbet
+            // check reads (`sorbet_check::alias_value`), or dropped.
             if is_sorbet_type_alias(&cw.value()) {
+                if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
+                    out.constants.push((Symbol::from(constant_id_str(&cw.name())), value));
+                }
                 continue;
             }
             // `NAME = Struct.new(...) do … end` is a class, which

@@ -34,11 +34,22 @@
 //!
 //! `strip` rather than the regex because every target emitter carries
 //! it and a POSIX character class is not a shape every regex backend
-//! shares. The divergence that leaves is NON-ASCII whitespace: Ruby's
-//! `String#strip` takes ASCII space plus NUL, where `[[:space:]]` also
-//! takes U+00A0 and friends. No corpus app has one, and the targets
+//! shares. The divergence that leaves is NON-ASCII whitespace and NUL:
+//! Ruby's `String#strip` takes ASCII space plus NUL, where `[[:space:]]`
+//! takes U+00A0, U+3000, U+2028 and friends but not NUL. The targets
 //! disagree there among themselves anyway — Python's `.strip()` and
-//! JavaScript's `.trim()` do take them.
+//! JavaScript's `.trim()` do take the Unicode spaces.
+//!
+//! The CRuby and JRuby trees do not carry that divergence. The `empty?`
+//! this pass builds is tagged `IrHint::StringBlank`, and the Ruby
+//! emitter writes it there as Rails' own `r.blank?`
+//! (`emit::ruby::expr::rails_string_blank`), which their overlay's
+//! `String#blank?` answers with activesupport's regex and its retry in
+//! the string's own encoding (`tests/string_blank_run.rs` holds it to
+//! the native run). The spinel tree keeps `r.strip.empty?`: it has no
+//! `String#blank?` to send to, and `runtime/ruby/active_support_ext.rb`'s
+//! regex form has no encoding retry there, so the divergence above is
+//! its named gap.
 //!
 //! The nil-safety patch this used to be deferred behind
 //! (`emit::ruby::library::rewrite_empty_nilsafe`, which wraps the
@@ -1022,8 +1033,9 @@ fn plain_empty(span: crate::span::Span, r: Expr) -> Expr {
 
 /// `r.strip.empty?` — ActiveSupport's `String#blank?`, which is a
 /// whitespace match and not `empty?`. See the module header for why it
-/// is `strip` rather than the `/\A[[:space:]]*\z/` Rails writes, and
-/// for the one divergence that leaves.
+/// is `strip` rather than the `/\A[[:space:]]*\z/` Rails writes, for
+/// the divergence that leaves, and for the `IrHint::StringBlank` that
+/// lets the CRuby and JRuby trees write Rails' `r.blank?` instead.
 ///
 /// THE RECEIVER'S STAMP IS NARROWED to its non-nil half, because every
 /// nilable form below guards the strip behind a `nil?` test and that is
@@ -1040,7 +1052,9 @@ fn plain_empty(span: crate::span::Span, r: Expr) -> Expr {
 /// on top of, not one it introduces.
 fn blank_str(span: crate::span::Span, mut r: Expr) -> Expr {
     r.ty = Some(non_nil_ty(&r));
-    plain_empty(span, send0(span, r, "strip", Ty::Str))
+    let mut empty = plain_empty(span, send0(span, r, "strip", Ty::Str));
+    empty.hint = Some(crate::expr::IrHint::StringBlank);
+    empty
 }
 
 /// The grounded form a LATER pass must synthesize instead of spelling

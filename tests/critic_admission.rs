@@ -133,6 +133,62 @@ fn sorbet_type_checks_are_refused_where_the_tree_cannot_run_them() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A sorbet type alias is the type object the Ruby trees' check reads
+/// (`Title = SorbetRuntimeCheck.type_alias { String }`), and its static
+/// type is the type it names. Every other tree drops it with the checks
+/// that could read it: one no check reads must not stop that tree.
+#[test]
+fn a_type_alias_is_carried_where_its_check_runs() {
+    let alias_app = |body: &str| {
+        let root = probe_app(body);
+        let model = root.join("app/models/probe.rb");
+        let text = std::fs::read_to_string(&model).unwrap();
+        std::fs::write(&model, text.replacen("  validates", "  Title = T.type_alias { T.nilable(String) }\n  validates", 1)).unwrap();
+        root
+    };
+    let root = alias_app("T.let(title, Title).to_s.length");
+    let (ok, text) = run(&root, &["check"]);
+    assert!(ok, "check refused the alias-typed check: {text}");
+    let (ok, text) = run(&root, &["--target", "ruby"]);
+    assert!(ok, "ruby refused the alias-typed check: {text}");
+    let emitted = walk(&root.join("emitted-ruby"));
+    assert!(emitted.contains("Title = SorbetRuntimeCheck.type_alias { SorbetRuntimeCheck.nilable(String) }"), "{emitted}");
+    assert!(emitted.contains("SorbetRuntimeCheck.cast(title, Probe::Title, \"T.let\""), "{emitted}");
+    let (ok, text) = run(&root, &["--target", "typescript"]);
+    assert!(!ok && text.contains("sorbet type check not supported"), "typescript lost the named refusal: {text}");
+    std::fs::remove_dir_all(root).unwrap();
+    // No check reads it: the tree that cannot carry it emits without it.
+    let root = alias_app("T.let(nil, T.nilable(Title))");
+    for target in ["ruby", "typescript"] {
+        let (ok, text) = run(&root, &["--target", target]);
+        assert!(ok, "{target} refused an alias no check reads: {text}");
+    }
+    let emitted = walk(&root.join("emitted-typescript"));
+    assert!(!emitted.contains("type_alias") && !emitted.contains("SorbetRuntimeCheck"), "{emitted}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Every file under `dir` but source maps (which embed the authored
+/// Ruby), concatenated.
+fn walk(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "node_modules") {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|e| e == "map") {
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                out.push_str(&text);
+            }
+        }
+    }
+    out
+}
+
 /// A type form the check cannot rebuild is refused at the site by name,
 /// on `check` and on the Ruby tree alike.
 #[test]

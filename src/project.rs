@@ -1210,6 +1210,31 @@ fn without_rails_health_controller(app: &App, target: BuildTarget) -> Option<App
     Some(app)
 }
 
+/// The app without the sorbet type aliases ingest carries
+/// (`sorbet_check::alias_value`), for a tree that refuses every sorbet
+/// check that could read one: the type object is the CRuby overlay's,
+/// and a constant nothing reads would only stop the tree loading.
+/// `None` when there is nothing to drop.
+fn without_sorbet_type_aliases(app: &App, target: BuildTarget) -> Option<App> {
+    use crate::ingest::sorbet_check::is_alias;
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return None;
+    }
+    let carried = app.library_classes.iter().any(|class| class.constants.iter().any(|(_, value)| is_alias(value)))
+        || app.test_modules.iter().any(|test| test.constants.iter().any(|(_, value)| is_alias(value)));
+    if !carried {
+        return None;
+    }
+    let mut app = app.clone();
+    for class in &mut app.library_classes {
+        class.constants.retain(|(_, value)| !is_alias(value));
+    }
+    for test in &mut app.test_modules {
+        test.constants.retain(|(_, value)| !is_alias(value));
+    }
+    Some(app)
+}
+
 /// A unique index whose `where:` SQLite can't be trusted to run as
 /// written — a Postgres dump's `((kind)::text = 'initial'::text)` or
 /// `= ANY (ARRAY[…])` — is unique over every row in the SQLite DDL, as
@@ -1338,6 +1363,14 @@ pub fn target_files(
         Some(trimmed) => {
             without_health = trimmed;
             &without_health
+        }
+        None => app,
+    };
+    let without_aliases;
+    let app = match without_sorbet_type_aliases(app, target) {
+        Some(trimmed) => {
+            without_aliases = trimmed;
+            &without_aliases
         }
         None => app,
     };

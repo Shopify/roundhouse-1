@@ -154,6 +154,11 @@ pub enum IrHint {
     StringBuilderResult,
     /// On a string `Lit` ingested from `+"literal"` (an unfrozen copy).
     MutableStringLiteral,
+    /// On the `empty?` of `r.strip.empty?` that `lower::blank` builds
+    /// for a String `blank?`. The CRuby and JRuby trees write Rails'
+    /// own `r.blank?` (the overlay's `String#blank?`: `[[:space:]]`
+    /// plus the encoding retry); the rest keep the `strip.empty?`.
+    StringBlank,
 }
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;

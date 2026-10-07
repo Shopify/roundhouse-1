@@ -13,14 +13,20 @@
 //! class at runtime, and the tree runs the same check
 //! (`ingest::sorbet_check`, the CRuby overlay's sorbet_runtime_check.rb):
 //! a value sorbet rejects raises sorbet's TypeError, message and
-//! `Caller:` line included. Every observation agrees with the native run.
+//! `Caller:` line included. A sorbet type alias (`Count = T.type_alias
+//! { Integer }`) is the type object that check reads, built at its first
+//! check as sorbet builds it. Every observation agrees with the native run.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
 use roundhouse::project::BuildTarget;
 use std::process::Command;
 
-const LIB: &str = r##"class Thing
+const LIB: &str = r##"module Shapes
+  Id = T.type_alias { T.any(Integer, String) }
+end
+
+class Thing
   def name
     "thing"
   end
@@ -38,6 +44,12 @@ class Box
 end
 
 class Caster
+  Count = T.type_alias { Integer }
+  Ids = T.type_alias { T::Array[Shapes::Id] }
+  Nested = T.type_alias { Count }
+  MaybeId = T.type_alias { T.nilable(Shapes::Id) }
+  Later = T.type_alias { Gadget }
+
   def initialize(values)
     @values = values
     @held = values.first #: as Integer
@@ -197,6 +209,43 @@ class Caster
       ),
     )
   end
+
+  def alias_count
+    T.let(@values.first, Count)
+  end
+
+  def alias_nilable
+    T.let(@values.first, T.nilable(Count))
+  end
+
+  def alias_union
+    T.cast(@values.first, T.any(Shapes::Id, Symbol))
+  end
+
+  def alias_ids
+    T.cast(@values.first, Ids)
+  end
+
+  def alias_nested
+    T.let(@values.first, Nested)
+  end
+
+  def alias_qualified
+    T.let(@values.first, Shapes::Id)
+  end
+
+  def alias_maybe_id
+    T.assert_type!(@values.first, MaybeId)
+  end
+
+  def alias_later
+    T.let(@values.first, Later)
+  end
+end
+
+# Named by `Caster::Later` before it is defined: the alias reads it at
+# its first check.
+class Gadget
 end
 "##;
 
@@ -222,17 +271,19 @@ seen("defaults") { Caster.new([]).defaults }
 CHECKED = VALUES.merge(
   "thing" => [Thing.new], "Thing" => [Thing], "labeled" => [Labeled.new], "box" => [Box.new],
   "true" => [true], "1.5" => [1.5], ":sym" => [:sym], "{}" => [{}], "[nil]" => [[nil]],
-  "long" => ["y" * 80], "mixed" => [[1, "a", true, false]], "{a: 1}" => [{ a: 1, b: 2.5 }]
+  "long" => ["y" * 80], "mixed" => [[1, "a", true, false]], "{a: 1}" => [{ a: 1, b: 2.5 }],
+  "gadget" => [Gadget.new]
 )
 %i[tcast_value tcast_present tlet_blank tlet_nilable tlet_any tlet_nilable_any tlet_bool tcast_nilable_bool
    tlet_bool_or_int tlet_array tcast_hash tlet_bare_array tlet_nilable_array tlet_generic tcast_class_of
-   tlet_untyped tlet_unchecked tbind tassert tlet_multiline].each do |m|
+   tlet_untyped tlet_unchecked tbind tassert tlet_multiline
+   alias_count alias_nilable alias_union alias_ids alias_nested alias_qualified alias_maybe_id alias_later].each do |m|
   CHECKED.each { |label, values| seen("#{m} #{label}") { Caster.new(values).public_send(m) } }
 end
 "##;
 
 const COMMENT_LINES: usize = 11 * 8 + 2 + 1;
-const CHECKED_LINES: usize = 20 * 20;
+const CHECKED_LINES: usize = 28 * 21;
 
 /// The 1-based line of LIB that contains `needle`; a needle ending in a
 /// newline is the whole (trimmed) line.
@@ -345,6 +396,19 @@ fn author_casts_answer_like_the_native_run() {
         format!("tbind '12': [\"TypeError\", \"T.bind: Expected type Integer, got type String with value \\\"12\\\"{}\"]", caller(line_of("T.bind(self, Integer)"))),
         format!("tassert :sym: [\"TypeError\", \"T.assert_type!: Expected type Integer, got type Symbol with value :sym{}\"]", caller(line_of("T.assert_type!(@values.first, Integer)"))),
         "tlet_multiline 1.5: 1.5".to_string(),
+        // Type aliases: the type each names, a union of them flattened,
+        // a forward reference read at the first check.
+        "alias_count 12: 12".to_string(),
+        format!("alias_count nil: [\"TypeError\", \"T.let: Expected type Integer, got type NilClass{}\"]", caller(line_of("T.let(@values.first, Count)"))),
+        format!("alias_nilable '12': [\"TypeError\", \"T.let: Expected type T.nilable(Integer), got type String with value \\\"12\\\"{}\"]", caller(line_of("T.nilable(Count)"))),
+        format!("alias_union 1.5: [\"TypeError\", \"T.cast: Expected type T.any(Integer, String, Symbol), got type Float with value 1.5{}\"]", caller(line_of("T.any(Shapes::Id, Symbol)"))),
+        format!("alias_ids {{}}: [\"TypeError\", \"T.cast: Expected type T::Array[T.any(Integer, String)], got T::Hash[T.noreturn, T.noreturn]{}\"]", caller(line_of("T.cast(@values.first, Ids)"))),
+        format!("alias_nested '12': [\"TypeError\", \"T.let: Expected type Integer, got type String with value \\\"12\\\"{}\"]", caller(line_of("T.let(@values.first, Nested)"))),
+        format!("alias_qualified :sym: [\"TypeError\", \"T.let: Expected type T.any(Integer, String), got type Symbol with value :sym{}\"]", caller(line_of("T.let(@values.first, Shapes::Id)"))),
+        "alias_maybe_id nil: nil".to_string(),
+        format!("alias_maybe_id false: [\"TypeError\", \"T.assert_type!: Expected type T.nilable(T.any(Integer, String)), got type FalseClass{}\"]", caller(line_of("MaybeId)"))),
+        "alias_later gadget: #<Gadget:0x>".to_string(),
+        format!("alias_later 12: [\"TypeError\", \"T.let: Expected type Gadget, got type Integer with value 12{}\"]", caller(line_of("T.let(@values.first, Later)"))),
     ] {
         assert!(native_lines.contains(&expected.as_str()), "missing {expected:?} in native:\n{native}");
     }
@@ -394,6 +458,14 @@ fn author_casts_emit_the_value_or_the_check() {
         "  def tlet_unchecked\n    @values.first\n  end\n".to_string(),
         format!("      SorbetRuntimeCheck.cast(self, Integer, \"T.bind\", {path}, {})\n      self + 1\n", at("T.bind(self, Integer)")),
         format!("  def tassert\n    SorbetRuntimeCheck.cast(@values.first, Integer, \"T.assert_type!\", {path}, {})\n  end\n", at("T.assert_type!(")),
+        // A type alias is the type object its block builds at the first
+        // check; a check names the constant.
+        "  Count = SorbetRuntimeCheck.type_alias { Integer }\n".to_string(),
+        "  Ids = SorbetRuntimeCheck.type_alias { SorbetRuntimeCheck.generic(\"T::Array\", ::Array, Shapes::Id) }\n".to_string(),
+        "  Nested = SorbetRuntimeCheck.type_alias { Caster::Count }\n".to_string(),
+        "  Later = SorbetRuntimeCheck.type_alias { Gadget }\n".to_string(),
+        format!("SorbetRuntimeCheck.cast(@values.first, Caster::Count, \"T.let\", {path}, {})", at("T.let(@values.first, Count)")),
+        format!("SorbetRuntimeCheck.cast(@values.first, SorbetRuntimeCheck.any(Shapes::Id, Symbol), \"T.cast\", {path}, {})", at("T.any(Shapes::Id, Symbol)")),
     ] {
         assert!(caster.contains(&expected), "missing {expected:?} in\n{caster}");
     }
@@ -413,7 +485,7 @@ fn a_cast_the_value_backs_still_grounds() {
         .emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let backed = std::fs::read_to_string(emitted.join("app/models/backed.rb")).unwrap();
-    assert!(backed.contains("s = \"x\"\n    (s || \"\").strip.empty?\n"), "{backed}");
+    assert!(backed.contains("s = \"x\"\n    (s || \"\").blank?\n"), "{backed}");
 }
 
 /// A type the check cannot rebuild is refused at the site by name, on

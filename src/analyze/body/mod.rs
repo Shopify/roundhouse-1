@@ -152,6 +152,10 @@ pub struct ClassInfo {
     /// Constant values declared by external gem RBI/RBS files, or by
     /// a modeled stdlib module (`registry::stdlib`, e.g. `Process`).
     pub constants: HashMap<Symbol, Ty>,
+    /// The sorbet type aliases the class declares (`Name =
+    /// T.type_alias { X }`), as the types they name
+    /// (`ingest::sorbet_check::alias_ty`); `expand_type_aliases` reads them.
+    pub type_aliases: HashMap<Symbol, Ty>,
     /// If this class maps to a database table, which one.
     pub table: Option<crate::ident::TableRef>,
     /// Instance-state shape (columns + attr_accessor).
@@ -300,6 +304,61 @@ pub(crate) fn lexical_class(
         parts.pop();
     }
     classes.contains_key(written).then(|| written.clone())
+}
+
+/// `ty` with every sorbet type alias it names (`Name = T.type_alias { X }`,
+/// in `ClassInfo::type_aliases`) replaced by the type the alias names.
+/// An alias is found the way `lexical_class` finds a class, innermost
+/// enclosing scope of `scope` first, and its own type is read in the
+/// scope that declares it. Bounded, so an alias cycle stays a class.
+pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) -> Ty {
+    fn expand(ty: &Ty, scope: &str, classes: Classes<'_>, depth: u8) -> Ty {
+        match ty {
+            Ty::Class { id, args } if args.is_empty() => {
+                if depth < 8 && let Some((owner, aliased)) = type_alias(id, scope, classes) {
+                    return expand(&aliased, &owner, classes, depth + 1);
+                }
+                ty.clone()
+            }
+            Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(|t| expand(t, scope, classes, depth)).collect() },
+            Ty::Array { elem } => Ty::Array { elem: Box::new(expand(elem, scope, classes, depth)) },
+            Ty::Hash { key, value } => Ty::Hash {
+                key: Box::new(expand(key, scope, classes, depth)),
+                value: Box::new(expand(value, scope, classes, depth)),
+            },
+            Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(|t| expand(t, scope, classes, depth)).collect() },
+            Ty::Union { variants } => union_many(variants.iter().map(|t| expand(t, scope, classes, depth)).collect()),
+            other => other.clone(),
+        }
+    }
+    fn type_alias(written: &ClassId, scope: &str, classes: Classes<'_>) -> Option<(String, Ty)> {
+        let (prefix, name) = match written.0.as_str().rsplit_once("::") {
+            Some((prefix, name)) => (prefix.trim_start_matches("::"), name),
+            None => ("", written.0.as_str()),
+        };
+        let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+        loop {
+            let owner = parts.iter().copied().chain((!prefix.is_empty()).then_some(prefix)).collect::<Vec<_>>().join("::");
+            if !owner.is_empty()
+                && let Some(info) = classes.get(&ClassId(Symbol::from(owner.as_str())))
+                && let Some(aliased) = info.type_aliases.get(&Symbol::from(name))
+            {
+                return Some((owner, aliased.clone()));
+            }
+            if parts.pop().is_none() {
+                return None;
+            }
+        }
+    }
+    let has_class = std::cell::Cell::new(false);
+    ty.map_class_ids(&|id| {
+        has_class.set(true);
+        id.clone()
+    });
+    if !has_class.get() {
+        return ty.clone();
+    }
+    expand(ty, scope, classes, 0)
 }
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
@@ -2384,6 +2443,11 @@ impl<'a> BodyTyper<'a> {
                 // nearest one (`Capabilities::Charge` in
                 // `ShopifyPayments::Capability` is
                 // `ShopifyPayments::Capabilities::Charge`).
+                // A sorbet type alias is the type it names.
+                let target_ty = &match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
+                    Some(Ty::Class { id: scope, .. }) => expand_type_aliases(target_ty, scope.0.as_str(), self.classes()),
+                    _ => expand_type_aliases(target_ty, "", self.classes()),
+                };
                 let resolved = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
                     Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
                         lexical_class(id, scope.0.as_str(), self.classes()).unwrap_or_else(|| id.clone())

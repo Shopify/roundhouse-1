@@ -253,6 +253,7 @@ fn rewrite_stdlib_const(name: &str) -> Option<&'static str> {
 fn try_string_builder(e: &Expr) -> Option<String> {
     match e.hint? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
+        IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign {
                 target: LValue::Var { name, .. }, ..
