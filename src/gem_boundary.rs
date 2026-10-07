@@ -48,6 +48,12 @@ pub const RUBY_STDLIB: &[&str] = &[
     "WeakRef", "Gem", "Bundler", "Errno",
 ];
 
+/// How many modules [`GemBoundary::loaded_instance_surface`] visits
+/// following `include`s before it stops: a gem's mixin chains are a few
+/// modules deep, and a cycle or a pathological chain must not stall the
+/// emit.
+pub const MIXIN_WALK_LIMIT: usize = 32;
+
 /// Every gem class or module an RBI declares, by qualified name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GemBoundary {
@@ -100,6 +106,27 @@ pub struct GemSourceConstants {
     /// statement for it opens it.
     #[serde(default)]
     pub kinds: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceKind>>,
+    /// Module -> gem -> what the gem's source gives it as a mixin
+    /// (`SourceMixin`): the source counterpart of an RBI's methods,
+    /// includes and `mixes_in_class_methods`.
+    #[serde(default)]
+    pub mixins: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceMixin>>,
+}
+
+/// What a gem's installed source says about one of its modules as a
+/// mixin, every body that opens it merged. Names are fully qualified,
+/// resolved against the constants the gem declares as Ruby resolves them
+/// from the body's lexical scope; one the gem does not declare is left out.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceMixin {
+    /// The `def`s and `attr_*` methods of its body: its instance methods.
+    pub instance_methods: BTreeSet<String>,
+    /// `include X` in its body.
+    pub includes: Vec<String>,
+    /// The `X` of each unconditional `base.extend(X)` statement of its
+    /// `self.included(base)` hook (smart_properties' `base.extend
+    /// (ClassMethods)`): what Tapioca writes as `mixes_in_class_methods`.
+    pub mixes_in_class_methods: Vec<String>,
 }
 
 /// How a gem's source opens a class or module: `module`, or `class` with
@@ -290,6 +317,105 @@ impl GemBoundary {
         self.classes.get(name).filter(|class| self.loads(&class.gem))
     }
 
+    /// The declared class or module a constant `written` inside `scope`
+    /// names, looked up as Ruby does from the scope outwards
+    /// (`ClassMethods` written in `SmartProperties` is
+    /// `SmartProperties::ClassMethods`); a rooted `::X` names only `X`.
+    pub fn resolve_written(&self, scope: &str, written: &ClassId) -> Option<ClassId> {
+        let text = written.0.as_str();
+        if let Some(rooted) = text.strip_prefix("::") {
+            let id = ClassId(Symbol::from(rooted));
+            return self.classes.contains_key(&id).then_some(id);
+        }
+        let mut scope: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+        loop {
+            let candidate = if scope.is_empty() { text.to_string() } else { format!("{}::{text}", scope.join("::")) };
+            let id = ClassId(Symbol::from(candidate.as_str()));
+            if self.classes.contains_key(&id) {
+                return Some(id);
+            }
+            scope.pop()?;
+        }
+    }
+
+    /// Whether `name` is a module of a gem the tree loads, outside Ruby's
+    /// core and standard library: by its RBI ([`Self::loaded_reopen`]),
+    /// else by its installed source ([`Self::loaded_source_reopen`]).
+    pub fn is_loaded_gem_module(&self, name: &ClassId) -> bool {
+        match self.loaded_reopen(name) {
+            Some(class) => class.is_module,
+            None => self.loaded_source_reopen(name).is_some_and(|(_, kind)| kind.is_module),
+        }
+    }
+
+    /// The loaded gem module `name` as a mixin, names resolved: its
+    /// instance methods, the modules it includes, and its
+    /// `mixes_in_class_methods`. The RBI decides when it declares the
+    /// module; otherwise the gem's installed source (`SourceMixin`).
+    /// `None` when `name` is no loaded gem's module.
+    pub fn loaded_mixin(&self, name: &ClassId) -> Option<LoadedMixin> {
+        if let Some(class) = self.loaded_reopen(name) {
+            if !class.is_module {
+                return None;
+            }
+            let resolve = |list: &[ClassId]| -> Vec<ClassId> {
+                list.iter().filter_map(|w| self.resolve_written(name.0.as_str(), w)).collect()
+            };
+            return Some(LoadedMixin {
+                instance_methods: class.instance_methods.keys().cloned().collect(),
+                includes: resolve(&class.includes),
+                mixes_in_class_methods: resolve(&class.mixes_in_class_methods),
+            });
+        }
+        let (gem, kind) = self.loaded_source_reopen(name)?;
+        if !kind.is_module {
+            return None;
+        }
+        let text = name.0.as_str().trim_start_matches("::");
+        let Some(mixin) = self.source_constants.mixins.get(text).and_then(|gems| gems.get(gem)) else {
+            return Some(LoadedMixin::default());
+        };
+        let ids = |list: &[String]| -> Vec<ClassId> { list.iter().map(|n| ClassId(Symbol::from(n.as_str()))).collect() };
+        Some(LoadedMixin {
+            instance_methods: mixin.instance_methods.iter().map(|m| Symbol::from(m.as_str())).collect(),
+            includes: ids(&mixin.includes),
+            mixes_in_class_methods: ids(&mixin.mixes_in_class_methods),
+        })
+    }
+
+    /// The instance methods of the loaded gem module `module` and of the
+    /// loaded gem modules it includes, transitively: what `extend module`
+    /// gives the extended object as its singleton methods. Modules outside
+    /// a loaded gem ([`Self::loaded_mixin`]) contribute nothing; the walk
+    /// stops after [`MIXIN_WALK_LIMIT`] modules.
+    pub fn loaded_instance_surface(&self, module: &ClassId) -> BTreeSet<Symbol> {
+        let mut out = BTreeSet::new();
+        let mut seen: Vec<ClassId> = Vec::new();
+        let mut queue = vec![module.clone()];
+        while let Some(id) = queue.pop() {
+            if seen.contains(&id) || seen.len() >= MIXIN_WALK_LIMIT {
+                continue;
+            }
+            seen.push(id.clone());
+            let Some(mixin) = self.loaded_mixin(&id) else { continue };
+            out.extend(mixin.instance_methods);
+            queue.extend(mixin.includes.into_iter().rev());
+        }
+        out
+    }
+
+    /// The class-side methods `include module` gives the includer when
+    /// `module` is a loaded gem module that mixes class methods in
+    /// (`mixes_in_class_methods M` in its RBI, `base.extend(M)` in its
+    /// source's `included(base)` hook): Ruby runs the gem's hook, which
+    /// extends `base` with `M`, so `M`'s instance surface
+    /// ([`Self::loaded_instance_surface`]) becomes the includer's class
+    /// methods. Empty for anything else.
+    pub fn loaded_mixed_in_class_methods(&self, module: &ClassId) -> BTreeSet<Symbol> {
+        let Some(mixin) = self.loaded_mixin(module) else { return BTreeSet::new() };
+        mixin.mixes_in_class_methods.iter().flat_map(|m| self.loaded_instance_surface(m)).collect()
+    }
+
     /// [`Self::loaded_reopen`] for a tree with no RBI for the gem: the
     /// class or module the installed source of a gem the CRuby tree loads
     /// opens (`GemSourceConstants::kinds`), with the gem. Every gem read
@@ -329,6 +455,16 @@ impl GemBoundary {
     }
 }
 
+/// A loaded gem module as a mixin ([`GemBoundary::loaded_mixin`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadedMixin {
+    pub instance_methods: Vec<Symbol>,
+    /// Included modules, fully qualified.
+    pub includes: Vec<ClassId>,
+    /// `mixes_in_class_methods` modules, fully qualified.
+    pub mixes_in_class_methods: Vec<ClassId>,
+}
+
 /// One class or module as an RBI declares it.
 ///
 /// Class names inside `Ty`s are as WRITTEN: resolving them needs the
@@ -346,6 +482,16 @@ pub struct GemClass {
     /// `extend` targets, as written: their instance methods are this
     /// class's class-side surface.
     pub extends: Vec<ClassId>,
+    /// `mixes_in_class_methods` targets: the modules whose instance
+    /// methods become the class-side surface of whatever includes this
+    /// module, which the gem's `self.included(base)` hook gives the
+    /// includer (`base.extend(ClassMethods)`); Tapioca writes the hook
+    /// as this annotation. A rooted name (`::SmartProperties::
+    /// ClassMethods`) keeps its leading `::`; any other is as written,
+    /// resolved from this module's scope outwards
+    /// ([`GemBoundary::resolve_written`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixes_in_class_methods: Vec<ClassId>,
     pub instance_methods: HashMap<Symbol, Ty>,
     pub class_methods: HashMap<Symbol, Ty>,
     /// Constants the body assigns (`DEFAULT = ...`), which are values,
