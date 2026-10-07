@@ -103,6 +103,22 @@ module Rails
     def to_path
       @base
     end
+
+    # Pathname's file readers, which read the file the path names.
+    # Core's GraphApi::Authorization builds a class-body constant from
+    # `Rails.root.join("db/data/...").readlines(chomp: true)`; without
+    # these, Kernel's private `readlines` answered and raised.
+    def readlines(chomp: false)
+      File.read(@base).lines(chomp: chomp)
+    end
+
+    def read
+      File.read(@base)
+    end
+
+    def exist?
+      File.exist?(@base)
+    end
   end
 
   # One store per process. A fresh `Cache.new` per call would make every
