@@ -13,8 +13,10 @@
 //! `append_features` the emitted module no longer has) extends each
 //! carrier itself, in Ruby's order. The fold survives only as typing:
 //! the carrier's defs are typed as the includer's class side, with
-//! `self` a class object (`define_method`, `self < Object`). Native Ruby
-//! on the same sources is the oracle.
+//! `self` a class object (`define_method`, `self < Object`). A
+//! module-level `class << self` is the module's own singleton and reaches
+//! no includer, Concern or not. Native Ruby on the same sources is the
+//! oracle.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -46,6 +48,10 @@ end
     ("user_thing", "class UserThing\n  include Flaggy\n  PREFIX = \"local\"\nend\n"),
     ("letty", r#"module Letty
   extend ActiveSupport::Concern
+
+  class << self
+    def own_shift = :letty
+  end
 
   module ClassMethods
     def lets = { a: 1 }
@@ -117,7 +123,8 @@ UserThing.flag_alias(:fa)
 p [UserThing.flag, Flaggy.respond_to?(:flag), Flaggy.const_defined?(:ClassMethods),
    UserThing.singleton_class.include?(Flaggy::ClassMethods), Flaggy::ClassMethods.instance_methods.sort,
    UserThing.new.fa, UserThing.object_subclass?, UserThing.prefix]
-p [LetUser.lets, LetChild.parent_lets(LetChild), LetUser.parent_lets(Object), Letty.respond_to?(:lets)]
+p [LetUser.lets, LetChild.parent_lets(LetChild), LetUser.parent_lets(Object), Letty.respond_to?(:lets),
+   Letty.own_shift, LetUser.respond_to?(:own_shift)]
 p [Transformed.new.transform, Transformy.respond_to?(:transform), Transformed.respond_to?(:included)]
 p [h.acts_as_thing, h.singleton_class.include?(Acts::ClassMethods), ActsHost.respond_to?(:thing_names)]
 p [ConcernHost.inner, ConcernHost.outer, ConcernHost.who,
@@ -125,7 +132,7 @@ p [ConcernHost.inner, ConcernHost.outer, ConcernHost.who,
 "#;
 
 const EXPECTED: &str = r#"[:flag, false, true, true, [:flag, :flag_alias, :object_subclass?, :prefix], :defined, true, "flaggy"]
-[{a: 1}, {a: 1}, :none, false]
+[{a: 1}, {a: 1}, :none, false, :letty, false]
 [:class_transform, false, false]
 [[:thing], true, false]
 [:inner, :outer, :outer, ["OuterConcern::ClassMethods", "InnerConcern::ClassMethods"]]

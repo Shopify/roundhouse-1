@@ -817,6 +817,14 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         let mut included_origins =
                             super::helper_surface::RegisteredOrigins::default();
                         for lc in classes.iter().filter(|_| is_helper_module) {
+                            // A nested `module ClassMethods` is the
+                            // helper's class side, extended onto
+                            // includers; none of it is view-visible.
+                            if crate::app::class_methods_carrier_owner(&lc.name)
+                                .is_some_and(|owner| classes.iter().any(|c| c.name == owner))
+                            {
+                                continue;
+                            }
                             let origins = origins.as_ref().expect("helper origins");
                             let singletons: std::collections::BTreeSet<Symbol> = lc
                                 .methods

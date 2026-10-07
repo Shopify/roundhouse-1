@@ -142,11 +142,12 @@ fn class_methods_block_reaches_the_including_model() {
     );
 }
 
-/// `module_function` makes a singleton on the MODULE. Rails leaves it
-/// there. Copying it invented `User.email_on_blocklist?` on three
-/// lobsters models before the carrier list existed.
+/// A module-level `class << self` defines the MODULE's own singleton,
+/// Concern or not: native Ruby answers `Message.respond_to?(:from_token)`
+/// false and `Message::Window.from_token` keeps working. Only
+/// `class_methods do` / `module ClassMethods` reach the includer.
 #[test]
-fn class_shift_self_reaches_the_including_model() {
+fn class_shift_self_stays_on_the_module() {
     let app = ingest_app_from_tree(tree(&[
         (
             "db/schema.rb",
@@ -169,11 +170,16 @@ fn class_shift_self_reaches_the_including_model() {
         .map(|f| f.content.clone())
         .expect("message.rb");
     assert!(
-        message.contains("def self.from_token(token)"),
-        "class << self method lands on the includer:\n{message}"
+        !message.contains("from_token"),
+        "class << self method stays off the includer:\n{message}"
     );
+    let window = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Message::Window").expect("Message::Window");
+    assert!(window.methods.iter().any(|m| m.name.as_str() == "from_token"), "the module keeps its singleton");
 }
 
+/// `module_function` makes a singleton on the MODULE. Rails leaves it
+/// there. Copying it invented `User.email_on_blocklist?` on three
+/// lobsters models before the carrier list existed.
 #[test]
 fn module_own_singletons_do_not_reach_the_includer() {
     let m = message();
@@ -438,4 +444,16 @@ fn split_bridges_require_the_actual_nested_carrier_and_keep_other_callbacks() {
         let expect_build = carrier_module == Some("Factory::ClassMethods") || block_only == declaration;
         assert_eq!(typed_build, expect_build, "{bridge}\n{declaration}");
     }
+}
+
+/// A helper's nested `module ClassMethods` is its class side: none of it
+/// is a bare view helper.
+#[test]
+fn a_helper_carrier_is_not_view_visible() {
+    let app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+        ("app/helpers/flags_helper.rb", "module FlagsHelper\n  def self.included(base)\n    base.extend(ClassMethods)\n  end\n\n  module ClassMethods\n    def flag_names = [:a]\n  end\n\n  def flag_label = \"x\"\nend\n"),
+    ])).expect("ingest");
+    assert!(app.helper_method_index.contains_key(&roundhouse::Symbol::new("flag_label")));
+    assert!(!app.helper_method_index.contains_key(&roundhouse::Symbol::new("flag_names")), "{:?}", app.helper_method_index);
 }

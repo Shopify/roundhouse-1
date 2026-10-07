@@ -3752,14 +3752,11 @@ pub fn ingest_concern_class_method_spans(
             // above this function) so the concern fold copies these
             // names onto includers exactly as it does for `class_methods
             // do` / `module ClassMethods`.
-            if let Some(singleton) = stmt.as_singleton_class_node() {
-                // `class << self` is a class-method carrier. Record the
-                // defs so an includer receives them. `module_function`
-                // is not this node and stays on the module.
-                if singleton.expression().as_self_node().is_some() {
-                    defs_in(singleton.body(), file, &mut spans);
-                }
-            }
+            // A module-level `class << self` is NOT a carrier: like
+            // `def self.x` and `module_function`, it defines the module's
+            // own singleton, which `include` never carries and
+            // ActiveSupport::Concern never extends
+            // (`C.respond_to?(:x)` is false natively, Concern or not).
             if let Some(def) = super::visibility::definition(&stmt) {
                 if let Some(singleton_body) = included_hook_class_methods_body(&def) {
                     defs_in(Some(singleton_body), file, &mut spans);
