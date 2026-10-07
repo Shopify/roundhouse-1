@@ -1564,7 +1564,20 @@ pub fn target_files(
     // Full forwarding currently has a native Ruby contract only. A
     // declaration must be gated even when its body never forwards.
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
-        for (span, policy) in crate::analyze::forwarding::keyword_calls(app) {
+        let mut calls = crate::analyze::forwarding::keyword_calls(app);
+        // A splat the shared lowering kept for the Ruby family alone stays
+        // refused here even where the lowered app now classifies it as
+        // ordinary: it was never erased for this target.
+        fn ruby_native(e: &crate::expr::Expr, calls: &mut crate::det::HashMap<crate::span::Span, crate::analyze::forwarding::KeywordPolicy>) {
+            if e.decisions & crate::expr::RUBY_NATIVE_KEYWORD_SPLAT != 0 {
+                calls.insert(e.span, crate::analyze::forwarding::KeywordPolicy::NativeRuby);
+            }
+            e.node.for_each_child(&mut |c| ruby_native(c, calls));
+        }
+        crate::lower::for_each_forwarding_body_ref(app, &mut |e| ruby_native(e, &mut calls));
+        let mut calls: Vec<_> = calls.into_iter().collect();
+        calls.sort_by_key(|(span, _)| (span.file.0, span.start, span.end));
+        for (span, policy) in calls {
             if policy != crate::analyze::forwarding::KeywordPolicy::Legacy {
                 let (construct, detail) = if matches!(policy,
                     crate::analyze::forwarding::KeywordPolicy::RefuseOrdinarySuper

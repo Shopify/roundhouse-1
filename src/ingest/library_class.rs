@@ -1867,7 +1867,9 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
 /// A module's methods are copied into whatever includes it, and a
 /// class-side `def self.m(*)` into other carriers, which are not shown
 /// to keep it, so those stay refused. So does a method that passes the
-/// rest on (`source_passes_rest_on`): ingest keeps no slot for it.
+/// rest on by a bare `*` (`source_passes_rest_on`): ingest keeps no slot
+/// for it. An implicit `super` passes it on as Ruby does: the CRuby tree
+/// writes the zsuper bare beside the kept `*`.
 /// Lowerings that copy the parameters into a generated method (job and
 /// mailer wrappers) refuse it themselves.
 ///
@@ -1891,20 +1893,17 @@ fn admit_nameless_rest(methods: &mut [MethodDef]) {
     }
 }
 
-/// A bare `*` (`f(*)`, `[*]`) or an implicit `super` anywhere in the
-/// written def, parameters included. Read off the source, not the IR:
-/// IR ingests a bare `*` as a splat of nil, and drops some positions
-/// outright (a block parameter's default).
+/// A bare `*` (`f(*)`, `[*]`) anywhere in the written def, parameters
+/// included. Read off the source, not the IR: IR ingests a bare `*` as a
+/// splat of nil, and drops some positions outright (a block parameter's
+/// default). An implicit `super` keeps no binding of its own: it is the
+/// IR's argument-less `Super`, which the CRuby tree writes as written.
 fn source_passes_rest_on(def: &ruby_prism::DefNode<'_>) -> bool {
     struct Uses(bool);
     impl<'pr> ruby_prism::Visit<'pr> for Uses {
         fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
             self.0 |= node.expression().is_none();
             ruby_prism::visit_splat_node(self, node);
-        }
-        fn visit_forwarding_super_node(&mut self, node: &ruby_prism::ForwardingSuperNode<'pr>) {
-            self.0 = true;
-            ruby_prism::visit_forwarding_super_node(self, node);
         }
     }
     let mut uses = Uses(false);

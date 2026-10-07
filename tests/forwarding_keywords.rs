@@ -280,19 +280,26 @@ fn compiled_empty_and_optional_keyword_packets_survive_two_hops() {
     assert_eq!(run.stdout, "14\n21\n");
 }
 
+/// The lexical `target(factor:)` and the override's `target(...)` admit
+/// neither one projection: no target without keyword arguments may erase
+/// or keep the splat. The Ruby family writes it as written, and Ruby
+/// binds it to whichever method the receiver dispatches to.
 #[test]
 fn competing_ordinary_and_full_virtual_keyword_contracts_refuse_projection() {
     let source = "class Sink; def self.leaf(factor:,extra:); factor-extra; end; end; class Parent; def run; kw={factor:11,extra:4}; target(**kw); end; def target(factor:); factor; end; end; class Child < Parent; def target(...); Sink.leaf(...); end; end";
-    native_result(source, "puts Child.new.run", "7\n");
+    let script = "puts Child.new.run; puts Parent.new.run rescue puts $!.class";
+    native_result(source, script, "7\nArgumentError\n");
     let run = emit_and_run::real_blog()
         .write("app/lib/probe.rb", source)
-        .run_ruby("puts Child.new.run");
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "7\nArgumentError\n");
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/lib/probe.rb", source)
+        .emit(roundhouse::project::BuildTarget::Spinel);
     assert!(
-        run.errors.iter().any(|e| e.contains("keyword producer")),
-        "{:?}; actual={}; stderr={}",
-        run.errors,
-        run.stdout,
-        run.stderr
+        errors.iter().any(|e| e.contains("keyword splat into full argument forwarding")),
+        "{errors:?}"
     );
 }
 

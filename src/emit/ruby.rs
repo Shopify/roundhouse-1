@@ -76,10 +76,9 @@ pub fn emit_method(m: &MethodDef) -> String {
     // (`name: default`, `**rest`): Ruby 3 would bind a caller's keyword
     // Hash to the first optional positional. Only a trailing run can be
     // keywords; anything after it keeps the whole method positional.
-    let tail = m.params.iter().rev().take_while(|p| p.from_keyword || p.from_kwrest).count();
-    let first_kw = m.params.len() - tail;
-    let rest_ok = m.params[first_kw..].iter().position(|p| p.from_kwrest).is_none_or(|i| i + 1 == tail);
-    let respell = expr::native_keywords() && tail > 0 && rest_ok;
+    let respelled = crate::dialect::Param::respelled_keywords_from(&m.params);
+    let first_kw = respelled.unwrap_or(m.params.len());
+    let respell = expr::native_keywords() && first_kw < m.params.len();
     let mut ps: Vec<String> = m
         .params
         .iter()

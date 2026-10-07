@@ -62,6 +62,13 @@ pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 /// positional Hash does not bind keyword parameters.
 pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
 
+/// A call whose source `**value` is kept as written for the Ruby family
+/// alone (`analyze::forwarding::KeywordPolicy::NativeRuby`): its selector
+/// may name a full (`...`) forwarder, so the shared lowering proves
+/// neither the erased nor the kept form for a target without keyword
+/// arguments, and every target but the Ruby family refuses it at emit.
+pub const RUBY_NATIVE_KEYWORD_SPLAT: u64 = 1 << 18;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
@@ -1614,7 +1621,7 @@ mod tests {
             RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
-            SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL,
+            SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT,
         ];
         let mut seen = 0u64;
         for bit in bits {
