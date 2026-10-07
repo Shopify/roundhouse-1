@@ -3791,6 +3791,14 @@ fn semian_port_requires(app: &App) -> Vec<(&'static str, &'static str)> {
 /// `begin require "shopify-cloud" rescue LoadError end`): the source runs
 /// on without them, so the load does too.
 pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, Vec<String>) {
+    gem_source_dependencies_with(app, false)
+}
+
+/// [`gem_source_dependencies`], with `conditional` also following the
+/// requires under an `if`/`unless` (and the files they reach): what the
+/// gem sources may load, for reading the gem home's constants, rather
+/// than what they load for certain.
+pub(crate) fn gem_source_dependencies_with(app: &App, conditional: bool) -> (Vec<String>, Vec<String>, Vec<String>) {
     use crate::det::{HashMap, HashSet};
     if app.gem_lock.is_none() {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -3811,7 +3819,7 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
     let framework_feature = is_framework_feature;
     let mut native: Vec<String> = Vec::new();
     let mut framework: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::default();
+    let mut seen: HashMap<String, bool> = HashMap::default();
     let mut optional: HashSet<String> = HashSet::default();
     let mut required: HashSet<String> = HashSet::default();
     // A feature a file program requires after it has run or defined
@@ -3822,15 +3830,32 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
     // require above everything else in its file loads as before.)
     let late = late_program_requires(app);
     for (entry, lib) in entries {
-        let mut stack = vec![entry];
+        // (file, reached only through a conditional require)
+        let mut stack = vec![(entry, false)];
         let mut order: Vec<String> = Vec::new();
-        while let Some(path) = stack.pop() {
-            if !seen.insert(path.clone()) {
-                continue;
+        while let Some((path, branch)) = stack.pop() {
+            // A file walked as conditional is walked again where an
+            // unconditional require reaches it.
+            match seen.get(&path) {
+                Some(was) if *was || branch => continue,
+                _ => {
+                    seen.insert(path.clone(), !branch);
+                }
             }
             let Some(text) = by_path.get(path.as_str()) else { continue };
-            let mut nested: Vec<String> = Vec::new();
+            let mut nested: Vec<(String, bool)> = Vec::new();
             for (kind, feature) in load_level_requires(text.as_bytes()) {
+                // A require under a condition is the carried program's, run
+                // where and if its source runs it: kafka-shopify's
+                // `require ".../rspec_matcher" if defined?(RSpec)` reaches
+                // `require "rspec/expectations"`, which a Minitest boot
+                // never loads (and the test group's rspec need not be
+                // installed). Its file is still walked, for the Rails
+                // features to name, but loads nothing up front.
+                let (kind, maybe) = match kind.strip_prefix("conditional_") {
+                    Some(kind) => (kind, branch || !conditional),
+                    None => (kind, branch),
+                };
                 let target = if kind == "require_relative" {
                     let base = Path::new(&path).parent().unwrap_or(Path::new(""));
                     normalize_rb_path(&base.join(&feature))
@@ -3839,8 +3864,10 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
                     format!("{lib}{rb}")
                 };
                 if by_path.contains_key(target.as_str()) {
-                    nested.push(target);
+                    nested.push((target, maybe));
                 } else if late.get(path.as_str()).is_some_and(|features| features.contains(&feature)) {
+                    continue;
+                } else if maybe && !framework_feature(&feature) {
                     continue;
                 } else if (kind == "require" || kind == "optional_require") && !compiled_feature(&feature) {
                     if kind == "require" {
@@ -3959,7 +3986,9 @@ fn normalize_rb_path(path: &Path) -> String {
 /// each string-literal require that runs when `source` loads (see
 /// [`gem_source_dependencies`]). An `optional_require` is a `require` in
 /// the body of a `begin` with a rescue clause naming LoadError (or its
-/// ancestors ScriptError and Exception).
+/// ancestors ScriptError and Exception). A require in an `if`/`unless`
+/// branch (modifier forms included) is the same kind prefixed
+/// `conditional_`.
 fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
     fn rescues_load_error(n: &ruby_prism::BeginNode<'_>) -> bool {
         let mut rescue = n.rescue_clause();
@@ -3977,18 +4006,22 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
         false
     }
     fn walk<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>) {
-        walk_in(nodes, out, false)
+        walk_in(nodes, out, false, false)
     }
-    fn walk_in<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>, guarded: bool) {
-        let walk = |nodes, out: &mut Vec<(&'static str, String)>| walk_in(nodes, out, guarded);
+    fn walk_in<'pr>(nodes: Vec<ruby_prism::Node<'pr>>, out: &mut Vec<(&'static str, String)>, guarded: bool, conditional: bool) {
+        let walk = |nodes, out: &mut Vec<(&'static str, String)>| walk_in(nodes, out, guarded, conditional);
+        let branch = |nodes, out: &mut Vec<(&'static str, String)>| walk_in(nodes, out, guarded, true);
         for node in nodes {
             if let Some(call) = node.as_call_node() {
                 let name = call.name();
                 let name = std::str::from_utf8(name.as_slice()).unwrap_or("");
-                let kind = match name {
-                    "require" if guarded => "optional_require",
-                    "require" => "require",
-                    "require_relative" => "require_relative",
+                let kind = match (name, conditional) {
+                    ("require", true) if guarded => "conditional_optional_require",
+                    ("require", true) => "conditional_require",
+                    ("require_relative", true) => "conditional_require_relative",
+                    ("require", false) if guarded => "optional_require",
+                    ("require", false) => "require",
+                    ("require_relative", false) => "require_relative",
                     _ => continue,
                 };
                 if call.receiver().is_some() {
@@ -4006,20 +4039,20 @@ fn load_level_requires(source: &[u8]) -> Vec<(&'static str, String)> {
             } else if let Some(n) = node.as_class_node() {
                 walk(body_nodes(n.body()), out);
             } else if let Some(n) = node.as_if_node() {
-                walk(stmts(n.statements()), out);
+                branch(stmts(n.statements()), out);
                 if let Some(sub) = n.subsequent() {
                     match sub.as_else_node() {
-                        Some(e) => walk(stmts(e.statements()), out),
-                        None => walk(vec![sub], out),
+                        Some(e) => branch(stmts(e.statements()), out),
+                        None => branch(vec![sub], out),
                     }
                 }
             } else if let Some(n) = node.as_unless_node() {
-                walk(stmts(n.statements()), out);
+                branch(stmts(n.statements()), out);
                 if let Some(e) = n.else_clause() {
-                    walk(stmts(e.statements()), out);
+                    branch(stmts(e.statements()), out);
                 }
             } else if let Some(n) = node.as_begin_node() {
-                walk_in(stmts(n.statements()), out, guarded || rescues_load_error(&n));
+                walk_in(stmts(n.statements()), out, guarded || rescues_load_error(&n), conditional);
                 let mut rescue = n.rescue_clause();
                 while let Some(r) = rescue {
                     walk(stmts(r.statements()), out);

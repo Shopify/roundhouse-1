@@ -87,6 +87,28 @@ fn a_gem_sources_rescued_require_stays_optional() {
     app().run_test("test/models/oracle_test.rb").assert_passes();
 }
 
+/// kafka-shopify 5.2.3's classic entry runs
+/// `require "kafka-shopify/legacy/lib/rspec_matcher" if defined?(RSpec)`,
+/// and the matcher requires `rspec/expectations`. A Minitest boot never
+/// loads it (RSpec is not defined), so rspec need not be installed. The
+/// boot's load of the gem source's dependencies left the condition out
+/// and raised LoadError. A conditional require is the carried program's.
+#[test]
+fn a_gem_sources_conditional_require_loads_only_where_its_condition_holds() {
+    const WIDGET: &str = "require \"set\"\nrequire \"widget/answer\"\nrequire \"widget/matcher\" if defined?(RSpec)\nrequire \"rh_absent_unless_feature\" unless defined?(Set)\n\nmodule Widget\n  def self.answer\n    Answer.new.value\n  end\nend\n";
+    const MATCHER: &str = "require \"rh_absent_test_group_feature\"\n\nmodule Widget\n  MATCHER = true\nend\n";
+    let app = || {
+        widget_app(CARRIED)
+            .write("vendor/gems/widget-1.0.0/lib/widget.rb", WIDGET)
+            .write("vendor/gems/widget-1.0.0/lib/widget/matcher.rb", MATCHER)
+    };
+    let (emitted, _) = app().emit(BuildTarget::Ruby);
+    let facades = std::fs::read_to_string(emitted.join("runtime/gem_facades.rb")).unwrap();
+    assert!(facades.contains("[\"set\"].each do |feature|"), "{facades}");
+    assert!(!facades.contains("rh_absent_"), "{facades}");
+    app().run_test("test/models/oracle_test.rb").assert_passes();
+}
+
 /// A class whose superclass is a gem source's class, itself a subclass
 /// of a natively loaded gem's: the class-body DSL is the native gem's,
 /// on the native gem's class, and replays as the source has it. Core's
