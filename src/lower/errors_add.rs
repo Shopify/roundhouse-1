@@ -43,7 +43,8 @@ use crate::ty::Ty;
 /// dynamic, with the reason.
 pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |body| rewrite_errors_add(body, &mut diags));
+    let localized = app.locale_files.first().map(|f| (f.clone(), app.locale_files.len()));
+    super::for_each_hook_body(app, &mut |body| rewrite_errors_add(body, localized.as_ref(), &mut diags));
     diags
 }
 
@@ -80,9 +81,9 @@ fn fold_str_concat(e: Expr) -> Expr {
     Expr::new(e.span, ExprNode::Lit { value: Literal::Str { value: format!("{lv}{rv}") } })
 }
 
-fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
+fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diags: &mut Vec<Diagnostic>) {
     expr.node
-        .for_each_child_mut(&mut |c| rewrite_errors_add(c, diags));
+        .for_each_child_mut(&mut |c| rewrite_errors_add(c, localized, diags));
     // Any `add` on an `errors` reader is this pass's construct; decide
     // ground-vs-residue below.
     let recognized = matches!(
@@ -152,16 +153,30 @@ fn rewrite_errors_add(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
         Some(ExprNode::Lit { value: Literal::Sym { value } }) => Some(value.clone()),
         _ => None,
     };
-    let translated = symbol_type.as_ref().and_then(|t| default_error_message(t.as_str()));
+    // Rails looks the type up through the app's locale data first
+    // (`activerecord.errors.models.<model>.attributes.<attr>.<type>`,
+    // the model's, its ancestors', `activerecord.errors.messages`,
+    // `errors.attributes.<attr>`, `errors.messages`), and the record's
+    // class is not known here: with locale files present the default
+    // text is not the answer, so the site declines by name.
+    let translated = if localized.is_some() {
+        None
+    } else {
+        symbol_type.as_ref().and_then(|t| default_error_message(t.as_str()))
+    };
     let unrecognized = matches!(msg.as_ref().map(|m| &*m.node), Some(ExprNode::Hash { .. }))
         || (symbol_type.is_some() && translated.is_none());
     if unrecognized {
-        let reason = if symbol_type.is_some() {
-            "error type without a default message"
-        } else {
-            "unrecognized arg shape"
+        let reason = match (&symbol_type, localized) {
+            (Some(t), Some((first, n))) => format!(
+                "error type :{} resolves through the app's locale data ({first}{})",
+                t.as_str(),
+                if *n > 1 { format!(" and {} more", n - 1) } else { String::new() }
+            ),
+            (Some(t), None) => format!("error type :{} has no count-free default message", t.as_str()),
+            (None, _) => "unrecognized arg shape".to_string(),
         };
-        diags.push(residue(&Expr::new(span, ExprNode::Seq { exprs: vec![] }), reason));
+        diags.push(residue(&Expr::new(span, ExprNode::Seq { exprs: vec![] }), &reason));
         *expr.node = ExprNode::Send {
             recv,
             method: Symbol::from("add"),

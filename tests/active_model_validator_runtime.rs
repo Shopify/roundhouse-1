@@ -167,3 +167,63 @@ fn validates_with_runs_validators_that_add_errors() {
          [true, []]\n"
     );
 }
+
+const LOCALE_OVERRIDES: &str = "en:\n  errors:\n    messages:\n      invalid: \"looks wrong\"\n  activerecord:\n    errors:\n      models:\n        shop:\n          attributes:\n            name:\n              blank: \"needs a name\"\n";
+
+const TYPED_ERRORS: &str = r#"class DomainShapeErrorsValidator < ActiveModel::Validator
+  def validate(record)
+    record.errors.add(:domain, :invalid) if record.domain.to_s.include?(" ")
+    record.errors.add(:name, :blank) if record.name.to_s.empty?
+  end
+end
+"#;
+
+/// An app that ships locale data decides what an error TYPE reads.
+/// Native ActiveRecord 8.2.0.alpha, with this en.yml on the load path,
+/// prints `[false, ["Domain looks wrong", "Name needs a name"]]` for
+/// `Shop.new(name: "", domain: "Bad Host")`, not Rails' defaults ("is
+/// invalid", "can't be blank"), and which model the record is is only
+/// known at run time. So with locale files present the type is not
+/// baked: each site stays `errors.add` and is named on the residue
+/// ledger with the locale data it resolves through.
+#[test]
+fn app_locale_data_keeps_error_types_from_baking() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rh-validator-locale-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, content) in [
+        ("db/schema.rb", SCHEMA),
+        ("app/models/application_record.rb", APPLICATION_RECORD),
+        ("app/models/shop.rb", "class Shop < ApplicationRecord\n  validates_with DomainShapeErrorsValidator\nend\n"),
+        ("app/validators/domain_shape_errors_validator.rb", TYPED_ERRORS),
+        ("config/locales/en.yml", LOCALE_OVERRIDES),
+    ] {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+    }
+    let mut app = roundhouse::ingest::ingest_app(&dir).expect("ingest");
+    assert_eq!(app.locale_files, vec!["config/locales/en.yml".to_string()]);
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    let _ = std::fs::remove_dir_all(&dir);
+    let named: Vec<_> = diags
+        .iter()
+        .map(|d| d.message.clone())
+        .filter(|m| m.contains("resolves through the app's locale data (config/locales/en.yml)"))
+        .collect();
+    assert_eq!(named.len(), 2, "{diags:#?}");
+    assert!(named.iter().any(|m| m.contains("error type :invalid")), "{named:?}");
+    assert!(named.iter().any(|m| m.contains("error type :blank")), "{named:?}");
+    let validator = app
+        .library_classes
+        .iter()
+        .find(|c| c.name.0.as_str() == "DomainShapeErrorsValidator")
+        .expect("the validator is carried");
+    let body = format!("{:?}", validator.methods);
+    assert!(!body.contains("is invalid") && !body.contains("can't be blank"), "a default was baked: {body}");
+}
