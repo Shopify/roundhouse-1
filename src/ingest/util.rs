@@ -516,6 +516,28 @@ fn body_has_constant_decl(body: Option<Node<'_>>) -> bool {
     })
 }
 
+/// The path a `A::B = value` write names, as written (`"A::B"`, or
+/// `"::A::B"` from the top level), when every segment is a constant. A
+/// write through a computed parent (`self::B`, `klass::B`) is `None`.
+pub(super) fn written_constant_path(target: &ruby_prism::ConstantPathNode<'_>) -> Option<String> {
+    let mut segments = vec![constant_id_str(&target.name()?).to_string()];
+    let mut parent = target.parent();
+    let mut rooted = true;
+    while let Some(node) = parent {
+        if let Some(read) = node.as_constant_read_node() {
+            segments.push(constant_id_str(&read.name()).to_string());
+            rooted = false;
+            break;
+        }
+        let path = node.as_constant_path_node()?;
+        segments.push(constant_id_str(&path.name()?).to_string());
+        parent = path.parent();
+    }
+    segments.reverse();
+    let joined = segments.join("::");
+    Some(if rooted { format!("::{joined}") } else { joined })
+}
+
 /// `NAME = value unless const_defined?(:NAME)` (or `self.const_defined?`,
 /// or the name as a string): a constant write guarded by its own name,
 /// which leaves a value defined before the body runs in place. Core's

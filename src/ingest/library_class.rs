@@ -2858,6 +2858,21 @@ fn walk_decl_body_with_visibility<'pr>(
             out.constants.push((name, value));
             continue;
         }
+        // `Ref::Obj = Struct.new(:b)`: a write through a constant path.
+        // Generated protobuf `_pb.rb` files nest every message this way
+        // (`CustomFields::Field = …lookup("….CustomFields.Field").msgclass`
+        // right after `CustomFields = …`). Carried as a constant named by
+        // its written path, in source order among the body's constants,
+        // so the Ruby emit writes `Ref::Obj = value` where the source
+        // does, after `Ref` exists; the registry types it by the
+        // declaration Rubydex records for the write.
+        if let Some(write) = stmt.as_constant_path_write_node() {
+            if let Some(path) = super::util::written_constant_path(&write.target()) {
+                let value = ingest_expr(&write.value(), file)?;
+                out.constants.push((Symbol::from(path), value));
+                continue;
+            }
+        }
         // `ZeitwerkLoader.ignore(File.join(__dir__, "tapioca"))`,
         // `ZeitwerkLoader.setup`: applied statically; any other call on
         // the loader is refused at its site.
