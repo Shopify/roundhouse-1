@@ -30,6 +30,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
     ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
+    ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands

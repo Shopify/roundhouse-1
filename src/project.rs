@@ -2937,6 +2937,20 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_model_type.rb: {e}"))?,
         ));
     }
+    // ActiveModel::Validator / EachValidator / BlockValidator, ported from
+    // activemodel 8.2.0.alpha (see the file's header). Ruby-family only
+    // (`respond_to?(:to_proc)` options, `Array()`, `send`), and carried
+    // only where the app's own code names one: a `< ActiveModel::
+    // EachValidator` subclass or a direct construction. gem_facades.rb
+    // requires it, before any app file loads.
+    let carries_validators = carries_active_model_validator(&files);
+    if carries_validators {
+        files.push((
+            "runtime/active_model_validator.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_model_validator.rb")
+                .map_err(|e| format!("read runtime/spinel/active_model_validator.rb: {e}"))?,
+        ));
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -3054,6 +3068,11 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_types {
         format!("{gem_facades}require_relative \"active_model_type\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_validators {
+        format!("{gem_facades}require_relative \"active_model_validator\"\n")
     } else {
         gem_facades
     };
@@ -5118,9 +5137,12 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   # Register `mod`'s children: an autoload for each file, an implicit
   # module for a namespace only other files open. A child already
-  # defined (a runtime class the app reopens) loads its file now, after
-  # its siblings are registered, since nothing will reference it into
-  # loading.
+  # defined (a runtime class the app reopens, or a gem's namespace the
+  # app's file reopens, observe-instrument's `Observe`) loads its file
+  # now, after its siblings are registered, since nothing will reference
+  # it into loading. Its own children are registered first, as Zeitwerk
+  # sets up an already-defined namespace's autoloads at setup: its
+  # file's body may run code that reaches them (`@x = Child.new`).
   def self.register(mod)
     key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
     entries = NAMESPACES[key] or return
@@ -5135,9 +5157,9 @@ const AUTOLOAD_RUNTIME: &str = r##"
       end
     end
     defined.each do |name, file|
-      require path(file) if file
       child = mod.const_get(name, false)
       register(child) if child.is_a?(Module)
+      require path(file) if file
     end
   end
 
@@ -6432,6 +6454,8 @@ fn spinel_files_with_assertions(
     // And for the attribute types, pushed back by the two ruby-family
     // forks where the app names one.
     files.retain(|(p, _)| p != "runtime/active_model_type.rb");
+    // And for the validator bases, pushed back the same way.
+    files.retain(|(p, _)| p != "runtime/active_model_validator.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -8908,6 +8932,21 @@ fn carries_active_model_type(files: &[(String, String)]) -> bool {
                 .iter()
                 .chain(ACTIVE_MODEL_TYPE_METHODS)
                 .any(|name| mentions_messages_constant(content, name))
+    })
+}
+
+/// The classes runtime/spinel/active_model_validator.rb declares.
+const ACTIVE_MODEL_VALIDATOR_NAMES: &[&str] =
+    &["ActiveModel::Validator", "ActiveModel::EachValidator", "ActiveModel::BlockValidator"];
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names one of the validator bases.
+fn carries_active_model_validator(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && ACTIVE_MODEL_VALIDATOR_NAMES.iter().any(|name| mentions_messages_constant(content, name))
     })
 }
 

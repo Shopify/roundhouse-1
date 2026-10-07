@@ -181,3 +181,66 @@ end
     );
     assert!(diags.is_empty(), "{diags:?}");
 }
+
+#[test]
+fn parameter_field_humanizes_at_run_time() {
+    // An EachValidator's `validate_each(record, attribute, value)`.
+    let (out, diags) = lower_and_emit(
+        r#"
+class LowercaseValidator
+  def validate_each(record, attribute, value)
+    record.errors.add(attribute, "must be lowercase")
+  end
+end
+"#,
+    );
+    assert!(!out.contains("errors.add"), "site should be grounded:\n{out}");
+    assert!(
+        out.contains(
+            r##"    record.errors << if attribute.to_s == "base"
+      "must be lowercase"
+    else
+      "#{ActiveSupport.humanize(attribute.to_s)} must be lowercase"
+    end"##
+        ),
+        "expected the run-time full message:\n{out}"
+    );
+    assert!(diags.is_empty(), "a parameter field grounds without residue: {diags:?}");
+}
+
+#[test]
+fn error_type_symbols_bake_their_default_message() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  def validate_body(attribute)
+    errors.add(:title, :blank)
+    errors.add(:base, :invalid)
+    errors.add(attribute, :taken)
+    errors.add(:title, :too_long)
+  end
+end
+"#,
+    );
+    assert!(out.contains(r#"errors << "Title can't be blank""#), "{out}");
+    assert!(out.contains(r#"errors << "is invalid""#), "{out}");
+    assert!(out.contains(r##""#{ActiveSupport.humanize(attribute.to_s)} has already been taken""##), "{out}");
+    // :too_long interpolates a count: no count-free default, so residue.
+    assert!(out.contains("errors.add(:title, :too_long)"), "{out}");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+}
+
+#[test]
+fn computed_field_stays_residue() {
+    let (out, diags) = lower_and_emit(
+        r#"
+class Draft
+  def validate_body
+    errors.add(field_name, "is odd")
+  end
+end
+"#,
+    );
+    assert!(out.contains("errors.add(field_name"), "{out}");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+}

@@ -17,7 +17,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // propagate through dispatch without bottoming out at Var.
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
-    for m in ["application", "logger", "cache", "configuration", "root"] {
+    // `Rails.app` is railties' alias of `application`.
+    for m in ["application", "app", "logger", "cache", "configuration", "root", "gem_version"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String
@@ -30,6 +31,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             args: vec![],
         },
     );
+    // `Rails.version` (railties gem_version.rb): "8.2.0.alpha".
+    rails_cls.class_methods.insert(Symbol::from("version"), Ty::Str);
     classes.insert(ClassId(Symbol::from("Rails")), rails_cls);
 
     // `Rails.event` / `Rails.error` — ActiveSupport's EventReporter and
@@ -672,7 +675,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("to_sym", Ty::Union { variants: vec![Ty::Sym, Ty::Nil] }),
         ("to_s", Ty::Str), ("to_str", Ty::Str), ("inspect", Ty::Str),
         ("hash", Ty::Int), ("==", Ty::Bool), ("eql?", Ty::Bool),
+        ("html?", Ty::Bool), ("all?", Ty::Bool),
     ]);
+    // `Mime::ALL`'s class: the `*/*` wildcard, a Type whose `all?` and
+    // `html?` answer true (actionpack mime_type.rb:433-447).
+    let all_type = Ty::Class { id: ClassId(Symbol::from("Mime::AllType")), args: vec![] };
+    register_stdlib_class(classes, "Mime::AllType", &[("instance", all_type)], &[]);
+    if let Some(all) = classes.get_mut(&ClassId(Symbol::from("Mime::AllType"))) {
+        all.parent.get_or_insert_with(|| ClassId(Symbol::from("Mime::Type")));
+    }
     // `URI.parse` returns a URI object we don't model; `Untyped` lets
     // chained `.scheme` / `.host` flow gradually instead of erroring.
     register_stdlib_class(classes, "URI", &[

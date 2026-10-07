@@ -19,6 +19,8 @@ module Mime
     def eql?: (untyped other) -> bool
     def hash: () -> Integer
     def inspect: () -> String
+    def html?: () -> bool
+    def all?: () -> bool
 
     # Non-nilable on purpose: upstream's `lookup` answers a Type for any
     # well-formed string and raises for the rest. See the note in mime.rb.
@@ -26,6 +28,14 @@ module Mime
     def self.lookup_by_extension: ((String | Symbol) extension) -> Mime::Type?
     def self.valid?: (String? string) -> bool
   end
+
+  class AllType < Type
+    def self.instance: () -> Mime::AllType
+    def all?: () -> bool
+    def html?: () -> bool
+  end
+
+  ALL: Mime::AllType
 
   def self.[]: (String extension) -> Mime::Type?
 end

@@ -932,6 +932,84 @@ pub(super) fn ingest_model_body_item(
                 });
             }
         }
+        // `validates_with Validator[, Other], option: ...`: Rails builds
+        // `klass.new(options)` per class and runs its `validate(record)`
+        // with the model's validations. Each class rides as a
+        // `ValidationRule::With` carrying the class constant and the
+        // options hash (every option reaches the validator, `if:` /
+        // `unless:` included, as natively). Symbol `if:` / `unless:`
+        // guard the call; `on:`, a lambda condition, a block or a
+        // non-constant argument keep the call out, as for `validate`.
+        if method == "validates_with" && call.block().is_none() {
+            let args: Vec<Node<'_>> = call
+                .arguments()
+                .map(|a| a.arguments().iter().collect())
+                .unwrap_or_default();
+            let (classes, rest): (Vec<_>, Vec<_>) = args.iter().partition(|a| {
+                a.as_constant_read_node().is_some() || a.as_constant_path_node().is_some()
+            });
+            let mut if_method: Option<Symbol> = None;
+            let mut unless_method: Option<Symbol> = None;
+            let mut attribute: Option<Symbol> = None;
+            let mut ok = !classes.is_empty() && rest.len() <= 1;
+            let options = rest.first().and_then(|a| a.as_keyword_hash_node());
+            if !rest.is_empty() && options.is_none() {
+                ok = false;
+            }
+            if let Some(kw) = &options {
+                for el in kw.elements().iter() {
+                    let Some(assoc) = el.as_assoc_node() else {
+                        ok = false;
+                        continue;
+                    };
+                    let key = symbol_value(&assoc.key());
+                    let value = assoc.value();
+                    match key.as_deref() {
+                        Some("if") | Some("unless") => match symbol_value(&value) {
+                            Some(v) if key.as_deref() == Some("if") => if_method = Some(Symbol::from(v.as_str())),
+                            Some(v) => unless_method = Some(Symbol::from(v.as_str())),
+                            None => ok = false,
+                        },
+                        Some("on") | None => ok = false,
+                        Some("attributes") => {
+                            let first = value
+                                .as_array_node()
+                                .and_then(|a| a.elements().iter().next())
+                                .and_then(|e| symbol_value(&e))
+                                .or_else(|| symbol_value(&value));
+                            attribute = first.map(|s| Symbol::from(s.as_str()));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            if ok {
+                let options = match rest.first() {
+                    Some(o) => Some(ingest_expr(o, file)?),
+                    None => None,
+                };
+                let mut rules = Vec::with_capacity(classes.len());
+                for class in &classes {
+                    rules.push(crate::dialect::ValidationRule::With {
+                        validator: ingest_expr(class, file)?,
+                        options: options.clone(),
+                        if_method: if_method.clone(),
+                        unless_method: unless_method.clone(),
+                    });
+                }
+                return Ok(ModelBodyItem::Validation {
+                    validation: crate::dialect::Validation {
+                        // The validator faults whichever attributes it
+                        // likes; record the first named one, or :base.
+                        attribute: attribute.unwrap_or_else(|| Symbol::from("base")),
+                        rules,
+                    },
+                    leading_comments,
+                    leading_blank_line: false,
+                    span,
+                });
+            }
+        }
         if method == "validates" {
             let mut parsed = parse_validates(&call);
             if let Some(first) = parsed.first().cloned() {

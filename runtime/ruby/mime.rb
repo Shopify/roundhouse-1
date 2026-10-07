@@ -10,7 +10,8 @@
 # table would have "fixed" into a divergence. Re-port, don't edit, when
 # the pinned version moves.
 #
-# Only `lookup`, `lookup_by_extension` and `Mime.[]` are implemented;
+# Only `lookup`, `lookup_by_extension`, `Mime.[]`, `html?`/`all?` and the
+# `Mime::ALL` wildcard are implemented;
 # a call beyond them stays an honest gap rather than a method that
 # types and then raises. Absent on purpose: `register` (the table is
 # frozen at port time, so an app cannot add to it), `parse` and the
@@ -203,6 +204,15 @@ module Mime
       "#<Mime::Type:#{@string}>"
     end
 
+    # actionpack mime_type.rb:407-411.
+    def html?
+      (symbol == :html) || @string.include?("html")
+    end
+
+    def all?
+      false
+    end
+
     # Upstream's contract, which callers lean on: this NEVER answers nil.
     # An unregistered-but-well-formed string comes back as a Type whose
     # `symbol` is nil, which is why `if type = Mime::Type.lookup(ct)` is
@@ -246,6 +256,29 @@ module Mime
       true
     end
   end
+
+  # actionpack mime_type.rb:433-447. Upstream includes Singleton and its
+  # `initialize` is `super "*/*", nil`; the runtime has no Singleton on
+  # every target, so `instance` answers the one `ALL`, which is built
+  # with those same arguments below, and nothing else constructs one.
+  class AllType < Type
+    def self.instance
+      Mime::ALL
+    end
+
+    def all?
+      true
+    end
+
+    def html?
+      true
+    end
+  end
+
+  # ALL isn't a real MIME type, so it is not registered for lookup with
+  # the concrete types. It's a wildcard match `respond_to` negotiation
+  # uses internally.
+  ALL = AllType.new("*/*", nil)
 
   def self.[](extension)
     Mime::Type.lookup_by_extension(extension)
