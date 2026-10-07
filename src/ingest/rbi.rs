@@ -114,6 +114,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) 
             || class.parent.is_some()
             || !class.includes.is_empty()
             || !class.extends.is_empty()
+            || !class.mixes_in_class_methods.is_empty()
             || class.dynamic;
         if content {
             if let Some(names) = namespaces.get_mut(&class.gem) {
@@ -146,7 +147,13 @@ struct Reader<'a> {
 /// The name a `class`/`module` header declares, given its enclosing
 /// scope. `class ::Foo` is `Foo` wherever it sits.
 fn declared_name(scope: Option<&str>, path: &Node<'_>) -> String {
-    let cbase = path.as_constant_path_node().is_some_and(|p| {
+    let written = constant_path_name(path);
+    if is_rooted(path) { written } else { qualify(scope, &written) }
+}
+
+/// Whether a constant path is written from the top level (`::Foo::Bar`).
+fn is_rooted(path: &Node<'_>) -> bool {
+    path.as_constant_path_node().is_some_and(|p| {
         let mut root = p.parent();
         loop {
             match root {
@@ -157,9 +164,7 @@ fn declared_name(scope: Option<&str>, path: &Node<'_>) -> String {
                 },
             }
         }
-    });
-    let written = constant_path_name(path);
-    if cbase { written } else { qualify(scope, &written) }
+    })
 }
 
 /// Whether `gem` is named after `class`'s top-level namespace, ignoring
@@ -339,6 +344,19 @@ impl Reader<'_> {
                             &mut entry.includes
                         };
                         list.push(ClassId(Symbol::new(&target)));
+                    }
+                }
+                // `mixes_in_class_methods ::SmartProperties::ClassMethods`:
+                // Tapioca's spelling of an `included` hook that extends the
+                // includer with the module (`GemClass::mixes_in_class_methods`).
+                "mixes_in_class_methods" if !singleton => {
+                    for arg in &args {
+                        let target = constant_path_name(arg);
+                        if target.is_empty() {
+                            continue;
+                        }
+                        let written = if is_rooted(arg) { format!("::{target}") } else { target };
+                        self.class_entry(scope, false).mixes_in_class_methods.push(ClassId(Symbol::new(&written)));
                     }
                 }
                 "attr_reader" | "attr_writer" | "attr_accessor" => {

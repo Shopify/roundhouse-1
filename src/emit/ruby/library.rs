@@ -7844,10 +7844,29 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
 ///
 /// No runtime base answers these, so replaying them is what Ruby runs.
 /// Anything else stays dropped and reported (`replays_foreign_class_body`).
+///
+/// A class whose superclass is an app class replays the class macros it
+/// inherits instead (`inherited_class_macro_calls`). Either kind of class
+/// also replays the class macros a loaded gem's mixin gives it
+/// (`gem_mixin_macro_calls`). The result keeps the source order.
 fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
-    if lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
-        return inherited_class_macro_calls(lc, app);
+    let own = if lc.parent.as_ref().is_some_and(|p| !is_core_class_name(p.0.as_str())) {
+        inherited_class_macro_calls(lc, app)
+    } else {
+        plain_extension_calls(lc, app)
+    };
+    let gem = gem_mixin_macro_calls(lc, app);
+    if gem.is_empty() {
+        return own;
     }
+    lc.unknown_calls
+        .iter()
+        .filter(|call| own.iter().chain(gem.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .collect()
+}
+
+/// The `app_extension_calls` of a plain module or class.
+fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let own_class_side = |name: &str| {
         lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
     };
@@ -7915,16 +7934,7 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
 /// the call is what Ruby runs. Bare calls and `self.` calls only; a
 /// chain that reaches a model or a non-app class stops there.
 fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
-    let mut ancestors: Vec<&LibraryClass> = Vec::new();
-    let mut at = lc;
-    while let Some(parent) = at.parent.as_ref() {
-        let Some(next) = app_library_superclass(at, parent.0.as_str(), app) else { break };
-        if ancestors.iter().any(|a| std::ptr::eq(*a, next)) || std::ptr::eq(next, lc) {
-            break;
-        }
-        ancestors.push(next);
-        at = next;
-    }
+    let ancestors = app_library_ancestors(lc, app);
     if ancestors.is_empty() {
         return Vec::new();
     }
@@ -7941,6 +7951,122 @@ fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a E
             on_self && inherited(method.as_str())
         })
         .collect()
+}
+
+/// The app library classes `lc` inherits from, nearest first: its
+/// superclass chain while each link is an app library class
+/// (`app_library_superclass`); a model or a non-app class ends it.
+fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a LibraryClass> {
+    let mut ancestors: Vec<&LibraryClass> = Vec::new();
+    let mut at = lc;
+    while let Some(parent) = at.parent.as_ref() {
+        let Some(next) = app_library_superclass(at, parent.0.as_str(), app) else { break };
+        if ancestors.iter().any(|a| std::ptr::eq(*a, next)) || std::ptr::eq(next, lc) {
+            break;
+        }
+        ancestors.push(next);
+        at = next;
+    }
+    ancestors
+}
+
+/// The body calls that name a class-side method a loaded gem's module
+/// gives the class, which Ruby runs on the class through that module:
+/// - after `include G`, where `G`'s RBI says `mixes_in_class_methods M`
+///   (Core's `include SmartProperties` then `property! :name, accepts:
+///   String`: the gem's `included(base)` hook runs `base.extend
+///   (ClassMethods)`), the instance methods of `M`
+///   (`GemBoundary::loaded_mixed_in_class_methods`);
+/// - after `extend G`, `G`'s instance methods, and the `extend` itself.
+///
+/// `G` is a module of a gem the emitted tree loads, outside Ruby's core
+/// and standard library (`GemBoundary::loaded_reopen`), named as Ruby
+/// resolves it from the class's namespace outwards; an app constant of
+/// that name hides it. The gem itself runs the hook and defines the
+/// method, so replaying the call is what Ruby runs. An app superclass's
+/// own includes and extends count too: the singleton methods they give
+/// it are inherited.
+///
+/// Bare and `self.` calls only, after the `extend` that provides them;
+/// an `include` carries no position (`LibraryClass::includes`) and is
+/// written at the top of the emitted body, ahead of every replayed call.
+/// Anything else stays dropped and reported.
+fn gem_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let boundary = &app.gem_boundary;
+    if boundary.is_empty() {
+        return Vec::new();
+    }
+    let included = |c: &LibraryClass| -> BTreeSet<Symbol> {
+        c.includes
+            .iter()
+            .filter_map(|inc| loaded_gem_module(c, inc.0.as_str(), app))
+            .flat_map(|g| boundary.loaded_mixed_in_class_methods(&g))
+            .collect()
+    };
+    // `extend G, H` of loaded gem modules only: the modules, else `None`.
+    let gem_extend = |c: &LibraryClass, call: &Expr| -> Option<Vec<ClassId>> {
+        let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return None };
+        if method.as_str() != "extend" || args.is_empty() {
+            return None;
+        }
+        args.iter()
+            .map(|a| match &*a.node {
+                ExprNode::Const { path } => {
+                    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    loaded_gem_module(c, &written, app)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut provided = included(lc);
+    for ancestor in app_library_ancestors(lc, app) {
+        provided.extend(included(ancestor));
+        for call in &ancestor.unknown_calls {
+            for g in gem_extend(ancestor, call).into_iter().flatten() {
+                provided.extend(boundary.loaded_instance_surface(&g));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for call in &lc.unknown_calls {
+        if let Some(modules) = gem_extend(lc, call) {
+            for g in &modules {
+                provided.extend(boundary.loaded_instance_surface(g));
+            }
+            out.push(call);
+            continue;
+        }
+        let ExprNode::Send { recv, method, .. } = &*call.node else { continue };
+        let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+        if on_self && provided.contains(method) {
+            out.push(call);
+        }
+    }
+    out
+}
+
+/// The module of a loaded gem (`GemBoundary::loaded_reopen`) that the
+/// constant `written` in `lc`'s body names, resolved as Ruby does from
+/// `lc`'s namespace outwards: the first enclosing scope that has the
+/// name decides, so an app class or module of that name (one that is
+/// not itself a reopen of the gem's) hides the gem's.
+fn loaded_gem_module(lc: &LibraryClass, written: &str, app: &App) -> Option<ClassId> {
+    let rooted = written.starts_with("::");
+    let written = written.trim_start_matches("::");
+    let mut scope: Vec<&str> = if rooted { Vec::new() } else { lc.name.0.as_str().split("::").collect() };
+    loop {
+        let candidate =
+            if scope.is_empty() { written.to_string() } else { format!("{}::{written}", scope.join("::")) };
+        let id = ClassId(Symbol::from(candidate.as_str()));
+        if let Some(gem) = app.gem_boundary.loaded_reopen(&id) {
+            return gem.is_module.then_some(id);
+        }
+        if is_model_named(&candidate, app) || !library_classes_named(&candidate, app).is_empty() {
+            return None;
+        }
+        scope.pop()?;
+    }
 }
 
 /// The app library class (not a module, not a model) a superclass

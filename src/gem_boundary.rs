@@ -48,6 +48,12 @@ pub const RUBY_STDLIB: &[&str] = &[
     "WeakRef", "Gem", "Bundler", "Errno",
 ];
 
+/// How many modules [`GemBoundary::loaded_instance_surface`] visits
+/// following `include`s before it stops: a gem's mixin chains are a few
+/// modules deep, and a cycle or a pathological chain must not stall the
+/// emit.
+pub const MIXIN_WALK_LIMIT: usize = 32;
+
 /// Every gem class or module an RBI declares, by qualified name.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GemBoundary {
@@ -290,6 +296,67 @@ impl GemBoundary {
         self.classes.get(name).filter(|class| self.loads(&class.gem))
     }
 
+    /// The declared class or module a constant `written` inside `scope`
+    /// names, looked up as Ruby does from the scope outwards
+    /// (`ClassMethods` written in `SmartProperties` is
+    /// `SmartProperties::ClassMethods`); a rooted `::X` names only `X`.
+    pub fn resolve_written(&self, scope: &str, written: &ClassId) -> Option<ClassId> {
+        let text = written.0.as_str();
+        if let Some(rooted) = text.strip_prefix("::") {
+            let id = ClassId(Symbol::from(rooted));
+            return self.classes.contains_key(&id).then_some(id);
+        }
+        let mut scope: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+        loop {
+            let candidate = if scope.is_empty() { text.to_string() } else { format!("{}::{text}", scope.join("::")) };
+            let id = ClassId(Symbol::from(candidate.as_str()));
+            if self.classes.contains_key(&id) {
+                return Some(id);
+            }
+            scope.pop()?;
+        }
+    }
+
+    /// The instance methods of the loaded gem module `module` and of the
+    /// loaded gem modules it includes, transitively: what `extend module`
+    /// gives the extended object as its singleton methods. Modules outside
+    /// a loaded gem (`GemBoundary::loaded_reopen`) contribute nothing;
+    /// the walk stops after [`MIXIN_WALK_LIMIT`] modules.
+    pub fn loaded_instance_surface(&self, module: &ClassId) -> BTreeSet<Symbol> {
+        let mut out = BTreeSet::new();
+        let mut seen: Vec<ClassId> = Vec::new();
+        let mut queue = vec![module.clone()];
+        while let Some(id) = queue.pop() {
+            if seen.contains(&id) || seen.len() >= MIXIN_WALK_LIMIT {
+                continue;
+            }
+            seen.push(id.clone());
+            let Some(class) = self.loaded_reopen(&id) else { continue };
+            if !class.is_module {
+                continue;
+            }
+            out.extend(class.instance_methods.keys().cloned());
+            queue.extend(class.includes.iter().rev().filter_map(|inc| self.resolve_written(id.0.as_str(), inc)));
+        }
+        out
+    }
+
+    /// The class-side methods `include module` gives the includer when
+    /// `module` is a loaded gem module whose RBI says
+    /// `mixes_in_class_methods M`: Ruby runs the gem's `included(base)`
+    /// hook, which extends `base` with `M`, so `M`'s instance surface
+    /// ([`Self::loaded_instance_surface`]) becomes the includer's class
+    /// methods. Empty for anything else.
+    pub fn loaded_mixed_in_class_methods(&self, module: &ClassId) -> BTreeSet<Symbol> {
+        let Some(class) = self.loaded_reopen(module).filter(|c| c.is_module) else { return BTreeSet::new() };
+        class
+            .mixes_in_class_methods
+            .iter()
+            .filter_map(|m| self.resolve_written(module.0.as_str(), m))
+            .flat_map(|m| self.loaded_instance_surface(&m))
+            .collect()
+    }
+
     /// [`Self::loaded_reopen`] for a tree with no RBI for the gem: the
     /// class or module the installed source of a gem the CRuby tree loads
     /// opens (`GemSourceConstants::kinds`), with the gem. Every gem read
@@ -346,6 +413,16 @@ pub struct GemClass {
     /// `extend` targets, as written: their instance methods are this
     /// class's class-side surface.
     pub extends: Vec<ClassId>,
+    /// `mixes_in_class_methods` targets: the modules whose instance
+    /// methods become the class-side surface of whatever includes this
+    /// module, which the gem's `self.included(base)` hook gives the
+    /// includer (`base.extend(ClassMethods)`); Tapioca writes the hook
+    /// as this annotation. A rooted name (`::SmartProperties::
+    /// ClassMethods`) keeps its leading `::`; any other is as written,
+    /// resolved from this module's scope outwards
+    /// ([`GemBoundary::resolve_written`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixes_in_class_methods: Vec<ClassId>,
     pub instance_methods: HashMap<Symbol, Ty>,
     pub class_methods: HashMap<Symbol, Ty>,
     /// Constants the body assigns (`DEFAULT = ...`), which are values,
