@@ -1247,6 +1247,7 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
                         diagnostic: None,
                         hint: None,
                         decisions: 0,
+                        keyword_arg: None,
                     },
                 },
             ));
@@ -1271,6 +1272,7 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
             diagnostic: None,
             hint: None,
             decisions: 0,
+            keyword_arg: None,
         });
     }
     let body = Expr {
@@ -1282,6 +1284,7 @@ fn synth_params_initialize(spec: &ParamsSpec) -> MethodDef {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Private,
@@ -1317,6 +1320,7 @@ fn synth_attr_reader(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -1424,6 +1428,7 @@ fn synth_attr_writer(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     };
     let body = Expr {
         span: Span::synthetic(),
@@ -1437,6 +1442,7 @@ fn synth_attr_writer(owner: &ClassId, field: &Symbol, ty: Ty) -> MethodDef {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     };
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -1814,6 +1820,7 @@ fn expr(node: ExprNode, ty: Option<Ty>) -> Expr {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     }
 }
 
@@ -1870,6 +1877,7 @@ fn synth_to_h(spec: &ParamsSpec) -> MethodDef {
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     };
     let ret_ty = hash_ty;
     MethodDef {
@@ -2123,5 +2131,6 @@ fn try_rewrite_typed_bracket(
         diagnostic: None,
         hint: None,
         decisions: 0,
+        keyword_arg: None,
     })
 }

@@ -151,6 +151,9 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
                         },
                     );
                     v.ty = ty.clone();
+                    // The wrapper declares the instance method's params as
+                    // they are, flattened keywords included.
+                    crate::lower::keyword_marks::mark_forwarded_param(&mut v, p);
                     v
                 })
                 .collect();

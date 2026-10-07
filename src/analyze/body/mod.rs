@@ -1278,6 +1278,7 @@ impl<'a> BodyTyper<'a> {
                         diagnostic: None,
                         hint: None,
                         decisions: 0,
+                        keyword_arg: None,
                     });
                 }
 

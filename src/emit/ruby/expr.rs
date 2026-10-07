@@ -31,6 +31,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Whether the tree being emitted binds keywords natively (ruby family).
+pub(super) fn native_keywords() -> bool {
+    NATIVE_KEYWORD_SPLATS.with(Cell::get)
+}
+
 /// Run `f` emitting for an interpreter with Ruby 3 keyword arguments.
 pub fn with_native_keyword_splats<R>(f: impl FnOnce() -> R) -> R {
     let prev = NATIVE_KEYWORD_SPLATS.with(|c| c.replace(true));
@@ -1122,6 +1127,8 @@ pub(super) fn emit_send_base(
     args: &[Expr],
     parenthesized: bool,
 ) -> String {
+    // Dropped before any arity- or index-based arm below reads `args`.
+    let args = &*without_keyword_fills(args);
     let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
     let m = method.as_str();
     // `...` is a send argument packet, never an index or infix operand.
@@ -1544,8 +1551,30 @@ fn emit_keyword_forward_arg(arg: &Expr) -> String {
         && NATIVE_KEYWORD_SPLATS.with(Cell::get)
     {
         format!("**{}", paren_multiline(emit_arg(arg)))
+    } else if arg.decisions & crate::expr::SOURCE_KEYWORD_ARG != 0
+        && NATIVE_KEYWORD_SPLATS.with(Cell::get)
+    {
+        // The callee's flattened keywords are written back as keywords
+        // (`emit_method`), so the source's keyword argument is too.
+        match (arg.keyword_arg(), &*arg.node) {
+            (Some(key), _) => format!("{key}: {}", emit_arg(arg)),
+            (None, ExprNode::Hash { entries, .. }) if !entries.is_empty() => emit_hash(entries, true),
+            (None, _) => format!("**{}", paren_multiline(emit_arg(arg))),
+        }
     } else {
         emit_arg(arg)
+    }
+}
+
+/// A send's arguments with the lowering's keyword default fills
+/// (`KEYWORD_DEFAULT_FILL`) dropped on a native-keyword tree: the
+/// source omitted them, and the callee binds its own default.
+fn without_keyword_fills(args: &[Expr]) -> std::borrow::Cow<'_, [Expr]> {
+    let fill = |a: &Expr| a.decisions & crate::expr::KEYWORD_DEFAULT_FILL != 0;
+    if NATIVE_KEYWORD_SPLATS.with(Cell::get) && args.iter().any(fill) {
+        std::borrow::Cow::Owned(args.iter().filter(|a| !fill(a)).cloned().collect())
+    } else {
+        std::borrow::Cow::Borrowed(args)
     }
 }
 

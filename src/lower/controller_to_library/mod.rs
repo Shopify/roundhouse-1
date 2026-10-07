@@ -2895,6 +2895,7 @@ fn flatten_seqs(expr: &Expr) -> Expr {
             diagnostic: e.diagnostic.clone(),
             hint: e.hint,
             decisions: e.decisions,
+            keyword_arg: e.keyword_arg.clone(),
         }
     }
     flatten(expr)

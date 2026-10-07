@@ -321,6 +321,13 @@ fn rewrite_calls(e: &mut Expr, params: &HashMap<Symbol, Vec<Slot>>) {
 /// Move a call's trailing keywords into the positional slots they
 /// name. `keyword_slots_only` limits the names to slots ingest
 /// flattened from keywords.
+///
+/// Each moved value is marked `SOURCE_KEYWORD_ARG` with its key, and each
+/// filled gap `KEYWORD_DEFAULT_FILL`, so the ruby-family trees, which
+/// write the callee's flattened keywords back, restore the source call
+/// (`lower::keyword_marks`). The values keep slot order rather than the
+/// order the source wrote the keywords in, so their evaluation order can
+/// differ from Ruby's when two keyword values have side effects.
 fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
     let Some(last) = args.last() else { return };
     let ExprNode::Hash { entries, kwargs: true } = &*last.node else { return };
@@ -355,7 +362,9 @@ fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
     for pos in filled..=last_pos {
         if let Some((p, _)) = supplied.peek() {
             if *p == pos {
-                moved.push(supplied.next().map(|(_, v)| v).expect("peeked"));
+                let mut value = supplied.next().map(|(_, v)| v).expect("peeked");
+                value.mark_source_keyword(slots[pos].name.clone());
+                moved.push(value);
                 continue;
             }
         }
@@ -363,7 +372,9 @@ fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) {
         if !is_context_free(default) {
             return;
         }
-        moved.push(default.clone());
+        let mut fill = default.clone();
+        fill.mark_keyword_default_fill(slots[pos].name.clone());
+        moved.push(fill);
     }
     args.pop();
     args.extend(moved);

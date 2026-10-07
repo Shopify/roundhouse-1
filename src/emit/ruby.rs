@@ -45,11 +45,24 @@ pub fn emit_method(m: &MethodDef) -> String {
         MethodReceiver::Instance => "",
         MethodReceiver::Class => "self.",
     };
+    // A native-keyword tree writes ingest's flattened keywords back
+    // (`name: default`, `**rest`): Ruby 3 would bind a caller's keyword
+    // Hash to the first optional positional. Only a trailing run can be
+    // keywords; anything after it keeps the whole method positional.
+    let tail = m.params.iter().rev().take_while(|p| p.from_keyword || p.from_kwrest).count();
+    let first_kw = m.params.len() - tail;
+    let rest_ok = m.params[first_kw..].iter().position(|p| p.from_kwrest).is_none_or(|i| i + 1 == tail);
+    let respell = expr::native_keywords() && tail > 0 && rest_ok;
     let mut ps: Vec<String> = m
         .params
         .iter()
-        .map(|p| match (&p.default, p.keyword) {
+        .enumerate()
+        .map(|(i, p)| (respell && i >= first_kw, p))
+        .map(|(kw, p)| match (&p.default, p.keyword) {
             _ if p.forwarding => "...".to_string(),
+            _ if kw && p.from_kwrest => format!("**{}", p.name.as_str()),
+            (Some(default), false) if kw => format!("{}: {}", p.name.as_str(), emit_default(default)),
+            (None, false) if kw => format!("{}:", p.name.as_str()),
             (Some(default), false) => {
                 format!("{} = {}", p.name.as_str(), emit_default(default))
             }

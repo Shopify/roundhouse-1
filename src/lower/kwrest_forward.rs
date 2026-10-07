@@ -236,8 +236,16 @@ fn rewrite(e: &mut Expr, sigs: &HashMap<Symbol, Vec<Param>>, diags: &mut Vec<Dia
         return;
     };
 
-    let bundle = args.pop().expect("checked above");
-    args.extend(defaults);
+    // The defaults are fills the source never wrote, and the bundle is the
+    // erased `**` this pass identified. The ruby-family trees drop the
+    // fills and write `**bundle` against the restored `**rest`
+    // (`lower::keyword_marks`).
+    let mut bundle = args.pop().expect("checked above");
+    bundle.decisions |= crate::expr::ERASED_KEYWORD_SPLAT;
+    args.extend(defaults.into_iter().zip(&params[bundle_slot..rest_slot]).map(|(mut d, p)| {
+        d.mark_keyword_default_fill(p.name.clone());
+        d
+    }));
     args.push(bundle);
 }
 

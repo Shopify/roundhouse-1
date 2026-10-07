@@ -602,6 +602,9 @@ impl<'a> BodyTyper<'a> {
         let last_ty_is_hash = matches!(last_param.ty, Ty::Hash { .. });
         if last_kind_positional && last_ty_is_hash {
             *kwargs = false;
+            // Written unbraced in the source: the ruby-family trees, which
+            // may restore the callee's `**rest`, write it back that way.
+            last.decisions |= crate::expr::SOURCE_KEYWORD_ARG;
         }
     }
 
