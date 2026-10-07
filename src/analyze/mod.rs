@@ -31,6 +31,7 @@ mod site_cache;
 mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
+mod extension_modules;
 mod presence_not_null;
 mod test_teardown;
 pub(crate) mod test_constants;
@@ -130,6 +131,10 @@ pub struct Analyzer {
     /// includers (see `fold_host_surfaces`). Kept out of what the
     /// concern fold copies back down, and rewritten every round.
     host_folded: HashMap<ClassId, BTreeSet<Symbol>>,
+    /// Library modules only ever `extend`ed onto a class or module
+    /// object, whose instance methods are typed class side
+    /// (`extension_modules`).
+    extension_modules: crate::det::HashSet<ClassId>,
     /// Methods whose body ends in `.inquiry` — the evidence
     /// [`inquiry::is_inquiry_predicate`] needs to answer
     /// `content_type.attachment?` as Bool on a `Str` receiver.
@@ -1256,6 +1261,7 @@ impl Analyzer {
             adapter,
             concern_folded: HashMap::default(),
             host_folded: HashMap::default(),
+            extension_modules: extension_modules::extension_only_modules(app),
             refined_action_bindings: HashMap::default(),
             inquirers: inquiry::inquirer_methods(app),
             load_hook_bases: crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS
@@ -3956,10 +3962,12 @@ impl Analyzer {
         // `self < Base` are Module protocol on that receiver).
         let library_modules: crate::det::HashSet<&ClassId> =
             app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
+        // A module only ever `extend`ed onto a class runs the same way.
         let class_methods_carriers: crate::det::HashSet<ClassId> = app.library_classes.iter()
             .filter(|lc| lc.is_module)
             .filter(|lc| crate::app::class_methods_carrier_owner(&lc.name)
-                .is_some_and(|owner| library_modules.contains(&owner)))
+                .is_some_and(|owner| library_modules.contains(&owner))
+                || self.extension_modules.contains(&lc.name))
             .map(|lc| lc.name.clone())
             .collect();
         drop(library_modules);
