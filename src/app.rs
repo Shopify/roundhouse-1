@@ -116,6 +116,12 @@ pub struct App {
     /// Empty when the app ships no `sig/` directory.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub rbs_signatures: HashMap<ClassId, HashMap<Symbol, Ty>>,
+    /// The `rbs_signatures` entries a source `sig`/`#:` declared on the
+    /// SINGLETON side (`def self.x`, a `def` in `class << self`). The
+    /// analyzer registers those in `class_methods`; every other entry is
+    /// an instance method (or a sidecar's, whose side is not recorded).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rbs_singleton_methods: HashMap<ClassId, crate::det::HashSet<Symbol>>,
     /// What a `sig/**/*.rbs` sidecar says a class INCLUDES, keyed by
     /// the declaring class and holding the module names as written.
     ///
@@ -1067,6 +1073,7 @@ impl App {
             stylesheets: Vec::new(),
             rbs_signatures: HashMap::default(),
             rbs_includes: HashMap::default(),
+            rbs_singleton_methods: HashMap::default(),
             gem_lock: None,
             gem_boundary: Default::default(),
             content_helper_allowed_attributes: Vec::new(),

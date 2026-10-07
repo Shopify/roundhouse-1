@@ -61,6 +61,8 @@ pub fn classify_modulo(lhs: &Expr, rhs: &Expr) -> ModuloCase {
         // For now, Str with any rhs that isn't obvious-Incompatible
         // gets StringFormat.
         (Ty::Str, _) => ModuloCase::StringFormat,
+        // The receiver's own `%` (or one the registry cannot rule out).
+        _ if super::operand::is_user_operator_receiver(lhs) => ModuloCase::Unknown,
         _ => ModuloCase::Incompatible,
     }
 }

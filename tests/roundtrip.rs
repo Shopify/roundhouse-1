@@ -157,6 +157,7 @@ fn tiny_blog_round_trips() {
         importmap: None,
         stylesheets: vec![],
         rbs_signatures: roundhouse::det::HashMap::default(),
+        rbs_singleton_methods: roundhouse::det::HashMap::default(),
         gem_lock: None,
         gem_boundary: Default::default(),
         content_helper_allowed_attributes: Vec::new(),

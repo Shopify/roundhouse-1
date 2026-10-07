@@ -66,7 +66,9 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
         (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => CmpCase::SameType,
         (Ty::Str, Ty::Str) | (Ty::Sym, Ty::Sym) => CmpCase::SameType,
         (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => CmpCase::NumericPromote,
-        (Ty::Class { .. }, Ty::Class { .. }) if lhs.decisions & crate::expr::CLASS_OBJECT_VALUE != 0
+        // Not only `Ty::Class` pairs: `type <= Hash` with `type: Class[top]`
+        // compares two class objects whatever the rhs constant types as.
+        _ if lhs.decisions & crate::expr::CLASS_OBJECT_VALUE != 0
             && rhs.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 => CmpCase::ClassSubclass,
         // `Gem::Version < Integer?`, `Money <= Money?`: `<` is `Comparable`
         // on the lhs class; whether it accepts the rhs is that class's

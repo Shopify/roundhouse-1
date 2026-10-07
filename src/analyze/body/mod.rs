@@ -312,44 +312,6 @@ pub(crate) fn lexical_class(
 /// enclosing scope of `scope` first, and its own type is read in the
 /// scope that declares it. Bounded, so an alias cycle stays a class.
 pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) -> Ty {
-    fn expand(ty: &Ty, scope: &str, classes: Classes<'_>, depth: u8) -> Ty {
-        match ty {
-            Ty::Class { id, args } if args.is_empty() => {
-                if depth < 8 && let Some((owner, aliased)) = type_alias(id, scope, classes) {
-                    return expand(&aliased, &owner, classes, depth + 1);
-                }
-                ty.clone()
-            }
-            Ty::Class { id, args } => Ty::Class { id: id.clone(), args: args.iter().map(|t| expand(t, scope, classes, depth)).collect() },
-            Ty::Array { elem } => Ty::Array { elem: Box::new(expand(elem, scope, classes, depth)) },
-            Ty::Hash { key, value } => Ty::Hash {
-                key: Box::new(expand(key, scope, classes, depth)),
-                value: Box::new(expand(value, scope, classes, depth)),
-            },
-            Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(|t| expand(t, scope, classes, depth)).collect() },
-            Ty::Union { variants } => union_many(variants.iter().map(|t| expand(t, scope, classes, depth)).collect()),
-            other => other.clone(),
-        }
-    }
-    fn type_alias(written: &ClassId, scope: &str, classes: Classes<'_>) -> Option<(String, Ty)> {
-        let (prefix, name) = match written.0.as_str().rsplit_once("::") {
-            Some((prefix, name)) => (prefix.trim_start_matches("::"), name),
-            None => ("", written.0.as_str()),
-        };
-        let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
-        loop {
-            let owner = parts.iter().copied().chain((!prefix.is_empty()).then_some(prefix)).collect::<Vec<_>>().join("::");
-            if !owner.is_empty()
-                && let Some(info) = classes.get(&ClassId(Symbol::from(owner.as_str())))
-                && let Some(aliased) = info.type_aliases.get(&Symbol::from(name))
-            {
-                return Some((owner, aliased.clone()));
-            }
-            if parts.pop().is_none() {
-                return None;
-            }
-        }
-    }
     let has_class = std::cell::Cell::new(false);
     ty.map_class_ids(&|id| {
         has_class.set(true);
@@ -358,7 +320,124 @@ pub(crate) fn expand_type_aliases(ty: &Ty, scope: &str, classes: Classes<'_>) ->
     if !has_class.get() {
         return ty.clone();
     }
-    expand(ty, scope, classes, 0)
+    expand_type_aliases_by(
+        ty,
+        scope,
+        &|owner, name| classes.get(owner).and_then(|info| info.type_aliases.get(name).cloned()),
+        &|id, _| id.clone(),
+        true,
+    )
+}
+
+/// [`expand_type_aliases`] over any alias table: `alias(owner, name)` is the
+/// type `owner::name = T.type_alias { ... }` names, and `class(id, scope)`
+/// resolves a class name that is not an alias, read in `scope` (the alias's
+/// own scope inside an expanded alias). Recurses through signatures too.
+/// `normalize` joins a union an alias expanded into the analyzer's lattice
+/// (a cast's type); without it a union keeps its written arms (a declared
+/// signature, read as written).
+pub(crate) fn expand_type_aliases_by(
+    ty: &Ty,
+    scope: &str,
+    alias: &dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
+    class: &dyn Fn(&ClassId, &str) -> ClassId,
+    normalize: bool,
+) -> Ty {
+    struct Expand<'a> {
+        alias: &'a dyn Fn(&ClassId, &Symbol) -> Option<Ty>,
+        class: &'a dyn Fn(&ClassId, &str) -> ClassId,
+        normalize: bool,
+    }
+    impl Expand<'_> {
+        fn ty(&self, ty: &Ty, scope: &str, depth: u8) -> Ty {
+            match ty {
+                Ty::Class { id, args } if args.is_empty() => {
+                    if depth < 8 && let Some((owner, aliased)) = self.find(id, scope) {
+                        return self.ty(&aliased, &owner, depth + 1);
+                    }
+                    Ty::Class { id: (self.class)(id, scope), args: Vec::new() }
+                }
+                Ty::Class { id, args } => {
+                    let args: Vec<Ty> = args.iter().map(|t| self.ty(t, scope, depth)).collect();
+                    if is_stdlib_generic(id) {
+                        return Ty::Class { id: id.clone(), args };
+                    }
+                    // A constant naming a class (`Results::Result =
+                    // ::Shopify::Adt::Result`) takes the written arguments.
+                    if depth < 8
+                        && let Some((owner, aliased)) = self.find(id, scope)
+                        && matches!(&aliased, Ty::Class { args: none, .. } if none.is_empty())
+                        && let Ty::Class { id: target, args: target_args } = self.ty(&aliased, &owner, depth + 1)
+                        && target_args.is_empty()
+                    {
+                        return Ty::Class { id: target, args };
+                    }
+                    Ty::Class { id: (self.class)(id, scope), args }
+                }
+                Ty::Array { elem } => Ty::Array { elem: Box::new(self.ty(elem, scope, depth)) },
+                Ty::Hash { key, value } => Ty::Hash {
+                    key: Box::new(self.ty(key, scope, depth)),
+                    value: Box::new(self.ty(value, scope, depth)),
+                },
+                Ty::Tuple { elems } => Ty::Tuple { elems: elems.iter().map(|t| self.ty(t, scope, depth)).collect() },
+                Ty::Record { row } => Ty::Record {
+                    row: crate::ty::Row {
+                        fields: row.fields.iter().map(|(name, t)| (name.clone(), self.ty(t, scope, depth))).collect(),
+                        rest: row.rest.clone(),
+                    },
+                },
+                Ty::Union { variants } => {
+                    let arms: Vec<Ty> = variants.iter().map(|t| self.ty(t, scope, depth)).collect();
+                    if self.normalize { union_many(arms) } else { Ty::Union { variants: arms } }
+                }
+                Ty::Fn { params, block, ret, effects } => Ty::Fn {
+                    params: params
+                        .iter()
+                        .map(|p| crate::ty::Param { name: p.name.clone(), ty: self.ty(&p.ty, scope, depth), kind: p.kind.clone() })
+                        .collect(),
+                    block: block.as_ref().map(|b| Box::new(self.ty(b, scope, depth))),
+                    ret: Box::new(self.ty(ret, scope, depth)),
+                    effects: effects.clone(),
+                },
+                other => other.clone(),
+            }
+        }
+
+        fn find(&self, written: &ClassId, scope: &str) -> Option<(String, Ty)> {
+            let (prefix, name) = match written.0.as_str().rsplit_once("::") {
+                Some((prefix, name)) => (prefix.trim_start_matches("::"), name),
+                None => ("", written.0.as_str()),
+            };
+            let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+            loop {
+                let owner = parts.iter().copied().chain((!prefix.is_empty()).then_some(prefix)).collect::<Vec<_>>().join("::");
+                if !owner.is_empty()
+                    && let Some(aliased) = (self.alias)(&ClassId(Symbol::from(owner.as_str())), &Symbol::from(name))
+                {
+                    return Some((owner, aliased));
+                }
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    Expand { alias, class, normalize }.ty(ty, scope, 0)
+}
+
+/// A parameterized stdlib generic written unqualified: `Set[String]`,
+/// `Range[Integer]`, `Enumerable[T]`, `Enumerator[T]`, `Class[top]`,
+/// `Module[top]`, and `T::Set[X]` read the same way. Sorbet reads such a
+/// name as `T::Set[String]` (the stdlib class) whatever the lexical scope
+/// holds: inside `module Metafields`, beside `Metafields::Set`, `#: ->
+/// Set[String]` is `T::Set[String]` while a bare `#: -> Set` is
+/// `Metafields::Set` (srb 0.6.13502 `T.reveal_type`). So only the
+/// argument-less spelling resolves lexically.
+fn is_stdlib_generic(id: &ClassId) -> bool {
+    matches!(
+        id.0.as_str(),
+        "Set" | "Range" | "Enumerable" | "Enumerator" | "Enumerator::Lazy" | "Enumerator::Chain" | "Class" | "Module"
+    )
 }
 
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
@@ -559,7 +638,9 @@ impl<'a> BodyTyper<'a> {
         let ty = self.compute(expr, ctx);
         expr.ty = Some(ty.clone());
         expr.decisions &= !crate::expr::CLASS_OBJECT_VALUE;
-        if self.is_class_object(expr, ctx) { expr.decisions |= crate::expr::CLASS_OBJECT_VALUE; }
+        if self.is_class_object(expr, ctx) || self.is_class_of_value(expr, ctx) {
+            expr.decisions |= crate::expr::CLASS_OBJECT_VALUE;
+        }
         diagnostic::detect_diagnostic(expr);
         ty
     }
@@ -718,9 +799,14 @@ impl<'a> BodyTyper<'a> {
 
     /// Identity evidence for Module protocol, independent of nominal instance type.
     fn is_class_object(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        // `Class[top]`, `Module`, `T::Class[X]`: a declared type that is
+        // the class object itself, carried by a local or a call. A
+        // constant and `x.singleton_class` keep their own proofs below
+        // (`1.singleton_class` is typed `Class` yet raises TypeError).
+        let typed_class_value = || matches!(expr.ty.as_ref(), Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "Class" | "Module"));
         match &*expr.node {
             ExprNode::SelfRef => ctx.class_side,
-            ExprNode::Var { name, .. } => ctx.class_objects.contains(name),
+            ExprNode::Var { name, .. } => ctx.class_objects.contains(name) || typed_class_value(),
             ExprNode::Const { path } => {
                 if expr.decisions & crate::expr::RESOLVED_CLASS_REF != 0 { return true; }
                 if let Some(answer) = self.const_resolver.as_ref().and_then(|r| r.reference(expr.span, path)) {
@@ -771,6 +857,22 @@ impl<'a> BodyTyper<'a> {
             {
                 !self.owns_operator(r.ty.as_ref(), method, true)
             }
+            _ => typed_class_value(),
+        }
+    }
+
+    /// `x.class` is a class object as a VALUE: `x.class < Base` is
+    /// Module#<, answered on whatever class `x` has at run time. Not
+    /// identity evidence: `is_class_object` still refuses Module protocol
+    /// (`Probe.new.class.define_method`) on it.
+    fn is_class_of_value(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        match &*expr.node {
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+                if method.as_str() == "class" && args.is_empty() =>
+            {
+                !matches!(r.ty, None | Some(Ty::Var { .. }))
+                    && !self.owns_operator(r.ty.as_ref(), method, self.is_class_object(r, ctx))
+            }
             _ => false,
         }
     }
@@ -801,15 +903,59 @@ impl<'a> BodyTyper<'a> {
                 && variants.iter().all(|ty| self.owns_operator(Some(ty), method, class_object)),
             Some(Ty::Class { id, .. }) => {
                 let mut current = Some(id);
+                // Comparable defines the four orderings on `<=>`: an app
+                // value class, or a vendored one (`Gem::Version`) the
+                // registry does not model.
+                let ordering = !class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=");
                 for _ in 0..32 {
                     let Some(id) = current else { break };
-                    let Some(class) = self.classes().get(id) else { break };
+                    let Some(class) = self.classes().get(id) else {
+                        return ordering && crate::stdlib_rbs::declares_include(id.0.as_str(), "Comparable");
+                    };
                     let own = if class_object { class.has_class_method(method) } else { class.has_instance_method(method) };
                     if own { return true; }
                     if !class_object && class.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) { return true; }
+                    if ordering && class.includes.iter().any(|m| m.0.as_str() == "Comparable") { return true; }
                     current = class.parent_id();
                 }
                 false
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` may answer `method` with a definition the registry does
+    /// not show, so a binop on it is undecidable rather than a mismatch.
+    /// A class object always has `Module#<` and its siblings; anything
+    /// [`Self::owns_operator`] proves (an own or mixed-in definition, or
+    /// `Comparable`'s orderings, app or vendored) answers it; and so may
+    /// a receiver whose class, an ancestor or a mixin is not modeled (a
+    /// gem the app does not ingest, a sig-only name). Only a modeled
+    /// class lacking the operator through its whole known ancestry is
+    /// proven to raise.
+    fn may_own_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
+        if class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=") {
+            return true;
+        }
+        match ty {
+            Some(Ty::Union { variants }) => !variants.is_empty()
+                && variants.iter().all(|ty| self.may_own_operator(Some(ty), method, class_object)),
+            Some(Ty::Class { id, .. }) => {
+                if self.owns_operator(ty, method, class_object) {
+                    return true;
+                }
+                let mut current = Some(id);
+                for _ in 0..32 {
+                    let Some(id) = current else { return false };
+                    let Some(class) = self.classes().get(id) else {
+                        return !matches!(id.0.as_str(), "Object" | "BasicObject");
+                    };
+                    if !class_object && class.includes.iter().any(|m| !self.classes().contains_key(m)) {
+                        return true;
+                    }
+                    current = class.parent_id();
+                }
+                true
             }
             _ => false,
         }
@@ -1827,7 +1973,11 @@ impl<'a> BodyTyper<'a> {
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
-                        && self.owns_operator(recv_ty.as_ref(), method, self.is_class_object(receiver, ctx))
+                        && self.may_own_operator(
+                            recv_ty.as_ref(),
+                            method,
+                            receiver.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 || self.is_class_object(receiver, ctx),
+                        )
                     {
                         receiver.decisions |= crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     }
@@ -2668,9 +2818,15 @@ impl<'a> BodyTyper<'a> {
                     _ => expand_type_aliases(target_ty, "", self.classes()),
                 };
                 let resolved = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
-                    Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
-                        lexical_class(id, scope.0.as_str(), self.classes()).unwrap_or_else(|| id.clone())
-                    }),
+                    // As a signature reads it: `Set[String]` stays the
+                    // stdlib generic (`is_stdlib_generic`).
+                    Some(Ty::Class { id: scope, .. }) => expand_type_aliases_by(
+                        target_ty,
+                        scope.0.as_str(),
+                        &|_, _| None,
+                        &|id, scope| lexical_class(id, scope, self.classes()).unwrap_or_else(|| id.clone()),
+                        false,
+                    ),
                 _ => target_ty.clone(),
                 };
                 let missing = std::cell::RefCell::new(Vec::new());

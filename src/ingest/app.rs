@@ -2165,14 +2165,21 @@ end
     let mut abstract_methods: HashMap<crate::ident::ClassId, crate::det::HashSet<crate::ident::Symbol>> =
         HashMap::default();
     for source in sources.iter().filter(|source| source.path.ends_with(".rb") && !dropped.contains(&source.path)) {
-        let (signatures, abstracts) = super::sorbet_sig::ingest_sorbet_declarations(source.text.as_bytes());
-        for (class_id, names) in abstracts {
+        let declarations = super::sorbet_sig::ingest_sorbet_declarations(source.text.as_bytes());
+        for (class_id, names) in declarations.abstracts {
             abstract_methods.entry(class_id).or_default().extend(names);
         }
-        for (class_id, methods) in signatures {
-            let declared = app.rbs_signatures.entry(class_id).or_default();
+        for (class_id, methods) in declarations.signatures {
+            let singleton = declarations.singleton.get(&class_id);
+            let declared = app.rbs_signatures.entry(class_id.clone()).or_default();
             for (name, ty) in methods {
-                declared.entry(name).or_insert(ty);
+                // The first declaration read wins, and with it its side.
+                if let std::collections::hash_map::Entry::Vacant(slot) = declared.entry(name.clone()) {
+                    slot.insert(ty);
+                    if singleton.is_some_and(|names| names.contains(&name)) {
+                        app.rbs_singleton_methods.entry(class_id.clone()).or_default().insert(name);
+                    }
+                }
             }
         }
     }
