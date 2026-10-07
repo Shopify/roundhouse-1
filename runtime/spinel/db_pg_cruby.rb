@@ -4,6 +4,7 @@
 require "pg"
 require "bigdecimal"
 require "date"
+require "monitor"
 
 module Db
   # `lazy`: adapters are built on first checkout, up to `size`, as Rails'
@@ -49,10 +50,17 @@ module Db
   #                 Other notices are dropped, as Rails does without
   #                 `db_warnings_action` (not modeled).
   #
-  # Not modeled: lazy BEGIN (the runtime's BEGIN is its own statement),
-  # verification on pool checkout, query retry (`allow_retry`; the retry
-  # budget of every statement is 0), Rails' transaction restoration on
-  # reconnect, preconnect, the dirty mark Rails' public `raw_connection`
+  # Transactions: with_raw_connection materializes the adapter's lazy
+  # transactions before a statement and marks the current one dirty after
+  # it (`materialize_transactions:`, false for transaction control and
+  # configure_connection statements), and reconnect!/disconnect! reset the
+  # transaction state (reset_transaction), as Rails does. These hooks are
+  # no-ops here; the Active Record adapter's TransactionManager
+  # (runtime/active_record_transactions.rb) implements them.
+  #
+  # Not modeled: verification on pool checkout, query retry (`allow_retry`;
+  # the retry budget of every statement is 0, BEGIN's included),
+  # preconnect, the dirty mark Rails' public `raw_connection`
   # sets (which stops implicit reconnects until checkout), and Rails'
   # redundant-SET elision in configure_connection (the settings a session
   # ends with are the same; only SCHEMA statements differ).
@@ -86,6 +94,26 @@ module Db
       @search_path = nil
       @rh_pg_changes = 0
       @rh_pg_lease = nil
+      @lock = Monitor.new
+    end
+
+    # AbstractAdapter#lock: held around every statement and transaction
+    # change, so a connection shared by threads (a pinned one) runs one
+    # at a time.
+    attr_reader :lock
+
+    # Transaction hooks of with_raw_connection, reconnect! and
+    # disconnect! (see above); an adapter without transactions has none.
+    def materialize_transactions
+      nil
+    end
+
+    def dirty_current_transaction
+      nil
+    end
+
+    def reset_transaction(restore: false)
+      yield if block_given?
     end
 
     def connected?
@@ -110,7 +138,7 @@ module Db
     end
 
     def verify!
-      reconnect! if @needs_reconnect || !active?
+      reconnect!(restore_transactions: true) if @needs_reconnect || !active?
       @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       @verified = true
     end
@@ -124,7 +152,7 @@ module Db
       false
     end
 
-    def reconnect!
+    def reconnect!(restore_transactions: false)
       retries_remaining = connection_retries
       deadline = retry_deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) + retry_deadline
       attempt_configure_connection do
@@ -134,7 +162,7 @@ module Db
           @last_activity = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           @verified = true
           @transaction_open = false
-          configure_connection
+          reset_transaction(restore: restore_transactions) { configure_connection }
         rescue => original_exception
           translated_exception = Db.translate_exception_class(original_exception, nil, [])
           # Rails' RetryBudget: `connection_retries` attempts within the
@@ -152,6 +180,7 @@ module Db
     end
 
     def disconnect!
+      reset_transaction
       @verified = false
       @needs_reconnect = false
       @last_activity = nil
@@ -179,9 +208,9 @@ module Db
     # Lowest-level statement execution: one `sql.active_record` event
     # around a verified session, yielding the PG::Connection. Driver errors
     # leave as their Active Record translation.
-    def raw_execute(sql, name = "SQL", binds = [])
+    def raw_execute(sql, name = "SQL", binds = [], materialize_transactions: true)
       Db.instrument_sql(sql, binds, name: name, connection: self) do
-        with_raw_connection(sql, binds) { |conn| yield conn }
+        with_raw_connection(sql, binds, materialize_transactions: materialize_transactions) { |conn| yield conn }
       end
     end
 
@@ -228,29 +257,33 @@ module Db
 
     # Rails' with_raw_connection(allow_retry: false): its retry budget is
     # empty, so a failure is raised after downgrading the session.
-    def with_raw_connection(sql = nil, binds = [])
-      ensure_connection_ready
-      observe_transaction_state
-      begin
-        yield @raw_connection
-      rescue => original_exception
-        translated_exception = Db.translate_exception_class(original_exception, sql, binds)
-        downgrade_connection_after_error(translated_exception)
-        raise translated_exception
-      rescue Exception
-        # A non-StandardError (Timeout) abandoned the statement partway.
-        @last_activity = nil
-        @verified = false
-        raise
-      ensure
-        @transaction_open = false if sql && TRANSACTION_END.match?(sql)
+    def with_raw_connection(sql = nil, binds = [], materialize_transactions: false)
+      @lock.synchronize do
+        ensure_connection_ready(materialize_transactions)
+        observe_transaction_state
+        begin
+          yield @raw_connection
+        rescue => original_exception
+          translated_exception = Db.translate_exception_class(original_exception, sql, binds)
+          downgrade_connection_after_error(translated_exception)
+          raise translated_exception
+        rescue Exception
+          # A non-StandardError (Timeout) abandoned the statement partway.
+          @last_activity = nil
+          @verified = false
+          raise
+        ensure
+          @transaction_open = false if sql && TRANSACTION_END.match?(sql)
+          dirty_current_transaction if materialize_transactions
+        end
       end
     end
 
     # Rails' ensure_connection_ready and skip_verification? (allow_retry:
     # false).
-    def ensure_connection_ready
+    def ensure_connection_ready(materialize_transactions = false)
       connect! if !connected? && reconnect_can_restore_state?
+      self.materialize_transactions if materialize_transactions
       reconnectable = reconnect_can_restore_state?
       verify! unless skip_verification?(reconnectable)
       reconnectable
@@ -394,7 +427,7 @@ module Db
       if (path = @search_path)
         # Db's own search path (the schema manifest's), a value.
         sql = "SELECT pg_catalog.set_config('search_path', $1, false)"
-        raw_execute(sql, "SCHEMA", [path]) { |conn| perform_query(conn, sql, [path]).clear }
+        raw_execute(sql, "SCHEMA", [path], materialize_transactions: false) { |conn| perform_query(conn, sql, [path]).clear }
       elsif (path = @config[:schema_search_path] || @config[:schema_order])
         # Rails' schema_search_path=: the configured list as SQL.
         session_statement("SET search_path TO #{path}")
@@ -409,7 +442,7 @@ module Db
           session_statement("SET SESSION #{name} TO #{quote_session_value(value)}")
         end
       end
-      raw_execute(TYPE_MAP_QUERY, "SCHEMA") do |conn|
+      raw_execute(TYPE_MAP_QUERY, "SCHEMA", [], materialize_transactions: false) do |conn|
         conn.type_map_for_results = PG::BasicTypeMapForResults.new(conn)
         nil
       end
@@ -438,7 +471,7 @@ module Db
     end
 
     def session_statement(sql)
-      raw_execute(sql, "SCHEMA") { |conn| perform_query(conn, sql).clear }
+      raw_execute(sql, "SCHEMA", [], materialize_transactions: false) { |conn| perform_query(conn, sql).clear }
     end
 
     # Rails' PostgreSQL quote for the value classes a configuration holds.
@@ -798,6 +831,8 @@ module Db
       raise
     ensure
       adapter.instance_variable_set(:@transaction_open, false)
+      # The session's transactions ended with the ROLLBACK (or with it).
+      adapter.reset_transaction
       context[:cache]&.clear
       adapter.instance_variable_set(:@rh_pg_lease, nil)
       pool.mutex.synchronize do

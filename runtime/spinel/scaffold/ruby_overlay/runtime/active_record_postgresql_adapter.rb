@@ -56,32 +56,58 @@ module ActiveRecord
         super(value)
       end
 
-      def begin_db_transaction
-        Db.exec("BEGIN")
-        nil
+      # postgresql/database_statements.rb: the transaction statements, on
+      # this adapter's own session, named "TRANSACTION". BEGIN does not
+      # materialize the lazy transactions it is materializing; COMMIT and
+      # ROLLBACK do (Rails' `materialize_transactions: true`).
+      def begin_db_transaction # :nodoc:
+        query_command("BEGIN", "TRANSACTION", materialize_transactions: false)
       end
 
-      def begin_isolated_db_transaction(isolation)
-        level = case isolation
-        when :read_uncommitted then "READ UNCOMMITTED"
-        when :read_committed then "READ COMMITTED"
-        when :repeatable_read then "REPEATABLE READ"
-        when :serializable then "SERIALIZABLE"
-        else raise TransactionIsolationError, "unknown PostgreSQL isolation level: #{isolation}"
+      def begin_isolated_db_transaction(isolation) # :nodoc:
+        query_command("BEGIN ISOLATION LEVEL #{transaction_isolation_levels.fetch(isolation)}", "TRANSACTION", materialize_transactions: false)
+      end
+
+      def commit_db_transaction # :nodoc:
+        query_command("COMMIT", "TRANSACTION", materialize_transactions: true)
+      end
+
+      def exec_rollback_db_transaction # :nodoc:
+        cancel_any_running_query
+        query_command("ROLLBACK", "TRANSACTION", materialize_transactions: true)
+      end
+
+      def exec_restart_db_transaction # :nodoc:
+        cancel_any_running_query
+        query_command("ROLLBACK AND CHAIN", "TRANSACTION", materialize_transactions: true)
+      end
+
+      # A statement without rows on this adapter's session (Rails'
+      # query_command), recorded and instrumented as every statement is.
+      def query_command(sql, name = nil, materialize_transactions: true) # :nodoc:
+        Db.record_query(sql)
+        Db.context[:cache]&.clear
+        result = raw_execute(sql, name, [], materialize_transactions: materialize_transactions) { |conn| perform_query(conn, sql) }
+        nil
+      ensure
+        result&.clear
+      end
+
+      private
+        IDLE_TRANSACTION_STATUSES = [PG::PQTRANS_IDLE, PG::PQTRANS_INTRANS, PG::PQTRANS_INERROR].freeze
+        private_constant :IDLE_TRANSACTION_STATUSES
+
+        def cancel_any_running_query
+          return if @raw_connection.nil? || IDLE_TRANSACTION_STATUSES.include?(@raw_connection.transaction_status)
+
+          # pg < 1.6.0 cannot obtain the backend key under libpq >= 18.
+          if !(PG.library_version >= 18_00_00 && Gem::Version.new(PG::VERSION) < Gem::Version.new("1.6.0"))
+            @raw_connection.cancel
+          end
+          @raw_connection.block
+        rescue PG::Error
         end
-        Db.exec("BEGIN ISOLATION LEVEL #{level}")
-        nil
-      end
-
-      def commit_db_transaction
-        Db.exec("COMMIT")
-        nil
-      end
-
-      def exec_rollback_db_transaction
-        Db.exec("ROLLBACK")
-        nil
-      end
+      public
     end
   end
 

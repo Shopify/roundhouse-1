@@ -345,6 +345,7 @@ module EmittedSide
     staged = File.join(Dir.mktmpdir("semian-emitted"), "runtime")
     FileUtils.cp_r(File.join(root, "runtime/spinel/scaffold/ruby_overlay/runtime"), staged)
     FileUtils.cp(File.join(root, "runtime/spinel/cruby/active_record_connection_handling.rb"), staged)
+    FileUtils.cp(File.join(root, "runtime/spinel/cruby/active_record_transactions.rb"), staged)
     require File.join(staged, "active_record_postgresql_adapter")
     require File.join(root, "runtime/spinel/semian_activerecord_postgresql_adapter")
   end

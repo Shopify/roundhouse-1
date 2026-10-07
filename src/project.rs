@@ -3320,6 +3320,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let handling = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_connection_handling.rb")
         .map_err(|e| format!("read connection handling runtime: {e}"))?;
     files.push(("runtime/active_record_connection_handling.rb".into(), handling));
+    // Rails' TransactionManager (lazy transactions, savepoints,
+    // `requires_new:`, ActiveRecord::Rollback), required by the handling.
+    let transactions = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_transactions.rb")
+        .map_err(|e| format!("read transactions runtime: {e}"))?;
+    files.push(("runtime/active_record_transactions.rb".into(), transactions));
+    let test_fixtures = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/active_record_test_fixtures.rb")
+        .map_err(|e| format!("read test fixtures runtime: {e}"))?;
+    files.push(("runtime/active_record_test_fixtures.rb".into(), test_fixtures));
     files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
@@ -3386,6 +3394,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
+            // rails/test_help.rb's ActiveRecord::TestFixtures: transactional
+            // tests on every writing pool.
+            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\n");
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")
@@ -5825,10 +5836,13 @@ fn is_nil_assertion_check(expr: &crate::expr::Expr) -> bool {
 /// `translate` maps it), but the name stays refused rather than
 /// supported on one setup only.
 ///
-/// `transaction` with options is refused on every target, Ruby too: the
-/// runtime's `Base.transaction` takes none, and Rails' `isolation:` is
-/// checked only when the transaction first runs a statement, which the
-/// runtime's eager BEGIN does not reproduce.
+/// `transaction` with options is refused on every target but the
+/// PostgreSQL Ruby tree: the shared runtime's `Base.transaction` takes
+/// none, and Rails' `isolation:` is checked only when the transaction
+/// first runs a statement, which its eager BEGIN does not reproduce. The
+/// PostgreSQL tree carries Rails' TransactionManager
+/// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
+/// `requires_new:`, `joinable:`, `isolation:`).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;
@@ -5839,7 +5853,9 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             let ar_class = matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. })
                 if matches!(id.0.as_str(), "ActiveRecord::Base" | "ApplicationRecord")
                     || app.models.iter().any(|model| model.name == *id));
-            if method.as_str() == "transaction" && !args.is_empty() && ar_class {
+            let postgres_ruby = target == "ruby"
+                && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+            if method.as_str() == "transaction" && !args.is_empty() && ar_class && !postgres_ruby {
                 emit::diagnostics::report_unsupported(
                     expr.span,
                     target,

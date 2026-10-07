@@ -104,9 +104,11 @@ module ActiveRecord
     # Run the block on `klass`'s pool (its connection specification
     # under the current role and shard), as a model's statement runs on
     # `klass.connection_pool` in Rails. Re-entrant: inside the same pool
-    # it only yields.
+    # it only yields. With no pool in the handler (a program driving Db's
+    # databases directly, see Base.connection) Db's current database.
     def self.route(klass)
       return yield unless klass.is_a?(Class) && klass <= ActiveRecord::Base
+      return yield if klass.connection_handler.connection_pool_names.empty?
       key = klass.connection_pool.db_key
       return yield if Db.context[:name] == key
       Db.with_database(key) { yield }
@@ -566,39 +568,42 @@ module ActiveRecord
         nil
       end
 
-      # Rails' pin_connection!: one connection for every lease of the
-      # pool, in a real transaction (BEGIN now, `_lazy: false`).
+      # Rails 8.2 pin_connection!: one connection for every lease of the
+      # pool, in a non-joinable transaction begun now (`_lazy: false`),
+      # so a `transaction` inside it is a savepoint. `lock_thread` needs
+      # nothing more: the adapter's lock is always a Monitor.
       def pin_connection!(lock_thread) # :nodoc:
         refuse_unconnectable!
         @pinned_connection ||= (active_connection || checkout)
         @pinned_connections_depth += 1
         Db.pin(@db_key, @pinned_connection)
-        @pinned_connection.verify!
-        Db.with_database(@db_key) { @pinned_connection.begin_db_transaction }
-        @pinned_connection.instance_variable_set(:@rh_pinned_transaction, true)
-        nil
+        @pinned_connection.pinned = true
+        @pinned_connection.begin_transaction(joinable: false, _lazy: false)
       end
 
       def unpin_connection! # :nodoc:
         raise "There isn't a pinned connection #{object_id}" unless @pinned_connection
 
         clean = true
-        @pinned_connections_depth -= 1
-        connection = @pinned_connection
-        @pinned_connection = nil if @pinned_connections_depth.zero?
+        @pinned_connection.lock.synchronize do
+          @pinned_connections_depth -= 1
+          connection = @pinned_connection
+          @pinned_connection = nil if @pinned_connections_depth.zero?
 
-        if connection.transaction_open?
-          Db.with_database(@db_key) { connection.exec_rollback_db_transaction }
-        else
-          # Something committed or rolled back the transaction
-          clean = false
-        end
-        connection.instance_variable_set(:@rh_pinned_transaction, false)
+          if connection.transaction_open?
+            connection.rollback_transaction
+          else
+            # Something committed or rolled back the transaction
+            clean = false
+            connection.reset!
+          end
 
-        if @pinned_connection.nil?
-          Db.unpin(@db_key)
-          Db.with_database(@db_key) { Db.release_connection } if Db.leased_adapter(@db_key).equal?(connection)
-          checkin(connection) unless Db.free?(@db_key, connection)
+          if @pinned_connection.nil?
+            connection.pinned = false
+            Db.unpin(@db_key)
+            Db.with_database(@db_key) { Db.release_connection } if Db.leased_adapter(@db_key).equal?(connection)
+            checkin(connection) unless Db.free?(@db_key, connection)
+          end
         end
 
         clean
@@ -1145,14 +1150,9 @@ module ActiveRecord
 
         connection_descriptor.current_preventing_writes
       end
-
-      # The session's own transaction state (PQtransactionStatus).
-      def transaction_open?
-        conn = raw_connection
-        return false unless conn && !conn.finished?
-        status = conn.transaction_status
-        status != PG::PQTRANS_IDLE && status != PG::PQTRANS_UNKNOWN
-      end
     end
   end
 end
+
+# Transactions (TransactionManager, savepoints, `Base.transaction`).
+require_relative "active_record_transactions"

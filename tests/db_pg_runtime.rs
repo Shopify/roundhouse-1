@@ -409,7 +409,10 @@ class PostgreSQLRuntimeTest
     Entry.create!(Title: "discard isolated", enabled: true)
     connection.exec_rollback_db_transaction
     assert_equal 1, Entry.count
-    assert_raises(ActiveRecord::TransactionIsolationError) {{ connection.begin_isolated_db_transaction(:invalid) }}
+    # Rails 8.2 postgresql/database_statements.rb:60 fetches the level:
+    # an unknown one is a KeyError here (TransactionIsolationError comes
+    # from `transaction(isolation:)` inside a fixture transaction).
+    assert_raises(KeyError) {{ connection.begin_isolated_db_transaction(:invalid) }}
   end
 end
 "##);

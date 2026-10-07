@@ -84,6 +84,18 @@ module ActiveRecord
       ActiveRecord.adapter.select_rows(sql).map { |row| row.values }
     end
 
+    # Rails' DatabaseStatements#select_values / #select_value: the first
+    # column of every row, and the first column of the first row (nil
+    # for no rows). `name` is Rails' log label.
+    def select_values(sql, name = nil)
+      select_rows(sql).map(&:first)
+    end
+
+    def select_value(sql, name = nil)
+      row = select_rows(sql).first
+      row && row.first
+    end
+
     def exec_query(sql)
       execute(sql)
     end

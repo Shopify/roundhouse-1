@@ -60,6 +60,10 @@ const SWITCHES: &[&str] = &[
     "connecting_to",
     "while_preventing_writes",
     "prohibit_shard_swapping",
+    // Not a switch: Rails' connection handler itself (its pools, by
+    // connection name, role and shard), which only the multiple-database
+    // runtime carries.
+    "connection_handler",
 ];
 
 /// What one class body itself says about its connection.
@@ -468,12 +472,14 @@ pub(super) fn resolve(app: &mut App) {
         if multi_database_runtime {
             break;
         }
-        refusals.push(DatabaseRefusal {
-            span,
-            construct: method.clone(),
-            detail: format!("`{method}` switches the role or shard a block runs on; role and shard switching is not modeled"),
-            warning: false,
-        });
+        let detail = if method == "connection_handler" {
+            "`connection_handler` is Rails' connection handler (pools by connection name, role and shard); \
+             only the PostgreSQL runtime with a resolved config/database.yml carries it"
+                .to_string()
+        } else {
+            format!("`{method}` switches the role or shard a block runs on; role and shard switching is not modeled")
+        };
+        refusals.push(DatabaseRefusal { span, construct: method.clone(), detail, warning: false });
     }
 
     let any_routing = owners.values().any(|o| !matches!(o, ModelDatabase::Primary));
