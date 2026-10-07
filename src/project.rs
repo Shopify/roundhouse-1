@@ -7769,7 +7769,6 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("gurgel", "requiring it loads 2 Rails framework files"),
-    ("globalid", "requiring it loads 39 Rails framework files"),
     ("activeresource", "requiring it loads 55 Rails framework files"),
     ("responders", "requiring it loads 107 Rails framework files"),
     ("activemodel-serializers-xml", "requiring it loads 55 Rails framework files"),
@@ -7886,9 +7885,20 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[(
     ],
 )];
 
+/// Gem ports the CRuby overlay carries on every CRuby tree
+/// (`ruby_overlay/boot.rb` requires them), in `GEM_RUNTIME_PORTS`' shape:
+/// globalid 1.4.0's GlobalID, Identification and URI::GID. SignedGlobalID
+/// is not ported, so it is refused as a port gap.
+const OVERLAY_GEM_PORTS: &[(&str, &[(&str, &str)])] =
+    &[("globalid", &[("runtime/spinel/scaffold/ruby_overlay/runtime/global_id.rb", "runtime/global_id.rb")])];
+
+fn gem_ports() -> impl Iterator<Item = &'static (&'static str, &'static [(&'static str, &'static str)])> {
+    GEM_RUNTIME_PORTS.iter().chain(OVERLAY_GEM_PORTS)
+}
+
 /// The finished-tree path of `gem`'s runtime port files.
 pub(crate) fn gem_port_files(gem: &str) -> Option<Vec<&'static str>> {
-    GEM_RUNTIME_PORTS.iter().find(|(g, _)| *g == gem).map(|(_, ports)| ports.iter().map(|(_, emitted)| *emitted).collect())
+    gem_ports().find(|(g, _)| *g == gem).map(|(_, ports)| ports.iter().map(|(_, emitted)| *emitted).collect())
 }
 
 /// The finished-tree port file that declares `name` for `gem`: a class,
@@ -7925,7 +7935,7 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
                 }
             }
             let mut out = Declarations::default();
-            for (gem, ports) in GEM_RUNTIME_PORTS {
+            for (gem, ports) in gem_ports() {
                 let names = out.entry(*gem).or_default();
                 for (source, emitted) in *ports {
                     let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
@@ -10257,6 +10267,10 @@ mod tests {
             assert_eq!(gem_port_file("semian", name), None, "{name}");
         }
         assert_eq!(gem_port_file("dalli", "Dalli"), None);
+        for name in ["GlobalID", "GlobalID::Identification", "URI::GID"] {
+            assert_eq!(gem_port_file("globalid", name), Some("runtime/global_id.rb"), "{name}");
+        }
+        assert_eq!(gem_port_file("globalid", "SignedGlobalID"), None);
     }
 
     /// The cache port rides along where app code (not a test body)

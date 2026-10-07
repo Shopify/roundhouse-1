@@ -549,6 +549,49 @@ fn a_ported_gem_s_unported_names_and_portless_trees_are_refused() {
     );
 }
 
+const GLOBALID_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    globalid (1.4.0)\n      activesupport (>= 6.1)\n\nDEPENDENCIES\n  activesupport\n  globalid\n";
+
+/// Core's essentials, as t_enum_global_id.rb and observe.rb name
+/// globalid. Every CRuby tree carries the overlay's port
+/// (runtime/global_id.rb); SignedGlobalID is not ported.
+fn globalid_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", GLOBALID_LOCK)
+        .write("sorbet/rbi/gems/globalid@1.4.0.rbi", "# typed: true\nclass GlobalID\n  def initialize(gid, options = T.unsafe(nil)); end\n  def model_id; end\nend\nmodule GlobalID::Identification; end\nclass SignedGlobalID < ::GlobalID; end\n")
+        .write("lib/identified.rb", r#"class Identified
+  def identification
+    GlobalID::Identification
+  end
+
+  def model_id(gid)
+    GlobalID.new(gid).model_id
+  end
+end
+"#)
+}
+
+#[test]
+fn an_overlay_ported_gem_s_constants_run_as_its_port() {
+    let (dir, errors) = globalid_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let run = emit_and_run::ruby()
+        // In boot.rb's order: the port uses the core_ext's `blank?`.
+        .args(["-e", "require \"./runtime/active_support_core_ext\"\nrequire \"./runtime/global_id\"\nrequire \"./app/models/identified\"\ni = Identified.new\np [i.identification.equal?(GlobalID::Identification), i.model_id(\"gid://core/Shop/7\")]\np $LOADED_FEATURES.grep(%r{/gems/globalid}).empty?"])
+        .current_dir(&dir)
+        .output()
+        .expect("spawn ruby");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "[true, \"7\"]\ntrue\n", "{}", String::from_utf8_lossy(&run.stderr));
+
+    let gap = globalid_app().write("lib/signed.rb", "class Signed\n  def signed\n    SignedGlobalID\n  end\nend\n");
+    let (_, errors) = gap.emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("SignedGlobalID is declared by the globalid gem, which runs as its runtime port (runtime/global_id.rb), and the port does not declare it")),
+        "{errors:#?}"
+    );
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+}
+
 const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
 
 const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";
