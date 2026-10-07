@@ -151,7 +151,8 @@ fn an_unmodeled_loader_feature_is_refused_at_its_line() {
 /// `eager_load_dir` whose namespace is not defined yet (here `Host::Ext`,
 /// whose file is the one being required), and loads one whose namespace
 /// is.
-const EXT_ENTRY: &str = r##"require "zeitwerk"
+const EXT_ENTRY: &str = r##"require "active_support/core_ext/string/inflections"
+require "zeitwerk"
 
 module Host
   LOG = []
@@ -273,6 +274,10 @@ fn a_gem_extension_loader_inflects_ignores_and_eager_loads_directories() {
     assert!(run.errors.is_empty(), "{}", run.errors.join("\n"));
     assert!(run.success, "emitted program failed in {}:\n{}", run.emitted.display(), run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
+    // The entry's Rails feature require is the runtime ports' (graphql-shopify's
+    // `require "active_support/core_ext/class/attribute"`); it was kept as a
+    // file statement and failed at load with a LoadError.
+    assert!(!run.stderr.contains("file_statement_not_run"), "{}", run.stderr);
     let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).unwrap();
     assert!(!models.contains("optional/thing"), "an ignored file is registered:\n{models}");
 }

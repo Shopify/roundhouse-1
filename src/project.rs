@@ -3670,12 +3670,7 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>, V
         let tail = format!("/lib/{rb}");
         app.sources.iter().any(|s| s.path.ends_with(&tail) || s.path == format!("lib/{rb}"))
     };
-    let framework_feature = |feature: &str| {
-        feature == "rails"
-            || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
-                .iter()
-                .any(|prefix| feature.starts_with(prefix))
-    };
+    let framework_feature = is_framework_feature;
     let mut native: Vec<String> = Vec::new();
     let mut framework: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::default();
@@ -3907,6 +3902,15 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
          end.to_h.freeze\n",
         names.join(", ")
     )
+}
+
+/// A Rails feature (`rails`, `active_support/...`, `action_...`): this
+/// tree's runtime ports answer it, so nothing requires it.
+pub(crate) fn is_framework_feature(feature: &str) -> bool {
+    feature == "rails"
+        || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
+            .iter()
+            .any(|prefix| feature.starts_with(prefix))
 }
 
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not

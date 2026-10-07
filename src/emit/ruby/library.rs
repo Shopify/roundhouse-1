@@ -8266,6 +8266,14 @@ pub(super) fn emit_file_program(
                             );
                             writeln!(s, "{pad}warn {message:?}").unwrap();
                         }
+                        // graphql-shopify's `require "active_support/core_ext/
+                        // class/attribute"`: the runtime ports are the
+                        // framework here, loaded before any app file, and
+                        // no such file is on the tree's load path (as the
+                        // gem-source dependency block says of the same).
+                        None if !*relative && crate::project::is_framework_feature(feature) => {
+                            writeln!(s, "{pad}# {site}: `require {feature:?}` is a Rails feature this tree's runtime ports answer; not required").unwrap();
+                        }
                         None => {
                             writeln!(s, "{pad}RoundhouseAutoload.file_statement({site:?}) do").unwrap();
                             writeln!(s, "{pad}  require {feature:?}").unwrap();
