@@ -10064,6 +10064,49 @@ pub(crate) fn named_for_secrets(name: &str) -> bool {
         || [".key", ".pem", ".ejson", ".enc"].iter().any(|ext| lower.ends_with(ext))
 }
 
+/// The secrets-named files a tree carries anyway: each is git-tracked
+/// in the source app and read by its native test boot. Core's essentials
+/// `Secrets.from_env` reads `config/secrets.#{RAILS_ENV}.json` behind
+/// `File.exist?`, so without it the test boot silently runs on empty
+/// secrets. Nothing else: not the deploy-decrypted `config/secrets.json`,
+/// not `secrets.development.json`. See docs/BOOT_BOUNDARIES.md.
+const CARRIED_SECRETS_FILES: &[&str] = &["config/secrets.test.json"];
+
+/// Whether the secrets-named `rel` under `root` is carried: it is on
+/// [`CARRIED_SECRETS_FILES`], a regular file, and git-tracked. Tracked
+/// means `git ls-files --error-unmatch` in the source's own work tree;
+/// for a slice (`<slice>/root`, not a work tree), the slice manifest
+/// beside it (`<slice>/slice-manifest.json`) names the file's Core path
+/// under `core_root`, whose bytes must equal the copy, tracked there.
+/// Anything else, an untracked or edited copy included, is refused.
+fn carried_secrets_file(root: &Path, rel: &str) -> bool {
+    if !CARRIED_SECRETS_FILES.contains(&rel) || !root.join(rel).is_file() {
+        return false;
+    }
+    let tracked = |dir: &Path, path: &str| {
+        std::process::Command::new("git")
+            .arg("-C").arg(dir)
+            .args(["-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if tracked(root, rel) {
+        return true;
+    }
+    let Some(manifest) = root.parent().map(|p| p.join("slice-manifest.json")) else { return false };
+    let Ok(text) = fs::read_to_string(&manifest) else { return false };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let Some(core_root) = manifest.get("core_root").and_then(|v| v.as_str()).map(Path::new) else { return false };
+    let Some(core_path) = manifest.get("files").and_then(|f| f.as_array()).and_then(|files| {
+        files.iter().find(|f| f.get("slice_path").and_then(|p| p.as_str()) == Some(rel))
+    }).and_then(|f| f.get("core_path")).and_then(|p| p.as_str()) else { return false };
+    let same = matches!((fs::read(root.join(rel)), fs::read(core_root.join(core_path))), (Ok(a), Ok(b)) if a == b);
+    same && tracked(core_root, core_path)
+}
+
 /// The app's data files (`*.yml`, `*.yaml`, `*.json`, each optionally
 /// `.erb`), carried verbatim at their Rails.root-relative paths: app code
 /// reads them by a path it builds from `Rails.root` (Core's
@@ -10077,9 +10120,8 @@ pub(crate) fn named_for_secrets(name: &str) -> bool {
 /// Skipped: dev/build dirs (`SKIP_DIRS`), hidden entries, `sorbet/`
 /// (type declarations the compiler reads), `config/database.yml` (compiled
 /// into the tree as `DatabaseYml`), and any file or directory
-/// [`named_for_secrets`] (Core's `config/secrets.test.json`), each noted
-/// on stderr without its content. Encrypted material (`*.ejson`,
-/// `credentials.yml.enc`, `master.key`) has no data extension either.
+/// [`named_for_secrets`] that [`carried_secrets_file`] does not allow.
+/// Each secrets-named path is noted on stderr by path, never content.
 fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
     fn data_file(name: &str) -> bool {
         let name = name.strip_suffix(".erb").unwrap_or(name);
@@ -10092,14 +10134,22 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || named_for_secrets(&name) {
-                if !name.starts_with('.') {
-                    eprintln!("roundhouse: note: {prefix}{name} is named for secrets and is not carried into the tree");
+            let rel = format!("{prefix}{name}");
+            if name.starts_with('.') {
+                continue;
+            }
+            if named_for_secrets(&name) {
+                if carried_secrets_file(root, &rel) {
+                    if let Ok(content) = fs::read_to_string(entry.path()) {
+                        eprintln!("roundhouse: note: {rel} is named for secrets; carried: allowlisted, git-tracked, read by native test boot");
+                        out.push((rel, content));
+                    }
+                } else {
+                    eprintln!("roundhouse: note: {rel} is named for secrets and is not carried into the tree");
                 }
                 continue;
             }
             let Ok(ty) = entry.file_type() else { continue };
-            let rel = format!("{prefix}{name}");
             if ty.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) && !(prefix.is_empty() && name == "sorbet") {
                     stack.push((entry.path(), format!("{rel}/")));
