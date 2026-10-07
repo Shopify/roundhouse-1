@@ -5614,11 +5614,22 @@ const GEM_REQUIRES: &[&str] = &[
     "dalli",
     "google/protobuf",
     // Shopify Core's Bundler.require, in its Gemfile order.
+    "rack",
     "panama_client",
     "redis",
     "hiredis-client",
     "snappy",
+    "faraday",
+    "faraday/gzip",
+    "opentelemetry-instrumentation-trilogy",
+    "opentelemetry-instrumentation-pg",
+    "trilogy",
+    "sabertooth",
+    "sabertooth/prelude",
+    "shopify-opensrs",
     "panama_metadata",
+    "opentelemetry-shopify",
+    "magellan-ruby",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5913,7 +5924,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 28] = [
+    const RUNTIME_GEMS: [(Marker, &str); 45] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6044,6 +6055,37 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // Online Store's theme bodies and Paquito's codecs compress
         // through it.
         (Marker::Constant("Snappy"), "snappy"),
+        // Essentials' boot path, all Bundler.required by Core and loaded
+        // natively without Rails: Rack's request and utils in the logging
+        // middleware, Faraday's errors (faraday_exceptions.rb, at load),
+        // Trilogy's errors rescued by the daemonset pool provider (Core
+        // reopens `class Trilogy`, so only the gem's RBI types its
+        // errors), the Redis Lua runner's Sabertooth, the domains
+        // OpenSRS client and Podding discovery's Magellan.
+        (Marker::Constant("Rack"), "rack"),
+        (Marker::Constant("Faraday"), "faraday"),
+        (Marker::Constant("Faraday"), "faraday-gzip"),
+        (Marker::Constant("Trilogy"), "trilogy"),
+        (Marker::Constant("Sabertooth"), "sabertooth"),
+        (Marker::Constant("OpenSRS"), "shopify-opensrs"),
+        (Marker::Constant("Magellan"), "magellan-ruby"),
+        // Core's tracing. opentelemetry-shopify is the Bundler.required
+        // entry and loads the API, SDK and the instrumentations below;
+        // each gem whose RBI declares a constant Core names is its own
+        // row, so its RBI is read.
+        (Marker::Constant("OpenTelemetry"), "opentelemetry-shopify"),
+        (Marker::Constant("OpenTelemetry"), "opentelemetry-api"),
+        (Marker::Constant("OpenTelemetry"), "opentelemetry-sdk"),
+        (Marker::Constant("OpenTelemetry::Common"), "opentelemetry-common"),
+        (Marker::Constant("OpenTelemetry::Instrumentation::Rack"), "opentelemetry-instrumentation-rack"),
+        (Marker::Constant("OpenTelemetry::Instrumentation::Trilogy"), "opentelemetry-instrumentation-trilogy"),
+        (Marker::Constant("OpenTelemetry::Instrumentation::PG"), "opentelemetry-instrumentation-pg"),
+        (Marker::Constant("OpenTelemetry::Instrumentation::GraphQL"), "opentelemetry-instrumentation-graphql"),
+        // Demand only: Core's own `require "opentelemetry-helpers-sql-
+        // obfuscation"` and `require "prism"` (a default gem, in Core's
+        // lock) load these, as on Core.
+        (Marker::Constant("OpenTelemetry::Helpers::SqlObfuscation"), "opentelemetry-helpers-sql-obfuscation"),
+        (Marker::Constant("Prism"), "prism"),
     ];
     &RUNTIME_GEMS
 }

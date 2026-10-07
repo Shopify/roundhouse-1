@@ -43,14 +43,15 @@ pub(in crate::analyze) const RUBY_CORE: &[&str] = &[
 /// patches `OpenSSL::PKey::RSA`). The name is the stdlib's, not the
 /// gem's, and loading the gem would not make the stdlib part load, so
 /// none of them are registered: such a constant is unknown, like every
-/// other stdlib constant the analysis does not model. `DRb` is not here:
-/// it is the bundled drb gem, which the CRuby tree loads, so its own RBI
-/// declares it (`project.rs::RUNTIME_GEMS`).
+/// other stdlib constant the analysis does not model. `DRb` and `Prism`
+/// are not here: they are the bundled drb and default prism gems, which
+/// the CRuby tree loads, so their own RBIs declare them
+/// (`project.rs::RUNTIME_GEMS`).
 pub(in crate::analyze) const RUBY_STDLIB: &[&str] = &[
     "OpenSSL", "Net", "Digest", "Socket", "Zlib", "Psych", "YAML", "ERB", "CGI", "Base64",
     "SecureRandom", "Open3", "Timeout", "Tempfile", "FileUtils", "Benchmark", "Coverage",
     "Etc", "Find", "Shellwords", "OptionParser", "IPAddr", "Resolv", "PP", "Ripper", "Monitor",
-    "WeakRef", "Gem", "Bundler", "Prism", "Errno",
+    "WeakRef", "Gem", "Bundler", "Errno",
 ];
 
 /// Mixins that add no callable surface a caller could miss: sorbet's

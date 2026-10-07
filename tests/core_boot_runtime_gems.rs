@@ -161,3 +161,97 @@ fn the_test_config_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
         );
     }
 }
+
+/// Essentials' boot path through Rack, Faraday, Trilogy, Sabertooth,
+/// OpenSRS, Magellan and OpenTelemetry, all Bundler.required by Core and
+/// Rails-free. Core reopens `class Trilogy` (patches/trilogy_error.rb), so
+/// `Trilogy::ProtocolError` is typed only from the gem's RBI. Prism is
+/// demand only: Core's own `require "prism"` loads it.
+const PLATFORM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    faraday (2.14.3)\n    magellan-ruby (0.2.16)\n    opentelemetry-api (1.10.1)\n    opentelemetry-shopify (1.22.0)\n      opentelemetry-api (~> 1.0)\n    prism (1.9.0)\n    rack (2.2.24)\n    sabertooth (0.1.6)\n    shopify-opensrs (0.5.0)\n    trilogy (2.9.0)\n\nDEPENDENCIES\n  activesupport\n  faraday (>= 2)\n  magellan-ruby (= 0.2.16)\n  opentelemetry-shopify (~> 1.22)\n  rack (= 2.2.24)\n  sabertooth (~> 0.1)\n  shopify-opensrs (~> 0.5)\n  trilogy (= 2.9.0)\n";
+
+fn platform_app() -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", PLATFORM_LOCK)
+        .write("sorbet/rbi/gems/rack@2.2.24.rbi", &rbi("module Rack; end\nclass Rack::Request\n  def initialize(env); end\n  def path; end\nend\n"))
+        .write("sorbet/rbi/gems/faraday@2.14.3.rbi", &rbi("module Faraday; end\nclass Faraday::Error < ::StandardError; end\nclass Faraday::TimeoutError < ::Faraday::Error; end\n"))
+        .write("sorbet/rbi/gems/trilogy@2.9.0.rbi", &rbi("class Trilogy\n  def initialize(options = {}); end\nend\nclass Trilogy::ProtocolError < ::StandardError; end\n"))
+        .write("sorbet/rbi/gems/sabertooth@0.1.6.rbi", &rbi("module Sabertooth\n  class << self\n    def script(name); end\n  end\nend\n"))
+        .write("sorbet/rbi/gems/shopify-opensrs@0.5.0.rbi", &rbi("module OpenSRS; end\nclass OpenSRS::Server\n  def initialize(options = {}); end\nend\n"))
+        .write("sorbet/rbi/gems/magellan-ruby@0.2.16.rbi", &rbi("module Magellan; end\nclass Magellan::ServiceNotPolledYetError < ::StandardError; end\n"))
+        .write("sorbet/rbi/gems/opentelemetry-api@1.10.1.rbi", &rbi("module OpenTelemetry; end\nclass OpenTelemetry::Context\n  class << self\n    def current; end\n  end\nend\n"))
+        .write("sorbet/rbi/gems/prism@1.9.0.rbi", &rbi("module Prism\n  class << self\n    def parse(source); end\n  end\nend\n"))
+        .write("lib/trilogy_error.rb", r#"class Trilogy
+  module ConnectionError; end
+end
+"#)
+        .write("lib/platform_services.rb", r#"class PlatformServices
+  def request_path(env)
+    Rack::Request.new(env).path
+  end
+
+  def timeout?(error)
+    error.is_a?(Faraday::TimeoutError)
+  end
+
+  def connect
+    Trilogy.new(host: "localhost")
+  rescue Trilogy::ProtocolError
+    nil
+  end
+
+  def script
+    Sabertooth.script("release")
+  end
+
+  def domains
+    OpenSRS::Server.new(server: "https://opensrs.example")
+  end
+
+  def polled?
+    true
+  rescue Magellan::ServiceNotPolledYetError
+    false
+  end
+
+  def context
+    OpenTelemetry::Context.current
+  end
+
+  def parse(source)
+    require "prism"
+    Prism.parse(source)
+  end
+end
+"#)
+}
+
+const PLATFORM_GEMS: [&str; 9] =
+    ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-shopify", "opentelemetry-api", "prism"];
+
+#[test]
+fn the_emitted_ruby_tree_declares_and_loads_the_platform_gems() {
+    let (dir, errors) = platform_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    for gem in PLATFORM_GEMS {
+        assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
+    }
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    for feature in ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-shopify"] {
+        assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
+    assert!(!facades.contains("\"prism\""), "prism is required by the app, not Bundler: {facades}");
+}
+
+#[test]
+fn the_platform_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
+    let (_, errors) = platform_app().emit(BuildTarget::Rust);
+    for gem in ["rack", "faraday", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-api", "prism"] {
+        assert!(
+            errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem"))),
+            "{gem}: {errors:#?}"
+        );
+    }
+}
