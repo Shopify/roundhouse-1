@@ -1171,6 +1171,10 @@ impl Analyzer {
                 info.app_declared = true;
             }
         }
+        let const_resolver = app.const_resolver.for_sources(&app.sources);
+        // Before signatures resolve: `#: -> IdentityAccountFields` inside
+        // `IdentityAccount` names the Struct constant's class.
+        data::register_blockless_structs(app, &const_resolver, &mut classes);
 
         for (id, method) in app.models.iter()
             .flat_map(|model| model.methods().map(move |method| (&model.name, method)))
@@ -1259,7 +1263,6 @@ impl Analyzer {
             "source_index_missing: ingested source app cannot use IR-only analysis"
         );
 
-        let const_resolver = app.const_resolver.for_sources(&app.sources);
         let data_factories = data::register(app, &const_resolver, &mut classes);
 
         Self {

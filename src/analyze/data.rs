@@ -132,6 +132,88 @@ fn register_factory_classes(
     }
 }
 
+/// `X = Struct.new(:a, :b)` and `X = Struct.new(:a, keyword_init: true)`
+/// without a block, as a constant of a library class or a model
+/// (Core's `IdentityAccount::IdentityAccountFields`). The class the
+/// factory returns gets what `register_factory_classes` gives the block
+/// form: `Struct` as parent, `new`, an untyped reader and writer per
+/// member. The value stays the constructor's source expression; only
+/// Data constants are typed through `factories`. Runs before signatures
+/// resolve, so a signature in the owner can name the class bare.
+pub(super) fn register_blockless_structs(
+    app: &App,
+    resolver: &ConstResolver,
+    classes: &mut HashMap<ClassId, ClassInfo>,
+) {
+    if resolver.has_source_namespace("Struct") {
+        return;
+    }
+    let mut register = |owner: &ClassId, name: &Symbol, value: &Expr| {
+        let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
+            return;
+        };
+        let ExprNode::Const { path } = &*recv.node else { return };
+        if method.as_str() != "new" || !resolver.is_runtime_class(recv.span, path, "Struct") {
+            return;
+        }
+        let (options, members) = match args.split_last() {
+            Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { .. }) => (Some(last), rest),
+            _ => (None, args.as_slice()),
+        };
+        if let Some(options) = options {
+            let ExprNode::Hash { entries, .. } = &*options.node else { return };
+            let keyword_init = |(key, value): &(Expr, Expr)| {
+                matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "keyword_init")
+                    && matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil })
+            };
+            if !entries.iter().all(keyword_init) {
+                return;
+            }
+        }
+        let mut seen = HashSet::default();
+        let mut names = Vec::new();
+        for arg in members {
+            let ExprNode::Lit { value: Literal::Sym { value: member } } = &*arg.node else {
+                return;
+            };
+            if !reader_name(member.as_str()) || !seen.insert(member.clone()) {
+                return;
+            }
+            names.push(member.clone());
+        }
+        let Some(id) = resolver.constant_class(value.span, name.as_str()) else {
+            return;
+        };
+        if id.0.as_str() != format!("{}::{}", owner.0.as_str(), name.as_str()) || classes.contains_key(&id) {
+            return;
+        }
+        let mut info = ClassInfo::default();
+        info.app_declared = true;
+        info.parent = Some(ClassId(Symbol::from("Struct")));
+        info.class_methods.insert(Symbol::from("new"), Ty::Class { id: id.clone(), args: vec![] });
+        for member in names {
+            info.instance_methods.insert(Symbol::from(format!("{}=", member.as_str())), Ty::Untyped);
+            info.instance_methods.insert(member, Ty::Untyped);
+        }
+        classes.insert(id, info);
+    };
+    for class in &app.library_classes {
+        for (name, value) in &class.constants {
+            register(&class.name, name, value);
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            if let ExprNode::Assign { target: crate::expr::LValue::Const { path }, value } = &*expr.node
+                && let [name] = path.as_slice()
+            {
+                register(&model.name, name, value);
+            }
+        }
+    }
+}
+
 fn reader_name(member: &str) -> bool {
     let bare = member
         .strip_suffix('?')
