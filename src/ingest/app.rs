@@ -1417,6 +1417,16 @@ end
     // `keep_initializer_defined`).
     let mut initializer_defined: Vec<InitializerDefined> = Vec::new();
 
+    // `NAME = value` at the top level of every boot initializer, the
+    // engines' and the app's, in Rails' order: defined at boot
+    // (`initializer_constants`). Kept after every app class is known.
+    let mut initializer_constants = Vec::new();
+    for entry in &boot_initializers {
+        let Ok(bytes) = vfs.read(entry) else { continue };
+        initializer_constants
+            .extend(super::initializer_constants::extract(&bytes, &entry.display().to_string()));
+    }
+
     // `Time::DATE_FORMATS[:name] = ->(t) { … }` in an initializer —
     // read independently of config/application.rb above, since an app
     // can define a format without any of that file's config surface.
@@ -1462,9 +1472,20 @@ end
                 // are kept here; the rest wait in `initializer_defined`
                 // for the referenced-by-app test below.
                 let decls = super::initializers::declaration_ranges(&bytes);
-                let file_constants = super::initializers::top_level_constant_ranges(&bytes);
+                // A file-level constant `initializer_constants` took is
+                // its own, not the first class's to hoist.
+                let taken = super::initializer_constants::taken_in(&initializer_constants, &path_str);
+                let file_constants: Vec<(usize, usize)> = super::initializers::top_level_constant_ranges(&bytes)
+                    .into_iter()
+                    .filter(|&(start, _)| !taken.iter().any(|&(_, s)| s == start))
+                    .collect();
                 if let Ok(classes) = ingest_library_classes(&bytes, &path_str) {
-                    for (i, lc) in classes.into_iter().enumerate() {
+                    for (i, mut lc) in classes.into_iter().enumerate() {
+                        let hoisted = |name: &crate::ident::Symbol| taken.iter().any(|&(n, _)| n == name.as_str());
+                        lc.constants.retain(|(name, _)| {
+                            !(hoisted(name) && lc.top_level_constants.iter().any(|c| &c.name == name))
+                        });
+                        lc.top_level_constants.retain(|c| !hoisted(&c.name));
                         let defined = InitializerDefined::new(&path_str, &decls, &file_constants, i == 0, lc);
                         if mixins.iter().any(|m| m.module.as_str() == defined.lc.name.0.as_str()) {
                             for &(start, end) in &defined.ranges {
@@ -2073,6 +2094,7 @@ end
 
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
     keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
+    super::initializer_constants::keep(&mut app, dir, initializer_constants);
     // Carrier provenance must not depend on where a module lives:
     // models, services, helpers and lib all use the same splice.
     let mut concern_class_method_spans = Vec::new();

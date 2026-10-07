@@ -348,6 +348,12 @@ pub struct App {
     /// `initializer_unsupported` error by `analyze::initializer_coverage`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_gaps: Vec<InitializerGap>,
+    /// The top-level constants boot initializers assign, one entry per
+    /// initializer, in [`Self::initializer_files`] order. Rails defines
+    /// them as each initializer runs; the CRuby boot requires each
+    /// holder's file in this order (`ingest::initializer_constants`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initializer_constants: Vec<InitializerConstants>,
     /// `ActiveSupport.on_load(:hook)` blocks of boot initializers, lifted
     /// onto the Application reopen in boot order
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
@@ -717,6 +723,19 @@ pub struct InitializerGap {
     pub detail: String,
 }
 
+/// The top-level constant writes of one boot initializer, carried as the
+/// `LibraryClassOrigin::FileConstants` holder `holder`
+/// (`ingest::initializer_constants`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InitializerConstants {
+    /// The initializer that assigns them, relative to the app root.
+    pub file: String,
+    /// The holder in `App::library_classes`, named for the first one.
+    pub holder: crate::ident::ClassId,
+    /// The constants, in source order.
+    pub names: Vec<crate::ident::Symbol>,
+}
+
 /// One `ActiveSupport.on_load(:hook)` block of a boot initializer, lifted
 /// to `Rails.application.<method>(base)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -906,6 +925,7 @@ impl App {
             initializer_filters: Vec::new(),
             initializer_files: Vec::new(),
             initializer_gaps: Vec::new(),
+            initializer_constants: Vec::new(),
             load_hooks: Vec::new(),
             ingest_drops: Vec::new(),
             eager_load: Vec::new(),
