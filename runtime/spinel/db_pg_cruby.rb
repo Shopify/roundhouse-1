@@ -493,13 +493,24 @@ module Db
     context[:name] = previous
   end
 
+  # A failed release does not replace the request's own exception, as the
+  # SQLite driver's lease cleanup does (db_cruby.rb `with_connection`); a
+  # successful request still surfaces it.
   def self.with_connection
     return yield if in_lease?
     current_adapter
+    request_failed = false
     begin
       yield
+    rescue Exception
+      request_failed = true
+      raise
     ensure
-      release_connection
+      begin
+        release_connection
+      rescue StandardError
+        raise unless request_failed
+      end
     end
   end
 
@@ -515,6 +526,13 @@ module Db
         # A lost session (UNKNOWN) holds no transaction to roll back.
         conn.exec("ROLLBACK").clear if status != PG::PQTRANS_IDLE && status != PG::PQTRANS_UNKNOWN
       end
+    rescue Exception
+      # A session whose ROLLBACK failed may still hold the transaction.
+      # It never re-enters the free list as it is: like the SQLite
+      # driver's quarantine, the adapter drops it, and the next lease's
+      # first statement connects a fresh session.
+      adapter.disconnect!
+      raise
     ensure
       adapter.instance_variable_set(:@transaction_open, false)
       context[:cache]&.clear
@@ -530,9 +548,18 @@ module Db
     with_database(name) { with_connection { exec(sql) } }
   end
 
+  # Every connection is closed before a release error is raised, as the
+  # SQLite drivers' shutdown does: one failed ROLLBACK (whose session
+  # `release_connection` has already dropped) must not leave the other
+  # pools open. Another thread's lease still refuses the close outright.
   def self.close
     adopt_after_fork
-    context[:leases].keys.each { |name| with_database(name) { release_connection } }
+    error = nil
+    context[:leases].keys.each do |name|
+      with_database(name) { release_connection }
+    rescue StandardError => e
+      error ||= e
+    end
     @databases.each_value do |pool|
       pool.mutex.synchronize do
         raise "cannot close a leased PostgreSQL pool" unless pool.free.size == pool.size
@@ -541,6 +568,7 @@ module Db
     @databases.each_value { |pool| pool.connections.each(&:disconnect!) }
     @databases.clear
     Thread.current[:roundhouse_pg_db] = nil
+    raise error if error
     nil
   end
 

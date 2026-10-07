@@ -172,6 +172,55 @@ class PostgreSQLRuntimeTest < Minitest::Test
     end
   end
 
+  # A ROLLBACK that fails at release: the request's own exception wins,
+  # a successful request surfaces the release error, and in both cases
+  # the session holding the transaction never returns to the pool.
+  def test_failed_release_rollback_drops_the_session_and_keeps_the_request_error
+    [true, false].each do |request_failed|
+      request_error = RuntimeError.new("request failed")
+      release_error = PG::ConnectionBad.new("injected ROLLBACK failure")
+      session = nil
+      raised = assert_raises(request_failed ? RuntimeError : PG::ConnectionBad) do
+        Db.with_connection do
+          session = Db.current_dbh
+          original_exec = session.method(:exec)
+          session.define_singleton_method(:exec) do |sql, *args, &block|
+            raise release_error if sql == "ROLLBACK"
+            original_exec.call(sql, *args, &block)
+          end
+          Db.exec("BEGIN")
+          Db.exec("INSERT INTO items DEFAULT VALUES")
+          raise request_error if request_failed
+        end
+      end
+      assert_same(request_failed ? request_error : release_error, raised)
+      refute Db.in_lease?
+      assert session.finished?, "the failed session was returned to the pool"
+      Db.with_connection do
+        refute_same session, Db.current_dbh
+        assert_equal 0, scalar("SELECT COUNT(*) FROM items")
+      end
+    end
+  end
+
+  def test_close_disconnects_every_pool_before_raising_a_release_error
+    sessions = []
+    release_error = PG::ConnectionBad.new("injected ROLLBACK failure at close")
+    Db.with_database("archive") { sessions << Db.current_dbh }
+    session = Db.current_dbh
+    sessions << session
+    original_exec = session.method(:exec)
+    session.define_singleton_method(:exec) do |sql, *args, &block|
+      raise release_error if sql == "ROLLBACK"
+      original_exec.call(sql, *args, &block)
+    end
+    Db.exec("BEGIN")
+    raised = assert_raises(PG::ConnectionBad) { Db.close }
+    assert_same release_error, raised
+    sessions.each { |conn| assert conn.finished?, "close left a session open" }
+    refute Db.configured?
+  end
+
   def test_lease_restored_after_nested_database_exception
     Db.with_connection do
       connection = Db.current_dbh

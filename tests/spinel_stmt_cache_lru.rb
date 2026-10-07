@@ -76,9 +76,12 @@ elsif mode == "live"
     fill_cache
     raise "mid-lease eviction" unless Db.current_conn.cache_size == cap + 1
     raise "in-use entry lost" unless Db.current_conn.cache_has?(sql)
-    # Moving a hit must move the same statement, preserving its cursor.
-    same = Db.prepare(sql)
-    raise "promotion replaced statement" unless held == same
+    # Refreshing a busy hit moves the cached entry without lending its
+    # live cursor to another reader. That reader owns a transient instead.
+    nested = Db.prepare(sql)
+    raise "promotion shared active statement" if held == nested
+    raise "nested first row" unless Db.step?(nested) && Db.column_int(nested, 0) == 91
+    Db.finalize(nested)
     raise "promotion reset cursor" unless Db.step?(held) && Db.column_int(held, 0) == 92
     raise "cursor repeated" if Db.step?(held)
     Db.finalize(held)

@@ -29,7 +29,7 @@ def read_bound_id(id)
 end
 
 # A live outer cursor survives reuse of other shapes on the SAME connection.
-# Nesting an identical shape is not covered yet; that needs a separate fix.
+# Identical-shape ownership is covered by StatementCacheTest above.
 Db.with_connection do
   Db.query_cache_begin
   outer = Db.prepare("SELECT id FROM bind_rows WHERE id >= ? ORDER BY id")

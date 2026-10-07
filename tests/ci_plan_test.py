@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -399,6 +400,8 @@ class Routing(unittest.TestCase):
             "tests/param_binds_emit.rb",
             "tests/param_binds_raw_where.rb",
             "tests/param_binds_runtime.rb",
+            "tests/param_binds_cruby_cache.rb",
+            "tests/param_binds_spinel_cache.rb",
             "tests/support/emit_and_run.rs",
         ]:
             with self.subTest(path=path):
@@ -434,6 +437,23 @@ class Routing(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 self.assertNotIn("param_binds", ci.select([path])["spinel_tests"])
+
+    def test_jdbc_probes_select_the_existing_comparison_without_archives(self):
+        for path, native_jobs, suites in [
+            ("tests/support/jdbc_cleanup_failures.rb", set(), []),
+            (
+                "runtime/spinel/test/statement_cache_cases.rb",
+                set(ci.CORE) | {"framework-tests-spinel"},
+                ["param_binds"],
+            ),
+        ]:
+            with self.subTest(path=path):
+                plan = ci.select([path])
+                self.assertEqual(self.extras(plan), native_jobs | {"compare-jruby"})
+                self.assertIn("compare-jruby", plan["required"])
+                self.assertEqual(plan["spinel_tests"], suites)
+                self.assertEqual(plan["smoke"], [])
+                self.assertEqual(plan["archives"], [])
 
     def test_runtime_owners_choose_asymmetric_focused_binaries(self):
         cases = {
@@ -785,6 +805,28 @@ class Results(unittest.TestCase):
         needs = self.needs(owned)
         needs["compare"]["result"] = "failure"
         self.assertTrue(ci.check_results(owned, needs, compact=True)[0])
+
+
+class Workflow(unittest.TestCase):
+    def test_jruby_runs_cleanup_after_runtime_setup(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+        job = re.search(
+            r"(?ms)^  compare-jruby:\n(.*?)(?=^  [\w-]+:|\Z)", workflow
+        )[1]
+        probe = "jruby tests/support/jdbc_cleanup_failures.rb"
+        steps = re.split(r"(?m)^      - ", job)[1:]
+        step = next((s for s in steps if f"          {probe}\n" in s), None)
+        self.assertIsNotNone(step, "compare-jruby must execute the cleanup probe")
+        self.assertNotIn("continue-on-error:", job)
+        self.assertNotIn("\n        if:", step)
+        install = "jruby -S gem install jdbc-sqlite3 --no-document"
+        self.assertIn(f"\n          {install}\n", step)
+        self.assertLess(
+            job.index("java-version: '21'"), job.index("ruby-version: 'jruby-10.0'")
+        )
+        self.assertLess(job.index("ruby-version: 'jruby-10.0'"), job.index(install))
+        self.assertLess(step.index(install), step.index(probe))
+        self.assertLess(job.index(probe), job.index("ruby-version: ${{ env.MRI_RUBY }}"))
 
 
 class MergeTree(unittest.TestCase):

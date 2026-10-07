@@ -262,16 +262,19 @@ fn runtime(native: bool) {
         }
         "require_relative \"db\"\n".to_string()
     } else {
+        // The CRuby tree's error classes, as its boot loads them: the
+        // driver translates SQLite errors into them (`Db.translate`).
         format!(
-            "require {:?}\nrequire {:?}\n",
+            "require {:?}\nrequire {:?}\nrequire {:?}\nrequire {:?}\nrequire {:?}\n",
+            root.join("runtime/ruby/active_record/errors.rb"),
+            root.join("runtime/ruby/active_record/connection_not_established.rb"),
+            root.join("runtime/spinel/scaffold/ruby_overlay/runtime/active_record_statement_errors.rb"),
             root.join("runtime/ruby/active_record/connection_pool.rb"),
             root.join("runtime/spinel/db_cruby.rb")
         )
     };
-    let lifecycle = if native {
-        r#"
-# Spinel promises clear_bindings at release; CRuby instead promises complete
-# rebinding and deliberately retains old values. Probe the native contract
+    let clear = r#"
+# Both shims clear bindings on release. Probe a missing bind on idle reuse
 # directly, since a generated reader overwrites every slot and cannot see it.
 stmt = Db.prepare("SELECT COALESCE(?, -99)")
 Db.bind_int(stmt, 1, 73)
@@ -283,7 +286,9 @@ raise "missing clear probe" if !Db.step?(stmt)
 expect_int("finalize clears bindings", -99, Db.column_int(stmt, 0))
 Db.finalize(stmt)
 puts "runtime: finalize clears bindings passed"
-"#
+"#;
+    let lifecycle = if native {
+        ""
     } else {
         r#"
 # Finalize must release a partially consumed reader's lock before this
@@ -307,9 +312,8 @@ Db.with_connection do
 end
 puts "runtime: CRuby finalize releases partial reader before another connection writes"
 
-# A reader that raises before finalize leaves its cached statement stepped.
-# Rebind on the same connection before cleaning up the abandoned handle:
-# finalize's reset must not mask removal of the prepare-time reset.
+# An interrupted reader still owns its cached statement. A nested read uses
+# a transient sibling; it must neither reset nor rebind the live owner.
 Db.with_connection do
   interrupted = nil
   begin
@@ -327,7 +331,7 @@ Db.with_connection do
     Db.finalize(interrupted)
   end
 end
-puts "runtime: CRuby prepare recovers an interrupted reader with a different id"
+puts "runtime: CRuby interrupted reader keeps ownership across a different id"
 "#
     };
     // Run CRuby's lifecycle probes before any other reader can hold a lock.
@@ -344,8 +348,23 @@ puts "runtime: CRuby prepare recovers an interrupted reader with a different id"
         "missing or ambiguous lifecycle probe marker"
     );
     let body = body.replace(marker, &format!("{lifecycle}\n{marker}"));
+    let body = body.replace(
+        "# Observe bytes as a BLOB",
+        &format!("{clear}\n# Observe bytes as a BLOB"),
+    );
+    let cache_cases = include_str!("../runtime/spinel/test/statement_cache_cases.rb");
+    let ownership = if native {
+        include_str!("param_binds_spinel_cache.rb")
+    } else {
+        include_str!("param_binds_cruby_cache.rb")
+    };
     let script = format!(
-        "{prelude}\nDb.configure(\"file:bind_runtime?mode=memory&cache=shared\", pool_size: 4)\n{body}\nDb.close\n"
+        "{prelude}\nENV[\"DATABASE_POOL_SIZE\"] = \"1\"\n\
+         Db.configure(\"file:cache_cases?mode=memory&cache=shared\", pool_size: 1)\n\
+         {cache_cases}\nStatementCacheTest.new.run\n\
+         puts \"runtime: 12 statement cache ownership and error tests passed\"\nDb.close\n\
+         ENV[\"DATABASE_POOL_SIZE\"] = \"4\"\n\
+         Db.configure(\"file:bind_runtime?mode=memory&cache=shared\", pool_size: 4)\n{body}\n{ownership}\nDb.close\n"
     );
     run_script(&dir, &script, native);
     std::fs::remove_dir_all(dir).expect("remove successful runtime probe");
