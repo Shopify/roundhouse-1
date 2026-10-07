@@ -589,6 +589,11 @@ pub struct App {
     /// item provenance) can follow when emission needs it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub concern_model_items: HashMap<ClassId, Vec<ModelBodyItem>>,
+    /// A Concern's `prepended do` DSL, keyed like `concern_model_items`:
+    /// spliced after a model's `prepend <Concern>` line, as Rails
+    /// evaluates the block in a prepender's body.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub concern_prepended_items: HashMap<ClassId, Vec<ModelBodyItem>>,
     /// Classes that were `ActiveSupport::CurrentAttributes` subclasses
     /// before `ingest::current_attributes` flattened them. Recorded
     /// because that pass CLEARS the parent — nothing downstream could
@@ -1267,6 +1272,7 @@ impl App {
             class_methods_carrier_splices: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
             concern_model_items: HashMap::default(),
+            concern_prepended_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             render_edges: HashMap::default(),
             view_feeders: HashMap::default(),

@@ -25,7 +25,7 @@ use super::jbuilder::ingest_jbuilder;
 use super::library_class::{
     ClassKind, ConcernClassMethodSpans, ConcernEnumDecl, classify_class_file,
     ingest_concern_class_method_spans, ingest_concern_filters,
-    ingest_concern_model_items_with_constants,
+    ingest_concern_model_items_with_constants, ingest_concern_prepended_items,
     ingest_helper_method_names, ingest_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
@@ -572,6 +572,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                                 app.concern_model_items.extend(concern_items.into_iter().filter(
                                     |(id, _)| nested.iter().any(|class| class.name == *id),
                                 ));
+                                app.concern_prepended_items.extend(
+                                    ingest_concern_prepended_items(&source, &path_str, &enum_constants)
+                                        .into_iter()
+                                        .filter(|(id, _)| nested.iter().any(|class| class.name == *id)),
+                                );
                                 concern_enums.extend(concern_enum_decls.into_iter().filter(
                                     |(id, _)| nested.iter().any(|class| class.name == *id),
                                 ));
@@ -601,6 +606,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                                 &source, &path_str, &enum_constants,
                             );
                         app.concern_model_items.extend(concern_items);
+                        app.concern_prepended_items
+                            .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
                         concern_enums.extend(concern_enum_decls);
@@ -751,6 +758,11 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                             app.concern_model_items.extend(concern_items.into_iter().filter(
                                 |(id, _)| nested.iter().any(|class| class.name == *id),
                             ));
+                            app.concern_prepended_items.extend(
+                                ingest_concern_prepended_items(&source, &path_str, &enum_constants)
+                                    .into_iter()
+                                    .filter(|(id, _)| nested.iter().any(|class| class.name == *id)),
+                            );
                             concern_enums.extend(concern_enum_decls.into_iter().filter(
                                 |(id, _)| nested.iter().any(|class| class.name == *id),
                             ));
@@ -1754,6 +1766,8 @@ end
                                 &source, &path_str, &enum_constants,
                             );
                         app.concern_model_items.extend(concern_items);
+                        app.concern_prepended_items
+                            .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
                         app.view_visible_controller_methods
                             .extend(ingest_helper_method_names(&source));
                         concern_enums.extend(concern_enum_decls);
@@ -2821,6 +2835,7 @@ fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpan
         // is spliced once, so an include cycle terminates.
         let mut spliced: crate::det::HashSet<crate::ident::ClassId> =
             crate::det::HashSet::default();
+        let mut prepended: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
         let mut i = 0;
         while i < model.body.len() {
             // `include Attachment, Broadcasts, Mentionee` is one
@@ -2829,34 +2844,45 @@ fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpan
             // arg's items in that order and splice them as one run.
             // Matching only single-arg includes skipped campfire's
             // models entirely: every one of them writes the list form.
-            let concern_ids: Vec<crate::ident::ClassId> = match &model.body[i] {
+            //
+            // `prepend Concern` runs the concern's `prepended do` block
+            // instead (`concern_prepended_items`), right after the line.
+            let (concern_ids, prepend): (Vec<crate::ident::ClassId>, bool) = match &model.body[i] {
                 ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
                     ExprNode::Send { recv: None, method, args, block: None, .. }
-                        if method.as_str() == "include" =>
+                        if matches!(method.as_str(), "include" | "prepend") =>
                     {
-                        args.iter()
+                        let prepend = method.as_str() == "prepend";
+                        let source = if prepend { &app.concern_prepended_items } else { &app.concern_model_items };
+                        let ids = args
+                            .iter()
                             .filter_map(|arg| match &*arg.node {
-                                ExprNode::Const { path } => Some(concern_named(
-                                    model.name.0.as_str(),
-                                    path,
-                                    &app.concern_model_items,
-                                )),
+                                ExprNode::Const { path } => {
+                                    Some(concern_named(model.name.0.as_str(), path, source))
+                                }
                                 _ => None,
                             })
-                            .collect()
+                            .collect();
+                        (ids, prepend)
                     }
-                    _ => Vec::new(),
+                    _ => (Vec::new(), false),
                 },
-                _ => Vec::new(),
+                _ => (Vec::new(), false),
             };
             let model_name = model.name.clone();
             let mut ordered: Vec<ClassId> = Vec::new();
-            for id in &concern_ids {
-                with_dependencies(id, &dependencies, &mut spliced, &mut ordered);
+            if prepend {
+                // Ruby prepends `prepend A, B` last-first: B, then A.
+                ordered.extend(concern_ids.iter().rev().filter(|id| prepended.insert((*id).clone())).cloned());
+            } else {
+                for id in &concern_ids {
+                    with_dependencies(id, &dependencies, &mut spliced, &mut ordered);
+                }
             }
+            let source = if prepend { &app.concern_prepended_items } else { &app.concern_model_items };
             let items: Vec<ModelBodyItem> = ordered
                 .iter()
-                .filter_map(|id| app.concern_model_items.get(id).map(|items| (id, items)))
+                .filter_map(|id| source.get(id).map(|items| (id, items)))
                 .flat_map(|(id, items)| {
                     let class_attributes = super::class_attribute::declared_names(items);
                     let (model_name, defined) = (&model_name, &defined);
@@ -3234,6 +3260,47 @@ pub(super) fn concern_class_method_catalog(
 /// includer, which the Ruby emit writes with its `include`: there the
 /// copies are typing only (`App::class_methods_carrier_splices`), and
 /// the module reaches the includer the way Ruby does, through `extend`.
+/// The ActiveSupport::Concerns a model body prepends (`prepend A, B`
+/// names them last-first, as Ruby prepends), resolved from the model's
+/// namespace outward; a rooted `::A` from the top level.
+fn model_concern_prepends(
+    model: &crate::dialect::Model,
+    concerns: &crate::det::HashSet<&crate::ident::ClassId>,
+) -> Vec<crate::ident::ClassId> {
+    use crate::dialect::ModelBodyItem;
+    use crate::expr::ExprNode;
+    use crate::ident::{ClassId, Symbol};
+    let mut out = Vec::new();
+    for item in &model.body {
+        let ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        if !crate::lower::model_to_library::is_constant_prepend(expr) {
+            continue;
+        }
+        let ExprNode::Send { args, .. } = &*expr.node else { continue };
+        for arg in args.iter().rev() {
+            let ExprNode::Const { path } = &*arg.node else { continue };
+            let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            let found = if let Some(top) = written.strip_prefix("::") {
+                Some(ClassId(Symbol::from(top))).filter(|id| concerns.contains(id))
+            } else {
+                let mut scope = Some(model.name.0.as_str());
+                let mut found = None;
+                while let Some(prefix) = scope {
+                    let id = ClassId(Symbol::from(format!("{prefix}::{written}")));
+                    if concerns.contains(&id) {
+                        found = Some(id);
+                        break;
+                    }
+                    scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+                }
+                found.or_else(|| Some(ClassId(Symbol::from(written.as_str()))).filter(|id| concerns.contains(id)))
+            };
+            out.extend(found);
+        }
+    }
+    out
+}
+
 fn splice_concern_class_methods_into_includers(
     app: &mut App,
     carriers: &[ConcernClassMethodSpans],
@@ -3354,7 +3421,13 @@ fn splice_concern_class_methods_into_includers(
         // ActiveSupport::Concern would extend it, so the hook runs as in
         // Ruby; the copies stay the model's own class methods, ahead of
         // the carrier in its singleton's ancestors.
-        let (added, provenance, carried) = copies(crate::analyze::model_includes(model), taken);
+        // `prepend Concern`: ActiveSupport::Concern's `prepend_features`
+        // prepends its `ClassMethods` onto the model's singleton, ahead
+        // of every included concern's. A plain module's carrier is the
+        // authored `prepended` hook's business, as with `included`.
+        let mut mixins: Vec<ClassId> = model_concern_prepends(model, &concerns);
+        mixins.extend(crate::analyze::model_includes(model));
+        let (added, provenance, carried) = copies(mixins, taken);
         let hooked: Vec<crate::app::ClassMethodsCarrierSplice> = carried
             .into_iter()
             .filter(|splice| splice.extend && extended_hooks.contains(&splice.carrier))
