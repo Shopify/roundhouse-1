@@ -3223,6 +3223,19 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let railtie = crate::runtime_files::read_to_string("runtime/spinel/rails_railtie.rb")
         .map_err(|e| format!("read Rails::Railtie runtime: {e}"))?;
     files.push(("runtime/rails_railtie.rb".into(), railtie));
+    // Rails::Engine (railties 8.2.0.alpha), for the app's own engines,
+    // carried compiled (`App::railties`), and a gem's.
+    let engine = crate::runtime_files::read_to_string("runtime/spinel/rails_engine.rb")
+        .map_err(|e| format!("read Rails::Engine runtime: {e}"))?;
+    files.push(("runtime/rails_engine.rb".into(), engine));
+    files.push((
+        "runtime/features/rails/engine.rb".into(),
+        "# `require \"rails/engine\"` on this tree: railties' Rails::Engine,\n\
+         # ported (runtime/rails_engine.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../../rails_engine\"\n"
+            .into(),
+    ));
     let ordered_options = crate::runtime_files::read_to_string("runtime/spinel/active_support_ordered_options.rb")
         .map_err(|e| format!("read ActiveSupport::OrderedOptions runtime: {e}"))?;
     files.push(("runtime/active_support_ordered_options.rb".into(), ordered_options));
@@ -3231,10 +3244,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     files.push((
         "runtime/features/rails.rb".into(),
         "# `require \"rails\"` on this tree: railties' Rails, the runtime ports\n\
-         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie\n\
-         # (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
-         # directory first on the load path.\n\
-         require_relative \"../rails_railtie\"\n"
+         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie and\n\
+         # Rails::Engine (runtime/rails_railtie.rb, rails_engine.rb).\n\
+         # runtime/gem_facades.rb puts this directory first on the load path.\n\
+         require_relative \"../rails_railtie\"\n\
+         require_relative \"../rails_engine\"\n"
             .into(),
     ));
     files.push((
@@ -3316,11 +3330,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
             content.insert_str(
                 at,
-                "# Application#initialize!: the gems' railties' initializers, in\n\
-                 # Rails' order, before the app's code loads (runtime/rails_railtie.rb).\n\
-                 # Finisher's part runs at the end of this file.\n\
+                "# Rails::Railtie and Rails::Engine, for the gems' railties and the\n\
+                 # app's own railties and engines, which app/models.rb loads.\n\
                  require_relative \"runtime/rails_railtie\"\n\
-                 Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n",
+                 require_relative \"runtime/rails_engine\"\n",
             );
             content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
             content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
@@ -3331,6 +3344,22 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n",
             );
             content.push_str("require_relative \"runtime/database_configuration\"\n");
+        }
+        if path == "app/models.rb" {
+            // Application#initialize!: every railtie's and engine's
+            // initializers, in Rails' order, once the railties and
+            // engines are defined and before eager loading, which is
+            // Finisher's (runtime/rails_railtie.rb). Finisher's part runs
+            // at the end of boot.rb.
+            let eager = "RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n";
+            let at = content.rfind(eager).ok_or("PostgreSQL bootstrap: missing eager load in app/models.rb")?;
+            content.insert_str(
+                at,
+                "# Application#initialize!: the railties' and engines' initializers, in\n\
+                 # Rails' order (runtime/rails_railtie.rb). Finisher's part runs at the\n\
+                 # end of boot.rb.\n\
+                 Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n",
+            );
         }
         if path == "test/test_helper.rb" {
             *content = content.replace("../runtime/sqlite_adapter", "../runtime/postgres_adapter");
@@ -5096,9 +5125,44 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     body.push_str(
         "RoundhouseAutoload.register(Object)\n\
-         RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n\
-         RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n",
+         RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n",
     );
+    // The railties and engines the app carries (`App::railties`, kept
+    // only where the tree ports Rails::Railtie and Rails::Engine), loaded
+    // at boot in Rails' order, as Bundler.require and
+    // config/application.rb define them before Application#initialize!.
+    // Each engine's root first: the directory the source has it in,
+    // where its data files are carried (`Rails::Engine.source_roots`).
+    let railtie_files: Vec<(&crate::app::CarriedRailtie, String)> = app
+        .railties
+        .iter()
+        .filter(|r| app.library_classes.iter().any(|c| c.name == r.name))
+        .map(|r| (r, anchor_of(&r.name)))
+        .filter(|(_, anchor)| models.iter().any(|(m, _)| m == anchor))
+        .collect();
+    if !railtie_files.is_empty() {
+        body.push_str("# The app's railties and engines, in Rails' load order (runtime/rails_engine.rb).\n");
+        for (railtie, _) in &railtie_files {
+            if let Some(root) = &railtie.root {
+                writeln!(
+                    body,
+                    "Rails::Engine.source_roots[{:?}] = File.expand_path({:?}, RoundhouseAutoload::ROOT)",
+                    railtie.name.0.as_str(),
+                    format!("../{root}")
+                )
+                .unwrap();
+            }
+        }
+        body.push_str("[\n");
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (_, anchor) in &railtie_files {
+            if seen.insert(anchor.as_str()) {
+                writeln!(body, "  {anchor:?},").unwrap();
+            }
+        }
+        body.push_str("].each { |file| require RoundhouseAutoload.path(file) }\n");
+    }
+    body.push_str("RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n");
 
     if let Some((_, content)) = files.iter_mut().find(|(p, _)| p == "app/models.rb") {
         *content = body;
@@ -5114,6 +5178,17 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   def self.path(file)
     File.expand_path("#{file}.rb", ROOT)
+  end
+
+  # A carried engine's `Dir[config.root.join(pattern)]`: the emitted files
+  # of the app sources the pattern matched, resolved when the tree was
+  # emitted, and a named error for each matched source the tree does not
+  # carry (it does not load, as the native glob would load it).
+  def self.carried_files(pattern, files, not_carried)
+    not_carried.each do |source|
+      warn "roundhouse: error[engine_glob_file_not_carried]: #{source} matches #{pattern} in the source, but the tree carries no file for it; it was not loaded"
+    end
+    files.map { |file| path(file) }
   end
 
   # Register `mod`'s children: an autoload for each file, an implicit

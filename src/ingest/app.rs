@@ -766,6 +766,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         }
     }
     app.zeitwerk_loaders = super::zeitwerk::resolve(&super::zeitwerk::drain(), &support_classes);
+    app.railties = carried_railties(vfs, dir, &app, &support_classes, &engine_dirs);
 
     // `app/helpers/*.rb` — ingested as library classes like the support
     // dirs above, but ALSO registered in `helper_method_index` so the
@@ -1293,6 +1294,9 @@ end
             // single-element-Array holder is the shape every stub slot
             // in the runtime already uses, typed by its push on spinel.
             let mut slots: Vec<(String, String)> = Vec::new();
+            // Each lifted write's site and reader, for the engine class
+            // bodies that replay the same statement.
+            let mut lifted_sites: Vec<(String, u32, String)> = Vec::new();
             for ((segments, value), (site_file, site_start, site_end)) in
                 assignments.iter().zip(&assignment_sites)
             {
@@ -1316,10 +1320,12 @@ end
                      def {name}=(value)\n  CONFIG_LOCK.synchronize do\n    {slot}.clear\n    {slot}.push(value)\n  end\n  value\nend\n"
                 )) {
                     methods.append(&mut synth);
+                    lifted_sites.push((site_file.clone(), *site_start as u32, name.clone()));
                     slots.push((name, slot));
                     super::initializers::consume(site_file, *site_start, *site_end);
                 }
             }
+            read_lifted_engine_config(&mut app, &lifted_sites);
             if !slots.is_empty() {
                 let mut src = String::from("CONFIG_LOCK = Mutex.new\n");
                 for (_, slot) in &slots {
@@ -5366,6 +5372,115 @@ fn engine_app_roots<V: Vfs + ?Sized>(
         let relative = engine_dir.strip_prefix(dir).expect("path gems are inside the app");
         roots.push(relative.join("app"));
     }
+}
+
+/// An engine body replays `config.k = v` where Rails runs it
+/// (`library_class::railtie_body_statements`), and the lift above made
+/// `v` the once-built `Rails.application.k`. Two evaluations would be
+/// two objects (`Essentials::Config.for(Rails.env).new(ENV.to_hash)`
+/// built for the reader and again for the engine's `essentials_config`
+/// local its initializers read), so the replayed write reads the
+/// reader: one object, built when the engine body runs, as in Rails.
+fn read_lifted_engine_config(app: &mut App, lifted: &[(String, u32, String)]) {
+    use crate::expr::{ExprNode, LValue};
+    if lifted.is_empty() {
+        return;
+    }
+    let sites: crate::det::HashMap<(crate::span::FileId, u32), &str> = lifted
+        .iter()
+        .map(|(file, start, name)| ((super::sources::file_id(file), *start), name.as_str()))
+        .collect();
+    let railties: crate::det::HashSet<crate::ident::ClassId> =
+        app.railties.iter().map(|r| r.name.clone()).collect();
+    for class in app.library_classes.iter_mut().filter(|c| railties.contains(&c.name)) {
+        for statement in &mut class.unknown_calls {
+            let Some(name) = sites.get(&(statement.span.file, statement.span.start)) else { continue };
+            let span = statement.span;
+            let value = match &mut *statement.node {
+                ExprNode::Assign { target: LValue::Attr { .. }, value } => value,
+                ExprNode::Send { method, args, .. } if method.as_str().ends_with('=') && args.len() == 1 => &mut args[0],
+                _ => continue,
+            };
+            // `config.k = local = v`: the local keeps the reader's object.
+            let mut value = value;
+            while let ExprNode::Assign { target: LValue::Var { .. }, .. } = &*value.node {
+                let ExprNode::Assign { value: inner, .. } = &mut *value.node else { unreachable!() };
+                value = inner;
+            }
+            let rails = crate::expr::Expr::new(span, ExprNode::Const { path: vec![crate::ident::Symbol::from("Rails")] });
+            let application = crate::expr::Expr::new(span, ExprNode::Send {
+                recv: Some(rails),
+                method: crate::ident::Symbol::from("application"),
+                args: Vec::new(),
+                block: None,
+                parenthesized: false,
+            });
+            *value = crate::expr::Expr::new(value.span, ExprNode::Send {
+                recv: Some(application),
+                method: crate::ident::Symbol::from(*name),
+                args: Vec::new(),
+                block: None,
+                parenthesized: false,
+            });
+        }
+    }
+}
+
+/// The support walk's railtie and engine classes ([`App::railties`]), in
+/// the order Rails defines them: the railties in walk order, then the
+/// engines in the order their initializers run (`engine_dirs`), each
+/// engine with its root. Rails' root is `find_root_with_flag "lib"`
+/// from the defining file's directory (railties 8.2.0.alpha engine.rb):
+/// the nearest directory upward that has a `lib`.
+fn carried_railties<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    app: &App,
+    support_classes: &[(PathBuf, Vec<crate::ident::ClassId>)],
+    engine_dirs: &[PathBuf],
+) -> Vec<crate::app::CarriedRailtie> {
+    let parents: crate::det::HashMap<&str, &str> = app
+        .library_classes
+        .iter()
+        .filter_map(|c| c.parent.as_ref().map(|p| (c.name.0.as_str(), p.0.as_str())))
+        .collect();
+    // The railtie base at the top of the chain, if there is one.
+    let base_of = |name: &str| {
+        let mut current = name;
+        for _ in 0..16 {
+            let parent = parents.get(current)?;
+            if super::library_class::is_railtie_base(parent) {
+                return Some(*parent);
+            }
+            current = parent;
+        }
+        None
+    };
+    let mut seen: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    let mut found: Vec<(bool, usize, usize, crate::app::CarriedRailtie)> = Vec::new();
+    for (file, classes) in support_classes {
+        for class in classes {
+            let Some(base) = base_of(class.0.as_str()) else { continue };
+            if !seen.insert(class.0.as_str()) {
+                continue;
+            }
+            let engine = base == "Rails::Engine";
+            let root = engine.then(|| {
+                let mut at = file.parent();
+                while let Some(candidate) = at {
+                    if vfs.exists(&candidate.join("lib")) || candidate == dir {
+                        break;
+                    }
+                    at = candidate.parent();
+                }
+                at.and_then(|root| root.strip_prefix(dir).ok()).map(|rel| rel.display().to_string())
+            }).flatten();
+            let position = engine_dirs.iter().position(|d| file.starts_with(d)).unwrap_or(usize::MAX);
+            found.push((engine, position, found.len(), crate::app::CarriedRailtie { name: class.clone(), root }));
+        }
+    }
+    found.sort_by_key(|(engine, position, index, _)| (*engine, *position, *index));
+    found.into_iter().map(|(_, _, _, railtie)| railtie).collect()
 }
 
 /// `class X < Rails::Engine` / `class X < ::Rails::Engine`.

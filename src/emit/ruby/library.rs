@@ -7,7 +7,7 @@
 //! resolution, so this emitter is shorter than the TS analog: no ivar
 //! field block, no import partition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use crate::det::HashMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -6182,7 +6182,15 @@ fn emit_library_class_decl_inner(
     // Every require the file needs at its TOP: the class-body calls and
     // deferred constants (both run at load), and the method bodies.
     let mut body_requires: BTreeSet<String> = BTreeSet::new();
-    for call in &lc.unknown_calls {
+    // A carried railtie's or engine's body statements reach the app's
+    // constants through app/models.rb's autoload, each under its own
+    // `run_body_statement`, so a constant a statement reads loads when
+    // the statement runs and a file that cannot load is named there.
+    // Most of them sit in blocks Rails runs later (`initializer`,
+    // `config.to_prepare`); a require at the top of the file loaded
+    // their files when the engine loaded.
+    let railtie = carried_railtie(lc, app);
+    for call in lc.unknown_calls.iter().filter(|_| !railtie) {
         body_requires.extend(resolve_all(call, true));
     }
     for &i in &deferred {
@@ -6427,7 +6435,7 @@ fn emit_library_class_decl_inner(
     // their ivar absent. A replayed call and a body ivar write keep
     // their source order (`@registry = {}` then `register :x`), so the
     // two interleave by source position when every one has a real span.
-    let replayed: Vec<&Expr> = if replays_foreign_class_body(lc, app) {
+    let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
         lc.unknown_calls.iter().collect()
     } else {
         for call in &lc.unknown_calls {
@@ -6444,13 +6452,42 @@ fn emit_library_class_decl_inner(
     {
         body_effects.sort_by_key(|e| e.span.start);
     }
+    // A carried railtie's body: its locals first (a statement's block
+    // closes over a local an earlier statement writes), then each
+    // statement under `run_body_statement`, which names one that fails
+    // and goes on (runtime/rails_railtie.rb).
+    if railtie {
+        let mut locals: Vec<String> = Vec::new();
+        for effect in &body_effects {
+            body_scope_locals(effect, &mut locals);
+        }
+        for local in &locals {
+            writeln!(s, "{body_pad}{local} = nil").unwrap();
+        }
+    }
+    let railtie_root = app.railties.iter().find(|r| r.name == lc.name).and_then(|r| r.root.clone());
+    let mut sources: Option<BTreeMap<String, String>> = None;
     for effect in &body_effects {
-        for line in super::emit_expr(effect).lines() {
+        let text = if railtie {
+            super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
+        } else {
+            super::emit_expr(effect)
+        };
+        let (pad, text) = if railtie {
+            writeln!(s, "{body_pad}run_body_statement({:?}) do", statement_site(app, effect.span)).unwrap();
+            (format!("{body_pad}  "), text)
+        } else {
+            (body_pad.to_string(), text)
+        };
+        for line in text.lines() {
             if line.is_empty() {
                 writeln!(s).unwrap();
             } else {
-                writeln!(s, "{body_pad}{line}").unwrap();
+                writeln!(s, "{pad}{line}").unwrap();
             }
+        }
+        if railtie {
+            writeln!(s, "{body_pad}end").unwrap();
         }
     }
     if !replayed.is_empty() && !lc.methods.is_empty() {
@@ -7031,6 +7068,218 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
     lc.parent.as_ref().is_some_and(|p| {
         require_path_for_parent(p, app).is_none() && !is_core_class_name(p.0.as_str())
     })
+}
+
+/// A railtie or engine the app carries (`App::railties`): its class body
+/// is replayed statement by statement under `run_body_statement`.
+fn carried_railtie(lc: &LibraryClass, app: &App) -> bool {
+    !lc.is_module && app.railties.iter().any(|r| r.name == lc.name)
+}
+
+/// The locals a class-body statement writes in the body's own scope:
+/// not inside a block or lambda, whose writes are its own.
+fn body_scope_locals(e: &Expr, out: &mut Vec<String>) {
+    use crate::expr::LValue;
+    let mut add = |name: &str| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    match &*e.node {
+        ExprNode::Lambda { .. } => return,
+        ExprNode::Assign { target: LValue::Var { name, .. }, .. } => add(name.as_str()),
+        ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => add(name.as_str()),
+        ExprNode::MultiAssign { targets, .. } => {
+            for target in targets {
+                if let LValue::Var { name, .. } = target {
+                    add(name.as_str());
+                }
+            }
+        }
+        _ => {}
+    }
+    e.node.for_each_child(&mut |child| body_scope_locals(child, out));
+}
+
+/// A source file's path relative to the app root.
+fn relative_source_path<'a>(app: &App, path: &'a str) -> &'a str {
+    if app.root.is_empty() {
+        return path;
+    }
+    path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path)
+}
+
+/// Each app source file the tree carries => the emitted file
+/// (`models/<stem>`, an app/models.rb anchor) its classes and modules
+/// are in. A file that reopens a class carried from several sources maps
+/// to that one emitted file.
+fn carried_source_files(app: &App) -> BTreeMap<String, String> {
+    let mut table: BTreeMap<String, String> = BTreeMap::new();
+    for lc in &app.library_classes {
+        let anchor = format!("models/{}", super::library_file_stem(lc.name.0.as_str(), app));
+        let mut add = |span: crate::span::Span| {
+            if let Some(source) = (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
+                table.entry(relative_source_path(app, &source.path).to_string()).or_insert_with(|| anchor.clone());
+            }
+        };
+        for method in &lc.methods {
+            add(method.name_span);
+        }
+        for call in lc.unknown_calls.iter().chain(&lc.class_ivar_initializers) {
+            add(call.span);
+        }
+        for (_, value) in &lc.constants {
+            add(value.span);
+        }
+    }
+    table
+}
+
+/// A carried engine body statement's loads of the app's own Ruby files,
+/// resolved against the tree, where the source's files are not on
+/// `$LOAD_PATH` (railties 8.2.0.alpha loads them from the engine root):
+/// `require "feature"` that an app `lib/feature.rb` answers requires the
+/// emitted file, and `Dir[config.root.join("lib/x/**/*.rb")]` (or
+/// `root.join`, `Dir.glob`) lists the emitted files of the sources it
+/// matches, naming at boot each matched source the tree does not carry
+/// (`RoundhouseAutoload.carried_files`). Anything else stays as written.
+fn carried_loads(
+    e: &Expr,
+    app: &App,
+    root: Option<&str>,
+    sources: &mut Option<BTreeMap<String, String>>,
+) -> Expr {
+    let mut e = e.clone();
+    rewrite_carried_loads(&mut e, app, root, sources);
+    e
+}
+
+fn rewrite_carried_loads(
+    e: &mut Expr,
+    app: &App,
+    root: Option<&str>,
+    sources: &mut Option<BTreeMap<String, String>>,
+) {
+    let str_arg = |args: &[Expr]| -> Option<String> {
+        match args {
+            [one] => match &*one.node {
+                ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let prefix = root.filter(|r| !r.is_empty()).map(|r| format!("{r}/")).unwrap_or_default();
+    let mk = |span: crate::span::Span, node: ExprNode| Expr::new(span, node);
+    let lit = |span: crate::span::Span, value: &str| {
+        Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Str { value: value.to_string() } })
+    };
+    let mut replacement: Option<Expr> = None;
+    if let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node {
+        let span = e.span;
+        if recv.is_none() && method.as_str() == "require" {
+            if let Some(feature) = str_arg(args) {
+                let table = sources.get_or_insert_with(|| carried_source_files(app));
+                let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                let own = format!("{prefix}lib/{rb}");
+                let anchor = table.get(&own).or_else(|| {
+                    let mut hits = table.iter().filter(|(src, _)| *src == &format!("lib/{rb}") || src.ends_with(&format!("/lib/{rb}")));
+                    match (hits.next(), hits.next()) {
+                        (Some((_, a)), None) => Some(a),
+                        _ => None,
+                    }
+                });
+                if let Some(anchor) = anchor {
+                    let path = mk(span, ExprNode::Send {
+                        recv: Some(mk(span, ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })),
+                        method: Symbol::from("path"),
+                        args: vec![lit(span, anchor)],
+                        block: None,
+                        parenthesized: true,
+                    });
+                    replacement = Some(mk(span, ExprNode::Send {
+                        recv: None,
+                        method: Symbol::from("require"),
+                        args: vec![path],
+                        block: None,
+                        parenthesized: false,
+                    }));
+                }
+            }
+        }
+        let dir_glob = matches!(recv.as_ref().map(|r| &*r.node), Some(ExprNode::Const { path }) if path.len() == 1 && path[0].as_str() == "Dir")
+            && matches!(method.as_str(), "[]" | "glob");
+        if dir_glob && args.len() == 1 {
+            let pattern = match &*args[0].node {
+                ExprNode::Send { recv: Some(base), method, args: join, block: None, .. } if method.as_str() == "join" => {
+                    let engine_root = match &*base.node {
+                        ExprNode::Send { recv: None, method, args, .. } => method.as_str() == "root" && args.is_empty(),
+                        ExprNode::Send { recv: Some(config), method, args, .. } => {
+                            method.as_str() == "root"
+                                && args.is_empty()
+                                && matches!(&*config.node, ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "config" && args.is_empty())
+                        }
+                        _ => false,
+                    };
+                    if engine_root { str_arg(join) } else { None }
+                }
+                _ => None,
+            };
+            let supported = |p: &str| !p.contains(['?', '{', '}', '[', ']', '\\']);
+            if let Some(pattern) = pattern.filter(|p| supported(p)) {
+                let full = format!("{prefix}{}", pattern.trim_start_matches('/'));
+                let table = sources.get_or_insert_with(|| carried_source_files(app));
+                let mut matched: Vec<String> = app
+                    .sources
+                    .iter()
+                    .map(|s| relative_source_path(app, &s.path).to_string())
+                    .filter(|p| crate::ingest::routes::glob_matches(&full, p))
+                    .collect();
+                matched.sort();
+                matched.dedup();
+                let mut anchors: Vec<Expr> = Vec::new();
+                let mut missing: Vec<Expr> = Vec::new();
+                for source in &matched {
+                    match table.get(source) {
+                        Some(anchor) => {
+                            if !anchors.iter().any(|a| matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Str { value } } if value == anchor)) {
+                                anchors.push(lit(span, anchor));
+                            }
+                        }
+                        None => missing.push(lit(span, source)),
+                    }
+                }
+                let array = |elements: Vec<Expr>| mk(span, ExprNode::Array { elements, style: Default::default() });
+                replacement = Some(mk(span, ExprNode::Send {
+                    recv: Some(mk(span, ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })),
+                    method: Symbol::from("carried_files"),
+                    args: vec![lit(span, &full), array(anchors), array(missing)],
+                    block: None,
+                    parenthesized: true,
+                }));
+            }
+        }
+    }
+    if let Some(replacement) = replacement {
+        *e = replacement;
+        return;
+    }
+    e.node.for_each_child_mut(&mut |child| rewrite_carried_loads(child, app, root, sources));
+}
+
+/// `path:line` of a body statement, the path relative to the app root.
+fn statement_site(app: &App, span: crate::span::Span) -> String {
+    let Some(source) = (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
+        return "(unknown)".to_string();
+    };
+    let (line, _) = source.line_col(span.start);
+    let path = source.path.as_str();
+    let path = if app.root.is_empty() {
+        path
+    } else {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path)
+    };
+    format!("{path}:{line}")
 }
 
 /// Ledger a class-body call we captured but chose not to replay. The

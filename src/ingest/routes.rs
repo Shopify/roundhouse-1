@@ -1610,7 +1610,7 @@ fn ingest_glob_draw_each(
 /// two segment kinds `Dir.glob` actually uses in this idiom. No other
 /// glob metacharacter (`?`, `{a,b}`, character classes, …) is
 /// recognized.
-fn glob_matches(pattern: &str, candidate: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, candidate: &str) -> bool {
     let pat: Vec<&str> = pattern.split('/').collect();
     let cand: Vec<&str> = candidate.split('/').collect();
     glob_match_segments(&pat, &cand)

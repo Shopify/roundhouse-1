@@ -123,11 +123,18 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
     let feature = std::fs::read_to_string(dir.join("runtime/features/rails/railtie.rb")).expect("rails/railtie feature");
     assert!(feature.contains("require_relative \"../../rails_railtie\""), "{feature}");
     let boot = std::fs::read_to_string(dir.join("boot.rb")).expect("boot.rb");
-    let run = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{boot}"));
     let finish = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)").unwrap_or_else(|| panic!("{boot}"));
     let gems = boot.find("require_relative \"runtime/gem_facades\"").expect("gem facades");
+    let railtie = boot.find("require_relative \"runtime/rails_railtie\"").unwrap_or_else(|| panic!("{boot}"));
     let models = boot.find("require_relative \"app/models\"").expect("app/models");
-    assert!(gems < run && run < models && models < finish, "{boot}");
+    assert!(gems < railtie && railtie < models && models < finish, "{boot}");
+    // The :boot phase runs once app/models has loaded the boot files and
+    // the carried engines, before eager loading, as Rails runs it before
+    // `eager_load!`.
+    let autoload = std::fs::read_to_string(dir.join("app/models.rb")).expect("app/models.rb");
+    let run = autoload.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{autoload}"));
+    let eager = autoload.find("RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?").unwrap_or_else(|| panic!("{autoload}"));
+    assert!(run < eager, "{autoload}");
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
     let features = facades.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))").unwrap_or_else(|| panic!("{facades}"));
     let dependency = facades.find("[\"hashlike\"].each do |feature|").unwrap_or_else(|| panic!("{facades}"));
@@ -275,7 +282,7 @@ fn a_railtie_needing_unported_rails_is_named_and_the_rest_run() {
         stderr.contains("roundhouse: error[gem_railtie_middleware_not_applied]: config.app_middleware.use(:SomeMiddleware)"),
         "{stderr}"
     );
-    assert!(stderr.contains("roundhouse: 2 gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])"), "{stderr}");
+    assert!(stderr.contains("roundhouse: 2 railtie and engine initializer(s), hook(s) and body statement(s) did not run (error[gem_railtie_not_run], error[railtie_body_statement_not_run])"), "{stderr}");
 }
 
 /// bugsnag 5.5's railtie, reduced: its `bugsnag.use_rack_middleware`

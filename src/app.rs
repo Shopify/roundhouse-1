@@ -371,6 +371,15 @@ pub struct App {
     /// (`ingest::library_class::file_level_definition_gaps`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingest_drops: Vec<IngestDrop>,
+    /// The `Rails::Railtie` and `Rails::Engine` subclasses the support
+    /// walk carried (a gem source's railtie, an in-repo engine), in the
+    /// order Rails defines them: railties, then engines in the order
+    /// their initializers run (`ingest::initializers::
+    /// engines_in_initializer_order`). The PostgreSQL CRuby tree loads
+    /// them at boot in this order, so `Railtie.subclasses` sorts as
+    /// Rails' does, and runs their initializers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub railties: Vec<CarriedRailtie>,
     /// `config.eager_load = …` from each `config/environments/<env>.rb`,
     /// in file-name order. The emitted CRuby app evaluates the one for
     /// `Rails.env` at boot to choose eager loading or autoload on
@@ -705,6 +714,17 @@ pub struct ZeitwerkLoader {
     pub ignored: Vec<crate::ident::ClassId>,
 }
 
+/// A railtie or engine class the app carries ([`App::railties`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CarriedRailtie {
+    pub name: crate::ident::ClassId,
+    /// An engine's root relative to the app root: the directory of the
+    /// in-repo gem whose `lib/` defines it, where Rails' `find_root`
+    /// lands. `None` for a railtie, which has no root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
 /// A source file a failed library-class ingest left out of the IR.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IngestDrop {
@@ -937,6 +957,7 @@ impl App {
             initializer_constants: Vec::new(),
             load_hooks: Vec::new(),
             ingest_drops: Vec::new(),
+            railties: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),
             sql_functions: Vec::new(),

@@ -20,8 +20,11 @@
 # with the Bootstrap and Finisher hooks a railtie can register on
 # (`:before_initialize`, `to_prepare`, `:after_initialize`) at their names.
 #
-# Not ported, and refused where used: Rails::Engine (no
-# rails/engine feature), `config.app_middleware` operations (the tree has
+# Rails::Engine is runtime/rails_engine.rb. A railtie or engine the app
+# carries compiled replays its class body statement by statement
+# (`run_body_statement`), each statement named where it fails.
+#
+# Not ported, and refused where used: `config.app_middleware` operations (the tree has
 # no middleware stack a gem's railtie can join; each recorded operation is
 # error[gem_railtie_middleware_not_applied] when the railties run).
 # `rake_tasks`/`console`/`runner`/`generators`/`server` blocks are
@@ -322,7 +325,7 @@ module Rails
           end
         end
         return unless phases.include?(:finish)
-        warn "roundhouse: #{@@not_run} gem railtie initializer(s) and hook(s) did not run (error[gem_railtie_not_run])" if @@not_run > 0
+        warn "roundhouse: #{@@not_run} railtie and engine initializer(s), hook(s) and body statement(s) did not run (error[gem_railtie_not_run], error[railtie_body_statement_not_run])" if @@not_run > 0
       end
 
       def sorted_initializers_of_railties(app) # :nodoc:
@@ -342,7 +345,11 @@ module Rails
           end
         end
         add.(BOOTSTRAP_INITIALIZERS)
+        # Rails::Engine::Railties#_all: the railties, then the engines.
         subclasses.each { |railtie| collection.concat(railtie.instance.initializers) }
+        if defined?(::Rails::Engine)
+          ::Rails::Engine.subclasses.each { |engine| collection.concat(engine.instance.initializers) }
+        end
         add.(FINISHER_INITIALIZERS)
         collection.tsort
       end
@@ -358,6 +365,22 @@ module Rails
         @@not_run += 1
         site = e.backtrace&.find { |line| !line.include?(__FILE__) && !line.include?("active_support_lazy_load_hooks") }
         warn "roundhouse: error[gem_railtie_not_run]: #{what} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)} (#{site})"
+        nil
+      end
+
+      # One statement of a railtie's or engine's class body the app
+      # carries compiled (emitted under app/models/), run where the
+      # class body has it. Rails runs the body as the class loads, and a
+      # failure there stops the boot; here a statement that needs what
+      # this tree does not port (a gem's railtie that is not loaded, so
+      # `config.<gem>` is not there; a constant no carried file defines)
+      # is named, error[railtie_body_statement_not_run], and the body
+      # goes on, as `not_run_unless_it_runs` does for initializers.
+      def run_body_statement(site) # :nodoc:
+        yield
+      rescue StandardError, LoadError, NotImplementedError => e
+        @@not_run += 1
+        warn "roundhouse: error[railtie_body_statement_not_run]: #{name} body statement at #{site} did not run: #{e.class}: #{e.message.lines.first&.chomp}#{compiled_copy_note(e)}"
         nil
       end
 
