@@ -1,5 +1,7 @@
 require_relative "active_record/errors"
-require_relative "active_record/connection_not_established"
+# The rest of Rails' exception hierarchy, Ruby-family only (not on the
+# strict-target transpile tables, unlike errors.rb).
+require_relative "active_record/error_classes"
 require_relative "active_record/connection_pool"
 require_relative "active_record/registry"
 require_relative "active_record/base"

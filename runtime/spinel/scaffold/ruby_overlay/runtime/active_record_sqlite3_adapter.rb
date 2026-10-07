@@ -28,10 +28,11 @@
 # connection needs Thread, which is why it is not in the shared
 # `connection.rb` either.
 #
-# NOT modeled (ledgered): the Active Record error hierarchy above
-# StatementInvalid (ActiveRecordError, AdapterError,
-# WrappedDatabaseException, QueryAborted, StatementTimeout,
-# ConnectionNotEstablished); a connection of its own per thread on the
+# The Active Record error hierarchy is Rails' (runtime/active_record/
+# errors.rb and error_classes.rb, with the constructors of
+# active_record_statement_errors.rb).
+#
+# NOT modeled (ledgered): a connection of its own per thread on the
 # file database (every thread's adapter runs on `Db`'s shared handle
 # outside a lease; memory mode gives each thread its own); a
 # shared-cache mode, so an isolation level never reaches its PRAGMA;

@@ -47,23 +47,8 @@ require "set"
 require "monitor"
 
 module ActiveRecord
-  class AdapterNotSpecified < (defined?(ActiveRecordError) ? ActiveRecordError : StandardError); end unless defined?(AdapterNotSpecified)
-  class ReadOnlyError < (defined?(ActiveRecordError) ? ActiveRecordError : StandardError); end unless defined?(ReadOnlyError)
-
-  # errors.rb: raised when a connection is looked up and none is defined.
-  class ConnectionNotDefined < ConnectionNotEstablished
-    attr_reader :connection_name, :role, :shard
-
-    def initialize(message = nil, connection_name: nil, role: nil, shard: nil)
-      super(message)
-      @connection_name = connection_name
-      @role = role
-      @shard = shard
-    end
-  end unless defined?(ConnectionNotDefined)
-
-  # errors.rb (subclasses ArgumentError for backwards compatibility).
-  class ShardSwapProhibitedError < ArgumentError; end unless defined?(ShardSwapProhibitedError)
+  # AdapterNotSpecified, ReadOnlyError, ConnectionNotDefined and
+  # ShardSwapProhibitedError are runtime/ruby/active_record/error_classes.rb's.
 
   # active_record.rb: `singleton_class.attr_accessor :writing_role`
   # (default :writing), `:reading_role` (default :reading),

@@ -267,7 +267,7 @@ fn runtime(native: bool) {
         format!(
             "require {:?}\nrequire {:?}\nrequire {:?}\nrequire {:?}\nrequire {:?}\n",
             root.join("runtime/ruby/active_record/errors.rb"),
-            root.join("runtime/ruby/active_record/connection_not_established.rb"),
+            root.join("runtime/ruby/active_record/error_classes.rb"),
             root.join("runtime/spinel/scaffold/ruby_overlay/runtime/active_record_statement_errors.rb"),
             root.join("runtime/ruby/active_record/connection_pool.rb"),
             root.join("runtime/spinel/db_cruby.rb")

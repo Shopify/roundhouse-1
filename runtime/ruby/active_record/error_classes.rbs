@@ -1,0 +1,204 @@
+# Signatures for error_classes.rb: the Ruby-family part of Rails'
+# Active Record exception hierarchy (the shared roots are errors.rbs).
+module ActiveRecord
+  class AdapterError
+    @connection_pool: ConnectionAdapters::ConnectionPool?
+
+    def connection_pool: () -> ConnectionAdapters::ConnectionPool?
+  end
+
+  class SubclassNotFound < ActiveRecordError
+  end
+
+  class AssociationTypeMismatch < ActiveRecordError
+  end
+
+  class SerializationTypeMismatch < ActiveRecordError
+  end
+
+  class AdapterNotSpecified < ActiveRecordError
+  end
+
+  class TableNotSpecified < ActiveRecordError
+  end
+
+  class AdapterNotFound < ActiveRecordError
+  end
+
+  class ConnectionNotEstablished < AdapterError
+    def set_pool: (ConnectionAdapters::ConnectionPool? connection_pool) -> self
+  end
+
+  class ConnectionTimeoutError < ConnectionNotEstablished
+  end
+
+  class ConnectionNotDefined < ConnectionNotEstablished
+    def initialize: (?String? message, ?connection_name: String?, ?role: Symbol?, ?shard: Symbol?) -> void
+    def connection_name: () -> String?
+    def role: () -> Symbol?
+    def shard: () -> Symbol?
+  end
+
+  class DatabaseConnectionError < ConnectionNotEstablished
+    def initialize: (?String? message) -> void
+    def self.hostname_error: (String? hostname) -> DatabaseConnectionError
+    def self.username_error: (String? username) -> DatabaseConnectionError
+  end
+
+  class ExclusiveConnectionTimeoutError < ConnectionTimeoutError
+  end
+
+  class ReadOnlyError < ActiveRecordError
+  end
+
+  class ShardSwapProhibitedError < ArgumentError
+  end
+
+  class RecordNotSaved < ActiveRecordError
+    def record: () -> Base?
+    def initialize: (?String? message, ?Base? record) -> void
+  end
+
+  class RecordNotDestroyed < ActiveRecordError
+    def record: () -> Base?
+    def initialize: (?String? message, ?Base? record) -> void
+  end
+
+  class SoleRecordExceeded < ActiveRecordError
+    def record: () -> singleton(Base)?
+    def initialize: (?singleton(Base)? record) -> void
+  end
+
+  class InvalidForeignKey < WrappedDatabaseException
+  end
+
+  class MismatchedForeignKey < StatementInvalid
+  end
+
+  class NotNullViolation < StatementInvalid
+  end
+
+  class CheckViolation < StatementInvalid
+  end
+
+  class ExclusionViolation < StatementInvalid
+  end
+
+  class RangeError < StatementInvalid
+  end
+
+  class SQLWarning < AdapterError
+    def code: () -> String?
+    def level: () -> String?
+    def sql: () -> String?
+    def sql=: (String? sql) -> String?
+    def initialize: (?String? message, ?String? code, ?String? level, ?String? sql, ?ConnectionAdapters::ConnectionPool? connection_pool) -> void
+  end
+
+  class PreparedStatementInvalid < ActiveRecordError
+  end
+
+  class NoDatabaseError < StatementInvalid
+    def self.db_error: (String? db_name) -> NoDatabaseError
+  end
+
+  class DatabaseAlreadyExists < StatementInvalid
+  end
+
+  class PreparedStatementCacheExpired < StatementInvalid
+  end
+
+  class StaleObjectError < ActiveRecordError
+    def record: () -> Base?
+    def attempted_action: () -> String?
+    def initialize: (?Base? record, ?String? attempted_action) -> void
+  end
+
+  class ConfigurationError < ActiveRecordError
+  end
+
+  class ReadOnlyRecord < ActiveRecordError
+  end
+
+  class StrictLoadingViolationError < ActiveRecordError
+  end
+
+  class Rollback < ActiveRecordError
+  end
+
+  class DangerousAttributeError < ActiveRecordError
+  end
+
+  class AttributeAssignmentError < ActiveRecordError
+    def exception: () -> Exception?
+    def attribute: () -> String?
+    def initialize: (?String? message, ?Exception? exception, ?String? attribute) -> void
+  end
+
+  class MultiparameterAssignmentErrors < ActiveRecordError
+    def errors: () -> Array[AttributeAssignmentError]?
+    def initialize: (?Array[AttributeAssignmentError]? errors) -> void
+  end
+
+  class UnknownPrimaryKey < ActiveRecordError
+    def model: () -> singleton(Base)?
+    def initialize: (?singleton(Base)? model, ?String? description) -> void
+  end
+
+  class UnmodifiableRelation < ActiveRecordError
+  end
+
+  class TransactionIsolationError < ActiveRecordError
+  end
+
+  class TransactionRollbackError < StatementInvalid
+  end
+
+  class AsynchronousQueryInsideTransactionError < ActiveRecordError
+  end
+
+  class SerializationFailure < TransactionRollbackError
+  end
+
+  class Deadlocked < TransactionRollbackError
+  end
+
+  class MissingRequiredOrderError < ActiveRecordError
+  end
+
+  class IrreversibleOrderError < ActiveRecordError
+  end
+
+  class QueryAborted < StatementInvalid
+  end
+
+  class LockWaitTimeout < StatementInvalid
+  end
+
+  class StatementTimeout < QueryAborted
+  end
+
+  class QueryCanceled < QueryAborted
+  end
+
+  class AdapterTimeout < QueryAborted
+  end
+
+  class ConnectionFailed < QueryAborted
+  end
+
+  class UnknownAttributeReference < ActiveRecordError
+  end
+
+  class DatabaseVersionError < ActiveRecordError
+  end
+
+  class DeprecatedAssociationError < ActiveRecordError
+  end
+
+  class AssociationNotFoundError < ConfigurationError
+    def record: () -> Base?
+    def association_name: () -> (String | Symbol)?
+    def initialize: (?Base? record, ?(String | Symbol)? association_name) -> void
+  end
+end

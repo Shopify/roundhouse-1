@@ -623,6 +623,10 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         register_stdlib_class(classes, name, &class_side, instance_side);
     }
     for (exc, extra) in [
+        // Rails' root, from runtime/ruby/active_record/errors.rb. Named
+        // here so a gem RBI that reopens it (semian includes its
+        // AdapterError into it) does not claim the runtime's class.
+        ("ActiveRecord::ActiveRecordError", None),
         ("ActiveRecord::RecordNotFound", None),
         ("ActiveRecord::RecordNotUnique", None),
         ("ActiveRecord::ValueTooLong", None),
