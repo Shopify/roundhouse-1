@@ -3304,7 +3304,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
     files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
     let registrations = load_hook_registrations(app);
-    // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.1.4).
+    // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
     files.push(("runtime/active_support_backtrace_cleaner.rb".into(), cleaner));
@@ -3349,13 +3349,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
             content.insert_str(
                 at,
-                "# Rails::Railtie and Rails::Engine, for the gems' railties and the\n\
+                "# `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
+                 # (railties rails.rb:13): `Rails.backtrace_cleaner`, ported.\n\
+                 require_relative \"runtime/active_support_backtrace_cleaner\"\n\
+                 # Rails::Railtie and Rails::Engine, for the gems' railties and the\n\
                  # app's own railties and engines, which app/models.rb loads.\n\
                  require_relative \"runtime/rails_railtie\"\n\
                  require_relative \"runtime/rails_engine\"\n",
             );
-            content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
-            content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
+            content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
             content.push_str(
                 "# Application#initialize!'s Finisher (middleware, to_prepare,\n\
