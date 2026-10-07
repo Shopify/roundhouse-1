@@ -100,7 +100,10 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// for `initialize`, and the dynamic dispatchers. A call whose source
 /// destination resolves exactly (`destination`: a constant naming its
 /// class, a verified hierarchy, every self-dispatch override) to methods
-/// without one is admitted; anything less stays refused by selector.
+/// without one is admitted. So is `Const.m(**h)` / `Const.new(**h)`
+/// whose receiver's Ruby method lookup provably cannot reach any rest
+/// owner of the selector, even when its destination is an unmodeled
+/// ancestor ([`RestReach`]). Anything less stays refused by selector.
 /// Reifying such a method (`method(:m)`) is refused outright.
 /// An implicit `super` in an override of such a selector with keyword
 /// parameters (kept or flattened) passes the override's lowered
@@ -124,9 +127,11 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         destination(app, contracts, context, e).is_some_and(|(m, _)| !rest(m))
             && virtual_destinations(contracts, context, e).is_ok_and(|v| v.iter().all(|(m, _)| !rest(m)))
     }
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         app: &App,
         contracts: &SourceContractIndex<'_>,
+        reach: &RestReach<'_>,
         selectors: &HashSet<&Symbol>,
         context: Option<(&ClassId, &MethodDef)>,
         runtime_super: bool,
@@ -196,6 +201,7 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         if reaches
             && args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. }))
             && !proven_without_rest(app, contracts, context, e)
+            && !reach.constant_receiver_reaches_none(contracts, e)
         {
             out.push(Diagnostic::unsupported(
                 e.span,
@@ -204,7 +210,7 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
                 "the keyword splat lowering would pass the hash as a positional",
             ));
         }
-        e.node.for_each_child(&mut |c| visit(app, contracts, selectors, context, runtime_super, c, out));
+        e.node.for_each_child(&mut |c| visit(app, contracts, reach, selectors, context, runtime_super, c, out));
     }
     let rests: Vec<(&ClassId, &Symbol)> = methods(app)
         .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
@@ -237,14 +243,17 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
                 .iter()
                 .any(|(o, n)| **n == m.name && FACTORY_ANCESTORS.contains(&o.0.as_str()))
     };
+    let reach = RestReach::new(app);
     for (owner, method) in methods(app) {
         let runtime = runtime_super(owner, method);
-        visit(app, contracts, &selectors, Some((owner, method)), runtime, &method.body, &mut out);
+        visit(app, contracts, &reach, &selectors, Some((owner, method)), runtime, &method.body, &mut out);
         for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-            visit(app, contracts, &selectors, Some((owner, method)), runtime, default, &mut out);
+            visit(app, contracts, &reach, &selectors, Some((owner, method)), runtime, default, &mut out);
         }
     }
-    crate::lower::for_each_forwarding_body_ref(app, &mut |e| visit(app, contracts, &selectors, None, false, e, &mut out));
+    crate::lower::for_each_forwarding_body_ref(app, &mut |e| {
+        visit(app, contracts, &reach, &selectors, None, false, e, &mut out)
+    });
     // `delegate` writes a zero-arg forwarder, or none (a string name, a
     // test class); the library-class pass leaves such a declaration in
     // `unknown_calls`, and a controller's stays a body item, so refuse
@@ -276,6 +285,222 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         }
     }
     out
+}
+
+/// Proof that `Const.m(.., **h)` cannot reach an admitted nameless rest,
+/// from Ruby's method lookup rather than from a resolved destination.
+///
+/// `C.new` looks `new` up on C's singleton class (the singleton classes
+/// of C's superclass chain, the modules extended into them, then `Class`,
+/// `Module`, `Object`, `Kernel`, `BasicObject`), and `Class#new` looks
+/// `initialize` up on C's ancestors: C's superclass chain and the modules
+/// mixed into it. `C.m` is the first lookup alone. So a rest owner of the
+/// selector (`new` and `initialize` for `new`) can be reached only as
+///
+/// * a module. Mixins are also applied by calls this index does not see
+///   (hedwig's `bulk_process_by` runs `include(Hedwig::Bulk::Performer)`,
+///   Core's `include(mod)` takes a computed module), so a module owner
+///   may sit in any lookup and is never excluded;
+/// * `Object`, `BasicObject`, `Kernel`, `Module` or `Class`, which every
+///   lookup reaches;
+/// * a class in C's superclass chain: the only classes among C's
+///   ancestors, since a module's ancestors are modules. Owners and the
+///   chain's written superclasses are compared by last segment, so a
+///   relative spelling (`< Base` inside `module A`) cannot hide `A::Base`;
+/// * a class beyond a superclass the app does not model. Gem code cannot
+///   name a fresh app class, so an app-local owner is not there. The
+///   owners gem code can name are excluded only while the chain is
+///   closed: classes of installed gem source the app compiles (`vendor/`,
+///   `gems/`, `<gem>-<version>/`), which another gem may subclass; core,
+///   stdlib and RBI-declared names the app reopens; and the top-level
+///   `Application*` bases engines refer to.
+///
+/// A reopened owner (more than one fragment) is refused: its fragments
+/// are not shown to be one class. A written superclass that is an app
+/// constant rather than a modeled class (`Base = build_class`) is app
+/// code the index cannot see, so no proof is given. A chain root with no
+/// written superclass is `Object`'s child unless it is a core, stdlib or
+/// RBI-declared name, a factory class or a `Struct.new` superclass,
+/// whose real superclass is not the app's declaration: then the chain is
+/// open, as it is for a superclass whose top-level spelling is unmodeled.
+///
+/// Like `destination`, this takes a modeled class's recorded superclass
+/// as its superclass; a superclass expression the ingest cannot record
+/// (other than `Struct.new`) reads as none. `send`-family selectors are
+/// computed and `instance_exec` runs a block, so neither is admitted.
+struct RestReach<'a> {
+    app: &'a App,
+    rests: Vec<(&'a ClassId, &'a MethodDef)>,
+    /// Modeled classes and modules: `true` when any fragment is a module.
+    module: HashMap<&'a ClassId, bool>,
+    /// Factory classes and `Struct.new` superclasses.
+    synthesized: HashSet<&'a ClassId>,
+    /// Last segments of app constants that are not modeled classes.
+    constants: HashSet<&'a str>,
+    /// `<gem>-<version>` directory names of the locked gems.
+    installed: HashSet<String>,
+}
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+impl<'a> RestReach<'a> {
+    fn new(app: &'a App) -> Self {
+        let rests = methods(app)
+            .filter(|(_, m)| m.params.iter().any(crate::dialect::Param::is_nameless_rest))
+            .collect();
+        let mut module: HashMap<&ClassId, bool> = HashMap::new();
+        let mut synthesized = HashSet::new();
+        let mut constants = HashSet::new();
+        for class in classes(app) {
+            *module.entry(&class.name).or_insert(false) |= class.is_module;
+            if matches!(
+                class.origin,
+                Some(
+                    crate::dialect::LibraryClassOrigin::FactoryClass { .. }
+                        | crate::dialect::LibraryClassOrigin::StructSuperclass { .. }
+                )
+            ) {
+                synthesized.insert(&class.name);
+            }
+            constants.extend(class.constants.iter().map(|(name, _)| last_segment(name.as_str())));
+        }
+        let assigned = |e: &'a Expr| match &*e.node {
+            ExprNode::Assign { target: LValue::Const { path }, .. } => path.last().map(|s| s.as_str()),
+            _ => None,
+        };
+        for model in &app.models {
+            module.entry(&model.name).or_insert(false);
+            constants.extend(model.body.iter().filter_map(|item| match item {
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } => assigned(expr),
+                _ => None,
+            }));
+        }
+        for controller in &app.controllers {
+            constants.extend(controller.body.iter().filter_map(|item| match item {
+                crate::dialect::ControllerBodyItem::Unknown { expr, .. } => assigned(expr),
+                _ => None,
+            }));
+        }
+        for test in &app.test_modules {
+            constants.extend(test.constants.iter().map(|(name, _)| last_segment(name.as_str())));
+        }
+        let installed = app
+            .gem_lock
+            .iter()
+            .flat_map(|lock| lock.specs.iter().map(|(name, version)| format!("{name}-{version}")))
+            .collect();
+        Self { app, rests, module, synthesized, constants, installed }
+    }
+
+    /// `Const.m(.., **h)`: no rest owner of the selector is reachable
+    /// from the constant's class (see the type's documentation).
+    fn constant_receiver_reaches_none(&self, contracts: &SourceContractIndex<'_>, e: &Expr) -> bool {
+        let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node else { return false };
+        if matches!(method.as_str(), "send" | "public_send" | "__send__" | "instance_exec") {
+            return false;
+        }
+        let (ExprNode::Const { .. }, Some(Ty::Class { id, .. })) = (&*recv.node, recv.ty.as_ref()) else {
+            return false;
+        };
+        if !constant_names_class(recv, id) || !self.module.contains_key(id) {
+            return false;
+        }
+        let Some((chain, open)) = self.superclass_chain(contracts, id) else { return false };
+        let new = method.as_str() == "new";
+        self.rests
+            .iter()
+            .filter(|(_, m)| m.name == *method || (new && m.name.as_str() == "initialize"))
+            .all(|(owner, m)| self.excluded(contracts, owner, m, &chain, open))
+    }
+
+    fn excluded(
+        &self,
+        contracts: &SourceContractIndex<'_>,
+        owner: &ClassId,
+        method: &MethodDef,
+        chain: &[String],
+        open: bool,
+    ) -> bool {
+        let name = owner.0.as_str();
+        !matches!(name, "Object" | "BasicObject" | "Kernel" | "Module" | "Class")
+            && contracts.fragments.get(owner).copied() == Some(1)
+            && self.module.get(owner) == Some(&false)
+            && !chain.iter().any(|n| last_segment(n) == last_segment(name))
+            && !(open && self.gem_nameable(name, method.name_span))
+    }
+
+    /// A name gem code can refer to, so a gem class may descend from it.
+    fn gem_nameable(&self, name: &str, span: Span) -> bool {
+        self.foreign(name) || (!name.contains("::") && name.starts_with("Application")) || self.gem_source(span)
+    }
+
+    /// Ruby's, its standard library's, or a gem RBI's name.
+    fn foreign(&self, name: &str) -> bool {
+        use super::registry::gem_boundary::{RUBY_CORE, RUBY_STDLIB};
+        let top = name.split("::").next().unwrap_or(name);
+        RUBY_CORE.contains(&top) || RUBY_STDLIB.contains(&top) || self.app.gem_boundary.gem_of(name).is_some()
+    }
+
+    /// Declared in installed gem source the app compiles. A span with no
+    /// file has no provenance and counts as gem source.
+    fn gem_source(&self, span: Span) -> bool {
+        let Some(file) = (span.file.0 as usize).checked_sub(1).and_then(|i| self.app.sources.get(i)) else {
+            return true;
+        };
+        file.path
+            .split(['/', '\\'])
+            .any(|part| part == "vendor" || part == "gems" || self.installed.contains(part))
+    }
+
+    /// The receiver's superclass chain as modeled and as written, and
+    /// whether it continues past what the app models. `None` when a
+    /// written superclass may be an unmodeled app constant.
+    fn superclass_chain(&self, contracts: &SourceContractIndex<'_>, receiver: &ClassId) -> Option<(Vec<String>, bool)> {
+        let mut names = Vec::new();
+        let mut open = false;
+        let mut pending = vec![receiver.clone()];
+        let mut seen = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            names.push(node.0.as_str().to_string());
+            if self.synthesized.contains(&node) {
+                open = true;
+            }
+            let Some(parent) = contracts.parent(&node) else {
+                if self.foreign(node.0.as_str()) {
+                    open = true;
+                }
+                continue;
+            };
+            let written = parent.0.as_str().trim_start_matches("::");
+            if self.constants.contains(last_segment(written)) {
+                return None;
+            }
+            names.push(written.to_string());
+            // Ruby resolves the spelling innermost scope first; follow
+            // every modeled candidate. The chain is open unless the
+            // top-level spelling itself is modeled: a compact `class
+            // A::B < P` resolves `P` at the top level only.
+            let mut scope: Vec<&str> = node.0.as_str().split("::").collect();
+            scope.pop();
+            let mut candidates = Vec::new();
+            while !scope.is_empty() {
+                candidates.push(ClassId(Symbol::from(format!("{}::{written}", scope.join("::")))));
+                scope.pop();
+            }
+            let top = ClassId(Symbol::from(written));
+            if !contracts.fragments.contains_key(&top) {
+                open = true;
+            }
+            candidates.push(top);
+            pending.extend(candidates.into_iter().filter(|c| contracts.fragments.contains_key(c)));
+        }
+        Some((names, open))
+    }
 }
 
 fn classes(app: &App) -> impl Iterator<Item = &LibraryClass> {

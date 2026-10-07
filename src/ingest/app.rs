@@ -301,10 +301,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let vfs = &source_vfs;
     // Every initializer Rails runs at boot, in its load order: each
     // in-repo engine's, then the app's (see `initializers`).
-    let boot_initializers: Vec<std::path::PathBuf> = {
-        let engines = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
-        super::initializers::initializer_files(vfs, dir, &engines)
-    };
+    let engine_dirs = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
+    let boot_initializers: Vec<std::path::PathBuf> =
+        super::initializers::initializer_files(vfs, dir, &engine_dirs);
     let additional_test_paths = additional_test_paths(vfs, dir)?;
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
     let mut app = App::new();
@@ -704,7 +703,14 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         app.models.push(model);
                         // Classes nested in the model's body are classes
                         // of their own, exactly as under `app/models`.
-                        if let Ok(classes) = ingest_library_classes(&source, &path_str) {
+                        let classes = match ingest_library_classes(&source, &path_str) {
+                            Ok(classes) => Some(classes),
+                            Err(err) => {
+                                drop_library_file(&mut app, &path_str, &err);
+                                None
+                            }
+                        };
+                        if let Some(classes) = classes {
                             let nested = nested_under(&outer, classes);
                             let (concern_items, concern_enum_decls) =
                                 ingest_concern_model_items_with_constants(
@@ -736,11 +742,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     }
                     app.library_classes.extend(classes)
                 }
-                Err(err) => {
-                    if survey::is_active() {
-                        survey::record_dropped_file(&err);
-                    }
-                }
+                Err(err) => drop_library_file(&mut app, &path_str, &err),
             }
             // A reopen deferred behind `ActiveSupport.on_load` is
             // invisible to the class finder above (it skips blocks);
@@ -826,11 +828,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                         }
                         app.library_classes.extend(classes);
                     }
-                    Err(err) => {
-                        if survey::is_active() {
-                            survey::record_dropped_file(&err);
-                        }
-                    }
+                    Err(err) => drop_library_file(&mut app, &path_str, &err),
                 }
             }
         }
@@ -873,6 +871,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             Err(err) => {
                 if survey::is_active() {
                     survey::record(&err);
+                } else {
+                    push_ingest_drop(&mut app, &file, &err);
                 }
                 Vec::new()
             }
@@ -883,6 +883,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                 Err(err) => {
                     if survey::is_active() {
                         survey::record(&err);
+                    } else {
+                        push_ingest_drop(&mut app, &file, &err);
                     }
                     Vec::new()
                 }
@@ -1191,6 +1193,45 @@ end
                 for a in extract_config_assignments(&bytes, &path) {
                     assignments.push((a.path, a.value));
                     assignment_sites.push((path.clone(), a.start, a.end));
+                }
+            }
+            // Each in-repo engine's class body writes the same config
+            // (see `engine_config`). Engines load before the
+            // application's initializers run, and the first reader of a
+            // key answers below, so they follow the app's own sources:
+            // an initializer that reassigns an engine's key wins, as
+            // its later write does in Rails.
+            {
+                let mut carried: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let names = app.models.iter().map(|m| m.name.0.as_str())
+                    .chain(app.library_classes.iter().map(|c| c.name.0.as_str()));
+                for name in names {
+                    let mut prefix = String::new();
+                    for segment in name.split("::") {
+                        if !prefix.is_empty() {
+                            prefix.push_str("::");
+                        }
+                        prefix.push_str(segment);
+                        carried.insert(prefix.clone());
+                    }
+                }
+                let known = |name: &str| carried.contains(name);
+                for engine in &engine_dirs {
+                    let lib = engine.join("lib");
+                    if !vfs.is_dir(&lib) {
+                        continue;
+                    }
+                    for file in read_rb_files(vfs, &lib).unwrap_or_default() {
+                        let Ok(bytes) = vfs.read(&file) else { continue };
+                        if !bytes.windows(13).any(|w| w == b"Rails::Engine") {
+                            continue;
+                        }
+                        let path = file.display().to_string();
+                        for a in super::engine_config::extract(&bytes, &path, &known) {
+                            assignments.push((a.path, a.value));
+                            assignment_sites.push((path.clone(), a.start, a.end));
+                        }
+                    }
                 }
             }
             // ONCE PER PROCESS. An initializer runs at boot, so the
@@ -2147,7 +2188,40 @@ end
     let late_sources = super::sources::drain();
     super::sources::assert_snapshot_matches(&[], &late_sources);
     app.dropped_files = survey::dropped_files();
+    // Survey mode goes on past a file whose class ingest failed, as the
+    // support-dir walk does outside it: each is an error at the
+    // construct that failed it too, not only a punch-list entry.
+    for dropped in &app.dropped_files {
+        // The source registry is drained above; `app.sources` is its snapshot.
+        let Some(index) = app.sources.iter().position(|s| s.path == dropped.file) else { continue };
+        let file = crate::span::FileId(index as u32 + 1);
+        let span = crate::span::Span { file, start: dropped.start as u32, end: dropped.end as u32 };
+        app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone() });
+    }
     Ok(app)
+}
+
+/// A support-dir file whose library-class ingest failed. The walk goes
+/// on without it; survey mode records the gap in its punch list, and
+/// outside it the file is an `ingest_unsupported` error at the construct
+/// that failed it, not a silent absence.
+fn drop_library_file(app: &mut App, path: &str, err: &IngestError) {
+    if survey::is_active() {
+        survey::record_dropped_file(err);
+    } else {
+        push_ingest_drop(app, path, err);
+    }
+}
+
+fn push_ingest_drop(app: &mut App, path: &str, err: &IngestError) {
+    let (start, end) = super::error_site::of(err).unwrap_or((0, 0));
+    let message = match err {
+        IngestError::Unsupported { message, .. } => message.clone(),
+        IngestError::Parse { message, .. } => format!("parse error: {message}"),
+        IngestError::Io(e) => format!("io error: {e}"),
+    };
+    let span = crate::span::Span { file: super::sources::file_id(path), start: start as u32, end: end as u32 };
+    app.ingest_drops.push(crate::app::IngestDrop { span, message });
 }
 
 /// Source subtrees whose binary files are copied into the emitted tree.
@@ -6756,7 +6830,7 @@ fn outer_local_read(node: &ruby_prism::Node<'_>) -> Option<String> {
 /// reads back the same way, as a plain method on `Rails::Application`.
 /// `config_reader` flattens the read side identically, so the two halves
 /// meet at the same name.
-fn config_receiver_path(
+pub(super) fn config_receiver_path(
     recv: &Option<ruby_prism::Node<'_>>,
     app_param: Option<&str>,
 ) -> Option<Vec<String>> {

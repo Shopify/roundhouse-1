@@ -1423,7 +1423,7 @@ fn is_setter_method(m: &str) -> bool {
 /// body; `do … end` spans multiple lines when the body has newlines.
 pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     use crate::expr::BlockStyle;
-    let ExprNode::Lambda { params, rest_param, body, block_style, .. } = &*block.node else {
+    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = &*block.node else {
         // A non-Lambda block expression is a Proc FORWARD (`&block` —
         // ingest lowers the block-pass arg to a bare Var in the block
         // slot). Rendering it as a literal `{ block }` block made the
@@ -1450,6 +1450,10 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
     if let Some(r) = rest_param {
         ps.push(format!("*{r}"));
+    }
+    // `|*args, &blk|`: the block's own block parameter, last.
+    if let Some(b) = block_param {
+        ps.push(format!("&{b}"));
     }
     let params_str = if ps.is_empty() {
         String::new()

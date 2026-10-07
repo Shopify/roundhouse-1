@@ -344,6 +344,15 @@ pub struct App {
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hooks: Vec<LoadHook>,
+    /// Source files whose library-class ingest failed and that ingest
+    /// went on without (the isolate-tolerant support-dir walk; in survey
+    /// mode, every per-file class ingest): none of their classes,
+    /// modules or constants are in the emitted app. Each is an
+    /// `ingest_unsupported` error at the construct that failed it
+    /// (`analyze::ingest_coverage`); survey mode also lists the gap in
+    /// its punch list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingest_drops: Vec<IngestDrop>,
     /// `config.eager_load = …` from each `config/environments/<env>.rb`,
     /// in file-name order. The emitted CRuby app evaluates the one for
     /// `Rails.env` at boot to choose eager loading or autoload on
@@ -651,6 +660,16 @@ pub struct EagerLoadSetting {
     pub value: Result<crate::expr::Expr, String>,
 }
 
+/// A source file a failed library-class ingest left out of the IR.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IngestDrop {
+    /// The construct that failed the file, or the file's first byte
+    /// when no frame noted one.
+    pub span: crate::span::Span,
+    /// What the file's ingest refused.
+    pub message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InitializerGap {
     /// The statement's source range.
@@ -851,6 +870,7 @@ impl App {
             initializer_files: Vec::new(),
             initializer_gaps: Vec::new(),
             load_hooks: Vec::new(),
+            ingest_drops: Vec::new(),
             eager_load: Vec::new(),
             sql_functions: Vec::new(),
             rails_application: None,

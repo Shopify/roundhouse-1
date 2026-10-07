@@ -1391,6 +1391,9 @@ pub fn target_files(
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby) {
         report_unloaded_gem_constants(app, target);
     }
+    if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Roda) {
+        report_unsupported_block_captures(app, target);
+    }
 
     // Blog is the verbatim Rails source — it ships `db/seeds.rb` and is
     // seeded by Rails, so it needs no SQL seed. Every transpile target
@@ -2669,6 +2672,14 @@ fn ruby_family_runtime_files(
         crate::runtime_files::read_to_string("runtime/spinel/module_delegate.rb")
             .map_err(|e| format!("read runtime/spinel/module_delegate.rb: {e}"))?,
     ));
+    // `Rails.configuration` / `Rails.application.config` answering the
+    // lifted config keys (see the file's header): computed-name dispatch,
+    // so ruby-family only, and required beside module_delegate below.
+    files.push((
+        "runtime/rails_configuration.rb".to_string(),
+        crate::runtime_files::read_to_string("runtime/spinel/rails_configuration.rb")
+            .map_err(|e| format!("read runtime/spinel/rails_configuration.rb: {e}"))?,
+    ));
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -2720,6 +2731,7 @@ fn ruby_family_runtime_files(
              # commonmark-java Markly shim — from the same list, minus that\n\
              # one name.)\n\
              require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
              {}{}",
             gem_require_block(&[]),
             WEB_PUSH_STUB_REOPEN
@@ -2743,6 +2755,7 @@ fn ruby_family_runtime_files(
                  # than carrying a second copy.\n\
                  {}\
                  require_relative \"module_delegate\"\n\
+             require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
                 gem_require_block(&["markly"]),
@@ -4521,6 +4534,29 @@ fn report_unsupported_harness_reads(app: &App, target: BuildTarget, files: &[(St
     }
 }
 
+/// A block's or lambda's own block parameter (`|*args, &blk|`) is
+/// emitted by the CRuby-compatible Ruby emitter and refused on every
+/// other target, whose block and closure lowerings have no slot for it:
+/// dropping the binding would let the body read an outer local of the
+/// same name, or nothing.
+fn report_unsupported_block_captures(app: &App, target: BuildTarget) {
+    // A block's Lambda has a synthetic span; the call it is attached
+    // to is the nearest sited ancestor.
+    fn visit(target: BuildTarget, expr: &crate::expr::Expr, sited: crate::span::Span) {
+        let sited = if expr.span.file.0 == 0 { sited } else { expr.span };
+        if let crate::expr::ExprNode::Lambda { block_param: Some(name), .. } = &*expr.node {
+            emit::diagnostics::report_unsupported(
+                sited,
+                target.as_str(),
+                "block_capture",
+                format!("the block parameter `&{name}` of a block or lambda is not lowered for {}", target.as_str()),
+            );
+        }
+        expr.node.for_each_child(&mut |child| visit(target, child, sited));
+    }
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(target, expr, expr.span));
+}
+
 /// A constant only a gem's RBI declares (`StatsD`) runs on the CRuby
 /// tree, which loads the gem, and is refused on every other target,
 /// which loads none. The analyzer marks each such read
@@ -5256,6 +5292,11 @@ fn spinel_files_with_assertions(
     // `delegate` is lowered at ingest. Injected only by
     // `ruby_runtime_files` / `jruby_runtime_files`.
     files.retain(|(p, _)| p != "runtime/module_delegate.rb");
+    // And for `rails_configuration.rb` (`Rails.configuration`), for the
+    // same reason: computed-name dispatch, pushed back by the two
+    // ruby-family forks only. A tree without it refuses the read
+    // (`report_unsupported_runtime_reads`).
+    files.retain(|(p, _)| p != "runtime/rails_configuration.rb");
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks

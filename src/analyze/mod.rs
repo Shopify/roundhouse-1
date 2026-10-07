@@ -37,6 +37,7 @@ pub(crate) mod test_harness_calls;
 pub mod test_helper_connection;
 mod database_identity;
 mod initializer_coverage;
+mod ingest_coverage;
 mod fixture_entries;
 mod body;
 mod class_configuration;

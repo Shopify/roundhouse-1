@@ -169,6 +169,13 @@ module Rails
       @name.to_sym
     end
 
+    # The String's own `capitalize` (`"test"` → `"Test"`): Core's
+    # `Component::Config.for(Rails.env)` names the per-environment
+    # config class with it (`const_get(env.capitalize)`).
+    def capitalize
+      @name.capitalize
+    end
+
     def inspect
       @name.inspect
     end

@@ -29,7 +29,7 @@ use super::super::body::ClassInfo;
 
 /// Ruby's own top-level names. An RBI that mentions them is patching or
 /// extending the language, not declaring a gem class.
-const RUBY_CORE: &[&str] = &[
+pub(in crate::analyze) const RUBY_CORE: &[&str] = &[
     "BasicObject", "Object", "Module", "Class", "Kernel", "Comparable", "Enumerable", "Enumerator",
     "Numeric", "Integer", "Float", "Rational", "Complex", "String", "Symbol", "Array", "Hash",
     "Range", "Regexp", "MatchData", "Struct", "Proc", "Method", "UnboundMethod", "Time", "Date",
@@ -46,7 +46,7 @@ const RUBY_CORE: &[&str] = &[
 /// other stdlib constant the analysis does not model. `DRb` is not here:
 /// it is the bundled drb gem, which the CRuby tree loads, so its own RBI
 /// declares it (`project.rs::RUNTIME_GEMS`).
-const RUBY_STDLIB: &[&str] = &[
+pub(in crate::analyze) const RUBY_STDLIB: &[&str] = &[
     "OpenSSL", "Net", "Digest", "Socket", "Zlib", "Psych", "YAML", "ERB", "CGI", "Base64",
     "SecureRandom", "Open3", "Timeout", "Tempfile", "FileUtils", "Benchmark", "Coverage",
     "Etc", "Find", "Shellwords", "OptionParser", "IPAddr", "Resolv", "PP", "Ripper", "Monitor",
