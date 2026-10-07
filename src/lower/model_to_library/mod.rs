@@ -528,6 +528,7 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
 /// observation. Typing and method selection remain the caller's job.
 fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: model.name.clone(),
         is_module: false,

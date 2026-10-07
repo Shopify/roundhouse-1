@@ -5959,6 +5959,7 @@ fn synthesize_module_lc(
         })
         .collect();
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: module_id,
         is_module: true,
@@ -6458,11 +6459,53 @@ fn emit_library_class_decl_inner(
     }
 
     let mut first = true;
-    for m in &lc.methods {
+    for (index, m) in lc.methods.iter().enumerate() {
         if !first {
             writeln!(s).unwrap();
         }
         first = false;
+        // An alias copy is written as the native alias, so a `super` in
+        // it keeps looking up the original's name, as in the source. The
+        // alias takes the original's visibility; a different one on the
+        // copy is a later visibility change, written after it.
+        if let Some(original) = native_alias_original(lc, index) {
+            let (to, from) = (m.name.as_str(), original.name.as_str());
+            match m.receiver {
+                MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
+                MethodReceiver::Class => {
+                    writeln!(s, "{body_pad}class << self").unwrap();
+                    writeln!(s, "{body_pad}  alias_method :{to}, :{from}").unwrap();
+                    writeln!(s, "{body_pad}end").unwrap();
+                }
+            }
+            if m.visibility != original.visibility {
+                match (m.receiver, m.visibility) {
+                    (MethodReceiver::Instance, MethodVisibility::Public) => writeln!(s, "{body_pad}public :{to}"),
+                    (MethodReceiver::Instance, MethodVisibility::Protected) => writeln!(s, "{body_pad}protected :{to}"),
+                    (MethodReceiver::Instance, MethodVisibility::Private) => writeln!(s, "{body_pad}private :{to}"),
+                    (MethodReceiver::Class, MethodVisibility::Public) => writeln!(s, "{body_pad}public_class_method :{to}"),
+                    (MethodReceiver::Class, MethodVisibility::Private) => writeln!(s, "{body_pad}private_class_method :{to}"),
+                    (MethodReceiver::Class, MethodVisibility::Protected) => {
+                        writeln!(s, "{body_pad}class << self").unwrap();
+                        writeln!(s, "{body_pad}  protected :{to}").unwrap();
+                        writeln!(s, "{body_pad}end")
+                    }
+                }
+                .unwrap();
+            }
+            continue;
+        }
+        if lc.method_aliases.iter().any(|a| a.name == m.name && a.receiver == m.receiver)
+            && contains_super(&m.body)
+        {
+            crate::emit::diagnostics::report_unsupported(
+                m.body.span,
+                "ruby",
+                "alias_method copy calling super",
+                "its original is not the def emitted before it, so it cannot be a native alias, \
+                 and a copied def would look `super` up under the alias's name",
+            );
+        }
         let body = super::emit_method(m);
         for line in body.lines() {
             if line.is_empty() {
@@ -6532,6 +6575,35 @@ fn emit_library_class_decl_inner(
     }
 
     EmittedFile { path: out_path, content: s }
+}
+
+/// The method `lc.methods[index]` is a native alias of: it is recorded
+/// as an alias copy, and the nearest def of the original's name on the
+/// same side before it is the very def it was copied from (same header
+/// and body spans; a replacing def has its own). Anything else (an
+/// original redefined in place, or a copy whose original a later pass
+/// dropped or moved) keeps the copied def.
+fn native_alias_original(lc: &LibraryClass, index: usize) -> Option<&MethodDef> {
+    let m = &lc.methods[index];
+    let alias = lc.method_aliases.iter().find(|a| a.name == m.name && a.receiver == m.receiver)?;
+    let original = lc.methods[..index]
+        .iter()
+        .rev()
+        .find(|o| o.name == alias.original && o.receiver == m.receiver)?;
+    (original.name_span == m.name_span
+        && original.body.span == m.body.span
+        && original.params.len() == m.params.len()
+        && original.kind == m.kind)
+        .then_some(original)
+}
+
+fn contains_super(expr: &Expr) -> bool {
+    if matches!(&*expr.node, ExprNode::Super { .. }) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |child| found |= contains_super(child));
+    found
 }
 
 /// `lc`'s file with the source's FILE-level constants (see

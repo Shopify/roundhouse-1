@@ -1314,6 +1314,33 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target));
 }
 
+/// An alias copy (`LibraryClass::method_aliases`) that calls `super`:
+/// Ruby looks that `super` up under the original's name. The Ruby family
+/// writes the native alias; a target that emits the copy as its own
+/// method would reach the parent's method of the alias's name instead.
+fn report_alias_super_copies(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return;
+    }
+    fn calls_super(expr: &crate::expr::Expr) -> bool {
+        let mut found = matches!(&*expr.node, crate::expr::ExprNode::Super { .. });
+        expr.node.for_each_child(&mut |child| found |= calls_super(child));
+        found
+    }
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            if lc.method_aliases.iter().any(|a| a.name == m.name && a.receiver == m.receiver)
+                && calls_super(&m.body)
+            {
+                crate::emit::diagnostics::report_unsupported(
+                    m.body.span, target.as_str(), "alias_method copy calling super",
+                    "Ruby looks `super` up under the original method's name; the copy is emitted as a method of the alias's name",
+                );
+            }
+        }
+    }
+}
+
 /// A self binding (`T.bind(self, T)`, `#: self as T`) retypes `self` for
 /// the rest of a body, and the analyzer types the sends after it against
 /// that type. The Ruby emitters drop the binding and leave those sends to
@@ -1398,6 +1425,7 @@ pub fn target_files(
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
     report_self_bindings(app, target);
+    report_alias_super_copies(app, target);
     // Full forwarding currently has a native Ruby contract only. A
     // declaration must be gated even when its body never forwards.
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
@@ -11552,6 +11580,7 @@ mod tests {
 
         let cable = crate::runtime_files::read_to_string("runtime/spinel/action_cable.rb").unwrap();
         let connection_class = |name: &str| LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from(name)),
             is_module: false,
@@ -11726,6 +11755,7 @@ mod tests {
             kind: MixinKind::Include,
         });
         modapp.library_classes.push(crate::dialect::LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: crate::ident::ClassId(Symbol::from("Greetable")),
             is_module: true,

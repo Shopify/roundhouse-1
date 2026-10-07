@@ -1562,6 +1562,7 @@ pub fn module_funcs_to_library_class(
         })
         .collect();
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(crate::ident::Symbol::from(name)),
         is_module: true,

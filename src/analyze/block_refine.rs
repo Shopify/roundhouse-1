@@ -261,6 +261,7 @@ mod tests {
 
     fn holder_class(methods: Vec<MethodDef>) -> LibraryClass {
         LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from("Holder")),
             is_module: false,

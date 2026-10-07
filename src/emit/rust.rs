@@ -1127,6 +1127,7 @@ pub fn emit(app: &App) -> Vec<EmittedFile> {
                 use crate::dialect::LibraryClass;
                 use crate::ident::ClassId;
                 all_models.push(LibraryClass {
+                    method_aliases: Vec::new(),
                     top_level_constants: Vec::new(),
                     name: ClassId(crate::ident::Symbol::from(struct_name.as_str())),
                     is_module: false,

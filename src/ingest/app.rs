@@ -1402,6 +1402,7 @@ end
         }
         if !methods.is_empty() {
             app.rails_application = Some(crate::dialect::LibraryClass {
+                method_aliases: Vec::new(),
                 top_level_constants: Vec::new(),
                 name: crate::ident::ClassId(crate::ident::Symbol::from("Rails::Application")),
                 is_module: false,

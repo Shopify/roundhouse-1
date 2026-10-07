@@ -742,6 +742,7 @@ mod tests {
 
     fn synth_class(name: &str, methods: Vec<MethodDef>) -> LibraryClass {
         LibraryClass {
+            method_aliases: Vec::new(),
             top_level_constants: Vec::new(),
             name: ClassId(Symbol::from(name)),
             is_module: false,

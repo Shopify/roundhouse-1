@@ -259,6 +259,7 @@ fn library_classes(
 /// first constant is `first`.
 pub(super) fn file_constants_holder(first: &Symbol) -> LibraryClass {
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(first.clone()),
         is_module: false,
@@ -317,6 +318,7 @@ fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<
     let mut full: Vec<&str> = scope.iter().copied().filter(|s| !s.is_empty()).collect();
     full.push(name.as_str());
     Some(LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: ClassId(Symbol::from(full.join("::"))),
         is_module: false,
@@ -504,6 +506,7 @@ pub(super) fn library_class_and_struct_base(
         mut unknown_calls,
         class_initializers,
         visibility_overrides,
+        method_aliases,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
@@ -569,6 +572,7 @@ pub(super) fn library_class_and_struct_base(
     admit_nameless_rest(&mut methods);
     Ok((
         LibraryClass {
+            method_aliases,
             top_level_constants: Vec::new(),
             name: owner,
             is_module: false,
@@ -1298,6 +1302,7 @@ fn struct_base_class(owner: &ClassId, members: &[Symbol]) -> LibraryClass {
         block_param: None,
     });
     LibraryClass {
+        method_aliases: Vec::new(),
         top_level_constants: Vec::new(),
         name: base,
         is_module: false,
@@ -1387,10 +1392,11 @@ pub(super) fn library_class_from_module_node_with_scope(
     let owner = ClassId(Symbol::from(full_path.join("::")));
 
     let visibility = Visibility::resolve(module.body().as_ref(), file, Some(&owner))?;
-    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, .. } =
+    let DeclBody { includes, methods, constants, unknown_calls, class_initializers, method_aliases, .. } =
         walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
     Ok(LibraryClass {
+        method_aliases,
         top_level_constants: Vec::new(),
         name: owner,
         is_module: true,
@@ -1478,6 +1484,8 @@ struct DeclBody {
     unknown_calls: Vec<Expr>,
     class_initializers: Vec<Expr>,
     visibility_overrides: Vec<crate::dialect::VisibilityOverride>,
+    /// Which `methods` are alias copies (see `MethodAlias`).
+    method_aliases: Vec<crate::dialect::MethodAlias>,
     /// An include, constant or captured class-body call came AFTER a
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
@@ -1492,6 +1500,7 @@ impl DeclBody {
         self.unknown_calls.extend(other.unknown_calls);
         self.class_initializers.extend(other.class_initializers);
         self.visibility_overrides.extend(other.visibility_overrides);
+        self.method_aliases.extend(other.method_aliases);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
     }
 
@@ -2248,6 +2257,11 @@ fn walk_decl_body_with_visibility<'pr>(
                     let mut copy = out.methods[source].clone();
                     copy.name = Symbol::from(to.as_str());
                     visibility.apply(&statement, &mut copy);
+                    out.method_aliases.push(crate::dialect::MethodAlias {
+                        name: copy.name.clone(),
+                        receiver,
+                        original: Symbol::from(from.as_str()),
+                    });
                     out.methods.push(copy);
                     continue;
                 }
@@ -2440,6 +2454,11 @@ fn walk_decl_body_with_visibility<'pr>(
                         let mut copy = out.methods[source].clone();
                         copy.name = Symbol::from(to.as_str());
                         visibility.apply(&statement, &mut copy);
+                        out.method_aliases.push(crate::dialect::MethodAlias {
+                            name: copy.name.clone(),
+                            receiver: copy.receiver,
+                            original: out.methods[source].name.clone(),
+                        });
                         out.methods.push(copy);
                     }
                     // `extend self` — the spelling campfire's
