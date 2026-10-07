@@ -40,6 +40,8 @@ pub(crate) enum DepKey<'k> {
     Params(&'k ClassId, &'k Symbol),
     /// The inferred value of a source constant.
     Constant(&'k DeclarationId),
+    /// The app-wide bare-name constant value (`ConstScope::get_global`).
+    ConstName(&'k Symbol),
 }
 
 /// Multiply-rotate hasher (the `FxHash` mix); the keys are short and
@@ -104,6 +106,10 @@ impl DepKey<'_> {
             DepKey::Constant(id) => {
                 h.write_u8(6);
                 id.hash(&mut h);
+            }
+            DepKey::ConstName(name) => {
+                h.write_u8(7);
+                h.write(name.as_str().as_bytes());
             }
         }
         h.finish()

@@ -303,6 +303,7 @@ pub(crate) fn lexical_class(
 /// Reusable body-type walker. Holds a borrow of the dispatch table so
 /// repeated `analyze_expr` calls reuse the same lookup structures
 /// without cloning.
+#[derive(Clone)]
 pub struct BodyTyper<'a> {
     classes: &'a HashMap<ClassId, ClassInfo>,
     /// Notes every registry read when the caller wants to know what the
@@ -348,6 +349,14 @@ impl<'a> BodyTyper<'a> {
 
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
         Self { classes, deps: None, const_resolver: None, typed_constants: None, data_factories: None, inquirers: None }
+    }
+
+    /// The app-wide bare-name value of `name`, noted as a read.
+    fn global_constant<'c>(&self, ctx: &'c Ctx, name: &Symbol) -> Option<&'c Ty> {
+        if let Some(deps) = self.deps {
+            deps.note(DepKey::ConstName(name));
+        }
+        ctx.constants.get_global(name)
     }
 
     /// Note every registry read in `deps`.
@@ -570,7 +579,7 @@ impl<'a> BodyTyper<'a> {
                 // A typed VALUE constant, even with the same nominal type, is not.
                 let id = written_class_id(path);
                 let value = if let [name] = path.as_slice() {
-                    ctx.constants.get_own(name).or_else(|| ctx.constants.get_global(name))
+                    ctx.constants.get_own(name).or_else(|| self.global_constant(ctx, name))
                 } else { None };
                 value.is_none() && self.classes().contains_key(&id)
             }
@@ -732,7 +741,7 @@ impl<'a> BodyTyper<'a> {
                                     let ty = exact_modeled_class(path);
                                     (!matches!(ty, Ty::Var { .. })).then_some(ty)
                                 })
-                                .or_else(|| ctx.constants.get_global(name).cloned())
+                                .or_else(|| self.global_constant(ctx, name).cloned())
                         } else {
                             let name = written_class_id(path);
                             self.typed_constant(&declaration_id_from_lookup_name(name.0.as_str()))

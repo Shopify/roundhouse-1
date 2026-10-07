@@ -1761,12 +1761,25 @@ impl Analyzer {
         let mut map: HashMap<Symbol, Ty> = HashMap::new();
         let mut ambiguous: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         let mut resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
+        // The class registry does not change while this runs, so a
+        // value whose constant reads all answer as they did when it was
+        // last typed types the same again: each round after the first
+        // re-types only the values that read a constant the round
+        // before changed. `version` counts the rounds' constant maps;
+        // `changed_at` holds, per read key, the version that last
+        // changed its answer.
+        let mode = self.incremental.mode;
+        let mut last: Vec<Option<(usize, Vec<u64>, Ty)>> = vec![None; entries.len()];
+        let mut changed_at: HashMap<u64, usize> = HashMap::new();
+        let (mut typed, mut clean_count, mut mismatches) = (0usize, 0usize, 0usize);
+        let mut rounds = 0usize;
         // Each round can type one more link of a `B = A` chain, so n
         // values need at most n + 1 rounds when no value changes after
         // it is typed. A cycle (`A = B`, `B = A`) never types and stays
         // unknown, and the read reports it. The bound also stops values
         // that change on each round.
-        for _ in 0..=entries.len() {
+        for version in 0..=entries.len() {
+            rounds += 1;
             let mut next: HashMap<Symbol, Ty> = HashMap::new();
             let mut next_resolved: IdentityHashMap<DeclarationId, Ty> = IdentityHashMap::default();
             let shared = body::ConstScope::global(map.clone());
@@ -1775,18 +1788,42 @@ impl Analyzer {
                 .with_typed_constants(&resolved)
                 .with_data_factories(&self.data_factories);
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
-            for (self_ty, name, id, value, production) in entries.iter_mut() {
-                let ctx = Ctx {
-                    self_ty: Some(self_ty.clone()),
-                    lexical_self: None,
-                    ivar_bindings: HashMap::new(),
-                    local_bindings: HashMap::new(),
-                    class_objects: Default::default(),
-                    constants: shared.clone(),
-                    annotate_self_dispatch: false,
-                    in_view: false, class_side: false,
+            for (index, (self_ty, name, id, value, production)) in entries.iter_mut().enumerate() {
+                let clean = last[index].as_ref().filter(|(at, reads, _)| {
+                    reads.iter().all(|k| changed_at.get(k).is_none_or(|v| v <= at))
+                });
+                let reused = clean.map(|(_, _, ty)| ty.clone());
+                clean_count += usize::from(reused.is_some());
+                let ty = if let (Some(ty), incremental::Mode::On) = (&reused, mode) {
+                    ty.clone()
+                } else {
+                    let ctx = Ctx {
+                        self_ty: Some(self_ty.clone()),
+                        lexical_self: None,
+                        ivar_bindings: HashMap::new(),
+                        local_bindings: HashMap::new(),
+                        class_objects: Default::default(),
+                        constants: shared.clone(),
+                        annotate_self_dispatch: false,
+                        in_view: false, class_side: false,
+                    };
+                    let deps = body::DepRecorder::default();
+                    let ty = typer.clone().with_deps(&deps).analyze_expr(value, &ctx);
+                    typed += 1;
+                    if let (Some(old), incremental::Mode::Check) = (&reused, mode) {
+                        if *old != ty {
+                            mismatches += 1;
+                            if mismatches <= 40 {
+                                eprintln!(
+                                    "roundhouse-incremental-check: constant {} round {version}: kept {old:?}, typed {ty:?}",
+                                    name.as_str()
+                                );
+                            }
+                        }
+                    }
+                    last[index] = Some((version, deps.take(), ty.clone()));
+                    ty
                 };
-                let ty = typer.analyze_expr(value, &ctx);
                 if matches!(ty, Ty::Var { .. }) {
                     continue;
                 }
@@ -1811,9 +1848,39 @@ impl Analyzer {
             if next == map && next_resolved == resolved {
                 break;
             }
+            // Stamp the keys whose answer the next round's maps change.
+            let next_version = version + 1;
+            for (name, ty) in &next {
+                if map.get(name) != Some(ty) {
+                    changed_at.insert(body::DepKey::ConstName(name).hash64(), next_version);
+                }
+            }
+            for name in map.keys() {
+                if !next.contains_key(name) {
+                    changed_at.insert(body::DepKey::ConstName(name).hash64(), next_version);
+                }
+            }
+            for (id, ty) in next_resolved.iter() {
+                if resolved.get(id) != Some(ty) {
+                    changed_at.insert(body::DepKey::Constant(id).hash64(), next_version);
+                }
+            }
+            for id in resolved.keys() {
+                if !next_resolved.contains_key(id) {
+                    changed_at.insert(body::DepKey::Constant(id).hash64(), next_version);
+                }
+            }
             map = next;
             resolved = next_resolved;
         }
+        crate::timings::note(format_args!(
+            "constants ({mode:?}): {} values, {rounds} rounds, typed {typed}, clean {clean_count}, check mismatches {mismatches}",
+            entries.len()
+        ));
+        assert!(
+            mismatches == 0,
+            "ROUNDHOUSE_INCREMENTAL=check: {mismatches} constant values the incremental registry would keep typed differently"
+        );
         // These source-declared constants have modeled factory-generated
         // object methods even though their initializer is not a retained class.
         for constant in app.generated_helper_methods.keys() {
