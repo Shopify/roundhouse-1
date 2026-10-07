@@ -3,13 +3,12 @@
 //! ordinary calls rejoin the existing keyword lowerings without a new carrier.
 
 use crate::App;
-use crate::analyze::forwarding::{KeywordPolicy, keyword_calls, keyword_refusal};
+use crate::analyze::forwarding::{KeywordPolicy, keyword_calls_and_nameless_rest, keyword_refusal};
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, ExprNode};
 
 pub(super) fn apply(app: &mut App) -> Vec<Diagnostic> {
-    let plans = keyword_calls(app);
-    let mut diagnostics = crate::analyze::forwarding::keyword_splats_into_nameless_rest(app);
+    let (plans, mut diagnostics) = keyword_calls_and_nameless_rest(app);
     for (span, policy) in &plans {
         if matches!(policy, KeywordPolicy::Refuse | KeywordPolicy::RefuseOrdinarySuper) {
             diagnostics.push(keyword_refusal(*span, *policy));
