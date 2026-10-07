@@ -6857,8 +6857,13 @@ fn emit_library_class_decl_inner(
     // unknown_calls`), replayed verbatim when — and only when — the
     // class extends a base we don't model at all, or reopens a loaded
     // gem's class. See `replays_foreign_class_body`.
+    //
+    // Never an analyzer include refusal (`is_include_refusal`): a ledger
+    // record for check, not a statement. The include it names is written
+    // above (`write_include`), where the source has it; replayed, the
+    // record raised again at the end of a body whose include had run.
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
-        lc.unknown_calls.iter().collect()
+        lc.unknown_calls.iter().filter(|c| !crate::analyze::is_include_refusal(c)).collect()
     } else {
         // sorbet's `mixes_in_class_methods`, lowered by the ingest
         // (`sorbet_check::mixes_in_class_methods`), is behavior every
@@ -6870,7 +6875,7 @@ fn emit_library_class_decl_inner(
             .filter(|c| crate::ingest::sorbet_check::is_mixes_in(c) || extensions.iter().any(|e| std::ptr::eq(*e, *c)))
             .collect();
         for call in &lc.unknown_calls {
-            if !own.iter().any(|c| std::ptr::eq(*c, call)) {
+            if !own.iter().any(|c| std::ptr::eq(*c, call)) && !crate::analyze::is_include_refusal(call) {
                 report_dropped_class_body_call(lc, call);
             }
         }

@@ -1442,12 +1442,7 @@ impl Analyzer {
                     if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
                         Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                         if construct.as_str() == "gem_requires_rails" && old == &detail)) { continue; }
-                    let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
-                        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
-                    refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
-                        target: None, construct: Symbol::from("gem_requires_rails"), detail,
-                    });
-                    class.unknown_calls.push(refusal);
+                    class.unknown_calls.push(include_refusal("gem_requires_rails", detail));
                     continue;
                 }
                 // A Ruby-family runtime module (ActiveSupport::Testing::
@@ -1476,12 +1471,7 @@ impl Analyzer {
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
                     Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail: old, .. })
                     if construct.as_str() == "include" && old == &detail)) { continue; }
-                let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
-                    crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
-                refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
-                    target: None, construct: Symbol::from("include"), detail,
-                });
-                class.unknown_calls.push(refusal);
+                class.unknown_calls.push(include_refusal("include", detail));
             }
         }
         for model in &mut app.models {
@@ -8248,6 +8238,35 @@ fn class_ids_for_call_receiver(ty: &Ty) -> Vec<ClassId> {
         }
         _ => Vec::new(),
     }
+}
+
+/// A library class's refused `include`, kept in its class-body ledger
+/// (`unknown_calls`) so check reports it even when no method is called.
+/// It is a record, not a statement: the include itself stays in
+/// `LibraryClass::includes` and is written where the source has it
+/// (an unresolved name raises NameError there natively; a
+/// `gem_requires_rails` one is replaced in place by its raise). See
+/// [`is_include_refusal`].
+fn include_refusal(construct: &str, detail: String) -> crate::expr::Expr {
+    let mut refusal = crate::expr::Expr::new(crate::span::Span::synthetic(),
+        crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil });
+    refusal.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+        target: None, construct: Symbol::from(construct), detail,
+    });
+    refusal
+}
+
+/// Whether `call` is an [`include_refusal`] record rather than an
+/// authored class-body statement. A body replay must skip it: replayed,
+/// it rendered as a second `raise "roundhouse: include not supported"`
+/// at the end of a class whose include had already run (Core's
+/// `PanamaMetadata::Schema < Hashie::Dash`, whose includes name a
+/// transitive gem's modules), failing boot on an include that worked.
+pub fn is_include_refusal(call: &crate::expr::Expr) -> bool {
+    call.span.is_synthetic()
+        && matches!(&*call.node, crate::expr::ExprNode::Lit { value: crate::expr::Literal::Nil })
+        && matches!(&call.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+            if matches!(construct.as_str(), "include" | "gem_requires_rails"))
 }
 
 /// The model-side twin of [`controller_includes`]: modules a model mixes
