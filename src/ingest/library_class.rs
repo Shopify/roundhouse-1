@@ -2608,6 +2608,14 @@ fn body_local_constant(name: &Symbol, file: &str, offset: usize) -> Symbol {
     Symbol::from(format!("{BODY_LOCAL_CONSTANT_PREFIX}{}_{:08x}", name.as_str(), hasher.finish() as u32))
 }
 
+/// The source name of a stored class-body local's constant
+/// (`RH_BODY_LOCAL_states_1a2b3c4d` → `states`), for diagnostics.
+pub fn stored_body_local_name(constant: &str) -> Option<&str> {
+    let rest = constant.strip_prefix(BODY_LOCAL_CONSTANT_PREFIX)?;
+    let (name, hash) = rest.rsplit_once('_')?;
+    (hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(name)
+}
+
 fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> IngestResult<BodyLocal> {
     let name = Symbol::from(constant_id_str(&lw.name()));
     let value = lw.value();

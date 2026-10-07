@@ -269,3 +269,11 @@ fn a_frozen_string_local_is_one_frozen_object_as_in_native_ruby() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
 }
 
+/// A stored local whose value has no inferred type is refused at its
+/// reads by the name the source wrote, not by its hidden constant's.
+#[test]
+fn an_untyped_stored_local_is_reported_by_its_source_name() {
+    let text = check("module Podish\n  module Registry\n    reason = Ghost.new\n    FIRST = { reason: reason }\n  end\nend\n");
+    assert!(text.contains("class-body local `reason` holds a value with no inferred type"), "{text}");
+    assert!(!text.contains("RH_BODY_LOCAL"), "{text}");
+}
