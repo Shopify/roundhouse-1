@@ -184,13 +184,21 @@ pub(crate) fn methods(owner: &ClassId, decl: &Decl) -> Vec<MethodDef> {
 
 /// `@__class_attr_<name> = default` for each name, at the declaration.
 pub(crate) fn seeds(decl: &Decl) -> Vec<Expr> {
+    // ActiveSupport evaluates `default:` once and stores that one object
+    // under every name: the first name's seed evaluates it and each later
+    // one reads the first's ivar back (`@__class_attr_b =
+    // @__class_attr_a`), so a mutable default is shared and a default
+    // with a side effect runs once.
+    let mut first: Option<Symbol> = None;
     decl.names
         .iter()
         .map(|name| {
-            let value = decl
-                .default
-                .clone()
-                .unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }));
+            let value = match (&first, &decl.default) {
+                (Some(shared), Some(_)) => Expr::new(decl.span, ExprNode::Ivar { name: storage_ivar(shared) }),
+                (_, Some(default)) => default.clone(),
+                (_, None) => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            };
+            first.get_or_insert_with(|| name.clone());
             Expr::new(
                 decl.span,
                 ExprNode::Assign { target: LValue::Ivar { name: storage_ivar(name) }, value },

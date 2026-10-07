@@ -186,3 +186,62 @@ fn reopened_class_body_writes_its_class_attribute_after_emission() {
     let actual: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(actual, expected, "emitted Ruby diverges from ActiveSupport");
 }
+
+/// One `default:` for several names is one object: ActiveSupport
+/// evaluates the keyword argument once and stores it under each name, so
+/// mutating one attribute's default shows through the others until one
+/// is reassigned, and a default with a side effect runs once.
+const SHARED_DEFAULT_SOURCE: &str = r#"class CaShared
+  def self.fresh
+    @made = (@made || 0) + 1
+    []
+  end
+
+  def self.made
+    @made
+  end
+
+  class_attribute :left, :right, :third, default: fresh
+end
+"#;
+
+const SHARED_DEFAULT_PLAN: &str = r#"class SharedPlan < ApplicationRecord
+  class_attribute :tags, :labels, default: []
+end
+"#;
+
+#[test]
+fn several_names_share_one_default_object_after_emission() {
+    let script = "p [CaShared.made, CaShared.left.equal?(CaShared.right), CaShared.right.equal?(CaShared.third)]
+CaShared.left << :x
+p [CaShared.right, CaShared.third]
+CaShared.right = [:own]
+p [CaShared.left, CaShared.right, CaShared.third]
+";
+    let expected = native_lines(
+        "require \"active_support\"\nrequire \"active_support/core_ext/class/attribute\"",
+        SHARED_DEFAULT_SOURCE,
+        script,
+    );
+    assert_eq!(expected, ["[1, true, true]", "[[:x], [:x]]", "[[:x], [:own], [:x]]"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/services/ca_shared.rb", SHARED_DEFAULT_SOURCE)
+        .run_ruby(script);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from ActiveSupport");
+
+    let model_script = "SharedPlan.tags << :a\np [SharedPlan.labels, SharedPlan.tags.equal?(SharedPlan.labels)]\n";
+    let expected = native_lines(
+        "require \"active_record\"\nclass ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend",
+        SHARED_DEFAULT_PLAN,
+        model_script,
+    );
+    assert_eq!(expected, ["[[:a], true]"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/models/shared_plan.rb", SHARED_DEFAULT_PLAN)
+        .run_ruby(model_script);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from ActiveRecord");
+}
