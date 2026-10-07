@@ -72,7 +72,7 @@ fn the_cruby_tree_runs_the_authored_value() {
     assert_eq!(named.len(), 1, "{errors:#?}");
     assert!(
         named[0].contains(
-            "OpenTelemetry::Trace::Tracer has no indexed declaration; the opentelemetry-api gem the CRuby tree loads provides it at runtime"
+            "OpenTelemetry::Trace::Tracer has no indexed declaration; OpenTelemetry::Trace::Tracer sits in a namespace the opentelemetry-api gem's RBI declares (namespace ownership; no gem home was read); the CRuby tree loads opentelemetry-api natively, so the value runs and is typed as opaque"
         ),
         "{}",
         named[0]

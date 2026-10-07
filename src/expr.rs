@@ -84,11 +84,15 @@ pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 pub const DECLARED_TYPE_INDEXED: u64 = 1 << 14;
 
 /// A [`SOURCE_TYPE_ASCRIPTION`] cast whose declared type names a constant
-/// no registry indexes, inside a namespace a gem the CRuby tree loads
-/// owns (`OpenTelemetry::Trace::Tracer`, opentelemetry-api). Ruby never
-/// evaluates an annotation, so the CRuby tree emits the authored value;
-/// the declaration stays a `declared type` diagnostic (the value is an
-/// opaque nominal type), and every other target refuses it at emit.
+/// no registry indexes that a gem the CRuby tree loads natively provides
+/// (`OpenTelemetry::Trace::Tracer`, which opentelemetry-api's source
+/// declares). Ruby never evaluates an annotation, so the CRuby tree emits
+/// the authored value; the declaration stays a `declared type` diagnostic
+/// (the value is an opaque nominal type), and every other target refuses
+/// it at emit. On a constant read (`Const`), the same for a constant only
+/// namespace ownership attributes to such a gem (created under a computed
+/// name, or by its native extension): the read runs on CRuby, and its
+/// `constant` diagnostic says how the gem was taken to provide it.
 pub const DECLARED_TYPE_RUNTIME_CONSTANT: u64 = 1 << 17;
 
 /// A call argument the SOURCE passed by keyword, which a lowering (or the

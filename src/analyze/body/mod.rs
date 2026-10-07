@@ -379,6 +379,8 @@ pub struct BodyTyper<'a> {
     inquirers: Option<&'a crate::det::HashSet<Symbol>>,
     /// The base each load hook fires with (see `Analyzer::load_hook_bases`).
     load_hook_bases: Option<&'a std::collections::BTreeMap<String, ClassId>>,
+    /// What the natively loaded gems' installed sources declare.
+    gem_sources: Option<std::sync::Arc<crate::gem_boundary::GemSourceConstants>>,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -443,6 +445,41 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// How a gem the CRuby tree loads natively provides the unindexed
+    /// constant `name` written in lexical `scope`: `Ok((fact, gem))`, the
+    /// fact phrased for the diagnostic. By the gem's installed source when
+    /// it was read: the constant it declares exactly, else a namespace it
+    /// fills under computed names (namespace ownership, said so). Without
+    /// a read source, by the namespace its RBI declares. `Err` carries the
+    /// refusal the source proves (its nearest namespace is a fully read
+    /// gem's, which does not declare it), or is empty.
+    fn runtime_constant_provider(&self, name: &str, scope: &str) -> Result<(String, String), String> {
+        if let Some(sources) = self.gem_sources.as_deref() {
+            let version = |gem: &str| sources.scans.get(gem).map(|s| s.version.as_str()).unwrap_or("");
+            match sources.provider(name, scope) {
+                Some(provider) => return Ok((provider.describe(name, sources), provider.gem().to_string())),
+                None => {
+                    if let Some(gem) = sources.complete_namespace_owner(name) {
+                        return Err(format!(
+                            "{name} has no indexed declaration, and no installed source of a gem the CRuby tree loads declares it (its nearest namespace is {gem} {}'s, read whole)",
+                            version(gem)
+                        ));
+                    }
+                }
+            }
+        }
+        match self.runtime_constant_owner(name) {
+            Some(gem) => Ok((
+                format!(
+                    "{name} sits in a namespace the {gem} gem's RBI declares (namespace ownership; {})",
+                    if self.gem_sources.is_some() { "that gem's source was not read" } else { "no gem home was read" }
+                ),
+                gem,
+            )),
+            None => Err(String::new()),
+        }
+    }
+
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
         Self {
             classes,
@@ -452,7 +489,14 @@ impl<'a> BodyTyper<'a> {
             data_factories: None,
             inquirers: None,
             load_hook_bases: None,
+            gem_sources: None,
         }
+    }
+
+    /// Decide declared types against the loaded gems' installed sources.
+    pub(crate) fn with_gem_sources(mut self, sources: std::sync::Arc<crate::gem_boundary::GemSourceConstants>) -> Self {
+        self.gem_sources = Some(sources).filter(|s| !s.is_empty());
+        self
     }
 
     /// The app-wide bare-name value of `name`, noted as a read.
@@ -780,7 +824,9 @@ impl<'a> BodyTyper<'a> {
                 // A later typing pass may resolve a value constant whose
                 // owner was unknown in an earlier constant fixpoint round.
                 expr.diagnostic = None;
-                expr.decisions &= !(crate::expr::GEM_CONSTANT_REF | crate::expr::STDLIB_CONSTANT_REF);
+                expr.decisions &= !(crate::expr::GEM_CONSTANT_REF
+                    | crate::expr::STDLIB_CONSTANT_REF
+                    | crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT);
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -945,6 +991,46 @@ impl<'a> BodyTyper<'a> {
                         value.unwrap_or_else(|| Ty::Class { id: written_class_id(path), args: vec![] })
                     }
                 };
+                // A constant nothing indexes that a gem the CRuby tree
+                // loads natively declares in its installed source
+                // (`GemBoundary::source_constants`): the read runs as the
+                // gem's, gradually typed, and other trees refuse it
+                // (`GEM_CONSTANT_REF`).
+                let ty = match (&ty, self.gem_sources.as_deref()) {
+                    (Ty::Var { .. }, Some(sources)) if indexed_source && !generated => {
+                        let written = written_class_id(path);
+                        let scope = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
+                            Some(Ty::Class { id, .. }) => id.0.as_str(),
+                            _ => "",
+                        };
+                        match sources.provider(written.0.as_str(), scope) {
+                            Some(crate::gem_boundary::SourceProvider::Declared { name, .. }) => {
+                                qualify_resolved_path(path, &ClassId(Symbol::from(name.as_str())));
+                                expr.decisions |= crate::expr::GEM_CONSTANT_REF;
+                                Ty::Untyped
+                            }
+                            // Namespace ownership: the read runs on CRuby,
+                            // and stays named with how the gem was taken
+                            // to provide it.
+                            Some(provider) => {
+                                expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
+                                expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                    target: None,
+                                    construct: Symbol::from("constant"),
+                                    detail: format!(
+                                        "{} has no indexed declaration; {}; the CRuby tree loads {} natively, so the read runs there",
+                                        written.0,
+                                        provider.describe(written.0.as_str(), sources),
+                                        provider.gem(),
+                                    ),
+                                });
+                                Ty::Untyped
+                            }
+                            None => ty,
+                        }
+                    }
+                    _ => ty,
+                };
                 if indexed_source && matches!(ty, Ty::Var { .. }) {
                     // A stored class-body local is reported by the name the
                     // source wrote, not the hidden constant's.
@@ -963,7 +1049,7 @@ impl<'a> BodyTyper<'a> {
                 }
                 // A gem's RBI types the constant; only a tree that loads
                 // the gem can run it.
-                if expr.diagnostic.is_none() && !app_value {
+                if expr.diagnostic.is_none() && !app_value && expr.decisions & crate::expr::GEM_CONSTANT_REF == 0 {
                     if let Some((gem, loaded)) = self.declaring_gem(path) {
                         let name = written_class_id(path);
                         if loaded || crate::project::gem_port_file(&gem, name.0.as_str()).is_some() {
@@ -2612,20 +2698,25 @@ impl<'a> BodyTyper<'a> {
                     // not re-decide it.
                 } else if !missing.is_empty() {
                     // Ruby never evaluates the annotation. Where each name
-                    // sits in a namespace a gem the CRuby tree loads owns,
-                    // that tree runs the authored value, typed as the
-                    // opaque declared class; anything else stays refused.
-                    let owners: Vec<Option<String>> =
-                        missing.iter().map(|name| self.runtime_constant_owner(name)).collect();
-                    let detail = if owners.iter().all(Option::is_some) {
+                    // is a constant a gem the CRuby tree loads natively
+                    // provides, that tree runs the authored value, typed as
+                    // the opaque declared class; anything else stays refused.
+                    let scope = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
+                        Some(Ty::Class { id, .. }) => id.0.as_str().to_string(),
+                        _ => String::new(),
+                    };
+                    let owners: Vec<Result<(String, String), String>> =
+                        missing.iter().map(|name| self.runtime_constant_provider(name, &scope)).collect();
+                    let detail = if owners.iter().all(Result::is_ok) {
                         expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
-                        let gems: Vec<String> = owners.into_iter().flatten().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                        let (facts, gems): (Vec<String>, std::collections::BTreeSet<String>) =
+                            owners.into_iter().flatten().unzip();
+                        let gems: Vec<String> = gems.into_iter().collect();
                         format!(
-                            "{} has no indexed declaration; the {} gem{} the CRuby tree loads provide{} it at runtime, so the value runs and is typed as opaque",
+                            "{} has no indexed declaration; {}; the CRuby tree loads {} natively, so the value runs and is typed as opaque",
                             missing.join(", "),
+                            facts.join("; "),
                             gems.join(", "),
-                            if gems.len() == 1 { "" } else { "s" },
-                            if gems.len() == 1 { "s" } else { "" },
                         )
                     } else if let Some((name, gem, reason)) = missing.iter().find_map(|name| {
                         let gem = self.namespace_gem(name)?;
@@ -2634,6 +2725,8 @@ impl<'a> BodyTyper<'a> {
                         format!(
                             "{name} is in a namespace of the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree has it"
                         )
+                    } else if let Some(refusal) = owners.iter().find_map(|o| o.as_ref().err().filter(|r| !r.is_empty())) {
+                        refusal.clone()
                     } else {
                         format!("{} has no indexed declaration or modeled dependency", missing.join(", "))
                     };
