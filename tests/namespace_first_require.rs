@@ -242,3 +242,136 @@ fn native_and_emitted(eager: bool, files: &[(&str, &str)], report: &str) -> (Str
     assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
     (expected, run)
 }
+
+/// Core's checkouts/one/oversell_protection: the namespace module reads
+/// its manager at load (`@manager = ReservationsOversellManager.new`),
+/// the manager's class body reads `InventoryItemAllocator`, and that
+/// constant is written in a file of its own,
+/// oversell_protection/inventory_item_allocator.rb, which reopens the
+/// namespace for it. Natively Zeitwerk loads the constant from that file
+/// while the namespace's file is still loading. Ingest merges the reopen
+/// into the namespace, so the constant was emitted in the namespace's
+/// file, and the manager's require of it was a require of the file
+/// already loading.
+const OVERSELL_PROTECTION: &str = r#"module Vd
+  module OversellProtection
+    @manager = ReservationsOversellManager.new
+
+    def self.manager
+      @manager
+    end
+  end
+end
+"#;
+
+const RESERVATIONS_OVERSELL_MANAGER: &str = r#"module Vd
+  module OversellProtection
+    class ReservationsOversellManager
+      class ReservationsBackendProxyImpl
+        def initialize(allocator)
+          @allocator = allocator
+        end
+
+        def allocator
+          @allocator
+        end
+      end
+
+      ReservationsBackendProxy = ReservationsBackendProxyImpl.new(InventoryItemAllocator)
+
+      def backend
+        ReservationsBackendProxy
+      end
+    end
+  end
+end
+"#;
+
+const INVENTORY_ITEM_ALLOCATOR_IMPL: &str = r#"module Vd
+  module OversellProtection
+    class InventoryItemAllocatorImpl
+      class ReservationRepositoryWrapper
+        def label
+          "wrapped repository"
+        end
+      end
+
+      def initialize(reservation_repository:)
+        @reservation_repository = reservation_repository
+      end
+
+      def repository_label
+        @reservation_repository.label
+      end
+    end
+  end
+end
+"#;
+
+const INVENTORY_ITEM_ALLOCATOR: &str = r#"module Vd
+  module OversellProtection
+    InventoryItemAllocator = InventoryItemAllocatorImpl.new(reservation_repository: InventoryItemAllocatorImpl::ReservationRepositoryWrapper.new)
+  end
+end
+"#;
+
+const OVERSELL_FILES: [(&str, &str); 5] = [
+    ("gems/vd/lib/vd.rb", ENTRY),
+    ("gems/vd/lib/vd/oversell_protection.rb", OVERSELL_PROTECTION),
+    ("gems/vd/lib/vd/oversell_protection/reservations_oversell_manager.rb", RESERVATIONS_OVERSELL_MANAGER),
+    ("gems/vd/lib/vd/oversell_protection/inventory_item_allocator_impl.rb", INVENTORY_ITEM_ALLOCATOR_IMPL),
+    ("gems/vd/lib/vd/oversell_protection/inventory_item_allocator.rb", INVENTORY_ITEM_ALLOCATOR),
+];
+
+const OVERSELL_REPORT: &str = r#"allocator = Vd::OversellProtection.manager.backend.allocator
+puts allocator.repository_label
+puts allocator.equal?(Vd::OversellProtection::InventoryItemAllocator)
+"#;
+
+#[test]
+fn a_namespace_constant_written_in_its_own_file_loads_from_that_file() {
+    constant_in_its_own_file(false);
+}
+
+#[test]
+fn eager_loading_loads_a_namespace_constant_from_its_own_file() {
+    constant_in_its_own_file(true);
+}
+
+fn constant_in_its_own_file(eager: bool) {
+    let (expected, run) = native_and_emitted(eager, &OVERSELL_FILES, OVERSELL_REPORT);
+    assert_eq!(expected, "wrapped repository\ntrue\n", "native control");
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+    let read = |path: &str| std::fs::read_to_string(run.emitted.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let namespace = read("app/models/vd/oversell_protection.rb");
+    assert!(!namespace.contains("InventoryItemAllocator ="), "{namespace}");
+    let constant = read("app/models/vd/oversell_protection/inventory_item_allocator.rb");
+    assert!(constant.contains("InventoryItemAllocator ="), "{constant}");
+    let manager = read("app/models/vd/oversell_protection/reservations_oversell_manager.rb");
+    assert!(manager.contains("require_relative \"inventory_item_allocator\"\n"), "{manager}");
+    assert!(!manager.contains("require_relative \"../oversell_protection\"\n"), "{manager}");
+    let models = read("app/models.rb");
+    assert!(
+        models.contains("[:InventoryItemAllocator, \"models/vd/oversell_protection/inventory_item_allocator\", false]"),
+        "no autoload entry for the constant's file:\n{models}"
+    );
+}
+
+/// A gem that loads its files by `require`, not Zeitwerk: the namespace
+/// constant written in vd/setup.rb still has a file of its own in the
+/// tree, and the require of vd/setup.rb loads it right there, as Ruby
+/// does, not on first reference.
+#[test]
+fn a_required_file_that_writes_a_namespace_constant_loads_it_when_required() {
+    let files = [
+        (
+            "gems/vd/lib/vd.rb",
+            "require \"vd/setup\"\n\nmodule Vd\n  def self.banner\n    \"vd #{Setup}\"\n  end\nend\n",
+        ),
+        ("gems/vd/lib/vd/setup.rb", "module Vd\n  Setup = \"ready\".tap { |state| puts \"setup #{state}\" }\nend\n"),
+    ];
+    let report = "puts \"booted\"\nputs Vd.banner\n";
+    let (expected, run) = native_and_emitted(false, &files, report);
+    assert_eq!(expected, "setup ready\nbooted\nvd ready\n", "native control");
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+}

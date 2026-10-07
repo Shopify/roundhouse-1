@@ -156,7 +156,48 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         // Makefile's dependency list.
         let file_stem = crate::naming::underscore(lc.name.0.as_str());
         let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        // A namespace constant the source wrote in a file of its own
+        // goes to that file (`constant_file`): the namespace's file
+        // reopens the module without it, and the constant's file
+        // reopens it with only the constant.
+        let apart: Vec<(usize, String)> = lc
+            .constants
+            .iter()
+            .enumerate()
+            .filter_map(|(j, (n, _))| constant_file(lc.name.0.as_str(), n.as_str(), app).map(|stem| (j, stem)))
+            .collect();
+        let without_apart;
+        let lc = if apart.is_empty() {
+            lc
+        } else {
+            let mut copy = lc.clone();
+            copy.constants = lc
+                .constants
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| !apart.iter().any(|(k, _)| k == j))
+                .map(|(_, c)| c.clone())
+                .collect();
+            without_apart = copy;
+            &without_apart
+        };
         let mut files = emit_library_class_pair(lc, app, out_path);
+        for (j, stem) in &apart {
+            let constant = LibraryClass {
+                includes: Vec::new(),
+                methods: Vec::new(),
+                class_ivar_initializers: Vec::new(),
+                nullable_columns: Vec::new(),
+                constants: vec![lcs[i].constants[*j].clone()],
+                unknown_calls: Vec::new(),
+                visibility_overrides: Vec::new(),
+                method_aliases: Vec::new(),
+                top_level_constants: Vec::new(),
+                conditional_definitions: Vec::new(),
+                ..lc.clone()
+            };
+            files.extend(emit_library_class_pair(&constant, app, PathBuf::from(format!("app/models/{stem}.rb"))));
+        }
         if last_of_name.get(lc.name.0.as_str()) == Some(&i) {
             if let Some(kids) = children.get(lc.name.0.as_str()) {
                 splice_nested(&mut files, lc, kids, app);
@@ -8973,6 +9014,14 @@ pub(super) fn emit_file_program(
                         if emitted.contains(&anchor) && loaded.insert(anchor.clone()) {
                             require_anchor(s, &anchor);
                         }
+                        // The constants this file wrote that have a file
+                        // of their own (`constant_file`) load with it.
+                        for stem in constant_files_written_in(name.0.as_str(), rel, app) {
+                            let anchor = format!("models/{stem}");
+                            if emitted.contains(&anchor) && loaded.insert(anchor.clone()) {
+                                require_anchor(s, &anchor);
+                            }
+                        }
                     }
                 }
                 ProgramItem::Statement(expr) => {
@@ -9261,6 +9310,161 @@ fn written_apart(name: &str, owner: &str, app: &App) -> bool {
     child.extend(declared_files(name, app));
     let parent = body_files(owner, app);
     !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)
+}
+
+/// The file stem (`checkouts/one/oversell_protection/inventory_item_allocator`)
+/// of a namespace module's constant that the source wrote in a file of
+/// its own, named for it the way Zeitwerk maps files to constants:
+///
+/// ```ruby
+/// # oversell_protection/inventory_item_allocator.rb
+/// module Checkouts; module One; module OversellProtection
+///   InventoryItemAllocator = InventoryItemAllocatorImpl.new(...)
+/// ```
+///
+/// Ingest merges every reopen of the module into one, so the constant
+/// arrives among the namespace's own and would be written into the
+/// namespace's file. Natively Zeitwerk loads it from its own file when
+/// it is first read, and Core's namespace file reads its manager at
+/// load (`@manager = ReservationsOversellManager.new`), whose class
+/// body reads `InventoryItemAllocator`: in the namespace's file that
+/// read required the file already loading, a circular require. So the
+/// emitted tree keeps the file, at the constant's own path, and the
+/// autoload table maps the constant to it.
+///
+/// Only for a module (a class's body ends once, in its own file; see
+/// `file_owner`) that keeps a file of its own, and only when that
+/// source file adds nothing else to the module and the value reads none
+/// of the module's other constants, which stay in the namespace's file.
+fn constant_file(owner: &str, constant: &str, app: &App) -> Option<String> {
+    let classes = library_classes_named(owner, app);
+    if classes.is_empty()
+        || !classes.iter().all(|c| c.is_module && c.origin.is_none())
+        || is_model_named(owner, app)
+        || file_owner(owner, app) != owner
+        // What the emit adds to a class by name (`extend`s, forwarders)
+        // would be written into the constant's file too.
+        || app.class_methods_carrier_splices.contains_key(&classes[0].name)
+        || app.ruby_declined_delegate_forwarders.contains_key(&classes[0].name)
+    {
+        return None;
+    }
+    let qualified = format!("{owner}::{constant}");
+    if is_model_or_library_class(&qualified, app) {
+        return None;
+    }
+    let (holder, value) = classes.iter().find_map(|c| {
+        c.constants.iter().find(|(n, _)| n.as_str() == constant).map(|(_, v)| (*c, v))
+    })?;
+    if holder.top_level_constants.iter().any(|t| t.name.as_str() == constant) {
+        return None;
+    }
+    let file = value.span.file.0;
+    if file == 0 {
+        return None;
+    }
+    let stem = crate::naming::underscore(&qualified);
+    let source = app.sources.get(file as usize - 1)?;
+    let source_stem = source.path.strip_suffix(".rb")?;
+    if !(source_stem.ends_with(&format!("/{stem}")) || source_stem == stem) {
+        return None;
+    }
+    // Only where an autoloader maps the file to the constant: a Rails
+    // autoload root (`app/<x>`, `app/<x>/concerns`) or a Zeitwerk
+    // loader's. A gem that `require`s the file loads the constant when
+    // it requires it, which the namespace's file, loaded where the
+    // require was, already does.
+    let dir = relative_source_path(app, source_stem.strip_suffix(stem.as_str())?).trim_matches('/');
+    let segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    let n = segments.len();
+    let autoloaded = (n >= 2 && segments[n - 2] == "app")
+        || (n >= 3 && segments[n - 1] == "concerns" && segments[n - 3] == "app")
+        || app.zeitwerk_loaders.iter().any(|l| relative_source_path(app, &l.root).trim_matches('/') == dir);
+    if !autoloaded {
+        return None;
+    }
+    let mut others: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    for c in &classes {
+        let from_file = |span: &Span| span.file.0 == file;
+        if c.methods.iter().any(|m| from_file(&m.body.span))
+            || c.class_ivar_initializers.iter().any(|e| from_file(&e.span))
+            || c.unknown_calls.iter().any(|e| from_file(&e.span))
+        {
+            return None;
+        }
+        for (n, v) in &c.constants {
+            if n.as_str() == constant {
+                continue;
+            }
+            if from_file(&v.span) {
+                return None;
+            }
+            others.insert(n.as_str());
+        }
+    }
+    let mut paths: BTreeSet<Vec<String>> = BTreeSet::new();
+    walk_const_paths(value, &mut paths);
+    let reads_sibling = paths.iter().any(|p| match p.split_last() {
+        Some((last, prefix)) => {
+            others.contains(last.as_str())
+                && (prefix.is_empty() || prefix.join("::").trim_start_matches("::") == owner)
+        }
+        None => false,
+    });
+    (!reads_sibling).then_some(stem)
+}
+
+/// The file of a constant `path` names, read from `self_name`, when it
+/// is a namespace constant that has a file of its own (`constant_file`):
+/// the qualified spelling, or a bare one resolved through the lexical
+/// scopes `self_name` sits in, the nearest that defines it.
+fn constant_file_for_path(path: &[String], app: &App, self_name: &str) -> Option<String> {
+    let (constant, prefix) = path.split_last()?;
+    if !constant.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    if !prefix.is_empty() {
+        scopes.push(prefix.join("::"));
+    }
+    let segments: Vec<&str> = if self_name.is_empty() { Vec::new() } else { self_name.split("::").collect() };
+    for n in (1..=segments.len()).rev() {
+        let scope = segments[..n].join("::");
+        scopes.push(if prefix.is_empty() { scope } else { format!("{scope}::{}", prefix.join("::")) });
+    }
+    for scope in scopes {
+        let classes = library_classes_named(&scope, app);
+        let defines = is_model_or_library_class(&format!("{scope}::{constant}"), app)
+            || classes.iter().any(|c| c.constants.iter().any(|(n, _)| n.as_str() == constant.as_str()));
+        if defines {
+            return constant_file(&scope, constant, app);
+        }
+    }
+    None
+}
+
+/// The `constant_file` stems of `owner`'s constants written in the
+/// source file `rel` (relative to the app root): a file program that
+/// declares the namespace from that file loads them where it ran them.
+fn constant_files_written_in(owner: &str, rel: &str, app: &App) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in library_classes_named(owner, app) {
+        for (name, value) in &c.constants {
+            let written_here = value.span.file.0 != 0
+                && app
+                    .sources
+                    .get(value.span.file.0 as usize - 1)
+                    .is_some_and(|source| relative_source_path(app, &source.path) == rel);
+            if written_here {
+                if let Some(stem) = constant_file(owner, name.as_str(), app) {
+                    if !out.contains(&stem) {
+                        out.push(stem);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Each library class => the ids of the source files that declare it
@@ -9579,6 +9783,11 @@ fn require_path_for_body_const(
         None => path,
     };
     let first = path.first()?;
+    // A namespace constant written in a file of its own is emitted
+    // there (`constant_file`), not in the namespace's file.
+    if let Some(stem) = constant_file_for_path(path, app, self_name) {
+        return Some(format!("app/models/{stem}"));
+    }
     // A nested class of THIS class is still a different file:
     // `Sound::Image` lives at app/models/sound/image.rb even though the
     // reference's first segment is `Sound`. Resolve the full path before
