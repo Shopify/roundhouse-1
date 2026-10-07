@@ -25,6 +25,7 @@
 
 mod alba;
 mod cycles;
+mod incremental;
 mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
@@ -157,6 +158,9 @@ pub struct Analyzer {
     /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
     /// settle; see [`Self::fixpoint_rounds`].
     fixpoint_rounds: FixpointRounds,
+    /// What each library class's last typing read; lets the library
+    /// pass skip classes none of whose reads changed (see `incremental`).
+    incremental: incremental::Incremental,
 }
 
 /// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
@@ -954,7 +958,7 @@ impl Analyzer {
             .flat_map(|(class_id, methods)| {
                 methods.iter().map(|(name, ty)| {
                     let scoped = ty.map_class_ids(&|id| {
-                        body::lexical_class(id, class_id.0.as_str(), &classes)
+                        body::lexical_class(id, class_id.0.as_str(), body::Classes::new(&classes, None))
                             .unwrap_or_else(|| id.clone())
                     });
                     (class_id.clone(), name.clone(), ty.clone(), scoped)
@@ -1009,6 +1013,7 @@ impl Analyzer {
             data_factories,
             recursive_methods: Self::find_recursive_methods(app),
             fixpoint_rounds: FixpointRounds::default(),
+            incremental: incremental::Incremental::new(incremental::Mode::from_env()),
         }
     }
 
@@ -1062,7 +1067,7 @@ impl Analyzer {
         for class in &mut app.library_classes {
             for included in &class.includes {
                 let known = self.classes.contains_key(included)
-                    || body::lexical_class(included, class.name.0.as_str(), &self.classes).is_some()
+                    || body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                     || body::RUBY_TOP_LEVEL.contains(&included.0.as_str());
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
@@ -1090,7 +1095,7 @@ impl Analyzer {
                     let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
                     let id = ClassId(Symbol::from(name.as_str()));
                     let known = self.classes.contains_key(&id)
-                        || body::lexical_class(&id, model.name.0.as_str(), &self.classes).is_some()
+                        || body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str());
                     (!known).then_some(name)
                 }).collect();
@@ -1336,6 +1341,13 @@ impl Analyzer {
                 true,
             )
         });
+        // The oracle for the incremental library pass: every class it
+        // would have skipped typed to the trees it kept.
+        assert!(
+            self.incremental.mismatches_total == 0,
+            "ROUNDHOUSE_INCREMENTAL=check: {} library classes the incremental pass would skip typed differently",
+            self.incremental.mismatches_total
+        );
         // Effects are a function of the converged typed trees, not of
         // the fixpoint. Collecting inside every typing round walked
         // the same bodies two or three times per round for no harvest
@@ -3212,21 +3224,52 @@ impl Analyzer {
         let mut mailer_params_by_view: HashMap<Symbol, Ty> = HashMap::new();
 
         let _typing_library = crate::timings::begin("typing: library");
-        for lc in &mut app.library_classes {
+        self.incremental.begin_pass(
+            &self.classes,
+            &self.inferred_params,
+            &self.typed_constants,
+            app.library_classes.len(),
+        );
+        let mode = self.incremental.mode;
+        for (index, lc) in app.library_classes.iter_mut().enumerate() {
             if let Some(row) = mailer_with_params.get(&lc.name) {
-                self.classes
-                    .entry(lc.name.clone())
-                    .or_default()
-                    .instance_methods
-                    .insert(Symbol::from("params"), Ty::Record { row: row.clone() });
+                let created = !self.classes.contains_key(&lc.name);
+                let params_name = Symbol::from("params");
+                let params_ty = Ty::Record { row: row.clone() };
+                let methods = &mut self.classes.entry(lc.name.clone()).or_default().instance_methods;
+                if methods.get(&params_name) != Some(&params_ty) {
+                    methods.insert(params_name.clone(), params_ty);
+                    self.incremental.note_write(&lc.name, &params_name, created);
+                }
             }
             let self_id = if lc.is_module {
                 sole_includer.get(&lc.name).cloned().unwrap_or_else(|| lc.name.clone())
             } else {
                 lc.name.clone()
             };
+            // A mailer's pass also feeds its templates' ivar seeds below,
+            // so it is typed every pass.
+            let concern_env_here = concern_ivar_env.get(&lc.name);
+            let writes_here = current_attribute_writes.get(&lc.name);
+            let clean = !mailer_names.contains(&lc.name)
+                && self.incremental.is_clean(index, &lc.name, &self_id, concern_env_here, writes_here);
+            if clean {
+                self.incremental.pass.clean += 1;
+                if mode == incremental::Mode::On {
+                    continue;
+                }
+            }
+            let kept = (clean && mode == incremental::Mode::Check).then(|| lc.clone());
+            let deps = body::DepRecorder::default();
+            // `seed_method_params` reads these outside the typer.
+            deps.note(body::DepKey::Class(&lc.name));
+            for method in &lc.methods {
+                deps.note(body::DepKey::Params(&lc.name, &method.name));
+                deps.note(body::DepKey::Instance(&lc.name, &method.name));
+                deps.note(body::DepKey::ClassMethod(&lc.name, &method.name));
+            }
             let class_ctx = Ctx {
-                self_ty: Some(Ty::Class { id: self_id, args: vec![] }),
+                self_ty: Some(Ty::Class { id: self_id.clone(), args: vec![] }),
                 lexical_self: None,
                 ivar_bindings: HashMap::new(),
                 local_bindings: HashMap::new(),
@@ -3235,11 +3278,11 @@ impl Analyzer {
             };
 
             for initializer in &mut lc.class_ivar_initializers {
-                self.body_typer().analyze_expr(initializer, &class_ctx);
+                self.body_typer().with_deps(&deps).analyze_expr(initializer, &class_ctx);
             }
             for (_, value) in &mut lc.constants {
                 if self.data_factories.contains_key(&value.span) {
-                    self.body_typer().analyze_expr(value, &class_ctx);
+                    self.body_typer().with_deps(&deps).analyze_expr(value, &class_ctx);
                 }
             }
             let lc_name = lc.name.clone();
@@ -3251,11 +3294,11 @@ impl Analyzer {
                 // and the stamped signature can fold it in.
                 for p in &mut method.params {
                     if let Some(default) = &mut p.default {
-                        self.body_typer().analyze_expr(default, &class_ctx);
+                        self.body_typer().with_deps(&deps).analyze_expr(default, &class_ctx);
                     }
                 }
                 let mctx = self.seed_method_params(&class_ctx, &lc_name, method);
-                self.body_typer().analyze_expr(&mut method.body, &mctx);
+                self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
             }
 
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::new();
@@ -3375,10 +3418,17 @@ impl Analyzer {
                 };
                 for method in &mut lc.methods {
                     let mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method);
-                    self.body_typer().analyze_expr(&mut method.body, &mctx);
+                    self.body_typer().with_deps(&deps).analyze_expr(&mut method.body, &mctx);
                 }
             }
+            if let Some(kept) = kept {
+                if kept != *lc {
+                    self.incremental.report_mismatch(&kept, lc);
+                }
+            }
+            self.incremental.record(index, &lc_name, &self_id, deps.take(), concern_env_here, writes_here);
         }
+        self.incremental.end_pass();
         drop(_typing_library);
 
         if !type_views_and_tests {

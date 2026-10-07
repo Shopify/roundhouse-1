@@ -37,6 +37,8 @@ fn bytes_block_has_escaping_break(e: &Expr) -> bool {
 }
 
 mod diagnostic;
+mod deps;
+pub(crate) use deps::{Classes, DepKey, DepRecorder, Mix};
 mod const_resolution;
 pub(crate) use const_resolution::{ConstResolver, ConstResolverTask};
 pub use const_resolution::PreparedConstResolver;
@@ -284,7 +286,7 @@ pub struct ClassInfo {
 pub(crate) fn lexical_class(
     written: &ClassId,
     scope: &str,
-    classes: &HashMap<ClassId, ClassInfo>,
+    classes: Classes<'_>,
 ) -> Option<ClassId> {
     let name = written.0.as_str();
     let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
@@ -303,6 +305,9 @@ pub(crate) fn lexical_class(
 /// without cloning.
 pub struct BodyTyper<'a> {
     classes: &'a HashMap<ClassId, ClassInfo>,
+    /// Notes every registry read when the caller wants to know what the
+    /// typing depended on (the incremental library pass).
+    deps: Option<&'a DepRecorder>,
     const_resolver: Option<std::sync::Arc<ConstResolver>>,
     typed_constants: Option<&'a IdentityHashMap<DeclarationId, Ty>>,
     data_factories: Option<&'a HashMap<crate::span::Span, Ty>>,
@@ -315,8 +320,16 @@ pub struct BodyTyper<'a> {
 impl<'a> BodyTyper<'a> {
     /// Submodule accessor for the dispatch table. `classes` itself
     /// stays private to this module; `send.rs` reaches it here.
-    pub(super) fn classes(&self) -> &'a HashMap<ClassId, ClassInfo> {
-        self.classes
+    pub(super) fn classes(&self) -> Classes<'a> {
+        Classes::new(self.classes, self.deps)
+    }
+
+    /// A source constant's inferred value, noted as a read.
+    fn typed_constant(&self, declaration: &DeclarationId) -> Option<&'a Ty> {
+        if let Some(deps) = self.deps {
+            deps.note(DepKey::Constant(declaration));
+        }
+        self.typed_constants.and_then(|values| values.get(declaration))
     }
 
     /// The gem whose RBI is the only declaration of the constant `path`
@@ -334,7 +347,13 @@ impl<'a> BodyTyper<'a> {
     }
 
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
-        Self { classes, const_resolver: None, typed_constants: None, data_factories: None, inquirers: None }
+        Self { classes, deps: None, const_resolver: None, typed_constants: None, data_factories: None, inquirers: None }
+    }
+
+    /// Note every registry read in `deps`.
+    pub(crate) fn with_deps(mut self, deps: &'a DepRecorder) -> Self {
+        self.deps = Some(deps);
+        self
     }
 
     /// Share the analyzer's immutable source index across typing passes.
@@ -526,7 +545,7 @@ impl<'a> BodyTyper<'a> {
         // Bounded: a parent link that cycles must not hang the typer.
         for _ in 0..16 {
             let Some(cur) = cursor else { break };
-            let Some(info) = self.classes.get(&cur) else { break };
+            let Some(info) = self.classes().get(&cur) else { break };
             if let Some(ty) = info.attributes.fields.get(name) {
                 return Some(ty.clone());
             }
@@ -553,7 +572,7 @@ impl<'a> BodyTyper<'a> {
                 let value = if let [name] = path.as_slice() {
                     ctx.constants.get_own(name).or_else(|| ctx.constants.get_global(name))
                 } else { None };
-                value.is_none() && self.classes.contains_key(&id)
+                value.is_none() && self.classes().contains_key(&id)
             }
             _ => false,
         }
@@ -561,7 +580,7 @@ impl<'a> BodyTyper<'a> {
 
     fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
         matches!(method.as_str(), "included" | "prepended" | "append_features" | "prepend_features")
-            && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes.get(id).is_some_and(|c| c.is_module && c.class_methods.contains_key(method)))
+            && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes().get(id).is_some_and(|c| c.is_module && c.has_class_method(method)))
     }
 
     fn owns_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
@@ -572,11 +591,11 @@ impl<'a> BodyTyper<'a> {
                 let mut current = Some(id);
                 for _ in 0..32 {
                     let Some(id) = current else { break };
-                    let Some(class) = self.classes.get(id) else { break };
-                    let own = if class_object { &class.class_methods } else { &class.instance_methods };
-                    if own.contains_key(method) { return true; }
+                    let Some(class) = self.classes().get(id) else { break };
+                    let own = if class_object { class.has_class_method(method) } else { class.has_instance_method(method) };
+                    if own { return true; }
                     if !class_object && class.includes.iter().any(|m| self.lookup_in_module(m, method).is_some()) { return true; }
-                    current = class.parent.as_ref();
+                    current = class.parent_id();
                 }
                 false
             }
@@ -680,7 +699,7 @@ impl<'a> BodyTyper<'a> {
                     Some(Some(ResolvedConstant::Value { declaration, name, runtime, .. })) => {
     // Concern splices retain the resolved value owner as well as its type.
     qualify_resolved_path(path, name);
-    let value = self.typed_constants.and_then(|values| values.get(declaration)).cloned()
+    let value = self.typed_constant(declaration).cloned()
         .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
     match value {
         Some(ty) => ty,
@@ -716,10 +735,7 @@ impl<'a> BodyTyper<'a> {
                                 .or_else(|| ctx.constants.get_global(name).cloned())
                         } else {
                             let name = written_class_id(path);
-                            self.typed_constants
-                                .and_then(|values| {
-                                    values.get(&declaration_id_from_lookup_name(name.0.as_str()))
-                                })
+                            self.typed_constant(&declaration_id_from_lookup_name(name.0.as_str()))
                                 .cloned()
                         };
                         // Otherwise retain the written class path, but
@@ -1187,8 +1203,8 @@ impl<'a> BodyTyper<'a> {
                         ctx.self_ty.as_ref(),
                         Some(Ty::Class { id, .. })
                             if self.classes().get(id).is_some_and(|cls|
-                                cls.class_methods.contains_key(method)
-                                    || cls.instance_methods.contains_key(method))
+                                cls.has_class_method(method)
+                                    || cls.has_instance_method(method))
                     );
                 if resolves_through_self {
                     *recv = Some(crate::expr::Expr {
@@ -1228,8 +1244,8 @@ impl<'a> BodyTyper<'a> {
                         if id.0.as_str() == "ActionController::Parameters"
                             && method.as_str() != "new"
                             && !self.classes().get(&id).is_some_and(|c|
-                                c.instance_methods.contains_key(method)
-                                    || c.class_methods.contains_key(method)) =>
+                                c.has_instance_method(method)
+                                    || c.has_class_method(method)) =>
                     {
                         Some(send::params_as_hash())
                     }
@@ -1357,7 +1373,7 @@ impl<'a> BodyTyper<'a> {
                                 resolved = Some(*k);
                                 break;
                             }
-                            current_id = cls.parent.as_ref();
+                            current_id = cls.parent_id();
                         }
                         if matches!(resolved, Some(AccessorKind::Method)) {
                             *parenthesized = true;
@@ -2263,7 +2279,7 @@ impl<'a> BodyTyper<'a> {
                 // `ShopifyPayments::Capabilities::Charge`).
                 let resolved = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
                     Some(Ty::Class { id: scope, .. }) => target_ty.map_class_ids(&|id| {
-                        lexical_class(id, scope.0.as_str(), self.classes).unwrap_or_else(|| id.clone())
+                        lexical_class(id, scope.0.as_str(), self.classes()).unwrap_or_else(|| id.clone())
                     }),
                 _ => target_ty.clone(),
                 };
@@ -2273,7 +2289,7 @@ impl<'a> BodyTyper<'a> {
                 // retypes them. Resolve source declarations at their boundary.
                 if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {
                     resolved.map_class_ids(&|id| {
-                        if !self.classes.contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
+                        if !self.classes().contains_key(id) && !RUBY_TOP_LEVEL.contains(&id.0.as_str())
                             && !self.const_resolver.as_ref().is_some_and(|r| {
                                 r.has_source_namespace(id.0.as_str()) || r.has_stdlib_namespace(id.0.as_str())
                             }) {
@@ -4101,10 +4117,10 @@ impl BodyTyper<'_> {
             if !seen.insert(id) { break; }
             let Some(class) = self.classes().get(id) else { break };
             if class.declares_constructor
-                || matches!(class.class_methods.get(&Symbol::from("new")), Some(Ty::Fn { .. })) {
+                || matches!(class.class_method(&Symbol::from("new")), Some(Ty::Fn { .. })) {
                 return true;
             }
-            next = class.parent.as_ref();
+            next = class.parent_id();
         }
         false
     }

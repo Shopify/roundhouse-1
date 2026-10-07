@@ -16,8 +16,6 @@ use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
 use super::{BodyTyper, Ctx, union_many, union_of, unknown};
-use crate::analyze::ClassInfo;
-use std::collections::HashMap;
 
 impl<'a> BodyTyper<'a> {
     /// `record[:column]` / `read_attribute(:column)` (and their writer
@@ -39,11 +37,11 @@ impl<'a> BodyTyper<'a> {
             "[]=" | "write_attribute" if args.len() == 2 => &args[0],
             _ => return None,
         };
-        let methods = &self.classes().get(model)?.instance_methods;
+        let cls = self.classes().get(model)?;
         let entry = match &*key_arg.node {
-            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => methods.get(value),
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => cls.instance_method(value),
             ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
-                methods.get(&Symbol::from(value.as_str()))
+                cls.instance_method(&Symbol::from(value.as_str()))
             }
             _ => None,
         }?;
@@ -90,7 +88,7 @@ impl<'a> BodyTyper<'a> {
             return None;
         };
         let cls = self.classes().get(model)?;
-        let col_ty = cls.instance_methods.get(col)?.clone();
+        let col_ty = cls.instance_method(col)?.clone();
         Some(match method.as_str() {
             // `pick` is `pluck(...).first` — the column value, or nil
             // when the relation is empty.
@@ -169,7 +167,7 @@ impl<'a> BodyTyper<'a> {
         let ExprNode::Lit { value: crate::expr::Literal::Sym { value: col } } = &*arg.node else {
             return None;
         };
-        self.classes().get(model)?.instance_methods.get(col).cloned()
+        self.classes().get(model)?.instance_method(col).cloned()
     }
 
     /// Build the Ctx used to analyze a block passed to `recv.method(...) { |p1, p2| ... }`.
@@ -403,9 +401,8 @@ impl<'a> BodyTyper<'a> {
                         .chain(cls.includes.iter().filter_map(|m| self.classes().get(m)))
                     {
                         if let Some(sig) = c
-                            .instance_methods
-                            .get(method)
-                            .or_else(|| c.class_methods.get(method))
+                            .instance_method(method)
+                            .or_else(|| c.class_method(method))
                         {
                             // The block's yield may name the receiver
                             // (`{ (instance) -> void }`); substitute
@@ -534,7 +531,7 @@ impl<'a> BodyTyper<'a> {
             if let Some(ty) = cls.assoc_extensions.get(&key) {
                 return Some(ty.clone());
             }
-            current = cls.parent.as_ref();
+            current = cls.parent_id();
         }
         None
     }
@@ -578,13 +575,12 @@ impl<'a> BodyTyper<'a> {
             }
             let Some(cls) = self.classes().get(cid) else { break None };
             if let Some(s) = cls
-                .instance_methods
-                .get(&lookup_name)
-                .or_else(|| cls.class_methods.get(&lookup_name))
+                .instance_method(&lookup_name)
+                .or_else(|| cls.class_method(&lookup_name))
             {
                 break Some(s);
             }
-            current_id = cls.parent.as_ref();
+            current_id = cls.parent_id();
         };
         // The same substitution dispatch makes, for the same reason:
         // a signature that declares `(instance) -> bool` (`==`,
@@ -605,14 +601,14 @@ impl<'a> BodyTyper<'a> {
 
     fn ancestor_defining_class_method(&self, of: &ClassId, method: &Symbol) -> Option<ClassId> {
         let own = self.classes().get(of)?;
-        if own.class_methods.contains_key(method) {
+        if own.has_class_method(method) {
             return None;
         }
         let mut current = own.parent.clone();
         for _ in 0..32 {
             let id = current?;
             let cls = self.classes().get(&id)?;
-            if cls.table.is_some() && cls.class_methods.contains_key(method) {
+            if cls.table.is_some() && cls.has_class_method(method) {
                 return Some(id);
             }
             current = cls.parent.clone();
@@ -636,7 +632,7 @@ impl<'a> BodyTyper<'a> {
             if id.0.as_str() == "ActionController::Parameters"
                 && method.as_str() != "new"
                 && !self.classes().get(id).is_some_and(|c| {
-                    c.instance_methods.contains_key(method) || c.class_methods.contains_key(method)
+                    c.has_instance_method(method) || c.has_class_method(method)
                 })
             {
                 let as_hash = params_as_hash();
@@ -722,7 +718,7 @@ impl<'a> BodyTyper<'a> {
                     let mut depth = 0;
                     while let Some(cid) = cur {
                         let Some(cls) = self.classes().get(&cid) else { break };
-                        if let Some(ty) = cls.instance_methods.get(m).or_else(|| cls.class_methods.get(m)) {
+                        if let Some(ty) = cls.instance_method(m).or_else(|| cls.class_method(m)) {
                             // Same substitution as dispatch, against the
                             // receiver's class: `try(:instance)` on a
                             // subclass answers the subclass.
@@ -989,7 +985,7 @@ impl<'a> BodyTyper<'a> {
                     && self
                         .classes()
                         .get(id)
-                        .is_some_and(|c| c.class_methods.contains_key(method))
+                        .is_some_and(|c| c.has_class_method(method))
                 {
                     return Ty::Array {
                         elem: Box::new(Ty::Class { id: id.clone(), args: vec![] }),
@@ -1103,17 +1099,17 @@ impl<'a> BodyTyper<'a> {
                         )
                     {
                         if let (Some(cm), Some(im)) =
-                            (cls.class_methods.get(method), cls.instance_methods.get(method))
+                            (cls.class_method(method), cls.instance_method(method))
                         {
                             if matches!(unwrap_fn_ret(cm), Ty::Relation { .. }) {
                                 return unwrap_fn_ret(&subst(im));
                             }
                         }
                     }
-                    if let Some(ty) = cls.class_methods.get(method) {
+                    if let Some(ty) = cls.class_method(method) {
                         return unwrap_fn_ret(&subst(ty));
                     }
-                    if let Some(ty) = cls.instance_methods.get(method) {
+                    if let Some(ty) = cls.instance_method(method) {
                         return unwrap_fn_ret(&subst(ty));
                     }
                     // Mixed-in modules (`include IntervalHelper`)
@@ -1128,9 +1124,8 @@ impl<'a> BodyTyper<'a> {
                     }
                     if method_missing_ty.is_none() {
                         method_missing_ty = cls
-                            .class_methods
-                            .get(&Symbol::from("method_missing"))
-                            .or_else(|| cls.instance_methods.get(&Symbol::from("method_missing")))
+                            .class_method(&Symbol::from("method_missing"))
+                            .or_else(|| cls.instance_method(&Symbol::from("method_missing")))
                             .cloned()
                             .or_else(|| {
                                 cls.includes.iter().find_map(|m| {
@@ -1138,7 +1133,7 @@ impl<'a> BodyTyper<'a> {
                                 })
                             });
                     }
-                    current_id = cls.parent.as_ref();
+                    current_id = cls.parent_id();
                 }
                 let _ = args; // already shadowed below for new-call shortcut
                 // Every class in Ruby responds to `.new`, returning an
@@ -1342,7 +1337,7 @@ impl<'a> BodyTyper<'a> {
                         return self.dispatch(Some(&base), method, block_ret, args).rebind_class(&anc, id);
                     }
                     if let Some(cls) = self.classes().get(id) {
-                        match cls.class_methods.get(method) {
+                        match cls.class_method(method) {
                             Some(scope_ret @ Ty::Array { .. }) => {
                                 return scope_ret.clone();
                             }
@@ -1492,7 +1487,7 @@ impl<'a> BodyTyper<'a> {
                     return t.rebind_class(&anc, of);
                 }
                 if let Some(cls) = self.classes().get(of) {
-                    match cls.class_methods.get(method) {
+                    match cls.class_method(method) {
                         Some(ret @ Ty::Relation { .. }) => return ret.clone(),
                         // A class-side entry that answers with a
                         // COLLECTION. Chain methods preserve the
@@ -1705,7 +1700,7 @@ impl<'a> BodyTyper<'a> {
                 }
                 // Defined here without being one: it shadows anything
                 // further up.
-                if c.instance_methods.contains_key(method) || c.class_methods.contains_key(method) {
+                if c.has_instance_method(method) || c.has_class_method(method) {
                     return None;
                 }
             }
@@ -1724,7 +1719,7 @@ impl<'a> BodyTyper<'a> {
                 continue;
             }
             let Some(m) = self.classes().get(&id) else { continue };
-            if let Some(ty) = m.instance_methods.get(method) {
+            if let Some(ty) = m.instance_method(method) {
                 return Some(unwrap_fn_ret(ty));
             }
             stack.extend(m.includes.iter().cloned());
@@ -1740,10 +1735,10 @@ impl<'a> BodyTyper<'a> {
                 continue;
             }
             let Some(m) = self.classes().get(&id) else { continue };
-            if let Some(ty) = m.instance_methods.get(method) {
+            if let Some(ty) = m.instance_method(method) {
                 return Some(unwrap_fn_ret(ty));
             }
-            if let Some(ty) = m.class_methods.get(method) {
+            if let Some(ty) = m.class_method(method) {
                 return Some(unwrap_fn_ret(ty));
             }
             stack.extend(m.includes.iter().cloned());
@@ -1772,7 +1767,7 @@ impl<'a> BodyTyper<'a> {
                 continue;
             }
             let Some(cls) = self.classes().get(&cid) else { continue };
-            for ty in cls.instance_methods.values() {
+            for ty in cls.instance_method_types() {
                 // `-> self` on an ancestor answers the receiver, not
                 // the ancestor — substitute before the return is read.
                 let r = unwrap_fn_ret(&ty.subst_self(recv_ty));
@@ -2939,9 +2934,9 @@ pub(super) fn is_module_protocol(method: &Symbol) -> bool {
 pub(super) fn is_query_any_receiver_may_answer(
     method: &Symbol,
     recv_ty: Option<&Ty>,
-    classes: &HashMap<ClassId, ClassInfo>,
+    classes: super::Classes<'_>,
 ) -> bool {
-    fn unproven(ty: &Ty, classes: &HashMap<ClassId, ClassInfo>) -> bool {
+    fn unproven(ty: &Ty, classes: super::Classes<'_>) -> bool {
         match ty {
             Ty::Var { .. } | Ty::Untyped => true,
             Ty::Class { id, .. } => !classes.contains_key(id),
