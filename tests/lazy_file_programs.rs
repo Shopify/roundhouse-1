@@ -164,7 +164,7 @@ fn a_load_time_dependency_on_a_programs_constant_loads_the_program() {
     assert!(run.success, "{}\n{}", run.stdout, run.stderr);
     assert_eq!(run.stdout, "booted\nloading helping\n:helped\n", "{}", run.stderr);
     let user = std::fs::read_to_string(run.emitted.join("app/models/consumer.rb")).expect("consumer.rb");
-    assert!(user.contains("require_relative \"roundhouse_files/app/services/helping\""), "{user}");
+    assert!(user.contains("RoundhouseAutoload.require_through(\"models/roundhouse_files/app/services/helping\", \"models/helping\")"), "{user}");
 }
 
 /// essentials' lib/podding/patches/active_record.rb reopens the runtime's
@@ -236,4 +236,52 @@ fn a_program_required_before_its_constant_is_referenced_defines_it_without_warni
     assert_eq!(run.stdout, "booted\n:hooked\n:schema\n", "{}", run.stderr);
     assert!(!run.stderr.contains("circular require") && !run.stderr.contains("to define"), "{}", run.stderr);
     assert!(run.stderr.contains("error[file_statement_not_run]: the file-level statement at lib/hooked.rb:2"), "{}", run.stderr);
+}
+
+/// shopify-money's lib/money.rb (Bundler.require's entry) requires
+/// money/money.rb, which declares Money but is no path match for it, so
+/// Money autoloads its declarations file; that file first requires
+/// money/null_currency.rb (a class-body dependency), whose `class Money`
+/// resolved the autoload into the in-flight declarations file: a
+/// circular require, fatal under Core's StrictWarning.
+#[test]
+fn a_declarations_file_required_while_its_constant_autoloads_it_does_not_re_enter_itself() {
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "require_relative \"boot\"\nrequire \"purse\"\n")
+        .write(
+            "lib/strict.rb",
+            "$VERBOSE = true\n\nmodule Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.include?(\"circular require\") || msg.include?(\"to define\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n",
+        )
+        .write("lib/purse.rb", "require \"purse/purse\"\nrequire \"purse/null\"\nputs \"purse entry\"\n")
+        .write("lib/purse/purse.rb", "class Purse\n  NULL = Purse::Null.new\nend\n")
+        .write("lib/purse/null.rb", "class Purse\n  class Null\n    def kind\n      :null\n    end\n  end\nend\n")
+        .run_ruby("puts \"booted\"\np Purse::NULL.kind\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "purse entry\nbooted\n:null\n", "{}", run.stderr);
+    assert!(!run.stderr.contains("circular require") && !run.stderr.contains("to define"), "{}", run.stderr);
+}
+
+/// secure_headers.rb (a program, SecureHeaders' autoload) requires
+/// headers/content_security_policy, whose policy_management depends on
+/// SecureHeaders: that dependency loads through the program, which is
+/// the file loading now. Natively nothing requires secure_headers.rb
+/// back; requiring it again was a circular require (StrictWarning).
+#[test]
+fn a_dependency_on_a_program_loading_now_loads_its_declarations_not_the_program_again() {
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "require_relative \"boot\"\nrequire \"shield\"\n")
+        .write(
+            "lib/strict.rb",
+            "$VERBOSE = true\n\nmodule Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.include?(\"circular require\") || msg.include?(\"to define\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n",
+        )
+        .write("lib/shield.rb", "module Shield\n  VERSION = \"1.0\"\nend\n\nrequire \"shield/policy\"\nputs \"shield entry\"\n")
+        .write("lib/shield/policy.rb", "module Shield\n  module Policy\n    DEFAULT = \"v#{Shield::VERSION}\"\n  end\nend\n")
+        .run_ruby("puts \"booted\"\np Shield::Policy::DEFAULT\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "shield entry\nbooted\n\"v1.0\"\n", "{}", run.stderr);
+    assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
 }

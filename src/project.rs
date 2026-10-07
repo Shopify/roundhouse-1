@@ -5757,16 +5757,34 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         writeln!(body, "    {anchor:?} => {:?},", load.site).unwrap();
     }
     body.push_str("  }.freeze\n");
-    // The constants whose autoload is each program (`entering_program`).
+    // The constants whose autoload is each program (`entering_program`),
+    // and each declarations file that requires other files before its
+    // own definitions: a program (shopify-money's lib/money.rb) may load
+    // it by a plain `require` while its constant still autoloads it, and
+    // a file it requires first (money/null_currency.rb's `class Money`)
+    // would resolve that autoload into the in-flight file.
+    let requires_first = |file: &str| -> bool {
+        let path = format!("app/{file}.rb");
+        files.iter().find(|(p, _)| *p == path).is_some_and(|(_, content)| {
+            content
+                .lines()
+                .map(str::trim_start)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .is_some_and(|l| l.starts_with("require ") || l.starts_with("require_relative "))
+        })
+    };
     let mut program_constants: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
     for (namespace, children) in &namespaces {
         for (name, child) in children {
-            if let Some(program) = child.file.as_ref().and_then(|f| program_of_file.get(f)) {
+            let Some(file) = child.file.as_ref() else { continue };
+            if let Some(program) = program_of_file.get(file) {
                 program_constants.entry(program.clone()).or_default().push((namespace, name));
+            } else if requires_first(file) {
+                program_constants.entry(file.clone()).or_default().push((namespace, name));
             }
         }
     }
-    body.push_str("  # program => the constants it is the autoload of, [namespace, constant]\n  PROGRAM_CONSTANTS = {\n");
+    body.push_str("  # program (or declarations file loading other files first) => the\n  # constants it is the autoload of, [namespace, constant]\n  PROGRAM_CONSTANTS = {\n");
     for (program, constants) in &program_constants {
         let pairs: Vec<String> = constants.iter().map(|(ns, name)| format!("[{ns:?}, :{name}]")).collect();
         writeln!(body, "    {program:?} => [{}],", pairs.join(", ")).unwrap();
@@ -5924,7 +5942,8 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let file = format!("app/{program}.rb");
         if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
             let header: usize = content.split_inclusive('\n').take_while(|l| l.starts_with('#')).map(str::len).sum();
-            content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?})\n"));
+            // An initializer's constant file loads before app/models.rb.
+            content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
         }
     }
 }
@@ -5938,7 +5957,10 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
 /// that file is then a circular no-op and X stays undefined (Core's
 /// verdict/bucket_hash.rb, which verdict/experiment.rb depends on).
 /// The program's own declarations files keep requiring each other
-/// directly: the program is already loading them.
+/// directly: the program is already loading them. So does a file the
+/// program is loading now (`require_through`): secure_headers.rb requires
+/// headers/content_security_policy, whose policy_management depends on
+/// SecureHeaders; natively nothing there requires secure_headers.rb back.
 fn load_declarations_through_their_program(
     files: &mut [(String, String)],
     app: &App,
@@ -6007,14 +6029,20 @@ fn load_declarations_through_their_program(
             {
                 let target = normalize(&format!("{dir}/{rel}"));
                 let target = target.strip_suffix(".rb").unwrap_or(&target);
-                target
-                    .strip_prefix("app/")
-                    .and_then(through)
-                    .map(|program| format!("require_relative {:?}", relative(dir, &format!("app/{program}"))))
+                // A file loading before app/models.rb (an initializer's
+                // constant, boot.rb) keeps its direct require.
+                target.strip_prefix("app/").and_then(|anchor| {
+                    through(anchor).map(|program| {
+                        format!(
+                            "defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through({program:?}, {anchor:?}) : require_relative({:?})",
+                            relative(dir, &format!("app/{program}"))
+                        )
+                    })
+                })
             } else if let Some(anchor) =
                 text.strip_prefix("require RoundhouseAutoload.path(\"").and_then(|r| r.strip_suffix("\")"))
             {
-                through(anchor).map(|program| format!("require RoundhouseAutoload.path({program:?})"))
+                through(anchor).map(|program| format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})"))
             } else {
                 None
             };
@@ -6063,6 +6091,24 @@ const AUTOLOAD_RUNTIME: &str = r##"
       next unless mod.is_a?(Module)
       next unless mod.constants(false).include?(name) && !mod.const_defined?(name, false)
       mod.send(:remove_const, name)
+    end
+  end
+
+  # A load-time dependency on a constant whose program loads it
+  # (load_declarations_through_their_program): that program, unless it is
+  # loading now (entered, not yet a loaded feature), when it is the file
+  # being required on its way: then the declarations file, as the program
+  # itself loads it. Requiring the in-flight program is a circular
+  # require natively absent, which Core's StrictWarning raises.
+  def self.require_through(program, declarations)
+    @loaded_programs ||= {}
+    if @loaded_programs.key?(program) || !@entered&.key?(program)
+      require path(program)
+    elsif $LOADED_FEATURES.include?(path(program))
+      @loaded_programs[program] = true
+      require path(program)
+    else
+      require path(declarations)
     end
   end
 
