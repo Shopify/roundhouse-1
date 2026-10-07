@@ -377,6 +377,8 @@ pub struct BodyTyper<'a> {
     /// [`crate::analyze::inquiry`]); empty for the bare constructor,
     /// which the runtime-source typer and tests use.
     inquirers: Option<&'a crate::det::HashSet<Symbol>>,
+    /// The base each load hook fires with (see `Analyzer::load_hook_bases`).
+    load_hook_bases: Option<&'a std::collections::BTreeMap<String, ClassId>>,
 }
 
 impl<'a> BodyTyper<'a> {
@@ -409,8 +411,48 @@ impl<'a> BodyTyper<'a> {
         info.constants.contains_key(name).then(|| info.gem.clone().map(|gem| (gem, info.gem_loaded))).flatten()
     }
 
+    /// The gem owning the nearest enclosing namespace of `name` that the
+    /// registry knows, when that namespace is a gem's (its RBI declares
+    /// it, and neither the app nor the framework catalog does).
+    fn namespace_gem(&self, name: &str) -> Option<String> {
+        let mut scope = name;
+        while let Some((outer, _)) = scope.rsplit_once("::") {
+            scope = outer;
+            if let Some(info) = self.classes().get(&ClassId(Symbol::from(scope))) {
+                if info.app_declared {
+                    return None;
+                }
+                return info.gem.clone();
+            }
+        }
+        None
+    }
+
+    /// The gem that provides the unindexed constant `name` at runtime on
+    /// the CRuby tree: the gem owning its nearest known namespace, when
+    /// the tree loads that gem natively.
+    fn runtime_constant_owner(&self, name: &str) -> Option<String> {
+        let gem = self.namespace_gem(name)?;
+        let mut scope = name;
+        while let Some((outer, _)) = scope.rsplit_once("::") {
+            scope = outer;
+            if let Some(info) = self.classes().get(&ClassId(Symbol::from(scope))) {
+                return info.gem_loaded.then_some(gem);
+            }
+        }
+        None
+    }
+
     pub fn new(classes: &'a HashMap<ClassId, ClassInfo>) -> Self {
-        Self { classes, deps: None, const_resolver: None, typed_constants: None, data_factories: None, inquirers: None }
+        Self {
+            classes,
+            deps: None,
+            const_resolver: None,
+            typed_constants: None,
+            data_factories: None,
+            inquirers: None,
+            load_hook_bases: None,
+        }
     }
 
     /// The app-wide bare-name value of `name`, noted as a read.
@@ -449,6 +491,11 @@ impl<'a> BodyTyper<'a> {
 
     /// Name the app's inquirer-returning methods, so their predicates
     /// type as Bool instead of failing dispatch on `Str`.
+    pub fn with_load_hook_bases(mut self, bases: &'a std::collections::BTreeMap<String, ClassId>) -> Self {
+        self.load_hook_bases = Some(bases);
+        self
+    }
+
     pub fn with_inquirers(
         mut self,
         inquirers: &'a crate::det::HashSet<Symbol>,
@@ -1500,6 +1547,16 @@ impl<'a> BodyTyper<'a> {
                             block_ctx.class_side = self.is_class_object(receiver, ctx);
                         }
                     }
+                    // `ActiveSupport.on_load(:hook) { … }`: lazy_load_hooks
+                    // `class_eval`s the block on the base the hook fires with.
+                    if method.as_str() == "on_load"
+                        && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ActiveSupport"))
+                        && let Some(ExprNode::Lit { value: crate::expr::Literal::Sym { value: hook } }) = args.first().map(|a| &*a.node)
+                        && let Some(base) = self.load_hook_bases.and_then(|bases| bases.get(hook.as_str()))
+                    {
+                        block_ctx.self_ty = Some(Ty::Class { id: base.clone(), args: vec![] });
+                        block_ctx.class_side = true;
+                    }
                     let method_ref_ty = self.analyze_expr(b, &block_ctx);
                     // The Lambda walker stores the analyzed body's type
                     // on the body expr itself. `map`/`collect`/similar
@@ -2540,11 +2597,41 @@ impl<'a> BodyTyper<'a> {
                     });
                 }
                 let missing = missing.into_inner();
-                if !missing.is_empty() {
+                if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 {
+                    // Decided by the registry that saw the gems' namespaces
+                    // (the analyzer's); a lowerer's reduced registry does
+                    // not re-decide it.
+                } else if !missing.is_empty() {
+                    // Ruby never evaluates the annotation. Where each name
+                    // sits in a namespace a gem the CRuby tree loads owns,
+                    // that tree runs the authored value, typed as the
+                    // opaque declared class; anything else stays refused.
+                    let owners: Vec<Option<String>> =
+                        missing.iter().map(|name| self.runtime_constant_owner(name)).collect();
+                    let detail = if owners.iter().all(Option::is_some) {
+                        expr.decisions |= crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT;
+                        let gems: Vec<String> = owners.into_iter().flatten().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                        format!(
+                            "{} has no indexed declaration; the {} gem{} the CRuby tree loads provide{} it at runtime, so the value runs and is typed as opaque",
+                            missing.join(", "),
+                            gems.join(", "),
+                            if gems.len() == 1 { "" } else { "s" },
+                            if gems.len() == 1 { "s" } else { "" },
+                        )
+                    } else if let Some((name, gem, reason)) = missing.iter().find_map(|name| {
+                        let gem = self.namespace_gem(name)?;
+                        crate::project::gem_requires_rails(&gem).map(|reason| (name.clone(), gem, reason))
+                    }) {
+                        format!(
+                            "{name} is in a namespace of the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree has it"
+                        )
+                    } else {
+                        format!("{} has no indexed declaration or modeled dependency", missing.join(", "))
+                    };
                     expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                         target: None,
                         construct: Symbol::from("declared type"),
-                        detail: format!("{} has no indexed declaration or modeled dependency", missing.join(", ")),
+                        detail,
                     });
                 } else {
                     if expr.decisions & crate::expr::SOURCE_TYPE_ASCRIPTION != 0 {

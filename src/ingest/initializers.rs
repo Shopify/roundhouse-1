@@ -85,6 +85,11 @@ pub fn consumed(file: &str) -> Vec<(usize, usize)> {
     CONSUMED.with(|c| c.borrow().get(file).cloned().unwrap_or_default())
 }
 
+/// The ranges a reader refused in `file` so far.
+pub(super) fn refused_ranges(file: &str) -> Vec<(usize, usize)> {
+    REFUSED.with(|r| r.borrow().iter().filter(|x| x.file == file).map(|x| (x.start, x.end)).collect())
+}
+
 /// [`consume`] a prism node's whole location.
 pub(super) fn consume_node(file: &str, node: &Node<'_>) {
     let loc = node.location();
@@ -504,6 +509,73 @@ pub(super) fn survey(app: &mut App) {
     app.initializer_gaps = gaps;
 }
 
+/// One statement of a boot initializer and what the emitted app does
+/// with it (`roundhouse check --initializer-ledger`).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LedgerRow {
+    pub file: String,
+    pub line: usize,
+    pub construct: String,
+    /// `applied` (a reader consumed it), `refused` (a reader named why
+    /// not), `unmodeled` (no reader recognized it), each the survey's
+    /// rule; `container` rows are a statement a reader descended into,
+    /// whose children follow.
+    pub fate: &'static str,
+    pub detail: String,
+}
+
+/// Every top-level statement of every boot initializer, in boot order,
+/// with its fate under the same rule [`survey`] reports gaps by. Call
+/// after ingest, on the same thread.
+pub fn ledger(app: &App) -> Vec<LedgerRow> {
+    fn walk(stmts: Vec<Node<'_>>, ranges: &[(usize, usize)], refused: &[&Refusal], src: &str, file: &str, out: &mut Vec<LedgerRow>) {
+        for stmt in stmts {
+            let loc = stmt.location();
+            let (start, end) = (loc.start_offset(), loc.end_offset());
+            let line = src[..start].matches('\n').count() + 1;
+            let construct = construct_of(&stmt, src);
+            let row = |fate, detail| LedgerRow { file: file.to_string(), line, construct: construct.clone(), fate, detail };
+            if ranges.iter().any(|&(a, b)| a <= start && end <= b) {
+                out.push(row("applied", first_line(&src[start..end])));
+                continue;
+            }
+            let lists = child_statement_lists(&stmt);
+            let descended = ranges.iter().any(|&(a, b)| {
+                start <= a
+                    && b <= end
+                    && lists.iter().any(|list| {
+                        let first = list.first().map(|n| n.location().start_offset()).unwrap_or(0);
+                        let last = list.last().map(|n| n.location().end_offset()).unwrap_or(0);
+                        first <= a && b <= last
+                    })
+            });
+            if descended {
+                out.push(row("container", first_line(&src[start..end])));
+                for list in lists {
+                    walk(list, ranges, refused, src, file, out);
+                }
+                continue;
+            }
+            match refused.iter().find(|r| start <= r.start && r.end <= end) {
+                Some(r) => out.push(row("refused", r.reason.clone())),
+                None => out.push(row("unmodeled", first_line(&src[start..end]))),
+            }
+        }
+    }
+    let refusals = REFUSED.with(|r| r.borrow().clone());
+    let mut out = Vec::new();
+    for path in &app.initializer_files {
+        let Some(source) = app.sources.iter().find(|s| &s.path == path) else { continue };
+        let ranges = consumed(path);
+        let refused: Vec<&Refusal> = refusals.iter().filter(|r| &r.file == path).collect();
+        let result = ruby_prism::parse(source.text.as_bytes());
+        let root = result.node();
+        let Some(program) = root.as_program_node() else { continue };
+        walk(program.statements().body().iter().collect(), &ranges, &refused, &source.text, path, &mut out);
+    }
+    out
+}
+
 fn survey_statements(
     stmts: Vec<Node<'_>>,
     ranges: &[(usize, usize)],
@@ -570,7 +642,7 @@ fn first_line(text: &str) -> String {
 /// receiverless call (`require`), `<expr>.<method>` for any other
 /// receiver, and the statement kind otherwise (`if`, `class`, `constant
 /// assignment`).
-fn construct_of(node: &Node<'_>, src: &str) -> String {
+pub(super) fn construct_of(node: &Node<'_>, src: &str) -> String {
     let with_receiver = |receiver: Option<Node<'_>>, member: String| match receiver {
         None => member,
         Some(r) => format!("{}.{member}", receiver_label(&r, src)),

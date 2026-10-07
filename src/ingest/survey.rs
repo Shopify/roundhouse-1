@@ -92,6 +92,18 @@ pub(super) fn continue_or_fail(err: IngestError) -> IngestResult<()> {
     }
 }
 
+/// How many gaps the collector holds (0 when survey mode is off).
+pub(super) fn recorded_len() -> usize {
+    SURVEY_STATE.with(|s| s.borrow().as_ref().map_or(0, |survey| survey.gaps.len()))
+}
+
+/// The first gap recorded after the collector held `len`.
+pub(super) fn recorded_since(len: usize) -> Option<String> {
+    SURVEY_STATE.with(|s| {
+        s.borrow().as_ref().and_then(|survey| survey.gaps.get(len).map(|e| err_message(e).to_string()))
+    })
+}
+
 /// Push an ingest error into the per-thread collector. No-op if
 /// survey mode isn't active (so callers can record unconditionally).
 pub fn record(err: &IngestError) {

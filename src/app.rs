@@ -361,6 +361,27 @@ pub struct App {
     /// holder's file in this order (`ingest::initializer_constants`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub initializer_constants: Vec<InitializerConstants>,
+    /// The statements of each boot initializer the emitted boot runs,
+    /// one holder per initializer, in [`Self::initializer_files`] order
+    /// (`ingest::initializer_programs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initializer_programs: Vec<InitializerProgram>,
+    /// Framework load hooks the app's initializers register for, with
+    /// the base Rails fires each with (`ingest::initializer_programs`).
+    /// The emitted boot fires them where the runtime has loaded the base.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub framework_load_hooks: Vec<FrameworkLoadHook>,
+    /// `ActiveSupport.run_load_hooks(:hook, base)` written in a class or
+    /// module body, or at the top level of an app file, after the class
+    /// it names: the emitted class file ends with it
+    /// (`ingest::initializer_programs::class_load_hooks`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_load_hooks: Vec<ClassLoadHook>,
+    /// Each load hook the app's code fires, with the base it fires it
+    /// with (`Object` when it passes none): the `self` of an initializer's
+    /// `ActiveSupport.on_load(:hook)` block.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub load_hook_bases: std::collections::BTreeMap<String, String>,
     /// `ActiveSupport.on_load(:hook)` blocks of boot initializers, lifted
     /// onto the Application reopen in boot order
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
@@ -772,6 +793,47 @@ pub struct InitializerConstants {
     pub names: Vec<crate::ident::Symbol>,
 }
 
+/// The statements of one boot initializer the emitted boot runs, as the
+/// body of `holder.run_initializer` (`ingest::initializer_programs`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InitializerProgram {
+    /// The initializer, relative to the app root.
+    pub file: String,
+    /// The holder module in `App::library_classes`.
+    pub holder: crate::ident::ClassId,
+    /// Statements carried (top level, and inside a deferred block).
+    pub statements: usize,
+}
+
+/// A framework load hook an initializer registers for, and the runtime
+/// class Rails fires it with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrameworkLoadHook {
+    pub hook: String,
+    /// The base (`ActiveRecord::Base`).
+    pub base: String,
+    /// Where Rails fires it (`activerecord/lib/active_record/base.rb:336`).
+    pub site: String,
+}
+
+/// An app's own `ActiveSupport.run_load_hooks` at class-body or file
+/// level.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClassLoadHook {
+    /// The hook name, as written (a Symbol, or a String).
+    pub hook: String,
+    /// The hook literal as Ruby (`:shop`, `"x"`).
+    pub hook_literal: String,
+    /// The base expression as emitted (`Shop`, `Object`).
+    pub base: String,
+    /// The class or module whose emitted file the call ends.
+    pub class: String,
+    /// `file:line` of the call, relative to the app root.
+    pub site: String,
+    /// The call.
+    pub span: crate::span::Span,
+}
+
 /// One `ActiveSupport.on_load(:hook)` block of a boot initializer, lifted
 /// to `Rails.application.<method>(base)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -963,6 +1025,10 @@ impl App {
             initializer_files: Vec::new(),
             initializer_gaps: Vec::new(),
             initializer_constants: Vec::new(),
+            initializer_programs: Vec::new(),
+            framework_load_hooks: Vec::new(),
+            class_load_hooks: Vec::new(),
+            load_hook_bases: std::collections::BTreeMap::new(),
             load_hooks: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),

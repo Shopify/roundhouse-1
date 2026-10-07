@@ -3304,6 +3304,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read lazy load hooks runtime: {e}"))?;
     files.push(("runtime/active_support_lazy_load_hooks.rb".into(), hooks));
     let registrations = load_hook_registrations(app);
+    let programs = initializer_program_block(app);
+    apply_class_load_hooks(files, app);
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
@@ -3359,6 +3361,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             );
             content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
+            content.push_str(&programs);
             content.push_str(
                 "# Application#initialize!'s Finisher (middleware, to_prepare,\n\
                  # after_initialize), after the app's code and initializers.\n\
@@ -3775,6 +3778,70 @@ fn gem_source_dependency_block(app: &App) -> String {
          end\n",
     );
     out
+}
+
+/// Fire the framework load hooks where the runtime has loaded each
+/// base, then run each boot initializer's carried statements
+/// (`ingest::initializer_programs`) in Rails' `load_config_initializers`
+/// order, after the gems' railtie initializers and before the Finisher.
+fn initializer_program_block(app: &App) -> String {
+    if app.initializer_programs.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# Rails fires each framework's load hook as the file defining its base\n\
+         # ends (`ActiveSupport.run_load_hooks`, at the site noted). The runtime\n\
+         # has defined these bases by here, so a hook the initializers below\n\
+         # register runs at registration, as in Rails once the framework is loaded.\n",
+    );
+    for (hook, base, site) in crate::ingest::initializer_programs::FRAMEWORK_LOAD_HOOKS {
+        out.push_str(&format!("ActiveSupport.run_load_hooks(:{hook}, {base}) # {site}\n"));
+    }
+    out.push_str(
+        "# The boot initializers' statements (ingest::initializer_programs), file\n\
+         # by file in load_config_initializers order (engines, then the app).\n\
+         # A statement that raises names itself (error[initializer_statement_not_run])\n\
+         # and the next one runs.\n",
+    );
+    for program in &app.initializer_programs {
+        let stem = format!("app/models/{}", crate::naming::underscore(program.holder.0.as_str()));
+        out.push_str(&format!(
+            "# {}: {} statement(s)\nrequire_relative {stem:?}\n{}.{}\n",
+            program.file,
+            program.statements,
+            program.holder.0.as_str(),
+            crate::ingest::initializer_programs::RUN_METHOD
+        ));
+    }
+    out
+}
+
+/// End each emitted class file with the `ActiveSupport.run_load_hooks`
+/// its source wrote in the class body (or after it, at the file's top
+/// level), so the hook fires when the class loads, as in Rails. A class
+/// the tree has no file for is named, not skipped.
+fn apply_class_load_hooks(files: &mut [(String, String)], app: &App) {
+    for hook in &app.class_load_hooks {
+        let stem = crate::naming::underscore(&hook.class);
+        let candidates = [format!("app/models/{stem}.rb"), format!("app/controllers/{stem}.rb")];
+        let Some((_, content)) = files.iter_mut().find(|(p, _)| candidates.contains(p)) else {
+            emit::diagnostics::report_unsupported(
+                hook.span,
+                "ruby",
+                "ActiveSupport.run_load_hooks",
+                format!("`{}` has no emitted file; `{}` hooks do not fire at its load", hook.class, hook.hook_literal),
+            );
+            continue;
+        };
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&format!(
+            "\n# {}: the class body's `ActiveSupport.run_load_hooks`, after the body\n\
+             ActiveSupport.run_load_hooks({}, {})\n",
+            hook.site, hook.hook_literal, hook.base
+        ));
+    }
 }
 
 /// The boot-time registration of each `ActiveSupport.on_load` block the
@@ -5700,6 +5767,18 @@ fn report_unsupported_block_captures(app: &App, target: BuildTarget) {
 /// runs on the CRuby tree only where the tree carries the port file.
 fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(String, String)]) {
     fn visit(app: &App, target: BuildTarget, files: &[(String, String)], expr: &crate::expr::Expr) {
+        // A declared type only such a gem provides at runtime
+        // (`DECLARED_TYPE_RUNTIME_CONSTANT`), refused the same way.
+        if expr.decisions & crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT != 0 && target != BuildTarget::Ruby {
+            if let Some(crate::diagnostic::DiagnosticKind::Unsupported { detail, .. }) = &expr.diagnostic {
+                emit::diagnostics::report_unsupported(
+                    expr.span,
+                    target.as_str(),
+                    "declared type",
+                    format!("{detail}; the {} tree does not load the gem", target.as_str()),
+                );
+            }
+        }
         if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
             if let crate::expr::ExprNode::Const { path } = &*expr.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
