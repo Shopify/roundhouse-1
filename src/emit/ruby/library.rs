@@ -1435,7 +1435,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 || crate::lower::scope_chain::mentions_assoc_class_method(
                     &m.body,
                     &assocs,
-                    &scopes,
+                    &names,
                     &assoc_class_methods,
                 )
                 || (class_self.is_some()
@@ -6626,6 +6626,20 @@ impl ConstantReaderIndex {
         CONSTANT_READER_INDEX
             .with(|slot| slot.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, index)| index.clone()))
     }
+}
+
+/// Both lookup indexes, installed for the life of the returned guard.
+/// `emit_library_class_decls` installs its own; the model, controller and
+/// view emits in `emit_with_assertions` run outside it and, without
+/// these, walked every library class per emitted class
+/// (`constant_readers`) and scanned them per constant reference.
+pub(super) struct LookupIndexes<'a> {
+    _readers: ConstantReaderIndexGuard<'a>,
+    _names: NameIndexGuard<'a>,
+}
+
+pub(super) fn install_lookup_indexes(app: &App) -> LookupIndexes<'_> {
+    LookupIndexes { _readers: ConstantReaderIndex::install(app), _names: NameIndex::install(app) }
 }
 
 /// The app's class names, for the per-reference lookups: model and

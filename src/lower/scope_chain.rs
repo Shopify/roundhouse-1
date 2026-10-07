@@ -1868,18 +1868,22 @@ pub fn mentions_assoc_extension(expr: &Expr, assocs: &AssocRegistry) -> bool {
 /// `rewrite_call_site`, alongside `mentions_assoc_constructor`: such a
 /// body may name no scope and start no model chain, and without a gate
 /// it never reaches the rewriter at all.
+///
+/// `scope_names` is `all_scope_names(scopes)`, computed once by the
+/// caller: this runs per method body, and rebuilding the set each time
+/// was most of the Ruby emit's model lowering on Shopify Core's full
+/// closure (one set of every scope name, per method).
 pub fn mentions_assoc_class_method(
     expr: &Expr,
     assocs: &AssocRegistry,
-    scopes: &ScopeRegistry,
+    scope_names: &HashSet<Symbol>,
     acm: &AssocClassMethods,
 ) -> bool {
     if acm.is_empty() {
         return false;
     }
-    let names = all_scope_names(scopes);
     let mut demand: HashSet<(Symbol, Symbol)> = HashSet::default();
-    collect_assoc_method_demand(expr, assocs, &names, &mut demand);
+    collect_assoc_method_demand(expr, assocs, scope_names, &mut demand);
     demand
         .iter()
         .any(|(_, m)| acm.values().any(|per_model| per_model.contains_key(m)))

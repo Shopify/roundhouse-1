@@ -841,6 +841,7 @@ pub fn emit_with_assertions(
     app: &App,
     assertion_mode: crate::lower::test_module_to_library::inline_assertions::AssertionMode,
 ) -> Vec<EmittedFile> {
+    let _indexes = library::install_lookup_indexes(app);
     let mut files = Vec::new();
     files.extend(emit_lowered_schema_pair(app));
     // routes.rb gets a require-relative header prepended (see
