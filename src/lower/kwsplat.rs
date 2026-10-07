@@ -110,7 +110,7 @@ use crate::det::HashMap;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
-use crate::dialect::{MethodReceiver, ModelBodyItem};
+use crate::dialect::{ControllerBodyItem, MethodReceiver, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::dialect::Param;
@@ -128,6 +128,10 @@ use crate::ty::Ty;
 #[derive(Default)]
 struct Signatures {
     methods: HashMap<(ClassId, Symbol), Vec<Param>>,
+    /// Controller `ClassMethod` (and copied Concern macros) parameter
+    /// lists. Kept separate from `methods` so a receiverless call in a
+    /// `def self.` cannot resolve to an instance method of the same name.
+    class_methods: HashMap<(ClassId, Symbol), Vec<Param>>,
     /// Superclass links, so a call landing on an inherited `initialize`
     /// still resolves.
     parents: HashMap<ClassId, ClassId>,
@@ -154,14 +158,18 @@ pub(crate) fn restore_kwrest_in_test_helpers(app: &mut App) {
     apply_to_test_modules(app, &mut Vec::new());
 }
 
-/// The receiverless half for models and library classes: `render_code(
-/// size: 2, **opts)` inside the class that defines `render_code`, or
-/// inside a concern it includes. The body typer leaves these sends
-/// `recv: None`, so the receiver-typed walk above never sees them.
-/// Each class's view is its own instance methods, its ancestors', and
-/// every module it includes, transitively. Only instance method bodies
-/// are rewritten: a receiverless call in a `def self.` reaches the
-/// class side, which the view does not hold.
+/// The receiverless half for models, library classes, and controller
+/// class methods: `render_code(size: 2, **opts)` inside the class that
+/// defines `render_code`, or a Concern macro's
+/// `add_preload_definition(kind: …, **options)` after
+/// `ingest::class_attribute` copies it onto the includer. The body
+/// typer leaves these sends `recv: None`, so the receiver-typed walk
+/// above never sees them. Each class's view is its own methods, its
+/// ancestors', and every module it includes, transitively.
+///
+/// Instance method bodies use the instance-method table; controller
+/// `ClassMethod` bodies use the class-method table — a receiverless
+/// call in a `def self.` reaches the class side.
 fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnostic>) {
     let mut includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
@@ -170,16 +178,26 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
     for model in &app.models {
         includes.insert(model.name.clone(), crate::analyze::model_includes(model));
     }
-    // Each owner's own methods, indexed once. Scanning every signature
-    // in the app for every class on every class's ancestry was
+    for controller in &app.controllers {
+        includes.insert(
+            controller.name.clone(),
+            crate::analyze::controller_includes(controller),
+        );
+    }
+    // Each owner's own methods, indexed once per side. Scanning every
+    // signature in the app for every class on every class's ancestry was
     // |classes| * depth * |methods|: 465 s of post-analyze on the v3.1
     // Core slice. A (owner, name) key is unique, so within one owner the
     // order these are visited in cannot change which entry wins.
-    let mut by_owner: HashMap<&ClassId, Vec<(&Symbol, &Vec<Param>)>> = HashMap::default();
+    let mut instance_by_owner: HashMap<&ClassId, Vec<(&Symbol, &Vec<Param>)>> = HashMap::default();
     for ((owner, name), params) in &sigs.methods {
-        by_owner.entry(owner).or_default().push((name, params));
+        instance_by_owner.entry(owner).or_default().push((name, params));
     }
-    let view_of = |id: &ClassId| -> HashMap<Symbol, Vec<Param>> {
+    let mut class_by_owner: HashMap<&ClassId, Vec<(&Symbol, &Vec<Param>)>> = HashMap::default();
+    for ((owner, name), params) in &sigs.class_methods {
+        class_by_owner.entry(owner).or_default().push((name, params));
+    }
+    let view_of = |id: &ClassId, class_side: bool| -> HashMap<Symbol, Vec<Param>> {
         let mut out: HashMap<Symbol, Vec<Param>> = HashMap::default();
         let mut queue: Vec<ClassId> = vec![id.clone()];
         let mut seen: std::collections::BTreeSet<ClassId> = std::collections::BTreeSet::new();
@@ -187,6 +205,7 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
             if !seen.insert(cid.clone()) {
                 continue;
             }
+            let by_owner = if class_side { &class_by_owner } else { &instance_by_owner };
             for (name, params) in by_owner.get(&cid).map(Vec::as_slice).unwrap_or_default() {
                 // Nearest definition wins: the class itself is
                 // visited first, then what it reaches.
@@ -202,7 +221,7 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
         out
     };
     for lc in &mut app.library_classes {
-        let view = view_of(&lc.name);
+        let view = view_of(&lc.name, false);
         if view.is_empty() {
             continue;
         }
@@ -213,7 +232,7 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
         }
     }
     for model in &mut app.models {
-        let view = view_of(&model.name);
+        let view = view_of(&model.name, false);
         if view.is_empty() {
             continue;
         }
@@ -222,6 +241,20 @@ fn apply_to_self_sends(app: &mut App, sigs: &Signatures, diags: &mut Vec<Diagnos
                 if matches!(method.receiver, MethodReceiver::Instance) {
                     rewrite_self_sends(&mut method.body, &view, diags);
                 }
+            }
+        }
+    }
+    // Concern macros writing a `class_attribute` are class methods on
+    // the includer; their erased `**options` must expand here or the
+    // emitted Ruby raises at class load (wrong number of arguments).
+    for controller in &mut app.controllers {
+        let view = view_of(&controller.name, true);
+        if view.is_empty() {
+            continue;
+        }
+        for item in &mut controller.body {
+            if let ControllerBodyItem::ClassMethod { method, .. } = item {
+                rewrite_self_sends(&mut method.body, &view, diags);
             }
         }
     }
@@ -282,9 +315,10 @@ fn rewrite_self_sends(expr: &mut Expr, helpers: &HashMap<Symbol, Vec<Param>>, di
     restore_kwrest_splat(args, params);
 }
 
-/// Every instance method an app class declares. Class-side methods are
-/// skipped: a `Class.new(…)` call resolves to `initialize`, and no other
-/// receiver shape this pass matches reaches a `def self.`.
+/// Every instance method an app class declares, plus every controller
+/// class method. Instance and class-side tables stay separate: a
+/// `Class.new(…)` call resolves to `initialize` on the instance table,
+/// while a receiverless call in a `def self.` uses the class-side table.
 fn collect_signatures(app: &App) -> Signatures {
     let mut sigs = Signatures::default();
     for lc in &app.library_classes {
@@ -307,6 +341,19 @@ fn collect_signatures(app: &App) -> Signatures {
                         method.params.clone(),
                     );
                 }
+            }
+        }
+    }
+    for controller in &app.controllers {
+        if let Some(parent) = &controller.parent {
+            sigs.parents.insert(controller.name.clone(), parent.clone());
+        }
+        for item in &controller.body {
+            if let ControllerBodyItem::ClassMethod { method, .. } = item {
+                sigs.class_methods.insert(
+                    (controller.name.clone(), method.name.clone()),
+                    method.params.clone(),
+                );
             }
         }
     }

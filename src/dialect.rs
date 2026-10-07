@@ -44,6 +44,12 @@ pub struct Model {
     /// the Ruby emitter reproduces the source's superclass verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path (`< ActionController::RoutingError`),
+    /// when the parent was a source Const. Synthetic when the parent was
+    /// synthesized or absent — the ruby-family availability gate skips
+    /// synthetic loci.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     pub table: TableRef,
     /// The column named by `self.primary_key = "…"`, when the model
     /// overrides Rails' `id` default. `None` means `id`.
@@ -886,6 +892,10 @@ pub struct LibraryClass {
     pub is_module: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path when ingested from source.
+    /// Synthetic for synthesized classes and modules with no parent.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     /// `include` directives at the class top level, in source order
     /// (e.g. `Enumerable`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1265,6 +1275,9 @@ fn is_pure_effects(e: &crate::effect::EffectSet) -> bool {
 pub struct Controller {
     pub name: ClassId,
     pub parent: Option<ClassId>,
+    /// Span of the superclass constant path when ingested from source.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
     /// Source-ordered class body. Same shape as `Model.body` — the
     /// emitter iterates in order so `private` markers land at the right
     /// position and unknown class-body calls round-trip verbatim.
@@ -1277,15 +1290,23 @@ pub struct Controller {
     #[serde(default, skip_serializing_if = "LayoutDecl::is_inherit")]
     pub layout: LayoutDecl,
     /// Empty-bodied top-level classes declared alongside the controller
-    /// in its source file, as (name, parent) pairs — lobsters'
-    /// `login_controller.rb` opens with `class LoginFailedError <
-    /// StandardError; end` and four siblings that the actions
-    /// raise/rescue. Only the empty-body shape is captured (a pure
-    /// declaration); a sibling with real methods stays dropped and
-    /// surfaces through diagnostics as before. The Ruby emit path
-    /// re-declares these ahead of the controller class.
+    /// in its source file — lobsters' `login_controller.rb` opens with
+    /// `class LoginFailedError < StandardError; end` and four siblings
+    /// that the actions raise/rescue. Only the empty-body shape is
+    /// captured; a sibling with real methods stays dropped. The Ruby
+    /// emit path re-declares these ahead of the controller class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sibling_classes: Vec<(Symbol, Symbol)>,
+    pub sibling_classes: Vec<SiblingClass>,
+}
+
+/// An empty-bodied class beside a controller (`class X < Parent; end`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SiblingClass {
+    pub name: Symbol,
+    pub parent: Symbol,
+    /// Span of the superclass constant path.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub parent_span: Span,
 }
 
 /// What `layout` was declared at the controller class level.
@@ -1378,12 +1399,15 @@ impl Controller {
     }
 }
 
-/// The two method forms admitted by finite class configuration.
+/// The two method forms admitted by finite class configuration, plus
+/// `ClassAttribute`: a Concern class method copied onto its includer
+/// that reads or writes a `class_attribute` (`ingest::class_attribute`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassConfigurationRole {
     Writer,
     Reader,
+    ClassAttribute,
 }
 
 /// One statement inside a controller class body, in source order.
@@ -1674,6 +1698,10 @@ pub struct RouteTable {
     /// writes by hand when it wants the same thing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redirects: Vec<RedirectRoute>,
+    /// Recovered route omissions stay errors in the normal diagnostic stream,
+    /// so callers can inspect supported siblings without claiming full support.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
 }
 
 /// One `to: redirect(...)` route, as the action synthesized for it.
@@ -1772,8 +1800,13 @@ pub enum RouteSpec {
         scope: ResourceScope,
     },
     /// `root "controller#action"` — shorthand for `GET /` routed to the
-    /// given target, with `:root` as the generated name.
-    Root { target: String },
+    /// given target. Helper name defaults to `{prefix}root`; `as:`
+    /// overrides via [`Self::Root::as_name`].
+    Root {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        as_name: Option<Symbol>,
+    },
     /// `resources :name [, only: [...]] [, except: [...]] [do ... end]`.
     /// `only` and `except` are empty-on-default (an empty `only` means
     /// "all seven standard actions," matching Rails' behavior). Nested

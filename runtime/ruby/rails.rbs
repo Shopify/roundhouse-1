@@ -84,6 +84,8 @@ module Rails
     def credentials: () -> Hash[Symbol, untyped]
     def config_time_zone: () -> String
     def active_storage_excluded_content_types: () -> Array[String]
+    def active_storage_video_preview_arguments: () -> String
+    def active_storage_previewers: () -> Array[untyped]
     def vips_block_untrusted: () -> bool
     def vips_blocked_operations: () -> Array[String]
     def pagination_default_per_page: () -> Integer

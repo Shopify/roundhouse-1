@@ -41,6 +41,7 @@
 # target compiles against.
 
 require "sqlite3"
+require "fileutils"
 
 module Db
   @pool    = nil
@@ -65,6 +66,10 @@ module Db
   # lease. See `start_checkpointer`.
   @checkpoint_wanted = false
   @checkpointer_pid  = nil
+  # The process-shared flock File while this process holds it. Retained
+  # so `adopt_after_fork` can close the child's inherited copy without
+  # LOCK_UN (parent keeps the lock). Cleared on release.
+  @checkpoint_lock_file = nil
   # Failed resources stay reachable, but never re-enter the free list.
   @quarantined = []
   @missing_connections = 0
@@ -166,6 +171,16 @@ module Db
     # compile-time accident is not agreement, so each states it.
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    # Page cache + mmap — same measured knobs as runtime/spinel/db.rb
+    # (roundhouse#17 CRuby half). SQLite's default cache is 2 MB; a
+    # long-lived serving process re-reads the working set from the OS
+    # on every visit. Spinel measured ~400 pread64s per /top visit at
+    # the default vs a large cache; tip CRuby still opened at
+    # cache_size=-2000 / mmap_size=0. Negative cache_size is a KiB
+    # budget (-65536 = 64 MiB); mmap_size maps the file so hits skip
+    # the read() copy. Harmless on :memory: (pages are already heap).
+    db.execute("PRAGMA cache_size=-65536")
+    db.execute("PRAGMA mmap_size=268435456")
     # The gem's default is 0: a second writer fails at once with
     # SQLITE_BUSY. Rails' database.yml says `timeout: 5000`, and so do
     # the binary's PRAGMAS — the harness's file database (see
@@ -213,6 +228,19 @@ module Db
       # Re-checked under the lock: every worker thread in a fresh child
       # reaches this together on the first request.
       if @owner_pid != Process.pid
+        # Drop the inherited checkpoint-lock FD without LOCK_UN. The
+        # parent may still hold the flock via its own descriptor; if we
+        # unlocked here we would release the parent's hold. Closing the
+        # child copy lets a surviving worker acquire after the parent
+        # exits (Puma preload / clustered fork after checkpointer start).
+        inherited = @checkpoint_lock_file
+        if inherited && !inherited.closed?
+          begin
+            inherited.close
+          rescue StandardError
+          end
+        end
+        @checkpoint_lock_file = nil
         # The parent's handles are simply dropped. They are already
         # discarded by the gem's fork safety, and closing a descriptor
         # this process shares with its parent is not ours to do.
@@ -666,26 +694,82 @@ module Db
     end
   end
 
+  # One checkpointer across WEB_CONCURRENCY / Resque siblings (the bit
+  # Campfire once-campfire#319 adds on top of the same PASSIVE loop).
+  # Without a flock every forked worker runs its own 250ms PASSIVE and
+  # they contend on the WAL; with it, losers skip the tick. Lock file
+  # sits next to the database so each file-backed DB has its own.
+  def self.checkpoint_lock_path(path)
+    File.join(File.dirname(path), ".#{File.basename(path)}.wal_checkpoint.lock")
+  end
+
+  # File on acquire, `:busy` when another process holds the flock, `nil`
+  # when the lock file cannot be used (mkdir/open/flock error). Callers
+  # skip only on `:busy`; `nil` still checkpoints so a broken lock path
+  # cannot disable WAL copy after `wal_autocheckpoint=0`.
+  def self.try_checkpoint_lock(lock_path)
+    file = nil
+    FileUtils.mkdir_p(File.dirname(lock_path))
+    file = File.open(lock_path, File::RDWR | File::CREAT, 0644)
+    if file.flock(File::LOCK_EX | File::LOCK_NB)
+      @checkpoint_lock_file = file
+      return file
+    end
+    file.close
+    :busy
+  rescue StandardError
+    begin
+      file.close if file && !file.closed?
+    rescue StandardError
+    end
+    nil
+  end
+
+  def self.release_checkpoint_lock(file)
+    return if file.nil? || !file.is_a?(File)
+    begin
+      file.flock(File::LOCK_UN)
+    ensure
+      file.close
+      @checkpoint_lock_file = nil if @checkpoint_lock_file.equal?(file)
+    end
+  rescue StandardError
+  end
+
   def self.checkpoint_loop(path)
     conn = SQLite3::Database.new(path)
     conn.busy_handler_timeout = 100
+    lock_path = checkpoint_lock_path(path)
     loop do
-      sleep CHECKPOINT_INTERVAL
+      # Hold the flock for the whole inner loop (Campfire #319), not
+      # per tick: releasing every 250ms lets a sibling overlap a
+      # PASSIVE with ours. Losers sleep and retry; a dead winner
+      # drops the flock so another worker takes over.
+      lock = try_checkpoint_lock(lock_path)
+      if lock == :busy
+        sleep CHECKPOINT_INTERVAL
+        next
+      end
       begin
-        row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)")[0]
-        log_frames = row.nil? ? 0 : row[1].to_i
-        if log_frames >= CHECKPOINT_RESTART_FRAMES
-          if acquire_permit
-            begin
-              conn.execute("PRAGMA wal_checkpoint(RESTART)")
-            ensure
-              release_permit
+        loop do
+          sleep CHECKPOINT_INTERVAL
+          row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)")[0]
+          log_frames = row.nil? ? 0 : row[1].to_i
+          if log_frames >= CHECKPOINT_RESTART_FRAMES
+            if acquire_permit
+              begin
+                conn.execute("PRAGMA wal_checkpoint(RESTART)")
+              ensure
+                release_permit
+              end
             end
           end
         end
       rescue StandardError
-        # A busy or failed checkpoint is retried on the next tick; the
-        # log only grows meanwhile.
+        # A busy or failed checkpoint is retried on the next outer
+        # pass; the log only grows meanwhile.
+      ensure
+        release_checkpoint_lock(lock)
       end
     end
   end
@@ -874,10 +958,32 @@ module Db
     # `sql` names the statement in a translated step error (`translate`).
     handle = { stmt: stmt, row: nil, cached: cached, capture: nil, open: open, sql: sql }
     open[stmt] = handle
+    handle[:capture] = { rows: [], names: stmt.columns, eof: false, sql: sql } if !qcache.nil? && !parameterized
+    handle
+  end
+
+  # Explicit uncached reads skip statement reuse, but the separate
+  # request result cache still applies. Partial replays already promote
+  # to a transient statement, which finalize closes.
+  def self.prepare_uncached(sql)
     qcache = Fiber[:rh_qcache]
-    unless qcache.nil? || parameterized
-      handle[:capture] = { rows: [], names: stmt.columns, eof: false, sql: sql }
+    parameterized = sql.include?("?")
+    if !qcache.nil? && !parameterized && (hit = qcache[sql])
+      return { stmt: nil, row: nil, cached: false, replay: hit, pos: 0, sql: sql }
     end
+    record_query(sql)
+    conn = current_dbh
+    begin_snapshot(conn)
+    stmt = conn.prepare(sql)
+    statement_handle(open_statements(conn), stmt, sql, false, !qcache.nil? && !parameterized)
+  end
+
+  # Transient handles use the same ownership and bounded capture contract.
+  # The cached path constructs its handle inline on the query hot path.
+  def self.statement_handle(open, stmt, sql, cached, capture_rows)
+    handle = { stmt: stmt, row: nil, cached: cached, capture: nil, open: open }
+    open[stmt] = handle
+    handle[:capture] = { rows: [], names: stmt.columns, eof: false, sql: sql } if capture_rows
     handle
   end
 
@@ -1084,12 +1190,37 @@ module Db
     bind_value(handle, idx, value)
   end
 
+  def self.bind_int_opt(handle, idx, value)
+    bind_int(handle, idx, value)
+  end
+
+  def self.bind_text_opt(handle, idx, value)
+    value.nil? ? bind_value(handle, idx, nil) : bind_text(handle, idx, value)
+  end
+
+  def self.bind_bool_opt(handle, idx, value)
+    bind_value(handle, idx, value.nil? ? nil : (value ? 1 : 0))
+  end
+
   def self.bind_text(handle, idx, value)
-    bind_value(handle, idx, value)
+    value = value.to_s
+    # Match escape_string's storage class exactly. The gem otherwise binds
+    # every BINARY string as BLOB and every UTF-8 string (even NUL) as TEXT;
+    # SQLite equality does not equate the same bytes across those classes.
+    if value.include?("\0") || (value.encoding == Encoding::BINARY && !value.ascii_only?)
+      bind_value(handle, idx, value.b)
+    elsif value.encoding == Encoding::BINARY
+      bind_value(handle, idx, value.encode(Encoding::UTF_8))
+    else
+      bind_value(handle, idx, value)
+    end
+  rescue StandardError => error
+    # Encoding checks/conversion can raise before bind_value is entered.
+    statement_failed(handle, "bind", error)
   end
 
   def self.bind_bool(handle, idx, value)
-    bind_value(handle, idx, value ? 1 : 0)
+    bind_value(handle, idx, value.nil? ? nil : (value ? 1 : 0))
   end
 
   def self.last_insert_rowid

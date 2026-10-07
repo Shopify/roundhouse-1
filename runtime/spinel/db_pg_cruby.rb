@@ -1012,6 +1012,16 @@ module Db
       lease: adapter.instance_variable_get(:@rh_pg_lease), cacheable: cacheable }
   end
 
+  # A lowered read whose SQL shape varies with which nullable binds are
+  # nil (more of them than the shape cache keeps): executed with its binds
+  # but never prepared server-side, so its shapes cannot churn the
+  # connection's bounded statement cache.
+  def self.prepare_uncached(sql)
+    handle = prepare(sql)
+    handle[:uncached] = true
+    handle
+  end
+
   def self.validate_handle(handle)
     raise "finalized PostgreSQL statement" if handle[:closed]
     raise "PostgreSQL statement belongs to another thread or fiber" unless handle[:owner] == [Thread.current, Fiber.current]
@@ -1036,6 +1046,8 @@ module Db
     result = adapter.raw_execute(sql, "SQL", binds) do |conn|
       if binds.empty?
         adapter.perform_query(conn, sql)
+      elsif handle[:uncached]
+        adapter.perform_query(conn, sql, binds)
       else
         cache = conn.instance_variable_get(:@rh_pg_cache)
         name = cache.delete(sql)
@@ -1152,6 +1164,19 @@ module Db
 
   def self.bind_bool(handle, index, value)
     bind_int(handle, index, value.nil? ? nil : (value ? "t" : "f"))
+  end
+
+  # Nullable binds: nil binds SQL NULL, as the non-optional binds already do.
+  def self.bind_int_opt(handle, index, value)
+    bind_int(handle, index, value)
+  end
+
+  def self.bind_text_opt(handle, index, value)
+    bind_text(handle, index, value)
+  end
+
+  def self.bind_bool_opt(handle, index, value)
+    bind_bool(handle, index, value)
   end
 
   def self.query_cache_begin

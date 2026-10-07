@@ -6,6 +6,8 @@
 //! Production model lowering still uses SQLite until PostgreSQL project
 //! assembly and model ownership have emitted execution coverage.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::dialect::AccessorKind;
 use crate::effect::EffectSet;
 use crate::expr::{ArrayStyle, BlockStyle, Expr, ExprNode, Literal, LValue};
@@ -81,42 +83,133 @@ pub(crate) fn param_binds_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// One deferred bind: the unrendered value expr plus the `ValueType`
-/// that picks `bind_int` / `bind_text` / `bind_bool`. Accumulated by the
-/// SQL composers alongside the `?` they emit, then drained into
-/// `Db.bind_*(stmt, i, expr)` calls right after the `Db.prepare`.
+/// A typed pending bind. Nullable predicates also select an SQL fragment.
+/// Their runtime branch reserves a position together with the `= ?` fragment;
+/// position zero means `IS NULL` and no bind. The RHS is evaluated just once.
 struct Bind {
     expr: Expr,
     ty: ValueType,
+    nullable_column: Option<String>,
+    parameterized: bool,
 }
 
-/// `Db.bind_<ty>(stmt, <1-based idx>, <expr>)` for each accumulated
-/// bind, in placeholder order (sqlite bind indices are 1-based). The
-/// per-value type is known at composition time, so each bind is
-/// monomorphic — no heterogeneous bind bag on the hot path.
-fn emit_bind_calls(stmt: &Symbol, binds: &[Bind]) -> Vec<Expr> {
+/// One shaped-read site gets one id so `__rh_value_0` from two reads in
+/// the same method cannot collide under Spinel's pinned local types.
+fn next_read_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn bind_local(kind: &str, i: usize, read_id: usize) -> Symbol {
+    Symbol::from(format!("__rh_{}_{}_{}", kind, i, read_id))
+}
+
+fn bind_index_local(read_id: usize) -> Symbol {
+    Symbol::from(format!("__rh_bind_index_{}", read_id))
+}
+
+fn has_shaped_predicates(binds: &[Bind]) -> bool {
+    binds.iter().any(|b| b.nullable_column.is_some())
+}
+
+/// No exponential code generation: one branch per nullable predicate. Up to
+/// seven predicates have at most 128 SQL shapes; larger combinations bypass
+/// the cache, including Spinel's cache which only trims at lease boundaries.
+const MAX_CACHED_NULLABLE_PREDICATES: usize = 7;
+
+fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize, dialect: SqlDialect) -> Vec<Expr> {
     let db = ClassId(Symbol::from(DB_MOD));
-    binds
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            let method = match b.ty {
-                ValueType::Int => "bind_int",
-                ValueType::Str => "bind_text",
-                ValueType::Bool => "bind_bool",
-                // Nullable values never reach here: `push_value_segment`
-                // routes them through inline escaping, since the bind
-                // surface has no `bind_null`.
-                ty if ty.is_nullable() => unreachable!("nullable value in bind path: {ty:?}"),
-                _ => unreachable!(),
+    let mut out = Vec::new();
+    let shaped = has_shaped_predicates(binds);
+    let index = bind_index_local(read_id);
+    if shaped && binds.iter().any(|b| b.parameterized) {
+        out.push(assign_var(&index, lit_int(0)));
+    }
+    for (i, b) in binds.iter().enumerate() {
+        if !shaped { break; }
+        // Reserving the slot is the bind decision. The later typed bind
+        // consumes this position, never re-evaluating a nullable RHS.
+        let reserve = || vec![
+            assign_var(&index, send_to(var_ref(&index), "+", vec![lit_int(1)], false)),
+            assign_var(&bind_local("position", i, read_id), var_ref(&index)),
+        ];
+        if let Some(column) = &b.nullable_column {
+            let value = bind_local("value", i, read_id);
+            let fragment = bind_local("predicate", i, read_id);
+            out.push(assign_var(&value, b.expr.clone()));
+            if b.parameterized {
+                out.push(assign_var(&bind_local("position", i, read_id), lit_int(0)));
+            }
+            let non_nil_sql = if b.parameterized && dialect == SqlDialect::Postgres {
+                // `$n` names the slot reserved just before it.
+                concat_chain(vec![
+                    lit_str(format!("{} = $", column)),
+                    send_to(var_ref(&bind_local("position", i, read_id)), "to_s", vec![], false),
+                ])
+            } else if b.parameterized {
+                lit_str(format!("{} = ?", column))
+            } else {
+                concat_chain(vec![lit_str(format!("{} = ", column)), escape_value(&db,
+                    &Value::Runtime { expr: var_ref(&value), ty: b.ty }, dialect)])
             };
-            db_call(
-                &db,
-                method,
-                vec![var_ref(stmt), lit_int((i + 1) as i64), b.expr.clone()],
-            )
-        })
-        .collect()
+            let mut non_nil = Vec::new();
+            if b.parameterized && dialect == SqlDialect::Postgres { non_nil.extend(reserve()); }
+            non_nil.push(assign_var(&fragment, non_nil_sql));
+            if b.parameterized && dialect != SqlDialect::Postgres { non_nil.extend(reserve()); }
+            out.push(Expr::new(Span::synthetic(), ExprNode::If {
+                cond: send_to(var_ref(&value), "nil?", vec![], false),
+                then_branch: assign_var(&fragment, lit_str(format!("{} IS NULL", column))),
+                else_branch: seq(non_nil),
+            }));
+        } else {
+            out.push(assign_var(&bind_local("value", i, read_id), b.expr.clone()));
+            out.extend(reserve());
+        }
+    }
+    let nullable_count = binds.iter().filter(|b| b.nullable_column.is_some()).count();
+    let prepare = if nullable_count > MAX_CACHED_NULLABLE_PREDICATES && binds.iter().any(|b| b.parameterized) {
+        "prepare_uncached"
+    } else {
+        "prepare"
+    };
+    out.push(assign_var(stmt, db_call(&db, prepare, vec![sql])));
+    out
+}
+
+/// Fixed-shape queries keep literal positions. Shaped queries consume the
+/// positions reserved during SQL construction, skipping nil predicates.
+fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize) -> Vec<Expr> {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let shaped = has_shaped_predicates(binds);
+    binds.iter().enumerate().filter(|(_, b)| b.parameterized).map(|(i, b)| {
+        let method = match b.ty {
+            ValueType::Int => "bind_int",
+            ValueType::Str => "bind_text",
+            ValueType::Bool => "bind_bool",
+            ValueType::IntOpt => "bind_int_opt",
+            ValueType::StrOpt => "bind_text_opt",
+            ValueType::BoolOpt => "bind_bool_opt",
+            ValueType::FloatOpt => unreachable!("unserialized float in bind path"),
+        };
+        let position = if shaped {
+            var_ref(&bind_local("position", i, read_id))
+        } else {
+            lit_int((i + 1) as i64)
+        };
+        let value = if shaped {
+            var_ref(&bind_local("value", i, read_id))
+        } else {
+            b.expr.clone()
+        };
+        let call = db_call(&db, method, vec![var_ref(stmt), position.clone(), value]);
+        if b.nullable_column.is_some() {
+            Expr::new(Span::synthetic(), ExprNode::If {
+                cond: send_to(position, ">", vec![lit_int(0)], false),
+                then_branch: call,
+                else_branch: nil_lit(),
+            })
+        } else { call }
+    }).collect()
 }
 
 /// Render an Arel tree into an `Expr` that calls into the per-target
@@ -212,10 +305,11 @@ fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
     let result_init = assign_var(&result, nil_lit());
 
     // if Db.step?(stmt) ; result = <Owner>.from_stmt(stmt) ; end
@@ -235,8 +329,8 @@ fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool
 
     let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
     // stmt = prepare ; [bind …] ; result = nil ; if step? {…} ; finalize ; result
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(result_init);
     stmts.push(if_expr);
     stmts.push(finalize);
@@ -255,10 +349,11 @@ fn emit_multi_hydrate(
     let stmt = Symbol::from("stmt");
     let results = Symbol::from("results");
     let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
     // Empty Array literal carries an explicit `Array<Owner>` type
     // annotation so strict-target emit (Crystal `[] of Owner`)
     // matches the subsequent `results << instance` push semantics.
@@ -312,8 +407,8 @@ fn emit_multi_hydrate(
     // hydrate loop. Preload sub-queries build their own statements and
     // keep the inline `IN (…)` list (variable arity — not parameterized
     // here; see the note in `push_preload_stmts`).
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(finalize);
@@ -617,10 +712,11 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool,
         });
     let read_method = crate::lower::model_to_library::schema::column_read_method_for(column);
     let elem_ty = crate::lower::model_to_library::ty_of_column_slot(column);
+    let read_id = next_read_id();
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
 
     // The element type is carried explicitly for the same reason the
     // hydrate loop carries `Array<Owner>`: an untyped `[]` types as
@@ -653,8 +749,8 @@ fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool,
         },
     );
 
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
@@ -714,10 +810,11 @@ fn emit_group_count(
         key: Box::new(key_ty),
         value: Box::new(crate::ty::Ty::Int),
     };
+    let read_id = next_read_id();
 
     let mut binds = Vec::new();
-    let sql = compose_sql_select(sel, table, param, &mut binds, dialect);
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![sql]));
+    let sql = compose_sql_select(sel, table, param, &mut binds, dialect, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id, dialect);
 
     let results_init = assign_var(
         &results,
@@ -755,8 +852,8 @@ fn emit_group_count(
         },
     );
 
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(results_init);
     stmts.push(while_loop);
     stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
@@ -769,23 +866,24 @@ fn emit_count(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) -> 
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
 
     let mut segments: Vec<Expr> = vec![lit_str(format!(
         "SELECT COUNT(*) FROM {}",
         dialect.ident(table.name.as_str())
     ))];
     let mut binds = Vec::new();
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect, read_id);
 
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![concat_chain(segments)]));
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect);
     let step = db_call(&db, "step?", vec![var_ref(&stmt)]);
     let read = db_call(&db, "column_int", vec![var_ref(&stmt), lit_int(0)]);
     let result_assign = assign_var(&result, read);
     let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
 
     // stmt = prepare ; [bind …] ; step? ; result = column_int ; finalize ; result
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(step);
     stmts.push(result_assign);
     stmts.push(finalize);
@@ -798,22 +896,23 @@ fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) ->
     let stmt = Symbol::from("stmt");
     let result = Symbol::from("result");
     let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
 
     let mut segments: Vec<Expr> =
         vec![lit_str(format!("SELECT 1 FROM {}", dialect.ident(table.name.as_str())))];
     let mut binds = Vec::new();
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, dialect, read_id);
     if let Some(super::ir::LimitSpec(n)) = sel.limit {
         segments.push(lit_str(format!(" LIMIT {}", n)));
     }
 
-    let stmt_assign = assign_var(&stmt, db_call(&db, "prepare", vec![concat_chain(segments)]));
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id, dialect);
     let result_assign = assign_var(&result, db_call(&db, "step?", vec![var_ref(&stmt)]));
     let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
 
     // stmt = prepare ; [bind …] ; result = step? ; finalize ; result
-    let mut stmts = vec![stmt_assign];
-    stmts.extend(emit_bind_calls(&stmt, &binds));
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
     stmts.push(result_assign);
     stmts.push(finalize);
     stmts.push(var_ref(&result));
@@ -895,7 +994,7 @@ fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
     // Writes go through `Db.exec` (`sqlite3_exec`), which never touches
     // the prepared-statement cache — so the WHERE stays inline-escaped
     // regardless of the placeholder-bind gate.
-    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect);
+    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
     db_call(&db, "exec", vec![concat_chain(segments)])
 }
 
@@ -911,7 +1010,7 @@ fn visit_delete(del: &Delete, schema: &Schema, dialect: SqlDialect) -> Expr {
 
     let mut segments: Vec<Expr> = vec![lit_str(format!("DELETE FROM {}", dialect.ident(del.table.0.as_str())))];
     // Exec path — inline WHERE (see visit_update note); not cached.
-    push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new(), dialect);
+    push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new(), dialect, next_read_id());
     let delete_call = db_call(&db, "exec", vec![concat_chain(segments)]);
 
     // Truncate (Delete with no WHERE) — also reset the
@@ -948,7 +1047,14 @@ fn visit_delete(del: &Delete, schema: &Schema, dialect: SqlDialect) -> Expr {
 
 /// Build the SELECT prefix `"SELECT <cols> FROM <table>[...]"` plus
 /// any WHERE / LIMIT segments, returning the concat chain.
-fn compose_sql_select(sel: &Select, table: &Table, param: bool, binds: &mut Vec<Bind>, dialect: SqlDialect) -> Expr {
+fn compose_sql_select(
+    sel: &Select,
+    table: &Table,
+    param: bool,
+    binds: &mut Vec<Bind>,
+    dialect: SqlDialect,
+    read_id: usize,
+) -> Expr {
     let cols_csv = match &sel.columns {
         ColumnSpec::All => select_cols_csv(table, dialect),
         ColumnSpec::Named(refs) => refs
@@ -968,7 +1074,7 @@ fn compose_sql_select(sel: &Select, table: &Table, param: bool, binds: &mut Vec<
         cols_csv,
         dialect.ident(table.name.as_str())
     ))];
-    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, binds, dialect);
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, binds, dialect, read_id);
     // GROUP BY sits between WHERE and ORDER BY. Read off the
     // projection rather than a `Select` field: the grouped column is
     // the projection here (see `ColumnSpec::GroupCount`), so one place
@@ -1018,19 +1124,37 @@ fn push_where_segments(
     preds: Option<&Predicate>,
     _table: &Table,
     param: bool,
-    binds: &mut Vec<Bind>, dialect: SqlDialect) {
+    binds: &mut Vec<Bind>,
+    dialect: SqlDialect,
+    read_id: usize,
+) {
     let Some(pred) = preds else {
         return;
     };
+    // A PostgreSQL placeholder names its position, so once a nullable
+    // predicate can drop its bind every later `$n` is numbered at run time.
+    let dynamic = dialect == SqlDialect::Postgres && has_nullable_runtime(pred);
     segments.push(lit_str(" WHERE ".to_string()));
-    push_predicate_segments(segments, pred, param, binds, dialect);
+    push_predicate_segments(segments, pred, param, binds, dialect, read_id, dynamic);
+}
+
+fn has_nullable_runtime(pred: &Predicate) -> bool {
+    match pred {
+        Predicate::NullableEq(_, Value::Runtime { .. }) => true,
+        Predicate::Eq(_, _) | Predicate::NullableEq(_, _) => false,
+        Predicate::And(l, r) | Predicate::Or(l, r) => has_nullable_runtime(l) || has_nullable_runtime(r),
+    }
 }
 
 fn push_predicate_segments(
     segments: &mut Vec<Expr>,
     pred: &Predicate,
     param: bool,
-    binds: &mut Vec<Bind>, dialect: SqlDialect) {
+    binds: &mut Vec<Bind>,
+    dialect: SqlDialect,
+    read_id: usize,
+    dynamic: bool,
+) {
     match pred {
         // SQL equality never matches NULL (`col = NULL` is three-valued
         // unknown, i.e. no rows); a literal-nil condition is the IS NULL
@@ -1038,20 +1162,29 @@ fn push_predicate_segments(
         Predicate::Eq(col, Value::LiteralNull) => {
             segments.push(lit_str(format!("{} IS NULL", dialect.ident(col.column.as_str()))));
         }
+        Predicate::NullableEq(col, Value::Runtime { expr, ty }) => {
+            segments.push(var_ref(&bind_local("predicate", binds.len(), read_id)));
+            binds.push(Bind {
+                expr: expr.clone(), ty: *ty,
+                nullable_column: Some(dialect.ident(col.column.as_str())),
+                parameterized: param && *ty != ValueType::FloatOpt,
+            });
+        }
+        Predicate::NullableEq(_, _) => unreachable!("only runtime predicates select a shape"),
         Predicate::Eq(col, val) => {
             segments.push(lit_str(format!("{} = ", dialect.ident(col.column.as_str()))));
-            push_value_segment(segments, val, param, binds, dialect);
+            push_value_segment(segments, val, param, binds, dialect, read_id, dynamic);
         }
         Predicate::And(l, r) => {
-            push_predicate_segments(segments, l, param, binds, dialect);
+            push_predicate_segments(segments, l, param, binds, dialect, read_id, dynamic);
             segments.push(lit_str(" AND ".to_string()));
-            push_predicate_segments(segments, r, param, binds, dialect);
+            push_predicate_segments(segments, r, param, binds, dialect, read_id, dynamic);
         }
         Predicate::Or(l, r) => {
             segments.push(lit_str("(".to_string()));
-            push_predicate_segments(segments, l, param, binds, dialect);
+            push_predicate_segments(segments, l, param, binds, dialect, read_id, dynamic);
             segments.push(lit_str(" OR ".to_string()));
-            push_predicate_segments(segments, r, param, binds, dialect);
+            push_predicate_segments(segments, r, param, binds, dialect, read_id, dynamic);
             segments.push(lit_str(")".to_string()));
         }
     }
@@ -1062,18 +1195,32 @@ fn push_predicate_segments(
 /// Runtime value becomes `Db.escape_<ty>(<expr>)` inline when `param`
 /// is off, or a `?` placeholder + a recorded `Bind` when on — so the
 /// composed SQL keys the prepared-statement cache by shape, not value.
-fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds: &mut Vec<Bind>, dialect: SqlDialect) {
+fn push_value_segment(
+    segments: &mut Vec<Expr>,
+    val: &Value,
+    param: bool,
+    binds: &mut Vec<Bind>,
+    dialect: SqlDialect,
+    read_id: usize,
+    dynamic: bool,
+) {
     let db = ClassId(Symbol::from(DB_MOD));
     match val {
         Value::LiteralInt(n) => segments.push(lit_str(n.to_string())),
         Value::LiteralStr(s) => segments.push(lit_str(format!("'{}'", s.replace('\'', "''")))),
         Value::LiteralBool(b) => segments.push(lit_str(dialect.boolean(*b).to_string())),
         Value::LiteralNull => segments.push(lit_str("NULL".into())),
-        // A nullable value can't ride the placeholder path — there is
-        // no `bind_null` — so it always renders inline.
-        Value::Runtime { expr, ty } if param && !ty.is_nullable() => {
-            segments.push(lit_str(dialect.placeholder(binds.len() + 1)));
-            binds.push(Bind { expr: expr.clone(), ty: *ty });
+        // One optional bind still occupies exactly one placeholder. In a
+        // PostgreSQL shaped read the `$n` is the position reserved at
+        // run time, since a nil predicate before it binds nothing.
+        Value::Runtime { expr, ty } if param && *ty != ValueType::FloatOpt => {
+            if dialect == SqlDialect::Postgres && dynamic {
+                segments.push(lit_str("$".to_string()));
+                segments.push(send_to(var_ref(&bind_local("position", binds.len(), read_id)), "to_s", vec![], false));
+            } else {
+                segments.push(lit_str(dialect.placeholder(binds.len() + 1)));
+            }
+            binds.push(Bind { expr: expr.clone(), ty: *ty, nullable_column: None, parameterized: true });
         }
         Value::Runtime { .. } => segments.push(escape_value(&db, val, dialect)),
     }

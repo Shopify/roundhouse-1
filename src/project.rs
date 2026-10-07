@@ -789,6 +789,34 @@ pub fn spinel_relation_model_handle(files: &mut [(String, String)]) -> Result<()
         *conn = conn.replace(narrow, wide);
     }
     *conn = widen_spinel_base_on_sigs(conn);
+
+    // The public find/exists? nil guards live in the connection reopen.
+    // Spinel seeds their inherited adapter calls from Base's declaration,
+    // even when a String-keyed model overrides the adapter with a String
+    // argument. Follow the app-wide id contract established by
+    // widen_key_contract: Integer-only apps keep their original seeds,
+    // while apps with String keys need both kinds at shared dispatch.
+    // Each generated model still declares its schema's scalar.
+    let base = files
+        .iter_mut()
+        .find(|(p, _)| {
+            p == "sig/runtime/active_record/base.rbs" || p == "runtime/active_record/base.rbs"
+        })
+        .ok_or_else(|| {
+            "spinel_relation_model_handle: active_record/base.rbs not in the tree".to_string()
+        })?;
+    if base.1.contains("    def id: () -> (Integer | String)\n") {
+        for method in ["self._adapter_find_by_id", "self._adapter_exists_by_id?"] {
+            let narrow = format!("    def {method}: (Integer id)");
+            let wide = format!("    def {method}: (Integer | String id)");
+            if !base.1.contains(&narrow) {
+                return Err(format!(
+                    "spinel_relation_model_handle: base.rbs no longer declares {narrow:?}"
+                ));
+            }
+            base.1 = base.1.replace(&narrow, &wide);
+        }
+    }
     resolve_runtime_sig_conflicts(files)
 }
 
@@ -1079,6 +1107,72 @@ fn app_uses_date(app: &App) -> bool {
     has_date |= app.rbs_signatures.values().flat_map(|methods| methods.values())
         .any(crate::ty::Ty::contains_date);
     has_date
+}
+
+/// Insert Date-package requires after `active_record_serialization` in
+/// `boot.rb`. Spinel only — the program-defined `Date` class and the
+/// date-column JSON reopen belong on that target (matz/spinel#7334).
+fn inject_date_package_into_boot(boot: &mut String) -> Result<(), String> {
+    let anchor = "require_relative \"runtime/active_record_serialization\"\n";
+    // Prefer concat! over one escaped multiline string: the CI
+    // planner's project.rs body-scope regex backtracks for minutes
+    // on `\"` + `\` continuations in a single literal this large.
+    let inject = concat!(
+        "# Date package — only when the app uses date-only values (matz/spinel#7334).\n",
+        "require_relative \"runtime/date\"\n",
+        "require_relative \"runtime/active_support_date_parsing\"\n",
+        "require_relative \"runtime/active_record_date_serialization\"\n",
+    );
+    if boot.contains("require_relative \"runtime/date\"") {
+        return Ok(());
+    }
+    if let Some(at) = boot.find(anchor) {
+        boot.insert_str(at + anchor.len(), inject);
+        Ok(())
+    } else {
+        Err(
+            "boot.rb missing active_record_serialization require \
+             (Date package inject anchor)"
+                .into(),
+        )
+    }
+}
+
+/// CRuby/JRuby overlay boot replaces Spinel's boot wholesale, wiping
+/// the Date-package inject. Re-inject **only** the shared `date_*`
+/// calendar helpers (invariant 2). Do not load Spinel's `date.rb`
+/// polyfill (clobbers stdlib Date → `@year` nil on `>>`) or
+/// `active_record_date_serialization` (overlay already wraps
+/// `_as_json_only`; a second alias infinite-recurses).
+fn inject_cruby_date_calendar_helpers(boot: &mut String) -> Result<(), String> {
+    let anchor = "require_relative \"runtime/active_record_serialization\"\n";
+    let inject = concat!(
+        "# Date calendar helpers — shared with Spinel (invariant 2).\n",
+        "require_relative \"runtime/active_support_date_parsing\"\n",
+    );
+    if boot.contains("require_relative \"runtime/active_support_date_parsing\"") {
+        return Ok(());
+    }
+    if let Some(at) = boot.find(anchor) {
+        boot.insert_str(at + anchor.len(), inject);
+        Ok(())
+    } else {
+        Err(
+            "boot.rb missing active_record_serialization require \
+             (CRuby date calendar inject anchor)"
+                .into(),
+        )
+    }
+}
+
+fn inject_cruby_date_calendar_boot_requires(
+    files: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    let boot = files
+        .iter_mut()
+        .find(|(p, _)| p == "boot.rb")
+        .ok_or("ruby family: boot.rb missing for date calendar re-inject")?;
+    inject_cruby_date_calendar_helpers(&mut boot.1)
 }
 
 /// The executed Date-only runtime is native Ruby (and now Spinel), not
@@ -1452,13 +1546,16 @@ pub fn target_files(
         }
         None => app,
     };
+    // Before the refusals below: a refusal returns early, and a
+    // reference that it hides would leave the transpile with fewer
+    // errors than the app has.
+    report_unsupported_bundled_constants(app, target);
     reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_data_factories(app, target)?;
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);
     report_inherited_visibility_overrides(app, target);
-    report_unsupported_bundled_constants(app, target);
     report_test_helper_connection(app, target);
     report_sqlite_index_predicates(app, target);
     report_native_ruby_syntax(app, target);
@@ -2807,6 +2904,14 @@ fn ruby_family_files(
                         require \"tempfile\"\n"
                 .to_string();
         }
+        // `Timeout`: default gem on CRuby/JRuby; the port is for Spinel.
+        if path == "runtime/timeout.rb" {
+            *content = "# Ruby's own timeout — see `project::ruby_runtime_files`.\n\
+                        # The port at runtime/ruby/timeout.rb exists for Spinel,\n\
+                        # which has no stdlib timeout package.\n\
+                        require \"timeout\"\n"
+                .to_string();
+        }
         // `Resolv`: the same swap as ipaddr, and for both of ipaddr's
         // reasons at once. net/http loads the stdlib's resolver over
         // here, so a second `Resolv` beside it is a superclass mismatch
@@ -3300,6 +3405,14 @@ fn ruby_family_files(
         files.retain(|(p, _)| p != "runtime/active_record_postgresql_adapter.rb");
     }
     apply_initializer_constants(&mut files, app)?;
+    // Overlay boot replaces the spinel boot wholesale (see comment above
+    // on apply_module_mixins), wiping the Date-package inject from
+    // `spinel_files`. Re-inject only the shared `date_*` helpers — not
+    // Spinel's Date polyfill or date-JSON reopen (see
+    // `inject_cruby_date_calendar_helpers`).
+    if app_uses_date(app) {
+        inject_cruby_date_calendar_boot_requires(&mut files)?;
+    }
     Ok(files)
 }
 
@@ -6253,6 +6366,101 @@ fn is_nil_assertion_check(expr: &crate::expr::Expr) -> bool {
     }
 }
 
+/// Exception classes defined in `runtime/ruby/`
+/// (`action_controller/parameter_missing.rb`,
+/// `action_view/missing_template.rb`) that only the ruby family and
+/// Spinel ship. Strict targets must ledger a typed constant read; keep
+/// this list as the single name source for the gate and its tests.
+pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
+    "ActionController::ParameterMissing",
+    "ActionController::UnpermittedParameters",
+    "ActionController::UnknownFormat",
+    "ActionController::RoutingError",
+    "ActionView::MissingTemplate",
+];
+
+/// Availability policy for class/module *values* that inference
+/// resolves but the target does not ship. Returns the diagnostic
+/// construct when the name is unavailable on `target`.
+///
+/// Two policies share one visitor walk and the app-defined exemptions:
+/// Ruby/Spinel bundled library objects (`bundled_constant`), and
+/// ruby-family runtime exception stubs (`ruby_family_runtime_constant`).
+fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'static str> {
+    // The CRuby and Spinel Ruby trees evaluate no class value here.
+    if target == "ruby" {
+        return None;
+    }
+    if RUBY_FAMILY_RUNTIME_CONSTANTS.iter().any(|n| *n == name) {
+        // JRuby, Spinel and Roda ship the same runtime files as CRuby.
+        return if matches!(target, "jruby" | "spinel" | "roda") {
+            None
+        } else {
+            Some("ruby_family_runtime_constant")
+        };
+    }
+    // Only the CRuby tree's SQLite3 adapter (and the `sqlite3` gem under
+    // it) supplies these, on every other target Spinel included.
+    if matches!(name,
+        "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException" | "SQLite3::ConstraintException"
+        | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation"
+        | "ActiveRecord::ConnectionAdapters::SQLite3Adapter")
+    {
+        return Some("bundled_constant");
+    }
+    // Spinel and Roda ship Ruby's bundled libraries themselves.
+    let bundled = !matches!(target, "spinel" | "roda") && matches!(name,
+        "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
+        | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
+        | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
+        | "Struct" | "Mutex" | "Fiber" | "Process");
+    if !bundled {
+        return None;
+    }
+    // Nokogiri does not supply HTML5 on JRuby. The other bundled
+    // values remain available there.
+    if target == "jruby" && name != "Rails::HTML5::SafeListSanitizer" {
+        return None;
+    }
+    Some("bundled_constant")
+}
+
+/// True when the app already defines `id` as a class/module value, so
+/// the availability gate must not ledger it as a missing runtime stub.
+fn app_defines_class(app: &App, id: &crate::ident::ClassId) -> bool {
+    app.library_classes.iter().any(|class| class.name == *id)
+        || app.models.iter().any(|model| model.name == *id)
+        || app.controllers.iter().any(|controller| controller.name == *id)
+        || app.rails_application.as_ref().is_some_and(|class| class.name == *id)
+        || app.test_modules.iter().any(|module| {
+            module.inner_classes.iter().any(|class| class.name == *id)
+        })
+}
+
+/// Ledger a Const / superclass name that is unavailable on `target`
+/// (bundled library object or ruby-family runtime exception stub).
+fn report_unavailable_class_value(
+    app: &App,
+    target: &str,
+    name: &str,
+    span: crate::span::Span,
+) {
+    if span.is_synthetic() {
+        return;
+    }
+    let id = crate::ident::ClassId(crate::ident::Symbol::from(name));
+    if let Some(construct) = unavailable_class_module_construct(name, target)
+        && !app_defines_class(app, &id)
+    {
+        emit::diagnostics::report_unsupported(
+            span,
+            target,
+            construct,
+            format!("{name} is not available as a class/module value on {target}"),
+        );
+    }
+}
+
 /// These class objects are supplied by Ruby/Spinel's bundled libraries,
 /// not by the transpiled runtimes. Recognizing them during inference
 /// must not turn a missing target implementation into a clean emit.
@@ -6425,31 +6633,7 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
         }
         if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
-                let cruby_sqlite3 = matches!(id.0.as_str(),
-                    "ActiveRecord::StatementInvalid" | "ActiveRecord::TransactionIsolationError" | "SQLite3::SQLException" | "SQLite3::ConstraintException"
-                    | "ActiveRecord::NotNullViolation" | "ActiveRecord::InvalidForeignKey" | "ActiveRecord::CheckViolation"
-                    | "ActiveRecord::ConnectionAdapters::SQLite3Adapter");
-                if (cruby_sqlite3 || bundled && matches!(id.0.as_str(),
-                    "URI::HTTP" | "URI::InvalidURIError" | "Net::OpenTimeout" | "Net::ReadTimeout"
-                    | "Net::HTTPRedirection" | "Net::HTTPOK" | "StringIO" | "OpenSSL::OpenSSLError"
-                    | "Rails::HTML5::SafeListSanitizer" | "JSON" | "JSON::ParserError"
-                    | "Struct" | "Mutex" | "Fiber" | "Process")
-                    // Nokogiri does not supply HTML5 on JRuby. The
-                    // other bundled values remain available there.
-                    && (target != "jruby" || id.0.as_str() == "Rails::HTML5::SafeListSanitizer"))
-                    && !app.library_classes.iter().any(|class| class.name == *id)
-                    && !app.models.iter().any(|model| model.name == *id)
-                    && !app.controllers.iter().any(|controller| controller.name == *id)
-                    && !app.rails_application.as_ref().is_some_and(|class| class.name == *id)
-                    && !app.test_modules.iter().any(|module| module.inner_classes.iter().any(|class| class.name == *id))
-                {
-                    emit::diagnostics::report_unsupported(
-                        expr.span,
-                        target,
-                        "bundled_constant",
-                        format!("{} is not available as a bundled class/module value on {target}", id.0.as_str()),
-                    );
-                }
+                report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
             }
         }
         // A mapped JSON call does not emit a Ruby module object. Skip
@@ -6475,6 +6659,32 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     }
     let mut visit = |expr: &crate::expr::Expr| visit(expr, app, target.as_str(), bundled);
     crate::lower::for_each_hook_body_ref(app, &mut visit);
+    // Controller `render` → `MissingTemplate` rewriting lives in
+    // `controller_to_library`, which runs at emit time after this gate.
+    // Survey a throwaway lower so lowers-added exception Consts (now
+    // typed) are still ledgered on strict targets (Thomas 2B). The
+    // Ruby-family trees ship those classes, so only strict targets pay
+    // for the extra lower.
+    let lowered_controllers = if matches!(target, BuildTarget::Ruby | BuildTarget::Spinel | BuildTarget::Roda) {
+        Vec::new()
+    } else {
+        crate::lower::controller_to_library::lower_controllers_with_arel_and_views(
+            &app.controllers,
+            Vec::new(),
+            Some(&app.schema),
+            &app.views,
+        )
+    };
+    for class in &lowered_controllers {
+        for method in &class.methods {
+            visit(&method.body);
+            for param in &method.params {
+                if let Some(default) = &param.default {
+                    visit(default);
+                }
+            }
+        }
+    }
     // Like the Date gate, include roots outside the app-body survey.
     for controller in &app.controllers {
         for action in controller.actions() {
@@ -6570,6 +6780,51 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             }
         }
     }
+
+    // Superclass Consts are ClassIds with a captured parent_span, not
+    // Exprs in a method body — visit them explicitly so
+    // `class X < ActionController::RoutingError` is ledgered.
+    let target = target.as_str();
+    for model in &app.models {
+        if let Some(parent) = &model.parent {
+            report_unavailable_class_value(app, target, parent.0.as_str(), model.parent_span);
+        }
+    }
+    for controller in &app.controllers {
+        if let Some(parent) = &controller.parent {
+            report_unavailable_class_value(
+                app,
+                target,
+                parent.0.as_str(),
+                controller.parent_span,
+            );
+        }
+        for sibling in &controller.sibling_classes {
+            report_unavailable_class_value(
+                app,
+                target,
+                sibling.parent.as_str(),
+                sibling.parent_span,
+            );
+        }
+    }
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        if let Some(parent) = &class.parent {
+            report_unavailable_class_value(app, target, parent.0.as_str(), class.parent_span);
+        }
+    }
+    for module in &app.test_modules {
+        for class in &module.inner_classes {
+            if let Some(parent) = &class.parent {
+                report_unavailable_class_value(
+                    app,
+                    target,
+                    parent.0.as_str(),
+                    class.parent_span,
+                );
+            }
+        }
+    }
 }
 
 // Return app-emitted test stems separately: merging the scaffold loses
@@ -6662,27 +6917,7 @@ fn spinel_files_with_assertions(
             files.push((dest.to_string(), rbs));
         }
         if let Some((_, boot)) = files.iter_mut().find(|(p, _)| p == "boot.rb") {
-            let anchor = "require_relative \"runtime/active_record_serialization\"\n";
-            // Prefer concat! over one escaped multiline string: the CI
-            // planner's project.rs body-scope regex backtracks for minutes
-            // on `\"` + `\` continuations in a single literal this large.
-            let inject = concat!(
-                "# Date package — only when the app uses date-only values (matz/spinel#7334).\n",
-                "require_relative \"runtime/date\"\n",
-                "require_relative \"runtime/active_support_date_parsing\"\n",
-                "require_relative \"runtime/active_record_date_serialization\"\n",
-            );
-            if !boot.contains("require_relative \"runtime/date\"") {
-                if let Some(at) = boot.find(anchor) {
-                    boot.insert_str(at + anchor.len(), inject);
-                } else {
-                    return Err(
-                        "spinel boot.rb missing active_record_serialization require \
-                         (Date package inject anchor)"
-                            .into(),
-                    );
-                }
-            }
+            inject_date_package_into_boot(boot)?;
         }
     } else {
         files.retain(|(p, _)| !DATE_PACKAGE_FILES.contains(&p.as_str()));
@@ -6882,6 +7117,15 @@ fn spinel_files_with_assertions(
         files.push((format!("sig/runtime/{stem}.rbs"), rbs));
     }
 
+    // View buffer capacity memo — returning wrappers call
+    // ViewBufferCap.alloc/store (lower::view_buffer_passing). Spinel
+    // stub + CRuby overlay share this contract.
+    {
+        let rbs = crate::runtime_files::read_to_string("runtime/spinel/view_buffer_cap.rbs")
+            .map_err(|e| format!("read runtime/spinel/view_buffer_cap.rbs: {e}"))?;
+        files.push(("sig/runtime/view_buffer_cap.rbs".to_string(), rbs));
+    }
+
     // `db_jruby.rb` is the JRuby/JDBC Db backend — it uses Java interop
     // (`java_import`, `Java::`) that the CRuby and Spinel toolchains (and
     // the spinel-subset compliance gate) must never see. It is injected
@@ -6972,6 +7216,10 @@ fn spinel_files_with_assertions(
         "inflector",
         "inflector_ext",
         "json_builder",
+        // Pure string ActiveSupport helpers for the Ruby/Spinel
+        // scaffold (strict targets literalize controller_name/path).
+        // Listed before active_support_ext so require_relative resolves.
+        "active_support_inflections",
         "active_support_ext",
         "security_utils",
         "params",
@@ -7026,6 +7274,10 @@ fn spinel_files_with_assertions(
         // targets with no zlib to bind to, swapped for Ruby's own on
         // the CRuby/JRuby trees below.
         "zlib",
+        // `Timeout.timeout` / `Timeout::Error` — Campfire unfurl + video
+        // previewer capture. Port for Spinel; CRuby/JRuby swap to the
+        // default gem below. BUNDLED also lists Timeout → "timeout".
+        "timeout",
     ] {
         let rb = format!("runtime/ruby/{stem}.rb");
         let content = crate::runtime_files::read_to_string(&rb)?;
@@ -9662,7 +9914,7 @@ fn apply_bundled_gem_wiring(files: &mut [(String, String)], stdlib: &[(&str, &st
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 14] = [
+const BUNDLED: [(&str, &str); 15] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -9709,6 +9961,10 @@ const BUNDLED: [(&str, &str); 14] = [
     // first write (`Account::Joinable#generate_join_code`) raised
     // `undefined method 'join' for unknown`.
     ("SecureRandom", "securerandom"),
+    // `Timeout.timeout` / `Timeout::Error` — Campfire unfurl deadline and
+    // TimeLimitedVideoPreviewer#capture. Default gem on CRuby/JRuby;
+    // Spinel takes `runtime/ruby/timeout.rb` via spinel_files.
+    ("Timeout", "timeout"),
 ];
 
 /// Every gap in a tree, as `(file index, require line)`. One walk,
@@ -11483,6 +11739,7 @@ mod tests {
             vec![crate::ident::ClassId(crate::ident::Symbol::from("Current"))];
         app.routes.entries.push(crate::dialect::RouteSpec::Root {
             target: "articles#index".to_string(),
+            as_name: None,
         });
 
         let mut files = vec![
@@ -11560,7 +11817,10 @@ mod tests {
         }
 
         // With a root the table keeps it, first.
-        app.routes.entries.push(crate::dialect::RouteSpec::Root { target: "widgets#index".to_string() });
+        app.routes.entries.push(crate::dialect::RouteSpec::Root {
+            target: "widgets#index".to_string(),
+            as_name: None,
+        });
         let mut files = scaffold();
         apply_route_table_root(&mut files, &app);
         for (path, content) in &files {
@@ -12098,6 +12358,7 @@ mod tests {
             name: ClassId(Symbol::from(name)),
             is_module: false,
             parent: Some(ClassId(Symbol::from("ActionCable::Connection::Base"))),
+            parent_span: Default::default(),
             includes: Vec::new(),
             methods: Vec::new(),
             nullable_columns: Vec::new(),
@@ -12273,6 +12534,7 @@ mod tests {
             name: crate::ident::ClassId(Symbol::from("Greetable")),
             is_module: true,
             parent: None,
+            parent_span: Default::default(),
             includes: Vec::new(),
             methods: Vec::new(),
             nullable_columns: Vec::new(),

@@ -265,6 +265,8 @@ pub(crate) fn materialize_models(
         &params_specs,
         &assoc_scopes,
         materialization,
+        crate::lower::model_to_library::FinderInputs::Request,
+        true,
         if app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql) {
             crate::lower::arel::SqlDialect::Postgres
         } else {
@@ -614,7 +616,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
     // + class_info_from_library_class) because the former returns
     // ClassInfo with `table` set — the Arel pass needs `info.table`
     // to map a Const recv to a TableRef when recognizing chains.
-    let (_, model_registry) = crate::lower::lower_models_with_registry(
+    let (_, model_registry) = crate::lower::model_to_library::lower_models_with_request_finders(
         &app.models,
         &app.schema,
         Vec::new(),
@@ -641,6 +643,7 @@ fn lower_controllers_for_spinel(app: &App, format_breadth: FormatBreadth) -> Vec
         &app.controllers,
         model_extras,
         crate::lower::controller_to_library::LowerControllerOptions {
+            ruby_read_values: true,
             schema: Some(&app.schema),
             views: &app.views,
             library_classes: &app.library_classes,
@@ -717,17 +720,17 @@ fn emit_lowered_controllers_from_lcs(
 /// file put them). No-op when the class line isn't found.
 fn prepend_sibling_classes(
     content: &mut String,
-    siblings: &[(crate::ident::Symbol, crate::ident::Symbol)],
+    siblings: &[crate::dialect::SiblingClass],
     class_name: &str,
 ) {
     let marker = format!("class {class_name}");
     let Some(pos) = content.find(&marker) else { return };
     let mut decls = String::new();
-    for (name, parent) in siblings {
+    for sibling in siblings {
         decls.push_str(&format!(
             "class {} < {}; end\n",
-            name.as_str(),
-            parent.as_str()
+            sibling.name.as_str(),
+            sibling.parent.as_str()
         ));
     }
     decls.push('\n');
@@ -1087,7 +1090,7 @@ pub fn emit_with_assertions(
         // counted twice, which is worse than not knowing.
         let (model_registry, _dup_diags) = crate::emit::diagnostics::scope(|| {
             let (_, reg) =
-                crate::lower::lower_models_with_registry(&app.models, &app.schema, Vec::new());
+                crate::lower::model_to_library::lower_models_with_request_finders(&app.models, &app.schema, Vec::new());
             reg
         });
         let fixture_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> = fixture_lcs

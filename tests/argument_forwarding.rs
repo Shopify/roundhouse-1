@@ -1142,3 +1142,49 @@ fn full_forwarding_super_out_of_the_app_runs_as_written() {
         .collect();
     assert!(!errors.is_empty(), "a module's super is not shown to leave the app");
 }
+
+#[test]
+fn extend_module_super_forwarding_is_not_residual() {
+    // Campfire WebPush::Connections::Stages: module extended onto Net::HTTP,
+    // `super(...)` lands outside app source. Must not residual tip check.
+    use roundhouse::det::HashMap;
+    use std::path::PathBuf;
+    let files: [(&str, &str); 3] = [
+        (
+            "app/models/pool.rb",
+            r#"class Pool
+  module Stages
+    def begin_transport(...)
+      super
+    end
+    def connect(...)
+      super(...)
+    end
+  end
+end
+"#,
+        ),
+        (
+            "config/routes.rb",
+            "Rails.application.routes.draw do\nend\n",
+        ),
+        ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
+    ];
+    let tree: HashMap<PathBuf, Vec<u8>> = files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let diags = roundhouse::analyze::diagnose(&app);
+    let forwards = diags
+        .iter()
+        .filter(|d| d.to_string().contains("full argument forwarding"))
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        forwards.is_empty(),
+        "extend-module super(...) must not residual: {forwards:?}"
+    );
+}

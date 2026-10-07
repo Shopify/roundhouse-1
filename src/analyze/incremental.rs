@@ -255,6 +255,7 @@ fn sync_class(
             // A class new since the last pass: its entry, and every
             // method an earlier read found missing.
             if !first {
+                stamp(DepKey::Class(&super::body::class_set_key()));
                 stamp(DepKey::Class(id));
                 stamp(DepKey::AllInstance(id));
                 for m in info.instance_methods.keys() {
@@ -461,6 +462,7 @@ impl Incremental {
             prints.classes.retain(|id, _| {
                 let kept = classes.contains_key(id);
                 if !kept {
+                    stamp(DepKey::Class(&super::body::class_set_key()));
                     stamp(DepKey::Class(id));
                     stamp(DepKey::AllInstance(id));
                 }

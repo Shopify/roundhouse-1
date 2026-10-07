@@ -70,6 +70,7 @@ pub(super) enum NarrowPred {
     IsBlank(VarKey),
 }
 
+#[cfg(test)]
 pub(super) fn extract_narrowing(cond: &Expr) -> Option<NarrowPred> {
     extract_narrowing_with(cond, &|_| None)
 }

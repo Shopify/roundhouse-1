@@ -192,6 +192,93 @@ check("the abandoned insert rolled back", count("t") == 1)
     );
 }
 
+/// Serving connections pin the measured page-cache / mmap knobs
+/// (roundhouse#17 CRuby half). Tip used to inherit SQLite defaults
+/// (`cache_size=-2000`, `mmap_size=0`) while the Spinel shim already
+/// set the 64 MiB / 256 MiB budget — same working-set win, every
+/// RH CRuby app, not Campfire-specific.
+#[test]
+fn open_connection_sets_cache_and_mmap() {
+    run(
+        "pragmas",
+        r#"
+Db.with_connection do
+  c = Db.current_dbh
+  check("journal_mode=WAL", c.execute("PRAGMA journal_mode")[0][0].to_s.downcase == "wal")
+  check("synchronous=NORMAL", c.execute("PRAGMA synchronous")[0][0] == 1)
+  check("cache_size=-65536", c.execute("PRAGMA cache_size")[0][0] == -65536)
+  check("mmap_size=256MiB", c.execute("PRAGMA mmap_size")[0][0] == 268435456)
+end
+"#,
+    );
+}
+
+/// Multi-worker checkpointing takes a non-blocking flock so only one
+/// process copies the WAL (Campfire once-campfire#319's generalizable
+/// bit). A second holder must fail while the first still holds it.
+#[test]
+fn checkpoint_flock_is_exclusive_across_processes() {
+    run(
+        "checkpoint_flock",
+        r#"
+path = Db.instance_variable_get(:@path)
+lock_path = Db.checkpoint_lock_path(path)
+held = Db.try_checkpoint_lock(lock_path)
+check("first holder acquired", held.is_a?(File))
+pid = fork do
+  other = Db.try_checkpoint_lock(lock_path)
+  exit(other == :busy ? 0 : 1)
+end
+_pid, status = Process.wait2(pid)
+check("sibling saw :busy", status.exitstatus == 0)
+Db.release_checkpoint_lock(held)
+again = Db.try_checkpoint_lock(lock_path)
+check("lock free after release", again.is_a?(File))
+Db.release_checkpoint_lock(again)
+# mkdir_p fails when the parent is a file — that is setup failure, not
+# contention; the loop must still checkpoint (nil, not :busy).
+parent = File.join(File.dirname(path), "not-a-dir")
+File.write(parent, "x")
+got = Db.try_checkpoint_lock(File.join(parent, "x.lock"))
+check("setup failure is nil so checkpoint still runs", got.nil?)
+"#,
+    );
+}
+
+/// After fork, the child must close the inherited checkpoint-lock FD
+/// without LOCK_UN. Otherwise a surviving worker keeps the OFD open
+/// after the parent exits and its new checkpointer stays `:busy` forever
+/// while `wal_autocheckpoint=0` (CodeRabbit on #548 / Puma preload).
+#[test]
+fn adopt_after_fork_closes_inherited_checkpoint_lock() {
+    run(
+        "checkpoint_flock_fork",
+        r#"
+path = Db.instance_variable_get(:@path)
+lock_path = Db.checkpoint_lock_path(path)
+held = Db.try_checkpoint_lock(lock_path)
+check("parent acquired", held.is_a?(File))
+check("Db retained lock file", Db.instance_variable_get(:@checkpoint_lock_file).equal?(held))
+r, w = IO.pipe
+pid = fork do
+  w.close
+  r.read(1)
+  Db.adopt_after_fork
+  got = Db.try_checkpoint_lock(lock_path)
+  exit(got.is_a?(File) ? 0 : 1)
+end
+r.close
+# Drop the parent's FD without unlocking — same as the parent exiting
+# while the child still holds an inherited copy of the OFD.
+held.close
+w.write("x")
+w.close
+_pid, status = Process.wait2(pid)
+check("child acquired after adopt closed inherited FD", status.exitstatus == 0)
+"#,
+    );
+}
+
 /// Once the server asks, serving connections stop checkpointing inside
 /// COMMIT and a background thread copies the log into the database
 /// file instead: the file grows without any request checkpointing.

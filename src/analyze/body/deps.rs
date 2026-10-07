@@ -162,6 +162,31 @@ impl<'a> Classes<'a> {
         self.note(DepKey::Class(id));
         self.map.contains_key(id)
     }
+
+    /// The classes whose instance table has `method`, as a scan over
+    /// the whole registry: reads the class set ([`class_set_key`]) and
+    /// each visited class's entry for `method`.
+    pub(crate) fn instance_method_definers<'s>(
+        &'s self,
+        method: &'s Symbol,
+    ) -> impl Iterator<Item = &'a ClassId> + 's {
+        self.note(DepKey::Class(&class_set_key()));
+        let map: &'a HashMap<ClassId, ClassInfo> = self.map;
+        map.iter()
+            .filter(move |(id, info)| {
+                self.note(DepKey::Class(id));
+                self.note(DepKey::Instance(id, method));
+                info.instance_methods.contains_key(method)
+            })
+            .map(|(id, _)| id)
+    }
+}
+
+/// The [`DepKey::Class`] stamped whenever a class is created or removed:
+/// what a scan over the whole registry reads besides the classes it
+/// visited.
+pub(crate) fn class_set_key() -> ClassId {
+    ClassId(Symbol::from("<class set>"))
 }
 
 /// One class's entry. Its other fields read through `Deref`; the method
@@ -196,6 +221,17 @@ impl<'a> ClassRef<'a> {
 
     pub(crate) fn has_class_method(&self, method: &Symbol) -> bool {
         self.class_method(method).is_some()
+    }
+
+    /// The class's parent, for the lifetime of the registry (the entry
+    /// read [`Classes::get`] noted covers it).
+    pub(crate) fn parent(&self) -> Option<&'a ClassId> {
+        self.info.parent.as_ref()
+    }
+
+    /// The class's includes, for the lifetime of the registry.
+    pub(crate) fn includes(&self) -> &'a [ClassId] {
+        &self.info.includes
     }
 
     /// The superclass, borrowed from the registry rather than from this

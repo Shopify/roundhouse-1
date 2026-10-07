@@ -115,7 +115,7 @@ impl Analyzer {
                 ctx.ivar_bindings.retain(|_, ty| !ty.is_unknown());
             }
             if let Some(setup) = module.helpers.iter_mut().find(|method| method.name.as_str() == "setup") {
-                let method_ctx = self.seed_method_params(&ctx, &module.name, setup);
+                let method_ctx = self.seed_method_params(&ctx, &module.name, setup, false);
                 self.body_typer().analyze_expr(&mut setup.body, &method_ctx);
                 extract_ivar_assignments(&setup.body, &mut ctx.ivar_bindings);
                 ctx.ivar_bindings.retain(|_, ty| !ty.is_unknown());
@@ -132,12 +132,12 @@ impl Analyzer {
                     // Re-seed after typing this default: a dependent default
                     // must see the fresh binding, not last round's default.
                     let name = param.name.clone();
-                    let seeded = self.seed_method_params(&ctx, &module.name, method);
+                    let seeded = self.seed_method_params(&ctx, &module.name, method, false);
                     if let Some(ty) = seeded.local_bindings.get(&name) {
                         default_ctx.local_bindings.insert(name, ty.clone());
                     }
                 }
-                let method_ctx = self.seed_method_params(&ctx, &module.name, method);
+                let method_ctx = self.seed_method_params(&ctx, &module.name, method, false);
                 self.body_typer()
                     .analyze_expr(&mut method.body, &method_ctx);
             }
