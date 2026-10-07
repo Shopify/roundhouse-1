@@ -447,10 +447,13 @@ fn postgres_project_packages_matching_driver_schema_and_gem() {
     assert!(source("config/schema.rb").contains("serial PRIMARY KEY"));
     assert!(source("config/schema.rb").contains("boolean NOT NULL"));
     assert_eq!(files.iter().filter(|(p, _)| p == "runtime/db.rb").count(), 1);
-    // The semian port rides with the PostgreSQL adapter it wraps, once.
+    // The semian port (core, shared adapter, the PostgreSQL adapter it wraps
+    // and `semian/net_http`) rides with the PostgreSQL bootstrap, once each.
     assert!(source("runtime/semian_activerecord_postgresql_adapter.rb").contains("require_relative \"semian\""));
     assert!(source("runtime/semian.rb").contains("require \"semian/semian\""));
-    assert_eq!(files.iter().filter(|(p, _)| p.starts_with("runtime/semian")).count(), 2);
+    let mut semian: Vec<&str> = files.iter().filter(|(p, _)| p.starts_with("runtime/semian")).map(|(p, _)| p.as_str()).collect();
+    semian.sort_unstable();
+    assert_eq!(semian, ["runtime/semian.rb", "runtime/semian_activerecord_postgresql_adapter.rb", "runtime/semian_adapter.rb", "runtime/semian_net_http.rb"]);
     assert_eq!(files.iter().filter(|(p, _)| p == "config/schema.rb").count(), 1);
     for target in [BuildTarget::Jruby, BuildTarget::Spinel, BuildTarget::Rust] {
         let error = target_files(&app, &fixture, target).unwrap_err();

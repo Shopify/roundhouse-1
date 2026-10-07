@@ -475,7 +475,7 @@ fn semian_app(postgresql: bool) -> emit_and_run::Overlay {
     let mut app = emit_and_run::empty_app()
         .write("roundhouse.yml", config)
         .write("Gemfile.lock", SEMIAN_LOCK)
-        .write("sorbet/rbi/gems/semian@0.28.3.rbi", "# typed: true\nmodule Semian; end\nclass Semian::BaseError < ::StandardError; end\nclass Semian::TimeoutError < ::Semian::BaseError; end\nclass Semian::OpenCircuitError < ::Semian::BaseError; end\nmodule Semian::AdapterError; end\nmodule Semian::NetHTTP; end\n")
+        .write("sorbet/rbi/gems/semian@0.28.3.rbi", "# typed: true\nmodule Semian; end\nclass Semian::BaseError < ::StandardError; end\nclass Semian::TimeoutError < ::Semian::BaseError; end\nclass Semian::OpenCircuitError < ::Semian::BaseError; end\nmodule Semian::AdapterError; end\nmodule Semian::NetHTTP; end\nmodule Semian::Redis; end\n")
         .write("lib/resilience.rb", r#"class Resilience
   def timeout?(error)
     error.is_a?(Semian::TimeoutError)
@@ -529,10 +529,10 @@ fn a_ported_gem_s_constants_run_as_its_runtime_port() {
 /// the ported names.
 #[test]
 fn a_ported_gem_s_unported_names_and_portless_trees_are_refused() {
-    let gap = semian_app(true).write("lib/net.rb", "class NetAdapter\n  def adapter\n    Semian::NetHTTP\n  end\nend\n");
+    let gap = semian_app(true).write("lib/redis_adapter.rb", "class RedisAdapter\n  def adapter\n    Semian::Redis\n  end\nend\n");
     let (_, errors) = gap.emit(BuildTarget::Ruby);
     assert!(
-        errors.iter().any(|e| e.contains("Semian::NetHTTP is declared by the semian gem, which runs as its runtime port (runtime/semian.rb, runtime/semian_activerecord_postgresql_adapter.rb), and the port does not declare it")),
+        errors.iter().any(|e| e.contains("Semian::Redis is declared by the semian gem, which runs as its runtime port (") && e.contains("), and the port does not declare it")),
         "{errors:#?}"
     );
     assert_eq!(errors.iter().filter(|e| !is_adapter_refusal(*e)).count(), 1, "{errors:#?}");
