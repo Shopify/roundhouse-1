@@ -219,13 +219,15 @@ what they do natively:
   (`is_a?`), `T.nilable` as nil-or, `T.any` as any-of, `T::Boolean` as
   true/false, `T.class_of`, a hash shape (`{a: X, "b" => Y}`, sorbet's
   `FixedHash`) as a Hash whose declared keys' values pass (an absent key
-  reads nil or the hash's default) with no other key, and the stdlib
+  reads nil or the hash's default) with no other key, a tuple shape
+  (`[A, B]`, sorbet's `FixedArray`) as an Array of exactly that length
+  whose each element passes its position's type, and the stdlib
   generics (`T::Array[X]`, ...) and user generics by their outer class
   only. A check that cannot fail
   (`T.untyped`, `checked: false`, `T.let(nil, T.nilable(X))`,
   `T.let([], T::Array[X])`) is the value alone. A type the check cannot
   rebuild faithfully (`T.proc`, `T.self_type`, `T.attached_class`, type
-  parameters, `T.all`, tuple shapes, a hash shape keyed by anything but
+  parameters, `T.all`, a tuple shape with a splat, a hash shape keyed by anything but
   a symbol or string literal, sorbet's own constants
   such as `T::Struct`) is refused at the site by name. A type alias
   (`X = T.type_alias { T }` in a library class, model, test or module
@@ -235,7 +237,7 @@ what they do natively:
   check as sorbet's `aliased_type` is and unwrapped wherever a type is
   read (a union of aliases names their flattened members); the analysis
   reads the declared type through it. Still dropped, so their sites keep
-  the refusal: aliases whose type is a form above (tuples, procs), aliases
+  the refusal: aliases whose type is a form above (procs, intersections), aliases
   in controller bodies or `class << self`, and the blockless
   `T.type_alias(T)`. A file-level alias outside any class is written at
   the top level of its file, like every file-level constant (see below), but

@@ -194,7 +194,7 @@ fn walk(dir: &std::path::Path) -> String {
 #[test]
 fn uncheckable_sorbet_types_are_refused_by_name() {
     refuses("T.let(title, T.proc.params(x: Integer).returns(String))", "is a proc type");
-    refuses("T.let(title, [String, Integer])", "is a tuple shape");
+    refuses("T.let(title, [String, *[Integer]])", "splats an array into a tuple shape");
     refuses("T.cast(title, T.self_type)", "T.self_type");
 }
 

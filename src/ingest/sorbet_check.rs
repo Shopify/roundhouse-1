@@ -23,13 +23,15 @@
 //!   accept everything;
 //! - a hash shape `{a: X, "b" => Y}` is sorbet's `FixedHash`: a Hash
 //!   whose every declared key's value passes its type (an absent key
-//!   reads nil) and which has no other key.
+//!   reads nil) and which has no other key;
+//! - a tuple shape `[A, B]` is sorbet's `FixedArray`: an Array of exactly
+//!   that length whose every element passes the type at its position.
 //!
 //! A form sorbet checks some other way, or that names sorbet-runtime's
 //! own constants (`T.proc`, `T.self_type`, `T.attached_class`,
-//! `T.type_parameter`, `T.all`, tuple shapes, ...), is refused at the site by
-//! name ("sorbet type check"), never skipped. A check that provably
-//! passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
+//! `T.type_parameter`, `T.all`, a splat in a tuple shape, ...), is refused
+//! at the site by name ("sorbet type check"), never skipped. A check that
+//! provably passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
 //! `T::Array[...]`, ...) is the value alone, as is `checked: false`.
 //! `project` refuses the lowered call on every tree but CRuby / JRuby.
 
@@ -72,6 +74,9 @@ enum SorbetType {
     /// `{a: Integer, "b" => String}`: sorbet's `T::Types::FixedHash`,
     /// which checks each declared key's value and admits no other key.
     FixedHash(Vec<(ShapeKey, SorbetType)>),
+    /// `[Integer, String]`: sorbet's `T::Types::FixedArray`, an Array
+    /// of that length whose each element passes its position's type.
+    FixedArray(Vec<SorbetType>),
 }
 
 /// A shape's key, as written: sorbet keys the hash by the literal.
@@ -249,13 +254,11 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
     if let Some(hash) = node.as_hash_node() {
         return read_shape(&hash, file);
     }
+    if let Some(array) = node.as_array_node() {
+        return read_tuple(&array, file);
+    }
     let Some(call) = node.as_call_node() else {
-        let shape = if node.as_array_node().is_some() {
-            "is a tuple shape, which sorbet checks member by member"
-        } else {
-            "is not a type expression this check reads"
-        };
-        return Ok(Err(format!("`{}` {shape}", text())));
+        return Ok(Err(format!("`{}` is not a type expression this check reads", text())));
     };
     let method = constant_id_str(&call.name());
     let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
@@ -357,6 +360,23 @@ fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str) -> IngestResult<Resul
         }
     }
     Ok(Ok(SorbetType::FixedHash(fields)))
+}
+
+/// A tuple shape: each element a type this check reads, in place (a
+/// splat would make the length the check fixes a runtime value).
+fn read_tuple(array: &ruby_prism::ArrayNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+    let mut types = Vec::new();
+    for element in array.elements().iter() {
+        if element.as_splat_node().is_some() {
+            let text = String::from_utf8_lossy(array.location().as_slice()).into_owned();
+            return Ok(Err(format!("`{text}` splats an array into a tuple shape")));
+        }
+        match read_type(&element, file)? {
+            Ok(ty) => types.push(ty),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    Ok(Ok(SorbetType::FixedArray(types)))
 }
 
 /// `T.proc`, or a builder chain on it (`T.proc.params(...).returns(...)`).
@@ -497,6 +517,11 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
             let union = |mut tys: Vec<Ty>| if tys.len() == 1 { tys.remove(0) } else { Ty::Union { variants: tys } };
             Some(Ty::Hash { key: Box::new(union(keys)), value: Box::new(union(values)) })
         }
+        // A tuple is the tuple `sorbet_sig` reads `[A, B]` as.
+        ("fixed_array", [array]) => {
+            let ExprNode::Array { elements, .. } = &*array.node else { return None };
+            Some(Ty::Tuple { elems: elements.iter().map(type_object_ty).collect::<Option<_>>()? })
+        }
         ("generic", [label, _outer, rest @ ..]) => {
             let ExprNode::Lit { value: Literal::Str { value: label } } = &*label.node else { return None };
             let args: Vec<Ty> = rest.iter().map(type_object_ty).collect::<Option<_>>()?;
@@ -544,6 +569,11 @@ fn type_expr(ty: &SorbetType) -> Expr {
                 .collect();
             let hash = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
             send(helper(), "fixed_hash", vec![hash])
+        }
+        SorbetType::FixedArray(types) => {
+            let elements = types.iter().map(type_expr).collect();
+            let array = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: Default::default() });
+            send(helper(), "fixed_array", vec![array])
         }
     }
 }

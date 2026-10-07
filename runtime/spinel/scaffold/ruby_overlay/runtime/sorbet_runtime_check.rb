@@ -2,7 +2,7 @@
 # `T.bind` and `T.assert_type!` perform (sorbet-runtime 0.6.13502:
 # lib/types/_types.rb, private/casts.rb, types/base.rb, types/simple.rb,
 # types/union.rb, types/typed_*.rb, types/class_of.rb, types/fixed_hash.rb,
-# utils.rb).
+# types/fixed_array.rb, utils.rb).
 #
 # No tree loads sorbet-runtime, so `ingest::expr` lowers each of those
 # calls to `SorbetRuntimeCheck.cast(value, type, "T.let", path, line)`:
@@ -13,11 +13,12 @@
 #
 # The type argument is a Module, as written, or one of the type objects
 # below, which the ingest builds for `T.nilable`, `T.any`, `T::Boolean`,
-# `T.untyped`, `T.anything`, `T.class_of`, hash shapes and the stdlib generics
+# `T.untyped`, `T.anything`, `T.class_of`, hash and tuple shapes and the
+# stdlib generics
 # (`T::Array[X]` and friends, which check the outer class only, as
 # sorbet's `valid?` does). A user generic `Foo[X]` is `Foo` itself:
 # `T::Generic#[]` answers `self`. Type forms the ingest cannot build here
-# (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, tuples)
+# (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, ...)
 # are refused at the site and never reach this file.
 #
 # `Name = T.type_alias { X }` is carried as
@@ -324,6 +325,50 @@ module SorbetRuntimeCheck
     end
   end
 
+  # `T::Types::FixedArray`: `[Integer, String]`. An Array of exactly
+  # that length whose each element passes the type at its position.
+  class FixedArray
+    include Described
+
+    def initialize(types)
+      @inner_types = types
+    end
+
+    def types
+      @types ||= @inner_types.map { |type| SorbetRuntimeCheck.coerce(type) }
+    end
+
+    def name
+      "[#{types.join(", ")}]"
+    end
+
+    def valid?(obj)
+      element_types = types
+      length = element_types.length
+      return false unless obj.is_a?(::Array) && obj.length == length
+      index = 0
+      while index < length
+        return false unless element_types.fetch(index).valid?(obj[index])
+        index += 1
+      end
+      true
+    end
+
+    # `Expected [String, Symbol], got type [String, String]`, or the
+    # size when it differs, not `got Array`.
+    def describe_obj(obj)
+      if obj.is_a?(::Array)
+        if obj.length == types.length
+          "type [#{obj.map(&:class).join(", ")}]"
+        else
+          "array of size #{obj.length}"
+        end
+      else
+        super
+      end
+    end
+  end
+
   # `T::Private::Types::StringHolder`: the `T::Boolean` stand-in a union
   # name puts in place of TrueClass and FalseClass.
   class Named
@@ -425,6 +470,10 @@ module SorbetRuntimeCheck
 
   def self.fixed_hash(types)
     FixedHash.new(types)
+  end
+
+  def self.fixed_array(types)
+    FixedArray.new(types)
   end
 
   def self.untyped
