@@ -5288,6 +5288,25 @@ fn qualify_relative_includes(app: &mut App) {
         .filter_map(|lc| Some((lc.name.0.as_str().to_string(), lc.parent.clone()?)))
         .collect();
     let join = |path: &[crate::ident::Symbol]| path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    // `OptionHelpers = ShopifyMetafields::Types::OptionHelpers` in a
+    // module body is another name for that module, so an include of it
+    // includes the target (Core's metafield reference types include
+    // `::Metafields::Types::OptionHelpers`, a gem module). The target is
+    // qualified from the alias's scope when that names a known class.
+    let aliases: HashMap<String, String> = app
+        .library_classes
+        .iter()
+        .flat_map(|lc| {
+            let owner = lc.name.0.as_str();
+            let known = &known;
+            lc.constants.iter().filter_map(move |(name, value)| {
+                let ExprNode::Const { path } = &*value.node else { return None };
+                let target = resolve(owner, path, known).map(|p| join(&p)).unwrap_or_else(|| join(path));
+                let alias = format!("{owner}::{name}");
+                (target != alias).then_some((alias, target))
+            })
+        })
+        .collect();
     for lc in &mut app.library_classes {
         let owner = lc.name.0.as_str().to_string();
         for inc in &mut lc.includes {
@@ -5323,6 +5342,26 @@ fn qualify_relative_includes(app: &mut App) {
                 }
                 class = ancestor;
             }
+        }
+        // An include no known class answers that names an alias, from
+        // the class's scope outwards: the alias's target.
+        let scope: Vec<&str> = owner.split("::").collect();
+        for inc in lc.includes.iter_mut().filter(|inc| !known.contains(*inc) && !inc.0.as_str().starts_with("::")) {
+            let written = inc.0.as_str().to_string();
+            let Some(mut target) = (0..=scope.len()).rev().find_map(|depth| {
+                let key = if depth == 0 { written.clone() } else { format!("{}::{written}", scope[..depth].join("::")) };
+                aliases.get(&key).cloned()
+            }) else {
+                continue;
+            };
+            for _ in 0..8 {
+                let id = crate::ident::ClassId(crate::ident::Symbol::from(target.as_str()));
+                match aliases.get(&target) {
+                    Some(next) if !known.contains(&id) => target = next.clone(),
+                    _ => break,
+                }
+            }
+            *inc = crate::ident::ClassId(crate::ident::Symbol::from(target.as_str()));
         }
     }
 }
