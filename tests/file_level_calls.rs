@@ -39,3 +39,46 @@ fn a_file_level_call_is_reported_at_its_site() {
     let start = SOURCE.find("FileLevelRegistry.register").unwrap();
     assert!(reported[0].contains(&format!("start: {start}, ")), "the span is the call's own: {reported:#?}");
 }
+
+/// Each site has one diagnostic. A call inside a file-level conditional
+/// is part of the conditional, which `file_level_definition` names when
+/// it holds a definition; a call after a file-level `return` is its own
+/// statement, reported as a call, while the `return` is named for the
+/// definitions it guards.
+const GUARDED: &str = r#"class GuardedRegistry
+  def self.register(key)
+    (@keys ||= []) << key
+  end
+end
+
+if ENV["RH_NEVER_SET"] == "1"
+  class GuardedExtra
+  end
+  GuardedRegistry.register(:extra)
+end
+
+return unless ENV["RH_NEVER_SET"]
+
+class GuardedLate
+end
+
+GuardedRegistry.register(:late)
+"#;
+
+#[test]
+fn a_file_level_call_and_a_file_level_definition_are_never_the_same_site() {
+    let (_tree, errors) = emit_and_run::real_blog()
+        .write("app/services/guarded_registry.rb", GUARDED)
+        .emit(BuildTarget::Ruby);
+    let here: Vec<&String> = errors.iter().collect();
+    let calls: Vec<&&String> = here.iter().filter(|e| e.contains("file-level call `")).collect();
+    let definitions: Vec<&&String> = here.iter().filter(|e| e.contains("file_level_definition not supported")).collect();
+    assert_eq!(calls.len(), 1, "only the call after the return: {here:#?}");
+    let late = GUARDED.find("GuardedRegistry.register(:late)").unwrap();
+    assert!(calls[0].contains(&format!("start: {late}, ")), "{calls:#?}");
+    assert_eq!(definitions.len(), 2, "the conditional and the return: {here:#?}");
+    let conditional = GUARDED.find("if ENV").unwrap();
+    let guard = GUARDED.find("return unless").unwrap();
+    assert!(definitions.iter().any(|e| e.contains(&format!("start: {conditional}, "))), "{definitions:#?}");
+    assert!(definitions.iter().any(|e| e.contains(&format!("start: {guard}, "))), "{definitions:#?}");
+}
