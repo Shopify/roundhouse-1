@@ -68,8 +68,13 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 /// family, yet Core's code reads `OpenTelemetry::Trace::Tracer`.
 /// So is a Rails-dependent one (`crate::project::gem_requires_rails`),
 /// so its constants are refused by that name.
-pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) -> GemBoundary {
-    let mut boundary = GemBoundary { loaded: crate::project::lock_loaded_gems(lock), ..GemBoundary::default() };
+pub fn load_gem_boundary<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    lock: &Lockfile,
+    bundler: &[crate::app::BundlerGem],
+) -> GemBoundary {
+    let mut boundary = GemBoundary { loaded: crate::project::lock_loaded_gems(lock, bundler), ..GemBoundary::default() };
     let Some(root) = rbi_dir(vfs, dir) else { return boundary };
     let Ok(entries) = vfs.read_dir(&root) else { return boundary };
 

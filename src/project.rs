@@ -3279,7 +3279,11 @@ fn ruby_family_files(
             // require grpc" (its grpc_fork_safety raises once GRPC is
             // loaded; the list's opentelemetry-instrumentation-grpc loads it).
             format!("{}{}", compiled_gem_native_copies_block(app), gem_source_dependency_block(app)),
-            gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
+            format!(
+                "{}{}",
+                gem_require_block(&compiled_gems, app.gem_lock.as_ref()),
+                bundler_gem_require_block(&app.bundler_gems, app.gem_lock.as_ref())
+            ),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -3398,7 +3402,12 @@ fn ruby_family_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    let gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    let mut gem_sources: Vec<String> = gem_source_entries(app).into_iter().map(|(name, _, _)| name).collect();
+    // The app's own Bundler.require entries are activated as the
+    // lock-gated ones are (a GIT-sourced one by its checkout).
+    gem_sources.extend(
+        bundler_required_runtime_gems(&app.bundler_gems, app.gem_lock.as_ref()).into_iter().map(|gem| gem.name.clone()),
+    );
     apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref(), &gem_sources);
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
@@ -9026,6 +9035,86 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
     Some(out)
 }
 
+/// Shopify Core's Gemfile entries outside the default group whose
+/// Bundler.require is measured Rails-free (`runs/rails-free-probe`,
+/// verdicts.tsv "test-group", by `LOCK_GATED_REQUIRES`' method): the
+/// gem's own require (or Bundler's `-` to `/` fallback) loads no Rails
+/// gem, bare or with the runtime's Rails modules defined, and registers
+/// no `ActiveSupport.on_load` hook. Not the measurement's minitest and
+/// minitest-reporters: they are `CRUBY_TEST_GEMS`, which the test
+/// process loads itself. ci-queue's `ci/queue` does not touch Minitest
+/// (its patches are minitest/queue, which only the app requires).
+const BUNDLER_GROUP_RAILS_FREE_GEMS: &[&str] = &[
+    "ci-queue", "debug", "dev_server", "erb-mux", "grizzly_ber", "grpc_mock", "jwt",
+    "letter_opener", "mocha", "octokit", "pdf-inspector", "rack-test", "rbi", "rotoscope",
+    "rubydex", "vcr", "webmock",
+];
+
+/// The app's Bundler.require entries (`App::bundler_gems`) the emitted
+/// tree requires as installed gems, beyond `GEM_REQUIRES` and
+/// `LOCK_GATED_REQUIRES`: resolved by the lock, not carried as source
+/// (a carried gem's entry is a file program the boot loads), and
+/// measured Rails-free (`BUNDLER_GROUP_RAILS_FREE_GEMS`). The rest of
+/// Core's default group is `LOCK_GATED_REQUIRES`, Rails-dependent, or
+/// unclassified (runtime-engine-client's `runtime/engine/client` does
+/// not exist, so native Bundler.require skips it too). `require: false`
+/// gems are not in `App::bundler_gems`: they still need the app's own
+/// require.
+pub(crate) fn bundler_required_runtime_gems<'a>(
+    bundler: &'a [crate::app::BundlerGem],
+    lock: Option<&crate::gems::Lockfile>,
+) -> Vec<&'a crate::app::BundlerGem> {
+    let Some(lock) = lock else { return Vec::new() };
+    bundler
+        .iter()
+        .filter(|gem| {
+            lock.has(&gem.name)
+                && !lock.is_in_repo(&gem.name)
+                && BUNDLER_GROUP_RAILS_FREE_GEMS.contains(&gem.name.as_str())
+                && !GEM_REQUIRES.contains(&gem.name.as_str())
+                && !LOCK_GATED_REQUIRES.iter().any(|(_, g)| *g == gem.name)
+        })
+        .collect()
+}
+
+/// Bundler.require of each gem in `bundler_required_runtime_gems`, in the
+/// environments its Gemfile groups name: the explicit `require:` path,
+/// else the gem name and then the name with `-` as `/` (Bundler's
+/// autorequire). Quiet only when the gem itself is absent; a LoadError
+/// for another feature is the gem failing part way, named as in
+/// `gem_require_block`.
+fn bundler_gem_require_block(bundler: &[crate::app::BundlerGem], lock: Option<&crate::gems::Lockfile>) -> String {
+    let gems = bundler_required_runtime_gems(bundler, lock);
+    if gems.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's Bundler.require: its other Gemfile gems, each in the\n\
+         # environments its groups name (`require: false` ones are the app's).\n[\n",
+    );
+    for gem in gems {
+        let envs: Vec<String> = gem.envs.iter().map(|e| format!("{e:?}")).collect();
+        let paths: Vec<String> = match &gem.require {
+            Some(path) => vec![format!("{path:?}")],
+            None if gem.name.contains('-') => vec![format!("{:?}", gem.name), format!("{:?}", gem.name.replace('-', "/"))],
+            None => vec![format!("{:?}", gem.name)],
+        };
+        out.push_str(&format!("  [[{}], [{}]], # {}\n", paths.join(", "), envs.join(", "), gem.site));
+    }
+    out.push_str(
+        "].each do |paths, envs|\n  \
+         next unless envs.empty? || envs.include?(Rails.env.to_s)\n  \
+         paths.each do |path|\n    \
+         begin\n      require path\n      break\n    \
+         rescue LoadError => e\n      \
+         next if e.path.nil? || e.path == path\n      \
+         $stderr.puts \"roundhouse: require #{path.inspect} failed: #{e.message}\"\n      \
+         break\n    \
+         end\n  end\nend\n",
+    );
+    out
+}
+
 fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
     let gated = LOCK_GATED_REQUIRES
         .iter()
@@ -9064,9 +9153,21 @@ pub(crate) fn ruby_tree_loads_gem(gem: &str) -> bool {
 /// run as the gems'. A lockfile dependency alone is not a load:
 /// payment_service_client depends on cusco but autoloads it, and cusco
 /// requires Rails. So the walk follows only `LOCK_GATED_DEPENDENCIES`.
-pub(crate) fn lock_loaded_gems(lock: &crate::gems::Lockfile) -> std::collections::BTreeSet<String> {
+/// Also the app's own Bundler.require entries
+/// (`bundler_required_runtime_gems`) for the test environment, which the
+/// emitted tree's gem_facades.rb requires there as Bundler would.
+pub(crate) fn lock_loaded_gems(
+    lock: &crate::gems::Lockfile,
+    bundler: &[crate::app::BundlerGem],
+) -> std::collections::BTreeSet<String> {
     let mut loaded = std::collections::BTreeSet::new();
     let mut stack: Vec<&str> = LOCK_GATED_REQUIRES.iter().map(|(_, gem)| *gem).filter(|gem| lock.has(gem)).collect();
+    stack.extend(
+        bundler_required_runtime_gems(bundler, Some(lock))
+            .into_iter()
+            .filter(|gem| gem.envs.is_empty() || gem.envs.iter().any(|e| e == "test"))
+            .map(|gem| gem.name.as_str()),
+    );
     while let Some(gem) = stack.pop() {
         if loaded.insert(gem.to_string()) {
             stack.extend(
@@ -9119,8 +9220,10 @@ const LOCK_GATED_DEPENDENCIES: [&str; 127] = [
 /// (`runtime/spinel/test/minitest_runner.rb`, CRuby only) and the
 /// reporters Core's test boot subclasses. Its constants are the gems',
 /// typed from their RBIs; the Spinel and JRuby test bootstraps stay
-/// Minitest-free and refuse them. Not ci-queue: it patches Minitest when
-/// it loads, so it is required only where the app requires it.
+/// Minitest-free and refuse them. Not ci-queue: its minitest/queue
+/// patches Minitest, so it loads only where the app requires it, or (as
+/// `ci/queue`) where its Bundler.require does
+/// (`BUNDLER_GROUP_RAILS_FREE_GEMS`).
 const CRUBY_TEST_GEMS: [&str; 2] = ["minitest", "minitest-reporters"];
 
 fn runtime_gems() -> &'static [(Marker, &'static str)] {

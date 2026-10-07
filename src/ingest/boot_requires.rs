@@ -67,6 +67,7 @@ pub(super) fn boot_loads<V: Vfs + ?Sized>(
         conditional: false,
         loads: Vec::new(),
         conditional_loads: Vec::new(),
+        bundler_require: false,
     };
     for seed in ["config/boot.rb", "config/application.rb", "config/environment.rb"] {
         walk.file(&dir.join(seed), None);
@@ -105,6 +106,8 @@ struct Walk<'a, V: Vfs + ?Sized> {
     conditional: bool,
     loads: Vec<BootLoad>,
     conditional_loads: Vec<BootLoad>,
+    /// Whether a walked file calls `Bundler.require`.
+    bundler_require: bool,
 }
 
 impl<V: Vfs + ?Sized> Walk<'_, V> {
@@ -179,6 +182,7 @@ impl<V: Vfs + ?Sized> Walk<'_, V> {
                     })
                 };
                 if name == "require" && on("Bundler") {
+                    self.bundler_require = true;
                     let gems: Vec<(PathBuf, Vec<String>, String)> =
                         self.gems.iter().map(|g| (g.entry.clone(), g.envs.clone(), g.site.clone())).collect();
                     for (entry, envs, gem_site) in gems {
@@ -284,6 +288,61 @@ fn bundler_entries<V: Vfs + ?Sized>(
     path_gems: &[PathBuf],
     gem_sources: &[(String, PathBuf)],
 ) -> Vec<BundlerEntry> {
+    let mut out = Vec::new();
+    for GemfileGem { name, require, path, groups, line } in gemfile_gems(vfs, dir) {
+        let name = name.as_str();
+        let path = path.as_deref();
+        let groups = &groups;
+        let Some(require) = require else { continue };
+        let explicit_dir = path.map(|p| normalize(&dir.join(p)));
+        let dirs: Vec<&PathBuf> = explicit_dir
+            .iter()
+            .chain(gem_sources
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, d)| d))
+            .chain(path_gems.iter().filter(|gem| {
+                gem.file_name().and_then(|f| f.to_str()).is_some_and(|base| {
+                    base == name
+                        || base.strip_prefix(name).and_then(|r| r.strip_prefix('-')).is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
+                })
+            }))
+            .collect();
+        let candidates: Vec<String> = match &require {
+            Some(explicit) => vec![explicit.clone()],
+            None => {
+                let mut c = vec![name.to_string()];
+                if name.contains('-') {
+                    c.push(name.replace('-', "/"));
+                }
+                c
+            }
+        };
+        let envs: Vec<String> = if groups.is_empty() || groups.iter().any(|g| g == "default") { Vec::new() } else { groups.to_vec() };
+        for gem_dir in dirs {
+            let gem_dir = if gem_dir.is_absolute() { gem_dir.clone() } else { dir.join(gem_dir) };
+            if let Some(entry) = candidates.iter().map(|c| gem_dir.join("lib").join(with_rb(c))).find(|p| vfs.exists(p)) {
+                out.push(BundlerEntry { entry, envs: envs.clone(), site: format!("Gemfile:{line}") });
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A `gem` call of the Gemfile (or of a Gemfile-local helper that
+/// forwards to `gem`).
+struct GemfileGem {
+    name: String,
+    /// None: `require: false`; Some(None): the default; Some(Some(p)):
+    /// an explicit require path.
+    require: Option<Option<String>>,
+    path: Option<String>,
+    groups: Vec<String>,
+    line: usize,
+}
+
+fn gemfile_gems<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<GemfileGem> {
     let Ok(source) = vfs.read(&dir.join("Gemfile")) else { return Vec::new() };
     let result = ruby_prism::parse(&source);
     let root = result.node();
@@ -318,41 +377,51 @@ fn bundler_entries<V: Vfs + ?Sized>(
     }
     let mut out = Vec::new();
     gem_calls(&stmts, &helpers, &[], &source, &mut |name, require, path, groups, line| {
-        let Some(require) = require else { return };
-        let explicit_dir = path.map(|p| normalize(&dir.join(p)));
-        let dirs: Vec<&PathBuf> = explicit_dir
-            .iter()
-            .chain(gem_sources
-            .iter()
-            .filter(|(n, _)| *n == name)
-            .map(|(_, d)| d))
-            .chain(path_gems.iter().filter(|gem| {
-                gem.file_name().and_then(|f| f.to_str()).is_some_and(|base| {
-                    base == name
-                        || base.strip_prefix(name).and_then(|r| r.strip_prefix('-')).is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()))
-                })
-            }))
-            .collect();
-        let candidates: Vec<String> = match &require {
-            Some(explicit) => vec![explicit.clone()],
-            None => {
-                let mut c = vec![name.to_string()];
-                if name.contains('-') {
-                    c.push(name.replace('-', "/"));
-                }
-                c
-            }
-        };
-        let envs: Vec<String> = if groups.is_empty() || groups.iter().any(|g| g == "default") { Vec::new() } else { groups.to_vec() };
-        for gem_dir in dirs {
-            let gem_dir = if gem_dir.is_absolute() { gem_dir.clone() } else { dir.join(gem_dir) };
-            if let Some(entry) = candidates.iter().map(|c| gem_dir.join("lib").join(with_rb(c))).find(|p| vfs.exists(p)) {
-                out.push(BundlerEntry { entry, envs: envs.clone(), site: format!("Gemfile:{line}") });
-                break;
-            }
-        }
+        out.push(GemfileGem {
+            name: name.to_string(),
+            require,
+            path: path.map(str::to_string),
+            groups: groups.to_vec(),
+            line,
+        });
     });
     out
+}
+
+/// The Gemfile gems the boot's `Bundler.require` requires, whatever
+/// their source (installed, git, or carried): each one not `require:
+/// false`, with its require path (None: Bundler's default, the name and
+/// then the name with `-` as `/`) and the environments its groups limit
+/// it to (empty: every one; `Bundler.require(*Rails.groups)` requires
+/// `:default` and the environment's group). Empty when no boot file
+/// calls `Bundler.require`.
+pub(crate) fn bundler_required_gems<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Vec<crate::app::BundlerGem> {
+    let mut walk = Walk {
+        vfs,
+        dir,
+        load_path: vec![dir.join("lib")],
+        gems: Vec::new(),
+        visited: BTreeSet::new(),
+        envs: Vec::new(),
+        conditional: false,
+        loads: Vec::new(),
+        conditional_loads: Vec::new(),
+        bundler_require: false,
+    };
+    for seed in ["config/boot.rb", "config/application.rb", "config/environment.rb"] {
+        walk.file(&dir.join(seed), None);
+    }
+    if !walk.bundler_require {
+        return Vec::new();
+    }
+    gemfile_gems(vfs, dir)
+        .into_iter()
+        .filter_map(|gem| {
+            let require = gem.require?;
+            let envs = if gem.groups.is_empty() || gem.groups.iter().any(|g| g == "default") { Vec::new() } else { gem.groups };
+            Some(crate::app::BundlerGem { name: gem.name, require, envs, site: format!("Gemfile:{}", gem.line) })
+        })
+        .collect()
 }
 
 /// Each gem call in `stmts`: `(name, require (None: `require: false`;
