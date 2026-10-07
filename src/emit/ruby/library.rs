@@ -7835,6 +7835,12 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
+    /// Implicit self, `self`, or the class spelled out.
+    fn is_self_or_own_class(recv: &Option<Expr>, class_name: &str) -> bool {
+        recv.is_none()
+            || recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::SelfRef))
+            || is_own_class(recv, class_name)
+    }
     /// Does this Const name a constant already marked deferred — bare
     /// `BUILTIN`, or `OwnClass::BUILTIN` (qualified by a later rewrite)?
     fn const_names_deferred(
@@ -7876,9 +7882,32 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
             // at the Send arm below, so a Lambda reaching this arm is a
             // stored literal.
             ExprNode::Lambda { .. } => false,
+            // `&method(:own)`, ingested as a MethodRef: the same lookup.
+            ExprNode::MethodRef { recv, name }
+                if is_self_or_own_class(recv, class_name) && own.contains(name.as_str()) =>
+            {
+                true
+            }
             ExprNode::Send { recv, method, args, block, .. } => {
                 if (recv.is_none() || is_own_class(recv, class_name))
                     && (method.as_str() == "new" || own.contains(method.as_str()))
+                {
+                    return true;
+                }
+                // `method(:own)` (and `instance_method`, `public_method`,
+                // `public_instance_method`) looks the method up as it
+                // runs: above the `def` it is `NameError: undefined
+                // method`. paquito's `TYPES = [{ packer:
+                // method(:time_pack_deprecated), ... }]` follows its
+                // `class << self` defs natively.
+                if is_self_or_own_class(recv, class_name)
+                    && matches!(
+                        method.as_str(),
+                        "method" | "public_method" | "instance_method" | "public_instance_method"
+                    )
+                    && args.first().is_some_and(|a| {
+                        matches!(&*a.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if own.contains(value.as_str()))
+                    })
                 {
                     return true;
                 }
