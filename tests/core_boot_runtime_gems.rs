@@ -145,11 +145,11 @@ fn a_git_sourced_gem_is_declared_with_its_source_and_activated_from_its_bundler_
     );
 }
 
-/// Essentials' test config (`config/test.rb`): an in-process Redis, the
-/// Panama fake client over the metadata registry, and Snappy-compressed
-/// bodies. Core's Gemfile Bundler.requires redis, hiredis-client,
-/// panama_client, panama_metadata and snappy; redis-client comes with redis.
-const TEST_CONFIG_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    hiredis-client (0.28.0)\n      redis-client (= 0.28.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    redis (5.4.0)\n      redis-client (>= 0.22.0)\n    redis-client (0.28.0)\n    snappy (0.5.1)\n\nDEPENDENCIES\n  activesupport\n  hiredis-client\n  panama_client\n  panama_metadata\n  redis\n  snappy\n";
+/// Essentials' test config (`config/test.rb`): an in-process Redis and
+/// Snappy-compressed bodies. Core's Gemfile Bundler.requires redis,
+/// hiredis-client and snappy; redis-client comes with redis. (Its Panama
+/// fake client is `RAILS_DEPENDENT_GEMS`, below.)
+const TEST_CONFIG_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    hiredis-client (0.28.0)\n      redis-client (= 0.28.0)\n    redis (5.4.0)\n      redis-client (>= 0.22.0)\n    redis-client (0.28.0)\n    snappy (0.5.1)\n\nDEPENDENCIES\n  activesupport\n  hiredis-client\n  redis\n  snappy\n";
 
 fn test_config_app() -> emit_and_run::Overlay {
     emit_and_run::empty_app()
@@ -157,8 +157,6 @@ fn test_config_app() -> emit_and_run::Overlay {
         .write("Gemfile.lock", TEST_CONFIG_LOCK)
         .write("sorbet/rbi/gems/redis@5.4.0.rbi", "# typed: true\nclass Redis\n  def initialize(options = {}); end\nend\nclass Redis::BaseError < ::StandardError; end\nclass Redis::CommandError < ::Redis::BaseError; end\n")
         .write("sorbet/rbi/gems/redis-client@0.28.0.rbi", "# typed: true\nclass RedisClient\n  class << self\n    def register(middleware); end\n  end\nend\n")
-        .write("sorbet/rbi/gems/panama_client@3.2.3.rbi", "# typed: true\nmodule PanamaClient; end\nclass PanamaClient::NotFoundError < ::StandardError; end\n")
-        .write("sorbet/rbi/gems/panama_metadata@0.3.19.1687.rbi", "# typed: true\nmodule PanamaMetadata; end\nclass PanamaMetadata::Registry\n  def initialize(path:); end\nend\n")
         .write("sorbet/rbi/gems/snappy@0.5.1.rbi", "# typed: true\nmodule Snappy\n  class << self\n    def deflate(source); end\n  end\nend\n")
         .write("lib/test_services.rb", r#"module RedisLogging
   def call(command, config)
@@ -177,14 +175,6 @@ class TestServices
     nil
   end
 
-  def registry
-    PanamaMetadata::Registry.new(path: "panama.yml")
-  end
-
-  def missing
-    raise PanamaClient::NotFoundError, "missing"
-  end
-
   def compress(body)
     Snappy.deflate(body)
   end
@@ -192,7 +182,7 @@ end
 "#)
 }
 
-const TEST_CONFIG_GEMS: [&str; 5] = ["redis", "redis-client", "panama_client", "panama_metadata", "snappy"];
+const TEST_CONFIG_GEMS: [&str; 3] = ["redis", "redis-client", "snappy"];
 
 #[test]
 fn the_emitted_ruby_tree_declares_and_loads_the_test_config_gems() {
@@ -203,7 +193,7 @@ fn the_emitted_ruby_tree_declares_and_loads_the_test_config_gems() {
         assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
     }
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
-    for feature in ["panama_client", "redis", "hiredis-client", "snappy", "panama_metadata"] {
+    for feature in ["redis", "hiredis-client", "snappy"] {
         assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
     }
 }
@@ -219,15 +209,16 @@ fn the_test_config_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
     }
 }
 
-/// panama_client is a GEM spec, but it depends on Core's grpc fork, a GIT
-/// spec RubyGems cannot find on its own (`Gem::MissingSpecError: Could not
-/// find 'grpc'`, swallowed by the guarded require). The git closure of
-/// the needed gems is activated, dependencies first.
+/// A needed GEM spec can depend on a GIT spec RubyGems cannot find on its
+/// own (Core's panama_client on its grpc fork: `Gem::MissingSpecError:
+/// Could not find 'grpc'`, swallowed by the guarded require). The git
+/// closure of the needed gems is activated, dependencies first. Shown here
+/// on redis, since panama_client is now a `RAILS_DEPENDENT_GEMS` refusal.
 #[test]
 fn a_git_dependency_of_a_needed_gem_is_activated_before_it() {
     let lock = TEST_CONFIG_LOCK.replace(
-        "    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
-        "    panama_client (3.2.3)\n      grpc (>= 1.40)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n",
+        "    redis (5.4.0)\n      redis-client (>= 0.22.0)\n",
+        "    redis (5.4.0)\n      grpc (>= 1.40)\n      redis-client (>= 0.22.0)\n",
     );
     let lock = format!(
         "GIT\n  remote: https://github.com/Shopify/grpc.git\n  revision: d5dd2a32be6bfd2e9abd7d10ccfb87d129e868de\n  branch: shopify-fixes\n  submodules: true\n  specs:\n    grpc (1.85.0.dev)\n\n{lock}"
@@ -237,12 +228,13 @@ fn a_git_dependency_of_a_needed_gem_is_activated_before_it() {
     let git_gems = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
     assert!(git_gems.contains("[\"grpc\", \"grpc-d5dd2a32be6b\", \"https://github.com/Shopify/grpc.git\""), "{git_gems}");
     let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
-    assert!(gemfile.contains("gem \"panama_client\"\n"), "{gemfile}");
+    assert!(gemfile.contains("gem \"redis\"\n"), "{gemfile}");
 }
 
 /// Essentials' boot path through Rack, Faraday, Trilogy, Sabertooth,
-/// OpenSRS, Magellan and OpenTelemetry, all Bundler.required by Core and
-/// Rails-free. Core reopens `class Trilogy` (patches/trilogy_error.rb), so
+/// OpenSRS, Magellan and OpenTelemetry's API, all Rails-free and (but
+/// for the API, which Core's instrumentations require) Bundler.required
+/// by Core. Core reopens `class Trilogy` (patches/trilogy_error.rb), so
 /// `Trilogy::ProtocolError` is typed only from the gem's RBI. Prism is
 /// demand only: Core's own `require "prism"` loads it.
 const PLATFORM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    faraday (2.14.3)\n    magellan-ruby (0.2.16)\n    opentelemetry-api (1.10.1)\n    opentelemetry-shopify (1.22.0)\n      opentelemetry-api (~> 1.0)\n    prism (1.9.0)\n    rack (2.2.24)\n    sabertooth (0.1.6)\n    shopify-opensrs (0.5.0)\n    trilogy (2.9.0)\n\nDEPENDENCIES\n  activesupport\n  faraday (>= 2)\n  magellan-ruby (= 0.2.16)\n  opentelemetry-shopify (~> 1.22)\n  rack (= 2.2.24)\n  sabertooth (~> 0.1)\n  shopify-opensrs (~> 0.5)\n  trilogy (= 2.9.0)\n";
@@ -305,8 +297,8 @@ end
 "#)
 }
 
-const PLATFORM_GEMS: [&str; 9] =
-    ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-shopify", "opentelemetry-api", "prism"];
+const PLATFORM_GEMS: [&str; 8] =
+    ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-api", "prism"];
 
 #[test]
 fn the_emitted_ruby_tree_declares_and_loads_the_platform_gems() {
@@ -317,7 +309,7 @@ fn the_emitted_ruby_tree_declares_and_loads_the_platform_gems() {
         assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
     }
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
-    for feature in ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby", "opentelemetry-shopify"] {
+    for feature in ["rack", "faraday", "trilogy", "sabertooth", "shopify-opensrs", "magellan-ruby"] {
         assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
     }
     assert!(!facades.contains("\"prism\""), "prism is required by the app, not Bundler: {facades}");
@@ -346,24 +338,22 @@ fn middleware_app() -> emit_and_run::Overlay {
         .write("Gemfile.lock", MIDDLEWARE_LOCK)
         .write("sorbet/rbi/gems/stack_frames@0.1.3.rbi", &rbi("module StackFrames; end\nclass StackFrames::Buffer\n  def initialize(size); end\nend\n"))
         .write("sorbet/rbi/gems/lru_redux@1.1.0.rbi", &rbi("module LruRedux; end\nclass LruRedux::Cache\n  def initialize(max_size); end\nend\nclass LruRedux::ThreadSafeCache < ::LruRedux::Cache; end\n"))
-        .write("sorbet/rbi/gems/secure_headers@5.2.0.rbi", &rbi("module SecureHeaders; end\nclass SecureHeaders::StrictTransportSecurity; end\nSecureHeaders::StrictTransportSecurity::HEADER_NAME = T.let(T.unsafe(nil), String)\n"))
         .write("sorbet/rbi/gems/shopify_bots@0.59.0.rbi", &rbi("module ShopifyBots; end\nmodule ShopifyBots::Rack; end\nclass ShopifyBots::Rack::Middleware; end\nShopifyBots::Rack::Middleware::REQUEST_PRIORITY = T.let(T.unsafe(nil), String)\n"))
         .write("sorbet/rbi/gems/customer_privacy_api_ruby@42.1.0.rbi", &rbi("module CustomerPrivacyApiRuby; end\nmodule CustomerPrivacyApiRuby::Storage; end\nCustomerPrivacyApiRuby::Storage::VISIT_COOKIE_EXPIRATION_TIME_SECONDS = T.let(T.unsafe(nil), Integer)\n"))
         .write("lib/middleware_settings.rb", r#"class MiddlewareSettings
   FRAMES = StackFrames::Buffer.new(32)
   CACHE = LruRedux::ThreadSafeCache.new(100)
-  HSTS = SecureHeaders::StrictTransportSecurity::HEADER_NAME
   PRIORITY = ShopifyBots::Rack::Middleware::REQUEST_PRIORITY
   VISIT_TTL = CustomerPrivacyApiRuby::Storage::VISIT_COOKIE_EXPIRATION_TIME_SECONDS
 
   def headers
-    { HSTS => PRIORITY, "ttl" => VISIT_TTL.to_s }
+    { "priority" => PRIORITY, "ttl" => VISIT_TTL.to_s }
   end
 end
 "#)
 }
 
-const MIDDLEWARE_GEMS: [&str; 5] = ["stack_frames", "lru_redux", "secure_headers", "shopify_bots", "customer_privacy_api_ruby"];
+const MIDDLEWARE_GEMS: [&str; 4] = ["stack_frames", "lru_redux", "shopify_bots", "customer_privacy_api_ruby"];
 
 #[test]
 fn the_emitted_ruby_tree_declares_and_loads_the_middleware_gems() {
@@ -390,29 +380,80 @@ fn the_middleware_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
     }
 }
 
-/// Core's Money is shopify-money's. Another app's `Money` (RubyMoney's,
-/// or its own class) is named the same, so the row is demanded only
-/// where the lock names shopify-money.
-const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
+/// Gems in Core's Bundler.require list whose load closure reaches Rails
+/// once `Rails`, `ActiveSupport` or `ActiveRecord` is defined, as the
+/// emitted runtime defines them: never required natively, their
+/// constants refused by name until their source is compiled as app code.
+const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    elasticsearch-shopify (6.0.1)\n    opentelemetry-shopify (1.22.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    secure_headers (5.2.0)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  elasticsearch-shopify (= 6.0.1)\n  opentelemetry-shopify (~> 1.22)\n  panama_client\n  panama_metadata\n  secure_headers (~> 5.2)\n  shopify-money (~> 4.1.1)\n";
 
-const SHOPIFY_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  shopify-money (~> 4.1.1)\n";
+fn rails_dependent_app() -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", RAILS_DEPENDENT_LOCK)
+        .write("sorbet/rbi/gems/secure_headers@5.2.0.rbi", &rbi("module SecureHeaders; end\nclass SecureHeaders::StrictTransportSecurity; end\nSecureHeaders::StrictTransportSecurity::HEADER_NAME = T.let(T.unsafe(nil), String)\n"))
+        .write("sorbet/rbi/gems/shopify-money@4.1.1.rbi", &rbi("class Money\n  def initialize(value, currency); end\nend\n"))
+        .write("sorbet/rbi/gems/elasticsearch-shopify@6.0.1.rbi", &rbi("module ElasticSearch; end\nmodule ElasticSearch::Shopify; end\nclass ElasticSearch::Shopify::Client; end\n"))
+        .write("sorbet/rbi/gems/opentelemetry-shopify@1.22.0.rbi", &rbi("module OpenTelemetry; end\nmodule OpenTelemetry::Shopify\n  class << self\n    def configure(**options); end\n  end\nend\n"))
+        .write("sorbet/rbi/gems/panama_client@3.2.3.rbi", &rbi("module PanamaClient; end\nclass PanamaClient::NotFoundError < ::StandardError; end\n"))
+        .write("sorbet/rbi/gems/panama_metadata@0.3.19.1687.rbi", &rbi("module PanamaMetadata; end\nclass PanamaMetadata::Registry; end\n"))
+        .write("lib/rails_dependent.rb", r#"class RailsDependent
+  def hsts
+    SecureHeaders::StrictTransportSecurity::HEADER_NAME
+  end
 
-const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";
+  def zero
+    Money.new(0, "USD")
+  end
+
+  def client?(value)
+    value.is_a?(ElasticSearch::Shopify::Client)
+  end
+
+  def tracing
+    OpenTelemetry::Shopify.configure
+  end
+
+  def missing
+    raise PanamaClient::NotFoundError, "missing"
+  end
+
+  def registry?(value)
+    value.is_a?(PanamaMetadata::Registry)
+  end
+end
+"#)
+}
+
+const RAILS_DEPENDENT: [(&str, &str); 6] = [
+    ("secure_headers", "secure_headers"),
+    ("shopify-money", "shopify-money"),
+    ("elasticsearch-shopify", "elastic_search/shopify"),
+    ("opentelemetry-shopify", "opentelemetry-shopify"),
+    ("panama_client", "panama_client"),
+    ("panama_metadata", "panama_metadata"),
+];
 
 #[test]
-fn the_emitted_ruby_tree_declares_shopify_money_where_the_lock_names_it() {
-    let (dir, errors) = emit_and_run::empty_app()
-        .write("roundhouse.yml", "test_paths:\n  - test\n")
-        .write("Gemfile.lock", SHOPIFY_MONEY_LOCK)
-        .write("sorbet/rbi/gems/shopify-money@4.1.1.rbi", "# typed: true\nclass Money\n  def initialize(value, currency); end\n  def currency; end\nend\n")
-        .write("lib/price.rb", PRICE)
-        .emit(BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{errors:#?}");
+fn a_rails_dependent_gem_is_refused_by_name_and_never_required() {
+    let (dir, errors) = rails_dependent_app().emit(BuildTarget::Ruby);
     let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
-    assert!(gemfile.contains("gem \"shopify-money\""), "{gemfile}");
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
-    assert!(facades.contains("\"shopify-money\""), "{facades}");
+    for (gem, feature) in RAILS_DEPENDENT {
+        assert!(
+            errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem, whose load closure requires Rails"))),
+            "{gem}: {errors:#?}"
+        );
+        assert!(!gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
+        assert!(!facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
 }
+
+/// Core's Money is shopify-money's. Another app's own `Money` is named
+/// the same and declares no gem.
+const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
+
+const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";
 
 #[test]
 fn an_app_s_own_money_does_not_declare_shopify_money() {
@@ -428,7 +469,7 @@ fn an_app_s_own_money_does_not_declare_shopify_money() {
     assert!(!gemfile.contains("shopify-money"), "{gemfile}");
 }
 
-const SERVICES_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    elasticsearch-shopify (6.0.1)\n    graphql (2.6.11)\n    shopify-adt (1.2.0)\n\nDEPENDENCIES\n  activesupport\n  elasticsearch-shopify (= 6.0.1)\n  graphql (~> 2.6.11)\n  shopify-adt (~> 1.2.0)\n";
+const SERVICES_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    graphql (2.6.11)\n    shopify-adt (1.2.0)\n\nDEPENDENCIES\n  activesupport\n  graphql (~> 2.6.11)\n  shopify-adt (~> 1.2.0)\n";
 
 fn services_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
@@ -436,15 +477,10 @@ fn services_app() -> emit_and_run::Overlay {
         .write("roundhouse.yml", "test_paths:\n  - test\n")
         .write("Gemfile.lock", SERVICES_LOCK)
         .write("sorbet/rbi/gems/shopify-adt@1.2.0.rbi", &rbi("module Shopify; end\nmodule Shopify::Adt; end\nclass Shopify::Adt::Optional\n  def present?; end\nend\n"))
-        .write("sorbet/rbi/gems/elasticsearch-shopify@6.0.1.rbi", &rbi("module ElasticSearch; end\nmodule ElasticSearch::Shopify; end\nclass ElasticSearch::Shopify::Client\n  def search(index, body); end\nend\n"))
         .write("sorbet/rbi/gems/graphql@2.6.11.rbi", &rbi("module GraphQL; end\nmodule GraphQL::Language; end\nmodule GraphQL::Language::Nodes; end\nclass GraphQL::Language::Nodes::AbstractNode; end\nclass GraphQL::Language::Nodes::Field < ::GraphQL::Language::Nodes::AbstractNode\n  def name; end\nend\n"))
         .write("lib/service_reader.rb", r#"class ServiceReader
   def optional?(value)
     value.is_a?(Shopify::Adt::Optional)
-  end
-
-  def client?(value)
-    value.is_a?(ElasticSearch::Shopify::Client)
   end
 
   def field?(node)
@@ -454,7 +490,7 @@ end
 "#)
 }
 
-const SERVICES_GEMS: [&str; 3] = ["shopify-adt", "elasticsearch-shopify", "graphql"];
+const SERVICES_GEMS: [&str; 2] = ["shopify-adt", "graphql"];
 
 #[test]
 fn the_emitted_ruby_tree_declares_and_loads_the_service_gems() {
@@ -465,7 +501,7 @@ fn the_emitted_ruby_tree_declares_and_loads_the_service_gems() {
         assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
     }
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
-    for feature in ["shopify/adt", "elastic_search/shopify", "graphql"] {
+    for feature in ["shopify/adt", "graphql"] {
         assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
     }
 }
@@ -546,4 +582,71 @@ fn the_locked_bundled_gems_are_on_the_load_path_and_a_partial_gem_load_is_named(
         "{stderr}"
     );
     assert!(!stderr.contains("require \"bcrypt\""), "an absent gem stays quiet: {stderr}");
+}
+
+/// The Rails-free part of Core's Bundler.require list, in its Gemfile
+/// order.
+const CORE_REQUIRES: [&str; 24] = [
+    "rack", "redis", "hiredis-client", "stack_frames", "snappy", "faraday", "faraday/gzip",
+    "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux",
+    "trilogy", "shopify_bots", "shopify_bots/agent_classification_identifier", "shopify_bots/rack/middleware",
+    "shopify_bots/request_extension", "shopify_bots/session/object_agent_classification_record",
+    "shopify_bots/session/agent_classification_updater", "sabertooth", "sabertooth/prelude", "shopify-opensrs",
+    "customer_privacy_api_ruby", "magellan-ruby", "shopify/adt", "graphql",
+];
+
+/// A blog-shaped app whose lock names none of Core's gems requires none
+/// of them, whatever the machine has installed.
+#[test]
+fn an_app_whose_lock_omits_core_s_gems_requires_none_of_them() {
+    for lock in [Some(OWN_MONEY_LOCK), None] {
+        let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+        if let Some(lock) = lock {
+            app = app.write("Gemfile.lock", lock);
+        }
+        let (dir, errors) = app.emit(BuildTarget::Ruby);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+        assert!(facades.contains("\"bcrypt\""), "{facades}");
+        for feature in CORE_REQUIRES {
+            assert!(!facades.contains(&format!("\"{feature}\"")), "{feature} ({lock:?}): {facades}");
+        }
+    }
+}
+
+/// Core's lock gets the Rails-free list, in Gemfile order, though the
+/// lock lists its specs alphabetically, and none of the Rails-dependent
+/// gems it also resolves.
+#[test]
+fn core_s_lock_requires_its_bundler_require_list_in_gemfile_order() {
+    let mut gems: Vec<&str> = CORE_REQUIRES
+        .iter()
+        .map(|f| match *f {
+            "faraday/gzip" => "faraday-gzip",
+            "shopify/adt" => "shopify-adt",
+            f if f.starts_with("shopify_bots") => "shopify_bots",
+            f if f.starts_with("sabertooth") => "sabertooth",
+            f => f,
+        })
+        .chain(RAILS_DEPENDENT.iter().map(|(gem, _)| *gem))
+        .collect();
+    gems.sort();
+    gems.dedup();
+    let specs: String = gems.iter().map(|g| format!("    {g} (1.0.0)\n")).collect();
+    let deps: String = gems.iter().map(|g| format!("  {g}\n")).collect();
+    let lock = format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nDEPENDENCIES\n{deps}");
+    let (dir, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", &lock)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    let at: Vec<usize> = CORE_REQUIRES
+        .iter()
+        .map(|f| facades.find(&format!("\"{f}\"")).unwrap_or_else(|| panic!("{f}: {facades}")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "out of Gemfile order: {facades}");
+    for (_, feature) in RAILS_DEPENDENT {
+        assert!(!facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
 }

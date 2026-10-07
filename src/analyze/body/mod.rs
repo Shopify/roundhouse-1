@@ -802,6 +802,17 @@ impl<'a> BodyTyper<'a> {
                     if let Some(gem) = self.declaring_gem(path) {
                         if crate::project::ruby_tree_loads_gem(&gem) {
                             expr.decisions |= crate::expr::GEM_CONSTANT_REF;
+                        } else if let Some(reason) = crate::project::gem_requires_rails(&gem) {
+                            // Named apart from "no tree loads it": the
+                            // gem's source has to be compiled as app code.
+                            expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                target: None,
+                                construct: Symbol::from("gem_requires_rails"),
+                                detail: format!(
+                                    "{} is declared by the {gem} gem, whose load closure requires Rails ({reason}), so no emitted tree loads it natively",
+                                    written_class_id(path).0
+                                ),
+                            });
                         } else {
                             expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                                 target: None,

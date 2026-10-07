@@ -2944,7 +2944,7 @@ fn ruby_family_files(
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
              {}{}",
-            gem_require_block(&[]),
+            gem_require_block(&[], app.gem_lock.as_ref()),
             WEB_PUSH_STUB_REOPEN
         ),
         RubyFlavor::JRuby => {
@@ -2969,7 +2969,7 @@ fn ruby_family_files(
              require_relative \"rails_configuration\"\n\
                  {}{}",
                 markly_require,
-                gem_require_block(&["markly"]),
+                gem_require_block(&["markly"], app.gem_lock.as_ref()),
                 WEB_PUSH_STUB_REOPEN
             )
         }
@@ -6277,37 +6277,38 @@ const GEM_REQUIRES: &[&str] = &[
     "ostruct",
     "dalli",
     "google/protobuf",
-    // Shopify Core's Bundler.require, in its Gemfile order.
-    "rack",
-    "panama_client",
-    "redis",
-    "hiredis-client",
-    "stack_frames",
-    "snappy",
-    "faraday",
-    "faraday/gzip",
-    "opentelemetry-instrumentation-trilogy",
-    "opentelemetry-instrumentation-pg",
-    "lru_redux",
-    "secure_headers",
-    "trilogy",
-    "shopify_bots",
-    "shopify_bots/agent_classification_identifier",
-    "shopify_bots/rack/middleware",
-    "shopify_bots/request_extension",
-    "shopify_bots/session/object_agent_classification_record",
-    "shopify_bots/session/agent_classification_updater",
-    "sabertooth",
-    "sabertooth/prelude",
-    "shopify-opensrs",
-    "customer_privacy_api_ruby",
-    "panama_metadata",
-    "opentelemetry-shopify",
-    "magellan-ruby",
-    "shopify-money",
-    "shopify/adt",
-    "elastic_search/shopify",
-    "graphql",
+];
+
+/// Shopify Core's Bundler.require, in its Gemfile order, as (require
+/// path, lockfile gem): the entries whose load closure is Rails-free
+/// (the rest are `RAILS_DEPENDENT_GEMS`). Unlike `GEM_REQUIRES` these
+/// load only where the app's Gemfile.lock resolves the gem, so a tree's
+/// load set does not follow whatever gems the machine has installed.
+const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
+    ("rack", "rack"),
+    ("redis", "redis"),
+    ("hiredis-client", "hiredis-client"),
+    ("stack_frames", "stack_frames"),
+    ("snappy", "snappy"),
+    ("faraday", "faraday"),
+    ("faraday/gzip", "faraday-gzip"),
+    ("opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-trilogy"),
+    ("opentelemetry-instrumentation-pg", "opentelemetry-instrumentation-pg"),
+    ("lru_redux", "lru_redux"),
+    ("trilogy", "trilogy"),
+    ("shopify_bots", "shopify_bots"),
+    ("shopify_bots/agent_classification_identifier", "shopify_bots"),
+    ("shopify_bots/rack/middleware", "shopify_bots"),
+    ("shopify_bots/request_extension", "shopify_bots"),
+    ("shopify_bots/session/object_agent_classification_record", "shopify_bots"),
+    ("shopify_bots/session/agent_classification_updater", "shopify_bots"),
+    ("sabertooth", "sabertooth"),
+    ("sabertooth/prelude", "sabertooth"),
+    ("shopify-opensrs", "shopify-opensrs"),
+    ("customer_privacy_api_ruby", "customer_privacy_api_ruby"),
+    ("magellan-ruby", "magellan-ruby"),
+    ("shopify/adt", "shopify-adt"),
+    ("graphql", "graphql"),
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -6570,10 +6571,15 @@ fn spinel_sql_functions_file(app: &App) -> Option<String> {
     Some(out)
 }
 
-fn gem_require_block(exclude: &[&str]) -> String {
+fn gem_require_block(exclude: &[&str], lock: Option<&crate::gems::Lockfile>) -> String {
+    let gated = LOCK_GATED_REQUIRES
+        .iter()
+        .filter(|(_, gem)| lock.is_some_and(|l| l.has(gem)))
+        .map(|(path, _)| path);
     let names: Vec<String> = GEM_REQUIRES
         .iter()
         .filter(|g| !exclude.contains(g))
+        .chain(gated)
         .map(|g| format!("{g:?}"))
         .collect();
     let mut out = format!("[{}].each do |gem_name|\n", names.join(", "));
@@ -6610,7 +6616,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 54] = [
+    const RUNTIME_GEMS: [(Marker, &str); 44] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6733,11 +6739,6 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         (Marker::Constant("Redis"), "redis"),
         (Marker::Constant("RedisClient"), "redis-client"),
         (Marker::Constant("Redis"), "hiredis-client"),
-        // Core's test config builds `PanamaClient::TestFakeClient` (Core
-        // reopens the gem's module) over the gem's `PanamaMetadata`
-        // registry. Neither gem depends on Rails.
-        (Marker::Constant("PanamaClient"), "panama_client"),
-        (Marker::Constant("PanamaMetadata"), "panama_metadata"),
         // Online Store's theme bodies and Paquito's codecs compress
         // through it.
         (Marker::Constant("Snappy"), "snappy"),
@@ -6757,37 +6758,26 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         (Marker::Constant("Magellan"), "magellan-ruby"),
         // More of Essentials' load-time constants, each Bundler.required by
         // Core and loaded natively without Rails: query capture's
-        // StackFrames buffer, the middlewares' LruRedux cache, SecureHeaders
-        // and ShopifyBots (with its listed requires) and customer account's
+        // StackFrames buffer, the middlewares' LruRedux cache, ShopifyBots
+        // (with its listed requires) and customer account's
         // CustomerPrivacyApiRuby.
         (Marker::Constant("StackFrames"), "stack_frames"),
         (Marker::Constant("LruRedux"), "lru_redux"),
-        (Marker::Constant("SecureHeaders"), "secure_headers"),
         (Marker::Constant("ShopifyBots"), "shopify_bots"),
         (Marker::Constant("CustomerPrivacyApiRuby"), "customer_privacy_api_ruby"),
-        // Core's Money, Rails-free natively (it adds `money_column` only
-        // `if defined?(ActiveRecord)`). RubyMoney's money gem defines the
-        // same `Money`, so this row is in `LOCK_GATED_GEMS`.
-        (Marker::Constant("Money"), "shopify-money"),
         // Bundler.required by Core and loaded natively without Rails:
-        // Shopify::Adt's Optional, the search client and graphql-ruby's
-        // query AST (`GraphQL::Language::Nodes`). Not kafka-shopify or
+        // Shopify::Adt's Optional and graphql-ruby's query AST
+        // (`GraphQL::Language::Nodes`). Not kafka-shopify or
         // graphql-client: each loads ActiveSupport when required.
         (Marker::Constant("Shopify::Adt"), "shopify-adt"),
-        (Marker::Constant("ElasticSearch::Shopify"), "elasticsearch-shopify"),
         (Marker::Constant("GraphQL"), "graphql"),
-        // Core's tracing. opentelemetry-shopify is the Bundler.required
-        // entry and loads the API, SDK and the instrumentations below;
-        // each gem whose RBI declares a constant Core names is its own
-        // row, so its RBI is read.
-        (Marker::Constant("OpenTelemetry"), "opentelemetry-shopify"),
+        // Core's tracing, as far as its Rails-free instrumentations load
+        // it: each requires the API and the instrumentation base.
+        // opentelemetry-shopify, the SDK entry, is in
+        // `RAILS_DEPENDENT_GEMS`.
         (Marker::Constant("OpenTelemetry"), "opentelemetry-api"),
-        (Marker::Constant("OpenTelemetry"), "opentelemetry-sdk"),
-        (Marker::Constant("OpenTelemetry::Common"), "opentelemetry-common"),
-        (Marker::Constant("OpenTelemetry::Instrumentation::Rack"), "opentelemetry-instrumentation-rack"),
         (Marker::Constant("OpenTelemetry::Instrumentation::Trilogy"), "opentelemetry-instrumentation-trilogy"),
         (Marker::Constant("OpenTelemetry::Instrumentation::PG"), "opentelemetry-instrumentation-pg"),
-        (Marker::Constant("OpenTelemetry::Instrumentation::GraphQL"), "opentelemetry-instrumentation-graphql"),
         // Demand only: Core's own `require "opentelemetry-helpers-sql-
         // obfuscation"` and `require "prism"` (a default gem, in Core's
         // lock) load these, as on Core.
@@ -6797,17 +6787,34 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     &RUNTIME_GEMS
 }
 
-/// `RUNTIME_GEMS` rows whose marker another gem also defines. The app
-/// names the constant either way, so the row is demanded only when the
-/// app's lock names the row's gem.
-const LOCK_GATED_GEMS: [&str; 1] = ["shopify-money"];
+/// Gems in Core's Bundler.require list whose load closure reaches Rails,
+/// with the evidence. The emitted runtime defines `Rails`,
+/// `ActiveSupport` and `ActiveRecord`, so a gem's `if defined?(...)`
+/// integration fires there too. These gems are compiled as app code
+/// through `gem_sources:` or their constants are refused by name
+/// (construct `gem_requires_rails`); they are never required natively. Verdicts: docs/RUNTIME_GEMS.md
+/// (core-transpile).
+const RAILS_DEPENDENT_GEMS: [(&str, &str); 9] = [
+    ("secure_headers", "view_helper.rb calls `ActiveSupport.on_load(:action_view)` when ActiveSupport is defined"),
+    ("shopify-money", "money.rb requires money_column when ActiveRecord is defined"),
+    ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),
+    ("opentelemetry-shopify", "it requires its railtie, and with it `active_support/parameter_filter`, when Rails is defined"),
+    ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
+    ("opentelemetry-common", "only opentelemetry-shopify requires it"),
+    ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
+    ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
+    ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
+];
+
+/// Why `gem`'s load closure reaches Rails, when it is in
+/// `RAILS_DEPENDENT_GEMS`.
+pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
+    RAILS_DEPENDENT_GEMS.iter().find(|(g, _)| *g == gem).map(|(_, why)| *why)
+}
 
 fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
     let mut needed: Vec<&str> = Vec::new();
     for &(ref marker, gem) in runtime_gems() {
-        if LOCK_GATED_GEMS.contains(&gem) && !lock.is_some_and(|l| l.has(gem)) {
-            continue;
-        }
         // `app/` only. The runtime tree names several of these itself (the
         // façade lists all nine), and a scan that saw those would declare
         // every gem for every app — the same self-fulfilling wiring the
