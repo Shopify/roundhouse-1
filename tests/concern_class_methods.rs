@@ -9,8 +9,9 @@
 //!
 //! The carrier is the whole distinction. `module ClassMethods` and
 //! `class_methods do` are inherited; a module's OWN singletons —
-//! `module_function :x`, `class << self` — are not, and after ingest's
-//! flatten all four look identical.
+//! `module_function :x`, `class << self` — are not. `class_methods do`
+//! flattens into the module as `def self.…`; `module ClassMethods` stays
+//! a module of its own, whose instance defs the splice reads.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::dialect::MethodReceiver;
 use roundhouse::ty::Ty;
 
 fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
@@ -331,60 +333,109 @@ fn an_includers_own_factory_and_constructor_win() {
     });
 }
 
+/// The carrier is emitted as its own module and reaches the includers
+/// through the authored hook; the spliced copies type the includers'
+/// class side but are not written into them.
 #[test]
 fn library_factory_splicing_preserves_lexical_constants_and_carrier_boundaries() {
     let mut app = factory_app("app/services/factory.rb", &format!("{READING}{PACKET}"), CONSUMER, "");
     roundhouse::lower::class_body_new::apply_class_body_new_lowering(&mut app);
-    let emitted = ruby::emit_library(&app);
-    for class in ["reading", "packet"] {
-        let values = emitted.iter().find(|f| f.path.to_string_lossy().ends_with(&format!("/{class}.rb"))).unwrap();
-        assert!(values.content.contains("value = Factory::PREFIX"), "{}", values.content);
-        assert!(!values.content.contains("def self.module_only"), "{}", values.content);
-        assert_eq!(values.content.matches("def self.build").count(), 1, "{}", values.content);
+    for class in ["Reading", "Packet"] {
+        let lc = app.library_classes.iter().find(|c| c.name.0.as_str() == class).unwrap();
+        // The typing copy is there (and qualified to the carrier's lexical scope) ...
+        let build = lc.methods.iter().filter(|m| m.name.as_str() == "build").count();
+        assert_eq!(build, 1, "{class}");
+        let splices = &app.class_methods_carrier_splices[&lc.name];
+        assert_eq!(splices.len(), 1, "{class}: {splices:?}");
+        assert_eq!(splices[0].carrier.0.as_str(), "Factory::ClassMethods");
+        assert!(!splices[0].extend, "the authored hook extends, not the includer");
+        for method in ["build", "fixed", "prefix"] {
+            assert!(splices[0].methods.iter().any(|m| m.as_str() == method), "{class}: {splices:?}");
+        }
     }
-    let factory = emitted.iter().find(|f| f.path.to_string_lossy().ends_with("factory.rb")).unwrap();
-    assert!(!factory.content.contains("def self.included"), "{}", factory.content);
+    let emitted = ruby::emit_library(&app);
+    let file = |suffix: &str| emitted.iter().find(|f| f.path.to_string_lossy().ends_with(suffix))
+        .unwrap_or_else(|| panic!("no {suffix}")).content.clone();
+    for class in ["reading", "packet"] {
+        let values = file(&format!("/{class}.rb"));
+        // ... but the emitted includer gets the methods from the module.
+        assert!(values.contains("include Factory"), "{values}");
+        assert!(!values.contains("def self.build") && !values.contains("def self.prefix"), "{values}");
+        assert!(!values.contains("def self.module_only"), "{values}");
+        assert!(!values.contains("extend Factory::ClassMethods"), "{values}");
+    }
+    let factory = file("/factory.rb");
+    assert!(factory.contains("def self.included(base)") && factory.contains("base.extend(Factory::ClassMethods)"), "{factory}");
+    assert!(!factory.contains("def self.build"), "{factory}");
+    let carrier = file("/factory/class_methods.rb");
+    assert!(carrier.contains("module Factory\n  module ClassMethods"), "{carrier}");
+    assert!(carrier.contains("def build(**fields)") && carrier.contains("def prefix(value = Factory::PREFIX)"), "{carrier}");
 }
 
+/// The vanilla bridge `def self.included(base) = base.extend(ClassMethods)`
+/// is the module's real hook: it stays as authored in every spelling, and
+/// the nested module stays a module whose defs are instance methods (the
+/// owner answers none of them, as in Ruby).
 #[test]
-fn only_the_complete_class_methods_bridge_is_consumed() {
-    for (source, retained) in [
-        (FACTORY.to_string(), false),
-        (FACTORY.replace("base.extend(ClassMethods)", "base.extend(ClassMethods)\n    puts \"registered\""), true),
-        (FACTORY.replace("base.extend(ClassMethods)", "base.extend(OtherMethods)"), true),
-        (FACTORY.replace("base.extend(ClassMethods)", "other.extend(ClassMethods)"), true),
-        (FACTORY.replace("included(base)", "included(base, **options)"), true),
-        (FACTORY.replace("module ClassMethods", "module OtherMethods"), true),
+fn the_class_methods_bridge_is_kept_as_authored() {
+    for source in [
+        FACTORY.to_string(),
+        FACTORY.replace("base.extend(ClassMethods)", "base.extend(ClassMethods)\n    puts \"registered\""),
+        FACTORY.replace("base.extend(ClassMethods)", "base.extend(OtherMethods)"),
+        FACTORY.replace("base.extend(ClassMethods)", "other.extend(ClassMethods)"),
+        FACTORY.replace("included(base)", "included(base, **options)"),
+        FACTORY.replace("module ClassMethods", "module OtherMethods"),
     ] {
         let classes = roundhouse::ingest::library_class::ingest_library_classes(source.as_bytes(), "factory.rb").unwrap();
         let factory = classes.iter().find(|c| c.name.0.as_str() == "Factory").unwrap();
-        assert_eq!(factory.methods.iter().any(|m| m.name.as_str() == "included"), retained, "{source}");
+        assert!(factory.methods.iter().any(|m| m.name.as_str() == "included" && m.receiver == MethodReceiver::Class), "{source}");
+        assert!(!factory.methods.iter().any(|m| matches!(m.name.as_str(), "build" | "fixed" | "prefix")), "{source}");
+        let nested = if source.contains("module OtherMethods") { "Factory::OtherMethods" } else { "Factory::ClassMethods" };
+        let carrier = classes.iter().find(|c| c.name.0.as_str() == nested).unwrap_or_else(|| panic!("{nested}: {source}"));
+        assert!(carrier.is_module);
+        let defs: Vec<_> = carrier.methods.iter().map(|m| (m.name.as_str(), m.receiver)).collect();
+        assert_eq!(defs, [("build", MethodReceiver::Instance), ("fixed", MethodReceiver::Instance), ("prefix", MethodReceiver::Instance)], "{source}");
     }
 }
 
+/// A bridge in a different reopening than its carrier is kept too, and the
+/// includer's class side is typed from the carrier only when the carrier
+/// is the bridge owner's own nested module.
 #[test]
 fn split_bridges_require_the_actual_nested_carrier_and_keep_other_callbacks() {
     let carrier = "module Factory\n  module ClassMethods\n    def build(**fields)\n      new(**fields).freeze\n    end\n  end\nend\n";
     let block_only = carrier.replace("module ClassMethods", "class_methods do");
     let other_owner = carrier.replace("module Factory", "module OtherFactory");
     let overridden = format!("{carrier}module Factory\n  def self.included(base)\n    puts \"registered\"\n  end\nend\n");
-    for (hook, declaration, retained) in [
-        ("base.extend(ClassMethods)", carrier, false),
-        ("base.extend(ClassMethods)\n    puts \"registered\"", carrier, true),
-        ("base.extend(OtherMethods)", carrier, true),
-        ("base.extend(ClassMethods)", block_only.as_str(), true),
-        ("base.extend(ClassMethods)", other_owner.as_str(), true),
-        ("base.extend(ClassMethods)", overridden.as_str(), true),
+    for (hook, declaration, carrier_module) in [
+        ("base.extend(ClassMethods)", carrier, Some("Factory::ClassMethods")),
+        ("base.extend(ClassMethods)\n    puts \"registered\"", carrier, Some("Factory::ClassMethods")),
+        ("base.extend(OtherMethods)", carrier, Some("Factory::ClassMethods")),
+        ("base.extend(ClassMethods)", block_only.as_str(), None),
+        ("base.extend(ClassMethods)", other_owner.as_str(), Some("OtherFactory::ClassMethods")),
+        ("base.extend(ClassMethods)", overridden.as_str(), Some("Factory::ClassMethods")),
     ] {
         let bridge = format!("module Factory\n  def self.included(base)\n    {hook}\n  end\nend\n");
         let app = ingest_app_from_tree(tree(&[
             ("lib/factory.rb", declaration),
             ("lib/factory_bridge.rb", &bridge),
+            ("lib/gauge.rb", "class Gauge\n  include Factory\nend\n"),
         ])).expect("ingest split carrier and bridge");
-        let has_hook = app.library_classes.iter()
+        let hooks = app.library_classes.iter()
             .filter(|c| c.name.0.as_str() == "Factory")
             .flat_map(|c| &c.methods)
-            .any(|m| m.name.as_str() == "included");
-        assert_eq!(has_hook, retained, "{bridge}\n{declaration}");
+            .filter(|m| m.name.as_str() == "included")
+            .count();
+        let expected_hooks = if declaration.contains("puts") { 2 } else { 1 };
+        assert_eq!(hooks, expected_hooks, "{bridge}\n{declaration}");
+        let module = carrier_module.map(|name| app.library_classes.iter().find(|c| c.name.0.as_str() == name)
+            .unwrap_or_else(|| panic!("{name}")));
+        assert!(module.is_none_or(|m| m.is_module && m.methods.iter().any(|d| d.name.as_str() == "build" && d.receiver == MethodReceiver::Instance)));
+        let gauge = app.library_classes.iter().find(|c| c.name.0.as_str() == "Gauge").unwrap();
+        let typed_build = gauge.methods.iter().any(|m| m.name.as_str() == "build" && m.receiver == MethodReceiver::Class);
+        // `class_methods do` is the Concern block spelling, a carrier of
+        // Factory's own; the other owner's module is not Factory's.
+        let expect_build = carrier_module == Some("Factory::ClassMethods") || block_only == declaration;
+        assert_eq!(typed_build, expect_build, "{bridge}\n{declaration}");
     }
 }

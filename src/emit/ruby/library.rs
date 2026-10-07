@@ -118,23 +118,51 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // closure the scans made assembling the files the emit's longest
     // stage.
     let _names = NameIndex::install(app);
-    lcs.iter()
-        .filter(|lc| owner_in_this_tree(lc).is_none())
-        .flat_map(|lc| {
-            // `underscore`, not `snake_case`: a namespaced reopen
-            // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
-            // `ShortId::CandidateId`) nests as `active_record/base.rb` —
-            // a literal `::` in the filename breaks the emitted
-            // Makefile's dependency list.
-            let file_stem = crate::naming::underscore(lc.name.0.as_str());
-            let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
-            let mut files = emit_library_class_pair(lc, app, out_path);
+    // A module or class reopened in several source files is several
+    // LibraryClasses of one name, and they share the one emitted path.
+    // Each emits as a reopening of its own and the file holds them all,
+    // in source order, as Ruby would have run them; written one per
+    // path, the last reopening silently replaced the others (a bridge
+    // `def self.included` in one file, its `module ClassMethods` in the
+    // next, lost the hook). Nested children splice into the last.
+    let mut last_of_name: crate::det::HashMap<&str, usize> = crate::det::HashMap::default();
+    for (i, lc) in lcs.iter().enumerate() {
+        last_of_name.insert(lc.name.0.as_str(), i);
+    }
+    let mut out: Vec<EmittedFile> = Vec::new();
+    let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
+    for (i, lc) in lcs.iter().enumerate().filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
+        // `underscore`, not `snake_case`: a namespaced reopen
+        // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
+        // `ShortId::CandidateId`) nests as `active_record/base.rb` —
+        // a literal `::` in the filename breaks the emitted
+        // Makefile's dependency list.
+        let file_stem = crate::naming::underscore(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
+        let mut files = emit_library_class_pair(lc, app, out_path);
+        if last_of_name.get(lc.name.0.as_str()) == Some(&i) {
             if let Some(kids) = children.get(lc.name.0.as_str()) {
                 splice_nested(&mut files, lc, kids, app);
             }
-            files
-        })
-        .collect()
+        }
+        for file in files {
+            match at_path.get(&file.path) {
+                Some(&j) => {
+                    let merged = &mut out[j].content;
+                    if !merged.ends_with('\n') {
+                        merged.push('\n');
+                    }
+                    merged.push('\n');
+                    merged.push_str(&file.content);
+                }
+                None => {
+                    at_path.insert(file.path.clone(), out.len());
+                    out.push(file);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A child's `require_relative` target, expressed from its parent's
@@ -6284,6 +6312,31 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // A concern's nested `module ClassMethods` reaches a library-class
+    // includer through `extend`, as in Ruby: the authored `included` hook
+    // or (written here) ActiveSupport::Concern's `append_features`. The
+    // class-side copies the splice made are analysis's view of that
+    // extend, not methods of this class (`App::class_methods_carrier_splices`).
+    let carrier_splices = app.class_methods_carrier_splices.get(&lc.name);
+    let without_carrier_copies;
+    let lc = match carrier_splices {
+        Some(splices) if splices.iter().any(|splice| !splice.methods.is_empty()) => {
+            let mut copy = lc.clone();
+            copy.methods.retain(|m| {
+                !(m.receiver == MethodReceiver::Class
+                    && splices.iter().any(|splice| splice.methods.contains(&m.name)))
+            });
+            without_carrier_copies = copy;
+            &without_carrier_copies
+        }
+        _ => lc,
+    };
+    let carrier_extends: Vec<&crate::ident::ClassId> = carrier_splices
+        .into_iter()
+        .flatten()
+        .filter(|splice| splice.extend)
+        .map(|splice| &splice.carrier)
+        .collect();
     if !lc.top_level_constants.is_empty() {
         return emit_with_top_level_constants(lc, app, out_path, synthesized_siblings);
     }
@@ -6362,7 +6415,7 @@ fn emit_library_class_decl_inner(
     // class-definition time — unlike body const-refs (request-time), so we
     // require them even when they're same-dir siblings (plain Ruby has no
     // Rails autoload). Resolve through the same model/library_class anchor.
-    for inc in &lc.includes {
+    for inc in lc.includes.iter().chain(carrier_extends.iter().copied()) {
         // SPLIT on `::` — an include's ClassId is one Symbol holding the
         // whole path, and the const resolver keys on the ROOT segment.
         // Unsplit, `Turbo::Streams::StreamName::ClassMethods` was its
@@ -6605,7 +6658,10 @@ fn emit_library_class_decl_inner(
         }
         writeln!(s, "{body_pad}include {}", inc.0.as_str()).unwrap();
     }
-    if !lc.includes.is_empty() && !lc.methods.is_empty() {
+    for carrier in &carrier_extends {
+        writeln!(s, "{body_pad}extend {}", carrier.0.as_str()).unwrap();
+    }
+    if (!lc.includes.is_empty() || !carrier_extends.is_empty()) && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
 

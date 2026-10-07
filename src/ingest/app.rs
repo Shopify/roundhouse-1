@@ -2625,16 +2625,54 @@ pub(super) fn concern_class_method_catalog(
     }
     let mut class_side: HashMap<_, (Vec<crate::dialect::MethodDef>, HashSet<Symbol>)> = HashMap::default();
     for lc in classes {
-        let Some(spans) = carried.get(&lc.name) else { continue };
-        let (methods, consts) = class_side.entry(lc.name.clone()).or_default();
-        consts.extend(lc.constants.iter().map(|(n, _)| n.clone()));
+        // The owner's own class-side carriers (`class_methods do`,
+        // `class << klass` in the hook, `included do def self.x`) are its
+        // Class-receiver defs. A nested `module ClassMethods` is its own
+        // module: its INSTANCE defs are what `extend` hands an includer,
+        // read here as that includer's class side, with the carrier's own
+        // constants written in full (Ruby looks them up in
+        // `Owner::ClassMethods` first).
+        let (owner, carrier_module) = match carried.get_key_value(&lc.name) {
+            Some((owner, _)) => (*owner, false),
+            None => match crate::app::class_methods_carrier_owner(&lc.name).and_then(|o| carried.get_key_value(&o)) {
+                Some((owner, _)) if lc.is_module => (*owner, true),
+                _ => continue,
+            },
+        };
+        let spans = &carried[owner];
+        let receiver = if carrier_module { MethodReceiver::Instance } else { MethodReceiver::Class };
+        let carrier_consts: HashSet<Symbol> = lc.constants.iter().map(|(n, _)| n.clone()).collect();
+        let (methods, consts) = class_side.entry(owner.clone()).or_default();
+        if carrier_module {
+            consts.insert(Symbol::from("ClassMethods"));
+        } else {
+            consts.extend(carrier_consts.iter().cloned());
+        }
         for method in lc.methods.iter()
-            .filter(|m| m.receiver == MethodReceiver::Class && spans.contains(&m.name_span))
+            .filter(|m| m.receiver == receiver && spans.contains(&m.name_span))
+            // The owner's own module callbacks (`class << self; def
+            // included(base)`) run when IT is included; an includer never
+            // answers them.
+            .filter(|m| carrier_module || !matches!(m.name.as_str(),
+                "included" | "prepended" | "extended" | "append_features" | "prepend_features"))
         {
+            let mut method = method.clone();
+            if carrier_module {
+                method.receiver = MethodReceiver::Class;
+                method.enclosing_class = owner.0.as_str().rsplit("::").next().map(Symbol::from);
+                if !carrier_consts.is_empty() {
+                    qualify_lexical_consts(&mut method.body, &lc.name, &carrier_consts);
+                    for param in &mut method.params {
+                        if let Some(default) = &mut param.default {
+                            qualify_lexical_consts(default, &lc.name, &carrier_consts);
+                        }
+                    }
+                }
+            }
             if let Some(prior) = methods.iter_mut().find(|m| m.name == method.name) {
-                *prior = method.clone();
+                *prior = method;
             } else {
-                methods.push(method.clone());
+                methods.push(method);
             }
         }
     }
@@ -2646,11 +2684,11 @@ pub(super) fn concern_class_method_catalog(
 /// typed against each concrete includer.
 ///
 /// `include` never carries them. A concern writes its class side as
-/// `class_methods do` / `module ClassMethods`, both of which
-/// `ingest_library_classes` flattens into the module as `def self.…` —
-/// and Ruby's `include` brings instance methods across, never singleton
-/// ones (`C.respond_to?(:x)` is false; verified). Rails only gets away
-/// with it because ActiveSupport::Concern's `append_features` runs
+/// `class_methods do` (flattened into the module as `def self.…`) or as
+/// a nested `module ClassMethods` (a module of its own) — and Ruby's
+/// `include` brings instance methods across, never singleton ones
+/// (`C.respond_to?(:x)` is false; verified). Rails only gets away with
+/// it because ActiveSupport::Concern's `append_features` runs
 /// `base.extend ClassMethods`, and the emitted modules have no Concern.
 ///
 /// So `Message.create_with_attachment!` — campfire's entire message
@@ -2674,6 +2712,11 @@ pub(super) fn concern_class_method_catalog(
 /// copy is unreachable there rather than wrong (nothing calls
 /// `Message::Attachment.create_with_attachment!`). Removing it would
 /// mean rewriting library-class emit for no behavioural gain.
+///
+/// A nested `module ClassMethods` is the exception on a LIBRARY-class
+/// includer, which the Ruby emit writes with its `include`: there the
+/// copies are typing only (`App::class_methods_carrier_splices`), and
+/// the module reaches the includer the way Ruby does, through `extend`.
 fn splice_concern_class_methods_into_includers(
     app: &mut App,
     carriers: &[ConcernClassMethodSpans],
@@ -2682,14 +2725,6 @@ fn splice_concern_class_methods_into_includers(
     use crate::ident::{ClassId, Symbol};
     use crate::det::{HashMap, HashSet};
 
-    let nested_carriers: HashSet<&ClassId> = carriers.iter()
-        .filter(|c| c.has_nested_carrier).map(|c| &c.owner).collect();
-    let mut bridges: HashMap<&ClassId, HashSet<&crate::span::Span>> = HashMap::default();
-    for carrier in carriers {
-        if nested_carriers.contains(&carrier.owner) {
-            bridges.entry(&carrier.owner).or_default().extend(&carrier.bridges);
-        }
-    }
     let class_side = concern_class_method_catalog(&app.library_classes, carriers);
     let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for lc in &app.library_classes {
@@ -2698,41 +2733,58 @@ fn splice_concern_class_methods_into_includers(
     if class_side.is_empty() {
         return;
     }
-
-    // A complete bridge may precede or follow the actual carrier in a
-    // different reopening. Remove only those exact defs, and only after
-    // finding registered carrier methods that this splice will copy.
-    for lc in &mut app.library_classes {
-        if class_side.get(&lc.name).is_some_and(|(methods, _)| !methods.is_empty()) {
-            if let Some(spans) = bridges.get(&lc.name) {
-                lc.methods.retain(|m| !spans.contains(&m.name_span));
-            }
+    // Owners that `extend ActiveSupport::Concern`: their `append_features`
+    // extends the includer with `ClassMethods` (and defers their own
+    // includes to it). Any other module's carrier reaches an includer only
+    // if the module's authored `included` hook extends it.
+    let concerns: HashSet<&ClassId> = carriers.iter()
+        .filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
+    // The defs of each owner's nested `module ClassMethods`, by identity.
+    let mut carrier_defs: HashMap<ClassId, HashSet<crate::span::Span>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        let Some(owner) = crate::app::class_methods_carrier_owner(&lc.name) else { continue };
+        if !class_side.contains_key(&owner) {
+            continue;
         }
+        carrier_defs.entry(owner).or_default().extend(
+            lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name_span),
+        );
     }
 
-    let copies = |mut queue: Vec<ClassId>, mut taken: HashSet<Symbol>| {
+    let copies = |includes: Vec<ClassId>, mut taken: HashSet<Symbol>| {
         // Transitive closure of the includer's includes, in ancestor order.
-        let mut order: Vec<ClassId> = Vec::new();
+        // `via` is whether a native include reaches the includer through
+        // Concerns only: a Concern defers its own includes to its
+        // includer, a plain module performed them on itself.
+        let mut queue: Vec<(ClassId, bool)> = includes.into_iter().map(|id| (id, true)).collect();
+        let mut order: Vec<(ClassId, bool)> = Vec::new();
         let mut seen: HashSet<ClassId> = HashSet::default();
         while !queue.is_empty() {
-            let id = queue.remove(0);
+            let (id, via) = queue.remove(0);
             if !seen.insert(id.clone()) {
                 continue;
             }
-            order.push(id.clone());
+            let deferred = via && concerns.contains(&id);
             if let Some(nested) = module_includes.get(&id) {
-                queue.extend(nested.iter().cloned());
+                queue.extend(nested.iter().cloned().map(|n| (n, deferred)));
             }
+            order.push((id, via));
         }
         let mut added = Vec::new();
         let mut provenance: HashMap<Symbol, ClassId> = HashMap::default();
-        for concern in &order {
+        let mut carried: Vec<crate::app::ClassMethodsCarrierSplice> = Vec::new();
+        for (concern, via) in &order {
             let Some((methods, consts)) = class_side.get(concern) else { continue };
+            let carrier = carrier_defs.get(concern);
+            let mut carrier_copies = Vec::new();
             for m in methods {
                 if !taken.insert(m.name.clone()) {
                     continue;
                 }
                 provenance.insert(m.name.clone(), concern.clone());
+                if carrier.is_some_and(|defs| defs.contains(&m.name_span)) {
+                    carrier_copies.push(m.name.clone());
+                }
                 let mut m = m.clone();
                 refuse_copied_classvars(&mut m.body, concern);
                 if !consts.is_empty() {
@@ -2745,17 +2797,34 @@ fn splice_concern_class_methods_into_includers(
                 }
                 added.push(m);
             }
+            if carrier.is_some() {
+                let extend = *via && concerns.contains(concern);
+                if extend || !carrier_copies.is_empty() {
+                    carried.push(crate::app::ClassMethodsCarrierSplice {
+                        carrier: ClassId(Symbol::from(format!("{}::ClassMethods", concern.0.as_str()))),
+                        methods: carrier_copies,
+                        extend,
+                    });
+                }
+            }
         }
-        (added, provenance)
+        // Ruby runs the extends in this order: a Concern's deferred
+        // includes before its own `ClassMethods`, and `include A, B`
+        // includes B first; the LAST extend has precedence.
+        carried.reverse();
+        (added, provenance, carried)
     };
 
     let mut spliced: HashMap<ClassId, HashMap<Symbol, ClassId>> = HashMap::default();
+    let mut carrier_splices: HashMap<ClassId, Vec<crate::app::ClassMethodsCarrierSplice>> = HashMap::default();
     for model in &mut app.models {
         let taken = model.methods()
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance) = copies(crate::analyze::model_includes(model), taken);
+        // A model emits no `include`: its concerns are flattened into it,
+        // the class side as these copies.
+        let (added, provenance, _) = copies(crate::analyze::model_includes(model), taken);
         model.body.extend(added.into_iter().map(|method| ModelBodyItem::Method {
             method,
             leading_comments: Vec::new(),
@@ -2773,13 +2842,17 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance) = copies(lc.includes.clone(), taken);
+        let (added, provenance, carried) = copies(lc.includes.clone(), taken);
         lc.methods.extend(added);
         if !provenance.is_empty() {
             spliced.insert(lc.name.clone(), provenance);
         }
+        if !carried.is_empty() {
+            carrier_splices.insert(lc.name.clone(), carried);
+        }
     }
     app.concern_spliced_class_methods = spliced;
+    app.class_methods_carrier_splices = carrier_splices;
 }
 
 /// A class variable in a concern's class-side method belongs to the
@@ -3627,17 +3700,28 @@ fn expand_class_body_macros(app: &mut App) {
 
     // Class-side methods of every module, by name — the macro table.
     // Populated from library classes because that is where a concern's
-    // `class_methods do` / `module ClassMethods` bodies land.
+    // `class_methods do` bodies land, as `def self.…` of the concern; a
+    // nested `module ClassMethods` is its own module, whose instance defs
+    // are the includer's class side (entered under the owner).
     let mut macros: HashMap<crate::ident::ClassId, Vec<crate::dialect::MethodDef>> = HashMap::default();
     for lc in &app.library_classes {
+        let carrier_owner = crate::app::class_methods_carrier_owner(&lc.name).filter(|_| lc.is_module);
+        let (owner, receiver) = match &carrier_owner {
+            Some(owner) => (owner, MethodReceiver::Instance),
+            None => (&lc.name, MethodReceiver::Class),
+        };
         let class_side: Vec<crate::dialect::MethodDef> = lc
             .methods
             .iter()
-            .filter(|m| matches!(m.receiver, MethodReceiver::Class))
+            .filter(|m| m.receiver == receiver)
             .cloned()
+            .map(|mut m| {
+                m.receiver = MethodReceiver::Class;
+                m
+            })
             .collect();
         for method in class_side {
-            let methods = macros.entry(lc.name.clone()).or_default();
+            let methods = macros.entry(owner.clone()).or_default();
             if let Some(prior) = methods.iter_mut().find(|m| m.name == method.name) {
                 *prior = method;
             } else {

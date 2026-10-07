@@ -1223,6 +1223,33 @@ fn without_rails_health_controller(app: &App, target: BuildTarget) -> Option<App
     Some(app)
 }
 
+/// The app as a target without runtime mixins sees it: a module hook's
+/// `base.extend(ClassMethods)` is the raise stub (the complete bridge is
+/// dropped), and a library-class includer keeps the concern splice's
+/// class-side copies, which are its only class methods there
+/// (`App::class_methods_carrier_splices`). Spinel is one of these: it
+/// refuses `Object#extend`. `None` when there is nothing to change.
+fn without_runtime_mixins(app: &App, target: BuildTarget) -> Option<App> {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return None;
+    }
+    let hooks = app.library_classes.iter().any(|lc| {
+        lc.methods.iter().any(|m| {
+            m.receiver == crate::dialect::MethodReceiver::Class
+                && matches!(m.name.as_str(), "included" | "prepended" | "inherited")
+        })
+    });
+    if !hooks && app.class_methods_carrier_splices.is_empty() {
+        return None;
+    }
+    let mut app = app.clone();
+    app.class_methods_carrier_splices.clear();
+    for d in crate::lower::object_extend::stub_module_hook_extends(&mut app) {
+        emit::diagnostics::push(d);
+    }
+    Some(app)
+}
+
 /// The app without the sorbet type aliases ingest carries
 /// (`sorbet_check::alias_value`), for a tree that refuses every sorbet
 /// check that could read one: the type object is the CRuby overlay's,
@@ -1384,6 +1411,14 @@ pub fn target_files(
         Some(trimmed) => {
             without_aliases = trimmed;
             &without_aliases
+        }
+        None => app,
+    };
+    let without_mixins;
+    let app = match without_runtime_mixins(app, target) {
+        Some(trimmed) => {
+            without_mixins = trimmed;
+            &without_mixins
         }
         None => app,
     };

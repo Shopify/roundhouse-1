@@ -131,12 +131,21 @@ pub(crate) fn expand_model_macros(
             else {
                 continue;
             };
+            // A provider is a class-side def of an included module, or an
+            // instance def of its nested `ClassMethods` carrier.
             let providers = app
                 .library_classes
                 .iter()
-                .filter(|c| included.contains(&c.name) || hook_origins.contains(&c.name))
-                .flat_map(|c| &c.methods)
-                .filter(|m| m.receiver == MethodReceiver::Class && &m.name == method)
+                .filter_map(|c| {
+                    if included.contains(&c.name) || hook_origins.contains(&c.name) {
+                        return Some((c, MethodReceiver::Class));
+                    }
+                    crate::app::class_methods_carrier_owner(&c.name)
+                        .filter(|owner| c.is_module && included.contains(owner))
+                        .map(|_| (c, MethodReceiver::Instance))
+                })
+                .flat_map(|(c, receiver)| c.methods.iter().filter(move |m| m.receiver == receiver))
+                .filter(|m| &m.name == method)
                 .count();
             let methods = (recv.is_none()
                 && block.is_none()
