@@ -6084,6 +6084,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     } else {
         files.push(("app/models.rb".to_string(), body));
     }
+    require_namespace_files_first(files, app);
     load_declarations_through_their_program(files, app, &program_of_file);
     for program in &autoloaded_programs {
         let file = format!("app/{program}.rb");
@@ -6097,6 +6098,145 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
         }
     }
+}
+
+/// A file under app/models that requires a nested file
+/// (`flags/processor.rb`'s `require_relative "../subject_type/pii_level"`)
+/// requires that file's enclosing namespace files first, outermost first,
+/// as Zeitwerk loads a namespace's own file (`subject_type.rb`) before
+/// its children. A child file loaded first reopens its namespace
+/// (`module SubjectType`) and fires the namespace's autoload. That file
+/// requires its children up front (its constants name them: Core's
+/// verdict `DEFAULT_SUBJECT_CLASS_MAPPING`), one of them reaches the
+/// child back while it is still loading, and Ruby warns about a circular
+/// require, which Core's StrictWarning raises.
+///
+/// A namespace is skipped when it encloses the requiring file or one of
+/// its program's declarations: it is loading or loaded already. It is
+/// also skipped when its file already reaches the requiring file by
+/// requires, since the new edge would close a cycle. File programs'
+/// source trees (models/roundhouse_files) are paths, not namespaces.
+fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
+    use std::collections::{BTreeMap, BTreeSet};
+    const PROGRAMS: &str = "app/models/roundhouse_files/";
+    let normalize = |path: &str| -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    };
+    let required = |dir: &str, line: &str| -> Option<String> {
+        let text = line.trim();
+        if let Some(rel) = text.strip_prefix("require_relative \"").and_then(|r| r.strip_suffix('"')) {
+            let target = normalize(&format!("{dir}/{rel}"));
+            return Some(target.strip_suffix(".rb").map(str::to_string).unwrap_or(target));
+        }
+        text.strip_prefix("require RoundhouseAutoload.path(\"")
+            .and_then(|r| r.strip_suffix("\")"))
+            .map(|anchor| format!("app/{anchor}"))
+    };
+    let dir_of = |path: &str| path.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
+    let stem_of = |path: &str| path.strip_suffix(".rb").unwrap_or(path).to_string();
+    let present: BTreeSet<String> =
+        files.iter().filter(|(p, _)| p.ends_with(".rb")).map(|(p, _)| stem_of(p)).collect();
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (path, content) in files.iter() {
+        if !path.ends_with(".rb") || !content.contains("require") {
+            continue;
+        }
+        let dir = dir_of(path);
+        let out = edges.entry(stem_of(path)).or_default();
+        out.extend(content.lines().filter_map(|l| required(&dir, l)));
+    }
+    let reaches = |edges: &BTreeMap<String, BTreeSet<String>>, from: &str, to: &str| -> bool {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut stack = vec![from];
+        while let Some(at) = stack.pop() {
+            if at == to {
+                return true;
+            }
+            if seen.insert(at) {
+                stack.extend(edges.get(at).into_iter().flatten().map(String::as_str));
+            }
+        }
+        false
+    };
+    let mut declarations_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for program in &app.file_programs {
+        let anchor = format!("app/{}", emit::ruby::file_program_anchor(app, program));
+        for item in &program.items {
+            if let crate::app::ProgramItem::Declared(names) = item {
+                for name in names {
+                    let stem = format!("app/models/{}", emit::ruby::library_file_stem(name.0.as_str(), app));
+                    declarations_of.entry(anchor.clone()).or_default().push(stem);
+                }
+            }
+        }
+    }
+    for (path, content) in files.iter_mut() {
+        if !path.starts_with("app/models/") || !path.ends_with(".rb") || !content.contains("require") {
+            continue;
+        }
+        let own = stem_of(path);
+        let dir = dir_of(path);
+        let mut loading: Vec<String> = vec![own.clone()];
+        loading.extend(declarations_of.get(&own).into_iter().flatten().cloned());
+        let encloses = |namespace: &str| {
+            loading.iter().any(|f| f == namespace || f.starts_with(&format!("{namespace}/")))
+        };
+        let mut before: BTreeSet<String> = BTreeSet::new();
+        let mut changed = false;
+        let mut out = String::with_capacity(content.len());
+        for line in content.split_inclusive('\n') {
+            let Some(target) = required(&dir, line) else {
+                out.push_str(line);
+                continue;
+            };
+            if target.starts_with("app/models/") && !target.starts_with(PROGRAMS) {
+                let segments: Vec<&str> = target.split('/').collect();
+                // app/models/<a>/<b>/<c> => app/models/<a>, app/models/<a>/<b>
+                for n in 3..segments.len() {
+                    let namespace = segments[..n].join("/");
+                    if !present.contains(&namespace)
+                        || before.contains(&namespace)
+                        || encloses(&namespace)
+                        || reaches(&edges, &namespace, &own)
+                    {
+                        continue;
+                    }
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    let rel = relative_path(&dir, &namespace);
+                    out.push_str(&format!("{indent}require_relative {rel:?}\n"));
+                    edges.entry(own.clone()).or_default().insert(namespace.clone());
+                    before.insert(namespace);
+                    changed = true;
+                }
+            }
+            before.insert(target);
+            out.push_str(line);
+        }
+        if changed {
+            *content = out;
+        }
+    }
+}
+
+/// `to` (a path under the tree root) spelled relative to the directory
+/// `from_dir`.
+fn relative_path(from_dir: &str, to: &str) -> String {
+    let from: Vec<&str> = from_dir.split('/').filter(|p| !p.is_empty()).collect();
+    let target: Vec<&str> = to.split('/').collect();
+    let common = from.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut out: Vec<&str> = std::iter::repeat_n("..", from.len() - common).collect();
+    out.extend(&target[common..]);
+    out.join("/")
 }
 
 /// A declarations file whose constant autoloads its program (above) is
