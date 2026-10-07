@@ -284,3 +284,50 @@ fn inline_backends_refuse_setup_method_control_flow() {
         assert!(errors.iter().any(|error| error.contains("test_setup_control_flow")), "{target:?}: {errors:#?}");
     }
 }
+
+/// Rails resets fixtures in `before_setup` (ActiveRecord::TestFixtures
+/// `setup_fixtures`, then `run_callbacks :setup`), before any setup
+/// callback or setup method. A record a callback writes must survive to
+/// the test: the reset may not run again from the authored `super`.
+#[test]
+fn fixture_reset_precedes_setup_callbacks() {
+    let source = r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  setup do
+    Probe.create!(name: "from callback")
+  end
+  def setup
+    super
+    assert_equal 1, Probe.where(name: "from callback").count
+  end
+  def test_callback_row_survives
+    assert_equal 1, Probe.where(name: "from callback").count
+  end
+  def test_each_test_starts_clean
+    assert_equal 1, Probe.count
+  end
+end
+"#;
+    let (emitted, errors) = app(source)
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n")
+        .write("app/models/probe.rb", "class Probe < ApplicationRecord\nend\n")
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let results = emitted.join("results.jsonl");
+    let output = ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), "test/models/assertion_contract_test.rb"])
+        .current_dir(&emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &results)
+        .env("BLOG_DB", ":memory:")
+        .output().expect("emitted CRuby");
+    let log = format!("stdout={}\nstderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let rows = read_rows(&std::fs::read_to_string(&results).unwrap_or_else(|error| panic!("no results: {error}\n{log}")));
+    let outcomes: Vec<(&str, &str, u64)> = rows.iter()
+        .map(|row| (row["id"].as_str().unwrap(), row["status"].as_str().unwrap(), row["assertions"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(outcomes, [
+        ("AssertionContractTest#test_callback_row_survives", "pass", 2),
+        ("AssertionContractTest#test_each_test_starts_clean", "pass", 2),
+    ], "{log}");
+    assert!(output.status.success(), "{log}");
+}

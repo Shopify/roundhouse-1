@@ -12,6 +12,23 @@ module RoundhouseMinitestAssertions
     @assertions || 0
   end
 
+  # Rails' fixture phase. ActiveRecord::TestFixtures#before_setup calls
+  # setup_fixtures and only then super, which reaches ActiveSupport's
+  # before_setup (run_callbacks :setup); Minitest calls setup after that.
+  # TestBase#setup is this tree's fixture/harness reset (SchemaSetup.reset!,
+  # clock, job/mail/broadcast/stub/cache clears), so the runner calls it
+  # here, before any setup callback or authored setup reads a record.
+  def __roundhouse_setup_fixtures
+    TestBase.instance_method(:setup).super_method.bind_call(self)
+  end
+
+  # Where an authored `super` from setup lands: Minitest::Test#setup is
+  # empty. The reset already ran above; running it again here reloaded
+  # fixtures AFTER setup callbacks had read them (a `User.take` held a
+  # password digest whose salt the reload had replaced).
+  def setup
+  end
+
   # The compiler emits setup blocks here, separately from an authored setup
   # method. Rails runs these callbacks before calling setup on the test.
   def __roundhouse_before_setup
@@ -76,6 +93,7 @@ module RoundhouseTestRunner
     if test
       capture(errors, "setup") do
         yield if block_given?
+        test.__roundhouse_setup_fixtures
         test.__roundhouse_before_setup
         test.setup
       end
