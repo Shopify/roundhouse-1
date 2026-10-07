@@ -3163,6 +3163,36 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ),
         ));
     }
+    // Rails::Railtie (railties 8.2.0.alpha), the feature `rails/railtie`
+    // answers on this tree: a gem's optional railtie (hashie 5.0.0's
+    // `require 'rails/railtie' if defined?(::Rails)`) defines against
+    // the port, and boot runs its initializers where
+    // Application#initialize! would, before the app's code loads.
+    let railtie = crate::runtime_files::read_to_string("runtime/spinel/rails_railtie.rb")
+        .map_err(|e| format!("read Rails::Railtie runtime: {e}"))?;
+    files.push(("runtime/rails_railtie.rb".into(), railtie));
+    let ordered_options = crate::runtime_files::read_to_string("runtime/spinel/active_support_ordered_options.rb")
+        .map_err(|e| format!("read ActiveSupport::OrderedOptions runtime: {e}"))?;
+    files.push(("runtime/active_support_ordered_options.rb".into(), ordered_options));
+    // `require "rails"` (bugsnag 5.5's railtie): Rails is the runtime's,
+    // already loaded by boot.rb, with the Railtie port.
+    files.push((
+        "runtime/features/rails.rb".into(),
+        "# `require \"rails\"` on this tree: railties' Rails, the runtime ports\n\
+         # (runtime/rails.rb, loaded by boot.rb) with Rails::Railtie\n\
+         # (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../rails_railtie\"\n"
+            .into(),
+    ));
+    files.push((
+        "runtime/features/rails/railtie.rb".into(),
+        "# `require \"rails/railtie\"` on this tree: railties' Rails::Railtie,\n\
+         # ported (runtime/rails_railtie.rb). runtime/gem_facades.rb puts this\n\
+         # directory first on the load path.\n\
+         require_relative \"../../rails_railtie\"\n"
+            .into(),
+    ));
     let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
@@ -3196,7 +3226,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             content.insert_str(
                 0,
                 "require_relative \"active_support_lazy_load_hooks\"\n\
-                 # semian's features answer from the runtime ports (runtime/features).\n\
+                 # semian's and rails/railtie's features answer from the runtime\n\
+                 # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
             // Where Bundler.require would have loaded them: with the gems.
@@ -3211,6 +3242,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         if path == "boot.rb" {
             *content = content.replace("runtime/sqlite_adapter", "runtime/postgres_adapter")
                 .replace("runtime/active_record_sqlite3_adapter", "runtime/active_record_postgresql_adapter");
+            let models = "require_relative \"app/models\"\n";
+            let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
+            content.insert_str(
+                at,
+                "# Application#initialize!: the gems' railties' initializers, in\n\
+                 # Rails' order, before the app's code loads (runtime/rails_railtie.rb).\n\
+                 require_relative \"runtime/rails_railtie\"\n\
+                 Rails::Railtie.run_initializers_of_railties(Rails.application)\n",
+            );
             content.push_str("\nrequire_relative \"runtime/active_support_backtrace_cleaner\"\n");
             content.push_str("require_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
@@ -6928,7 +6968,6 @@ const LOCK_GATED_REQUIRES: &[(&str, &str)] = &[
     ("json", "json"),
     ("bootsnap", "bootsnap"),
     ("tzinfo/data", "tzinfo-data"),
-    ("actionpack-xml_parser", "actionpack-xml_parser"),
     ("csv", "csv"),
     ("gda", "gda"),
     ("redis", "redis"),
@@ -7649,6 +7688,7 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
     ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
+    ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("gurgel", "requiring it loads 2 Rails framework files"),
     ("globalid", "requiring it loads 39 Rails framework files"),

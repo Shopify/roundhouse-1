@@ -111,8 +111,10 @@ module Rails
     @cache_store ||= Cache.new
   end
 
+  # One logger per process, as Rails.logger is: a gem that keeps it
+  # (hashie's railtie `Hashie.logger = Rails.logger`) holds the same one.
   def self.logger
-    Logger.new
+    @logger ||= Logger.new
   end
 
   # The Logger's one write path, hoisted to module level so the bare
