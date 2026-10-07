@@ -1,14 +1,16 @@
-# Native Rails 8.1.4 oracle for `config.filter_parameters` against the
-# emitted app (tests/filter_parameters_runtime.rs).
+# Native Rails oracle (the Rails native Core runs; tests/support/
+# rails_oracle.rb) for `config.filter_parameters` against the emitted app
+# (tests/filter_parameters_runtime.rs).
 #
-# `native APP_DIR` boots a real Rails 8.1.4 application from APP_DIR
+# `native APP_DIR` boots a real Rails application from APP_DIR
 # (its config/application.rb and config/initializers/*.rb, run by
 # railties itself) and prints the observations below. The emitted side
 # loads this file after the emitted main.rb has booted, with no
 # arguments, and prints the same observations; the Rust test requires
 # the two outputs equal.
 if ARGV.first == "native"
-  gem "railties", "8.1.4"
+  require_relative "support/rails_oracle"
+  RailsOracle.activate("railties")
   require "active_support/parameter_filter"
   ENV["RAILS_ENV"] = "test"
   require File.join(File.expand_path(ARGV[1]), "config/application")

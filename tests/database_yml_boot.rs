@@ -4,8 +4,9 @@
 //! The template's ERB compiles into the app (`DatabaseYml.render`, calling
 //! the app's own `lib/` code); the emitted program renders, parses and
 //! resolves it at boot. The oracle tests compare that resolution, as JSON
-//! and `inspect` (symbol vs string keys, Integer vs String), with native
-//! Rails 8.1.4 reading the same file (`tests/database_yml_oracle.rb`:
+//! and `inspect` (symbol vs string keys, Integer vs String), with the native
+//! Rails Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha, from Core's
+//! pinned gem home; `tests/support/rails_oracle.rb`) reading the same file (`tests/database_yml_oracle.rb`:
 //! `Rails::Application::Configuration#database_configuration` and
 //! `ActiveRecord::DatabaseConfigurations`, with the same lib file loaded
 //! plainly; no app boot). Native Rails runs only in the oracle.
@@ -229,8 +230,8 @@ fn json(text: &str) -> serde_json::Value {
 }
 
 #[test]
-#[ignore = "requires ruby with the pg gem and native activerecord/railties 8.1.4 for the oracle"]
-fn boot_resolution_matches_rails_8_1_4() {
+#[ignore = "requires ruby with the pg gem and Core's pinned activerecord/railties for the oracle"]
+fn boot_resolution_matches_pinned_rails() {
     let app_dir = fixture_app(DATABASE_YML);
     let app = ingest(&app_dir);
     let yml = app.database_yml.as_ref().expect("database.yml compiled");

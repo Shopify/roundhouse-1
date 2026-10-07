@@ -1,10 +1,10 @@
-// `config.filter_parameters` (railties 8.1.4) carried into the emitted
+// `config.filter_parameters` (railties, the copy native Core runs) carried into the emitted
 // app: the writes in config/application.rb and every initializer, in
 // boot order, reach `ActiveSupport.filter_parameters` and the event
 // reporter's payload filter after boot, as the
 // `active_support.set_filter_parameters` initializer does it
 // (activesupport railtie.rb:82-87). tests/filter_parameters_runtime.rb
-// prints the same observations from a real Rails 8.1.4 boot of the same
+// prints the same observations from a real Rails boot (tests/support/rails_oracle.rb) of the same
 // configuration and from the emitted real-blog; they must be equal.
 //
 // Both sides run the fixture's own config/initializers/
@@ -107,7 +107,7 @@ fn native(initializer: &str, lib: &[(&str, &str)]) -> String {
         .expect("ruby is on PATH");
     assert!(
         out.status.success(),
-        "native Rails 8.1.4 boot failed\n{}",
+        "native Rails boot failed\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -133,7 +133,7 @@ fn emitted(initializer: &str, lib: &[(&str, &str)]) -> String {
 fn assert_agree(initializer: &str, lib: &[(&str, &str)], expected_filters: &str) {
     let native = native(initializer, lib);
     let emitted = emitted(initializer, lib);
-    assert_eq!(native, emitted, "emitted filter_parameters diverge from Rails 8.1.4");
+    assert_eq!(native, emitted, "emitted filter_parameters diverge from native Rails");
     // Not a vacuous agreement: the list is the one Rails builds.
     assert_eq!(native.lines().next(), Some(expected_filters), "native output:\n{native}");
     assert!(native.contains("[FILTERED]"), "nothing was filtered:\n{native}");

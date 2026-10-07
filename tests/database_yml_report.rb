@@ -1,5 +1,5 @@
 # Shared report shape for tests/database_yml_boot.rs: the same JSON from
-# native Rails 8.1.4 (tests/database_yml_oracle.rb) and from the emitted
+# the native Rails Core runs (tests/database_yml_oracle.rb) and from the emitted
 # program's boot-time resolution. Plain Ruby; it only calls the methods
 # both ActiveRecord::DatabaseConfigurations and the emitted
 # DatabaseConfigurations::Configurations answer.
