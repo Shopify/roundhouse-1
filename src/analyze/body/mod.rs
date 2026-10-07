@@ -854,36 +854,32 @@ impl<'a> BodyTyper<'a> {
 
     /// Whether `ty` may answer `method` with a definition the registry does
     /// not show, so a binop on it is undecidable rather than a mismatch.
-    /// That is [`Self::owns_operator`], or a receiver whose class, an
-    /// ancestor or a mixin is not modeled (a gem the app does not ingest,
-    /// a sig-only name), or one that includes `Comparable` for an ordering
-    /// operator. A class object always has `Module#<` and its siblings.
-    /// Only a modeled class lacking the operator through its whole known
-    /// ancestry is proven to raise.
+    /// A class object always has `Module#<` and its siblings; anything
+    /// [`Self::owns_operator`] proves (an own or mixed-in definition, or
+    /// `Comparable`'s orderings, app or vendored) answers it; and so may
+    /// a receiver whose class, an ancestor or a mixin is not modeled (a
+    /// gem the app does not ingest, a sig-only name). Only a modeled
+    /// class lacking the operator through its whole known ancestry is
+    /// proven to raise.
     fn may_own_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
-        let ordering = matches!(method.as_str(), "<" | "<=" | ">" | ">=");
-        if class_object && ordering {
+        if class_object && matches!(method.as_str(), "<" | "<=" | ">" | ">=") {
             return true;
         }
         match ty {
             Some(Ty::Union { variants }) => !variants.is_empty()
                 && variants.iter().all(|ty| self.may_own_operator(Some(ty), method, class_object)),
             Some(Ty::Class { id, .. }) => {
+                if self.owns_operator(ty, method, class_object) {
+                    return true;
+                }
                 let mut current = Some(id);
                 for _ in 0..32 {
                     let Some(id) = current else { return false };
                     let Some(class) = self.classes().get(id) else {
                         return !matches!(id.0.as_str(), "Object" | "BasicObject");
                     };
-                    if class_object {
-                        if class.has_class_method(method) { return true; }
-                    } else {
-                        if class.has_instance_method(method) { return true; }
-                        for module in &class.includes {
-                            if ordering && module.0.as_str() == "Comparable" { return true; }
-                            if !self.classes().contains_key(module) { return true; }
-                            if self.lookup_in_module(module, method).is_some() { return true; }
-                        }
+                    if !class_object && class.includes.iter().any(|m| !self.classes().contains_key(m)) {
+                        return true;
                     }
                     current = class.parent_id();
                 }
@@ -1854,7 +1850,11 @@ impl<'a> BodyTyper<'a> {
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
-                        && self.may_own_operator(recv_ty.as_ref(), method, self.is_class_object(receiver, ctx) || is_class_send(receiver))
+                        && self.may_own_operator(
+                            recv_ty.as_ref(),
+                            method,
+                            receiver.decisions & crate::expr::CLASS_OBJECT_VALUE != 0 || self.is_class_object(receiver, ctx),
+                        )
                     {
                         receiver.decisions |= crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     }
@@ -2771,15 +2771,6 @@ impl<'a> BodyTyper<'a> {
 }
 
 /// Conditional writes, block writes and parameter rebinding invalidate identity.
-/// `x.class`: `Kernel#class` answers a class object, which the typer names
-/// by its instance type. Enough for an ordering operator to be `Module#<`
-/// rather than a value mismatch; not the identity proof Module protocol
-/// (`define_method`, `class_eval`) requires.
-fn is_class_send(expr: &Expr) -> bool {
-    matches!(&*expr.node, ExprNode::Send { recv: Some(_), method, args, block: None, .. }
-        if method.as_str() == "class" && args.is_empty())
-}
-
 fn forget_class_object_writes(expr: &Expr, ctx: &mut Ctx) {
     let mut names = Vec::new();
     match &*expr.node {
