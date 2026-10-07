@@ -6824,12 +6824,17 @@ fn emit_library_class_decl_inner(
     };
     // An include whose `self.included(base)` hook calls class methods of
     // this class runs after them, as in the source (see
-    // `hooked_include_position`); the rest open the body as before.
-    let positioned: Vec<(usize, &ClassId)> = lc
-        .includes
-        .iter()
-        .filter_map(|inc| hooked_include_position(lc, inc, app).map(|at| (at, inc)))
-        .collect();
+    // `hooked_include_position`); the rest open the body as before. An
+    // include the source has after a positioned one is written no
+    // earlier than it, so the includes keep their source order, and with
+    // it the class's ancestors.
+    let mut positioned: Vec<(usize, &ClassId)> = Vec::new();
+    for inc in &lc.includes {
+        let floor = positioned.last().map(|(at, _)| *at);
+        if let Some(at) = hooked_include_position(lc, inc, app).max(floor) {
+            positioned.push((at, inc));
+        }
+    }
     for inc in &lc.includes {
         if positioned.iter().any(|(_, p)| *p == inc) {
             continue;
@@ -6857,8 +6862,13 @@ fn emit_library_class_decl_inner(
     // unknown_calls`), replayed verbatim when — and only when — the
     // class extends a base we don't model at all, or reopens a loaded
     // gem's class. See `replays_foreign_class_body`.
+    //
+    // Never an analyzer include refusal (`is_include_refusal`): a ledger
+    // record for check, not a statement. The include it names is written
+    // above (`write_include`), where the source has it; replayed, the
+    // record raised again at the end of a body whose include had run.
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
-        lc.unknown_calls.iter().collect()
+        lc.unknown_calls.iter().filter(|c| !crate::analyze::is_include_refusal(c)).collect()
     } else {
         // sorbet's `mixes_in_class_methods`, lowered by the ingest
         // (`sorbet_check::mixes_in_class_methods`), is behavior every
@@ -6870,7 +6880,7 @@ fn emit_library_class_decl_inner(
             .filter(|c| crate::ingest::sorbet_check::is_mixes_in(c) || extensions.iter().any(|e| std::ptr::eq(*e, *c)))
             .collect();
         for call in &lc.unknown_calls {
-            if !own.iter().any(|c| std::ptr::eq(*c, call)) {
+            if !own.iter().any(|c| std::ptr::eq(*c, call)) && !crate::analyze::is_include_refusal(call) {
                 report_dropped_class_body_call(lc, call);
             }
         }
@@ -7164,6 +7174,13 @@ fn emit_library_class_decl_inner(
 /// include goes right after the last class method of `lc` its hook
 /// calls on `base` (the source must have had it below that def), and so
 /// also after every eagerly emitted constant. `None` keeps it first.
+///
+/// A hook may also name one of `lc`'s methods by symbol in a call on
+/// `base`: asset_cloud 2.7.3's `AssetExtension` defines `store`, then
+/// includes `Validations`, whose hook runs `base.send(:alias_method,
+/// :store_without_validation, :store)`. Written first, the include raised
+/// NameError (undefined method 'store') at load. Such an include goes
+/// right after the last method of `lc`, of either side, the hook names.
 fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Option<usize> {
     let bare = |c: &ClassId| c.0.as_str().trim_start_matches("::").to_string();
     let target = bare(inc);
@@ -7173,18 +7190,28 @@ fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Optio
     })?;
     let base = hook.params[0].name.clone();
     let mut called: Vec<Symbol> = Vec::new();
-    fn walk(e: &Expr, base: &Symbol, called: &mut Vec<Symbol>) {
-        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node {
-            if matches!(&*r.node, ExprNode::Var { name, .. } if name == base) && !called.contains(method) {
-                called.push(method.clone());
+    let mut named: Vec<Symbol> = Vec::new();
+    fn walk(e: &Expr, base: &Symbol, called: &mut Vec<Symbol>, named: &mut Vec<Symbol>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
+            if matches!(&*r.node, ExprNode::Var { name, .. } if name == base) {
+                if !called.contains(method) {
+                    called.push(method.clone());
+                }
+                for arg in args {
+                    if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
+                        if !named.contains(value) {
+                            named.push(value.clone());
+                        }
+                    }
+                }
             }
         }
-        e.node.for_each_child(&mut |c| walk(c, base, called));
+        e.node.for_each_child(&mut |c| walk(c, base, called, named));
     }
-    walk(&hook.body, &base, &mut called);
+    walk(&hook.body, &base, &mut called, &mut named);
     lc.methods
         .iter()
-        .rposition(|m| m.receiver == MethodReceiver::Class && called.contains(&m.name))
+        .rposition(|m| (m.receiver == MethodReceiver::Class && called.contains(&m.name)) || named.contains(&m.name))
         .map(|i| i + 1)
 }
 
