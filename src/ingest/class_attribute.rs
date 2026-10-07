@@ -260,3 +260,229 @@ pub(crate) fn generated_writer_param<'a>(method: &'a MethodDef, names: &[Symbol]
     let reads_param = matches!(&*value.node, ExprNode::Var { name, .. } if *name == param.name);
     (*ivar == expected && reads_param).then_some(&param.name)
 }
+
+/// Class-side visibility a concern's `included do` block gives the
+/// methods its own `class_attribute` declarations generate, in the two
+/// shapes Rails code uses (Core's `MutationGuard`):
+///
+/// ```ruby
+/// class_attribute :gate
+/// wrapped_method = method(:gate=)
+/// redefine_singleton_method(:gate=) do |value|
+///   wrapped_method.call(value)
+///   singleton_class.class_eval { protected :gate }
+/// end
+/// class << self
+///   protected :gate=
+/// end
+/// ```
+///
+/// - `class << self; protected :a, …; end` makes those class-side
+///   methods protected on the includer (`protected`).
+/// - The `method` capture and `redefine_singleton_method` replace the
+///   writer with one that runs the captured writer (bound to the
+///   includer, so it writes the includer's storage whatever class it is
+///   called on) and then makes the reader protected on the receiving
+///   class (`wrapped`). The capture's local is read nowhere else.
+///
+/// The statements are consumed (`consumed`, by start offset). `None` when
+/// the block has none of these, or has one the expansion cannot make
+/// faithful: a name no earlier `class_attribute` of the block generated,
+/// a writer wrapped twice or re-declared after wrapping, a `protected`
+/// that a later redefinition would make public again, or any other
+/// statement in a singleton body or the redefined block.
+pub(crate) struct ClassSideVisibility {
+    pub consumed: Vec<usize>,
+    pub protected: Vec<String>,
+    /// (attribute, the redefined block's parameter, the reader it protects).
+    pub wrapped: Vec<(String, String, String)>,
+}
+
+pub(crate) fn class_side_visibility(direct: &[ruby_prism::Node<'_>], file: &str) -> Option<ClassSideVisibility> {
+    use super::util::flatten_statements;
+    let mut declared: Vec<String> = Vec::new();
+    let mut captures: Vec<(String, String, usize)> = Vec::new();
+    let mut out = ClassSideVisibility { consumed: Vec::new(), protected: Vec::new(), wrapped: Vec::new() };
+    let mut capture_reads: Vec<(String, usize)> = Vec::new();
+    let sym_args = |call: &ruby_prism::CallNode<'_>| -> Option<Vec<String>> {
+        let args: Vec<String> = call.arguments()?.arguments().iter().map(|a| symbol_value(&a)).collect::<Option<_>>()?;
+        (!args.is_empty()).then_some(args)
+    };
+    for stmt in direct {
+        let offset = stmt.location().start_offset();
+        if let Some(call) = stmt.as_call_node()
+            && let Some(decl) = parse(&call, file)
+        {
+            for name in &decl.names {
+                let n = name.as_str();
+                if declared.iter().any(|d| d == n) {
+                    return None;
+                }
+                declared.push(n.to_string());
+                declared.push(format!("{n}="));
+                if decl.instance_predicate {
+                    declared.push(format!("{n}?"));
+                }
+            }
+            continue;
+        }
+        // `wrapped_method = method(:gate=)`
+        if let Some(write) = stmt.as_local_variable_write_node()
+            && let Some(call) = write.value().as_call_node()
+            && call.receiver().is_none()
+            && call.block().is_none()
+            && constant_id_str(&call.name()) == "method"
+            && let Some(args) = sym_args(&call)
+            && let [writer] = args.as_slice()
+            && writer.ends_with('=')
+            && declared.iter().any(|d| d == writer)
+        {
+            let local = constant_id_str(&write.name()).to_string();
+            if captures.iter().any(|(l, _, _)| *l == local) {
+                return None;
+            }
+            captures.push((local, writer.clone(), offset));
+            continue;
+        }
+        // `redefine_singleton_method(:gate=) do |value| … end`
+        if let Some(call) = stmt.as_call_node()
+            && call.receiver().is_none()
+            && constant_id_str(&call.name()) == "redefine_singleton_method"
+        {
+            let args = sym_args(&call)?;
+            let [writer] = args.as_slice() else { return None };
+            let attr = writer.strip_suffix('=')?;
+            if out.wrapped.iter().any(|(a, _, _)| a == attr) || out.protected.iter().any(|p| p == writer) {
+                return None;
+            }
+            let block = call.block()?.as_block_node()?;
+            let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+            let requireds: Vec<_> = params.requireds().iter().collect();
+            let [param] = requireds.as_slice() else { return None };
+            if params.optionals().iter().next().is_some()
+                || params.rest().is_some()
+                || params.posts().iter().next().is_some()
+                || params.keywords().iter().next().is_some()
+                || params.keyword_rest().is_some()
+                || params.block().is_some()
+            {
+                return None;
+            }
+            let param = constant_id_str(&param.as_required_parameter_node()?.name()).to_string();
+            let body = flatten_statements(block.body()?);
+            let [first, second] = body.as_slice() else { return None };
+            // `wrapped_method.call(value)`
+            let forward = first.as_call_node()?;
+            let local = constant_id_str(&forward.receiver()?.as_local_variable_read_node()?.name()).to_string();
+            let forwarded: Vec<_> = forward.arguments()?.arguments().iter().collect();
+            let [forwarded] = forwarded.as_slice() else { return None };
+            if constant_id_str(&forward.name()) != "call"
+                || forward.block().is_some()
+                || forwarded.as_local_variable_read_node().is_none_or(|l| constant_id_str(&l.name()) != param)
+            {
+                return None;
+            }
+            let (_, captured, capture_at) = captures.iter().find(|(l, _, _)| *l == local)?;
+            if captured != writer {
+                return None;
+            }
+            // `singleton_class.class_eval { protected :gate }`
+            let eval = second.as_call_node()?;
+            let recv = eval.receiver()?.as_call_node()?;
+            if constant_id_str(&eval.name()) != "class_eval"
+                || eval.arguments().is_some()
+                || constant_id_str(&recv.name()) != "singleton_class"
+                || recv.receiver().is_some()
+                || recv.arguments().is_some()
+                || recv.block().is_some()
+            {
+                return None;
+            }
+            let inner = flatten_statements(eval.block()?.as_block_node()?.body()?);
+            let [mark] = inner.as_slice() else { return None };
+            let mark = mark.as_call_node()?;
+            if mark.receiver().is_some() || mark.block().is_some() || constant_id_str(&mark.name()) != "protected" {
+                return None;
+            }
+            let protects = sym_args(&mark)?;
+            let [reader] = protects.as_slice() else { return None };
+            if !declared.iter().any(|d| d == reader) || reader.ends_with('=') {
+                return None;
+            }
+            capture_reads.push((local, offset));
+            out.consumed.push(*capture_at);
+            out.consumed.push(offset);
+            out.wrapped.push((attr.to_string(), param, reader.clone()));
+            continue;
+        }
+        // `class << self; protected :gate=; end`
+        if let Some(singleton) = stmt.as_singleton_class_node() {
+            if singleton.expression().as_self_node().is_none() {
+                return None;
+            }
+            for inner in flatten_statements(singleton.body()?) {
+                let mark = inner.as_call_node()?;
+                if mark.receiver().is_some() || mark.block().is_some() || constant_id_str(&mark.name()) != "protected" {
+                    return None;
+                }
+                for name in sym_args(&mark)? {
+                    if !declared.iter().any(|d| *d == name) {
+                        return None;
+                    }
+                    out.protected.push(name);
+                }
+            }
+            out.consumed.push(offset);
+            continue;
+        }
+    }
+    if out.consumed.is_empty() {
+        return None;
+    }
+    // A captured writer read anywhere but its own redefinition is a
+    // Method object the expansion does not keep.
+    for stmt in direct {
+        let offset = stmt.location().start_offset();
+        for (local, _, _) in &captures {
+            let consumer = capture_reads.iter().any(|(l, at)| l == local && *at == offset);
+            if !consumer && reads_local(stmt, local) {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn reads_local(node: &ruby_prism::Node<'_>, local: &str) -> bool {
+    struct Reads<'a>(&'a str, bool);
+    impl<'pr> ruby_prism::Visit<'pr> for Reads<'_> {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.1 |= constant_id_str(&node.name()) == self.0;
+        }
+    }
+    let mut reads = Reads(local, false);
+    ruby_prism::Visit::visit(&mut reads, node);
+    reads.1
+}
+
+/// The writer `class_side_visibility`'s redefinition leaves: the captured
+/// writer's effect, bound to `owner` (the includer, once the carried item
+/// is rehomed), then the reader made protected on the receiving class.
+/// The method returns what the block returned (`class_eval`'s value).
+pub(crate) fn wrapped_writer(owner: &ClassId, attr: &str, param: &str, reader: &str) -> Option<MethodDef> {
+    let src = format!(
+        "class RoundhouseClassAttribute\n  def self.{attr}=({param})\n    {owner}.instance_variable_set(:@__class_attr_{attr}, {param})\n    self.singleton_class.class_eval {{ protected :{reader} }}\n  end\nend\n",
+        owner = owner.0.as_str(),
+    );
+    let classes = match super::ingest_library_classes(src.as_bytes(), "<class_attribute>") {
+        Ok(classes) => classes,
+        Err(err) => {
+            super::survey::record(&err);
+            return None;
+        }
+    };
+    let mut method = classes.into_iter().flat_map(|c| c.methods).next()?;
+    method.enclosing_class = Some(owner.0.clone());
+    method.name_span = Span::synthetic();
+    Some(method)
+}

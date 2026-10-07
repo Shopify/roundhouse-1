@@ -2793,6 +2793,22 @@ fn rehome_carried(
                     method.name.as_str().trim_end_matches(['=', '?']) == n.as_str()
                 }) =>
         {
+            // A wrapped writer names its owner, the class the captured
+            // writer was bound to: the includer
+            // (`class_attribute::wrapped_writer`).
+            fn rebind(e: &mut Expr, concern: &[crate::ident::Symbol], model: &[crate::ident::Symbol]) {
+                if let ExprNode::Const { path } = &mut *e.node {
+                    if path.as_slice() == concern {
+                        *path = model.to_vec();
+                    }
+                    return;
+                }
+                e.node.for_each_child_mut(&mut |child| rebind(child, concern, model));
+            }
+            let path = |id: &crate::ident::ClassId| -> Vec<crate::ident::Symbol> {
+                id.0.as_str().split("::").map(crate::ident::Symbol::from).collect()
+            };
+            rebind(&mut method.body, &path(concern), &path(model));
             method.enclosing_class = Some(model.0.clone())
         }
         ModelBodyItem::ClassBody { expr, .. } | ModelBodyItem::Unknown { expr, .. } => {

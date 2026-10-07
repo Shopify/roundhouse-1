@@ -1063,6 +1063,28 @@ impl Visibility {
             }) {
                 continue;
             }
+            // `class << self; protected :x=; end` and a writer
+            // redefinition that protects the reader, on methods the
+            // block's own `class_attribute` generates: expanded on each
+            // includer (`class_attribute::class_side_visibility`). The
+            // block's other statements are checked as before.
+            if !class_side
+                && name == "included"
+                && call.arguments().is_none()
+                && let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body())
+            {
+                let direct = flatten_statements(body);
+                if let Some(expanded) = super::class_attribute::class_side_visibility(&direct, file) {
+                    let rest_declares = direct.iter().any(|stmt| {
+                        !expanded.consumed.contains(&stmt.location().start_offset())
+                            && Self::reject_dynamic_declarations(stmt, file).is_err()
+                    });
+                    if rest_declares {
+                        return Err(Self::unsupported(file, Self::dynamic_declaration_message(node)));
+                    }
+                    continue;
+                }
+            }
             if name == "class_methods" {
                 if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
                     self.walk_carrier(block.body(), file, false)?;

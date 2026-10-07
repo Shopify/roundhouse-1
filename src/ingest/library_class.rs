@@ -4823,6 +4823,34 @@ fn walk_dsl_stmts<'pr>(body: ruby_prism::Node<'pr>, out: &mut Vec<ruby_prism::No
 
 /// Only blocks with a retained candidate have a per-includer refusal gate.
 /// Reuse the collector's traversal and IR recognizer, not a broader AST search.
+/// The block's `class_attribute` methods, as its class-side visibility
+/// statements leave them (`class_attribute::class_side_visibility`): a
+/// redefined writer replaced by the wrapped one, then each named
+/// class-side method protected.
+fn apply_class_side_visibility(
+    items: &mut [crate::dialect::ModelBodyItem],
+    owner: &ClassId,
+    class_side: &super::class_attribute::ClassSideVisibility,
+) {
+    use crate::dialect::{MethodReceiver, MethodVisibility, ModelBodyItem};
+    for item in items.iter_mut() {
+        let ModelBodyItem::Method { method, .. } = item else { continue };
+        if method.receiver != MethodReceiver::Class || !method.name_span.is_synthetic() {
+            continue;
+        }
+        let name = method.name.as_str().to_string();
+        if let Some((attr, param, reader)) =
+            class_side.wrapped.iter().find(|(attr, _, _)| format!("{attr}=") == name)
+            && let Some(wrapped) = super::class_attribute::wrapped_writer(owner, attr, param, reader)
+        {
+            *method = wrapped;
+        }
+        if class_side.protected.contains(&name) {
+            method.visibility = MethodVisibility::Protected;
+        }
+    }
+}
+
 pub(super) fn included_has_accessor(body: ruby_prism::Node<'_>, owner: &ClassId, file: &str) -> bool {
     let mut stmts = Vec::new();
     walk_dsl_stmts(body, &mut stmts);
@@ -4894,7 +4922,18 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
             let mut unclaimed = false;
             let mut stmts = Vec::new();
             walk_dsl_stmts(block.body().unwrap(), &mut stmts);
+            // Class-side visibility of the block's own `class_attribute`
+            // methods: its statements are expanded onto those methods
+            // below rather than carried.
+            let class_side = if is_concern {
+                super::class_attribute::class_side_visibility(&direct, file)
+            } else {
+                None
+            };
             for inner in stmts {
+                if class_side.as_ref().is_some_and(|c| c.consumed.contains(&inner.location().start_offset())) {
+                    continue;
+                }
                 // `enum` inside `included do` belongs to every includer
                 // exactly like an association does — campfire declares
                 // `enum :role, %i[member administrator bot]` in
@@ -5004,6 +5043,9 @@ pub(in crate::ingest) fn ingest_concern_model_items_with_constants(
                         unclaimed = true;
                     }
                 }
+            }
+            if let Some(class_side) = &class_side {
+                apply_class_side_visibility(&mut items[block_start..], &id, class_side);
             }
             // A dropped statement can alter a carried accessor's
             // visibility or definition. Defer the refusal until a
