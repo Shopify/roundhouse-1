@@ -67,6 +67,11 @@ module Rails
     def warn: (untyped message) -> void
     def debug: (untyped message) -> void
     def fatal: (untyped message) -> void
+    def debug?: () -> bool
+    def info?: () -> bool
+    def warn?: () -> bool
+    def error?: () -> bool
+    def fatal?: () -> bool
   end
 
   class Application
