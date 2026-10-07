@@ -3673,23 +3673,31 @@ pub(crate) fn gem_source_dependencies(app: &App) -> (Vec<String>, Vec<String>) {
 /// Each gem source's (name, entry file, lib dir): `<root>/<name>-<version>/lib/<name>.rb`,
 /// the released gem vendored at its version. (A lockfile PATH gem is in
 /// `in_repo` too, but it is the app's own code, required as the app
-/// requires it.)
+/// requires it.) A hyphenated name with no `lib/<name>.rb` enters as
+/// Bundler.require falls back to, `lib/<name with / for ->.rb`:
+/// elasticsearch-shopify 6.0.1's `lib/elasticsearch/shopify.rb`.
 fn gem_source_entries(app: &App) -> Vec<(String, String, String)> {
     let Some(lock) = app.gem_lock.as_ref() else { return Vec::new() };
     let mut entries = Vec::new();
     for name in &lock.in_repo {
-        let tail = format!("/lib/{name}.rb");
-        for source in &app.sources {
-            let Some(dir) = source.path.strip_suffix(&tail) else { continue };
-            let gem_dir = dir.rsplit('/').next().unwrap_or("");
-            let versioned = gem_dir
-                .strip_prefix(name.as_str())
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
-            if versioned {
-                entries.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+        let stems = [name.clone(), name.replace('-', "/")];
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for stem in stems.iter().take(if name.contains('-') { 2 } else { 1 }) {
+            let tail = format!("/lib/{stem}.rb");
+            for source in &app.sources {
+                let Some(dir) = source.path.strip_suffix(&tail) else { continue };
+                let gem_dir = dir.rsplit('/').next().unwrap_or("");
+                let versioned = gem_dir
+                    .strip_prefix(name.as_str())
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit()));
+                // The namespaced file only where the gem lacks the plain one.
+                if versioned && !found.iter().any(|(_, _, lib)| lib == &format!("{dir}/lib/")) {
+                    found.push((name.clone(), source.path.clone(), format!("{dir}/lib/")));
+                }
             }
         }
+        entries.extend(found);
     }
     entries
 }
@@ -5957,6 +5965,50 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         expr.node.for_each_child(&mut |child| visit(app, target, files, child));
     }
     crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(app, target, files, expr));
+    // `include Semian::AdapterError`: analysis resolved a module only a
+    // gem's runtime port declares, and the class body raises NameError at
+    // load wherever the finished tree lacks the port file. A module the
+    // app or a gem's RBI declares resolved before the port was consulted
+    // and is not gated here.
+    let declared = |name: &str| app.library_classes.iter().any(|c| c.name.0.as_str() == name)
+        || app.models.iter().any(|m| m.name.0.as_str() == name)
+        || app.gem_boundary.gem_of(name).is_some();
+    let mut includes: Vec<(crate::span::Span, String, String)> = Vec::new();
+    for class in &app.library_classes {
+        for included in &class.includes {
+            includes.push((crate::span::Span::synthetic(), class.name.0.to_string(), included.0.to_string()));
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let crate::expr::ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
+            if !matches!(method.as_str(), "include" | "extend" | "prepend") {
+                continue;
+            }
+            for arg in args {
+                if let crate::expr::ExprNode::Const { path } = &*arg.node {
+                    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    includes.push((expr.span, model.name.0.to_string(), name));
+                }
+            }
+        }
+    }
+    for (span, owner, name) in includes {
+        let name = name.trim_start_matches("::");
+        if declared(name) {
+            continue;
+        }
+        let Some((gem, port)) = gem_port_declaring(name) else { continue };
+        let detail = if target != BuildTarget::Ruby {
+            format!("{owner} includes {name}, declared by the {gem} gem's runtime port {port}, which the {} tree does not carry", target.as_str())
+        } else if !app.gem_boundary.loads(gem) && !files.iter().any(|(p, _)| p == port) {
+            format!("{owner} includes {name}, declared by the {gem} gem's runtime port {port}, which only the PostgreSQL CRuby tree carries")
+        } else {
+            continue;
+        };
+        emit::diagnostics::report_unsupported(span, target.as_str(), "include", detail);
+    }
 }
 
 /// A read of a name only the Ruby-family runtime declares
@@ -8386,6 +8438,14 @@ pub(crate) fn gem_port_file(gem: &str, name: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// The gem, and the finished-tree port file, of the runtime port that
+/// declares `name` (`Semian::AdapterError`, from either spelling): the
+/// name an app may `include` though no RBI or loaded gem source names
+/// it, since the port, not the gem, is what the tree runs.
+pub(crate) fn gem_port_declaring(name: &str) -> Option<(&'static str, &'static str)> {
+    gem_ports().find_map(|(gem, _)| gem_port_file(gem, name).map(|file| (*gem, file)))
+}
+
 /// `gem_sources`: the gems carried as source (`gem_source_entries`). They
 /// are compiled, but their own dependencies load from the gem home
 /// (`gem_source_dependency_block`), so a `GIT` gem in their closure is
@@ -9344,6 +9404,23 @@ fn names_constant(src: &str, konst: &str) -> bool {
         if let Some(rest) = ["include ", "extend ", "prepend "].iter().find_map(|kw| trimmed.strip_prefix(kw)) {
             if rest.split(',').any(|module| module.trim() == konst) {
                 return true;
+            }
+        }
+        // ... and as the argument of an explicit receiver's mixin call,
+        // `klass.extend(Forwardable)` (a `Class.new` value): there the
+        // name ends at `)` or `,`, which the punctuation rule rejects.
+        for kw in [".extend(", ".include(", ".prepend("] {
+            let mut from = 0;
+            while let Some(off) = trimmed[from..].find(kw) {
+                let args_at = from + off + kw.len();
+                let args = trimmed[args_at..].split(')').next().unwrap_or("");
+                if args.split(',').any(|module| {
+                    let module = module.trim();
+                    module.strip_prefix("::").unwrap_or(module) == konst
+                }) {
+                    return true;
+                }
+                from = args_at;
             }
         }
         let b = line.as_bytes();

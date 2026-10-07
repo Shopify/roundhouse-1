@@ -1376,7 +1376,11 @@ impl Analyzer {
                     // A Ruby-family runtime port's module
                     // (`ActiveRecord::Type::QueryPredicates`); its tree
                     // carries it where the app names it (runtime_reads).
-                    || runtime_reads::is_runtime_declared_namespace(included.0.as_str());
+                    || runtime_reads::is_runtime_declared_namespace(included.0.as_str())
+                    // A gem runtime port's module (`Semian::AdapterError`);
+                    // `project` gates it on the tree carrying the port file
+                    // (report_unloaded_gem_constants).
+                    || crate::project::gem_port_declaring(included.0.as_str()).is_some();
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
@@ -1411,7 +1415,8 @@ impl Analyzer {
                     let known = self.classes.contains_key(&id)
                         || body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str())
-                        || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str());
+                        || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str())
+                        || crate::project::gem_port_declaring(&name).is_some();
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {

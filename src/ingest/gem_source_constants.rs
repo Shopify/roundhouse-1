@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ruby_prism::Node;
 
-use crate::gem_boundary::{GemSourceConstants, GemSourceScan};
+use crate::gem_boundary::{GemSourceConstants, GemSourceScan, SourceKind};
 use crate::gems::Lockfile;
 use crate::vfs::Vfs;
 
@@ -52,6 +52,8 @@ struct DirScan {
     declared: BTreeMap<String, String>,
     /// Namespace -> first file filling it under a computed name.
     dynamic: BTreeMap<String, String>,
+    /// Class or module -> how its first `class`/`module` statement opens it.
+    kinds: BTreeMap<String, SourceKind>,
     files: usize,
     bytes: u64,
     complete: bool,
@@ -101,6 +103,9 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         for (name, file) in &read.dynamic {
             out.dynamic.entry(name.clone()).or_default().insert(gem.clone(), file.clone());
         }
+        for (name, kind) in &read.kinds {
+            out.kinds.entry(name.clone()).or_default().insert(gem.clone(), kind.clone());
+        }
         out.scans.insert(
             gem.clone(),
             GemSourceScan {
@@ -114,6 +119,95 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         );
     }
     out
+}
+
+/// The Rails gems the boot's gem-source dependency block refuses a
+/// feature for depending on (`project::gem_source_dependency_block`,
+/// `__rh_rails_gems`).
+const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "actionpack", "actionview", "activejob", "railties"];
+
+/// Add to `app`'s source constants the gems the gem sources (`gem_sources:`,
+/// compiled with the app) require from the gem home as they load
+/// (`project::gem_source_dependencies`), which the boot loads there too:
+/// elasticsearch-shopify 6.0.1's `require "elastic/transport"` loads
+/// elastic-transport, whose `Elastic::Transport::Transport::Errors::*`
+/// its errors.rb lists at load. A required feature is a gem's when that
+/// gem, a lock dependency of a gem source (transitively), has the file
+/// under a require path. Not read: a gem whose lock closure reaches a
+/// Rails gem (the boot refuses its feature), a ported gem (its runtime
+/// port answers, `project::gem_port_files`), a gem the app carries, and
+/// a gem already read. Runs after the sources are registered, which the
+/// feature walk reads.
+pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
+    let Some(lock) = app.gem_lock.as_ref() else { return };
+    let (features, _) = crate::project::gem_source_dependencies(app);
+    if features.is_empty() {
+        return;
+    }
+    fn deps<'a>(lock: &'a Lockfile, gem: &str) -> impl Iterator<Item = &'a str> {
+        lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
+    }
+    let reaches_rails = |gem: &str| {
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<&str> = deps(lock, gem).collect();
+        if RAILS_GEMS.contains(&gem) {
+            return true;
+        }
+        while let Some(next) = stack.pop() {
+            if RAILS_GEMS.contains(&next) {
+                return true;
+            }
+            if seen.insert(next) {
+                stack.extend(deps(lock, next));
+            }
+        }
+        false
+    };
+    let mut candidates = BTreeSet::new();
+    let mut stack: Vec<&str> = lock.in_repo.iter().flat_map(|g| deps(lock, g)).collect();
+    while let Some(gem) = stack.pop() {
+        if candidates.insert(gem) {
+            stack.extend(deps(lock, gem));
+        }
+    }
+    let sources = &app.gem_boundary.source_constants;
+    let mut installed = None;
+    let mut found = BTreeSet::new();
+    for gem in candidates {
+        if sources.scans.contains_key(gem)
+            || lock.is_in_repo(gem)
+            || crate::project::gem_requires_rails(gem).is_some()
+            || crate::project::gem_port_files(gem).is_some()
+            || reaches_rails(gem)
+        {
+            continue;
+        }
+        let Some(version) = lock.version_of(gem) else { continue };
+        let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
+        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let owns = |feature: &str| {
+            let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+            require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
+        };
+        if features.iter().any(|f| owns(f)) {
+            found.insert(gem.to_string());
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    let read = scan(vfs, home, lock, &found);
+    let sources = &mut app.gem_boundary.source_constants;
+    for (name, gems) in read.declared {
+        sources.declared.entry(name).or_default().extend(gems);
+    }
+    for (name, gems) in read.dynamic {
+        sources.dynamic.entry(name).or_default().extend(gems);
+    }
+    for (name, gems) in read.kinds {
+        sources.kinds.entry(name).or_default().extend(gems);
+    }
+    sources.scans.extend(read.scans);
 }
 
 /// `<home>/gems/<gem>-<version>` (or a platform build of it,
@@ -308,10 +402,13 @@ impl Walker<'_> {
         }
     }
 
-    fn nested(&mut self, path: &Node<'_>, body: Option<Node<'_>>) {
+    fn nested(&mut self, path: &Node<'_>, body: Option<Node<'_>>, kind: SourceKind) {
         let Some((rooted, written)) = written_path(path) else { return };
         let name = self.qualify(rooted, &written);
         self.declare(&name);
+        if self.singleton == 0 && self.in_def == 0 {
+            self.out.kinds.entry(name.clone()).or_insert(kind);
+        }
         if let Some(body) = body {
             self.scope.push(name);
             ruby_prism::Visit::visit(self, &body);
@@ -336,14 +433,21 @@ fn is_constant_name(name: &str) -> bool {
 
 impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-        self.nested(&node.constant_path(), node.body());
+        self.nested(&node.constant_path(), node.body(), SourceKind { is_module: true, parent: None });
     }
 
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         if let Some(superclass) = node.superclass() {
             ruby_prism::Visit::visit(self, &superclass);
         }
-        self.nested(&node.constant_path(), node.body());
+        // The superclass as written (`Tag`, `::Liquid::Tag`); an
+        // expression (`Struct.new(...)`) is recorded as dynamic.
+        let parent = node.superclass().map(|sup| match written_path(&sup) {
+            Some((_, written)) => Some(written),
+            None => None,
+        });
+        let kind = SourceKind { is_module: false, parent: parent.map(|p| p.unwrap_or_default()) };
+        self.nested(&node.constant_path(), node.body(), kind);
     }
 
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {

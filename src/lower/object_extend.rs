@@ -114,6 +114,8 @@ fn stub_expr(span: crate::span::Span) -> Expr {
 /// Ruby calls these hooks with the class or module being extended, so the
 /// receiver is a class object. Not `extended(param)`, whose parameter is
 /// any object. A body that reassigns the parameter proves nothing.
+/// Also each `k.extend(Const, …)` on a local only ever assigned a
+/// `Class.new` / `Module.new`, which is a class object as well.
 fn module_hook_extends(app: &App) -> HashSet<Span> {
     fn assigns(expr: &Expr, name: &Symbol) -> bool {
         let here = match &*expr.node {
@@ -157,7 +159,50 @@ fn module_hook_extends(app: &App) -> HashSet<Span> {
             collect(&m.body, &param.name, &mut out);
         }
     }
+    // `k = Class.new(Base)` then `k.extend(Forwardable)`: a local every
+    // write of which is a fresh `Class.new` / `Module.new` holds a class
+    // object, so its `extend` restructures a class too (Core's
+    // `Checkouts::Core::Facade.define`, run at load by the constants
+    // that build each facade).
+    super::for_each_hook_body_ref(app, &mut |body| {
+        let mut writes: Vec<(Symbol, bool)> = Vec::new();
+        local_writes(body, &mut writes);
+        let mut seen: Vec<&Symbol> = Vec::new();
+        for (name, _) in &writes {
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name);
+            if writes.iter().filter(|(n, _)| n == name).all(|(_, class_new)| *class_new) {
+                collect(body, name, &mut out);
+            }
+        }
+    });
     out
+}
+
+/// Every write of a local in `expr`, with whether its value is a
+/// `Class.new(…)` / `Module.new(…)` call (optionally `::`-rooted, and
+/// through a `#:` cast).
+fn local_writes(expr: &Expr, out: &mut Vec<(Symbol, bool)>) {
+    expr.node.for_each_child(&mut |c| local_writes(c, out));
+    match &*expr.node {
+        ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+            // `k = Class.new(Base) #: singleton(Base)` reads as a cast.
+            let mut value = value;
+            while let ExprNode::Cast { value: inner, .. } = &*value.node {
+                value = inner;
+            }
+            let class_new = matches!(&*value.node, ExprNode::Send { recv: Some(r), method, .. }
+                if method.as_str() == "new"
+                    && matches!(&*r.node, ExprNode::Const { path }
+                        if matches!(path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().as_slice(),
+                            ["Class"] | ["Module"])));
+            out.push((name.clone(), class_new));
+        }
+        ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } => out.push((name.clone(), false)),
+        _ => {}
+    }
 }
 
 /// For a target without mixins: the hook extends [`apply_object_extend_stub`]
