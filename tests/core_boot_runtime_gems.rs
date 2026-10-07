@@ -384,7 +384,7 @@ fn the_middleware_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
 /// once `Rails`, `ActiveSupport` or `ActiveRecord` is defined, as the
 /// emitted runtime defines them: never required natively, their
 /// constants refused by name until their source is compiled as app code.
-const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    app_profiler (0.6.0)\n    elasticsearch-shopify (6.0.1)\n    opentelemetry-shopify (1.22.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    secure_headers (5.2.0)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  app_profiler\n  elasticsearch-shopify (= 6.0.1)\n  opentelemetry-shopify (~> 1.22)\n  panama_client\n  panama_metadata\n  secure_headers (~> 5.2)\n  shopify-money (~> 4.1.1)\n";
+const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    app_profiler (0.6.0)\n    cusco (3.4.0)\n    elasticsearch-shopify (6.0.1)\n    opentelemetry-shopify (1.22.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    secure_headers (5.2.0)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  app_profiler\n  cusco\n  elasticsearch-shopify (= 6.0.1)\n  opentelemetry-shopify (~> 1.22)\n  panama_client\n  panama_metadata\n  secure_headers (~> 5.2)\n  shopify-money (~> 4.1.1)\n";
 
 fn rails_dependent_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
@@ -398,7 +398,12 @@ fn rails_dependent_app() -> emit_and_run::Overlay {
         .write("sorbet/rbi/gems/panama_client@3.2.3.rbi", &rbi("module PanamaClient; end\nclass PanamaClient::NotFoundError < ::StandardError; end\n"))
         .write("sorbet/rbi/gems/panama_metadata@0.3.19.1687.rbi", &rbi("module PanamaMetadata; end\nclass PanamaMetadata::Registry; end\n"))
         .write("sorbet/rbi/gems/app_profiler@0.6.0.rbi", &rbi("module AppProfiler; end\nclass AppProfiler::Middleware; end\n"))
+        .write("sorbet/rbi/gems/cusco@3.4.0.rbi", &rbi("module Cusco; end\nclass Cusco::Client; end\n"))
         .write("lib/rails_dependent.rb", r#"class RailsDependent
+  def cusco?(value)
+    value.is_a?(Cusco::Client)
+  end
+
   def hsts
     SecureHeaders::StrictTransportSecurity::HEADER_NAME
   end
@@ -430,8 +435,10 @@ end
 "#)
 }
 
-const RAILS_DEPENDENT: [(&str, &str); 7] = [
+const RAILS_DEPENDENT: [(&str, &str); 8] = [
     ("app_profiler", "app_profiler"),
+    // From the probe: requiring it loads 59 Rails framework files.
+    ("cusco", "cusco"),
     ("secure_headers", "secure_headers"),
     ("shopify-money", "shopify-money"),
     ("elasticsearch-shopify", "elastic_search/shopify"),
@@ -457,6 +464,91 @@ fn a_rails_dependent_gem_is_refused_by_name_and_never_required() {
 
 /// Core's Money is shopify-money's. Another app's own `Money` is named
 /// the same and declares no gem.
+const SEMIAN_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    semian (0.28.3)\n\nDEPENDENCIES\n  activesupport\n  semian (~> 0.27)\n";
+
+/// Core's semian, as essentials and billing name it. The PostgreSQL
+/// CRuby tree carries the runtime port (runtime/spinel/semian*.rb), so
+/// the names it declares run as the port; the gem's net_http adapter is
+/// not ported.
+fn semian_app(postgresql: bool) -> emit_and_run::Overlay {
+    let config = if postgresql { "test_paths:\n  - test\ndatabase_adapter: postgresql\n" } else { "test_paths:\n  - test\n" };
+    let mut app = emit_and_run::empty_app()
+        .write("roundhouse.yml", config)
+        .write("Gemfile.lock", SEMIAN_LOCK)
+        .write("sorbet/rbi/gems/semian@0.28.3.rbi", "# typed: true\nmodule Semian; end\nclass Semian::BaseError < ::StandardError; end\nclass Semian::TimeoutError < ::Semian::BaseError; end\nclass Semian::OpenCircuitError < ::Semian::BaseError; end\nmodule Semian::AdapterError; end\nmodule Semian::NetHTTP; end\n")
+        .write("lib/resilience.rb", r#"class Resilience
+  def timeout?(error)
+    error.is_a?(Semian::TimeoutError)
+  end
+
+  def open_circuit
+    Semian::OpenCircuitError
+  end
+
+  def adapter_error?(error)
+    error.is_a?(Semian::AdapterError)
+  end
+end
+"#);
+    if postgresql {
+        app = app.write("config/database.yml", "test:\n  adapter: postgresql\n  database: app_test\n");
+    }
+    app
+}
+
+/// ingest's standing `database_adapter` refusal for a PostgreSQL app
+/// (`DatabaseAdapter::runtime_refusal`), as in tests/database_yml_boot.rs.
+fn is_adapter_refusal(error: &String) -> bool {
+    error.contains("database_adapter not supported")
+}
+
+#[test]
+fn a_ported_gem_s_constants_run_as_its_runtime_port() {
+    let (dir, errors) = semian_app(true).emit(BuildTarget::Ruby);
+    assert!(errors.iter().all(is_adapter_refusal), "{errors:#?}");
+    let port = std::fs::read_to_string(dir.join("runtime/semian.rb")).expect("semian port");
+    assert!(port.contains("TimeoutError = Class.new(BaseError)"), "{port}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(!facades.contains("\"semian\""), "the gem's own semian.rb is never required: {facades}");
+    let lib = std::fs::read_to_string(dir.join("app/models/resilience.rb")).expect("resilience");
+    let run = emit_and_run::ruby()
+        .args(["-e", "require \"./runtime/semian\"\nrequire \"./app/models/resilience\"\nr = Resilience.new\np [r.timeout?(Semian::TimeoutError.new), r.open_circuit.equal?(Semian::OpenCircuitError), r.adapter_error?(RuntimeError.new), Semian::OpenCircuitError.superclass]\np $LOADED_FEATURES.grep(%r{/gems/semian}).empty?"])
+        .current_dir(&dir)
+        // Names only: the bulkhead's extension is the semian gem's, which
+        // this machine's ruby need not have (tests/database_yml_boot.rs
+        // runs the bulkhead).
+        .env("SEMIAN_SEMAPHORES_DISABLED", "1")
+        .output()
+        .expect("spawn ruby");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout, "[true, true, false, Semian::BaseError]\ntrue\n", "{}\n{lib}", String::from_utf8_lossy(&run.stderr));
+}
+
+/// A name only the gem declares has no port to run it; a tree without
+/// the port (no PostgreSQL bootstrap) and a non-CRuby tree refuse even
+/// the ported names.
+#[test]
+fn a_ported_gem_s_unported_names_and_portless_trees_are_refused() {
+    let gap = semian_app(true).write("lib/net.rb", "class NetAdapter\n  def adapter\n    Semian::NetHTTP\n  end\nend\n");
+    let (_, errors) = gap.emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::NetHTTP is declared by the semian gem, which runs as its runtime port (runtime/semian.rb, runtime/semian_activerecord_postgresql_adapter.rb), and the port does not declare it")),
+        "{errors:#?}"
+    );
+    assert_eq!(errors.iter().filter(|e| !is_adapter_refusal(*e)).count(), 1, "{errors:#?}");
+
+    let (_, errors) = semian_app(false).emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::TimeoutError is declared by the semian gem's runtime port runtime/semian.rb, which only the PostgreSQL CRuby tree carries")),
+        "{errors:#?}"
+    );
+    let (_, errors) = semian_app(false).emit(BuildTarget::Rust);
+    assert!(
+        errors.iter().any(|e| e.contains("Semian::TimeoutError is declared by the semian gem, which the rust tree does not load")),
+        "{errors:#?}"
+    );
+}
+
 const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
 
 const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";
@@ -590,16 +682,84 @@ fn the_locked_bundled_gems_are_on_the_load_path_and_a_partial_gem_load_is_named(
     assert!(!stderr.contains("require \"bcrypt\""), "an absent gem stays quiet: {stderr}");
 }
 
-/// The Rails-free part of Core's Bundler.require list, in its Gemfile
-/// order.
-const CORE_REQUIRES: [&str; 24] = [
-    "rack", "redis", "hiredis-client", "stack_frames", "snappy", "faraday", "faraday/gzip",
-    "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux",
+/// Part of the Rails-free half of Core's Bundler.require list, in its
+/// Gemfile order.
+const CORE_REQUIRES: [&str; 28] = [
+    "rack", "redis", "hiredis-client", "stack_frames", "snappy", "graphql", "liquid", "stripe", "faraday",
+    "faraday/gzip", "opentelemetry-instrumentation-trilogy", "opentelemetry-instrumentation-pg", "lru_redux",
     "trilogy", "shopify_bots", "shopify_bots/agent_classification_identifier", "shopify_bots/rack/middleware",
     "shopify_bots/request_extension", "shopify_bots/session/object_agent_classification_record",
     "shopify_bots/session/agent_classification_updater", "sabertooth", "sabertooth/prelude", "shopify-opensrs",
-    "customer_privacy_api_ruby", "magellan-ruby", "shopify/adt", "graphql",
+    "customer_privacy_api_ruby", "shopify/adt", "magellan-ruby", "shopify_session", "colorize",
 ];
+
+const BUNDLED_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    jwt (2.10.1)\n    shopify_session (7.40.0)\n      jwt (>= 2.0)\n    stripe (18.4.2)\n\nDEPENDENCIES\n  activesupport\n  shopify_session\n  stripe (~> 18.4.2)\n";
+
+fn bundled_app(lock: &str) -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", lock)
+        .write("sorbet/rbi/gems/stripe@18.4.2.rbi", &rbi("module Stripe; end\nclass Stripe::Customer\n  def id; end\nend\n"))
+        .write("sorbet/rbi/gems/jwt@2.10.1.rbi", &rbi("module JWT; end\nclass JWT::DecodeError < StandardError; end\n"))
+        .write("lib/billing_reader.rb", r#"class BillingReader
+  def customer?(value)
+    value.is_a?(Stripe::Customer)
+  end
+
+  def bad_token?(error)
+    error.is_a?(JWT::DecodeError)
+  end
+end
+"#)
+}
+
+/// A Gemfile gem Core's Bundler.require loads runs as the gem on the
+/// CRuby tree, and so does every spec it depends on: jwt is not in the
+/// list, but shopify_session requires it.
+#[test]
+fn a_bundler_required_gem_and_its_dependencies_run_as_the_gems() {
+    let (dir, errors) = bundled_app(BUNDLED_LOCK).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    for feature in ["stripe", "shopify_session"] {
+        assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
+    assert!(!facades.contains("\"jwt\""), "loaded by shopify_session, not required itself: {facades}");
+
+    let (_, errors) = bundled_app(BUNDLED_LOCK).emit(BuildTarget::Rust);
+    for gem in ["stripe", "jwt"] {
+        assert!(errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem"))), "{gem}: {errors:#?}");
+    }
+}
+
+/// Core's sprockets is a fork from a GIT source, which plain RubyGems
+/// cannot find: the Bundler.require entry activates its checkout first,
+/// though no app constant demands it.
+#[test]
+fn a_git_sourced_bundler_required_gem_is_activated() {
+    let lock = format!(
+        "GIT\n  remote: https://github.com/Shopify/sprockets.git\n  revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    sprockets (4.2.1)\n\n{}",
+        BUNDLED_LOCK.replace("  stripe (~> 18.4.2)\n", "  sprockets!\n  stripe (~> 18.4.2)\n")
+    );
+    let (dir, errors) = bundled_app(&lock).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let git = std::fs::read_to_string(dir.join("runtime/git_gems.rb")).expect("git_gems");
+    assert!(git.contains("[\"sprockets\", \"sprockets-0123456789ab\""), "{git}");
+}
+
+/// Without the gem that loads it, a dependency's constants have nothing
+/// to run them, and are refused by its name.
+#[test]
+fn a_dependency_no_required_gem_loads_is_refused() {
+    let lock = BUNDLED_LOCK.replace("    shopify_session (7.40.0)\n      jwt (>= 2.0)\n", "").replace("  shopify_session\n", "  jwt\n");
+    let (_, errors) = bundled_app(&lock).emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("JWT::DecodeError is declared by the jwt gem, which no emitted tree loads")),
+        "{errors:#?}"
+    );
+    assert!(!errors.iter().any(|e| e.contains("stripe")), "{errors:#?}");
+}
 
 /// A blog-shaped app whose lock names none of Core's gems requires none
 /// of them, whatever the machine has installed.

@@ -66,7 +66,7 @@ fn rbi_dir<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> Option<PathBuf> {
 /// So is a Rails-dependent one (`crate::project::gem_requires_rails`),
 /// so its constants are refused by that name.
 pub fn load_gem_boundary<V: Vfs + ?Sized>(vfs: &V, dir: &Path, lock: &Lockfile) -> GemBoundary {
-    let mut boundary = GemBoundary::default();
+    let mut boundary = GemBoundary { loaded: crate::project::lock_loaded_gems(lock), ..GemBoundary::default() };
     let Some(root) = rbi_dir(vfs, dir) else { return boundary };
     let Ok(entries) = vfs.read_dir(&root) else { return boundary };
 
@@ -168,6 +168,7 @@ fn gem_names_namespace(gem: &str, class: &str) -> bool {
 impl Reader<'_> {
     fn class_entry(&mut self, name: &str, is_module: bool) -> &mut GemClass {
         let gem = self.gem;
+        let lock_loaded = &self.out.loaded;
         let entry = self.out.classes.entry(ClassId(Symbol::new(name))).or_default();
         if entry.gem.is_empty() {
             entry.gem = gem.to_string();
@@ -177,7 +178,7 @@ impl Reader<'_> {
             // reopens minitest's `Minitest::Result`); otherwise the gem
             // named after its namespace does (hedwig reopens redis's
             // `Redis::CommandError`).
-            let loaded = crate::project::ruby_tree_loads_gem;
+            let loaded = |g: &str| crate::project::ruby_tree_loads_gem(g) || lock_loaded.contains(g);
             let (held, offered) = (loaded(&entry.gem), loaded(gem));
             if (offered && !held)
                 || (offered == held && !gem_names_namespace(&entry.gem, name) && gem_names_namespace(gem, name))

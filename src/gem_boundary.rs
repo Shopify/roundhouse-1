@@ -32,11 +32,25 @@ pub struct GemBoundary {
     /// to nest a class) owns nothing beside what it nests.
     #[serde(default)]
     pub namespaces: HashMap<String, BTreeSet<String>>,
+    /// The locked gems the app's Bundler.require loads natively
+    /// (`crate::project::lock_loaded_gems`), with their dependency
+    /// closure. Read from the lock, so a gem the app does not resolve is
+    /// never in here.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub loaded: BTreeSet<String>,
 }
 
 impl GemBoundary {
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
+    }
+
+    /// Whether an emitted tree loads `gem`, so the constants its RBI
+    /// declares run as the gem's: one the runtime loads on every tree
+    /// with that gem (`crate::project::ruby_tree_loads_gem`), or one this
+    /// app's lock routes to Bundler.require.
+    pub fn loads(&self, gem: &str) -> bool {
+        crate::project::ruby_tree_loads_gem(gem) || self.loaded.contains(gem)
     }
 
     /// The gem whose RBI declares the constant `path`: the class or
