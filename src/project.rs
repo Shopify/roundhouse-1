@@ -2817,7 +2817,7 @@ fn ruby_family_runtime_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    apply_runtime_gem_wiring(&mut files);
+    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref());
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
     // target cannot perform a mixin — see `apply_module_mixins`), and the
@@ -6379,7 +6379,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     &RUNTIME_GEMS
 }
 
-fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
+fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
     let mut needed: Vec<&str> = Vec::new();
     for &(ref marker, gem) in runtime_gems() {
         // `app/` only. The runtime tree names several of these itself (the
@@ -6410,10 +6410,16 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
              # constants app/ actually names.\n",
         );
         for gem in &needed {
-            if gemfile.contains(&format!("gem {gem:?}")) {
+            if gemfile.contains(&format!("gem {gem:?}")) || block.contains(&format!("gem {gem:?}")) {
                 continue;
             }
-            block.push_str(&format!("gem {gem:?}\n"));
+            // A gem the lock resolves from a `GIT` source is declared with
+            // that source and the locked revision: a bare `gem "dalli"`
+            // would resolve the rubygems.org release, not Core's fork.
+            match lock.and_then(|l| l.git_source_of(gem)) {
+                Some(git) => block.push_str(&format!("gem {gem:?}, git: {:?}, ref: {:?}\n", git.remote, git.revision)),
+                None => block.push_str(&format!("gem {gem:?}\n")),
+            }
         }
         if block.contains("gem \"") {
             if !gemfile.ends_with('\n') {
@@ -6421,6 +6427,65 @@ fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
             }
             gemfile.push_str(&block);
         }
+    }
+    apply_git_gem_load_paths(files, &needed, lock);
+}
+
+/// The CRuby tree runs as plain `ruby` on the gem home's GEM_PATH, with no
+/// Bundler, and RubyGems never sees a `GIT` gem: Bundler checks it out
+/// under `<gem dir>/bundler/gems/<repo>-<revision[0, 12]>` and activates
+/// the checkout's gemspec itself (`Bundler::Source::Git`). So for each
+/// needed gem the lock resolves from git, `runtime/git_gems.rb` does the
+/// same — finds that checkout on Gem.path, loads its gemspec and
+/// activates it (its require paths and its runtime dependencies) — and
+/// `runtime/gem_facades.rb` requires it before its guarded requires. A
+/// missing checkout is a warning naming the gem, source and revision: the
+/// guarded require would otherwise swallow it as a quiet LoadError.
+fn apply_git_gem_load_paths(files: &mut Vec<(String, String)>, needed: &[&str], lock: Option<&crate::gems::Lockfile>) {
+    let Some(lock) = lock else { return };
+    let mut entries = String::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for &gem in needed {
+        if seen.contains(&gem) {
+            continue;
+        }
+        seen.push(gem);
+        if let Some(git) = lock.git_source_of(gem) {
+            entries.push_str(&format!(
+                "  [{gem:?}, {:?}, {:?}, {:?}],\n",
+                git.checkout_dir(),
+                git.remote,
+                git.revision
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    let Some(idx) = files.iter().position(|(p, _)| p == "runtime/gem_facades.rb") else { return };
+    let body = format!(
+        "# Gems the app's Gemfile.lock resolves from a GIT source, activated the\n\
+         # way Bundler::Source::Git does: the checkout under\n\
+         # <gem dir>/bundler/gems/<repo>-<revision[0, 12]>, its gemspec, its\n\
+         # require paths and runtime dependencies. RubyGems alone never sees\n\
+         # these, so runtime/gem_facades.rb requires this file first.\n\
+         # Written by `project.rs::apply_git_gem_load_paths` from the lock.\n\
+         [\n{entries}].each do |name, checkout, remote, revision|\n  \
+           next if Gem.loaded_specs.key?(name)\n  \
+           dir = Gem.path.map {{ |root| File.join(root, \"bundler\", \"gems\", checkout) }}.find {{ |d| File.directory?(d) }}\n  \
+           spec = dir && Dir[File.join(dir, \"{{,*,*/*}}.gemspec\")].filter_map {{ |f| Gem::Specification.load(f) }}.find {{ |s| s.name == name }}\n  \
+           if spec.nil?\n    \
+             warn \"roundhouse: git gem #{{name}} (#{{remote}} at #{{revision}}) has no checkout bundler/gems/#{{checkout}} on Gem.path #{{Gem.path.inspect}}\"\n    \
+             next\n  \
+           end\n  \
+           spec.full_gem_path = File.dirname(spec.loaded_from)\n  \
+           spec.activate\n\
+         end\n"
+    );
+    files.push(("runtime/git_gems.rb".to_string(), body));
+    let facades = &mut files[idx].1;
+    if !facades.contains("require_relative \"git_gems\"") {
+        facades.insert_str(0, "require_relative \"git_gems\"\n");
     }
 }
 
