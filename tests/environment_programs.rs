@@ -36,6 +36,8 @@ Rails.application.configure do
   host = "test.example"
   config.x.greeting = "from test"
   config.app_host = host
+  config.paths["log"] = "log/test.log"
+  config.colorize_logging = false
 
   if ENV["NEVER_SET_IN_THIS_TEST"]
     config.cache_classes = false
@@ -106,12 +108,12 @@ fn environment_files_become_programs_selected_by_rails_env() {
         .unwrap_or_else(|| panic!("{models}"));
     assert!(case < test && test < run && run < railties, "{models}");
     assert!(
-        models.contains("  # config/environments/test.rb: 9 carried, 2 consumed, 2 not carried\n"),
+        models.contains("  # config/environments/test.rb: 9 carried, 2 consumed, 4 not carried\n"),
         "{models}"
     );
     assert!(models.contains("but config/environments/#{Rails.env}.rb does not exist.\""), "{models}");
     let named: Vec<&str> = models.lines().filter(|l| l.starts_with("  warn \"roundhouse: error[environment_statement_not_carried]")).collect();
-    assert_eq!(named.len(), 2, "{models}");
+    assert_eq!(named.len(), 4, "{models}");
     assert!(
         named[0].contains("config/environments/test.rb:2 require \\\"no_such_feature\\\": `require \\\"no_such_feature\\\"`: not a runtime port"),
         "{}",
@@ -124,9 +126,14 @@ fn environment_files_become_programs_selected_by_rails_env() {
         "{}",
         named[1]
     );
-    // The same two, as `check` reports them.
+    // What `Rails.application.config` answers itself is framework
+    // configuration, never lifted as an app key over the runtime's method.
+    assert!(named[2].contains("test.rb:13 config.paths[\\\"log\\\"] = \\\"log/test.log\\\": `config.paths` is framework configuration"), "{}", named[2]);
+    assert!(named[3].contains("test.rb:14 config.colorize_logging = false: `config.colorize_logging` is framework configuration"), "{}", named[3]);
+    assert!(!models.contains("def paths__build") && !std::fs::read_to_string(dir.join("config/application.rb")).unwrap().contains("def paths__build"));
+    // The same four, as `check` reports them.
     let gaps: Vec<&String> = errors.iter().filter(|e| e.contains("initializer_unsupported") || e.contains("is framework configuration") || e.contains("no_such_feature")).collect();
-    assert_eq!(gaps.len(), 2, "{errors:#?}");
+    assert_eq!(gaps.len(), 4, "{errors:#?}");
     let program = std::fs::read_to_string(dir.join("app/models/roundhouse_environment_test.rb")).expect("holder");
     assert!(program.contains("Rails.application.x_greeting = \"from test\""), "{program}");
     assert!(program.contains("Rails.application.app_host = host"), "{program}");
@@ -177,7 +184,7 @@ fn boot_runs_the_selected_environment_program() {
         "stderr={stderr}"
     );
     let named: Vec<&str> = stderr.lines().filter(|l| l.contains("error[environment_statement_not_carried]")).collect();
-    assert_eq!(named.len(), 2, "{stderr}");
+    assert_eq!(named.len(), 4, "{stderr}");
     assert!(!stderr.contains("initializer_statement_not_run"), "{stderr}");
 
     let (ok, stdout, stderr) = run("development");

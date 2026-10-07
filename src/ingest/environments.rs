@@ -233,6 +233,41 @@ pub(super) fn written_config_path(node: &Node<'_>, app_param: Option<&str>) -> O
     Some(path)
 }
 
+/// What `Rails.application.config` answers itself, not through its
+/// `method_missing` store (railties 8.2.0.alpha
+/// application/configuration.rb:15-30 and :409-642,
+/// engine/configuration.rb, railtie/configuration.rb). A write of one is
+/// framework configuration: lifting it as an app key would shadow the
+/// runtime's own method (`Rails::Engine#paths`) with an unset reader.
+const RAILS_CONFIGURATION_METHODS: &[&str] = &[
+    // Application::Configuration attr_accessor / attr_reader.
+    "allow_concurrency", "asset_host", "assume_ssl", "autoflush_log", "cache_classes", "cache_store",
+    "consider_all_requests_local", "console", "eager_load", "exceptions_app", "file_watcher",
+    "filter_parameters", "precompile_filter_parameters", "force_ssl", "helpers_paths", "hosts",
+    "host_authorization", "logger", "log_formatter", "log_tags", "silence_healthcheck_path",
+    "railties_order", "relative_url_root", "ssl_options", "public_file_server", "session_options",
+    "time_zone", "reload_classes_only_on_change", "beginning_of_week", "filter_redirect", "x",
+    "content_security_policy_report_only", "content_security_policy_nonce_generator",
+    "content_security_policy_nonce_directives", "content_security_policy_nonce_auto",
+    "require_master_key", "credentials", "disable_sandbox", "sandbox_by_default",
+    "add_autoload_paths_to_load_path", "rake_eager_load", "server_timing", "log_file_size",
+    "dom_testing_default_html_version", "yjit", "action_on_early_load_hook", "encoding", "api_only",
+    "loaded_config_version", "log_level", "broadcast_log_level",
+    // Application::Configuration methods.
+    "load_defaults", "reloading_enabled?", "enable_reloading", "debug_exception_response_format",
+    "paths", "load_database_yaml", "database_configuration", "autoload_lib", "autoload_lib_once",
+    "colorize_logging", "secret_key_base", "revision", "session_store", "session_store?",
+    "annotations", "content_security_policy", "permissions_policy", "default_log_file",
+    // Engine::Configuration.
+    "root", "middleware", "javascript_path", "route_set_class", "default_scope", "eager_load_paths",
+    "autoload_once_paths", "autoload_paths", "generators", "all_autoload_paths",
+    "all_autoload_once_paths", "all_eager_load_paths",
+    // Railtie::Configuration.
+    "eager_load_namespaces", "watchable_files", "watchable_dirs", "app_middleware", "app_generators",
+    "before_configuration", "before_eager_load", "before_initialize", "after_initialize",
+    "after_routes_loaded", "to_prepare_blocks", "to_prepare",
+];
+
 /// The application.rb/initializer rule for a written config path
 /// (`ingest::app::extract_config_assignments`, `config_receiver_path`).
 pub(super) fn classify(path: &[String]) -> ConfigWrite {
@@ -248,6 +283,7 @@ pub(super) fn classify(path: &[String]) -> ConfigWrite {
     }
     match path {
         [key] if super::app::FRAMEWORK_CONFIG_KEYS.contains(&key.as_str()) => ConfigWrite::Framework,
+        [key] if RAILS_CONFIGURATION_METHODS.contains(&key.trim_end_matches('=')) => ConfigWrite::Framework,
         [key] => ConfigWrite::AppKey(key.clone()),
         [x, _, ..] if x == "x" => ConfigWrite::AppKey(path.join("_")),
         _ => ConfigWrite::Framework,
