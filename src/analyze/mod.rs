@@ -7430,10 +7430,20 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    if matches!(stored, Ty::Var { .. } | Ty::Untyped) {
+    // `Var` before `Untyped`: either order of a Var and an Untyped
+    // observation must give Untyped. Taking whichever came second made
+    // the join depend on iteration order, and `param_ty_with_default`
+    // reads the two differently (a Var slot falls back to the default).
+    if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
-    if matches!(observed, Ty::Var { .. } | Ty::Untyped) {
+    if matches!(observed, Ty::Var { .. }) {
+        return stored;
+    }
+    if matches!(stored, Ty::Untyped) {
+        return observed;
+    }
+    if matches!(observed, Ty::Untyped) {
         return stored;
     }
     // T + Nil → Union<T, Nil>; same for the symmetric case. Skip
@@ -9252,4 +9262,28 @@ pub(crate) fn tuple_return_ty(body: &Expr) -> Option<Ty> {
         return None;
     }
     Some(Ty::Tuple { elems })
+}
+
+#[cfg(test)]
+mod unify_param_ty_tests {
+    use super::*;
+
+    /// Call sites and concern includers are merged in hash order, so
+    /// the join must not care which observation came first.
+    #[test]
+    fn the_join_is_order_independent() {
+        let var = Ty::Var { var: crate::ident::TyVar(0) };
+        let arr = Ty::Array { elem: Box::new(Ty::Untyped) };
+        let tys = [var, Ty::Untyped, Ty::Nil, Ty::Str, Ty::Int, arr];
+        for a in &tys {
+            for b in &tys {
+                assert_eq!(unify_param_ty(a.clone(), b.clone()), unify_param_ty(b.clone(), a.clone()), "{a:?} / {b:?}");
+                for c in &tys {
+                    let left = unify_param_ty(unify_param_ty(a.clone(), b.clone()), c.clone());
+                    let right = unify_param_ty(unify_param_ty(a.clone(), c.clone()), b.clone());
+                    assert_eq!(left, right, "{a:?} / {b:?} / {c:?}");
+                }
+            }
+        }
+    }
 }
