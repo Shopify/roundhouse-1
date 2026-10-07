@@ -576,6 +576,13 @@ pub struct App {
     /// `delegate :add_error, to: :asset`) reaches the target.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ruby_delegate_forwarders: HashMap<ClassId, Vec<crate::dialect::MethodDef>>,
+    /// The instance methods `ingest::class_eval_macro` added to a library
+    /// class for a class-body call to a macro that writes them with a
+    /// `class_eval` heredoc (Core's ComplexStruct `attribute :value,
+    /// String`), by the call. The Ruby emit replays the call, which runs
+    /// the macro, and writes the class without these copies.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub class_eval_macro_expansions: HashMap<ClassId, Vec<ClassEvalExpansion>>,
     /// Model DSL declared inside a concern module's `included do`
     /// (`Account::Associations` → its `has_many :statuses` etc.),
     /// keyed by the module and classified as the same
@@ -743,6 +750,15 @@ pub enum TimeFormat {
     /// parameter, then `.to_s`, which is what Rails applies to the
     /// call's result above.
     Lambda { method: MethodDef },
+}
+
+/// One class-body macro call `ingest::class_eval_macro` expanded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClassEvalExpansion {
+    /// The call's span, as it stands in `LibraryClass::unknown_calls`.
+    pub call: crate::span::Span,
+    /// The instance methods its `class_eval` heredoc defines.
+    pub methods: Vec<Symbol>,
 }
 
 /// One concern's nested `module ClassMethods`, as an includer received it
@@ -1266,6 +1282,7 @@ impl App {
             concern_spliced_class_methods: HashMap::default(),
             class_methods_carrier_splices: HashMap::default(),
             ruby_delegate_forwarders: HashMap::default(),
+            class_eval_macro_expansions: HashMap::default(),
             concern_model_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             render_edges: HashMap::default(),

@@ -6471,6 +6471,24 @@ fn emit_library_class_decl_inner(
         }
         None => lc,
     };
+    // A `class_eval` heredoc macro's methods are written by the macro
+    // itself when its call is replayed (`App::class_eval_macro_expansions`).
+    let without_macro_copies;
+    let lc = match app.class_eval_macro_expansions.get(&lc.name) {
+        Some(expansions) => {
+            let replayed: Vec<crate::span::Span> = app_extension_calls(lc, app).iter().map(|c| c.span).collect();
+            let dropped: Vec<&Symbol> = expansions
+                .iter()
+                .filter(|e| replayed.contains(&e.call))
+                .flat_map(|e| e.methods.iter())
+                .collect();
+            let mut copy = lc.clone();
+            copy.methods.retain(|m| !(m.receiver == MethodReceiver::Instance && dropped.contains(&&m.name)));
+            without_macro_copies = copy;
+            &without_macro_copies
+        }
+        None => lc,
+    };
     // A concern's nested `module ClassMethods` reaches a library-class
     // includer through `extend`, as in Ruby: the authored `included` hook
     // or (written here) ActiveSupport::Concern's `append_features`. The
@@ -8069,13 +8087,7 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let own_class_side = |name: &str| {
         lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
     };
-    let app_module = |path: &[Symbol]| -> Option<&LibraryClass> {
-        let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-        let nested = format!("{}::{written}", lc.name.0.as_str());
-        app.library_classes.iter().find(|c| {
-            c.is_module && c.origin.is_none() && (c.name.0.as_str() == written || c.name.0.as_str() == nested)
-        })
-    };
+    let app_module = |path: &[Symbol]| resolve_app_module(lc, path, app);
     let mut extended: Vec<&LibraryClass> = Vec::new();
     let mut out = Vec::new();
     for call in &lc.unknown_calls {
@@ -8132,24 +8144,83 @@ fn plain_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
 /// that inherited method; the emitted ancestor defines it, so replaying
 /// the call is what Ruby runs. Bare calls and `self.` calls only; a
 /// chain that reaches a model or a non-app class stops there.
+///
+/// An ancestor's singleton methods include what an `extend` of an app
+/// module gives it (Core's `CustomerFoundations::ComplexStruct::Base`
+/// does `extend(ClassMethods)`, and each struct then calls `attribute
+/// :value, String`, whose `class_eval` heredoc defines the reader). Such
+/// an `extend` in the class itself is replayed too, ahead of the calls
+/// it answers.
 fn inherited_class_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let ancestors = app_library_ancestors(lc, app);
     if ancestors.is_empty() {
         return Vec::new();
     }
+    let extended: Vec<&LibraryClass> = std::iter::once(lc)
+        .chain(ancestors.iter().copied())
+        .flat_map(|c| extended_app_modules(c, app))
+        .collect();
     let inherited = |name: &str| {
         ancestors.iter().any(|a| {
             a.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == name)
-        })
+        }) || extended.iter().any(|m| module_defines(m, name, app, &mut Vec::new()))
     };
     lc.unknown_calls
         .iter()
         .filter(|call| {
             let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
             let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
-            on_self && inherited(method.as_str())
+            on_self && (inherited(method.as_str()) || app_module_extend(lc, call, app).is_some())
         })
         .collect()
+}
+
+/// `M` for a bare `extend M` naming the app's own module, as Ruby
+/// resolves the constant from `lc`'s namespace outwards (`extend
+/// ClassMethods` inside `module Cs; class Base` is `Cs::ClassMethods`).
+fn resolve_app_module<'a>(lc: &LibraryClass, path: &[Symbol], app: &'a App) -> Option<&'a LibraryClass> {
+    let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    (0..=scope.len()).rev().find_map(|n| {
+        let name = if n == 0 { written.clone() } else { format!("{}::{written}", scope[..n].join("::")) };
+        app.library_classes.iter().find(|c| c.is_module && c.origin.is_none() && c.name.0.as_str() == name)
+    })
+}
+
+/// The modules of a bare `extend M, …` whose every argument is an app
+/// module (`resolve_app_module`), or `None`.
+fn app_module_extend<'a>(lc: &LibraryClass, call: &Expr, app: &'a App) -> Option<Vec<&'a LibraryClass>> {
+    let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return None };
+    if method.as_str() != "extend" || args.is_empty() {
+        return None;
+    }
+    args.iter()
+        .map(|a| match &*a.node {
+            ExprNode::Const { path } => resolve_app_module(lc, path, app),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The app modules `lc`'s body extends itself with.
+fn extended_app_modules<'a>(lc: &LibraryClass, app: &'a App) -> Vec<&'a LibraryClass> {
+    lc.unknown_calls.iter().filter_map(|call| app_module_extend(lc, call, app)).flatten().collect()
+}
+
+/// Whether app module `m`, or an app module it includes, defines the
+/// instance method `name`.
+fn module_defines<'a>(m: &'a LibraryClass, name: &str, app: &'a App, seen: &mut Vec<&'a str>) -> bool {
+    if seen.contains(&m.name.0.as_str()) {
+        return false;
+    }
+    seen.push(m.name.0.as_str());
+    m.methods.iter().any(|d| d.receiver == MethodReceiver::Instance && d.name.as_str() == name)
+        || m.includes.iter().any(|inc| {
+            library_classes_named(inc.0.as_str().trim_start_matches("::"), app)
+                .into_iter()
+                .filter(|c| c.is_module)
+                .any(|c| module_defines(c, name, app, seen))
+        })
 }
 
 /// The app library classes `lc` inherits from, nearest first: its
