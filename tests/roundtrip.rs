@@ -130,6 +130,7 @@ fn tiny_blog_round_trips() {
         // Passthrough-only and `serde(skip)` — it never round-trips, so
         // the roundtrip fixture has nothing to say about it.
         binary_assets: Vec::new(),
+        locale_files: vec!["config/locales/en.yml".to_string()],
         inferred_method_params: Default::default(),
         models: vec![post_model],
         library_classes: vec![],

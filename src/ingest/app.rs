@@ -2261,6 +2261,7 @@ end
     // library module, so it runs once they all exist.
     super::database_ownership::resolve(&mut app);
     collect_binary_assets(vfs, dir, &mut app);
+    collect_locale_files(vfs, dir, &mut app);
     // After every initializer reader (the last, the Action Text
     // allowed-attributes read, runs above): what none of them consumed
     // is a gap.
@@ -2306,6 +2307,46 @@ fn push_ingest_drop(app: &mut App, path: &str, err: &IngestError) {
     };
     let span = crate::span::Span { file: super::sources::file_id(path), start: start as u32, end: end as u32 };
     app.ingest_drops.push(crate::app::IngestDrop { span, message, construct: None });
+}
+
+/// The app's locale files: `config/locales` at the root and in each
+/// component (`components/<a>[/<b>[/<c>]]/config/locales`, the depths
+/// Core's engines sit at), every `*.yml` / `*.rb` below them. Only the
+/// paths: no lowering reads the translations yet, it only declines to
+/// bake Rails' defaults over them (`lower::errors_add`).
+fn collect_locale_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path, app: &mut App) {
+    fn files<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = vfs.read_dir(dir) else { return };
+        for entry in entries {
+            if vfs.is_dir(&entry) {
+                files(vfs, root, &entry, out);
+            } else if matches!(entry.extension().and_then(|e| e.to_str()), Some("yml" | "yaml" | "rb")) {
+                let rel = entry.strip_prefix(root).unwrap_or(&entry);
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    fn components<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+        let Ok(entries) = vfs.read_dir(dir) else { return };
+        for entry in entries {
+            if !vfs.is_dir(&entry) {
+                continue;
+            }
+            let locales = entry.join("config/locales");
+            if vfs.is_dir(&locales) {
+                files(vfs, root, &locales, out);
+            }
+            if depth > 1 {
+                components(vfs, root, &entry, depth - 1, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    files(vfs, dir, &dir.join("config/locales"), &mut out);
+    components(vfs, dir, &dir.join("components"), 3, &mut out);
+    out.sort();
+    out.dedup();
+    app.locale_files = out;
 }
 
 /// Source subtrees whose binary files are copied into the emitted tree.

@@ -185,6 +185,13 @@ pub struct App {
     /// arrays would bloat every dump for nothing.
     #[serde(skip)]
     pub binary_assets: Vec<(String, Vec<u8>)>,
+    /// The app's own I18n locale files (`config/locales/**/*.{yml,rb}`
+    /// at the root and under each component), app-relative and sorted.
+    /// Rails resolves an error TYPE (`errors.add(:a, :blank)`) and the
+    /// attribute's human name through this data, so a lowering that
+    /// would bake Rails' default text declines when it is non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locale_files: Vec<String>,
     /// App-helper method registry: maps each method name defined in an
     /// `app/helpers/*.rb` module to the helper module (`ClassId`) that
     /// defines it. Rails mixes all helper modules into every view, so a
@@ -922,6 +929,7 @@ impl App {
             database_refusals: Vec::new(),
             database_yml: None,
             binary_assets: Vec::new(),
+            locale_files: Vec::new(),
             models: Vec::new(),
             library_classes: Vec::new(),
             controllers: Vec::new(),
