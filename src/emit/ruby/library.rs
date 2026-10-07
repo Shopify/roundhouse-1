@@ -6915,6 +6915,17 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         }
     }
 
+    /// The constants a value writes as it runs (`ALL = [VISIT = new(…)]`
+    /// writes VISIT): they exist only once that value has run.
+    fn written_constants(expr: &Expr, out: &mut crate::det::HashSet<String>) {
+        if let ExprNode::Assign { target: crate::expr::LValue::Const { path }, .. } = &*expr.node {
+            if let [name] = path.as_slice() {
+                out.insert(name.as_str().to_string());
+            }
+        }
+        expr.node.for_each_child(&mut |child| written_constants(child, out));
+    }
+
     let own: crate::det::HashSet<&str> =
         lc.methods.iter().map(|m| m.name.as_str()).collect();
     let mut deferred_names: crate::det::HashSet<String> = crate::det::HashSet::default();
@@ -6922,6 +6933,7 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
     for (i, (name, value)) in lc.constants.iter().enumerate() {
         if calls_self(value, &own, &deferred_names, lc.name.0.as_str()) {
             deferred_names.insert(name.as_str().to_string());
+            written_constants(value, &mut deferred_names);
             deferred.push(i);
         } else {
             eager.push(i);

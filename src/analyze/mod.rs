@@ -2023,6 +2023,39 @@ impl Analyzer {
                 }
             }
         }
+        // `ALL = [VISIT = ButtonMethod.new(…), MODAL = …].freeze` declares
+        // VISIT and MODAL in ALL's scope when ALL's value runs, and the
+        // emitted value runs those writes where the source does. Only a
+        // write the value always evaluates counts: an array or hash
+        // element, a call's receiver or argument, a cast, a chained write.
+        // One in a block, a branch or a lambda may never run.
+        fn nested_const_writes<'e>(value: &'e Expr, out: &mut Vec<(&'e Symbol, &'e Expr)>) {
+            match &*value.node {
+                ExprNode::Assign { target: LValue::Const { path }, value: inner } => {
+                    if let [name] = path.as_slice() {
+                        out.push((name, inner));
+                    }
+                    nested_const_writes(inner, out);
+                }
+                ExprNode::Array { elements, .. } => elements.iter().for_each(|e| nested_const_writes(e, out)),
+                ExprNode::Hash { entries, .. } => entries.iter().for_each(|(k, v)| {
+                    nested_const_writes(k, out);
+                    nested_const_writes(v, out);
+                }),
+                ExprNode::Send { recv, args, .. } => recv.iter().chain(args).for_each(|e| nested_const_writes(e, out)),
+                ExprNode::Cast { value: inner, .. } | ExprNode::Splat { value: inner } => nested_const_writes(inner, out),
+                _ => {}
+            }
+        }
+        let mut nested = Vec::new();
+        for (self_ty, _, _, value, eligible) in &entries {
+            let mut writes = Vec::new();
+            nested_const_writes(value, &mut writes);
+            for (name, inner) in writes {
+                nested.push((self_ty.clone(), name.clone(), declaration_id(name, inner), inner, *eligible));
+            }
+        }
+        entries.extend(nested);
 
         let mut map: HashMap<Symbol, Ty> = HashMap::default();
         let mut ambiguous: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
