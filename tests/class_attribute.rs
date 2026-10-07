@@ -154,3 +154,35 @@ fn model_class_attribute_behaves_as_in_activerecord_after_emission() {
     let actual: Vec<&str> = run.stdout.lines().collect();
     assert_eq!(actual, expected, "emitted Ruby diverges from ActiveRecord line for line");
 }
+
+/// A reopened class's body writes the attribute its first body declared:
+/// `self.knob += 10` reads and writes through the generated methods, so
+/// it runs after them. It used to be dropped as "`call` in the body", and
+/// then (once claimed) was written above the defs it calls, a
+/// NoMethodError at load.
+const REOPENED_SOURCE: &str = r#"class CaKnobbed
+  class_attribute :knob, default: 1
+end
+
+class CaKnobbed
+  self.knob += 10
+  self.knob = knob * 2
+end
+"#;
+
+#[test]
+fn reopened_class_body_writes_its_class_attribute_after_emission() {
+    let script = "p [CaKnobbed.knob, CaKnobbed.new.knob]\n";
+    let expected = native_lines(
+        "require \"active_support\"\nrequire \"active_support/core_ext/class/attribute\"",
+        REOPENED_SOURCE,
+        script,
+    );
+    assert_eq!(expected, ["[22, 22]"], "native control");
+    let run = emit_and_run::real_blog()
+        .write("app/services/ca_knobbed.rb", REOPENED_SOURCE)
+        .run_ruby(script);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(actual, expected, "emitted Ruby diverges from ActiveSupport");
+}

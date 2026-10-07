@@ -8320,10 +8320,7 @@ fn reopens_loaded_gem_class(lc: &LibraryClass, app: &App) -> bool {
 /// any `diagnostics::scope`), which is why the judgment happens at emit
 /// rather than where the call was captured.
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
-    let name = match &*call.node {
-        ExprNode::Send { method, .. } => method.as_str().to_string(),
-        _ => "call".to_string(),
-    };
+    let name = crate::lower::model_to_library::dropped_statement_name(call);
     crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
         "library_class_body",
         &name,

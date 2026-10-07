@@ -2178,8 +2178,8 @@ impl<'a> OwnClassCalls<'a> {
         }
     }
 
-    fn own_receiver(&self, recv: &Option<Expr>) -> bool {
-        match recv.as_ref().map(|r| &*r.node) {
+    fn own_receiver(&self, recv: Option<&Expr>) -> bool {
+        match recv.map(|r| &*r.node) {
             None | Some(ExprNode::SelfRef) => true,
             Some(ExprNode::Const { path }) => {
                 let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
@@ -2194,9 +2194,20 @@ impl<'a> OwnClassCalls<'a> {
             // A closure literal is stored; a block that runs now is
             // searched through its call below.
             ExprNode::Lambda { .. } => false,
+            // `self.x = v` / `self.x += v` calls the writer `x=` (and the
+            // compound form the reader `x`).
+            ExprNode::Assign { target: LValue::Attr { recv, name }, .. }
+            | ExprNode::OpAssign { target: LValue::Attr { recv, name }, .. }
+                if self.own_receiver(Some(recv))
+                    && (self.methods.contains(format!("{}=", name.as_str()).as_str())
+                        || matches!(&*expr.node, ExprNode::OpAssign { .. })
+                            && self.methods.contains(name.as_str())) =>
+            {
+                true
+            }
             ExprNode::Send { recv, method, args, block, .. } => {
                 let name = method.as_str();
-                if self.own_receiver(recv)
+                if self.own_receiver(recv.as_ref())
                     && (matches!(name, "new" | "allocate") || self.methods.contains(name))
                 {
                     return true;
@@ -2900,15 +2911,25 @@ fn walk_decl_body_with_visibility<'pr>(
         }
         // `self.x += v` / `||=` / `&&=` through a `class_attribute`'s
         // class-side reader and writer, in source order with its seed.
+        // Any other attribute op-write (`self.x += v` naming an
+        // attribute declared in another body of the class, `Foo.x ||= v`)
+        // is a captured class-body call: claimed later, replayed where
+        // the body is replayed, reported by name where it is dropped.
+        // (A `class << self` body's `self` is the singleton class; its
+        // statements keep the path they had.)
         if !force_class_receiver
             && (stmt.as_call_operator_write_node().is_some()
                 || stmt.as_call_or_write_node().is_some()
                 || stmt.as_call_and_write_node().is_some())
             && let Ok(e) = ingest_expr(&stmt, file)
-            && super::class_attribute::self_write(&e)
-                .is_some_and(|name| out.class_attribute_names.iter().any(|n| n.as_str() == name))
         {
-            out.class_attribute_effects.push(e);
+            let declared = super::class_attribute::self_write(&e)
+                .is_some_and(|name| out.class_attribute_names.iter().any(|n| n.as_str() == name));
+            if declared {
+                out.class_attribute_effects.push(e);
+            } else {
+                out.unknown_calls.push(e);
+            }
             continue;
         }
         if let Some(call) = stmt.as_call_node() {

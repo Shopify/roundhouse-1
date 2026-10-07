@@ -2818,19 +2818,28 @@ fn claim_class_attribute_writes(app: &mut App) {
     // Each class's own declarations, models and library classes alike; a
     // write may name one an ancestor declares (`ProPlan < Plan` writing
     // `self.tier = :pro`).
-    let own: crate::det::HashMap<ClassId, (Option<ClassId>, Vec<Symbol>)> = app
+    // A class reopened in several bodies (several library classes of
+    // one name) declares the union of theirs.
+    let mut own: crate::det::HashMap<ClassId, (Option<ClassId>, Vec<Symbol>)> = crate::det::HashMap::default();
+    let bodies = app
         .models
         .iter()
-        .map(|m| (m.name.clone(), (m.parent.clone(), super::class_attribute::declared_names(&m.body))))
+        .map(|m| (m.name.clone(), m.parent.clone(), super::class_attribute::declared_names(&m.body)))
         .chain(app.library_classes.iter().filter(|lc| !lc.is_module).map(|lc| {
             let names = lc
                 .class_ivar_initializers
                 .iter()
                 .filter_map(|e| super::class_attribute::seeded_name(e).map(Symbol::from))
                 .collect();
-            (lc.name.clone(), (lc.parent.clone(), names))
-        }))
-        .collect();
+            (lc.name.clone(), lc.parent.clone(), names)
+        }));
+    for (name, parent, names) in bodies {
+        let entry = own.entry(name).or_insert_with(|| (None, Vec::new()));
+        if entry.0.is_none() {
+            entry.0 = parent;
+        }
+        entry.1.extend(names);
+    }
     let declared_for = |name: &ClassId| -> crate::det::HashSet<String> {
         let mut declared = crate::det::HashSet::default();
         let mut at = Some(name.clone());
