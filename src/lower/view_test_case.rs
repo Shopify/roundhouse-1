@@ -42,12 +42,27 @@ const VIEW_TEST_CASE: &str = "ActionView::TestCase";
 
 pub fn apply_view_test_case_lowering(app: &mut App) -> Vec<Diagnostic> {
     let index: HashMap<Symbol, ClassId> = app.helper_method_index.clone();
-    // Each app module's own methods, for the bare-call half below.
+    // Each app module's own methods, for the bare-call half below. An
+    // include mixes in the instance surface only, so a helper's
+    // singleton-defined methods (`class << self; def format`) are not
+    // among them: a bare `format` in its test is still Kernel#format.
     let module_methods: HashMap<ClassId, crate::det::HashSet<Symbol>> = app
         .library_classes
         .iter()
         .filter(|lc| lc.is_module)
-        .map(|lc| (lc.name.clone(), lc.methods.iter().map(|m| m.name.clone()).collect()))
+        .map(|lc| {
+            let singletons = app.helper_singleton_methods.get(&lc.name);
+            let names = lc
+                .methods
+                .iter()
+                .filter(|m| {
+                    m.receiver == crate::dialect::MethodReceiver::Instance
+                        || !singletons.is_some_and(|s| s.contains(&m.name))
+                })
+                .map(|m| m.name.clone())
+                .collect();
+            (lc.name.clone(), names)
+        })
         .collect();
     let mut diags = Vec::new();
     for tm in &mut app.test_modules {

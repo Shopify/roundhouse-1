@@ -806,7 +806,30 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     .is_some_and(|stem| stem.ends_with("_helper"));
                 match ingest_library_classes(&source, &path_str) {
                     Ok(classes) => {
+                        // Only the INSTANCE surface is view-visible: a
+                        // `def self.x` / `class << self` method is reached
+                        // as `Helper.x` and never bare. Core's MoneyHelper
+                        // keeps a private singleton `format`, and indexing
+                        // it rewrote every Kernel#format in every model to
+                        // `MoneyHelper.format(…)`.
+                        let origins = is_helper_module
+                            .then(|| super::helper_surface::SingletonOrigins::of(&source));
+                        let mut included_origins =
+                            super::helper_surface::RegisteredOrigins::default();
                         for lc in classes.iter().filter(|_| is_helper_module) {
+                            let origins = origins.as_ref().expect("helper origins");
+                            let singletons: std::collections::BTreeSet<Symbol> = lc
+                                .methods
+                                .iter()
+                                .filter(|m| origins.is_singleton_defined(m))
+                                .map(|m| m.name.clone())
+                                .collect();
+                            if !singletons.is_empty() {
+                                app.helper_singleton_methods
+                                    .entry(lc.name.clone())
+                                    .or_default()
+                                    .extend(singletons);
+                            }
                             // Rails resolves a helper's `include`d
                             // modules into the same view surface —
                             // lobsters' ApplicationHelper includes
@@ -832,12 +855,21 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                                 else {
                                     continue;
                                 };
+                                // Its instance surface only, as for the
+                                // helper's own methods below.
                                 for m in &target.methods {
+                                    if included_origins.is_singleton_defined(m) {
+                                        app.helper_singleton_methods
+                                            .entry(target.name.clone())
+                                            .or_default()
+                                            .insert(m.name.clone());
+                                        continue;
+                                    }
                                     app.helper_method_index
                                         .insert(m.name.clone(), target.name.clone());
                                 }
                             }
-                            for m in &lc.methods {
+                            for m in lc.methods.iter().filter(|m| !origins.is_singleton_defined(m)) {
                                 app.helper_method_index
                                     .insert(m.name.clone(), lc.name.clone());
                             }

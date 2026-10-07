@@ -144,6 +144,15 @@ pub fn file_id(path: &str) -> FileId {
     })
 }
 
+/// The registered text behind a `FileId`; `None` for the synthetic id or
+/// one this thread never handed out.
+pub(super) fn text_of_file(id: FileId) -> Option<String> {
+    SOURCES.with(|s| {
+        let reg = s.borrow();
+        reg.files.get((id.0 as usize).checked_sub(1)?).map(|f| f.text.clone())
+    })
+}
+
 /// 1-based line number for a byte offset into `path`'s registered
 /// source, including ERB's translated template offsets. `None` when `path`
 /// was never registered (a bare `roundhouse-ast -e` snippet that
