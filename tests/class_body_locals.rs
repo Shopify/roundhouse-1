@@ -144,3 +144,77 @@ fn an_observable_local_is_refused_by_name() {
     );
     assert!(survey.contains("registry.rb:4:15: error[ingest_unsupported]: class-body local `store`"), "{survey}");
 }
+
+/// Core's GraphQL types bind a description heredoc to a body local and
+/// pass it to `field` (`display_name_description = <<~DESC`). Under
+/// `# frozen_string_literal: true` a static literal is one frozen object,
+/// so each read is `"…".freeze`: native Ruby on the same source is the
+/// oracle for value, identity and frozenness.
+const DESCRIPTIONS: &str = r#"# frozen_string_literal: true
+
+module Descriptions
+  display_name = <<~DESC
+    The full name of the customer. If the first_name and
+    last_name are not available, the email address.
+  DESC
+  short = "Short."
+
+  NAME = display_name
+  ALSO = display_name
+  BOTH = [display_name, short].freeze
+
+  def self.same?
+    NAME.equal?(ALSO) && NAME.equal?(BOTH.first) && NAME.frozen?
+  end
+end
+"#;
+
+const DESCRIPTIONS_REPORT: &str = "p Descriptions::NAME, Descriptions::BOTH, Descriptions.same?\n";
+
+#[test]
+fn a_frozen_string_local_is_one_frozen_object_as_in_native_ruby() {
+    let dir = std::env::temp_dir().join(format!("roundhouse-body-locals-frozen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("descriptions.rb");
+    std::fs::write(&file, DESCRIPTIONS).unwrap();
+    let native = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(format!("require {:?}\n{DESCRIPTIONS_REPORT}", file.display().to_string()))
+        .output()
+        .expect("native Ruby control");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(expected.ends_with("true\n"), "native control: {expected}");
+
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("lib/descriptions.rb", DESCRIPTIONS)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("require \"./app/models/descriptions\"\n{DESCRIPTIONS_REPORT}"))
+        .current_dir(&emitted)
+        .output()
+        .expect("spawn ruby");
+    assert!(output.status.success(), "emitted program failed in {}:\n{}", emitted.display(), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+}
+
+/// Without the magic comment the literal is a new mutable string at
+/// each evaluation, and an interpolated one is built by code: both stay
+/// refused.
+#[test]
+fn a_mutable_or_interpolated_string_local_is_refused_by_name() {
+    for source in [
+        "module Podish\n  module Registry\n    label = \"Label\"\n    LABEL = label\n  end\nend\n",
+        "# frozen_string_literal: true\n\nmodule Podish\n  module Registry\n    label = \"Label #{1 + 1}\"\n    LABEL = label\n  end\nend\n",
+    ] {
+        let text = check(source);
+        assert!(
+            text.contains("error[ingest_unsupported]: class-body local `label` holds a value that is not a closure-free lambda or an immediate literal"),
+            "{source}\n{text}"
+        );
+    }
+}
