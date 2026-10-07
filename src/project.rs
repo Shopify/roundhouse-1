@@ -5663,6 +5663,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             || loader_roots.contains(dir.join("/").as_str())
     };
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
+    let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (anchor, sources) in &declaring {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
@@ -5687,6 +5688,20 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         };
         if let Some(program) = owner.and_then(|o| program_by_source.get(o)) {
             program_of_file.insert(anchor.clone(), program.clone());
+        } else if named.is_empty() && sources.iter().all(|source| program_by_source.contains_key(source)) {
+            // Declared only inside file programs, away from any path an
+            // autoload root maps the constant to (kafka-shopify's
+            // patches/avro_stdlib_json.rb reopens the gem's
+            // `Avro::Schema` after requiring it): natively the constant
+            // is whoever defines it, and the reopen runs where its
+            // program has it. An autoload of the declarations would
+            // fire on the gem's own `class Schema` and load the reopen
+            // first. So no autoload; the program loads the file in place,
+            // and `eager_load!` loads the program.
+            in_place.insert(anchor.clone());
+            if let [one] = sources.as_slice() {
+                program_of_file.insert(anchor.clone(), program_by_source[one].clone());
+            }
         }
     }
     let as_loaded = |anchor: &str| program_of_file.get(anchor).cloned().unwrap_or_else(|| anchor.to_string());
@@ -5703,6 +5718,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, content) in &models {
+        if in_place.contains(anchor) {
+            continue;
+        }
         let Some(chain) = autoload_primary(anchor, content) else {
             boot_files.push(anchor);
             continue;
