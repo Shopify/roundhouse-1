@@ -6737,7 +6737,15 @@ fn emit_library_class_decl_inner(
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
         lc.unknown_calls.iter().collect()
     } else {
-        let own = app_extension_calls(lc, app);
+        // sorbet's `mixes_in_class_methods`, lowered by the ingest
+        // (`sorbet_check::mixes_in_class_methods`), is behavior every
+        // body runs, whatever its base; kept in source order.
+        let extensions = app_extension_calls(lc, app);
+        let own: Vec<&Expr> = lc
+            .unknown_calls
+            .iter()
+            .filter(|c| crate::ingest::sorbet_check::is_mixes_in(c) || extensions.iter().any(|e| std::ptr::eq(*e, *c)))
+            .collect();
         for call in &lc.unknown_calls {
             if !own.iter().any(|c| std::ptr::eq(*c, call)) {
                 report_dropped_class_body_call(lc, call);

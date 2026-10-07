@@ -133,3 +133,42 @@ end
         .run_test("test/models/box_test.rb");
     run.assert_passes();
 }
+
+#[test]
+fn mixes_in_class_methods_extends_each_includer() {
+    // sorbet's `mixes_in_class_methods` is behavior: every `include` of
+    // the module extends the includer. graphql-shopify's BaseInterface
+    // gets `GraphQL::Schema::Interface::DefinitionMethods` onto each
+    // implementing type this way. It was dropped as an unmodeled call
+    // (and `extend T::Helpers` with it), so `AppThing.describe` was a
+    // NoMethodError. `requires_ancestor`'s block never runs: sorbet-runtime
+    // 0.6.13502 defines the method with an empty body. Native oracle
+    // (ruby -rsorbet-runtime, same files): ["described AppThing", :extra,
+    // 1, false, true].
+    const DESCRIBABLE: &str = "module Widget\n  module Describable\n    extend T::Helpers\n    requires_ancestor { Widget::NotDefinedAnywhere }\n\n    module ClassMethods\n      def describe = \"described #{name}\"\n    end\n\n    module Extra\n      def extra = :extra\n    end\n\n    mixes_in_class_methods(ClassMethods)\n    mixes_in_class_methods Extra\n  end\nend\n";
+    const APP_MIXIN: &str = "module AppMixin\n  extend T::Helpers\n\n  module Counting\n    def count = 1\n  end\n\n  mixes_in_class_methods(Counting)\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", CARRIED)
+        .write("Gemfile.lock", LOCK)
+        .write("vendor/gems/widget-1.0.0/lib/widget.rb", "require \"widget/describable\"\n\nmodule Widget\nend\n")
+        .write("vendor/gems/widget-1.0.0/lib/widget/describable.rb", DESCRIBABLE)
+        .write("lib/app_mixin.rb", APP_MIXIN)
+        .write("lib/app_thing.rb", "require \"widget\"\n\nclass AppThing\n  include Widget::Describable\nend\n")
+        .write("lib/app_other.rb", "require \"app_mixin\"\n\nclass AppOther\n  include AppMixin\nend\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("test/mixin_test.rb", r#"require "test_helper"
+require "app_thing"
+require "app_other"
+class MixinTest < ActiveSupport::TestCase
+  test "each includer is extended with the mixed-in class methods" do
+    assert_equal "described AppThing", AppThing.describe
+    assert_equal :extra, AppThing.extra
+    assert_equal 1, AppOther.count
+    assert_equal false, Widget::Describable.respond_to?(:describe)
+    assert_equal true, AppThing.singleton_class.include?(Widget::Describable::ClassMethods)
+  end
+end
+"#)
+        .run_test("test/models/mixin_test.rb");
+    run.assert_passes();
+}

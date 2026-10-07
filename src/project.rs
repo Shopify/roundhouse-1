@@ -6476,6 +6476,14 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 format!("sorbet-runtime's class check of `T.let`, `T.cast`, `T.bind` and `T.assert_type!` runs on the CRuby and JRuby trees, not {target}"),
             );
         }
+        if !matches!(target, "ruby" | "jruby") && crate::ingest::sorbet_check::is_mixes_in(expr) {
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "mixes_in_class_methods",
+                format!("sorbet-runtime's `mixes_in_class_methods` runs on the CRuby and JRuby trees, not {target}"),
+            );
+        }
         if target == "ruby" {
             expr.node.for_each_child(&mut |child| visit(child, app, target, bundled));
             return;

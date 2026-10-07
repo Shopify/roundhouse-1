@@ -2337,6 +2337,12 @@ fn constant_path_written(path: &ruby_prism::ConstantPathNode<'_>) -> String {
 /// constructor and a reader, not an annotation, and deleting it would
 /// leave a class that cannot be built. Those need lowering, not
 /// dropping.
+///
+/// `requires_ancestor { X }` (`T::Helpers`) is an annotation at runtime
+/// too: sorbet-runtime 0.6.13502 defines it with an empty body (helpers.rb,
+/// "TODO: implement the checks"), so the block never runs. Its sibling
+/// `mixes_in_class_methods` is behavior and is lowered instead
+/// (`sorbet_check::mixes_in_class_methods`).
 pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sig",
     "abstract!",
@@ -2344,6 +2350,7 @@ pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "final!",
     "sealed!",
     "type_parameters",
+    "requires_ancestor",
 ];
 
 const POSITION_SENSITIVE_MARKERS: &[&str] = &[
@@ -3266,7 +3273,11 @@ fn walk_decl_body_with_visibility<'pr>(
                         // side reports the gap. That keeps a single
                         // exotic call in one library class from taking
                         // the app's ingest down.
-                        if !POSITION_SENSITIVE_MARKERS.contains(&kw)
+                        if !force_class_receiver
+                            && let Some(e) = super::sorbet_check::mixes_in_class_methods(&stmt, file)
+                        {
+                            out.unknown_calls.push(e);
+                        } else if !POSITION_SENSITIVE_MARKERS.contains(&kw)
                             && !SORBET_ANNOTATIONS.contains(&kw)
                             && !is_sorbet_annotation_mixin(&call)
                         {
