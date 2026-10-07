@@ -68,3 +68,16 @@ fn any_instance_side_use_keeps_the_refusal() {
         assert!(text.contains("Module protocol not supported"), "{other}: {text}");
     }
 }
+
+#[test]
+fn an_inherited_hook_receives_a_class() {
+    // Ruby calls `inherited(subclass)` with the new Class. Core's
+    // `GraphApi::GlobalId`, extended by every GraphApi type, runs
+    // `subclass.class_eval { @has_numeric_gid = nil }` there; refused as
+    // an unproven receiver, the hook raised on each type's definition.
+    let registry = "module Registry\n  def inherited(subclass)\n    super\n    subclass.class_eval do\n      @numeric = nil\n    end\n  end\nend\n";
+    let base = "class Base\n  extend Registry\n\n  def self.inherited(sub)\n    super\n    sub.class_eval { @seen = true }\n  end\nend\n\nclass Child < Base\nend\n";
+    let (ok, text) = check(&[("lib/gadget.rb", GADGET), ("lib/registry.rb", registry), ("lib/base.rb", base)]);
+    assert!(ok, "{text}");
+    assert!(!text.contains("Module protocol"), "{text}");
+}
