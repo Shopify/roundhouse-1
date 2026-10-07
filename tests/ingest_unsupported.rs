@@ -52,3 +52,27 @@ fn a_dropped_lib_file_is_an_error_at_the_construct() {
     assert!(!survey.contains("error[ingest_unsupported]"), "{survey}");
     assert!(survey.contains("`for` requires enclosing-scope lowering"), "{survey}");
 }
+
+/// Core's `Podding::Database::Concerns::ShardedTable::ClassMethods`
+/// carries a `class << self; def extended(base)` hook. That singleton is
+/// the carrier module's own, not the includers' class side the carrier
+/// is flattened into, so it is refused by name at its line.
+#[test]
+fn a_class_methods_carrier_singleton_is_refused_by_name() {
+    let root = std::env::temp_dir().join(format!("roundhouse-ingest-carrier-{}", std::process::id()));
+    app(&root);
+    let file = root.join("lib/sharded.rb");
+    std::fs::write(
+        &file,
+        "module Sharded\n  extend ActiveSupport::Concern\n\n  module ClassMethods\n    class << self\n      def extended(base)\n        base\n      end\n    end\n\n    def sharded?\n      true\n    end\n  end\nend\n",
+    )
+    .unwrap();
+    let (_, text) = check(&root, &[]);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        text.contains(
+            "lib/sharded.rb:5:5: error[ingest_unsupported]: `class << self` in a concern's `ClassMethods` defines the carrier module's own singleton methods"
+        ),
+        "{text}"
+    );
+}
