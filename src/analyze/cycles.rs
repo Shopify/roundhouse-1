@@ -39,8 +39,9 @@
 //! element passing through `Var`, `Array[Var]` and a union on the way.
 //! The lattice has no finite height along that chain, so it needs the
 //! other standard widening, k-limiting: once a slot has grown (more
-//! type nodes than the round before) [`GROWTH_ROUNDS`] rounds running
-//! and is nested deeper than the larger of [`DEPTH_FLOOR`] and the
+//! type nodes than the round before) [`GROWTH_ROUNDS`] times in a row,
+//! each growth within [`GROWTH_GAP`] rounds of the last, and is nested
+//! deeper than the larger of [`DEPTH_FLOOR`] and the
 //! depth it started the loop at, every container below that depth
 //! becomes the gradual `Untyped`, now and in each later round. The
 //! levels above the limit keep their precise types. A slot that stops
@@ -69,8 +70,14 @@ enum Slot {
 /// cap is only reached after the period has repeated.
 const VISITED_PER_SLOT: usize = 6;
 
-/// Consecutive rounds a slot must grow before it is depth-limited.
+/// Growths in a row a slot must make before it is depth-limited.
 const GROWTH_ROUNDS: usize = 3;
+
+/// Rounds apart two growths may be and still be in a row. A slot fed
+/// through another grows every other round: a parameter takes the
+/// hashes its callers build from the returns one round, and the
+/// returns, which are that parameter, take it the next.
+const GROWTH_GAP: usize = 2;
 
 /// The least nesting depth a limited slot keeps precise.
 const DEPTH_FLOOR: usize = 4;
@@ -82,8 +89,22 @@ struct Growth {
     start_depth: usize,
     /// The last round it changed in.
     last_round: usize,
-    /// Consecutive rounds, up to `last_round`, in which it grew.
+    /// Growths in a row, up to `last_round`: each within [`GROWTH_GAP`]
+    /// rounds of the last.
     streak: usize,
+}
+
+impl Growth {
+    /// Note the slot changed in `round`, growing or not.
+    fn record(&mut self, grew: bool, round: usize) {
+        let in_row = self.last_round != usize::MAX && round.saturating_sub(self.last_round) <= GROWTH_GAP;
+        self.streak = match (grew, in_row) {
+            (false, _) => 0,
+            (true, true) => self.streak + 1,
+            (true, false) => 1,
+        };
+        self.last_round = round;
+    }
 }
 
 /// One whole-program loop's cycle state. Start a fresh one per loop:
@@ -336,12 +357,7 @@ impl Analyzer {
                     streak: 0,
                 });
                 let grew = before.as_ref().is_some_and(|b| ty_size(&now) > ty_size(b));
-                growth.streak = match (grew, growth.last_round.wrapping_add(1) == this_round) {
-                    (false, _) => 0,
-                    (true, true) => growth.streak + 1,
-                    (true, false) => 1,
-                };
-                growth.last_round = this_round;
+                growth.record(grew, this_round);
                 let keep = growth.start_depth.max(DEPTH_FLOOR);
                 if growth.streak >= GROWTH_ROUNDS && slot_depth(&slot, &now) > keep {
                     state.limited.insert(slot.clone(), keep);
@@ -406,6 +422,25 @@ impl Analyzer {
 mod tests {
     use super::*;
     use crate::ident::TyVar;
+
+    #[test]
+    fn growths_every_other_round_are_in_a_row() {
+        let mut every_round = Growth { start_depth: 0, last_round: usize::MAX, streak: 0 };
+        let mut every_other = every_round;
+        let mut every_third = every_round;
+        for round in 0..6 {
+            every_round.record(true, round);
+            every_other.record(true, round * 2);
+            every_third.record(true, round * 3);
+        }
+        assert_eq!(every_round.streak, 6);
+        assert_eq!(every_other.streak, 6);
+        assert_eq!(every_third.streak, 1);
+        // A change that does not grow ends the row.
+        every_other.record(false, 12);
+        every_other.record(true, 13);
+        assert_eq!(every_other.streak, 1);
+    }
 
     #[test]
     fn params_join_position_by_position() {
