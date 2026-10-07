@@ -2601,6 +2601,7 @@ fn ruby_family_files(
         RubyFlavor::JRuby => crate::lower::test_module_to_library::inline_assertions::AssertionMode::Inline,
     };
     let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
+    crate::timings::lap_start();
     if matches!(flavor, RubyFlavor::CRuby) {
         files.push(("test/minitest_runner.rb".to_string(),
             crate::runtime_files::read_to_string("runtime/spinel/test/minitest_runner.rb")?));
@@ -3093,7 +3094,9 @@ fn ruby_family_files(
     // the layout — the seam where the @ivars a layout reads are in
     // scope. The plain spinel target keeps unwrapped controllers (its
     // dispatch wraps body-only).
+    crate::timings::lap("ruby family: overlays");
     files.extend(sort_files(emit::ruby::emit_lowered_controllers_with_layout(app)));
+    crate::timings::lap("ruby family: layout controllers");
 
     // The source app's `app/javascript/` + `public/` static assets are
     // already folded in by `spinel_files` (both targets need them — the
@@ -6596,7 +6599,9 @@ fn spinel_files_with_assertions(
         }
     }
 
-    let app_files = emit::ruby::emit_with_assertions(app, assertion_mode);
+    let app_files = crate::timings::phase("emit ruby: app files", || {
+        emit::ruby::emit_with_assertions(app, assertion_mode)
+    });
     let test_stems = app_test_stems(&app_files);
     files.extend(sort_files(app_files));
 
@@ -6611,7 +6616,9 @@ fn spinel_files_with_assertions(
     // under the Ruby→Ruby round-trip; under spinel AOT they are priced by
     // the strict whole-graph check, which is the point (spinel as
     // completeness oracle).
-    files.extend(sort_files(emit::ruby::emit_library(app)));
+    files.extend(sort_files(crate::timings::phase("emit ruby: library", || {
+        emit::ruby::emit_library(app)
+    })));
     // Vendored extras whose bodies drive un-modeled stdlib (Sponge →
     // Net::HTTP/Resolv/IPAddr/OpenSSL) get raising façades at the same
     // require path — spinel AOT prices every reachable body and the

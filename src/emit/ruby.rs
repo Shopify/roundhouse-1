@@ -848,7 +848,9 @@ pub fn emit_with_assertions(
 ) -> Vec<EmittedFile> {
     let _indexes = library::install_lookup_indexes(app);
     let mut files = Vec::new();
+    crate::timings::lap_start();
     files.extend(emit_lowered_schema_pair(app));
+    crate::timings::lap("emit app: schema");
     // routes.rb gets a require-relative header prepended (see
     // emit_lowered_routes); emit the .rb via that path, then derive
     // the .rbs sidecar from the same funcs without the header.
@@ -858,6 +860,7 @@ pub fn emit_with_assertions(
         &route_funcs,
         PathBuf::from("config/routes.rb"),
     ));
+    crate::timings::lap("emit app: routes");
     let importmap_funcs = crate::lower::lower_importmap_to_library_functions(app);
     if !importmap_funcs.is_empty() {
         files.extend(library::emit_module_file_pair(
@@ -883,6 +886,7 @@ pub fn emit_with_assertions(
                 .to_string(),
         });
     }
+    crate::timings::lap("emit app: importmap");
 
     // Per-app Rails::Application reopen (config/application.rb) — the
     // app's real config methods (`read_only?`, `name`, `domain`) so
@@ -905,13 +909,19 @@ pub fn emit_with_assertions(
                 .to_string(),
         }),
     }
+    crate::timings::lap("emit app: application");
     files.extend(emit_lowered_models(app));
+    crate::timings::lap("emit app: models");
     if let Some(f) = library::emit_relation_scope_delegates(app) {
         files.push(f);
     }
+    crate::timings::lap("emit app: scope_delegates");
     files.extend(emit_lowered_controllers(app));
+    crate::timings::lap("emit app: controllers");
     files.extend(emit_lowered_views(app));
+    crate::timings::lap("emit app: views");
     files.extend(emit_lowered_jbuilder_views(app));
+    crate::timings::lap("emit app: jbuilder");
 
     // RouteHelpers — `app/route_helpers.rb` with `def self.<x>_path(args)`
     // per named route. Generated from `app.routes`; supersedes the
@@ -932,6 +942,7 @@ pub fn emit_with_assertions(
             PathBuf::from("app/route_helpers.rb"),
         ));
     }
+    crate::timings::lap("emit app: route_helpers");
 
     // Seeds — `db/seeds.rb` as a `Seeds.run` module method. Mirrors
     // the TS pipeline; was previously missing from spinel emit.
@@ -943,6 +954,7 @@ pub fn emit_with_assertions(
             PathBuf::from("db/seeds.rb"),
         ));
     }
+    crate::timings::lap("emit app: seeds");
 
     // Lower fixtures up-front so the test_helper renderer can list them
     // explicitly (replacing the source-side `Object.constants.sort.each`
@@ -1024,6 +1036,7 @@ pub fn emit_with_assertions(
         let out_path = PathBuf::from(format!("test/fixtures/{stem}.rb"));
         files.extend(library::emit_library_class_pair(lc, app, out_path));
     }
+    crate::timings::lap("emit app: fixtures");
 
     // Test modules — lower each `XTest` class into a `LibraryClass`
     // whose methods are `def test_<snake>` blocks (one per `test "..."`
@@ -1446,6 +1459,7 @@ pub fn emit_with_assertions(
         content: aggregator,
     });
 
+    crate::timings::lap("emit app: tests and aggregators");
     files
 }
 

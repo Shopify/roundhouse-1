@@ -22,6 +22,7 @@ use crate::ty::Ty;
 
 pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     let mut lcs: Vec<LibraryClass> = app.library_classes.clone();
+    crate::timings::lap_start();
     // A block-taking tag helper gains a `<name>_into(io, …)` variant
     // that writes around a yield into the caller's buffer; the view
     // emit points its appends at it (`lower::tag_block_passing`).
@@ -29,8 +30,11 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // the `capture` the variant is recognised by, and the variant's
     // own body wants every one of them applied.
     crate::lower::tag_block_passing::apply_helpers(&mut lcs);
+    crate::timings::lap("emit library: tag_block_passing");
     apply_scope_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: scope_lowering");
     apply_library_partial_render_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: partial_render");
     // The Attachment's readers on a content-type attachable (campfire's
     // `OpengraphEmbed`): Rails hands the partial the Attachment, which
     // delegates to the record; the emitted partial takes the record,
@@ -44,15 +48,20 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             crate::lower::attachable::push_attachment_delegation(&mut lc.methods, &binding.class);
         }
     }
+    crate::timings::lap("emit library: attachment_delegation");
     apply_helper_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: helper_lowering");
     // A bare `<x>_path` that `apply_helper_lowering` did not claim and
     // the route table DOES answer is a route helper called somewhere
     // nothing qualifies — campfire's `Messages::AttachmentPresentation`
     // `delegate`s `rails_blob_path` to its context, which leaves three
     // calls to a method the emitted tree defines nowhere.
     crate::lower::route_helper_receiver::qualify_lcs(&mut lcs, app);
+    crate::timings::lap("emit library: route_helper_receiver");
     apply_route_param_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: route_param");
     apply_raw_helper_monomorphization(&mut lcs, app);
+    crate::timings::lap("emit library: raw_helper_monomorphization");
     // send→case grounding, update-kwargs inlining, mailer class-side
     // wrappers, and duration grounding run in the shared post-analyze
     // hook, which covers these library classes (dispatch's plural
@@ -64,10 +73,15 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // re-applies the same reader idempotently and adds the Ruby writer
     // normalize.
     apply_datetime_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: datetime");
     apply_boolean_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: boolean");
     apply_hydration_nil_lowering(&mut lcs, app);
+    crate::timings::lap("emit library: hydration_nil");
     apply_nilsafe_empty_lowering(&mut lcs);
+    crate::timings::lap("emit library: nilsafe_empty");
     apply_time_format_lowering(&mut lcs);
+    crate::timings::lap("emit library: time_format");
     // Same rooting the view pipeline applies, for the same reason one
     // step over: a class nested in a namespace that SHADOWS what it
     // references. `Message::Broadcasts` is where the broadcast lowering
@@ -76,6 +90,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // head is skipped), so running it in both pipelines is safe.
 
     apply_constant_rooting(&mut lcs, app, RootingScope::RuntimeOnly);
+    crate::timings::lap("emit library: constant_rooting");
     // A nested class goes in its parent's file, as the source wrote
     // it. Given its own, each part-file re-opened the outer class and
     // CLOSED it again, and `TracePoint(:end)` — how a gem implements
@@ -105,6 +120,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             children.entry(owner).or_default().push(lc);
         }
     }
+    crate::timings::lap("emit library: owners");
 
     // `constant_readers` asks, per emitted class, which OTHER classes'
     // load-time code reads its constants. Answered by walking every
@@ -118,7 +134,9 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // closure the scans made assembling the files the emit's longest
     // stage.
     let _names = NameIndex::install(app);
-    lcs.iter()
+    crate::timings::lap("emit library: reader_index");
+    let files: Vec<EmittedFile> = lcs
+        .iter()
         .filter(|lc| owner_in_this_tree(lc).is_none())
         .flat_map(|lc| {
             // `underscore`, not `snake_case`: a namespaced reopen
@@ -134,7 +152,9 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             }
             files
         })
-        .collect()
+        .collect();
+    crate::timings::lap("emit library: render");
+    files
 }
 
 /// A child's `require_relative` target, expressed from its parent's
@@ -1165,15 +1185,30 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     // `ActionText::Attachable` (campfire declares it one level down,
     // through `User::Mentionable`). Ruby-family only, like the
     // `MessageVerifier` the mint runs through.
+    let _span = crate::timings::begin("scope lowering: preload");
     let attachable = crate::lower::attachable::attachable_models(app);
+    // Per-class lookups by name, indexed once: a scan of `app.models`
+    // (and, for the STI walk below, of `app.library_classes`) per class
+    // made this pass quadratic in the class count on Core. First entry
+    // wins, as the scans' `find` did.
+    let mut model_named: HashMap<&ClassId, &crate::dialect::Model> = HashMap::default();
+    for m in &app.models {
+        model_named.entry(&m.name).or_insert(m);
+    }
+    let mut library_parent: HashMap<&ClassId, Option<&ClassId>> = HashMap::default();
+    for other in &app.library_classes {
+        library_parent.entry(&other.name).or_insert(other.parent.as_ref());
+    }
     for lc in lcs.iter_mut() {
-        if let Some(model) = app.models.iter().find(|m| m.name == lc.name) {
+        if let Some(model) = model_named.get(&lc.name).copied() {
             crate::lower::rich_text::push_preload_scope_methods(&mut lc.methods, model);
             crate::lower::attached::push_preload_scope_methods(&mut lc.methods, model);
             crate::lower::attachable::push_attachable_sgid(&mut lc.methods, model, &attachable);
             crate::lower::broadcasts::push_to_gid_param(&mut lc.methods, model);
         }
     }
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: registries");
     let scopes = crate::lower::scope_chain::build_scope_registry(&app.models);
     let assocs = crate::lower::scope_chain::build_assoc_registry(&app.models);
     // Class methods reached THROUGH an association (`user.sessions
@@ -1185,6 +1220,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     // has to be inserted on the MODEL.
     let (assoc_class_methods, declined) =
         crate::lower::scope_chain::survey_assoc_class_methods(app, &assocs, &scopes);
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: ground");
     for lc in lcs.iter_mut() {
         for method in &mut lc.methods {
             crate::lower::scope_chain::ground_literal_model_dispatch(&mut method.body, app, &assocs);
@@ -1198,6 +1235,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             push_assoc_scope_skip(&d.model, &d.method, &d.reason);
         }
     }
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: gates");
     let models = crate::lower::scope_chain::model_set(&app.models);
     // A model-root query needs the same Relation seed even when the app
     // declares no scopes. Otherwise `Widget.order(...)` reaches no method
@@ -1237,6 +1276,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     {
         return;
     }
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: setup");
     let names = crate::lower::scope_chain::all_scope_names(&scopes);
     let user_returns = crate::lower::scope_chain::build_user_method_returns(&app.models);
     let unique_keys = crate::lower::scope_chain::build_unique_keys(&app.models, &app.schema);
@@ -1248,9 +1289,11 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         user_returns: &user_returns,
         unique_keys: &unique_keys,
     };
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: bodies");
     for lc in lcs.iter_mut() {
         // Models gain their scope class methods (already chain-normalized).
-        let is_model = app.models.iter().any(|m| m.name == lc.name);
+        let is_model = model_named.contains_key(&lc.name);
         // A model CONCERN is a model body too — the third family
         // `lower::for_each_model_body` names. `module User::Bannable`'s
         // instance methods run on a `User`, so a bare `bans.create!` in
@@ -1268,7 +1311,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             .then(|| lc.name.0.as_str().rsplit_once("::").map(|(ns, _)| ns.to_string()))
             .flatten()
             .map(|ns| crate::ident::ClassId(crate::ident::Symbol::from(ns.as_str())))
-            .filter(|ns| app.models.iter().any(|m| &m.name == ns))
+            .filter(|ns| model_named.contains_key(ns))
             // An STI SUBCLASS is the same fact by inheritance rather
             // than by namespace: `Rooms::Open < Room` declares no table,
             // so it is not a model, but its instance methods run on a
@@ -1284,18 +1327,14 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 let mut cursor = lc.parent.clone();
                 for _ in 0..8 {
                     let parent = cursor?;
-                    if app.models.iter().any(|m| m.name == parent) {
+                    if model_named.contains_key(&parent) {
                         return Some(parent);
                     }
-                    cursor = app
-                        .library_classes
-                        .iter()
-                        .find(|other| other.name == parent)
-                        .and_then(|other| other.parent.clone());
+                    cursor = library_parent.get(&parent).copied().flatten().cloned();
                 }
                 None
             });
-        if let Some(model) = app.models.iter().find(|m| m.name == lc.name) {
+        if let Some(model) = model_named.get(&lc.name).copied() {
             crate::lower::model_to_library::push_scope_methods(
                 &mut lc.methods,
                 model,
@@ -1450,6 +1489,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             }
         }
     }
+    drop(_span);
+    let _span = crate::timings::begin("scope lowering: variants");
     // Fixed-arity relation entry points, generated AFTER every body
     // rewrite above: their forward bodies mention scope names on model
     // constants, which `rewrite_call_site` would re-thread if it saw
