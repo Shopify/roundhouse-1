@@ -94,14 +94,50 @@ Serve the MCP tools over stdio for the Rails app at APP
 /// mode: ingest gaps are recorded instead of aborting, and a
 /// deduplicated punch list is printed at the end. Useful for
 /// scope-estimation passes on unfamiliar apps.
+/// `roundhouse check --initializer-ledger PATH`: the fate of every boot
+/// initializer statement, one JSON object per line, then a summary on
+/// stderr. Exits 0 when written.
+fn write_initializer_ledger(app: &crate::App, path: &str) -> ExitCode {
+    let rows = crate::ingest::initializers::ledger(app);
+    let mut text = String::new();
+    for row in &rows {
+        match serde_json::to_string(row) {
+            Ok(line) => {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            Err(err) => {
+                eprintln!("roundhouse-check: initializer ledger: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Err(err) = std::fs::write(path, text) {
+        eprintln!("roundhouse-check: initializer ledger: write {path}: {err}");
+        return ExitCode::from(2);
+    }
+    let mut by_fate: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for row in &rows {
+        *by_fate.entry(row.fate).or_default() += 1;
+    }
+    eprintln!(
+        "roundhouse-check: initializer ledger {path}: {} file(s), {} statement row(s): {by_fate:?}",
+        app.initializer_files.len(),
+        rows.len()
+    );
+    ExitCode::SUCCESS
+}
+
 pub fn check(args: &[String], default_app: &str) -> ExitCode {
     let mut continue_on_error = std::env::var("ROUNDHOUSE_INGEST_SURVEY")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let mut fixture: Option<String> = None;
     let mut list_unknown_sends = false;
+    let mut initializer_ledger: Option<String> = None;
 
-    for arg in args {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
@@ -114,11 +150,22 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
                        --strict     Abort at the first unsupported construct (default).\n\
                        --unknown-sends\n\
                                     List each send on an unknown or gradual receiver (always\n\
-                                    counted in the summary; never an error)."
+                                    counted in the summary; never an error).\n\
+                       --initializer-ledger PATH\n\
+                                    After ingest, write each boot initializer statement and\n\
+                                    its fate (applied / refused / unmodeled) to PATH as JSON\n\
+                                    lines, and stop before analysis."
                 );
                 return ExitCode::SUCCESS;
             }
             "--unknown-sends" => list_unknown_sends = true,
+            "--initializer-ledger" => match args.next() {
+                Some(path) => initializer_ledger = Some(path.clone()),
+                None => {
+                    eprintln!("roundhouse-check: --initializer-ledger needs a PATH");
+                    return ExitCode::from(2);
+                }
+            },
             "--continue" => continue_on_error = true,
             "--strict" => continue_on_error = false,
             other if other.starts_with("--") => {
@@ -192,6 +239,9 @@ pub fn check(args: &[String], default_app: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(ledger) = initializer_ledger {
+        return write_initializer_ledger(&app, &ledger);
+    }
     let mut analyzer = Analyzer::new(&app);
     crate::timings::phase("analyze", || analyzer.analyze(&mut app));
     let mut diags = crate::timings::phase("diagnose", || diagnose(&app));
