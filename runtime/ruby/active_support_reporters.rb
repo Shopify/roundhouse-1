@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-# ActiveSupport's two process-wide reporters, ported from activesupport
-# 8.1.4: `Rails.event` (EventReporter, active_support/event_reporter.rb)
+# ActiveSupport's two process-wide reporters, ported from the Rails Core
+# runs, 8.2.0.alpha (Shopify/rails 5813559f4aed): `Rails.event` (EventReporter, active_support/event_reporter.rb)
 # and `Rails.error` (ErrorReporter, active_support/error_reporter.rb),
 # with the ParameterFilter that redacts event payloads and the
 # ExecutionContext an error report reads its context from.
@@ -272,10 +272,22 @@ module ActiveSupport
       @context_store = store
     end
 
+    # The filters this reporter's payloads are redacted with, in place of
+    # ActiveSupport.filter_parameters (`reload_payload_filter` to apply).
+    def self.filter_parameters
+      @filter_parameters
+    end
+
+    def self.filter_parameters=(filters)
+      @filter_parameters = filters
+    end
+
+    # Debug events are on until the app's boot sets `debug_mode` (Rails'
+    # `initialize_event_reporter`: on at log level :debug).
     def initialize(*subscribers, raise_on_error: false)
       @subscribers = []
       subscribers.each { |subscriber| subscribe(subscriber) }
-      @debug_mode = false
+      @debug_mode = true
       @raise_on_error = raise_on_error
       @payload_filter = nil
     end
@@ -291,8 +303,8 @@ module ActiveSupport
       @subscribers.delete_if { |s| subscriber === s[:subscriber] }
     end
 
-    def notify(name_or_object, payload = nil, caller_depth: 1, **kwargs)
-      deliver(name_or_object, payload, kwargs, caller_depth + 1)
+    def notify(name_or_object, payload = nil, caller_depth: 1, filter_payload: true, **kwargs)
+      deliver(name_or_object, payload, kwargs, filter_payload, caller_depth + 1)
     end
 
     def with_debug
@@ -309,14 +321,14 @@ module ActiveSupport
       @debug_mode || Thread.current[:event_reporter_debug_mode]
     end
 
-    def debug(name_or_object, payload = nil, caller_depth: 1, **kwargs)
+    def debug(name_or_object, payload = nil, caller_depth: 1, filter_payload: true, **kwargs)
       return nil unless debug_mode?
       if block_given?
         merged = kwargs.dup
         yield.each { |key, value| merged[key] = value }
-        deliver(name_or_object, payload, merged, caller_depth + 1)
+        deliver(name_or_object, payload, merged, filter_payload, caller_depth + 1)
       else
-        deliver(name_or_object, payload, kwargs, caller_depth + 1)
+        deliver(name_or_object, payload, kwargs, filter_payload, caller_depth + 1)
       end
     end
 
@@ -344,11 +356,22 @@ module ActiveSupport
     private
 
     # `notify` and `debug` both land here, `depth` frames above the
-    # caller whose location the event records.
-    def deliver(name_or_object, payload, kwargs, depth)
+    # caller whose location the event records. Subscriber filters see the
+    # name alone, before the payload is built; with no subscriber left,
+    # nothing is built.
+    def deliver(name_or_object, payload, kwargs, filter_payload, depth)
+      name = resolve_name(name_or_object)
+      named = { name: name }
+      subscribers = []
+      @subscribers.each do |entry|
+        filter = entry[:filter]
+        subscribers << entry[:subscriber] if filter.nil? || filter.call(named)
+      end
+      return nil if subscribers.empty?
+
       event = {
-        name: resolve_name(name_or_object),
-        payload: resolve_payload(name_or_object, payload, kwargs),
+        name: name,
+        payload: resolve_payload(name_or_object, payload, kwargs, filter_payload),
         tags: TagStack.tags,
         context: self.class.context_store.context,
         timestamp: Process.clock_gettime(Process::CLOCK_REALTIME, :nanosecond),
@@ -358,11 +381,9 @@ module ActiveSupport
       unless location.nil?
         event[:source_location] = { filepath: location.path, lineno: location.lineno, label: location.label }
       end
-      @subscribers.each do |entry|
+      subscribers.each do |subscriber|
         begin
-          filter = entry[:filter]
-          next if !filter.nil? && !filter.call(event)
-          entry[:subscriber].emit(event)
+          subscriber.emit(event)
         rescue StandardError => subscriber_error
           raise if @raise_on_error
           ActiveSupport.error_reporter.report(subscriber_error, handled: true)
@@ -372,7 +393,11 @@ module ActiveSupport
     end
 
     def payload_filter
-      @payload_filter ||= ParameterFilter.new(ActiveSupport.filter_parameters, mask: ParameterFilter::FILTERED)
+      @payload_filter ||= ParameterFilter.new(filter_parameters, mask: ParameterFilter::FILTERED)
+    end
+
+    def filter_parameters
+      self.class.filter_parameters || ActiveSupport.filter_parameters
     end
 
     def resolve_name(name_or_object)
@@ -383,13 +408,15 @@ module ActiveSupport
       end
     end
 
-    def resolve_payload(name_or_object, payload, kwargs)
+    def resolve_payload(name_or_object, payload, kwargs, filter)
       if name_or_object.is_a?(String) || name_or_object.is_a?(Symbol)
         handle_unexpected_args(name_or_object, payload, kwargs) if !payload.nil? && kwargs.any?
         if kwargs.any?
-          payload_filter.filter(symbolize(kwargs))
+          resolved = symbolize(kwargs)
+          filter ? payload_filter.filter(resolved) : resolved
         elsif !payload.nil?
-          payload_filter.filter(symbolize(payload))
+          resolved = symbolize(payload)
+          filter ? payload_filter.filter(resolved) : resolved
         end
       else
         handle_unexpected_args(name_or_object, payload, kwargs) if !payload.nil? || kwargs.any?
@@ -538,7 +565,7 @@ module ActiveSupport
       @subscribers.each do |subscriber|
         begin
           unless !disabled.nil? && disabled.any? { |s| s === subscriber }
-            subscriber.report(error, handled: handled, severity: severity, context: full_context, source: source)
+            subscriber.report(error, handled: handled, severity: severity, context: deep_dup(full_context), source: source)
           end
         rescue StandardError => subscriber_error
           raise if @logger.nil?
@@ -557,6 +584,29 @@ module ActiveSupport
     end
 
     private
+
+    # Object#deep_dup (core_ext/object/deep_dup.rb): each subscriber gets
+    # its own copy of the context.
+    def deep_dup(value)
+      if value.is_a?(Hash)
+        copy = value.dup
+        value.each_pair do |key, item|
+          if key.is_a?(String) || key.is_a?(Symbol)
+            copy[key] = deep_dup(item)
+          else
+            copy.delete(key)
+            copy[deep_dup(key)] = deep_dup(item)
+          end
+        end
+        copy
+      elsif value.is_a?(Array)
+        value.map { |item| deep_dup(item) }
+      elsif value.is_a?(Method) || value.is_a?(UnboundMethod)
+        value
+      else
+        value.dup
+      end
+    end
 
     def disabled_for_thread
       table = Thread.current[:active_support_error_reporter_disabled]

@@ -1,7 +1,9 @@
-# Native ActiveSupport 8.1.4 oracle for `Rails.event` (EventReporter) and
+# Native ActiveSupport oracle (the Rails native Core runs; tests/support/
+# rails_oracle.rb) for `Rails.event` (EventReporter) and
 # `Rails.error` (ErrorReporter) against runtime/ruby/active_support_reporters.rb.
 # Each mode prints one line per observation; `compare` requires them equal.
 require "json"
+require_relative "support/rails_oracle"
 
 if ARGV.first == "compare"
   require "open3"
@@ -16,18 +18,18 @@ if ARGV.first == "compare"
     abort "reporters differ:\n" + diff.map { |(x, y), i| "line #{i + 1}\n  native:  #{x}  emitted: #{y}" }.join("\n")
   end
   puts outputs.first
-  puts "Native ActiveSupport and emitted Rails.event/Rails.error agree"
+  puts "Native ActiveSupport and emitted Rails.event/Rails.error agree (#{RailsOracle.label})"
   exit
 end
 
 if ARGV.first == "native"
-  gem "activesupport", "8.1.4"
+  RailsOracle.activate("activesupport")
   require "active_support"
   require "active_support/event_reporter"
   require "active_support/error_reporter"
   require "active_support/execution_context"
   require "active_support/core_ext/hash/keys" # loaded by every Rails app
-  # railties 8.1.4 lib/rails.rb, verbatim.
+  # railties lib/rails.rb, verbatim.
   module Rails
     class << self
       def error
@@ -286,3 +288,68 @@ ActiveSupport::ExecutionContext[:inner] = 2
 show("nested push", ActiveSupport::ExecutionContext.to_h)
 ActiveSupport::ExecutionContext.pop
 show("nested pop", ActiveSupport::ExecutionContext.to_h)
+
+# --- 8.2 --------------------------------------------------------------------
+# A new reporter starts in debug mode (Rails' boot then sets it from the
+# log level).
+fresh_sink = EventSink.new
+fresh = ActiveSupport::EventReporter.new(fresh_sink)
+show("fresh debug_mode?", fresh.debug_mode?)
+fresh.debug("fresh.debug", a: 1)
+show("fresh debug event", fresh_sink.events.map { |e| [e[:name], e[:payload]] })
+
+# Subscriber filters see the name alone, before the payload is built.
+seen = []
+filtered_sink = EventSink.new
+filtering = ActiveSupport::EventReporter.new
+filtering.subscribe(filtered_sink) { |event| seen << event.keys; event[:name].start_with?("keep") }
+filtering.notify("keep.one", a: 1)
+filtering.notify("drop.one", a: 2)
+show("filter sees", seen)
+show("filter delivers", filtered_sink.events.map { |e| [e[:name], e[:payload]] })
+
+# With no subscriber left nothing is resolved: the mixed-arguments
+# error is not reported.
+strict = ActiveSupport::EventReporter.new(raise_on_error: true)
+show("no subscribers", outcome { strict.notify("x", { a: 1 }, b: 2) })
+strict.subscribe(EventSink.new) { |event| event[:name] == "y" }
+show("filtered out", outcome { strict.notify("x", { a: 1 }, b: 2) })
+show("filtered in", outcome { strict.notify("y", { a: 1 }, b: 2) })
+raising_filter = ActiveSupport::EventReporter.new
+raising_filter.subscribe(EventSink.new) { |_event| raise "filter failed" }
+show("raising filter", outcome { raising_filter.notify("z") })
+
+# filter_payload: false skips the redaction; EventReporter.filter_parameters
+# replaces ActiveSupport.filter_parameters for the reporter.
+ActiveSupport.filter_parameters = [:password]
+redacting_sink = EventSink.new
+redacting = ActiveSupport::EventReporter.new(redacting_sink)
+redacting.notify("f", password: "p", name: "n")
+redacting.notify("f", { "password" => "p" }, filter_payload: false)
+redacting.debug("f", password: "p", filter_payload: false)
+redacting.debug("f", password: "p") { { token: "t" } }
+ActiveSupport::EventReporter.filter_parameters = [:token]
+redacting.reload_payload_filter
+redacting.notify("f", password: "p", token: "t")
+ActiveSupport::EventReporter.filter_parameters = []
+redacting.reload_payload_filter
+redacting.notify("f", password: "p", token: "t")
+ActiveSupport::EventReporter.filter_parameters = nil
+redacting.reload_payload_filter
+redacting.notify("f", password: "p", token: "t")
+ActiveSupport.filter_parameters = []
+show("filter_payload", redacting_sink.events.map { |e| e[:payload] })
+
+# Each error subscriber gets its own copy of the context.
+class MutatingSink
+  def report(_error, handled:, severity:, context:, source:)
+    context[:mutated] = true
+    context[:list] << :mutated
+  end
+end
+copies = ErrorSink.new
+copying = ActiveSupport::ErrorReporter.new(MutatingSink.new, copies)
+shared = [1]
+copying.report(RuntimeError.new("ctx"), context: { list: shared, "str" => +"s" })
+show("context copies", [copies.reports.last[4], shared])
+show("severities frozen", ActiveSupport::ErrorReporter::SEVERITIES.frozen?)
