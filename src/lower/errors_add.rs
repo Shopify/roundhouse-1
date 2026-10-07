@@ -96,6 +96,15 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
     if !recognized {
         return;
     }
+    // The rewrite targets the shared runtime's `Array[String]`
+    // accumulator. An `errors` reader the analyzer typed as a class
+    // (an app's own error collection, e.g. CustomerFoundations::Errors
+    // with `add(attribute, code)`) is not that accumulator: its `add`
+    // is an ordinary method call and stays as written.
+    let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { unreachable!() };
+    if r.ty.as_ref().is_some_and(names_own_class) {
+        return;
+    }
     // The field: a Symbol literal is baked at lower time; a local or
     // parameter (`errors.add(attribute, …)` in an EachValidator's
     // `validate_each`) is humanized at run time. Anything else stays
@@ -270,6 +279,18 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
         parenthesized: false,
     };
     expr.ty = recv_ty;
+}
+
+/// A class type (or a nilable one), i.e. not the runtime accumulator.
+fn names_own_class(ty: &Ty) -> bool {
+    match ty {
+        Ty::Class { .. } => true,
+        Ty::Union { variants } => {
+            variants.iter().any(|v| matches!(v, Ty::Class { .. }))
+                && variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+        }
+        _ => false,
+    }
 }
 
 fn str_lit(span: crate::span::Span, value: &str) -> Expr {

@@ -244,3 +244,36 @@ end
     assert!(out.contains("errors.add(field_name"), "{out}");
     assert_eq!(diags.len(), 1, "{diags:?}");
 }
+
+#[test]
+fn class_typed_errors_reader_keeps_its_own_add() {
+    // An app's own error collection (Core's CustomerFoundations::Errors)
+    // has a real `add(attribute, code)`; it is not the Array[String]
+    // accumulator, so the call stays as written and is not residue.
+    let (out, diags) = lower_and_emit(
+        r#"
+class AppErrors
+  #: () -> void
+  def initialize = @list = []
+
+  #: (Symbol, Symbol) -> void
+  def add(attribute, code) = @list << [attribute, code]
+end
+
+class Signup
+  #: () -> AppErrors
+  def errors
+    @errors ||= AppErrors.new #: AppErrors?
+  end
+
+  #: () -> void
+  def check
+    errors.add(:email, :taken)
+  end
+end
+"#,
+    );
+    assert!(out.contains("errors.add(:email, :taken)"), "{out}");
+    assert!(!out.contains("has already been taken"), "{out}");
+    assert!(diags.is_empty(), "{diags:?}");
+}
