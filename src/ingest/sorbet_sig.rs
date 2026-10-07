@@ -245,11 +245,30 @@ fn walk(
             }
             continue;
         }
+        // `class_methods do … end`, ActiveSupport::Concern's class-side
+        // block: its `def`s are the concern's singleton methods, which
+        // the ingest copies onto every includer's class side. The walk
+        // did not enter call blocks, so their declarations went unread.
+        if let Some(body) = class_methods_block(statement).filter(|_| scope.is_some()) {
+            walk(&body, scope, true, aliases, rbs_aliases, out, abstracts, sides, source);
+            pending = None;
+            continue;
+        }
         pending = match statement.as_call_node() {
             Some(call) if is_sig_call(&call) => Some(index),
             _ => None,
         };
     }
+}
+
+/// The statements of a receiverless `class_methods do … end`.
+fn class_methods_block<'pr>(statement: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
+    let call = statement.as_call_node()?;
+    if call.receiver().is_some() || constant_id_str(&call.name()) != "class_methods" {
+        return None;
+    }
+    let body = call.block()?.as_block_node()?.body()?;
+    Some(body.as_statements_node()?.body().iter().collect())
 }
 
 /// `T::Struct` / `T::ImmutableStruct` — sorbet-runtime's typed value

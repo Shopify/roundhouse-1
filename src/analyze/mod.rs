@@ -564,6 +564,9 @@ impl Analyzer {
             cls.class_methods.insert(Symbol::from("connection"), registry::ar::connection_ty());
             cls.class_methods.insert(Symbol::from("connection_pool"), Ty::Untyped);
             cls.class_methods.insert(Symbol::from("establish_connection"), Ty::Untyped);
+            for (name, ty) in registry::ar::connection_switches() {
+                cls.class_methods.insert(Symbol::from(name), ty);
+            }
             cls.class_methods.insert(Symbol::from("table_name"), Ty::Str);
             // `Model.human_attribute_name(:col)` — the ActiveModel
             // translation entry point every form label and table header
@@ -1275,6 +1278,31 @@ impl Analyzer {
             }) {
                 if *slot == before {
                     *slot = after;
+                }
+            }
+        }
+        // A concern's class-side method reaches each includer as a copy of
+        // its `def` (`concern_spliced_class_methods`), and the harvest typed
+        // the copy from its body: a declared `-> Integer` over `raise` read
+        // as `bot`. The declaration was read where it was written: on the
+        // concern's singleton side (`class_methods do`) or on its nested
+        // `ClassMethods` carrier, an instance side (`mixes_in_class_methods
+        // (ClassMethods)`). The includer takes it, as it does from a module
+        // it `extend`s; the harvest keeps a declared `Ty::Fn`.
+        for (includer, names) in &app.concern_spliced_class_methods {
+            for (name, concern) in names {
+                let carrier = ClassId(Symbol::from(format!("{}::ClassMethods", concern.0.as_str())));
+                let declared = |id: &ClassId| app.rbs_signatures.get(id).is_some_and(|m| m.contains_key(name));
+                let singleton = app.rbs_singleton_methods.get(concern).is_some_and(|n| n.contains(name));
+                let ty = if declared(concern) && singleton {
+                    classes.get(concern).and_then(|c| c.class_methods.get(name))
+                } else if declared(&carrier) {
+                    classes.get(&carrier).and_then(|c| c.instance_methods.get(name))
+                } else {
+                    None
+                };
+                if let Some(ty) = ty.filter(|ty| matches!(ty, Ty::Fn { .. })).cloned() {
+                    classes.entry(includer.clone()).or_default().class_methods.insert(name.clone(), ty);
                 }
             }
         }
