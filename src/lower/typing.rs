@@ -108,10 +108,21 @@ pub fn type_method_body(
         }
     }
     if let Some(enclosing) = &method.enclosing_class {
+        let id = ClassId(enclosing.clone());
         ctx.self_ty = Some(Ty::Class {
-            id: ClassId(enclosing.clone()),
+            id: id.clone(),
             args: vec![],
         });
+        // Seed class constants so Value Const resolution can see
+        // locally-owned bare names (test-helper splice). Without this,
+        // `qualify_resolved_path` expands `WEB_PUSH_PUBLIC_TEST_IP` back
+        // to `DnsTestHelper::WEB_PUSH_PUBLIC_TEST_IP`.
+        if let Some(info) = classes.get(&id) {
+            if !info.constants.is_empty() {
+                let global = crate::analyze::ConstScope::default();
+                ctx.constants = global.with_own(info.constants.clone());
+            }
+        }
     }
     if matches!(method.receiver, crate::dialect::MethodReceiver::Instance) {
         for (name, ty) in ivar_bindings {

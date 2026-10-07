@@ -18,6 +18,8 @@
 //! [`SELF_BINDING`](crate::expr::SELF_BINDING), which the typer reads
 //! as the new type of `self`.
 
+use std::cell::RefCell;
+
 use ruby_prism::Node;
 
 use crate::expr::{Expr, ExprNode};
@@ -25,6 +27,29 @@ use crate::ty::Ty;
 
 use super::sorbet_sig::sorbet_type_node;
 use super::sources;
+
+thread_local! {
+    /// End offsets of ancestors that will consume a trailing `#:` at that
+    /// offset. A child ending at the same place must not also ascribe.
+    static OUTER_ASCRIPTION_ENDS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Enter an expression that may claim a trailing `#:` at `end`. Returns
+/// whether this call is the outermost claimant (no ancestor already
+/// covers the same offset). Pair with [`pop_trailing_ascription_claim`].
+pub(super) fn push_trailing_ascription_claim(end: usize) -> bool {
+    OUTER_ASCRIPTION_ENDS.with(|stack| {
+        let outermost = !stack.borrow().contains(&end);
+        stack.borrow_mut().push(end);
+        outermost
+    })
+}
+
+pub(super) fn pop_trailing_ascription_claim() {
+    OUTER_ASCRIPTION_ENDS.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
 
 /// Wrap `value` in a `Cast` to `ty`, unless the type is unreadable
 /// (`None` or an open inference variable), in which case `value` is

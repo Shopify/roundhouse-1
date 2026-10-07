@@ -130,3 +130,22 @@ end
     );
     assert!(f.is_empty(), "{f:?}");
 }
+
+#[test]
+fn a_trailing_cast_on_an_or_ascribes_the_whole_expression() {
+    // `x || y #: as Line` ends at the same offset for `y` and the OrNode.
+    // Only the outer expression must consume the comment.
+    let f = failures(
+        r#"class CartController < ApplicationController
+  def line
+    params[:fallback] || params[:x] #: as Line
+  end
+
+  def show
+    line.cents.bogus_from_or
+  end
+end
+"#,
+    );
+    assert_eq!(f, vec!["bogus_from_or".to_string()]);
+}

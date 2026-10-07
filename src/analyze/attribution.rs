@@ -467,7 +467,10 @@ pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
             DiagnosticKind::Unsupported { construct, detail, .. }
                 if construct.as_str() == "constant" =>
             {
-                crate::gems::gem_owning_constant(&census, detail).map(|gem| (gem, None))
+                crate::gems::gem_owning_constant_with(&census, detail, &|gem, path| {
+                    app.gem_boundary.declares_path(gem, path)
+                })
+                .map(|gem| (gem, None))
             }
             _ => None,
         }

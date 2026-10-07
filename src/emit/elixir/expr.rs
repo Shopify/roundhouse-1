@@ -925,14 +925,12 @@ fn emit_send(recv: Option<&Expr>, method: &str, args: &[Expr]) -> String {
                 return format!("{module}.put({r_s}, {k}, {v})");
             }
             // Array slot write: HeaderStore `@vals[i] = value` and similar.
-            // Int index → List; Hash key → Map.
-            let index_is_int = matches!(
-                args[0].ty.as_ref(),
-                Some(crate::ty::Ty::Int)
-            ) || matches!(
-                effective_recv_ty(r),
-                Some(crate::ty::Ty::Array { .. })
-            );
+            // Int index → List; Hash key → Map. A Hash with integer keys
+            // (`counts[record.id] = n`) must stay Map.put — same guard as
+            // C#/Kotlin `list_index_needs_int_cast`.
+            let index_is_int = !recv_is_hash(r)
+                && (matches!(args[0].ty.as_ref(), Some(crate::ty::Ty::Int))
+                    || recv_is_array(r));
             if index_is_int {
                 return format!("List.replace_at({r_s}, {k}, {v})");
             }
@@ -2087,9 +2085,10 @@ fn emit_ivar_state_send(name: &str, method: &str, args: &[Expr]) -> Option<Strin
 }
 
 /// Mutable declared module constants used as array slots
-/// (`FORGERY_SLOT[0] = value`). Module attributes cannot be reassigned
-/// at runtime — mirror the ivar path through `Process` with the
-/// attribute as the default so reads see writes.
+/// (`FORGERY_SLOT[0] = value`, `Resolv::STUB_ADDRS << …`). Module
+/// attributes cannot be reassigned at runtime — mirror the ivar path
+/// through `Process` with the attribute as the default so every mutate
+/// and read sees the same value.
 fn emit_const_slot_send(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
     let ExprNode::Const { path } = &*recv.node else {
         return None;
@@ -2111,6 +2110,15 @@ fn emit_const_slot_send(recv: &Expr, method: &str, args: &[Expr]) -> Option<Stri
             emit_expr(&args[1])
         )),
         ("[]", 1) => Some(format!("Enum.at({get}, {})", emit_expr(&args[0]))),
+        // `STUB_ADDRS << addrs` / `STUB_HOSTS.clear` must update the same
+        // Process entry as `[]=`; otherwise teardown leaves a stale list
+        // that a later indexed read would still see.
+        ("<<", 1) => Some(format!(
+            "Process.put({key}, {get} ++ [{}])",
+            emit_expr(&args[0])
+        )),
+        ("clear", 0) => Some(format!("Process.put({key}, [])")),
+        ("length" | "size", 0) => Some(format!("Kernel.length({get})")),
         _ => None,
     }
 }
@@ -3051,6 +3059,47 @@ mod tests {
         // An all-caps MODULE reference (not declared) stays a module name,
         // not a bogus `@json` attribute.
         assert_eq!(emit_expr(&const_ref("JSON")), "JSON");
+        clear_declared_constants();
+    }
+
+    #[test]
+    fn hash_int_key_index_put_uses_map_put() {
+        // `counts[record.id] = n` is Hash[Integer, Integer] — not a List.
+        let recv = var_t(
+            "counts",
+            Ty::Hash {
+                key: Box::new(Ty::Int),
+                value: Box::new(Ty::Int),
+            },
+        );
+        let key = var_t("id", Ty::Int);
+        let val = var_t("n", Ty::Int);
+        let e = call(recv, "__index_put__", vec![key, val]);
+        assert_eq!(emit_expr(&e), "Map.put(counts, id, n)");
+    }
+
+    #[test]
+    fn declared_const_array_mutators_share_process_dict() {
+        fn const_ref(name: &str) -> Expr {
+            Expr::new(crate::span::Span::synthetic(), ExprNode::Const {
+                path: vec![Symbol::from(name)],
+            })
+        }
+        clear_declared_constants();
+        register_declared_constant("STUB_ADDRS");
+        let recv = || const_ref("STUB_ADDRS");
+        assert_eq!(
+            emit_expr(&call(recv(), "<<", vec![var_t("addrs", arr())])),
+            "Process.put(:rh_const_stub_addrs, Process.get(:rh_const_stub_addrs, @stub_addrs) ++ [addrs])"
+        );
+        assert_eq!(
+            emit_expr(&call(recv(), "clear", vec![])),
+            "Process.put(:rh_const_stub_addrs, [])"
+        );
+        assert_eq!(
+            emit_expr(&call(recv(), "length", vec![])),
+            "Kernel.length(Process.get(:rh_const_stub_addrs, @stub_addrs))"
+        );
         clear_declared_constants();
     }
 

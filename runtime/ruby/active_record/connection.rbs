@@ -26,6 +26,9 @@ module ActiveRecord
   end
 
   class Base
+    @__pending_preload: PendingPreload?
+    def _pend_preload: (PendingPreload pending) -> nil
+    def _await_preload: () -> nil
     def self.connection: () -> Connection
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String

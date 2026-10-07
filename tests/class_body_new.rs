@@ -128,6 +128,39 @@ fn a_self_constructing_constant_still_defers_past_the_methods() {
     );
 }
 
+/// INDEX reads BUILTIN after index_by grounding qualifies it as
+/// `Sound::BUILTIN`. Deferral must follow that spelling too — otherwise
+/// INDEX stays eager, emits above BUILTIN, and campfire dies at load
+/// with `uninitialized constant Sound::BUILTIN`.
+const SOUND_WITH_INDEX: &str = r#"class Sound
+  attr_reader :name
+
+  def initialize(name:)
+    @name = name
+  end
+
+  BUILTIN = [ new(name: "bell"), new(name: "honk") ]
+  INDEX = BUILTIN.index_by(&:name)
+end
+"#;
+
+#[test]
+fn a_constant_reading_a_deferred_own_class_const_also_defers() {
+    let src = emitted(SOUND_WITH_INDEX);
+    let builtin = src.find("BUILTIN =").expect("BUILTIN emitted");
+    let index = src.find("INDEX =").expect("INDEX emitted");
+    let init = src.find("def initialize").expect("initialize emitted");
+    assert!(
+        builtin > init && index > init,
+        "both self-constructing BUILTIN and INDEX-that-reads-it must \
+         follow the methods:\n{src}"
+    );
+    assert!(
+        index > builtin,
+        "INDEX references Sound::BUILTIN, so it must emit after BUILTIN:\n{src}"
+    );
+}
+
 /// THE OWNER IS NOT ALWAYS `self`. In a class-side method a SUBCLASS
 /// inherits, `self` at call time is the subclass — the class-side
 /// template method, which campfire writes as

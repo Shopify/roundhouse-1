@@ -207,6 +207,25 @@ end
 }
 
 #[test]
+fn concern_options_bound_param_computes_helper_names() {
+    // Reparsing a concern body without its `|options|` declaration makes
+    // Prism treat `options` as a receiverless call; the evaluator must
+    // still resolve the bound parameter so `as:` names are kept.
+    let flat = flat(&[(
+        "config/routes.rb",
+        r##"Rails.application.routes.draw do
+  concern :prefixed do |options|
+    get "items", to: "catalog#items", as: "#{options[:prefix]}items"
+  end
+  concerns :prefixed, prefix: "shop_"
+end
+"##,
+    )]);
+    let got: Vec<String> = flat.iter().map(|(m, p, n)| format!("{m} {p} {n}")).collect();
+    assert_eq!(got, vec!["GET /items shop_items"]);
+}
+
+#[test]
 fn empty_only_list_means_no_actions() {
     let got = paths(&[(
         "config/routes.rb",

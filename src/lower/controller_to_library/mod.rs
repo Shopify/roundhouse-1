@@ -1288,10 +1288,8 @@ fn build_methods(
         }
     }
 
-    // The controller's own class-side methods (`def self.x`, the defs of
-    // a `class << self`) go through as they are: class-receiver methods
-    // of the lowered class, like a library class's.
-    methods.extend(controller.class_methods().cloned());
+    // Class-side methods are already seeded at the start of build_methods;
+    // do not append them again (duplicate defs break several emitters).
 
     methods
 }

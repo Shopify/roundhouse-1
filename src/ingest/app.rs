@@ -7510,10 +7510,12 @@ fn mapper_extension_block_methods<V: Vfs + ?Sized>(
     ];
     let mut out = std::collections::HashSet::new();
     for name in modules {
-        let suffix = format!("::{name}");
+        // Top-level `Mapper.prepend(Const)` resolves `Const` by its
+        // written name; a suffix match would also pull in unrelated
+        // `Other::Const` modules that share only the final segment.
         for lc in &app.library_classes {
             let full = lc.name.0.as_str();
-            if full != name && !full.ends_with(&suffix) {
+            if full != name {
                 continue;
             }
             for m in &lc.methods {

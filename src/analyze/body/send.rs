@@ -1126,17 +1126,15 @@ impl<'a> BodyTyper<'a> {
                             return subst(&ty);
                         }
                     }
+                    // Class-object sends only consult class-side
+                    // `method_missing`. Instance / included handlers answer
+                    // instance sends; applying them here would type an
+                    // undefined class-side call from an RBS instance sig.
                     if method_missing_ty.is_none() {
                         method_missing_ty = cls
                             .class_methods
                             .get(&Symbol::from("method_missing"))
-                            .or_else(|| cls.instance_methods.get(&Symbol::from("method_missing")))
-                            .cloned()
-                            .or_else(|| {
-                                cls.includes.iter().find_map(|m| {
-                                    self.lookup_in_module(m, &Symbol::from("method_missing"))
-                                })
-                            });
+                            .cloned();
                     }
                     current_id = cls.parent.as_ref();
                 }
@@ -2967,7 +2965,12 @@ pub(super) fn object_protocol_method(
     block_ret: Option<&Ty>,
     class_object: bool,
 ) -> Option<Ty> {
-    if is_module_protocol(method) && !class_object { return None; }
+    // `include?` doubles as Enumerable/String membership — answer Bool even
+    // without a proven Module receiver. Other Module-protocol names still
+    // require a class/module object.
+    if is_module_protocol(method) && !class_object && method.as_str() != "include?" {
+        return None;
+    }
     let sym_list = || Ty::Array { elem: Box::new(Ty::Sym) };
     let recv = || recv_ty.cloned().unwrap_or(Ty::Untyped);
     let block = || block_ret.filter(|t| !matches!(t, Ty::Var { .. })).cloned().unwrap_or(Ty::Untyped);
@@ -2988,8 +2991,13 @@ pub(super) fn object_protocol_method(
         "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval"
         | "module_exec" => block(),
         "display" => Ty::Nil,
-        // ActiveSupport's Object extensions.
+        // ActiveSupport's Object extensions. `to_param` on Untyped (and
+        // other non-nominal receivers) lowers to `ActiveSupport.to_param`
+        // (runtime exists). A nominal class without a synthesized/
+        // registered reader must hit the Object-extension refusal instead
+        // of being answered here (see critic_admission Value.new.to_param).
         "to_json" | "to_yaml" => Ty::Str,
+        "to_param" if !matches!(recv_ty, Some(Ty::Class { .. })) => Ty::Str,
         "===" | "!~" => Ty::Bool,
         "<=>" => Ty::Union { variants: vec![Ty::Int, Ty::Nil] },
         _ => return None,
@@ -3026,7 +3034,8 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         | "!=" | "===" | "equal?" | "eql?" => Ty::Bool,
         "each" | "each_pair" | "each_value" | "each_key" | "each_with_index" | "reverse_each"
         | "select" | "filter" | "reject" | "compact" | "uniq" | "sort" | "sort_by" | "reverse"
-        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require" => pv(),
+        | "merge" | "except" | "slice" | "permit" | "permit!" | "to_unsafe_h" | "to_h" | "require"
+        | "with_defaults" | "with_defaults!" | "reverse_merge" | "reverse_merge!" => pv(),
         "map" | "collect" | "flat_map" | "filter_map" => {
             Ty::Array { elem: Box::new(block_ret.cloned().unwrap_or(Ty::Untyped)) }
         }

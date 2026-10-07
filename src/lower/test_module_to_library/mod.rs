@@ -102,6 +102,11 @@ pub fn lower_test_modules_with_assertions(
     // RouteHelpers entries into each test class's instance_methods so
     // bare-name dispatch resolves.
     crate::lower::view_to_library::insert_framework_stubs(&mut classes);
+    // Stdlib exceptions (`StandardError`, `ActiveRecord::RecordNotFound`, …)
+    // so retyping test bodies keeps `CLASS_OBJECT_VALUE` on those Const
+    // refs — otherwise `Child < Parent` collapses to Incompatible and
+    // TS/Kotlin/Swift framework `errors_test` throw at emit.
+    crate::analyze::register_stdlib_classes(&mut classes);
     insert_minitest_test_baseline(&mut classes);
     insert_cookie_jar_baseline(&mut classes);
 
@@ -178,13 +183,19 @@ pub fn lower_test_modules_with_assertions(
     // setup. Lets dispatch on `self` resolve when one test method
     // calls a setup helper (or when frameworks evolve to support
     // shared utility methods).
-    for lc in &all_lcs {
+    for (idx, lc) in all_lcs.iter().enumerate() {
         let mut info = ClassInfo::default();
         for m in &lc.methods {
             if let Some(sig) = &m.signature {
                 info.instance_methods.insert(m.name.clone(), sig.clone());
                 info.instance_method_kinds.insert(m.name.clone(), m.kind);
             }
+        }
+        // Spliced test-helper constants (DnsTestHelper → WEB_PUSH_…) so
+        // `type_method_body` can seed ConstScope and Value qualify keeps
+        // the bare name rather than re-expanding to the helper module.
+        for (name, _) in &test_modules[idx].constants {
+            info.constants.entry(name.clone()).or_insert(Ty::Untyped);
         }
         // Inherit Minitest::Test assertion methods so `self.assert(...)`
         // dispatch resolves through the registry.

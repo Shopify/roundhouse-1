@@ -187,9 +187,16 @@ fn unused_unresolved_model_include_is_not_silent() {
 
 #[test]
 fn object_extensions_without_runtime_are_refused() {
-    for body in ["self.to_query", "self.instance_values", "self.acts_like?(:probe)", "self.to_param", "self.presence_in([1])"] {
+    // `to_param` on an AR model is synthesized + registered; refuse it on
+    // a plain library object that has no runtime/lowering support.
+    for body in ["self.to_query", "self.instance_values", "self.acts_like?(:probe)", "self.presence_in([1])"] {
         refuses(body, "Object extension");
     }
+    refuses_with(
+        "Value.new.to_param",
+        "Object extension",
+        &[("app/lib/value.rb", "class Value\nend\n")],
+    );
 }
 
 #[test]

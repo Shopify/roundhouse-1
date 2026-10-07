@@ -6547,6 +6547,30 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         let ExprNode::Const { path } = &*r.node else { return false };
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::") == class_name
     }
+    /// Does this Const name a constant already marked deferred — bare
+    /// `BUILTIN`, or `OwnClass::BUILTIN` (qualified by a later rewrite)?
+    fn const_names_deferred(
+        path: &[crate::ident::Symbol],
+        deferred_names: &std::collections::HashSet<String>,
+        class_name: &str,
+    ) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        if path.len() == 1 {
+            return deferred_names.contains(path[0].as_str());
+        }
+        let leaf = path[path.len() - 1].as_str();
+        if !deferred_names.contains(leaf) {
+            return false;
+        }
+        let prefix = path[..path.len() - 1]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        prefix == class_name
+    }
     fn calls_self(expr: &Expr, own: &std::collections::HashSet<&str>, deferred_names: &std::collections::HashSet<String>, class_name: &str) -> bool {
         match &*expr.node {
             // A closure that is STORED rather than run — `proc { … }`,
@@ -6588,9 +6612,12 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
                             _ => calls_self(b, own, deferred_names, class_name),
                         }))
             }
-            ExprNode::Const { path }
-                if path.len() == 1 && deferred_names.contains(path[0].as_str()) =>
-            {
+            // Bare `BUILTIN` *and* `Sound::BUILTIN` — index_by grounding
+            // (and similar) rewrites the receiver to the qualified form,
+            // and a rule that only matched path.len() == 1 left INDEX
+            // eager while BUILTIN deferred: `uninitialized constant
+            // Sound::BUILTIN` at load (campfire models.rb → sound.rb).
+            ExprNode::Const { path } if const_names_deferred(path, deferred_names, class_name) => {
                 true
             }
             _ => {

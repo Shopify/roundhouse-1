@@ -257,6 +257,37 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("exist?", Ty::Bool), ("exists?", Ty::Bool), ("mkdir", Ty::Int),
         ("pwd", Ty::Str), ("home", Ty::Str),
     ], &[]);
+    // Psych/YAML — campfire's Purchaser loads `config/purchased_by.yml`
+    // via `YAML.load_file`. Register the class-side surface the corpus
+    // writes so the constant is modeled (not a silent raise stub) and
+    // ruby-family emit keeps the call. Return types stay gradual: the
+    // document shape is whatever the file held.
+    register_stdlib_class(classes, "YAML", &[
+        ("load", Ty::Untyped), ("load_file", Ty::Untyped),
+        ("safe_load", Ty::Untyped), ("safe_load_file", Ty::Untyped),
+        ("dump", Ty::Str),
+    ], &[]);
+    // Framework modules an app `include`s that emit already handles
+    // (Attachable sgid, Turbo stream names, ActiveModel callbacks,
+    // SanitizeHelper). Empty module markers so the unresolved-include
+    // gate does not refuse known seams; methods come from lowering /
+    // other registry entries.
+    for name in [
+        "ActionText::Attachable",
+        "Turbo::Streams::StreamName",
+        "Turbo::Streams::StreamName::ClassMethods",
+        "ActiveModel::Validations::Callbacks",
+        "ActionView::Helpers::SanitizeHelper",
+    ] {
+        let info = classes.entry(ClassId(Symbol::from(name))).or_default();
+        info.is_module = true;
+    }
+    // SanitizeHelper readers Opengraph::Metadata calls after include.
+    if let Some(sanitize) = classes.get_mut(&ClassId(Symbol::from("ActionView::Helpers::SanitizeHelper"))) {
+        for m in ["sanitize", "strip_tags", "sanitize_css"] {
+            sanitize.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+    }
     register_stdlib_class(classes, "Math", &[
         ("sqrt", Ty::Float), ("cbrt", Ty::Float), ("log", Ty::Float),
         ("log2", Ty::Float), ("log10", Ty::Float), ("exp", Ty::Float),

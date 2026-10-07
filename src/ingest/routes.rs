@@ -1349,6 +1349,14 @@ mod eval {
             };
         }
         if let Some(call) = node.as_call_node() {
+            // Concern bodies are reparsed without the block-parameter
+            // declaration, so a bound parameter like `options` parses as a
+            // receiverless CallNode. Resolve it through the bound frame.
+            if call.receiver().is_none() && call.arguments().is_none() && call.block().is_none() {
+                if let Some(bound) = lookup(constant_id_str(&call.name())) {
+                    return Some(bound);
+                }
+            }
             // `options[:key]`
             if constant_id_str(&call.name()) == "[]" {
                 let recv = value(&call.receiver()?)?;

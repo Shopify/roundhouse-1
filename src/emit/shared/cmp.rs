@@ -82,12 +82,12 @@ pub fn classify_cmp(lhs: &Expr, rhs: &Expr) -> CmpCase {
 /// A point in time, of whatever class: the first-class `Time`, the legacy
 /// `Class { Time }`, and the other classes Rails orders against it
 /// (`DateTime`, `Date`, `ActiveSupport::TimeWithZone`), or a union of
-/// only those. `Time`, `Date` and `DateTime` compare across each other
-/// Equal temporal representations can compare directly. Cross-kind coercion
+/// only those. Equal temporal representations can compare directly. Cross-kind coercion
 /// requires runtime support; a nil arm never proves temporal ordering.
 fn temporal_kind(ty: &Ty) -> Option<&str> {
     match ty {
         Ty::Time => Some("Time"),
+        Ty::Date => Some("Date"),
         Ty::Class { id, .. } if matches!(id.0.as_str(), "Time" | "DateTime" | "Date") => Some(id.0.as_str()),
         Ty::Union { variants } => {
             let first = temporal_kind(variants.first()?);
@@ -211,6 +211,22 @@ mod tests {
             (Ty::Time, Ty::Time),
             (Ty::Time, legacy.clone()),
             (legacy.clone(), Ty::Time),
+            (legacy.clone(), legacy),
+        ] {
+            let l = var_typed("a", l);
+            let r = var_typed("b", r);
+            assert!(matches!(classify_cmp(&l, &r), CmpCase::Unknown));
+        }
+    }
+
+    #[test]
+    fn date_vs_date_is_not_incompatible() {
+        use crate::ident::ClassId;
+        let legacy = Ty::Class { id: ClassId(Symbol::from("Date")), args: vec![] };
+        for (l, r) in [
+            (Ty::Date, Ty::Date),
+            (Ty::Date, legacy.clone()),
+            (legacy.clone(), Ty::Date),
             (legacy.clone(), legacy),
         ] {
             let l = var_typed("a", l);

@@ -553,7 +553,18 @@ impl<'a> BodyTyper<'a> {
                 let value = if let [name] = path.as_slice() {
                     ctx.constants.get_own(name).or_else(|| ctx.constants.get_global(name))
                 } else { None };
-                value.is_none() && self.classes.contains_key(&id)
+                if value.is_some() {
+                    return false;
+                }
+                // Lowerers retype with a partial registry (no stdlib seed).
+                // A Const whose computed type is the written class itself is
+                // still the class object — `RecordNotFound < StandardError`
+                // must stay Module#<, not Incompatible value comparison.
+                self.classes.contains_key(&id)
+                    || matches!(
+                        expr.ty.as_ref(),
+                        Some(Ty::Class { id: ty_id, .. }) if *ty_id == id
+                    )
             }
             _ => false,
         }
@@ -678,23 +689,51 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                     Some(Some(ResolvedConstant::Value { declaration, name, runtime, .. })) => {
-    // Concern splices retain the resolved value owner as well as its type.
-    qualify_resolved_path(path, name);
-    let value = self.typed_constants.and_then(|values| values.get(declaration)).cloned()
-        .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
-    match value {
-        Some(ty) => ty,
-        // `Err = Class.new(StandardError)` is a constant to the source
-        // index and a class to ingest (`library_class::
-        // class_new_declaration`), which leaves no constant value
-        // behind: the exact declared name is that class.
-        None if self.classes().contains_key(name.as_ref()) => {
-            expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
-            Ty::Class { id: name.as_ref().clone(), args: vec![] }
-        }
-        None => unknown(),
-    }
-}
+                        // Concern splices retain the resolved value owner.
+                        // Test-helper splice lifts a foreign module's
+                        // constant onto the test class as a bare name
+                        // (`DnsTestHelper::WEB_PUSH_PUBLIC_TEST_IP` →
+                        // `WEB_PUSH_PUBLIC_TEST_IP`) and never emits the
+                        // helper module — re-qualifying that bare path is a
+                        // NameError at load. Leave bare paths bare when the
+                        // class owns the leaf and the declaration's owner
+                        // is foreign. Do not strip an already-qualified
+                        // path (`FactoryModel::Result`) just because the
+                        // leaf name also exists locally — that collision
+                        // is a different constant (`data_factory_constants`).
+                        let leaf = path.last();
+                        let locally_owned = leaf
+                            .is_some_and(|n| ctx.constants.get_own(n).is_some());
+                        let enclosing = match &ctx.self_ty {
+                            Some(Ty::Class { id, .. }) => Some(id.0.as_str()),
+                            _ => None,
+                        };
+                        let decl_owner = name.0.as_str().rsplit_once("::").map(|(o, _)| o);
+                        let keep_bare_splice = path.len() == 1
+                            && locally_owned
+                            && enclosing
+                                .zip(decl_owner)
+                                .is_some_and(|(enc, owner)| enc != owner);
+                        if !keep_bare_splice {
+                            qualify_resolved_path(path, name);
+                        }
+                        let value = self.typed_constants
+                            .and_then(|values| values.get(declaration))
+                            .cloned()
+                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
+                        match value {
+                            Some(ty) => ty,
+                            // `Err = Class.new(StandardError)` is a constant to the source
+                            // index and a class to ingest (`library_class::
+                            // class_new_declaration`), which leaves no constant value
+                            // behind: the exact declared name is that class.
+                            None if self.classes().contains_key(name.as_ref()) => {
+                                expr.decisions |= crate::expr::RESOLVED_CLASS_REF;
+                                Ty::Class { id: name.as_ref().clone(), args: vec![] }
+                            }
+                            None => unknown(),
+                        }
+                    }
                     // An unresolved source reference may still name an
                     // exact modeled external class (for example Time).
                     Some(None) => exact_modeled_class(path),
@@ -1476,7 +1515,15 @@ impl<'a> BodyTyper<'a> {
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
                     let class_object = class_object_receiver;
-                    if send::is_module_protocol(method) && !class_object
+                    // `include?` is Module's ancestor check AND String/Enumerable
+                    // membership. Refuse Module protocol only for true Module-only
+                    // names, or for `include?` on a nominal class *instance* (where
+                    // Module#include? would be the wrong answer). Untyped /
+                    // String / Array receivers fall through to membership → Bool.
+                    let module_only = send::is_module_protocol(method)
+                        && (method.as_str() != "include?"
+                            || matches!(recv_ty, Some(Ty::Class { .. })));
+                    if module_only && !class_object
                         && !self.owns_operator(recv_ty.as_ref(), method, false)
                         && !send::is_query_any_receiver_may_answer(method, recv_ty.as_ref(), self.classes()) {
                         expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
@@ -1518,7 +1565,17 @@ impl<'a> BodyTyper<'a> {
                         Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d" | "as_json") => Some("String extension"),
                         Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
                         _ if method.as_str() == "not_nil!" => Some("not_nil!"),
-                        _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "to_param" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
+                        // `to_param` on Untyped goes through ActiveSupport.to_param
+                        // (residue lowering + runtime). Refuse only on a nominal
+                        // class with no modeled/synthesized reader (e.g. a plain
+                        // PORO). Untyped helper params (campfire AvatarsHelper)
+                        // must not hard-fail.
+                        _ if method.as_str() == "to_param"
+                            && matches!(recv_ty, Some(Ty::Class { .. })) =>
+                        {
+                            Some("Object extension")
+                        }
+                        _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
                     if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
@@ -2780,6 +2837,32 @@ mod tests {
         let mut ctx = Ctx::default();
         ctx.local_bindings.insert(Symbol::from(name), ty);
         ctx
+    }
+
+    #[test]
+    fn const_class_ref_keeps_class_object_without_registry_entry() {
+        // Lower retypes with a partial registry that omits stdlib. A Const
+        // whose type is the written class must still stamp CLASS_OBJECT_VALUE
+        // so `RecordNotFound < StandardError` classifies as Module#<.
+        let classes = empty_classes();
+        let typer = BodyTyper::new(&classes);
+        let ctx = Ctx::default();
+        let mut expr = synth(ExprNode::Const {
+            path: vec![Symbol::from("StandardError")],
+        });
+        let ty = typer.analyze_expr(&mut expr, &ctx);
+        assert_eq!(
+            ty,
+            Ty::Class {
+                id: ClassId(Symbol::from("StandardError")),
+                args: vec![],
+            }
+        );
+        assert_ne!(
+            expr.decisions & crate::expr::CLASS_OBJECT_VALUE,
+            0,
+            "Const class ref must remain a class object without a registry entry"
+        );
     }
 
     fn optional_str() -> Ty {
@@ -4250,8 +4333,11 @@ fn is_ivar_params_rooted(e: &crate::expr::Expr, locals: &HashMap<Symbol, Ty>) ->
 /// the `nil` an empty collection would give. `[x, LIMIT].min` is the
 /// clamp idiom; typing it `T?` (as `Enumerable#min` does for an arbitrary
 /// array) makes every `MAX - [x, LIMIT].min` look like arithmetic on nil.
-/// A nil element cannot survive either: comparing it raises in Ruby, so
-/// the nil arm is dropped from the element type too.
+///
+/// Nil is stripped from the element type only when some element excludes
+/// Nil: comparing nil with a non-nil value raises, so a nil result cannot
+/// occur. A single nilable element (`[maybe].min`) or an all-nilable
+/// literal can still return nil without a comparison error.
 fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args: &[Expr]) -> Option<Ty> {
     if !matches!(method.as_str(), "min" | "max") || !args.is_empty() {
         return None;
@@ -4262,6 +4348,16 @@ fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args:
         return None;
     }
     let Ty::Array { elem } = recv_ty else { return None };
+    // A nil result needs every element to be nilable. One non-nilable
+    // element makes a nil result raise instead of returning nil.
+    let some_non_nil = elements.iter().any(|e| match e.ty.as_ref() {
+        Some(Ty::Nil) | None => false,
+        Some(Ty::Union { variants }) => !variants.iter().any(|v| matches!(v, Ty::Nil)),
+        Some(_) => true,
+    });
+    if !some_non_nil {
+        return None;
+    }
     Some(match &**elem {
         Ty::Union { variants } => {
             let kept: Vec<Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).cloned().collect();

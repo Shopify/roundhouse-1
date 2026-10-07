@@ -656,6 +656,15 @@ impl Analyzer {
             cls.instance_methods
                 .entry(Symbol::from("attachable_sgid"))
                 .or_insert(Ty::Str);
+            // `to_param` — every concrete model gets a synthesized
+            // `id.to_s` (or its own override) at the emit seam
+            // (`lower::model_to_library::markers::push_to_param_method`).
+            // Register here so analyzer dispatch matches that surface
+            // (campfire's `user.to_param` in AvatarsHelper) instead of
+            // the Object-extension refusal for an unmodeled call.
+            cls.instance_methods
+                .entry(Symbol::from("to_param"))
+                .or_insert(Ty::Str);
             // Core AR instance methods every model gets. Sourced
             // from the shared catalog — same mechanism as class
             // methods above. Covers mutation (save/update/destroy),
@@ -1601,6 +1610,14 @@ impl Analyzer {
                     continue;
                 }
 
+                // Class-side `new` answers `Ty::SelfInstance` so inherited
+                // factories stay receiver-dependent in the registry. The
+                // MethodDef signature is what RBS emit reads, and emit
+                // refuses a bare SelfInstance — pin it to the owner the
+                // method is stamped on (same concrete shape
+                // `concern_class_methods` requires).
+                let owner_ty = Ty::Class { id: owner.clone(), args: Vec::new() };
+
                 let params: Vec<crate::ty::Param> = method
                     .params
                     .iter()
@@ -1620,6 +1637,7 @@ impl Analyzer {
                         } else {
                             param_ty_with_default(inferred.and_then(|v| v.get(i)).cloned(), p)
                                 .unwrap_or(Ty::Untyped)
+                                .subst_self(&owner_ty)
                         };
                         // Kind must survive verbatim: the untyped
                         // fallback this replaces is kind-aware, and a
@@ -1632,7 +1650,7 @@ impl Analyzer {
                 method.signature = Some(Ty::Fn {
                     params,
                     block: None,
-                    ret: Box::new(ret.unwrap_or(Ty::Untyped)),
+                    ret: Box::new(ret.unwrap_or(Ty::Untyped).subst_self(&owner_ty)),
                     effects: method.effects.clone(),
                 });
             }

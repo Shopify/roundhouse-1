@@ -467,13 +467,32 @@ fn takes_trailing_ascription(node: &Node<'_>) -> bool {
 }
 
 fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
-    let expr = ingest_expr_node(node, file)?;
     if !takes_trailing_ascription(node) {
+        return ingest_expr_node(node, file);
+    }
+    // `x || y #: T`: both `y` and the OrNode share the same end offset.
+    // Only the outermost eligible expression may consume the comment.
+    let end = node.location().end_offset();
+    let outermost = super::type_ascription::push_trailing_ascription_claim(end);
+    // Drop-guard: ingest paths can panic (`expect` in constant_id_str);
+    // a skipped pop would leave a stale end on the thread-local stack
+    // and silently drop later trailing `#:` ascriptions at that offset.
+    struct PopClaim;
+    impl Drop for PopClaim {
+        fn drop(&mut self) {
+            super::type_ascription::pop_trailing_ascription_claim();
+        }
+    }
+    let expr = {
+        let _pop = PopClaim;
+        ingest_expr_node(node, file)
+    }?;
+    if !outermost {
         return Ok(expr);
     }
     Ok(super::type_ascription::ascribe_trailing(
         expr,
-        super::type_ascription::trailing_ascription(file, node.location().end_offset()),
+        super::type_ascription::trailing_ascription(file, end),
     ))
 }
 
