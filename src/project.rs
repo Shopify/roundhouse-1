@@ -5604,6 +5604,8 @@ const GEM_REQUIRES: &[&str] = &[
     "statsd-instrument",
     "drb",
     "ostruct",
+    "dalli",
+    "google/protobuf",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -5898,7 +5900,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 19] = [
+    const RUNTIME_GEMS: [(Marker, &str); 22] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -5999,6 +6001,19 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // mock payloads from it. It defines OpenStruct and patches no
         // other library, so requiring it at boot changes nothing else.
         (Marker::Constant("OpenStruct"), "ostruct"),
+        // Shopify Core's cache client. Essentials' Config#initialize runs
+        // `Dalli.register(Dalli::OpentelemetryMiddleware)` at boot (the
+        // middleware is the Shopify dalli fork's own), and Core's Gemfile
+        // Bundler.requires the gem.
+        (Marker::Constant("Dalli"), "dalli"),
+        // Protocol buffers, which Core's Gemfile Bundler.requires.
+        (Marker::Constant("Google::Protobuf"), "google-protobuf"),
+        // Core's generated messages, under the gem's `gen` require path.
+        // Core declares it `require: false`: the app's own `require
+        // "proto/shopify/common/island_name"` loads it (Podding::Discovery::
+        // Island at boot), so it is declared here and not in GEM_REQUIRES.
+        // It depends on google-protobuf.
+        (Marker::Constant("Proto::Shopify"), "proto"),
     ];
     &RUNTIME_GEMS
 }
