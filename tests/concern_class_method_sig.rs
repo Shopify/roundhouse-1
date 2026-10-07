@@ -54,3 +54,11 @@ fn a_library_class_takes_them_too() {
     assert!(text.contains("no known method `yyy` on Integer"), "{text}");
     assert!(!text.contains("on bot"), "{text}");
 }
+
+#[test]
+fn a_relation_answers_the_declared_return_not_the_signature() {
+    let account = "class Account < ApplicationRecord\n  include Conc\n\n  #: -> untyped\n  def use = Account.where(id: 1).cmeth.yyy\nend\n";
+    let text = check("relation", &[("app/models/account.rb", account)]);
+    assert!(text.contains("no known method `yyy` on Integer"), "{text}");
+    assert!(!text.contains("on ^("), "{text}");
+}
