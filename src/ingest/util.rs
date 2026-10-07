@@ -547,6 +547,17 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
                 {
                     return true;
                 }
+                // Forwarders: Forwardable's `def_delegators :@validation,
+                // :group_id, …` (Core's Apps::Models::UiExtension::Schema::
+                // ValidationDelegation is nothing else) and ActiveSupport's
+                // `delegate :a, to: :b` define methods (`ingest::delegate`).
+                if matches!(
+                    kw,
+                    "def_delegators" | "def_delegator" | "def_instance_delegators" | "def_instance_delegator" | "delegate"
+                ) && call.arguments().is_some()
+                {
+                    return true;
+                }
                 // ActiveSupport::Concern's `class_methods do … end`: its
                 // defs become class methods of every includer. A concern
                 // whose *only* defs live in that block (Mastodon's

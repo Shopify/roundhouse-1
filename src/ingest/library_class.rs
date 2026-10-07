@@ -3325,8 +3325,21 @@ fn walk_decl_body_with_visibility<'pr>(
                                 // original this body does not define (a
                                 // mock reopening a service, Core's
                                 // domains_dobby_service_mock.rb) aliases
-                                // the class method the same way.
-                                if force_class_receiver && matches!(kw, "delegate" | "alias_method") {
+                                // the class method the same way. So does
+                                // Forwardable's `def_delegators` after an
+                                // `extend Forwardable` there (Core's
+                                // `Metafields` registry readers).
+                                if force_class_receiver
+                                    && matches!(
+                                        kw,
+                                        "delegate"
+                                            | "alias_method"
+                                            | "def_delegators"
+                                            | "def_delegator"
+                                            | "def_instance_delegators"
+                                            | "def_instance_delegator"
+                                    )
+                                {
                                     if let ExprNode::Send { recv: recv @ None, .. } = &mut *e.node {
                                         *recv = Some(Expr::new(
                                             e.span,

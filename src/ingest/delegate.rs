@@ -58,6 +58,21 @@
 //! strict targets, but the Ruby target has no argument-forwarding gap, so
 //! it gets the `(...)` forwarders Rails generates
 //! (`App::ruby_declined_delegate_forwarders`).
+//!
+//! ## Forwardable
+//!
+//! Ruby's own `def_delegators :@validation, :group_id, …` and
+//! `def_delegator :@x, :m, :ali` (after `extend Forwardable`) go through
+//! the same expansion: each defines `def ali(*args, &block) =
+//! accessor.m(*args, &block)`, which is the `(...)` forwarder above, and
+//! `def_delegators` skips `__send__` and `__id__` as Ruby does. Only an
+//! instance-variable or method-name accessor is reproduced; a compiled
+//! accessor expression (`"self.class"`) and SingleForwardable's singleton
+//! side stay in `unknown_calls`. Once every definer call is expanded, the
+//! `extend Forwardable` itself is spent and leaves `unknown_calls` too.
+//! A module holding only such declarations is a mixin
+//! (`util::body_has_direct_method_decl`), not a namespace: Core's
+//! `Apps::Models::UiExtension::Schema::ValidationDelegation`.
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -102,7 +117,11 @@ pub fn lower_delegates(app: &mut crate::App) {
         .collect();
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
+        let had_definer = lc.unknown_calls.iter().any(forwardable_definer);
         let (methods, full, declined) = expand_delegates_declining(lc, &nameless_rest);
+        if had_definer {
+            drop_spent_forwardable_extend(lc);
+        }
         if !methods.is_empty() {
             generated.push((i, methods));
         }
@@ -116,6 +135,33 @@ pub fn lower_delegates(app: &mut crate::App) {
     for (i, methods) in generated {
         app.library_classes[i].methods.extend(methods);
     }
+}
+
+/// A call to one of Forwardable's definers (or ActiveSupport's
+/// same-named `delegate`).
+fn forwardable_definer(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Send { method, .. }
+        if forwardable_kind(method.as_str()).is_some() || matches!(method.as_str(), "delegate" | "instance_delegate"))
+}
+
+/// `extend Forwardable` gives the class nothing but the definers
+/// (`def_delegators`, `def_delegator`, `delegate`, `instance_delegate`
+/// and their `def_instance_*` spellings). Once this pass has turned
+/// every definer call the class makes into methods, the mixin has done
+/// all it does in this body, and the call is spent rather than an
+/// unmodelled one the emit would report as dropped. With any definer
+/// call left in `unknown_calls`, the `extend` stays beside it.
+fn drop_spent_forwardable_extend(lc: &mut LibraryClass) {
+    let forwardable_extend = |e: &Expr| {
+        matches!(&*e.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str() == "extend"
+                && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Const { path }
+                    if path.len() == 1 && path[0].as_str() == "Forwardable")))
+    };
+    if lc.unknown_calls.iter().any(forwardable_definer) {
+        return;
+    }
+    lc.unknown_calls.retain(|e| !forwardable_extend(e));
 }
 
 /// `synthesized_source` produced Ruby Prism couldn't parse cleanly —
@@ -227,10 +273,12 @@ fn take_delegate_decls(
     declined: &mut Vec<Delegation>,
 ) -> Vec<Delegation> {
     let called_with_args = names_called_with_arguments(lc);
+    let single_forwardable = extends_single_forwardable(lc);
     let mut out = Vec::new();
     lc.unknown_calls.retain(|call| {
-        let ExprNode::Send { recv, method, args, .. } = &*call.node else { return true };
-        if method.as_str() != "delegate" {
+        let ExprNode::Send { recv, method, args, block, .. } = &*call.node else { return true };
+        let forwardable = forwardable_kind(method.as_str());
+        if method.as_str() != "delegate" && forwardable.is_none() {
             return true;
         }
         let class_side = match recv {
@@ -239,6 +287,25 @@ fn take_delegate_decls(
                 if method.as_str() == "singleton_class" && args.is_empty()) => true,
             Some(_) => return true,
         };
+        if let Some(kind) = forwardable {
+            // `extend SingleForwardable` gives the class its own
+            // `def_delegators`, defining singleton methods: a shape this
+            // reading of Forwardable's instance side does not cover.
+            if block.is_some() || (single_forwardable && !class_side) {
+                return true;
+            }
+            let Some(delegations) = forwardable_delegations(kind, args) else { return true };
+            let needs_forwarding = !class_side
+                && delegations.iter().any(|(_, _, name)| {
+                    (!name.ends_with('=') && called_with_args.contains(name.as_str())) || decline.contains(name.as_str())
+                });
+            let file = super::sources::path_of(call.span.file).unwrap_or_default();
+            let into = if needs_forwarding { &mut *declined } else { &mut out };
+            for (target, method, name) in delegations {
+                into.push(Delegation { method, target, name, allow_nil: false, class_side, file: file.clone() });
+            }
+            return needs_forwarding;
+        }
         let mut names: Vec<Symbol> = Vec::new();
         let (mut to, mut prefix, mut allow_nil) = (None, false, false);
         let mut unknown_option = false;
@@ -303,6 +370,82 @@ fn take_delegate_decls(
         needs_forwarding
     });
     out
+}
+
+/// Which of Forwardable's instance-side definers a class-body call is.
+#[derive(Clone, Copy)]
+enum ForwardableKind {
+    /// `def_delegators accessor, *methods`.
+    Many,
+    /// `def_delegator accessor, method, ali = method`.
+    One,
+}
+
+fn forwardable_kind(method: &str) -> Option<ForwardableKind> {
+    match method {
+        "def_delegators" | "def_instance_delegators" => Some(ForwardableKind::Many),
+        "def_delegator" | "def_instance_delegator" => Some(ForwardableKind::One),
+        _ => None,
+    }
+}
+
+/// The class (or module) mixes in `SingleForwardable`, whose
+/// `def_delegators` defines singleton methods.
+fn extends_single_forwardable(lc: &LibraryClass) -> bool {
+    lc.unknown_calls.iter().any(|call| {
+        matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "extend"
+                && args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path }
+                    if path.last().is_some_and(|s| s.as_str() == "SingleForwardable"))))
+    })
+}
+
+/// A symbol or string literal's text: Forwardable takes either for the
+/// accessor and the method names.
+fn name_literal(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// An accessor this pass can write as a receiver verbatim: an instance
+/// variable (`:@validation`) or a method name (`:registration`). Ruby's
+/// Forwardable compiles any accessor expression into the method body; a
+/// richer one (`"self.class"`, `"@a.b"`) stays in `unknown_calls`.
+fn simple_accessor(text: &str) -> bool {
+    let ident = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    match text.strip_prefix('@') {
+        Some(ivar) => ident(ivar),
+        None => ident(text.strip_suffix(['?', '!']).unwrap_or(text)),
+    }
+}
+
+/// `(target, method, defined name)` for each forwarder a Forwardable
+/// declaration defines, or `None` for a shape it does not reproduce.
+/// Ruby's `def_delegators` skips `__send__` and `__id__`;
+/// `def_delegator`'s third argument names the method it defines.
+fn forwardable_delegations(kind: ForwardableKind, args: &[Expr]) -> Option<Vec<(Symbol, Symbol, String)>> {
+    let (accessor, rest) = args.split_first()?;
+    let accessor = name_literal(accessor).filter(|a| simple_accessor(a))?;
+    let names: Vec<String> = rest.iter().map(name_literal).collect::<Option<_>>()?;
+    let target = Symbol::from(accessor.as_str());
+    let out: Vec<(Symbol, Symbol, String)> = match (kind, names.as_slice()) {
+        (ForwardableKind::Many, _) => names
+            .iter()
+            .filter(|m| !matches!(m.as_str(), "__send__" | "__id__"))
+            .map(|m| (target.clone(), Symbol::from(m.as_str()), m.clone()))
+            .collect(),
+        (ForwardableKind::One, [method]) => vec![(target, Symbol::from(method.as_str()), method.clone())],
+        (ForwardableKind::One, [method, ali]) => vec![(target, Symbol::from(method.as_str()), ali.clone())],
+        (ForwardableKind::One, _) => return None,
+    };
+    (!out.is_empty()).then_some(out)
 }
 
 /// Bare names this class calls WITH arguments, anywhere in its own
@@ -441,6 +584,47 @@ mod tests {
             .into_iter()
             .flat_map(|c| c.methods)
             .collect()
+    }
+
+    #[test]
+    fn forwardable_definers_take_alias_and_skip_send() {
+        let mut lc = library_class(
+            "class Wrapper\n  extend Forwardable\n\n  def_delegators :@inner, :a, :__send__, :__id__, :b=\n  def_delegator :inner, :c, :d\n  def_delegator \"@inner\", :e\nend\n",
+        );
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
+        let got: Vec<(&str, &str, &str)> =
+            delegates.iter().map(|d| (d.target.as_str(), d.method.as_str(), d.name.as_str())).collect();
+        assert_eq!(got, [("@inner", "a", "a"), ("@inner", "b=", "b="), ("inner", "c", "d"), ("@inner", "e", "e")]);
+        assert!(delegates.iter().all(|d| !d.class_side && !d.allow_nil));
+        assert!(
+            !lc.unknown_calls.iter().any(forwardable_definer),
+            "every definer call should be consumed: {:?}",
+            lc.unknown_calls
+        );
+    }
+
+    #[test]
+    fn forwardable_shapes_it_cannot_reproduce_stay_visible() {
+        // A compiled accessor expression, and SingleForwardable's
+        // singleton-side `def_delegators`.
+        let mut lc = library_class(
+            "class Wrapper\n  extend Forwardable\n\n  def_delegators \"self.class\", :name\n  def_delegator :@x, :a, :b, :c\nend\n",
+        );
+        assert!(take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new()).is_empty());
+        assert_eq!(lc.unknown_calls.iter().filter(|c| forwardable_definer(c)).count(), 2);
+        let mut single =
+            library_class("class Wrapper\n  extend SingleForwardable\n\n  def_delegators :@x, :a\nend\n");
+        assert!(take_delegate_decls(&mut single, &Default::default(), &mut Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn forwardable_in_a_singleton_class_defines_class_methods() {
+        let mut lc = library_class(
+            "class Registry\n  class << self\n    extend Forwardable\n    def_delegators :store, :owners\n\n    def store = 1\n  end\nend\n",
+        );
+        let delegates = take_delegate_decls(&mut lc, &Default::default(), &mut Vec::new());
+        assert_eq!(delegates.len(), 1);
+        assert!(delegates[0].class_side, "a singleton-class def_delegators defines a class method");
     }
 
     #[test]
