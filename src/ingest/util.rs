@@ -510,8 +510,49 @@ pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
 fn body_has_constant_decl(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     flatten_statements(body).iter().any(|stmt| {
-        stmt.as_constant_write_node().is_some() || stmt.as_constant_path_write_node().is_some()
+        stmt.as_constant_write_node().is_some()
+            || stmt.as_constant_path_write_node().is_some()
+            || guarded_constant_write(stmt).is_some()
     })
+}
+
+/// `NAME = value unless const_defined?(:NAME)` (or `self.const_defined?`,
+/// or the name as a string): a constant write guarded by its own name,
+/// which leaves a value defined before the body runs in place. Core's
+/// `TaxesApi` writes its timeouts this way. Returns the write; the body
+/// walk registers it like an unguarded one and marks the value
+/// (`expr::GUARDED_CONSTANT_WRITE`). A guard with an `else`, an
+/// `inherit` argument, another name, or around a sorbet type alias or a
+/// `Struct.new`/`Data.define` class is not this shape.
+pub(super) fn guarded_constant_write<'pr>(stmt: &Node<'pr>) -> Option<ruby_prism::ConstantWriteNode<'pr>> {
+    let unless = stmt.as_unless_node()?;
+    if unless.else_clause().is_some() {
+        return None;
+    }
+    let body: Vec<Node<'pr>> = unless.statements()?.body().iter().collect();
+    let [only] = body.as_slice() else { return None };
+    let write = only.as_constant_write_node()?;
+    let call = unless.predicate().as_call_node()?;
+    if constant_id_str(&call.name()) != "const_defined?"
+        || call.block().is_some()
+        || call.receiver().is_some_and(|r| r.as_self_node().is_none())
+    {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+    let [arg] = args.as_slice() else { return None };
+    let named = match (arg.as_symbol_node(), arg.as_string_node()) {
+        (Some(sym), _) => String::from_utf8_lossy(sym.unescaped()).into_owned(),
+        (_, Some(s)) => String::from_utf8_lossy(s.unescaped()).into_owned(),
+        _ => return None,
+    };
+    if named != constant_id_str(&write.name())
+        || super::library_class::is_sorbet_type_alias(&write.value())
+        || super::factory_class::is_factory_class_write(&write.as_node())
+    {
+        return None;
+    }
+    Some(write)
 }
 
 /// An `included do … end` block marks an ActiveSupport::Concern whose

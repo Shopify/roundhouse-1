@@ -2690,6 +2690,11 @@ fn walk_decl_body_with_visibility<'pr>(
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
         order_mark.observe(&mut out);
+        // `NAME = value unless const_defined?(:NAME)` is the constant
+        // write, carrying its guard (`expr::GUARDED_CONSTANT_WRITE`).
+        let guarded = super::util::guarded_constant_write(&statement);
+        let statement = guarded.as_ref().map(|cw| cw.as_node()).unwrap_or(statement);
+        let guarded = guarded.is_some();
         // An `if` / `unless` around a `def`, a visibility marker, or an
         // accessor this walk would otherwise lower is not a statement it
         // can keep. Check the source statement, before a visibility
@@ -2846,7 +2851,10 @@ fn walk_decl_body_with_visibility<'pr>(
                 out.constants.push((name, value));
                 continue;
             }
-            let value = ingest_expr(&cw.value(), file)?;
+            let mut value = ingest_expr(&cw.value(), file)?;
+            if guarded {
+                value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
+            }
             out.constants.push((name, value));
             continue;
         }

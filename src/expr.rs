@@ -69,6 +69,15 @@ pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
 /// arguments, and every target but the Ruby family refuses it at emit.
 pub const RUBY_NATIVE_KEYWORD_SPLAT: u64 = 1 << 18;
 
+/// On a class-body constant's value: the source wrote the assignment
+/// guarded by its own name, `NAME = value unless const_defined?(:NAME)`
+/// (Core's `TaxesApi::FILING_OPERATION_TIMEOUT`, which a test may define
+/// first with a shorter timeout). The constant is registered and typed
+/// from `value` like any other; the Ruby family writes the guard back,
+/// so a value defined before the body runs still wins. Targets without
+/// load-time constant definition assign it unconditionally.
+pub const GUARDED_CONSTANT_WRITE: u64 = 1 << 19;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
