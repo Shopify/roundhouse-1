@@ -3193,6 +3193,24 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
          require_relative \"../../rails_railtie\"\n"
             .into(),
     ));
+    // useragent 0.16.11 and platform_agent 1.0.1 are runtime/user_agent.rb
+    // on every target. A native require of the gems (gem_facades.rb's
+    // `require "useragent"` for Shopify Core's secure_headers gem source)
+    // loaded the gem's files over the port, redefining UserAgent's
+    // constants and mixing the gem's methods into the port's classes.
+    if files.iter().any(|(p, _)| p == "runtime/user_agent.rb") {
+        for feature in ["useragent", "user_agent", "platform_agent"] {
+            files.push((
+                format!("runtime/features/{feature}.rb"),
+                format!(
+                    "# `require {feature:?}` on this tree: useragent 0.16.11 and\n\
+                     # platform_agent 1.0.1, ported (runtime/user_agent.rb).\n\
+                     # runtime/gem_facades.rb puts this directory first on the load path.\n\
+                     require_relative \"../user_agent\"\n"
+                ),
+            ));
+        }
+    }
     let port_requires = semian_port_requires(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
@@ -3226,7 +3244,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             content.insert_str(
                 0,
                 "require_relative \"active_support_lazy_load_hooks\"\n\
-                 # semian's and rails/railtie's features answer from the runtime\n\
+                 # semian's, rails/railtie's and useragent's features answer from the runtime\n\
                  # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
