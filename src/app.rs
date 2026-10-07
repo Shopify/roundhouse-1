@@ -196,6 +196,16 @@ pub struct App {
     /// ships no helpers or only empty helper modules (the blog).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub helper_method_index: HashMap<Symbol, ClassId>,
+    /// Per helper module, the methods it defines on its SINGLETON
+    /// (`def self.x`, `class << self`, a Concern's class side) rather
+    /// than as instance methods or `module_function` / `extend self`
+    /// copies. Both land as `MethodReceiver::Class`; only the latter are
+    /// in [`Self::helper_method_index`], because Rails exposes a helper's
+    /// instance methods to views and includers and nothing else. Read by
+    /// the Ruby helper lowering, which flips the instance surface onto
+    /// the module's singleton and so has to keep the two apart.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub helper_singleton_methods: BTreeMap<ClassId, BTreeSet<Symbol>>,
     /// Controller methods the app declared view-visible with Rails'
     /// `helper_method :name`. A view lowers to a module function with no
     /// controller instance, so a bare call to one of these routes
@@ -921,6 +931,7 @@ impl App {
             test_helper_connection_blockers: Vec::new(),
             inferred_method_params: HashMap::default(),
             helper_method_index: HashMap::default(),
+            helper_singleton_methods: BTreeMap::new(),
             view_visible_controller_methods: BTreeSet::new(),
             generated_helper_methods: BTreeMap::new(),
             global_id_locate_models: BTreeSet::new(),

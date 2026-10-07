@@ -158,6 +158,7 @@ fn tiny_blog_round_trips() {
         test_helper_connections: Vec::new(),
         test_helper_connection_blockers: Vec::new(),
         helper_method_index: roundhouse::det::HashMap::default(),
+        helper_singleton_methods: std::collections::BTreeMap::new(),
         view_visible_controller_methods: std::collections::BTreeSet::new(),
         global_id_locate_models: std::collections::BTreeSet::new(),
         attachable_unsigned_models: Vec::new(),

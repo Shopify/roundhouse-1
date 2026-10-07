@@ -2372,6 +2372,9 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         .collect();
     let helper_ivars = helper_read_ivars(app);
     let view_ivars = view_assigned_ivars(app);
+    let no_helpers: HashMap<Symbol, ClassId> = HashMap::default();
+    let renames = helper_instance_renames(app);
+    let reach = HelperReach::new(lcs, app, &helper_modules);
     for lc in lcs.iter_mut() {
         // CONTROLLERS in the index provide `helper_method`s to views:
         // only the call-site rewrite applies to them — their methods
@@ -2386,18 +2389,98 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // own `request` accessor and are left alone).
         let rewrite_request =
             is_helper_module || lc.name.0.as_str().starts_with("Views::");
+        // WHICH app helpers a bare call here can reach, as Rails decides
+        // it: a template sees every helper (`helper :all`), and so does a
+        // helper body, which runs on that same view object. Any other
+        // class sees only the helper modules it actually `include`s — a
+        // model's `format("%06i", n)` is Kernel#format whatever some
+        // helper happens to define. The pass runs over every emitted
+        // class, models included, so without this the flat view index
+        // captured names app-wide.
+        let sees_all_helpers = is_helper_module || lc.name.0.as_str().starts_with("Views::");
+        let included_index: HashMap<Symbol, ClassId>;
+        let class_index: &HashMap<Symbol, ClassId> = if sees_all_helpers {
+            &app.helper_method_index
+        } else {
+            let reachable = reach.helpers_for(lc);
+            if reachable.is_empty() {
+                &no_helpers
+            } else {
+                included_index = app
+                    .helper_method_index
+                    .iter()
+                    .filter(|(_, owner)| reachable.contains(*owner))
+                    .map(|(name, owner)| (name.clone(), owner.clone()))
+                    .collect();
+                &included_index
+            }
+        };
+        // A helper module has two method namespaces the flip below merges:
+        // its instance surface (what the view calls, including
+        // `module_function` / `extend self` copies) and its own singleton
+        // (`def self.x`, `class << self`). Rails resolves a bare call in a
+        // body on that body's own side, so each side shadows the index
+        // only with its own names.
+        let singletons = app
+            .helper_singleton_methods
+            .get(&lc.name)
+            .filter(|_| is_helper_module);
+        let is_singleton_side = |m: &MethodDef| {
+            m.receiver == MethodReceiver::Class
+                && singletons.is_some_and(|s| s.contains(&m.name))
+        };
         // The class's own method names shadow the helper index inside its
         // bodies — a bare call to one of them is a self-dispatch, never a
-        // cross-module helper reference.
-        let own_methods: crate::det::HashSet<Symbol> =
-            lc.methods.iter().map(|m| m.name.clone()).collect();
+        // cross-module helper reference. Per SIDE: an instance body's bare
+        // call never reaches a class method (a Concern fold's class-side
+        // copy on an includer does not hide the helper it included), and
+        // a class body's never reaches an instance method.
+        //
+        // In a helper module the instance side also holds the
+        // `module_function` / `extend self` copies (Class receivers that
+        // are not singleton-defined), and loses the names whose flipped
+        // copy is renamed below: the bare call has to go to that copy, so
+        // the index rewrite takes it.
+        let own_instance_side: crate::det::HashSet<Symbol> = lc
+            .methods
+            .iter()
+            .filter(|m| {
+                m.receiver == MethodReceiver::Instance
+                    || (is_helper_module && !is_singleton_side(m))
+            })
+            .filter(|m| !renames.contains_key(&(lc.name.clone(), m.name.clone())))
+            .map(|m| m.name.clone())
+            .collect();
+        let own_class_side: crate::det::HashSet<Symbol> = lc
+            .methods
+            .iter()
+            .filter(|m| m.receiver == MethodReceiver::Class)
+            .map(|m| m.name.clone())
+            .collect();
         for m in &mut lc.methods {
+            // A singleton method body runs on the module, never on the
+            // view: it reaches no helper bare, and none of this pass's
+            // view-context rewrites apply to it.
+            let singleton_side = is_singleton_side(m);
+            let instance_side = m.receiver == MethodReceiver::Instance
+                || (is_helper_module && !singleton_side);
             // A helper module's own methods become module-functions so the
             // rewritten `Module.method` call has a real target — Rails mixed
             // them into a view instance, but the emitted views are module
             // functions with no instance to receive them.
             if is_helper_module && m.receiver == MethodReceiver::Instance {
                 m.receiver = MethodReceiver::Class;
+                // The flip lands the instance method in the singleton's
+                // namespace; when the module ALSO defines that name on its
+                // singleton (Core's MoneyHelper keeps both a
+                // `class << self` and an instance `money_with_symbol`,
+                // the second delegating to the first), the later `def
+                // self.` would replace the singleton and recurse into
+                // itself. The flipped copy takes a name of its own, and
+                // every bare call the index binds to it follows.
+                if let Some(renamed) = renames.get(&(lc.name.clone(), m.name.clone())) {
+                    m.name = renamed.clone();
+                }
             }
             // Ground `…url_helpers.<x>_url(record?, host:)` → absolute-URL
             // interpolation BEFORE `rewrite_helper_calls` collapses the
@@ -2416,14 +2499,36 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
                 m.params.iter().map(|p| p.name.clone()).collect();
             rewrite_helper_calls(
                 &mut m.body,
-                &app.helper_method_index,
+                if singleton_side { &no_helpers } else { class_index },
+                &renames,
                 &route_helpers,
                 &url_helper_classes,
-                rewrite_request,
-                &own_methods,
+                rewrite_request && !singleton_side,
+                if instance_side { &own_instance_side } else { &own_class_side },
                 &own_params,
                 &app.view_visible_controller_methods,
             );
+            // What the flip cannot keep apart by renaming: a bare call in
+            // an instance-side body to a name only the SINGLETON defines.
+            // Rails resolves it on the view object, where the singleton
+            // is invisible; on the flipped `def self.` it would land on
+            // the singleton (MoneyHelper's private two-keyword `format`
+            // answering a `format("%.2f", m)`). Kernel's module functions
+            // are the names that reach this point and have a qualified
+            // spelling with the same meaning.
+            if instance_side {
+                if let Some(singletons) = singletons {
+                    let captured: crate::det::HashSet<Symbol> = singletons
+                        .iter()
+                        .filter(|n| !own_instance_side.contains(*n))
+                        .filter(|n| is_kernel_module_function(n.as_str()))
+                        .cloned()
+                        .collect();
+                    if !captured.is_empty() {
+                        qualify_kernel_calls(&mut m.body, &captured);
+                    }
+                }
+            }
             // A CONTROLLER IVAR read in a helper body. Rails mixes
             // helpers into the view instance, which carries the
             // controller's assigns, so `@room` there IS the
@@ -2438,7 +2543,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             // `cookies` / a `helper_method` already use, which is the
             // one place a module function can reach the live
             // controller.
-            if is_helper_module {
+            if is_helper_module && !singleton_side {
                 rewrite_helper_ivars(&mut m.body, &helper_ivars);
             }
             if lc.name.0.as_str().starts_with("Views::") {
@@ -2464,6 +2569,137 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     // produces — and over the whole slice at once, because constant NAMES
     // have to be unique across every class that shares a Ruby namespace.
     hoist_pure_helper_constants(lcs);
+}
+
+/// The flipped instance methods of a helper module that would collide
+/// with a method the module defines on its own singleton, keyed by
+/// (module, name), with the name the flipped copy takes instead:
+/// `money_with_symbol` -> `money_with_symbol__instance`, `html?` ->
+/// `html__instance?`. Read off the App, not the pass's slice, so every
+/// emitted stack (views, controllers, models) agrees on the name.
+fn helper_instance_renames(app: &App) -> std::collections::BTreeMap<(ClassId, Symbol), Symbol> {
+    let mut out = std::collections::BTreeMap::new();
+    for lc in &app.library_classes {
+        let Some(singletons) = app.helper_singleton_methods.get(&lc.name) else { continue };
+        if app.controllers.iter().any(|c| c.name == lc.name) {
+            continue;
+        }
+        for m in &lc.methods {
+            if m.receiver != MethodReceiver::Instance || !singletons.contains(&m.name) {
+                continue;
+            }
+            let name = m.name.as_str();
+            let (stem, suffix) = match name.char_indices().last() {
+                Some((i, '?' | '!' | '=')) => name.split_at(i),
+                _ => (name, ""),
+            };
+            out.insert(
+                (lc.name.clone(), m.name.clone()),
+                Symbol::from(format!("{stem}__instance{suffix}")),
+            );
+        }
+    }
+    out
+}
+
+/// Kernel's module functions whose `Kernel.<name>(…)` spelling means what
+/// the bare call means anywhere (frame-reading ones such as
+/// `block_given?`, `binding` and `__method__` are deliberately absent).
+fn is_kernel_module_function(name: &str) -> bool {
+    matches!(
+        name,
+        "Array" | "Complex" | "Float" | "Hash" | "Integer" | "Rational" | "String"
+            | "abort" | "catch" | "exit" | "exit!" | "fail" | "format" | "gets" | "loop"
+            | "p" | "print" | "printf" | "putc" | "puts" | "raise" | "rand" | "readline"
+            | "readlines" | "sleep" | "sprintf" | "srand" | "system" | "spawn" | "throw"
+            | "warn"
+    )
+}
+
+/// `format(…)` -> `Kernel.format(…)` for the receiver-less calls named.
+fn qualify_kernel_calls(e: &mut Expr, names: &crate::det::HashSet<Symbol>) {
+    e.node.for_each_child_mut(&mut |c| qualify_kernel_calls(c, names));
+    let span = e.span;
+    if let ExprNode::Send { recv: recv @ None, method, .. } = &mut *e.node {
+        if names.contains(method) {
+            *recv = Some(Expr::new(
+                span,
+                ExprNode::Const { path: vec![Symbol::from("Kernel")] },
+            ));
+        }
+    }
+}
+
+/// Which helper modules a class's bare calls can reach outside the view.
+///
+/// A class reaches the helpers it `include`s, transitively (a concern
+/// that includes a helper hands it on). A MODULE's body also runs as each
+/// of its includers, so a concern sees every helper its includers do:
+/// `def label; money_label(price); end` in a concern of a model that
+/// includes MoneyHelper is that helper's method at run time.
+///
+/// Built from the App (library classes and models) plus the pass's own
+/// slice, whose synthesized classes the App does not hold.
+struct HelperReach {
+    direct: HashMap<Symbol, BTreeSet<ClassId>>,
+    via_includers: HashMap<Symbol, BTreeSet<ClassId>>,
+}
+
+impl HelperReach {
+    fn new(lcs: &[LibraryClass], app: &App, helpers: &BTreeSet<ClassId>) -> Self {
+        if helpers.is_empty() {
+            return HelperReach { direct: HashMap::default(), via_includers: HashMap::default() };
+        }
+        let mut includes: std::collections::BTreeMap<ClassId, Vec<ClassId>> =
+            std::collections::BTreeMap::new();
+        for lc in app.library_classes.iter().chain(lcs.iter()) {
+            if !lc.includes.is_empty() {
+                includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+            }
+        }
+        for model in &app.models {
+            let incs = crate::analyze::model_includes(model);
+            if !incs.is_empty() {
+                includes.entry(model.name.clone()).or_default().extend(incs);
+            }
+        }
+        let closure = |start: &ClassId| -> BTreeSet<ClassId> {
+            let mut seen = BTreeSet::new();
+            let mut pending: Vec<ClassId> = includes.get(start).cloned().unwrap_or_default();
+            while let Some(next) = pending.pop() {
+                if seen.insert(next.clone()) {
+                    pending.extend(includes.get(&next).into_iter().flatten().cloned());
+                }
+            }
+            seen
+        };
+        let mut direct: HashMap<Symbol, BTreeSet<ClassId>> = HashMap::default();
+        let mut via_includers: HashMap<Symbol, BTreeSet<ClassId>> = HashMap::default();
+        for class in includes.keys() {
+            let reached = closure(class);
+            let reached_helpers: BTreeSet<ClassId> =
+                reached.iter().filter(|m| helpers.contains(*m)).cloned().collect();
+            if reached_helpers.is_empty() {
+                continue;
+            }
+            for module in &reached {
+                via_includers
+                    .entry(module.0.clone())
+                    .or_default()
+                    .extend(reached_helpers.iter().cloned());
+            }
+            direct.insert(class.0.clone(), reached_helpers);
+        }
+        HelperReach { direct, via_includers }
+    }
+
+    fn helpers_for(&self, lc: &LibraryClass) -> BTreeSet<ClassId> {
+        let mut out = self.direct.get(&lc.name.0).cloned().unwrap_or_default();
+        if lc.is_module {
+            out.extend(self.via_includers.get(&lc.name.0).into_iter().flatten().cloned());
+        }
+        out
+    }
 }
 
 /// Is this the app's base controller — the one every other controller
@@ -3232,6 +3468,7 @@ fn view_helpers_path() -> Vec<Symbol> {
 fn rewrite_helper_calls(
     expr: &mut Expr,
     index: &HashMap<Symbol, ClassId>,
+    renames: &std::collections::BTreeMap<(ClassId, Symbol), Symbol>,
     route_helpers: &crate::det::HashSet<Symbol>,
     url_helper_classes: &crate::det::HashSet<Symbol>,
     rewrite_request: bool,
@@ -3243,6 +3480,7 @@ fn rewrite_helper_calls(
         rewrite_helper_calls(
             c,
             index,
+            renames,
             route_helpers,
             url_helper_classes,
             rewrite_request,
@@ -3567,6 +3805,7 @@ fn rewrite_helper_calls(
     }
 
     // Cases 3/4: a bare call resolving to an app or framework helper module.
+    let mut renamed: Option<Symbol> = None;
     let path: Option<Vec<Symbol>> = match &*expr.node {
         ExprNode::Send { recv: None, method, args, block, .. } => {
             // A method's own PARAM shadows the helper index only as a BARE
@@ -3588,6 +3827,7 @@ fn rewrite_helper_calls(
                 // builder override vs Tag#tag) captures every read.
                 None
             } else if let Some(module) = index.get(method) {
+                renamed = renames.get(&(module.clone(), method.clone())).cloned();
                 Some(module.0.as_str().split("::").map(Symbol::from).collect())
             } else if method.as_str() == "pluralize" && args.len() == 2 {
                 // Count-labeling `pluralize(count, word)` in a helper
@@ -3612,6 +3852,7 @@ fn rewrite_helper_calls(
         let span = expr.span;
         let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
         let ExprNode::Send { method, mut args, block, .. } = node else { unreachable!() };
+        let method = renamed.unwrap_or(method);
         if path.len() == 1 && path[0].as_str() == "Inflector"
             && method.as_str() == "pluralize" && args.len() == 2 && !index.contains_key(&method)
         {
