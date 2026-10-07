@@ -6798,7 +6798,8 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
 /// through `gem_sources:` or their constants are refused by name
 /// (construct `gem_requires_rails`); they are never required natively. Verdicts: docs/RUNTIME_GEMS.md
 /// (core-transpile).
-const RAILS_DEPENDENT_GEMS: [(&str, &str); 9] = [
+const RAILS_DEPENDENT_GEMS: [(&str, &str); 10] = [
+    ("app_profiler", "app_profiler.rb requires active_support and its core_ext, and uses ActiveSupport::Deprecation"),
     ("secure_headers", "view_helper.rb calls `ActiveSupport.on_load(:action_view)` when ActiveSupport is defined"),
     ("shopify-money", "money.rb requires money_column when ActiveRecord is defined"),
     ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),

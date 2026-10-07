@@ -384,7 +384,7 @@ fn the_middleware_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
 /// once `Rails`, `ActiveSupport` or `ActiveRecord` is defined, as the
 /// emitted runtime defines them: never required natively, their
 /// constants refused by name until their source is compiled as app code.
-const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    elasticsearch-shopify (6.0.1)\n    opentelemetry-shopify (1.22.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    secure_headers (5.2.0)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  elasticsearch-shopify (= 6.0.1)\n  opentelemetry-shopify (~> 1.22)\n  panama_client\n  panama_metadata\n  secure_headers (~> 5.2)\n  shopify-money (~> 4.1.1)\n";
+const RAILS_DEPENDENT_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    app_profiler (0.6.0)\n    elasticsearch-shopify (6.0.1)\n    opentelemetry-shopify (1.22.0)\n    panama_client (3.2.3)\n      panama_metadata (>= 0.3.2, < 1.0.0)\n    panama_metadata (0.3.19.1687)\n    secure_headers (5.2.0)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  app_profiler\n  elasticsearch-shopify (= 6.0.1)\n  opentelemetry-shopify (~> 1.22)\n  panama_client\n  panama_metadata\n  secure_headers (~> 5.2)\n  shopify-money (~> 4.1.1)\n";
 
 fn rails_dependent_app() -> emit_and_run::Overlay {
     let rbi = |body: &str| format!("# typed: true\n{body}");
@@ -397,6 +397,7 @@ fn rails_dependent_app() -> emit_and_run::Overlay {
         .write("sorbet/rbi/gems/opentelemetry-shopify@1.22.0.rbi", &rbi("module OpenTelemetry; end\nmodule OpenTelemetry::Shopify\n  class << self\n    def configure(**options); end\n  end\nend\n"))
         .write("sorbet/rbi/gems/panama_client@3.2.3.rbi", &rbi("module PanamaClient; end\nclass PanamaClient::NotFoundError < ::StandardError; end\n"))
         .write("sorbet/rbi/gems/panama_metadata@0.3.19.1687.rbi", &rbi("module PanamaMetadata; end\nclass PanamaMetadata::Registry; end\n"))
+        .write("sorbet/rbi/gems/app_profiler@0.6.0.rbi", &rbi("module AppProfiler; end\nclass AppProfiler::Middleware; end\n"))
         .write("lib/rails_dependent.rb", r#"class RailsDependent
   def hsts
     SecureHeaders::StrictTransportSecurity::HEADER_NAME
@@ -421,11 +422,16 @@ fn rails_dependent_app() -> emit_and_run::Overlay {
   def registry?(value)
     value.is_a?(PanamaMetadata::Registry)
   end
+
+  def profiler
+    AppProfiler::Middleware
+  end
 end
 "#)
 }
 
-const RAILS_DEPENDENT: [(&str, &str); 6] = [
+const RAILS_DEPENDENT: [(&str, &str); 7] = [
+    ("app_profiler", "app_profiler"),
     ("secure_headers", "secure_headers"),
     ("shopify-money", "shopify-money"),
     ("elasticsearch-shopify", "elastic_search/shopify"),
