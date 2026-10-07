@@ -23,7 +23,9 @@ use crate::ty::Ty;
 pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
 /// The value is a proven class/module object, rather than a nominal instance.
 pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
-/// This receiver's operator call is backed by a registered method definition.
+/// This receiver's operator call is backed by a registered method definition,
+/// or by a class, ancestor or mixin the registry does not model: either way
+/// the binop classifiers cannot prove the operator missing.
 pub const RESOLVED_OPERATOR_RECEIVER: u64 = 1 << 6;
 /// The cast's type was declared by source, rather than synthesized by lowering.
 pub const SOURCE_TYPE_ASCRIPTION: u64 = 1 << 7;
