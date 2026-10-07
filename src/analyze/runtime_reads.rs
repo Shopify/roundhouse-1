@@ -9,7 +9,10 @@
 //! and no hand-written strict runtime declares the names. `project`
 //! refuses each read on a target whose finished tree does not declare
 //! the name, before code naming it is emitted, as it does a test body's
-//! harness names (`test_constants`).
+//! harness names (`test_constants`). One file is narrower than the Ruby
+//! family: useragent's `UserAgent::Version` rides only on the PostgreSQL
+//! CRuby tree's copy of the user_agent port. The gate is the finished
+//! tree's files either way.
 
 use crate::det::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -33,6 +36,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
+    // The PostgreSQL CRuby tree only (`project::apply_postgres_bootstrap`).
+    ("runtime/spinel/user_agent_version.rb", "runtime/user_agent_version.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands
@@ -349,6 +354,7 @@ mod tests {
             ("ActiveSupport::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
             ("Rails::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
+            ("UserAgent::Version", "runtime/user_agent_version.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }

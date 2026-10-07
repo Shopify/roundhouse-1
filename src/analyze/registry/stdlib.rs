@@ -410,6 +410,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("browser", Ty::Str), ("version", Ty::Str), ("os", Ty::Str),
         ("match?", Ty::Bool), ("user_agent", user_agent_ty),
     ]);
+    // useragent 0.16.11's `UserAgent::Version`, the gem's own file
+    // (runtime/spinel/user_agent_version.rb), which only the PostgreSQL
+    // CRuby tree carries. Shopify Core's secure_headers gem source builds
+    // three at class-body load (`VERSION_46 = ::UserAgent::Version.new("46")`)
+    // and compares versions with `>=`. The surface is that file's methods
+    // and the orderings its `include ::Comparable` gives it: `<=>` answers
+    // nil for an operand it cannot coerce, and `to_a` the segments (Integer
+    // runs and a trailing alphabetic tag). Registered on every target so
+    // the read types, like the type port's classes; `runtime_reads` gates
+    // each read on the finished tree carrying the file, so every other
+    // tree refuses it.
+    let version_ty = Ty::Class { id: ClassId(Symbol::from("UserAgent::Version")), args: vec![] };
+    register_stdlib_class(classes, "UserAgent::Version", &[("new", version_ty.clone())], &[
+        ("<=>", Ty::Union { variants: vec![Ty::Int, Ty::Nil] }),
+        ("==", Ty::Bool), ("eql?", Ty::Bool), ("nil?", Ty::Bool),
+        ("<", Ty::Bool), ("<=", Ty::Bool), (">", Ty::Bool), (">=", Ty::Bool),
+        ("between?", Ty::Bool), ("clamp", version_ty),
+        ("to_a", Ty::Array { elem: Box::new(Ty::Union { variants: vec![Ty::Int, Ty::Str] }) }),
+        ("to_str", Ty::Str), ("to_s", Ty::Str), ("inspect", Ty::Str),
+    ]);
     // `typeid`, PORTED into `runtime/ruby/typeid.rb` as a module whose
     // `new` answers a plain String (the gem's `TypeID < String` is a
     // builtin subclass the strict targets do not carry). Registered so
