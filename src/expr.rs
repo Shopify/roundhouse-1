@@ -55,7 +55,8 @@ pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
-/// keyword arguments. The Ruby emitter writes the splat back: in Ruby 3 a
+/// keyword arguments, or a `yield(**value)` argument, which ingest takes
+/// positionally. The Ruby emitter writes the splat back: in Ruby 3 a
 /// positional Hash does not bind keyword parameters.
 pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
 
@@ -64,6 +65,16 @@ pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
         && matches!(&*expr.node, ExprNode::Cast { value, .. } if matches!(&*value.node, ExprNode::SelfRef))
 }
+
+/// This string literal is the source file's own location (`__FILE__`,
+/// or the directory `__dir__` names), written relative to the app root.
+/// Ruby gives the absolute path of the loaded file there, whatever the
+/// process's cwd. A target that relocates the file (the Ruby family
+/// emits `lib/x.rb` as `app/models/x.rb`) uses this bit to anchor the
+/// path on the emitted file's own directory. Then `File.expand_path("../..",
+/// __FILE__)` still names the app root, and the same relative walk
+/// reaches the files carried there. Other targets emit the literal.
+pub const SOURCE_FILE_PATH: u64 = 1 << 13;
 
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
@@ -1497,6 +1508,25 @@ pub fn desugar_op_assign(
 
 #[cfg(test)]
 mod tests {
+    /// Two lanes once both took bit 12 (`ERASED_KEYWORD_SPLAT`,
+    /// `SOURCE_FILE_PATH`); each cross-target decision is its own bit,
+    /// clear of the Rust emitter's 0 and 1.
+    #[test]
+    fn decision_bits_are_distinct() {
+        let bits = [
+            RESOLVED_CLASS_REF, RESOLVED_DATA_FACTORY, GENERATED_CONST_REF, CLASS_OBJECT_VALUE,
+            RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
+            SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
+        ];
+        let mut seen = 0u64;
+        for bit in bits {
+            assert_eq!(bit.count_ones(), 1);
+            assert_eq!(seen & bit, 0, "bit {} is taken twice", bit.trailing_zeros());
+            assert!(bit > 0b11 && bit < 1 << 32);
+            seen |= bit;
+        }
+    }
+
     use super::*;
     use crate::ident::VarId;
     use crate::span::FileId;

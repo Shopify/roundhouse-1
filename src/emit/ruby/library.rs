@@ -5991,8 +5991,11 @@ pub(super) fn emit_library_class_decl_with_synthesized(
     // emitter is a free function reached from a dozen callers. A reopen
     // of a core class needs its `self.` receivers kept (see the elision
     // in `expr.rs`); everything else is emitted exactly as before.
-    super::expr::with_core_class_reopen(is_core_class_name(lc.name.0.as_str()), || {
-        emit_library_class_decl_inner(lc, app, out_path, synthesized_siblings)
+    let path = out_path.clone();
+    super::expr::with_emitted_file(&path, || {
+        super::expr::with_core_class_reopen(is_core_class_name(lc.name.0.as_str()), || {
+            emit_library_class_decl_inner(lc, app, out_path, synthesized_siblings)
+        })
     })
 }
 
@@ -6036,7 +6039,8 @@ fn emit_library_class_decl_inner(
     // so emit works correctly from any output directory.
     let mut requires: Vec<String> = Vec::new();
     if let Some(parent) = lc.parent.as_ref() {
-        if let Some(anchor) = require_path_for_parent(parent, app) {
+        let parent = lexical_parent(name, parent, app);
+        if let Some(anchor) = require_path_for_parent(&parent, app) {
             if anchor != self_anchor {
                 requires.push(relpath(&out_dir, &anchor));
             }
@@ -6754,10 +6758,44 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
         if owns_a_file(&prefix, app) {
+            if written_apart(name, &prefix, app) {
+                return name.to_string();
+            }
             return prefix;
         }
     }
     name.to_string()
+}
+
+/// Whether a nested class was written in a source file of its own,
+/// apart from every file its owner's body came from: Component::Config's
+/// `inherited` hook autoloads `Config::Test` from `config/test.rb` beside
+/// the file that defined `Config` (`Object.const_source_location`), so
+/// the emitted tree keeps that file, at the class's own path, rather
+/// than splicing the class into the owner's. Known only when both bodies
+/// carry real spans; otherwise the nested class stays in its owner's file.
+fn written_apart(name: &str, owner: &str, app: &App) -> bool {
+    let child = body_files(name, app);
+    let parent = body_files(owner, app);
+    !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)
+}
+
+/// The source files a library class's own body (methods, constants,
+/// class-level calls) was ingested from.
+fn body_files(name: &str, app: &App) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    let mut add = |span: &crate::span::Span| {
+        if span.file.0 != 0 {
+            out.insert(span.file.0);
+        }
+    };
+    for c in app.library_classes.iter().filter(|c| c.name.0.as_str() == name) {
+        c.methods.iter().for_each(|m| add(&m.body.span));
+        c.constants.iter().for_each(|(_, e)| add(&e.span));
+        c.class_ivar_initializers.iter().for_each(|e| add(&e.span));
+        c.unknown_calls.iter().for_each(|e| add(&e.span));
+    }
+    out
 }
 
 /// A class that can absorb its nested classes: a LIBRARY class, not a
@@ -6802,6 +6840,33 @@ fn outer_class_parent(name: &str, app: &App) -> Option<ClassId> {
         .iter()
         .find(|c| c.name.0.as_str() == name && !c.is_module)
         .and_then(|c| c.parent.clone())
+}
+
+/// The app class a written superclass names, looked up from the child's
+/// namespace outward as Ruby does: `PodConnectionConfigProvider` written
+/// in `Podding::Database::VmsPodConnectionConfigProvider` is
+/// `Podding::Database::PodConnectionConfigProvider`. A name that matches
+/// no app class at any level is returned as written (a runtime or gem
+/// class).
+fn lexical_parent(child: &str, parent: &ClassId, app: &App) -> ClassId {
+    let written = parent.0.as_str();
+    if written.starts_with("::") {
+        return parent.clone();
+    }
+    let defined = |candidate: &str| {
+        app.models.iter().any(|m| m.name.0.as_str() == candidate)
+            || app.library_classes.iter().any(|lc| lc.name.0.as_str() == candidate)
+    };
+    let mut scope: Vec<&str> = child.split("::").collect();
+    scope.pop();
+    while !scope.is_empty() {
+        let candidate = format!("{}::{written}", scope.join("::"));
+        if defined(&candidate) {
+            return ClassId(crate::ident::Symbol::from(candidate.as_str()));
+        }
+        scope.pop();
+    }
+    parent.clone()
 }
 
 fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {

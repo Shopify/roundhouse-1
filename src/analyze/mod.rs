@@ -38,6 +38,7 @@ pub(crate) mod test_harness_calls;
 pub mod test_helper_connection;
 mod database_identity;
 mod initializer_coverage;
+mod ingest_coverage;
 mod fixture_entries;
 mod body;
 mod class_configuration;
@@ -62,6 +63,7 @@ mod inferred_types;
 pub mod inquiry;
 pub use inferred_types::inferred_types;
 pub use inquiry::inquirer_methods;
+pub use forwarding::nameless_rest_refusals_off_ruby;
 pub use diagnostics::{diagnose, diagnose_with_coverage, unknown_receiver_sends, UnknownReceiverSend};
 
 pub use body::{BodyTyper, ClassInfo, ConstScope, Ctx};
@@ -1081,9 +1083,13 @@ impl Analyzer {
         // surface. Keep it in the class-body ledger even when no method is called.
         for class in &mut app.library_classes {
             for included in &class.includes {
+                // A Ruby-family runtime module (ActiveSupport::Testing::
+                // TimeHelpers) is resolved here and gated per target by
+                // `project` (report_unsupported_runtime_reads).
                 let known = self.classes.contains_key(included)
                     || body::lexical_class(included, class.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
-                    || body::RUBY_TOP_LEVEL.contains(&included.0.as_str());
+                    || body::RUBY_TOP_LEVEL.contains(&included.0.as_str())
+                    || runtime_reads::ruby_family_runtime_names().contains_key(included.0.as_str());
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, included.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
@@ -1111,7 +1117,8 @@ impl Analyzer {
                     let id = ClassId(Symbol::from(name.as_str()));
                     let known = self.classes.contains_key(&id)
                         || body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some()
-                        || body::RUBY_TOP_LEVEL.contains(&name.as_str());
+                        || body::RUBY_TOP_LEVEL.contains(&name.as_str())
+                        || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str());
                     (!known).then_some(name)
                 }).collect();
                 if !missing.is_empty() {

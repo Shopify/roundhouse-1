@@ -72,6 +72,7 @@ impl Diagnostic {
             DiagnosticKind::UndefinedFilterTarget { .. } => "undefined_filter_target",
             DiagnosticKind::GraphqlNullableField { .. } => "graphql_nullable_field",
             DiagnosticKind::InitializerUnsupported { .. } => "initializer_unsupported",
+            DiagnosticKind::IngestUnsupported { .. } => "ingest_unsupported",
         }
     }
 
@@ -164,6 +165,20 @@ impl Diagnostic {
         }
     }
 
+    /// Construct an `IngestUnsupported` diagnostic: a construct whose
+    /// ingest failed, leaving its file's library classes out of the
+    /// IR. Severity is the kind default (`Error`).
+    pub fn ingest_unsupported(span: Span, detail: impl Into<String>) -> Self {
+        let kind = DiagnosticKind::IngestUnsupported { detail: detail.into() };
+        let message = Self::stub_text(&kind);
+        Diagnostic {
+            span,
+            severity: Self::default_severity(&kind),
+            kind,
+            message,
+        }
+    }
+
     /// Render with source attribution when the span resolves against
     /// `sources` (the `App::sources` table captured at ingest):
     /// `path:line:col: error[code]: message`. Synthetic spans and
@@ -238,6 +253,9 @@ impl Diagnostic {
             DiagnosticKind::InitializerUnsupported { construct, detail } => format!(
                 "initializer statement `{}` does not run in the emitted app: {detail}",
                 construct.as_str()
+            ),
+            DiagnosticKind::IngestUnsupported { detail } => format!(
+                "{detail}; ingest left this file's classes, modules and constants out of the emitted app"
             ),
         }
     }
@@ -537,4 +555,11 @@ pub enum DiagnosticKind {
     /// statement's first line. Default severity `Error`: boot behavior
     /// the emitted program silently lacks is not a faithful compile.
     InitializerUnsupported { construct: Symbol, detail: String },
+    /// A construct roundhouse cannot ingest, in a support-dir file
+    /// (`lib/`, an engine's `lib/`, `app/helpers/`, …) whose library
+    /// classes the isolate-tolerant walk then leaves out of the IR
+    /// (`analyze::ingest_coverage`). `detail` is the ingest error.
+    /// Default severity `Error`: code the emitted app silently lacks is
+    /// not a faithful compile.
+    IngestUnsupported { detail: String },
 }
