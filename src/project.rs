@@ -2999,7 +2999,7 @@ fn ruby_family_files(
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
     apply_makefile_test_list_stems(&mut files, &test_stems);
-    apply_runtime_gem_wiring(&mut files);
+    apply_runtime_gem_wiring(&mut files, app.gem_lock.as_ref());
     // AGAIN, on purpose, and this time PERFORMING them. `spinel_files`
     // appended a commented-out block to the spinel tree's boot.rb (that
     // target cannot perform a mixin — see `apply_module_mixins`), and the
@@ -6167,6 +6167,10 @@ const GEM_REQUIRES: &[&str] = &[
     "panama_metadata",
     "opentelemetry-shopify",
     "magellan-ruby",
+    "shopify-money",
+    "shopify/adt",
+    "elastic_search/shopify",
+    "graphql",
 ];
 
 /// The guarded-require block, minus any gem this tree provides another
@@ -6461,7 +6465,7 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     // (constant an emitted body names, gem that defines it). Only gems
     // whose absence is a RUNTIME error belong here — the list is the
     // façade's, not a survey of what an app might like.
-    const RUNTIME_GEMS: [(Marker, &str); 50] = [
+    const RUNTIME_GEMS: [(Marker, &str); 54] = [
         (Marker::Constant("BCrypt"), "bcrypt"),
         (Marker::Constant("HTMLEntities"), "htmlentities"),
         (Marker::Constant("ROTP"), "rotp"),
@@ -6610,14 +6614,23 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
         // Core and loaded natively without Rails: query capture's
         // StackFrames buffer, the middlewares' LruRedux cache, SecureHeaders
         // and ShopifyBots (with its listed requires) and customer account's
-        // CustomerPrivacyApiRuby. Not shopify-money: RubyMoney's money gem
-        // defines the same `Money`, so the constant alone cannot say which
-        // gem an app means.
+        // CustomerPrivacyApiRuby.
         (Marker::Constant("StackFrames"), "stack_frames"),
         (Marker::Constant("LruRedux"), "lru_redux"),
         (Marker::Constant("SecureHeaders"), "secure_headers"),
         (Marker::Constant("ShopifyBots"), "shopify_bots"),
         (Marker::Constant("CustomerPrivacyApiRuby"), "customer_privacy_api_ruby"),
+        // Core's Money, Rails-free natively (it adds `money_column` only
+        // `if defined?(ActiveRecord)`). RubyMoney's money gem defines the
+        // same `Money`, so this row is in `LOCK_GATED_GEMS`.
+        (Marker::Constant("Money"), "shopify-money"),
+        // Bundler.required by Core and loaded natively without Rails:
+        // Shopify::Adt's Optional, the search client and graphql-ruby's
+        // query AST (`GraphQL::Language::Nodes`). Not kafka-shopify or
+        // graphql-client: each loads ActiveSupport when required.
+        (Marker::Constant("Shopify::Adt"), "shopify-adt"),
+        (Marker::Constant("ElasticSearch::Shopify"), "elasticsearch-shopify"),
+        (Marker::Constant("GraphQL"), "graphql"),
         // Core's tracing. opentelemetry-shopify is the Bundler.required
         // entry and loads the API, SDK and the instrumentations below;
         // each gem whose RBI declares a constant Core names is its own
@@ -6639,9 +6652,17 @@ fn runtime_gems() -> &'static [(Marker, &'static str)] {
     &RUNTIME_GEMS
 }
 
-fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>) {
+/// `RUNTIME_GEMS` rows whose marker another gem also defines. The app
+/// names the constant either way, so the row is demanded only when the
+/// app's lock names the row's gem.
+const LOCK_GATED_GEMS: [&str; 1] = ["shopify-money"];
+
+fn apply_runtime_gem_wiring(files: &mut Vec<(String, String)>, lock: Option<&crate::gems::Lockfile>) {
     let mut needed: Vec<&str> = Vec::new();
     for &(ref marker, gem) in runtime_gems() {
+        if LOCK_GATED_GEMS.contains(&gem) && !lock.is_some_and(|l| l.has(gem)) {
+            continue;
+        }
         // `app/` only. The runtime tree names several of these itself (the
         // façade lists all nine), and a scan that saw those would declare
         // every gem for every app — the same self-fulfilling wiring the

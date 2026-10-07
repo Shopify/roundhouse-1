@@ -301,8 +301,9 @@ fn sorbet_assertion_is_must(node: &Node<'_>) -> bool {
 /// evaluated once: a local read is tested directly, anything else is
 /// bound to a generated local inside the condition,
 /// `if (__must_N = x).nil? then raise ... else __must_N end`, so the
-/// else side reads it with nil narrowed away.
-fn must_check(span: Span, value: Expr, location: &ruby_prism::Location<'_>) -> Expr {
+/// else side reads it with nil narrowed away. `#: as !nil` lowers to the
+/// same check (`type_ascription::ascribe_trailing`) with its own message.
+pub(super) fn must_check(span: Span, value: Expr, location: &ruby_prism::Location<'_>, message: &str) -> Expr {
     let (tested, read) = match &*value.node {
         ExprNode::Var { .. } => (value.clone(), value),
         _ => {
@@ -329,7 +330,7 @@ fn must_check(span: Span, value: Expr, location: &ruby_prism::Location<'_>) -> E
     };
     let message = Expr::new(
         span,
-        ExprNode::Lit { value: crate::expr::Literal::Str { value: "Passed `nil` into T.must".to_string() } },
+        ExprNode::Lit { value: crate::expr::Literal::Str { value: message.to_string() } },
     );
     let type_error = Expr::new(Span::synthetic(), ExprNode::Const { path: vec![Symbol::from("TypeError")] });
     let raise = send(None, "raise", vec![send(Some(type_error), "new", vec![message], true)], true);
@@ -493,6 +494,7 @@ fn ingest_expr_strict(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
     Ok(super::type_ascription::ascribe_trailing(
         expr,
         super::type_ascription::trailing_ascription(file, end),
+        &node.location(),
     ))
 }
 
@@ -522,7 +524,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         let declared = super::type_ascription::sorbet_declared_type(node);
         let value = ingest_expr_strict(&inner, file)?;
         let value = if sorbet_assertion_is_must(node) {
-            must_check(span, value, &node.location())
+            must_check(span, value, &node.location(), "Passed `nil` into T.must")
         } else if sorbet_assertion_rules_out_nil(node) {
             super::type_ascription::not_nil(value)
         } else {
@@ -604,6 +606,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                         Some(super::type_ascription::ascribe_trailing(
                             value,
                             super::type_ascription::receiver_rbs_assertion(file, r.location().end_offset()),
+                            &r.location(),
                         ))
                     }
                 }
@@ -1197,7 +1200,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = raw.strip_prefix('@').unwrap_or(raw);
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
             ExprNode::Assign {
                 target: crate::expr::LValue::Ivar { name: Symbol::from(name) },
                 value,
@@ -1207,7 +1210,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let w = n.as_local_variable_write_node().unwrap();
             let name = Symbol::from(constant_id_str(&w.name()));
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
             ExprNode::Assign {
                 target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
                 value,
@@ -1348,7 +1351,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             let raw = constant_id_str(&w.name());
             let name = Symbol::from(raw.strip_prefix('@').unwrap_or(raw));
             let value = ingest_expr(&w.value(), file)?;
-            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()));
+            let value = super::type_ascription::ascribe_trailing(value, super::type_ascription::trailing_ascription(file, loc.end_offset()), &loc);
             ExprNode::OpAssign {
                 target: crate::expr::LValue::Ivar { name },
                 op: crate::expr::OpAssignOp::OrOr,

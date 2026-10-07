@@ -1,4 +1,4 @@
-//! RBS trailing types retain typing; non-nil assertions require executable semantics.
+//! RBS trailing types retain typing; `#: as !nil` lowers to T.must's nil check.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,9 +87,9 @@ end
 }
 
 #[test]
-fn as_not_nil_is_a_named_refusal() {
+fn as_not_nil_is_checked_and_narrows() {
     // A dispatch failure names the receiver's type. `Line.find_by` is
-    // `Line | nil`; with `#: as !nil` it is a `Line`.
+    // `Line | nil`; behind `#: as !nil`'s nil check it is a `Line`.
     let unchecked = receivers(
         r#"class CartController < ApplicationController
   def show
@@ -101,7 +101,7 @@ end
     );
     assert_eq!(unchecked.len(), 1, "{unchecked:?}");
     assert!(unchecked[0].contains("Nil"), "{unchecked:?}");
-    let checked = receivers(
+    let checked = failed_sends(
         r#"class CartController < ApplicationController
   def show
     line = Line.find_by(id: 1) #: as !nil
@@ -110,8 +110,9 @@ end
 end
 "#,
     );
-    assert!(checked.iter().any(|d| d.contains("nil-check")), "{checked:?}");
-    assert!(checked.iter().any(|d| d.contains("Nil")), "{checked:?}");
+    assert_eq!(checked.len(), 1, "{checked:?}");
+    assert_eq!(checked[0].0, "bogus_after", "{checked:?}");
+    assert!(checked[0].1.contains("Line") && !checked[0].1.contains("Nil"), "{checked:?}");
 }
 
 #[test]

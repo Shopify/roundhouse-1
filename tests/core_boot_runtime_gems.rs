@@ -311,3 +311,94 @@ fn the_middleware_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
         );
     }
 }
+
+/// Core's Money is shopify-money's. Another app's `Money` (RubyMoney's,
+/// or its own class) is named the same, so the row is demanded only
+/// where the lock names shopify-money.
+const PRICE: &str = "class Price\n  ZERO = Money.new(0, \"USD\")\n\n  def zero\n    ZERO\n  end\nend\n";
+
+const SHOPIFY_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    shopify-money (4.1.1)\n\nDEPENDENCIES\n  activesupport\n  shopify-money (~> 4.1.1)\n";
+
+const OWN_MONEY_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n\nDEPENDENCIES\n  activesupport\n";
+
+#[test]
+fn the_emitted_ruby_tree_declares_shopify_money_where_the_lock_names_it() {
+    let (dir, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", SHOPIFY_MONEY_LOCK)
+        .write("sorbet/rbi/gems/shopify-money@4.1.1.rbi", "# typed: true\nclass Money\n  def initialize(value, currency); end\n  def currency; end\nend\n")
+        .write("lib/price.rb", PRICE)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    assert!(gemfile.contains("gem \"shopify-money\""), "{gemfile}");
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    assert!(facades.contains("\"shopify-money\""), "{facades}");
+}
+
+#[test]
+fn an_app_s_own_money_does_not_declare_shopify_money() {
+    let (dir, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", OWN_MONEY_LOCK)
+        .write("lib/money.rb", "class Money\n  def initialize(value, currency)\n    @value = value\n  end\nend\n")
+        .write("lib/price.rb", PRICE)
+        .emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(std::fs::read_to_string(dir.join("app/models/price.rb")).unwrap().contains("Money.new"));
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    assert!(!gemfile.contains("shopify-money"), "{gemfile}");
+}
+
+const SERVICES_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    elasticsearch-shopify (6.0.1)\n    graphql (2.6.11)\n    shopify-adt (1.2.0)\n\nDEPENDENCIES\n  activesupport\n  elasticsearch-shopify (= 6.0.1)\n  graphql (~> 2.6.11)\n  shopify-adt (~> 1.2.0)\n";
+
+fn services_app() -> emit_and_run::Overlay {
+    let rbi = |body: &str| format!("# typed: true\n{body}");
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("Gemfile.lock", SERVICES_LOCK)
+        .write("sorbet/rbi/gems/shopify-adt@1.2.0.rbi", &rbi("module Shopify; end\nmodule Shopify::Adt; end\nclass Shopify::Adt::Optional\n  def present?; end\nend\n"))
+        .write("sorbet/rbi/gems/elasticsearch-shopify@6.0.1.rbi", &rbi("module ElasticSearch; end\nmodule ElasticSearch::Shopify; end\nclass ElasticSearch::Shopify::Client\n  def search(index, body); end\nend\n"))
+        .write("sorbet/rbi/gems/graphql@2.6.11.rbi", &rbi("module GraphQL; end\nmodule GraphQL::Language; end\nmodule GraphQL::Language::Nodes; end\nclass GraphQL::Language::Nodes::AbstractNode; end\nclass GraphQL::Language::Nodes::Field < ::GraphQL::Language::Nodes::AbstractNode\n  def name; end\nend\n"))
+        .write("lib/service_reader.rb", r#"class ServiceReader
+  def optional?(value)
+    value.is_a?(Shopify::Adt::Optional)
+  end
+
+  def client?(value)
+    value.is_a?(ElasticSearch::Shopify::Client)
+  end
+
+  def field?(node)
+    node.is_a?(GraphQL::Language::Nodes::Field)
+  end
+end
+"#)
+}
+
+const SERVICES_GEMS: [&str; 3] = ["shopify-adt", "elasticsearch-shopify", "graphql"];
+
+#[test]
+fn the_emitted_ruby_tree_declares_and_loads_the_service_gems() {
+    let (dir, errors) = services_app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let gemfile = std::fs::read_to_string(dir.join("Gemfile")).expect("Gemfile");
+    for gem in SERVICES_GEMS {
+        assert!(gemfile.contains(&format!("gem \"{gem}\"")), "{gem}: {gemfile}");
+    }
+    let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades");
+    for feature in ["shopify/adt", "elastic_search/shopify", "graphql"] {
+        assert!(facades.contains(&format!("\"{feature}\"")), "{feature}: {facades}");
+    }
+}
+
+#[test]
+fn the_service_gems_are_refused_as_the_gems_where_no_tree_loads_them() {
+    let (_, errors) = services_app().emit(BuildTarget::Rust);
+    for gem in SERVICES_GEMS {
+        assert!(
+            errors.iter().any(|e| e.contains(&format!("declared by the {gem} gem"))),
+            "{gem}: {errors:#?}"
+        );
+    }
+}
