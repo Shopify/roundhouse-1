@@ -20,6 +20,13 @@
 //! ApplicationMailbox` names a parent that no longer exists. First in
 //! the pass order, so no later pass ledgers residue for a body that is
 //! not going to emit.
+//!
+//! Except a railtie or engine on a PostgreSQL app: the only tree that
+//! emits one is the CRuby tree (`project::target_files` refuses every
+//! other target for PostgreSQL), and that tree ports `Rails::Railtie`
+//! and `Rails::Engine` (runtime/rails_railtie.rb, rails_engine.rb), so
+//! the class is carried, its body replayed, and boot runs its
+//! initializers (`App::railties`).
 
 use crate::det::HashMap;
 
@@ -34,6 +41,12 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
     // because `library_classes` is in file order, and a subclass's file
     // can sort before its parent's.
     let mut doomed: HashMap<Symbol, Symbol> = HashMap::default();
+    let carries_railties =
+        app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+    let unported = |base: &str| {
+        is_unported_rails_base(base)
+            && !(carries_railties && crate::ingest::library_class::is_railtie_base(base))
+    };
     loop {
         let mut grew = false;
         for lc in &app.library_classes {
@@ -41,7 +54,7 @@ pub fn apply_unported_rails_subclass_drop(app: &mut App) -> Vec<Diagnostic> {
                 continue;
             }
             let Some(parent) = lc.parent.as_ref() else { continue };
-            let base = if is_unported_rails_base(parent.0.as_str()) {
+            let base = if unported(parent.0.as_str()) {
                 Some(parent.0.clone())
             } else {
                 doomed.get(&parent.0).cloned()

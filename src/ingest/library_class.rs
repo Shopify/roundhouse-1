@@ -506,6 +506,9 @@ pub(super) fn library_class_and_struct_base(
         visibility_overrides,
         ..
     } = walk_decl_body(class.body(), &owner, file, false)?;
+    if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
+        unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
+    }
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
@@ -584,6 +587,61 @@ pub(super) fn library_class_and_struct_base(
         },
         base,
     ))
+}
+
+/// The Rails bases whose subclasses' class bodies ARE the boot work:
+/// `config.x = …`, `paths.add`, `initializer` and `config.to_prepare`
+/// blocks, under `if Rails.env.test?` as often as not (Shopify Core's
+/// in-repo engines). The PostgreSQL CRuby tree ports both
+/// (runtime/rails_railtie.rb, runtime/rails_engine.rb).
+pub fn is_railtie_base(parent: &str) -> bool {
+    matches!(parent, "Rails::Railtie" | "Rails::Engine")
+}
+
+/// A railtie's or engine's class body as Ruby runs it: every statement
+/// in source order, including the ones the declaration walk does not
+/// carry for an ordinary class (`if`/`unless`/`case`, calls on a
+/// receiver such as `config.to_prepare` or `paths.add`, local writes
+/// whose blocks read them later). What the walk already carries as a
+/// declaration stays its: `def`s, nested classes and modules, constants,
+/// class variables, `include`s of constants, accessors, visibility and
+/// sorbet markers. Each statement is ingested whole, so a body local
+/// stays a local of the replayed body rather than being inlined
+/// (`substitute_body_locals`): its value is built once, as Ruby builds
+/// it, and every block that closes over it sees that one object.
+fn railtie_body_statements(
+    body: Option<ruby_prism::Node<'_>>,
+    walked: &[Expr],
+    file: &str,
+) -> IngestResult<Vec<Expr>> {
+    let Some(body) = body else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    for statement in flatten_statements(body) {
+        let declaration = visibility::definition(&statement).is_some()
+            || statement.as_def_node().is_some()
+            || statement.as_class_node().is_some()
+            || statement.as_module_node().is_some()
+            || statement.as_singleton_class_node().is_some()
+            || statement.as_constant_write_node().is_some()
+            || statement.as_class_variable_write_node().is_some()
+            || statement.as_alias_method_node().is_some();
+        if declaration {
+            continue;
+        }
+        // A call on `self` (or none) is the walk's: the ones it does not
+        // turn into a declaration it captured, and those are replayed.
+        if let Some(call) = statement.as_call_node() {
+            if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+                let start = statement.location().start_offset() as u32;
+                if let Some(e) = walked.iter().find(|e| e.span.start == start) {
+                    out.push(ingest_expr(&statement, file).unwrap_or_else(|_| e.clone()));
+                }
+                continue;
+            }
+        }
+        out.push(ingest_expr(&statement, file)?);
+    }
+    Ok(out)
 }
 
 /// `NAME = T.type_alias { … }` — a constant holding a TYPE. Unlike
