@@ -31,9 +31,20 @@ fn lines(bytes: &[u8]) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "apply_models_autoload makes RuboCop an implicit module though only unloaded gem-source files open it"]
 fn a_namespace_only_unloaded_gem_files_open_stays_undefined() {
-    let root = std::env::temp_dir().join(format!("roundhouse-gem-source-unloaded-namespace-{}", std::process::id()));
+    unloaded_namespace(false);
+}
+
+/// Rails' `eager_load!` walks the autoload paths and Zeitwerk loaders,
+/// never a plain gem's `lib/`, so eager loading loads the cops no more
+/// than lazy boot does.
+#[test]
+fn eager_loading_leaves_a_plain_gems_unrequired_files_unloaded() {
+    unloaded_namespace(true);
+}
+
+fn unloaded_namespace(eager: bool) {
+    let root = std::env::temp_dir().join(format!("roundhouse-gem-source-unloaded-namespace-{}-{eager}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let lib = root.join("coinkit/lib");
     std::fs::create_dir_all(lib.join("rubocop/cop/coinkit")).unwrap();
@@ -49,6 +60,10 @@ fn a_namespace_only_unloaded_gem_files_open_stays_undefined() {
     let run = emit_and_run::empty_app()
         .write("roundhouse.yml", "gem_sources:\n  coinkit: vendor/gems/coinkit-1.0.0\n")
         .write("Gemfile.lock", LOCK)
+        .write(
+            "config/environments/development.rb",
+            &format!("Rails.application.configure do\n  config.eager_load = {eager}\nend\n"),
+        )
         .write("vendor/gems/coinkit-1.0.0/lib/coinkit.rb", COINKIT)
         .write("vendor/gems/coinkit-1.0.0/lib/rubocop/cop/coinkit.rb", COPS)
         .write("vendor/gems/coinkit-1.0.0/lib/rubocop/cop/coinkit/missing_currency.rb", COP)
