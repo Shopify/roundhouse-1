@@ -68,6 +68,32 @@ fn validation_gaps(app: &App) -> Vec<Diagnostic> {
             ));
         }
     }
+    // `uniqueness:` queries the model's table: a class outside the
+    // ActiveRecord hierarchy has none (ActiveModel has no
+    // UniquenessValidator, and Rails raises at load).
+    for model in app.models.iter().filter(|m| m.parent.is_none()) {
+        for item in &model.body {
+            let ModelBodyItem::Validation { validation, .. } = item else { continue };
+            let tableless_unique = validation.rules.iter().any(|r| {
+                let r = match r {
+                    ValidationRule::Guarded { rule, .. } => &**rule,
+                    other => other,
+                };
+                matches!(r, ValidationRule::Uniqueness { .. })
+            });
+            if tableless_unique {
+                out.push(Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    "`validates uniqueness:`",
+                    format!(
+                        "on `{}`, a uniqueness check on a class outside ActiveRecord (ActiveModel has no UniquenessValidator); the emitted model would skip this check",
+                        validation.attribute.as_str()
+                    ),
+                ));
+            }
+        }
+    }
     out
 }
 

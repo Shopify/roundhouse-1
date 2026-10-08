@@ -715,6 +715,39 @@ module ActiveRecord
       save_after_validation
     end
 
+    # Rails' validation context: `valid?(:publish)` / `save(context:)`
+    # run the validations with that context, and without one a record
+    # validates in `:create` when new, `:update` otherwise. A rule's
+    # `on:` reads it through `validation_context`, which is nil outside
+    # a run. Ruby-family-only, beside `save`'s other Rails options.
+    def valid?(context = nil)
+      previous = @validation_context
+      @validation_context = context || (new_record? ? :create : :update)
+      @errors = []
+      validate
+      ok = @errors.empty?
+      @validation_context = previous
+      ok
+    end
+
+    def validation_context
+      @validation_context
+    end
+
+    def save(context: nil)
+      before_validation
+      ok = valid?(context)
+      after_validation
+      return false unless ok
+
+      save_after_validation
+    end
+
+    def save!(context: nil)
+      raise RecordInvalid, self unless save(context: context)
+      self
+    end
+
     # Saved-change tracking (ActiveModel::Dirty subset) — the real
     # implementation behind base.rb's compile-surface stubs; see the
     # note there for why the diff is ruby-family-only. The snapshot
