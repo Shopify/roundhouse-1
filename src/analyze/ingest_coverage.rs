@@ -35,7 +35,40 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             kind,
         }
     });
-    drops.chain(calls).chain(cross_file_redefinitions(app)).collect()
+    drops.chain(calls).chain(validation_gaps(app)).chain(cross_file_redefinitions(app)).collect()
+}
+
+/// A `validates` validator or option ingest does not model
+/// (`ValidationRule::Unsupported`): an error at the call, because the
+/// emitted `validate` runs without it and accepts records Rails rejects.
+/// A model's own declarations and a concern's `included do` ones, which
+/// are spliced into each includer, are reported once each.
+fn validation_gaps(app: &App) -> Vec<Diagnostic> {
+    use crate::dialect::{ModelBodyItem, ValidationRule};
+    let mut out = Vec::new();
+    let concern_items = app.concern_model_items.values().flatten();
+    let items = app.models.iter().flat_map(|m| m.body.iter()).chain(concern_items);
+    let mut seen = crate::det::HashSet::default();
+    for item in items {
+        let ModelBodyItem::Validation { validation, .. } = item else { continue };
+        for rule in &validation.rules {
+            let ValidationRule::Unsupported { construct, detail } = rule else { continue };
+            let span = item.span();
+            if !seen.insert((span, construct.clone(), detail.clone())) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                span,
+                None,
+                construct.as_str(),
+                format!(
+                    "on `{}`, {detail}; the emitted model would skip this check",
+                    validation.attribute.as_str()
+                ),
+            ));
+        }
+    }
+    out
 }
 
 /// A method that two files' reopens of one class both define. Ruby keeps

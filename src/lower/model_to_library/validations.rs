@@ -12,9 +12,12 @@
 //! One top-level `def validate` per model; rules across multiple attrs each
 //! append their own stmt block to the body.
 
-use crate::dialect::{AccessorKind, Association, MethodDef, MethodReceiver, Model, ValidationRule};
+use crate::dialect::{
+    AccessorKind, Association, MethodDef, MethodReceiver, Model, NumericCheck, NumericOp, RuleMessage,
+    RuleOptions, ValidationRule,
+};
 use crate::effect::EffectSet;
-use crate::expr::{ArrayStyle, BoolOpKind, BoolOpSurface, Expr, ExprNode, Literal};
+use crate::expr::{ArrayStyle, BoolOpKind, BoolOpSurface, Expr, ExprNode, InterpPart, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::span::Span;
 use crate::ty::Ty;
@@ -23,6 +26,8 @@ use super::{fn_sig, seq};
 
 pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) {
     let mut stmts: Vec<Expr> = Vec::new();
+    // `model_name.human`, which a `message:` reads as `%{model}`.
+    let model_human = humanize(&crate::naming::underscore(crate::naming::demodulize(model.name.0.as_str())));
 
     for (span, v) in model.spanned_validations() {
         // Column type from the model's attributes row (when present).
@@ -44,26 +49,46 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
                 if name == &v.attribute)
         });
         for rule in &v.rules {
-            if is_assoc && matches!(rule, ValidationRule::Presence) {
-                let reader = Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Send {
-                        recv: None,
-                        method: v.attribute.clone(),
-                        args: vec![],
-                        block: None,
-                        parenthesized: false,
-                    },
+            // `allow_nil:` / `allow_blank:` / `message:` / `if:` /
+            // `unless:` wrap the rule they apply to.
+            let (rule, options) = match rule {
+                ValidationRule::Guarded { rule, options } => (&**rule, Some(options)),
+                other => (other, None),
+            };
+            // The Sequel front-end's `message:` rides on the Length rule.
+            let own_message = match rule {
+                ValidationRule::Length { message: Some(text), .. } => Some(RuleMessage::Text { text: text.clone() }),
+                _ => None,
+            };
+            let text = ErrorText {
+                attr: &v.attribute,
+                model_human: &model_human,
+                message: options.and_then(|o| o.message.as_ref()).or(own_message.as_ref()),
+            };
+            let reader = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: None,
+                    method: v.attribute.clone(),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            let (checks, value) = if is_assoc && matches!(rule, ValidationRule::Presence) {
+                let check = if_with_nil_else(
+                    send(reader.clone(), "nil?", vec![]),
+                    text.push("can't be blank", None, || reader.clone()),
                 );
-                let mut check = if_with_nil_else(
-                    send(reader, "nil?", vec![]),
-                    errors_push(format!("{} can't be blank", humanize(v.attribute.as_str()))),
-                );
-                check.inherit_span(span);
-                stmts.push(check);
-                continue;
-            }
-            for mut check in validation_rule_to_calls(&v.attribute, rule, attr_ty) {
+                (vec![check], reader)
+            } else {
+                (validation_rule_to_calls(&v.attribute, rule, attr_ty, &text), ivar(&v.attribute))
+            };
+            let checks = match options {
+                Some(o) => guard_rule(value, checks, o),
+                None => checks,
+            };
+            for mut check in checks {
                 // Each expanded check attributes to its `validates` line.
                 check.inherit_span(span);
                 stmts.push(check);
@@ -385,22 +410,36 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
 /// `attr`. Each helper is `<helper>(:attr, @attr [, kwargs])` — the value
 /// is passed positionally so the runtime helper sees a concretely-typed
 /// `value` parameter (no block-yield, no `instance_variable_get`).
-fn validation_rule_to_calls(attr: &Symbol, rule: &ValidationRule, attr_ty: Option<&Ty>) -> Vec<Expr> {
+fn validation_rule_to_calls(
+    attr: &Symbol,
+    rule: &ValidationRule,
+    attr_ty: Option<&Ty>,
+    text: &ErrorText<'_>,
+) -> Vec<Expr> {
     match rule {
-        ValidationRule::Presence => vec![inline_presence_check(attr, attr_ty)],
-        ValidationRule::Absence => vec![inline_absence_check(attr)],
-        ValidationRule::Length { min, max, message } => inline_length_check(
+        ValidationRule::Presence => vec![inline_presence_check(attr, attr_ty, text)],
+        ValidationRule::Absence => vec![inline_absence_check(attr, text)],
+        ValidationRule::Length { min, max, .. } => inline_length_check(
             attr,
             min.map(|n| n as usize),
             max.map(|n| n as usize),
-            message.as_deref(),
+            text,
             attr_ty,
         ),
-        ValidationRule::Format { pattern } => vec![inline_format_check(attr, pattern)],
-        ValidationRule::Numericality { only_integer, gt, lt } => {
-            inline_numericality_check(attr, *only_integer, *gt, *lt)
+        ValidationRule::Format { pattern, flags, without } => {
+            vec![inline_format_check(attr, pattern, flags, *without, text)]
         }
-        ValidationRule::Inclusion { values } => vec![inline_inclusion_check(attr, values)],
+        ValidationRule::Numericality { only_integer, checks } => {
+            inline_numericality_check(attr, *only_integer, checks, text)
+        }
+        ValidationRule::Inclusion { list, exclusion, cover } => {
+            vec![inline_inclusion_check(attr, list, *exclusion, *cover, text)]
+        }
+        // Reported by `roundhouse check` (`analyze::ingest_coverage`);
+        // a weaker check here would pass records Rails rejects.
+        ValidationRule::Unsupported { .. } => Vec::new(),
+        // `push_validate_method` unwraps the options before asking.
+        ValidationRule::Guarded { rule, .. } => validation_rule_to_calls(attr, rule, attr_ty, text),
         // `validate :validate_url` — a method the model defines, which
         // adds to `errors` itself. The synthesized `validate` just
         // calls it; everything else about the shape (when it runs, what
@@ -583,7 +622,7 @@ fn ivar(attr: &Symbol) -> Expr {
 /// `never` and reject the subsequent property access). Same logic for
 /// `Some(Ty::Array { .. })` — the String arm drops. `None` keeps the
 /// generic three-way form so untyped/dynamic-shape attrs still work.
-fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>) -> Expr {
+fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, text: &ErrorText<'_>) -> Expr {
     // Temporal columns (schema-typed `Time`) store ISO-8601 text in
     // `@<attr>_raw`; `@<attr>` is never the storage slot (the ruby
     // tree's parse memo is `@__t_<attr>`), so a check against it fired
@@ -597,7 +636,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>) -> Expr {
             send(raw_ivar.clone(), "nil?", vec![]),
             send(raw_ivar, "empty?", vec![]),
         );
-        let push_err = errors_push(format!("{} can't be blank", humanize(attr.as_str())));
+        let push_err = text.push("can't be blank", None, || ivar(attr));
         return if_with_nil_else(cond, push_err);
     }
     let attr_ivar = ivar(attr);
@@ -653,7 +692,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>) -> Expr {
         }
     };
     // `errors << "attr can't be blank"`
-    let push_err = errors_push(format!("{} can't be blank", humanize(attr.as_str())));
+    let push_err = text.push("can't be blank", None, || ivar(attr));
     // The wrapping `if cond then push_err end` (Nil else).
     if_with_nil_else(cond, push_err)
 }
@@ -663,7 +702,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>) -> Expr {
 ///     errors << "attr must be blank"
 ///   end
 /// Reuses the presence condition tree and wraps with unary `!`.
-fn inline_absence_check(attr: &Symbol) -> Expr {
+fn inline_absence_check(attr: &Symbol, text: &ErrorText<'_>) -> Expr {
     // Re-derive the blank-condition (matches inline_presence_check's tree).
     let attr_ivar = ivar(attr);
     let nil_check = send(attr_ivar.clone(), "nil?", vec![]);
@@ -692,73 +731,42 @@ fn inline_absence_check(attr: &Symbol) -> Expr {
             parenthesized: false,
         },
     );
-    let push_err = errors_push(format!("{} must be blank", humanize(attr.as_str())));
+    let push_err = text.push("must be blank", None, || ivar(attr));
     if_with_nil_else(not_blank, push_err)
 }
 
-/// Inline `validates :attr, inclusion: { in: [v1, v2, …] }`.
-///   if ![v1, v2, …].include?(@attr)
-///     errors << "attr is not included in the list"
-///   end
-/// The `within.nil?` guard from the runtime helper is unnecessary —
-/// the list is a known literal at lower time.
-fn inline_inclusion_check(attr: &Symbol, values: &[Literal]) -> Expr {
-    let array_lit = Expr::new(
-        Span::synthetic(),
-        ExprNode::Array {
-            elements: values
-                .iter()
-                .map(|lit| Expr::new(Span::synthetic(), ExprNode::Lit { value: lit.clone() }))
-                .collect(),
-            style: ArrayStyle::Brackets,
-        },
-    );
-    let attr_ivar = ivar(attr);
-    let include_call = send(array_lit, "include?", vec![attr_ivar]);
-    let not_included = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(include_call),
-            method: Symbol::from("!"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let push_err =
-        errors_push(format!("{} is not included in the list", humanize(attr.as_str())));
-    if_with_nil_else(not_included, push_err)
+/// Inline `validates :attr, inclusion: { in: LIST }` (`exclusion:` with
+/// `exclusion`), asking the list as Rails does:
+///   errors << "Attr is not included in the list" unless LIST.include?(@attr)
+///   errors << "Attr is reserved" if LIST.include?(@attr)
+/// `cover` (a Range literal over numbers) asks `cover?`. The list is the
+/// expression as written, so a constant resolves where the class body
+/// would resolve it.
+fn inline_inclusion_check(
+    attr: &Symbol,
+    list: &Expr,
+    exclusion: bool,
+    cover: bool,
+    text: &ErrorText<'_>,
+) -> Expr {
+    let member = send(list.clone(), if cover { "cover?" } else { "include?" }, vec![ivar(attr)]);
+    if exclusion {
+        return if_with_nil_else(member, text.push("is reserved", None, || ivar(attr)));
+    }
+    if_with_nil_else(not(member), text.push("is not included in the list", None, || ivar(attr)))
 }
 
-/// Inline `validates :attr, format: { with: /pattern/ }`.
-///   if !(@attr.is_a?(String) && /pattern/.match?(@attr))
-///     errors << "attr is invalid"
-///   end
-/// The runtime helper's `with.nil?` guard is unnecessary — the
-/// pattern is a known literal at lower time.
-fn inline_format_check(attr: &Symbol, pattern: &str) -> Expr {
-    let attr_ivar = ivar(attr);
+/// Inline `validates :attr, format: { with: /re/ }` (`without:` with
+/// `without`). Rails matches `value.to_s`, so nil reads as "":
+///   errors << "Attr is invalid" unless /re/.match?(@attr.to_s)
+fn inline_format_check(attr: &Symbol, pattern: &str, flags: &str, without: bool, text: &ErrorText<'_>) -> Expr {
     let regex_lit = Expr::new(
         Span::synthetic(),
-        ExprNode::Lit {
-            value: Literal::Regex { pattern: pattern.to_string(), flags: String::new() },
-        },
+        ExprNode::Lit { value: Literal::Regex { pattern: pattern.to_string(), flags: flags.to_string() } },
     );
-    let is_string = is_a_check(&attr_ivar, "String");
-    let match_call = send(regex_lit, "match?", vec![attr_ivar]);
-    let valid = bool_op(BoolOpKind::And, is_string, match_call);
-    let invalid = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(valid),
-            method: Symbol::from("!"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let push_err = errors_push(format!("{} is invalid", humanize(attr.as_str())));
-    if_with_nil_else(invalid, push_err)
+    let matched = send(regex_lit, "match?", vec![send(ivar(attr), "to_s", vec![])]);
+    let invalid = if without { matched } else { not(matched) };
+    if_with_nil_else(invalid, text.push("is invalid", None, || ivar(attr)))
 }
 
 /// Inline `validates :attr, length: { minimum: M, maximum: N, is: K }`.
@@ -775,7 +783,7 @@ fn inline_length_check(
     attr: &Symbol,
     min: Option<usize>,
     max: Option<usize>,
-    message: Option<&str>,
+    text: &ErrorText<'_>,
     attr_ty: Option<&Ty>,
 ) -> Vec<Expr> {
     let (attr_ty, nilable) = peel_nilable(attr_ty);
@@ -843,17 +851,9 @@ fn inline_length_check(
                 ExprNode::Lit { value: Literal::Int { value: n as i64 } },
             )],
         );
-        let msg = match message {
-            // `message:` override — Rails prefixes the humanized
-            // attribute exactly as it does for the default text.
-            Some(m) => format!("{} {m}", humanize(attr.as_str())),
-            None => format!(
-                "{} is too short (minimum is {} characters)",
-                humanize(attr.as_str()),
-                n
-            ),
-        };
-        inner_stmts.push(if_with_nil_else(lt, errors_push(msg)));
+        let count = Literal::Int { value: n as i64 };
+        let msg = text.push("is too short (minimum is %{count} characters)", Some(&count), || ivar(attr));
+        inner_stmts.push(if_with_nil_else(lt, msg));
     }
     if let Some(n) = max {
         let gt = send(
@@ -864,140 +864,320 @@ fn inline_length_check(
                 ExprNode::Lit { value: Literal::Int { value: n as i64 } },
             )],
         );
-        let msg = match message {
-            Some(m) => format!("{} {m}", humanize(attr.as_str())),
-            None => format!(
-                "{} is too long (maximum is {} characters)",
-                humanize(attr.as_str()),
-                n
-            ),
-        };
-        inner_stmts.push(if_with_nil_else(gt, errors_push(msg)));
+        let count = Literal::Int { value: n as i64 };
+        let msg = text.push("is too long (maximum is %{count} characters)", Some(&count), || ivar(attr));
+        inner_stmts.push(if_with_nil_else(gt, msg));
     }
     let body_seq = seq(inner_stmts);
 
-    // `unless @attr.nil?` → `if !@attr.nil? then body end`. Tests the
-    // RAW ivar — `attr_ivar` above may be the narrowed `Cast` read,
-    // which is exactly what this guard exists to make safe.
+    // A nil value has no length to read. LengthValidator still fails it
+    // on `minimum:` (nil is shorter than any minimum) and passes it on
+    // `maximum:` (`skip_nil_check?`), so:
+    //   if @attr.nil? then <too short, when min is set> else body end
+    // Tests the RAW ivar — `attr_ivar` above may be the narrowed `Cast`
+    // read, which is exactly what this guard exists to make safe.
     let nil_check = send(ivar(attr), "nil?", vec![]);
-    let not_nil = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(nil_check),
-            method: Symbol::from("!"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    vec![if_with_nil_else(not_nil, body_seq)]
-}
-
-/// Inline `validates :attr, numericality: { ... }`.
-///   if @attr.nil? || !@attr.is_a?(Numeric)
-///     errors << "attr is not a number"
-///   else
-///     errors << "attr must be greater than G" if @attr <= G      # if gt set
-///     errors << "attr must be less than L"    if @attr >= L      # if lt set
-///     errors << "attr must be an integer"     if !@attr.is_a?(Integer)  # if only_integer
-///   end
-/// The if/else form keeps subsequent rules on other attrs running:
-/// no early `return` from within `def validate`.
-fn inline_numericality_check(
-    attr: &Symbol,
-    only_integer: bool,
-    gt: Option<f64>,
-    lt: Option<f64>,
-) -> Vec<Expr> {
-    let attr_ivar = ivar(attr);
-    // `@attr.nil? || !@attr.is_a?(Numeric)` — the "not a number" guard.
-    let nil_check = send(attr_ivar.clone(), "nil?", vec![]);
-    let is_numeric = is_a_check(&attr_ivar, "Numeric");
-    let not_numeric = Expr::new(
-        Span::synthetic(),
-        ExprNode::Send {
-            recv: Some(is_numeric),
-            method: Symbol::from("!"),
-            args: vec![],
-            block: None,
-            parenthesized: false,
-        },
-    );
-    let bad_cond = bool_op(BoolOpKind::Or, nil_check, not_numeric);
-    let nan_msg = errors_push(format!("{} is not a number", humanize(attr.as_str())));
-
-    // Build the else-branch Seq of per-option checks.
-    let mut else_stmts: Vec<Expr> = Vec::new();
-    if let Some(n) = gt {
-        let le = send(
-            attr_ivar.clone(),
-            "<=",
-            vec![Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit { value: Literal::Float { value: n } },
-            )],
-        );
-        let msg = format!(
-            "{} must be greater than {}",
-            humanize(attr.as_str()),
-            format_float(n)
-        );
-        else_stmts.push(if_with_nil_else(le, errors_push(msg)));
-    }
-    if let Some(n) = lt {
-        let ge = send(
-            attr_ivar.clone(),
-            ">=",
-            vec![Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit { value: Literal::Float { value: n } },
-            )],
-        );
-        let msg = format!(
-            "{} must be less than {}",
-            humanize(attr.as_str()),
-            format_float(n)
-        );
-        else_stmts.push(if_with_nil_else(ge, errors_push(msg)));
-    }
-    if only_integer {
-        let is_int = is_a_check(&attr_ivar, "Integer");
-        let not_int = Expr::new(
-            Span::synthetic(),
-            ExprNode::Send {
-                recv: Some(is_int),
-                method: Symbol::from("!"),
-                args: vec![],
-                block: None,
-                parenthesized: false,
-            },
-        );
-        let msg = format!("{} must be an integer", humanize(attr.as_str()));
-        else_stmts.push(if_with_nil_else(not_int, errors_push(msg)));
-    }
-    // If the else has no stmts, just use the if-form (the rule has
-    // only the implicit "is a number" check). Otherwise wrap in
-    // if/else with both branches populated.
-    if else_stmts.is_empty() {
-        return vec![if_with_nil_else(bad_cond, nan_msg)];
-    }
-    let else_branch = seq(else_stmts);
+    let nil_branch = match min {
+        Some(n) => {
+            let count = Literal::Int { value: n as i64 };
+            text.push("is too short (minimum is %{count} characters)", Some(&count), || ivar(attr))
+        }
+        None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+    };
     vec![Expr::new(
         Span::synthetic(),
-        ExprNode::If { cond: bad_cond, then_branch: nan_msg, else_branch },
+        ExprNode::If { cond: nil_check, then_branch: nil_branch, else_branch: body_seq },
     )]
 }
 
-/// Float literal formatter that matches Ruby's default `to_s` shape
-/// for whole numbers: `5.0` → "5", `0.5` → "0.5". Matches the runtime
-/// helper's `#{greater_than}` interpolation output so error messages
-/// agree across inline and helper-call paths.
-fn format_float(n: f64) -> String {
-    if n == n.trunc() {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
+/// Inline `validates :attr, numericality: { ... }`, NumericalityValidator's
+/// order: the value parsed the way `parse_as_number` does (a Numeric as
+/// is, an integer String with `to_i`, any other non-hexadecimal String
+/// with `Kernel.Float`), then
+///   number = <parsed or nil>
+///   if number.nil?
+///     errors << "Attr is not a number"
+///   elsif <only_integer> && !/\A[+-]?\d+\z/.match?(@attr.to_s)
+///     errors << "Attr must be an integer"
+///   else
+///     errors << "Attr must be greater than 0" unless number > 0
+///     ...                                      # each option, in order
+///   end
+/// Every failing comparison adds its own error, as natively.
+fn inline_numericality_check(
+    attr: &Symbol,
+    only_integer: bool,
+    checks: &[NumericCheck],
+    text: &ErrorText<'_>,
+) -> Vec<Expr> {
+    let s = Span::synthetic();
+    let raw = || ivar(attr);
+    let regex = |pattern: &str| {
+        Expr::new(s, ExprNode::Lit { value: Literal::Regex { pattern: pattern.into(), flags: String::new() } })
+    };
+    let integer_re = r"\A[+-]?\d+\z";
+    let nil = || Expr::new(s, ExprNode::Lit { value: Literal::Nil });
+    let is_string = || is_a_check(&raw(), "String");
+    let float_parse = Expr::new(
+        s,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("Float"),
+            args: vec![
+                raw(),
+                Expr::new(
+                    s,
+                    ExprNode::Hash {
+                        entries: vec![(
+                            Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("exception") } }),
+                            Expr::new(s, ExprNode::Lit { value: Literal::Bool { value: false } }),
+                        )],
+                        kwargs: true,
+                    },
+                ),
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let parsed = Expr::new(
+        s,
+        ExprNode::If {
+            cond: is_a_check(&raw(), "Numeric"),
+            then_branch: raw(),
+            else_branch: Expr::new(
+                s,
+                ExprNode::If {
+                    cond: bool_op(BoolOpKind::And, is_string(), send(regex(integer_re), "match?", vec![raw()])),
+                    then_branch: send(raw(), "to_i", vec![]),
+                    else_branch: Expr::new(
+                        s,
+                        ExprNode::If {
+                            cond: bool_op(
+                                BoolOpKind::And,
+                                is_string(),
+                                not(send(regex(r"\A[+-]?0[xX]"), "match?", vec![raw()])),
+                            ),
+                            then_branch: float_parse,
+                            else_branch: nil(),
+                        },
+                    ),
+                },
+            ),
+        },
+    );
+    let name = Symbol::from(format!("{}_number", attr.as_str()));
+    let number = || Expr::new(s, ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() });
+    let assign = Expr::new(
+        s,
+        ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() },
+            value: parsed,
+        },
+    );
+    let mut compares: Vec<Expr> = Vec::new();
+    for check in checks {
+        let op = match check.op {
+            NumericOp::GreaterThan => ">",
+            NumericOp::GreaterThanOrEqualTo => ">=",
+            NumericOp::EqualTo => "==",
+            NumericOp::LessThan => "<",
+            NumericOp::LessThanOrEqualTo => "<=",
+            NumericOp::OtherThan => "!=",
+            NumericOp::Odd | NumericOp::Even => {
+                let parity = if check.op == NumericOp::Odd { "odd?" } else { "even?" };
+                let holds = send(send(number(), "to_i", vec![]), parity, vec![]);
+                let default = if check.op == NumericOp::Odd { "must be odd" } else { "must be even" };
+                compares.push(if_with_nil_else(not(holds), text.push(default, None, number)));
+                continue;
+            }
+        };
+        let Some(bound) = &check.bound else { continue };
+        let holds = send(number(), op, vec![Expr::new(s, ExprNode::Lit { value: bound.clone() })]);
+        let default = match check.op {
+            NumericOp::GreaterThan => "must be greater than %{count}",
+            NumericOp::GreaterThanOrEqualTo => "must be greater than or equal to %{count}",
+            NumericOp::EqualTo => "must be equal to %{count}",
+            NumericOp::LessThan => "must be less than %{count}",
+            NumericOp::LessThanOrEqualTo => "must be less than or equal to %{count}",
+            _ => "must be other than %{count}",
+        };
+        compares.push(if_with_nil_else(not(holds), text.push(default, Some(bound), number)));
     }
+    let tail = if compares.is_empty() { nil() } else { seq(compares) };
+    let tail = if only_integer {
+        Expr::new(
+            s,
+            ExprNode::If {
+                cond: not(send(regex(integer_re), "match?", vec![send(raw(), "to_s", vec![])])),
+                then_branch: text.push("must be an integer", None, raw),
+                else_branch: tail,
+            },
+        )
+    } else {
+        tail
+    };
+    let check = Expr::new(
+        s,
+        ExprNode::If {
+            cond: send(number(), "nil?", vec![]),
+            then_branch: text.push("is not a number", None, raw),
+            else_branch: tail,
+        },
+    );
+    vec![assign, check]
+}
+
+/// A numeric bound as ActiveModel interpolates it into `%{count}`: an
+/// Integer as written, a Float through `BigDecimal(f, Float::DIG)#to_s`
+/// (`1.5` → "0.15e1", `100.0` → "0.1e3").
+fn format_count(count: &Literal) -> String {
+    match count {
+        Literal::Int { value } => value.to_string(),
+        Literal::Float { value } => bigdecimal_to_s(*value),
+        Literal::Str { value } => value.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn bigdecimal_to_s(f: f64) -> String {
+    if f == 0.0 {
+        return "0.0".into();
+    }
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    // 15 significant digits, as `BigDecimal(f, Float::DIG)` keeps.
+    let sci = format!("{:.14e}", f.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("exponent form");
+    let exp: i32 = exp.parse().expect("exponent");
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    format!("{}0.{digits}e{}", if f < 0.0 { "-" } else { "" }, exp + 1)
+}
+
+/// How a rule's errors read: ActiveModel's default text, or the
+/// validator's `message:`. Either way the full message is the humanized
+/// attribute, a space, and the message (`"%{attribute} %{message}"`).
+pub(super) struct ErrorText<'a> {
+    attr: &'a Symbol,
+    model_human: &'a str,
+    message: Option<&'a RuleMessage>,
+}
+
+impl ErrorText<'_> {
+    /// `errors << "<Attr> <message>"` for an error whose default text is
+    /// `default` (its `%{count}` the formatted `count`) and whose value
+    /// (what `%{value}` and a callable message see) is `value`.
+    fn push(&self, default: &str, count: Option<&Literal>, value: impl Fn() -> Expr) -> Expr {
+        let human = humanize(self.attr.as_str());
+        let count_text = count.map(format_count).unwrap_or_default();
+        match self.message {
+            None => errors_push(format!("{human} {}", default.replace("%{count}", &count_text))),
+            Some(RuleMessage::Text { text }) => {
+                // I18n interpolation of the keys ActiveModel supplies;
+                // ingest admits no others.
+                let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("{human} ") }];
+                let mut rest = text.as_str();
+                let push_text = |parts: &mut Vec<InterpPart>, t: &str| match parts.last_mut() {
+                    Some(InterpPart::Text { value }) => value.push_str(t),
+                    _ => parts.push(InterpPart::Text { value: t.to_string() }),
+                };
+                while let Some(start) = rest.find("%{") {
+                    let tail = &rest[start + 2..];
+                    let Some(end) = tail.find('}') else { break };
+                    push_text(&mut parts, &rest[..start]);
+                    match &tail[..end] {
+                        "attribute" => push_text(&mut parts, &human),
+                        "model" => push_text(&mut parts, self.model_human),
+                        "count" => push_text(&mut parts, &count_text),
+                        "value" => parts.push(InterpPart::Expr { expr: value() }),
+                        other => push_text(&mut parts, &format!("%{{{other}}}")),
+                    }
+                    rest = &tail[end + 1..];
+                }
+                push_text(&mut parts, rest);
+                match parts.as_slice() {
+                    [InterpPart::Text { value }] => errors_push(value.clone()),
+                    _ => errors_push_expr(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })),
+                }
+            }
+            Some(RuleMessage::Call { callable }) => {
+                // `message.call(record, model:, attribute:, value:[, count:])`.
+                let s = Span::synthetic();
+                let sym = |n: &str| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n) } });
+                let str_lit = |t: &str| Expr::new(s, ExprNode::Lit { value: Literal::Str { value: t.to_string() } });
+                let mut entries = vec![
+                    (sym("model"), str_lit(self.model_human)),
+                    (sym("attribute"), str_lit(&human)),
+                    (sym("value"), value()),
+                ];
+                if let Some(c) = count {
+                    entries.push((sym("count"), Expr::new(s, ExprNode::Lit { value: c.clone() })));
+                }
+                let call = Expr::new(
+                    s,
+                    ExprNode::Send {
+                        recv: Some(callable.clone()),
+                        method: Symbol::from("call"),
+                        args: vec![Expr::new(s, ExprNode::SelfRef), Expr::new(s, ExprNode::Hash { entries, kwargs: true })],
+                        block: None,
+                        parenthesized: true,
+                    },
+                );
+                errors_push_expr(Expr::new(
+                    s,
+                    ExprNode::StringInterp {
+                        parts: vec![InterpPart::Text { value: format!("{human} ") }, InterpPart::Expr { expr: call }],
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// A rule's checks under its `allow_nil:` / `allow_blank:` (EachValidator
+/// skips such a value) and Symbol `if:` / `unless:` (both given: `if`
+/// holds and `unless` does not).
+fn guard_rule(value: Expr, checks: Vec<Expr>, o: &RuleOptions) -> Vec<Expr> {
+    if checks.is_empty() {
+        return checks;
+    }
+    let s = Span::synthetic();
+    let nil = || Expr::new(s, ExprNode::Lit { value: Literal::Nil });
+    let mut body = if checks.len() == 1 { checks.into_iter().next().unwrap() } else { seq(checks) };
+    let skip_nil = o.allow_nil.then(|| send(value.clone(), "nil?", vec![]));
+    let skip_blank = o.allow_blank.then(|| {
+        send(Expr::new(s, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }), "blank?", vec![value.clone()])
+    });
+    let skip = match (skip_nil, skip_blank) {
+        (Some(a), Some(b)) => Some(bool_op(BoolOpKind::Or, a, b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(cond) = skip {
+        body = Expr::new(s, ExprNode::If { cond, then_branch: nil(), else_branch: body });
+    }
+    let bare = |m: &Symbol| {
+        Expr::new(s, ExprNode::Send { recv: None, method: m.clone(), args: Vec::new(), block: None, parenthesized: false })
+    };
+    if let Some(c) = &o.unless_method {
+        body = Expr::new(s, ExprNode::If { cond: bare(c), then_branch: nil(), else_branch: body });
+    }
+    if let Some(c) = &o.if_method {
+        body = Expr::new(s, ExprNode::If { cond: bare(c), then_branch: body, else_branch: nil() });
+    }
+    vec![body]
+}
+
+fn not(e: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send { recv: Some(e), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
+    )
 }
 
 /// Humanize an attribute name for an error message, matching Rails'
@@ -1053,6 +1233,11 @@ fn is_a_check(value: &Expr, class_name: &str) -> Expr {
 /// shape every existing validates_*_of helper produces inside the
 /// Validations module).
 fn errors_push(msg: String) -> Expr {
+    errors_push_expr(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: msg } }))
+}
+
+/// `errors << <msg>` for a message built at run time.
+fn errors_push_expr(msg_expr: Expr) -> Expr {
     let errors_call = Expr::new(
         Span::synthetic(),
         ExprNode::Send {
@@ -1063,11 +1248,7 @@ fn errors_push(msg: String) -> Expr {
             parenthesized: false,
         },
     );
-    let msg_lit = Expr::new(
-        Span::synthetic(),
-        ExprNode::Lit { value: Literal::Str { value: msg } },
-    );
-    send(errors_call, "<<", vec![msg_lit])
+    send(errors_call, "<<", vec![msg_expr])
 }
 
 fn if_with_nil_else(cond: Expr, then_branch: Expr) -> Expr {
@@ -1155,9 +1336,14 @@ mod tests {
         Symbol::from("title")
     }
 
+    fn plain(attr: &Symbol) -> ErrorText<'_> {
+        ErrorText { attr, model_human: "Post", message: None }
+    }
+
     #[test]
     fn presence_emits_blank_error() {
-        let expr = inline_presence_check(&attr(), None);
+        let a = attr();
+        let expr = inline_presence_check(&a, None, &plain(&a));
         assert_eq!(collect_error_messages(&expr), vec!["Title can't be blank"]);
     }
 
@@ -1166,7 +1352,8 @@ mod tests {
         // Statically-typed string attr: the `is_a?(Array) && ...` arm
         // must drop out, otherwise tsc narrows the dead branch to
         // `never` and rejects the subsequent `.length` access.
-        let expr = inline_presence_check(&attr(), Some(&Ty::Str));
+        let a = attr();
+        let expr = inline_presence_check(&a, Some(&Ty::Str), &plain(&a));
         let dbg = format!("{:?}", expr);
         assert!(
             !dbg.contains("\"Array\""),
@@ -1176,7 +1363,8 @@ mod tests {
 
     #[test]
     fn presence_array_typed_attr_drops_is_a_string_branch() {
-        let expr = inline_presence_check(&attr(), Some(&Ty::Array { elem: Box::new(Ty::Str) }));
+        let a = attr();
+        let expr = inline_presence_check(&a, Some(&Ty::Array { elem: Box::new(Ty::Str) }), &plain(&a));
         let dbg = format!("{:?}", expr);
         assert!(
             !dbg.contains("\"String\""),
@@ -1185,33 +1373,51 @@ mod tests {
     }
 
     #[test]
+    fn presence_message_replaces_the_default_text() {
+        let a = attr();
+        let message = RuleMessage::Text { text: "must be given".into() };
+        let text = ErrorText { attr: &a, model_human: "Post", message: Some(&message) };
+        let expr = inline_presence_check(&a, None, &text);
+        assert_eq!(collect_error_messages(&expr), vec!["Title must be given"]);
+    }
+
+    #[test]
     fn absence_emits_must_be_blank_error() {
-        let expr = inline_absence_check(&attr());
+        let a = attr();
+        let expr = inline_absence_check(&a, &plain(&a));
         assert_eq!(collect_error_messages(&expr), vec!["Title must be blank"]);
     }
 
     #[test]
     fn length_min_only_emits_too_short() {
-        let exprs = inline_length_check(&attr(), Some(5), None, None, None);
+        // Twice: a nil value is too short as well (LengthValidator).
+        let a = attr();
+        let exprs = inline_length_check(&a, Some(5), None, &plain(&a), None);
         assert_eq!(exprs.len(), 1, "length lowers to one outer expression");
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
-        assert_eq!(msgs, vec!["Title is too short (minimum is 5 characters)"]);
+        assert_eq!(
+            msgs,
+            vec!["Title is too short (minimum is 5 characters)", "Title is too short (minimum is 5 characters)"]
+        );
     }
 
     #[test]
     fn length_max_only_emits_too_long() {
-        let exprs = inline_length_check(&attr(), None, Some(100), None, None);
+        let a = attr();
+        let exprs = inline_length_check(&a, None, Some(100), &plain(&a), None);
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(msgs, vec!["Title is too long (maximum is 100 characters)"]);
     }
 
     #[test]
     fn length_min_and_max_emits_both_in_order() {
-        let exprs = inline_length_check(&attr(), Some(5), Some(100), None, None);
+        let a = attr();
+        let exprs = inline_length_check(&a, Some(5), Some(100), &plain(&a), None);
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(
             msgs,
             vec![
+                "Title is too short (minimum is 5 characters)",
                 "Title is too short (minimum is 5 characters)",
                 "Title is too long (maximum is 100 characters)",
             ],
@@ -1219,59 +1425,84 @@ mod tests {
     }
 
     #[test]
+    fn length_message_interpolates_count() {
+        let a = attr();
+        let message = RuleMessage::Text { text: "needs %{count} for %{model}".into() };
+        let text = ErrorText { attr: &a, model_human: "Post", message: Some(&message) };
+        let exprs = inline_length_check(&a, None, Some(4), &text, None);
+        let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
+        assert_eq!(msgs, vec!["Title needs 4 for Post"]);
+    }
+
+    #[test]
     fn format_emits_invalid_error() {
-        let expr = inline_format_check(&attr(), "[A-Z]+");
+        let a = attr();
+        let expr = inline_format_check(&a, "[A-Z]+", "", false, &plain(&a));
         assert_eq!(collect_error_messages(&expr), vec!["Title is invalid"]);
     }
 
     #[test]
-    fn inclusion_emits_not_included_error() {
-        let values = vec![
-            Literal::Str { value: "a".into() },
-            Literal::Str { value: "b".into() },
-        ];
-        let expr = inline_inclusion_check(&attr(), &values);
-        assert_eq!(
-            collect_error_messages(&expr),
-            vec!["Title is not included in the list"],
+    fn inclusion_and_exclusion_emit_their_errors() {
+        let a = attr();
+        let list = Expr::new(
+            Span::synthetic(),
+            ExprNode::Array {
+                elements: ["a", "b"]
+                    .iter()
+                    .map(|v| Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: (*v).into() } }))
+                    .collect(),
+                style: ArrayStyle::Brackets,
+            },
         );
+        let expr = inline_inclusion_check(&a, &list, false, false, &plain(&a));
+        assert_eq!(collect_error_messages(&expr), vec!["Title is not included in the list"]);
+        let expr = inline_inclusion_check(&a, &list, true, false, &plain(&a));
+        assert_eq!(collect_error_messages(&expr), vec!["Title is reserved"]);
     }
 
     #[test]
     fn numericality_bare_emits_nan_only() {
-        let exprs = inline_numericality_check(&attr(), false, None, None);
+        let a = attr();
+        let exprs = inline_numericality_check(&a, false, &[], &plain(&a));
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(msgs, vec!["Title is not a number"]);
     }
 
     #[test]
-    fn numericality_with_gt_lt_and_only_integer_emits_all_messages() {
-        let exprs = inline_numericality_check(&attr(), true, Some(0.0), Some(100.0));
+    fn numericality_emits_each_option_in_activemodel_order() {
+        let a = attr();
+        let check = |op, bound| NumericCheck { op, bound };
+        let checks = [
+            check(NumericOp::GreaterThan, Some(Literal::Int { value: 0 })),
+            check(NumericOp::LessThanOrEqualTo, Some(Literal::Int { value: 100 })),
+            check(NumericOp::Odd, None),
+        ];
+        let exprs = inline_numericality_check(&a, true, &checks, &plain(&a));
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
-        // Order matches the source order in inline_numericality_check:
-        // nan-msg (then-branch), then gt → lt → only_integer in else.
         assert_eq!(
             msgs,
             vec![
                 "Title is not a number",
-                "Title must be greater than 0",
-                "Title must be less than 100",
                 "Title must be an integer",
+                "Title must be greater than 0",
+                "Title must be less than or equal to 100",
+                "Title must be odd",
             ],
         );
     }
 
     #[test]
-    fn numericality_float_bounds_format_without_trailing_zero() {
-        // `format_float` matches Ruby's default `to_s` shape for whole
-        // numbers: 5.0 → "5", 0.5 → "0.5". Lock the contract so error
-        // messages stay byte-stable across cruby and transpiled targets.
-        let exprs = inline_numericality_check(&attr(), false, Some(0.5), None);
+    fn numericality_float_bounds_read_as_bigdecimal() {
+        // ActiveModel parses a Float option through BigDecimal(f,
+        // Float::DIG) and interpolates its `to_s`.
+        let a = attr();
+        let checks = [NumericCheck { op: NumericOp::GreaterThan, bound: Some(Literal::Float { value: 0.5 }) }];
+        let exprs = inline_numericality_check(&a, false, &checks, &plain(&a));
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
-        assert!(
-            msgs.iter().any(|m| m == "Title must be greater than 0.5"),
-            "expected decimal preserved; got {msgs:?}",
-        );
+        assert!(msgs.iter().any(|m| m == "Title must be greater than 0.5e0"), "got {msgs:?}");
+        for (f, s) in [(1.5, "0.15e1"), (100.0, "0.1e3"), (-2.25, "-0.225e1"), (0.001, "0.1e-2"), (0.0, "0.0")] {
+            assert_eq!(bigdecimal_to_s(f), s);
+        }
     }
 
     #[test]

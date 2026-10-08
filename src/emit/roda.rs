@@ -301,13 +301,13 @@ fn model_for(model: &Model) -> String {
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Format { pattern } => {
+                        ValidationRule::Format { pattern, flags, without: false } if flags.is_empty() => {
                             validate_lines.push(format!(
                                 "    validates_format /{pattern}/, :{}",
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Numericality { only_integer, .. } => {
+                        ValidationRule::Numericality { only_integer, checks } if checks.is_empty() => {
                             let helper =
                                 if *only_integer { "validates_integer" } else { "validates_numeric" };
                             validate_lines.push(format!(
@@ -315,10 +315,17 @@ fn model_for(model: &Model) -> String {
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Inclusion { values } => {
-                            let list = values
+                        ValidationRule::Inclusion { list, exclusion: false, .. }
+                            if matches!(&*list.node, crate::expr::ExprNode::Array { elements, .. }
+                                if elements.iter().all(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. }))) =>
+                        {
+                            let crate::expr::ExprNode::Array { elements, .. } = &*list.node else { unreachable!() };
+                            let list = elements
                                 .iter()
-                                .map(literal_src)
+                                .filter_map(|e| match &*e.node {
+                                    crate::expr::ExprNode::Lit { value } => Some(literal_src(value)),
+                                    _ => None,
+                                })
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             validate_lines.push(format!(

@@ -100,7 +100,8 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
     // accumulator. An `errors` reader the analyzer typed as a class
     // (an app's own error collection, e.g. CustomerFoundations::Errors
     // with `add(attribute, code)`) is not that accumulator: its `add`
-    // is an ordinary method call and stays as written.
+    // is an ordinary method call and stays as written. The framework's
+    // `ActiveModel::Errors` is the accumulator and grounds.
     let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { unreachable!() };
     if r.ty.as_ref().is_some_and(names_own_class) {
         return;
@@ -282,12 +283,17 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
 }
 
 /// A class type (or a nilable one), i.e. not the runtime accumulator.
+/// `ActiveModel::Errors` is the framework's collection, which the
+/// analyzer types `errors` as on AR records and on includers of
+/// `ActiveModel::Validations`/`Model`: the shared runtime implements it
+/// as that very accumulator, so it grounds like an untyped receiver.
 fn names_own_class(ty: &Ty) -> bool {
+    let app_class = |v: &Ty| matches!(v, Ty::Class { id, .. } if id.0.as_str() != "ActiveModel::Errors");
     match ty {
-        Ty::Class { .. } => true,
+        Ty::Class { .. } => app_class(ty),
         Ty::Union { variants } => {
-            variants.iter().any(|v| matches!(v, Ty::Class { .. }))
-                && variants.iter().all(|v| matches!(v, Ty::Class { .. } | Ty::Nil))
+            variants.iter().any(app_class)
+                && variants.iter().all(|v| app_class(v) || matches!(v, Ty::Nil))
         }
         _ => false,
     }
