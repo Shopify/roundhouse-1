@@ -9602,6 +9602,7 @@ fn register_wrapped_belongs_to(body: &[ModelBodyItem], wrappers: &BTreeSet<Symbo
             default: None,
             touch: None,
             foreign_type: None,
+            autosave: None,
             primary_key: None,
         };
         let (reader, ty) = association_member_ty(&assoc);

@@ -261,6 +261,7 @@ fn expand(decl: Declaration, leading_comments: &[Comment]) -> Vec<ModelBodyItem>
             touch: decl.touch,
             foreign_type: Some(decl.foreign_type.clone()),
             primary_key: Some(decl.primary_key.clone()),
+            autosave: None,
         },
         leading_comments: leading_comments.to_vec(),
         leading_blank_line: false,

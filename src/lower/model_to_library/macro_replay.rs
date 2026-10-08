@@ -200,6 +200,10 @@ pub(crate) struct ClassSide<'a> {
     /// The body calls whose `attribute`/`query_constraints` the model's
     /// compiled columns answer (`Model::claimed_body_calls`).
     claimed: &'a [crate::span::Span],
+    /// The body calls whose `belongs_to` the model compiled as an
+    /// association (`ingest::macro_associations`), which the class
+    /// answers with its reflection at class-body run time.
+    declared: Vec<crate::span::Span>,
     /// The class-method modules every model inherits from
     /// ActiveRecord::Base's boot includes, with the include
     /// ([`base_include_class_modules`]); read when a call is not
@@ -258,6 +262,7 @@ impl<'a> ClassSide<'a> {
         let own: Vec<&MethodDef> = model.methods().filter(|d| d.receiver == MethodReceiver::Class).collect();
         let mut side = Self::new(&model.name, own, body_statements(model).collect(), model.parent.as_ref(), app);
         side.claimed = &model.claimed_body_calls;
+        side.declared = super::macro_associations::declaring_calls(model);
         side
     }
 
@@ -282,7 +287,7 @@ impl<'a> ClassSide<'a> {
                 _ => break,
             }
         }
-        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[], base: std::cell::OnceCell::new() };
+        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[], declared: Vec::new(), base: std::cell::OnceCell::new() };
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
         for call in body.into_iter().chain(ancestor_bodies) {
@@ -332,6 +337,15 @@ impl<'a> ClassSide<'a> {
                 self.module_method(included, name, seen)
             })
         })
+    }
+
+    /// The class macro a body call named `name` runs, wherever it is
+    /// defined.
+    pub(crate) fn macro_def(&self, name: &str) -> Option<&'a MethodDef> {
+        if is_model_dsl(name) {
+            return None;
+        }
+        self.class_method(name).map(|(def, _)| def)
     }
 
     /// The nearest definition of class method `name`, and the extended
@@ -394,6 +408,7 @@ impl<'a> ClassSide<'a> {
         let (def, module) = self.class_method(method.as_str())?;
         let mut walk = Walk::new(self, method.as_str());
         walk.answered = self.claimed.contains(&call.span);
+        walk.declares_association = self.declared.contains(&call.span);
         let result = (|| {
             if let Some(m) = module {
                 walk.module_extended(m, method.as_str())?;
@@ -709,6 +724,8 @@ struct Walk<'s, 'a> {
     /// The macro call is one whose `attribute`/`query_constraints` the
     /// model's compiled columns answer.
     answered: bool,
+    /// The macro call is one whose `belongs_to` the model compiled.
+    declares_association: bool,
 }
 
 impl<'s, 'a> Walk<'s, 'a> {
@@ -721,6 +738,7 @@ impl<'s, 'a> Walk<'s, 'a> {
             statics: Vec::new(),
             in_progress: Vec::new(),
             answered: false,
+            declares_association: false,
         }
     }
 
@@ -760,6 +778,11 @@ impl<'s, 'a> Walk<'s, 'a> {
     /// The class-side call `name` a macro makes on `self`.
     fn self_call(&mut self, name: &str) -> Result<(), String> {
         if runtime_answers_at_class_body(name, self.answered) {
+            return Ok(());
+        }
+        // The compiled class answers these from the association
+        // (`macro_associations::push_reflection_methods`).
+        if self.declares_association && matches!(name, "belongs_to" | "reflect_on_association") {
             return Ok(());
         }
         if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {

@@ -34,6 +34,7 @@ mod composite_key;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub(crate) mod macro_replay;
+pub(crate) mod macro_associations;
 pub(crate) mod transaction_callbacks;
 pub(crate) mod private_constant;
 pub use macro_replay::replay_model_macros;
@@ -52,6 +53,7 @@ use self::associations::{push_association_methods, push_dependent_destroy};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::BLOCK_CALLBACK_HOOKS;
+pub(crate) use self::markers::symbol_after_initialize;
 
 /// Push a synthesized instance method unless the model body defines the
 /// name (custom methods win — `push_user_methods` runs after the
@@ -1139,6 +1141,13 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
             if block.is_some() {
                 continue;
             }
+            // `after_initialize :set_defaults, if: :new_record?` —
+            // folded by markers::push_callback_methods.
+            if self::markers::symbol_after_initialize(expr).is_some()
+                && !self::markers::defines_after_initialize(model)
+            {
+                continue;
+            }
             if let ExprNode::Send { args, .. } = &*expr.node {
                 if matches!(args.first().map(|a| &*a.node), Some(ExprNode::Lambda { params, .. }) if params.is_empty()) {
                     continue;
@@ -1932,6 +1941,7 @@ fn build_methods_for_dialect(
 
     push_validate_method(&mut methods, model);
     push_association_methods(&mut methods, model, models);
+    self::macro_associations::push_reflection_methods(&mut methods, model, models);
     push_dependent_destroy(&mut methods, model);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);

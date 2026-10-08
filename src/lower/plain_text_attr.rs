@@ -141,6 +141,7 @@ pub fn synthesize_record_model(app: &mut App) {
             default: None,
             touch: None,
             foreign_type: None,
+            autosave: None,
             primary_key: None,
         },
         leading_comments: Vec::new(),

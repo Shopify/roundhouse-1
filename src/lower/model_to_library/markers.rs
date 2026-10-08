@@ -1299,11 +1299,90 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
                 push_symbol_callback(methods, model, callback, item.span());
             }
             ModelBodyItem::Unknown { expr, .. } => {
-                push_block_callback(methods, model, expr);
+                match symbol_after_initialize(expr).filter(|_| !defines_after_initialize(model)) {
+                    Some(body) => fold_into_or_push(methods, model, "after_initialize", body),
+                    None => push_block_callback(methods, model, expr),
+                }
             }
             _ => {}
         }
     }
+}
+
+/// `after_initialize :a, :b, if: :c` (or `unless:`): the self-calls the
+/// hook runs, under their condition, in declaration order. A `prepend:`
+/// changes nothing: ActiveModel sets it on every after-callback
+/// (`_define_after_model_callback`). Rails has no `CallbackHook` for it (it fires on
+/// construction and on load, not around a save), so it stays an
+/// Unknown item and folds into the `after_initialize` override the
+/// construction and hydration tails call (`schema::model_declares_after_initialize`).
+/// None for any other shape (a block, a lambda, a non-symbol target or
+/// option).
+pub(crate) fn symbol_after_initialize(expr: &Expr) -> Option<Expr> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "after_initialize" {
+        return None;
+    }
+    let sym = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let (opts, targets) = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { .. }) => (Some(last), rest),
+        _ => (None, args.as_slice()),
+    };
+    let targets: Vec<Symbol> = targets.iter().map(sym).collect::<Option<_>>()?;
+    if targets.is_empty() {
+        return None;
+    }
+    let span = expr.span;
+    let call = |name: Symbol| {
+        Expr::new(span, ExprNode::Send { recv: None, method: name, args: vec![], block: None, parenthesized: false })
+    };
+    let mut condition = None;
+    if let Some(opts) = opts {
+        let ExprNode::Hash { entries, .. } = &*opts.node else { return None };
+        for (key, value) in entries {
+            match (sym(key)?.as_str(), &*value.node) {
+                ("if", _) if condition.is_none() => condition = Some(call(sym(value)?)),
+                ("unless", _) if condition.is_none() => {
+                    condition = Some(Expr::new(
+                        span,
+                        ExprNode::Send {
+                            recv: Some(call(sym(value)?)),
+                            method: Symbol::from("!"),
+                            args: vec![],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ))
+                }
+                ("prepend", ExprNode::Lit { value: Literal::Bool { .. } }) => {}
+                _ => return None,
+            }
+        }
+    }
+    let mut body = seq(targets.into_iter().map(call).collect());
+    if let Some(cond) = condition {
+        body = Expr::new(
+            span,
+            ExprNode::If {
+                cond,
+                then_branch: body,
+                else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        );
+    }
+    Some(body)
+}
+
+/// A model that writes its own `def after_initialize` keeps it as
+/// written: a symbol-form `after_initialize` beside it is not folded in.
+pub(crate) fn defines_after_initialize(model: &Model) -> bool {
+    model.body.iter().any(|item| {
+        matches!(item, ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "after_initialize" && method.receiver == MethodReceiver::Instance)
+    })
 }
 
 /// Symbol-form callback → self-calls folded into the hook override.

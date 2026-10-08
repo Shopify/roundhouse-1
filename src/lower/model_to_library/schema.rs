@@ -2409,8 +2409,10 @@ fn synth_column_dirty_pred(owner: &ClassId, col: &Column, name: Symbol) -> Metho
 }
 
 /// True when the model's body declares an `after_initialize` hook —
-/// as a block-form callback (Unknown item, possibly concern-spliced;
-/// lobsters' Token concern) or its own `def after_initialize`. Gates
+/// as a block-form or symbol-form callback (Unknown item, possibly
+/// concern-spliced; lobsters' Token concern) or its own `def
+/// after_initialize` — or a subclass of it declares one
+/// (`lower::subclass_macros`), whose override the model's tails reach. Gates
 /// the hook-call tails in `synth_initialize` and the hydration
 /// factories, so hook-free models (the whole blog fixture) emit
 /// nothing new on any target.
@@ -2421,13 +2423,21 @@ pub(super) fn model_declares_after_initialize(model: &Model) -> bool {
             method.name.as_str() == "after_initialize"
                 && method.receiver == MethodReceiver::Instance
         }
-        ModelBodyItem::Unknown { expr, .. } => matches!(
-            &*expr.node,
-            ExprNode::Send { recv: None, method, block: Some(_), .. }
-                if method.as_str() == "after_initialize"
-        ),
+        ModelBodyItem::Unknown { expr, .. } => after_initialize_call(expr),
         _ => false,
-    })
+    }) || model
+        .subclass_declarations
+        .iter()
+        .flat_map(|(_, items)| items.iter())
+        .any(|item| matches!(item, ModelBodyItem::Unknown { expr, .. } if after_initialize_call(expr)))
+}
+
+/// `after_initialize do … end` or `after_initialize :m, …`.
+fn after_initialize_call(expr: &crate::expr::Expr) -> bool {
+    matches!(
+        &*expr.node,
+        ExprNode::Send { recv: None, method, block: Some(_), .. } if method.as_str() == "after_initialize"
+    ) || super::markers::symbol_after_initialize(expr).is_some()
 }
 
 /// `self.<writer>(<lookup>) unless <lookup>.nil?` — the guarded

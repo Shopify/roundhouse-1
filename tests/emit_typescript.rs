@@ -207,6 +207,7 @@ fn optional_belongs_to_emits_ternary_guard() {
                 default: None,
                 touch: None,
                 foreign_type: None,
+                autosave: None,
                 primary_key: None,
             },
             leading_comments: vec![],

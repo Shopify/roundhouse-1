@@ -30,6 +30,14 @@
 # - `reload` takes no options (Rails' `lock:`); it re-reads the row
 #   through the runtime's `_adapter_reload`.
 # - Multiparameter keys (`"written_on(1i)"`) raise NotImplementedError.
+#
+# Also Core#readonly! / #readonly? and the ReadOnlyRecord that
+# Persistence raises for a readonly record's save, destroy and touch
+# (core.rb, persistence.rb): after the before_save / before_destroy
+# callbacks, as Rails raises inside the callback run. And the slice of
+# Reflection::BelongsToReflection app code reads (reflection.rb), which
+# a class answers from `reflect_on_association` for the associations a
+# class macro declares (lower::model_to_library::macro_associations).
 
 module ActiveModel
   # Raised when forbidden attributes are used for mass assignment.
@@ -110,6 +118,16 @@ module ActiveRecord
       initialize_internals_callback
     end
 
+    # Returns +true+ if the record is read only.
+    def readonly?
+      @readonly == true
+    end
+
+    # Prevents records from being written to the database.
+    def readonly!
+      @readonly = true
+    end
+
     private
       def init_internals
         _runtime_internals
@@ -124,6 +142,65 @@ module ActiveRecord
     def reload
       _adapter_reload
       self
+    end
+
+    def save_after_validation
+      if readonly?
+        before_save
+        _raise_readonly_record_error
+      end
+      _runtime_save_after_validation
+    end
+
+    def destroy
+      if readonly?
+        before_destroy
+        _raise_readonly_record_error
+      end
+      _runtime_destroy
+    end
+
+    def touch
+      _raise_readonly_record_error if readonly?
+      _runtime_touch
+    end
+
+    private
+      def _raise_readonly_record_error
+        raise ReadOnlyRecord, "#{self.class} is marked as readonly"
+      end
+  end
+
+  module Reflection
+    # A `belongs_to` association's reflection: its name, foreign key
+    # (and type), the target class and primary key.
+    class BelongsToReflection
+      attr_reader :name, :foreign_key, :foreign_type, :class_name
+
+      def initialize(name, foreign_key, class_name, foreign_type, primary_key)
+        @name = name
+        @foreign_key = foreign_key
+        @class_name = class_name
+        @foreign_type = foreign_type
+        @primary_key = primary_key
+      end
+
+      def macro
+        :belongs_to
+      end
+
+      def polymorphic?
+        !@foreign_type.nil?
+      end
+
+      def klass
+        raise ArgumentError, "Polymorphic associations do not support computing the class." if polymorphic?
+        Object.const_get(@class_name)
+      end
+
+      def association_primary_key
+        @primary_key || klass.primary_key.to_s
+      end
     end
   end
 
@@ -171,6 +248,16 @@ module ActiveRecord
       $VERBOSE = verbose
     end
     remove_method :reload
+    # Base's own writes, which Persistence's readonly check calls. The
+    # Transactions module (active_record_transactions.rb) may already be
+    # prepended, and `alias_method` would name its method.
+    [:save_after_validation, :destroy, :touch].each do |name|
+      own = instance_method(name)
+      own = own.super_method until own.owner == self
+      define_method(:"_runtime_#{name}", own)
+      private :"_runtime_#{name}"
+      remove_method name
+    end
 
     include ActiveModel::AttributeAssignment
     include Core

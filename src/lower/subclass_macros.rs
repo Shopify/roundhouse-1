@@ -113,8 +113,12 @@ pub(crate) fn lowers(app: &App, sub: &ClassId, call: &Expr) -> bool {
         let Some(ExprNode::Lit { value: Literal::Sym { value } }) = args.first().map(|a| &*a.node) else { return false };
         return items.iter().any(|i| matches!(i, ModelBodyItem::Scope { scope, .. } if &scope.name == value));
     }
-    items.iter().any(|i| {
-        matches!(i, ModelBodyItem::Association { span, .. } | ModelBodyItem::Callback { span, .. } if *span == call.span)
+    items.iter().any(|i| match i {
+        ModelBodyItem::Association { span, .. } | ModelBodyItem::Callback { span, .. } => *span == call.span,
+        // `after_initialize` (`model_to_library::symbol_after_initialize`
+        // or its block form), folded by the view's callback pass.
+        ModelBodyItem::Unknown { expr, .. } => expr.span == call.span,
+        _ => false,
     })
 }
 

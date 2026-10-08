@@ -2792,7 +2792,7 @@ fn spelled_lambda_parts<'a>(
     Some((block.parameters(), block.body()))
 }
 
-fn parse_association(
+pub(super) fn parse_association(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     method: &str,
@@ -3016,6 +3016,7 @@ fn parse_association(
             touch,
             foreign_type: None,
             primary_key: None,
+            autosave,
         }),
         "has_and_belongs_to_many" => Some(Association::HasAndBelongsToMany {
             name: name.clone(),
