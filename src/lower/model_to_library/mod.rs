@@ -1386,6 +1386,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
                 || crate::analyze::is_include_refusal(call)
                 || crate::lower::sti_subclass_callbacks::folds(call)
                 || crate::lower::default_scope::claims(call)
+                || crate::lower::subclass_macros::lowers(app, &lc.name, call)
                 || app.models.iter().any(|m| lc.parent.as_ref() == Some(&m.name) && m.claimed_body_calls.contains(&call.span))
             {
                 continue;
@@ -2108,6 +2109,18 @@ fn push_user_methods(
             continue;
         }
         methods.push(method.clone());
+    }
+}
+
+/// A model subclass's view model's association methods
+/// (`lower::subclass_macros`); a method the subclass defines wins.
+pub(crate) fn push_subclass_association_methods(methods: &mut Vec<MethodDef>, view: &Model, models: &[Model]) {
+    let mut synthesized = Vec::new();
+    associations::push_association_methods(&mut synthesized, view, models);
+    for m in synthesized {
+        if !methods.iter().any(|o| o.name == m.name && o.receiver == m.receiver) {
+            methods.push(m);
+        }
     }
 }
 

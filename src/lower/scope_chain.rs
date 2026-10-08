@@ -91,6 +91,17 @@ pub fn build_unique_keys(models: &[Model], schema: &crate::schema::Schema) -> Un
 /// `Comment.arrange_for_user(u, recv)`.
 pub fn build_scope_registry(models: &[Model]) -> ScopeRegistry {
     let mut reg: ScopeRegistry = HashMap::default();
+    // A model subclass's own scopes, on the subclass
+    // (`lower::subclass_macros`).
+    for m in models {
+        for (sub, items) in &m.subclass_declarations {
+            for item in items {
+                if let ModelBodyItem::Scope { scope, .. } = item {
+                    reg.entry(sub.clone()).or_default().insert(scope.name.clone(), scope.params.clone());
+                }
+            }
+        }
+    }
     for m in models {
         let map = reg.entry(m.name.clone()).or_default();
         for item in &m.body {
