@@ -4262,7 +4262,17 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read per-thread module accessors runtime: {e}"))?;
         files.push(("runtime/active_support_attribute_accessors_per_thread.rb".into(), per_thread));
     }
+    // ActiveSupport::Concern, Hash's key extensions and Action Controller's
+    // errors (8.2.0.alpha concern.rb, core_ext/hash/keys.rb,
+    // metal/exceptions.rb), which Rails loads before any gem: a native
+    // gem's require of one answers from runtime/features.
+    for port in ["active_support_concern", "active_support_hash_keys", "action_controller_exceptions"] {
+        let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+            .map_err(|e| format!("read {port} runtime: {e}"))?;
+        files.push((format!("runtime/{port}.rb"), text));
+    }
     framework_feature_files(files);
+    files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
     // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
     for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
@@ -4316,7 +4326,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 "require_relative \"active_support_lazy_load_hooks\"\n\
                  # semian's, rails/railtie's and useragent's features answer from the runtime\n\
                  # ports (runtime/features).\n\
-                 $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
+                 $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n\
+                 # Any other Rails feature is refused by name (project.rs::framework_feature_refusal).\n\
+                 require_relative \"framework_feature_refusal\"\n",
             );
             // config/boot.rb's own requires of gem-home features, which
             // native boot makes before `require "rails"` and
@@ -4920,11 +4932,19 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
 const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support", &["active_support_lazy_load_hooks", "active_support_core_ext", "active_support_inflector"]),
     ("active_support/core_ext/object/blank", &["active_support_core_ext"]),
+    ("active_support/core_ext/object/try", &["active_support_tryable"]),
+    ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
+    ("active_support/concern", &["active_support_concern"]),
+    ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
+    ("active_support/notifications", &["active_support_notifications"]),
+    ("active_support/logger", &["active_support_logger"]),
     ("active_support/multibyte", &["active_support_multibyte_unicode"]),
     ("active_support/multibyte/unicode", &["active_support_multibyte_unicode"]),
     ("active_model", &["active_model_errors", "active_model_type", "active_model_validator"]),
     ("active_record", &["active_record"]),
     ("action_controller", &["action_controller"]),
+    ("action_controller/metal/exceptions", &["action_controller_exceptions"]),
+    ("action_view", &["action_view"]),
     ("action_mailer", &["action_mailer"]),
     ("active_job", &["active_job", "active_job_errors"]),
     // Not loaded by Rails natively until required; the port is the file.
@@ -4984,26 +5004,80 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
     }
 }
 
+/// The Rails frameworks' root features ([`is_framework_feature`]).
+const FRAMEWORKS: &[&str] = &[
+    "rails",
+    "active_support",
+    "active_record",
+    "active_model",
+    "active_job",
+    "active_storage",
+    "action_cable",
+    "action_controller",
+    "action_dispatch",
+    "action_mailbox",
+    "action_mailer",
+    "action_text",
+    "action_view",
+];
+
+/// runtime/framework_feature_refusal.rb, required right after
+/// runtime/features goes first on the load path: a Rails feature a
+/// native gem requires that neither [`FRAMEWORK_FEATURE_PORTS`] nor
+/// [`FRAMEWORK_FEATURES_NOT_PORTED`] answers fails as a LoadError that
+/// names it as not ported (polaris' `require
+/// "active_support/core_ext/numeric"`), never as a plain `cannot load
+/// such file` and never by RubyGems activating a Rails gem from the gem
+/// home for it (Core's git-sourced Rails has its require paths stripped;
+/// a released activesupport elsewhere on the gem path would load over the
+/// ports). A feature on the load path loads as before, as does one a
+/// non-Rails gem carries (rails-html-sanitizer's `rails/html/sanitizer`),
+/// and a LoadError from inside a file that did load passes through.
+/// Kernel's own `require` is resolved past any module prepended to
+/// Kernel, as in [`COMPILED_GEM_REQUIRE`].
+fn framework_feature_refusal() -> String {
+    let roots: Vec<String> = FRAMEWORKS.iter().map(|root| format!("{root:?}")).collect();
+    format!(
+        r##"# frozen_string_literal: true
+
+# A Rails feature that runtime/features does not answer: refused by name
+# (project.rs::framework_feature_refusal). Generated.
+module RoundhouseFrameworkFeatures
+  ROOTS = [{}].freeze
+  RAILS_GEMS = %w[rails railties activesupport activemodel activerecord activejob actionpack actionview actionmailer
+    actioncable activestorage actionmailbox actiontext].freeze
+
+  def self.refused?(feature)
+    name = feature.delete_suffix(".rb")
+    return false unless ROOTS.any? {{ |root| name == root || name.start_with?("#{{root}}/") }}
+    return false if $LOAD_PATH.resolve_feature_path(feature)
+    spec = Gem::Specification.find_by_path(feature) if defined?(Gem::Specification)
+    spec.nil? || RAILS_GEMS.include?(spec.name)
+  end
+end
+
+module Kernel
+  previous = instance_method(:require)
+  # A module prepended to Kernel stays in front of this method.
+  previous = previous.super_method while previous.owner != Kernel && previous.super_method
+  RoundhouseFrameworkFeatures.const_set(:REQUIRE_BEFORE_REFUSAL, previous)
+  private def require(feature)
+    if feature.is_a?(String) && RoundhouseFrameworkFeatures.refused?(feature)
+      raise LoadError, "roundhouse: error[framework_feature_not_ported]: `require #{{feature.inspect}}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded"
+    end
+    RoundhouseFrameworkFeatures::REQUIRE_BEFORE_REFUSAL.bind_call(self, feature)
+  end
+end
+"##,
+        roots.join(", ")
+    )
+}
+
 /// A Rails feature (`rails`, `active_support/...`, `action_...`): this
 /// tree's runtime ports answer it, so nothing requires it.
 /// A framework is its root feature and the files under it: a gem named
 /// like one (active_model_serializers, active_record_query_trace) is not.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
-    const FRAMEWORKS: &[&str] = &[
-        "rails",
-        "active_support",
-        "active_record",
-        "active_model",
-        "active_job",
-        "active_storage",
-        "action_cable",
-        "action_controller",
-        "action_dispatch",
-        "action_mailbox",
-        "action_mailer",
-        "action_text",
-        "action_view",
-    ];
     FRAMEWORKS.iter().any(|root| {
         feature.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     })
@@ -9648,6 +9722,10 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_deprecation.rb"
         && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_support_tryable.rb"
+        && p != "runtime/active_support_concern.rb"
+        && p != "runtime/active_support_hash_keys.rb"
+        && p != "runtime/action_controller_exceptions.rb"
+        && p != "runtime/active_support_attribute_accessors_per_thread.rb"
         && p != "runtime/active_support_inflector.rb"
         && p != "runtime/active_support_multibyte_unicode.rb"
         && p != "runtime/active_support_ractors.rb"

@@ -16,8 +16,12 @@
 # requires, `emitted` the tree's boot.rb; each then requires GEM_LIB's
 # probe_gem.rb (not compiled: a gem from the gem home) and prints what it
 # observes, which must be equal. `refusals` prints what the tree answers
-# for each feature it does not port (FRAMEWORK_FEATURES_NOT_PORTED).
+# for each feature it does not port (FRAMEWORK_FEATURES_NOT_PORTED, and
+# any other Rails feature: project.rs::framework_feature_refusal).
 require_relative "support/rails_oracle"
+require "fileutils"
+require "stringio"
+require "tmpdir"
 
 # Each mode in its own Ruby: the emitted tree with the pinned gem home
 # (i18n), and jemalloc, which that gem home's native extensions need.
@@ -47,7 +51,16 @@ else
 end
 
 if MODE == "refusals"
-  %w[active_support/all active_support/core_ext/hash].each do |feature|
+  # A framework-named feature whose file exists and requires a missing one.
+  inner = Dir.mktmpdir
+  FileUtils.mkdir_p(File.join(inner, "active_support"))
+  File.write(File.join(inner, "active_support/probe_inner.rb"), "require \"probe_gem_inner_dependency\"\n")
+  $LOAD_PATH.push(inner)
+  %w[
+    active_support/all active_support/core_ext/hash
+    active_support/core_ext/numeric active_support/core_ext action_dispatch/testing/integration rails/no_such_feature.rb
+    active_model_serializers_probe probe_missing/active_support active_support/probe_inner
+  ].each do |feature|
     require feature
     puts "#{feature}: loaded"
   rescue LoadError => e
@@ -78,3 +91,9 @@ end
 $LOAD_PATH.unshift(GEM_LIB)
 require "probe_gem"
 ProbeGem.report.each { |key, value| puts "#{key}: #{value.inspect}" }
+# The tree's answers are its ports: no released Rails gem from the gem
+# path (RubyGems would activate one for a feature the tree lacks).
+if MODE == "emitted"
+  released = $LOADED_FEATURES.grep(%r{/gems/(?:#{%w[activesupport activemodel activerecord activejob actionpack actionview actionmailer railties].join("|")})-\d})
+  abort "the gem home's Rails loaded on the tree:\n#{released.join("\n")}" if released.any?
+end
