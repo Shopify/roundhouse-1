@@ -315,7 +315,7 @@ fn model_for(model: &Model) -> String {
                                 validation.attribute
                             ));
                         }
-                        ValidationRule::Inclusion { list, exclusion: false, .. }
+                        ValidationRule::Inclusion { list, exclusion: false, list_of: None, .. }
                             if matches!(&*list.node, crate::expr::ExprNode::Array { elements, .. }
                                 if elements.iter().all(|e| matches!(&*e.node, crate::expr::ExprNode::Lit { .. }))) =>
                         {
