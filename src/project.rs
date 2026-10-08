@@ -4364,6 +4364,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     files.push(("runtime/database_configuration.rb".into(), configuration));
     // Rails loads the helper only on `require "active_support/log_subscriber/test_helper"`;
     // test-file requires are not carried, so load it when a test names it.
+    // Core extensions native boot has loaded before any app file:
+    // `require "rails"` loads Class#class_attribute (active_support/rails.rb)
+    // and Module#mattr_* (active_support.rb's logger), and Rails'
+    // :load_active_support initializer loads active_support/all, so a
+    // class body calls them with no require of its own (activemerchant
+    // 1.137.0's PostsData: `base.class_attribute :ssl_strict`). The tree
+    // loads each port where native boot loads it when its app code calls it.
+    let boot_extensions = boot_loaded_core_extensions(files);
     let log_subscriber_test_helper = files.iter().any(|(path, content)| {
         path.starts_with("test/") && path != "test/test_helper.rb"
             && content.lines().any(|line| !line.trim_start().starts_with('#')
@@ -4414,7 +4422,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let i18n = if carries_i18n { "require_relative \"active_support_i18n\"\n" } else { "" };
             // Then ActiveRecord::Base's ActiveModel ancestry over them, and
             // ActiveSupport::StringInquirer.
+            // With them, the core extensions `require "rails"` loads.
+            let rails_extensions: String = boot_extensions
+                .iter()
+                .filter(|ext| ext.at_require_rails)
+                .flat_map(|ext| ext.ports.iter())
+                .map(|port| format!("require_relative \"{port}\"\n"))
+                .collect();
             let ports: String = std::iter::once(i18n.to_string())
+                .chain(std::iter::once(rails_extensions))
                 .chain(
                     std::iter::once("active_support_string_inflections")
                         .chain(active_model_ports.iter().copied())
@@ -4461,6 +4477,28 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                      # (project.rs::BUNDLER_REQUIRED_GEM_PORTS), never the gem's own Ruby.\n\
                      require_relative {stem:?}\n"
                 ));
+            }
+            // After Bundler.require, Rails' :load_active_support initializer
+            // (`require "active_support/all"`): the extensions of it app code
+            // calls with no require.
+            for ext in boot_extensions.iter().filter(|ext| !ext.at_require_rails) {
+                let numeric: Vec<&str> = if carries_i18n {
+                    ext.ports.to_vec()
+                } else {
+                    // Numeric#to_fs formats through ActiveSupport::NumberHelper
+                    // and I18n, which this tree carries only with i18n.
+                    ext.ports.iter().copied().filter(|port| *port != "active_support_numeric").chain(
+                        ["active_support_numeric_bytes", "active_support_numeric_time"]
+                    ).collect()
+                };
+                content.push_str(&format!(
+                    "\n# Rails' :load_active_support initializer loads {} (active_support/all),\n\
+                     # which app code calls with no require (project.rs::BOOT_LOADED_CORE_EXTENSIONS).\n",
+                    ext.feature
+                ));
+                for port in numeric {
+                    content.push_str(&format!("require_relative \"{port}\"\n"));
+                }
             }
         }
         if path == "boot.rb" {
@@ -5022,6 +5060,86 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
         &["active_support_isolated_execution_state", "active_support_attribute_accessors_per_thread"],
     ),
 ];
+
+/// A core extension native Rails boot loads with no require from app
+/// code, as [`BOOT_LOADED_CORE_EXTENSIONS`] lists it.
+struct BootCoreExtension {
+    /// The Active Support feature, for the emitted comment.
+    feature: &'static str,
+    /// The runtime ports that answer it, in load order.
+    ports: &'static [&'static str],
+    /// The methods it defines, as app code calls them: a bare name, or
+    /// one written `.name` (a receiver's method, as `30.days`).
+    calls: &'static [&'static str],
+    /// Loaded by `require "rails"` (before Bundler.require), else by the
+    /// :load_active_support initializer's active_support/all (after it).
+    at_require_rails: bool,
+}
+
+/// The core extensions Rails 8.2.0.alpha has loaded before any app file:
+/// active_support/rails.rb requires core_ext/class/attribute, and
+/// active_support.rb's logger (logger_silence.rb) core_ext/module/
+/// attribute_accessors, at `require "rails"`; the bootstrap initializer
+/// :load_active_support requires active_support/all, and with it
+/// core_ext/numeric, unless `config.active_support.bare` (Core does not
+/// set it).
+const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
+    BootCoreExtension {
+        feature: "active_support/core_ext/module/attribute_accessors",
+        ports: &["active_support_module_attribute_accessors"],
+        calls: &["mattr_reader", "mattr_writer", "mattr_accessor", "cattr_reader", "cattr_writer", "cattr_accessor"],
+        at_require_rails: true,
+    },
+    BootCoreExtension {
+        feature: "active_support/core_ext/class/attribute",
+        ports: &["active_support_class_attribute"],
+        calls: &["class_attribute"],
+        at_require_rails: true,
+    },
+    BootCoreExtension {
+        feature: "active_support/core_ext/numeric",
+        ports: &["active_support_numeric"],
+        calls: &[
+            ".bytes", ".byte", ".kilobytes", ".kilobyte", ".megabytes", ".megabyte", ".gigabytes", ".gigabyte",
+            ".terabytes", ".terabyte", ".petabytes", ".petabyte", ".exabytes", ".exabyte", ".zettabytes", ".zettabyte",
+            ".seconds", ".second", ".minutes", ".minute", ".hours", ".hour", ".days", ".day", ".weeks", ".week",
+            ".fortnights", ".fortnight", ".in_milliseconds", ".to_fs", ".to_formatted_s",
+        ],
+        at_require_rails: false,
+    },
+];
+
+/// The [`BOOT_LOADED_CORE_EXTENSIONS`] the emitted app code (every Ruby
+/// file outside runtime/) calls, outside a comment line. A call the
+/// compiler lowered (a model's `class_attribute`) is not in the emitted
+/// text and needs no port; a receiver it cannot see (`ttl.days` on a
+/// Time's method) loads the extension, as natively it is loaded anyway.
+fn boot_loaded_core_extensions(files: &[(String, String)]) -> Vec<&'static BootCoreExtension> {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let calls = |text: &str, call: &str| -> bool {
+        text.match_indices(call).any(|(at, _)| {
+            let bytes = text.as_bytes();
+            let end = at + call.len();
+            let before_ok = call.starts_with('.') || at == 0 || !ident(bytes[at - 1]);
+            let after_ok = end == bytes.len() || !(ident(bytes[end]) || bytes[end] == b'?' || bytes[end] == b'!' || bytes[end] == b'=');
+            let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+            before_ok && after_ok && !text[line_start..at].trim_start().starts_with('#')
+        })
+    };
+    let app_code: Vec<&str> = files
+        .iter()
+        .filter(|(path, _)| path.ends_with(".rb") && !path.starts_with("runtime/"))
+        .map(|(_, text)| text.as_str())
+        .collect();
+    BOOT_LOADED_CORE_EXTENSIONS
+        .iter()
+        .filter(|ext| {
+            let carried = |port: &str| files.iter().any(|(p, _)| *p == format!("runtime/{port}.rb"));
+            (ext.ports.iter().all(|port| carried(port)) || !ext.at_require_rails)
+                && ext.calls.iter().any(|call| app_code.iter().any(|text| calls(text, call)))
+        })
+        .collect()
+}
 
 /// Rails features a native gem requires that Rails has not loaded by
 /// then natively and the tree ports only in part (Active Support's every
