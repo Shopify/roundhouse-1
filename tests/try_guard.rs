@@ -38,7 +38,7 @@ fn emit(files: &[(&str, &str)]) -> String {
         // narrowing tests for.
         (
             "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
         ),
         (
             "app/controllers/application_controller.rb",
@@ -211,7 +211,7 @@ fn a_runtime_method_try_keeps_its_type_through_the_guard() {
         ("app/models/room.rb", "class Room < ApplicationRecord\n  has_rich_text :body\nend\n"),
         (
             "app/models/application_record.rb",
-            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+            "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
         ),
         (
             "app/controllers/application_controller.rb",

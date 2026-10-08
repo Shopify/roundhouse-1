@@ -25,7 +25,7 @@ fn app(resources: &str, lock: Option<&str>) -> App {
 
 fn app_with_consumer(resources: &str, lock: Option<&str>, consumer: &str) -> App {
     let mut tree: HashMap<PathBuf, Vec<u8>> = [
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/article.rb", "class Article < ApplicationRecord\nend\n"),
         ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
         ("app/controllers/articles_controller.rb", consumer),

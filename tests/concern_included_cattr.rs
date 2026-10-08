@@ -83,6 +83,9 @@ fn a_concern_s_cattr_accessor_is_the_includer_s_class_attribute() {
     let expected = "[[:one, :two], [:b, :bb], [:c], [:d]]\n[true, true, true]\n";
     assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
     let run = emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"stores\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write("app/models/concerns/pc_a.rb", PC_A)
         .write("app/models/concerns/pc_b.rb", PC_B)
         .write("app/models/concerns/pc_c.rb", PC_C)

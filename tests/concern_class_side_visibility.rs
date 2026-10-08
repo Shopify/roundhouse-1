@@ -129,6 +129,10 @@ fn protected_class_attribute_methods_reach_each_includer_after_emission() {
         assert!(expected.iter().any(|line| line == probe), "native control lacks {probe:?}: {expected:#?}");
     }
     let run = emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        // The control never queries, so an empty table changes nothing.
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"vaults\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write("app/models/concerns/gated.rb", CONCERN)
         .write("app/models/vault.rb", VAULT)
         .write("app/models/sub_vault.rb", SUB_VAULT)

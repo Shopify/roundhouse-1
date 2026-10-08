@@ -49,7 +49,7 @@ end
 fn tree(controller: &str) -> HashMap<PathBuf, Vec<u8>> {
     [
         ("db/schema.rb", SCHEMA),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/report.rb", "class Report < ApplicationRecord\nend\n"),
         (
             "app/controllers/application_controller.rb",

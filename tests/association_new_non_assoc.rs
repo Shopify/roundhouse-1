@@ -17,6 +17,9 @@ fn a_library_reader_named_like_an_association_keeps_new() {
 #[test]
 fn model_class_readers_named_like_an_association_keep_new() {
     emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"memo2s\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write(
             "app/lib/note.rb",
             "class Note\n  attr_reader :text\n  def initialize(text)\n    @text = text\n  end\nend\n",

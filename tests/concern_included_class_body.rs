@@ -81,6 +81,10 @@ fn included_block_statements_run_in_each_includer_after_emission() {
         assert!(expected.iter().any(|line| line == probe), "native control lacks {probe:?}: {expected:#?}");
     }
     let run = emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        // The control never queries, so an empty table changes nothing.
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"stores\", force: :cascade do |t|\n  end\n\n  create_table \"depots\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write("app/models/concerns/guarded.rb", CONCERN)
         .write("app/models/store.rb", STORE)
         .write("app/models/depot.rb", DEPOT)
