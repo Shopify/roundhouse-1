@@ -4608,11 +4608,13 @@ fn body_local(lw: &ruby_prism::LocalVariableWriteNode<'_>, file: &str) -> Ingest
 
 /// The text of a string literal prism marks frozen (the file's
 /// `# frozen_string_literal: true`, no interpolation), a static heredoc
-/// or adjacent literals included.
+/// or adjacent literals included. Bytes that are not UTF-8 (`"\xc3("`)
+/// are no text: such a local is stored like any other value, which
+/// ingest builds from those bytes rather than U+FFFD.
 fn frozen_string_literal(node: &ruby_prism::Node<'_>) -> Option<String> {
     fn text(node: &ruby_prism::Node<'_>, out: &mut String) -> Option<()> {
         if let Some(s) = node.as_string_node() {
-            out.push_str(&String::from_utf8_lossy(s.unescaped()));
+            out.push_str(std::str::from_utf8(s.unescaped()).ok()?);
             return Some(());
         }
         let parts = node.as_interpolated_string_node()?;
