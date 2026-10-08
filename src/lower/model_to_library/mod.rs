@@ -742,6 +742,7 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
     let mut all: Vec<_> =
         app.models.iter().flat_map(|model| unclaimed_unknowns(model, app)).collect();
     all.extend(unclaimed_sti_subclass_calls(app));
+    all.extend(app.models.iter().filter_map(|model| user_validate_conflict(model, &app.models)));
     // A concern's statement is spliced into every includer: one row per
     // statement, naming the first includer and counting the rest.
     let mut first: std::collections::BTreeMap<(u32, u32, u32), (usize, usize)> = Default::default();
@@ -763,6 +764,62 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
         }
     }
     out
+}
+
+/// A model's own instance `def validate` that the lowered validation
+/// path would drop or call.
+///
+/// ActiveModel's instance `validate` is an alias of `valid?`, so in Rails
+/// a model's `def validate` replaces the alias and is a plain method:
+/// `valid?` and `save` run the `validates` / `validate :m` rules and never
+/// call it (pinned natively in tests/user_validate_method.rs). The
+/// lowered runtime runs the rules through a method of that name (`valid?`
+/// calls `validate`, in runtime/ruby/active_record/connection.rb, base.rb
+/// and the ActiveModel surface `validations.rs` synthesizes). So a model
+/// with rules lost its method to the synthesized one (`push_user_methods`
+/// keeps the first), and a model under a `valid?` that calls `validate`
+/// had it run on every `valid?` and `save`. Refused at the `def` until
+/// `valid?` runs the rules through a hook of its own. A class outside any
+/// hierarchy that declares no rules keeps its method: nothing synthesized
+/// calls it.
+fn user_validate_conflict(model: &Model, models: &[Model]) -> Option<crate::diagnostic::Diagnostic> {
+    let method = model.body.iter().find_map(|item| match item {
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "validate"
+                && method.receiver == MethodReceiver::Instance
+                && matches!(method.kind, crate::dialect::AccessorKind::Method) =>
+        {
+            Some(method)
+        }
+        _ => None,
+    })?;
+    // The rules the lowering would put under `validate`.
+    let mut synthesized = Vec::new();
+    push_validate_method(&mut synthesized, model);
+    let has_rules = synthesized.iter().any(|m| m.name.as_str() == "validate");
+    // A parent whose `valid?` calls `validate`: ActiveRecord's, or an app
+    // model's (the AR hierarchy, or a tableless class's synthesized one).
+    let under_valid = model.parent.as_ref().is_some_and(|parent| {
+        parent.0.as_str() == "ActiveRecord::Base" || models.iter().any(|m| &m.name == parent)
+    });
+    if !has_rules && !under_valid {
+        return None;
+    }
+    let why = if has_rules {
+        "the lowered `valid?` runs its rules through a method named `validate`, which would replace this one"
+    } else {
+        "the inherited lowered `valid?` calls `validate` to run the rules, so it would run this method on every `valid?` and `save`"
+    };
+    let span = if method.name_span.is_synthetic() { model.span } else { method.name_span };
+    Some(crate::diagnostic::Diagnostic::unsupported(
+        span,
+        None,
+        "`def validate`",
+        format!(
+            "on `{}`: in Rails it replaces ActiveModel's `validate` alias of `valid?` and is a plain method that validation never calls; {why}",
+            model.name.0.as_str()
+        ),
+    ))
 }
 
 /// The model-body statements no lowering pass claims, each an
