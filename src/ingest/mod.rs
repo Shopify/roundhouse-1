@@ -19,6 +19,7 @@ mod alba;
 mod boot_requires;
 mod graphql_ruby;
 pub(crate) mod class_attribute;
+pub(crate) mod autoload_glob;
 pub(crate) mod cattr;
 mod class_configuration;
 pub(crate) mod concern_class_attribute;

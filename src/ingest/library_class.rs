@@ -415,6 +415,18 @@ fn program_items(
             Err(err) => not_carried(node, format!("the ingest cannot carry this file-level statement: {err}")),
         }
     };
+    // A class or module body statement its walk discarded is named
+    // where the declaration stands (`DeclBody::discarded`).
+    let discarded = |stmt: &ruby_prism::Node<'_>, out: &mut Vec<ProgramItem>| {
+        let mut found = Vec::new();
+        discarded_in(stmt, file, &mut found);
+        for (node, why) in found {
+            out.push(not_carried(
+                &node,
+                format!("{why} in a class or module body is not carried; Ruby runs it when the body loads"),
+            ));
+        }
+    };
     for stmt in statements {
         let declaration = stmt.as_class_node().is_some() || stmt.as_module_node().is_some();
         if declaration && (in_branch || *guarded) {
@@ -442,6 +454,7 @@ fn program_items(
                     // An enclosing namespace before what it nests.
                     all.sort_by_key(|c| c.name.0.as_str().matches("::").count());
                     out.push(ProgramItem::Inline(all));
+                    discarded(stmt, out);
                 }
                 Err(err) => out.push(not_carried(stmt, format!("the ingest cannot carry this conditional definition: {err}"))),
             }
@@ -501,6 +514,7 @@ fn program_items(
             if !names.is_empty() {
                 out.push(ProgramItem::Declared(names));
             }
+            discarded(stmt, out);
             continue;
         }
         // A constant before any guard rides on the file's first class
@@ -1156,10 +1170,14 @@ pub(super) fn library_class_and_struct_base(
         conditional_definitions,
         class_attribute_effects,
         class_attr_seeds,
+        discarded,
         ..
     } = walk_declaration_body(class.body(), &owner, file)?;
+    // A Railtie's body is carried whole (`railtie_body_statements`).
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
+    } else {
+        note_discarded(file, discarded);
     }
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
     let class_initializers = with_class_attribute_effects(class_initializers, class_attribute_effects);
@@ -1287,6 +1305,7 @@ fn railtie_body_statements(
             || statement.as_module_node().is_some()
             || statement.as_singleton_class_node().is_some()
             || statement.as_constant_write_node().is_some()
+            || constant_multi_write(&statement).is_some()
             || statement.as_class_variable_write_node().is_some()
             || statement.as_alias_method_node().is_some();
         if declaration {
@@ -2123,8 +2142,10 @@ pub(super) fn library_class_from_module_node_with_scope(
         conditional_definitions,
         class_attribute_effects,
         class_attr_seeds,
+        discarded,
         ..
     } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
+    note_discarded(file, discarded);
     admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
@@ -2311,6 +2332,42 @@ fn with_class_attribute_effects(mut initializers: Vec<Expr>, effects: Vec<Expr>)
     initializers
 }
 
+/// `A, B = x, y` in a class or module body: each target a bare constant,
+/// the value a list of as many plain elements, none naming a target.
+/// Ruby evaluates the elements left to right and then assigns the
+/// targets in order, so the pairs written one by one, in order, are the
+/// same writes. Anything else (a splat, a nested target, a value array
+/// computed as a whole) is not this shape.
+fn constant_multi_write<'a>(stmt: &ruby_prism::Node<'a>) -> Option<Vec<(Symbol, ruby_prism::Node<'a>)>> {
+    let write = stmt.as_multi_write_node()?;
+    if write.rest().is_some() || !write.rights().is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = write
+        .lefts()
+        .iter()
+        .map(|left| left.as_constant_target_node().map(|target| constant_id_str(&target.name())))
+        .collect::<Option<_>>()?;
+    let array = write.value().as_array_node()?;
+    let elements: Vec<ruby_prism::Node<'a>> = array.elements().iter().collect();
+    if elements.len() != names.len() || elements.iter().any(|element| element.as_splat_node().is_some()) {
+        return None;
+    }
+    let names_a_target = |element: &ruby_prism::Node<'_>| {
+        let text = String::from_utf8_lossy(element.location().as_slice()).into_owned();
+        names.iter().any(|name| {
+            text.match_indices(name).any(|(at, _)| {
+                let word = |c: char| c == '_' || c.is_ascii_alphanumeric();
+                !text[..at].ends_with(word) && !text[at + name.len()..].starts_with(word)
+            })
+        })
+    };
+    if elements.iter().any(names_a_target) {
+        return None;
+    }
+    Some(names.into_iter().map(Symbol::from).zip(elements).collect())
+}
+
 fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
@@ -2362,6 +2419,114 @@ struct DeclBody {
     /// `class_initializers` so the ordering checks for native class
     /// variables do not count them; a top-level body merges them in.
     class_attr_seeds: Vec<Expr>,
+    /// The body statements the walk carries nowhere, which a top-level
+    /// class or module body names in its file's program
+    /// (`note_discarded`).
+    discarded: Vec<Discarded>,
+}
+
+/// A class or module body statement the walk does not carry.
+#[derive(Clone)]
+struct Discarded {
+    start: usize,
+    end: usize,
+    text: String,
+    why: &'static str,
+}
+
+impl Discarded {
+    fn of(node: &ruby_prism::Node<'_>, why: &'static str) -> Self {
+        let loc = node.location();
+        Discarded {
+            start: loc.start_offset(),
+            end: loc.end_offset(),
+            text: String::from_utf8_lossy(loc.as_slice()).into_owned(),
+            why,
+        }
+    }
+}
+
+thread_local! {
+    /// Per file, the statements its top-level class and module bodies
+    /// discard. The file's program (`program_items`) reads them back by
+    /// span and text, so a body walked from other text under the same
+    /// name (a synthesized reopen) names nothing.
+    static DISCARDED: std::cell::RefCell<HashMap<String, Vec<Discarded>>> = std::cell::RefCell::new(HashMap::default());
+}
+
+fn note_discarded(file: &str, discarded: Vec<Discarded>) {
+    if discarded.is_empty() {
+        return;
+    }
+    DISCARDED.with(|ledger| {
+        let mut ledger = ledger.borrow_mut();
+        let entries = ledger.entry(file.to_string()).or_default();
+        for d in discarded {
+            if !entries.iter().any(|e| e.start == d.start && e.end == d.end && e.text == d.text) {
+                entries.push(d);
+            }
+        }
+    });
+}
+
+/// Why `node`, a statement of a class or module body the walk visited,
+/// was discarded, if the walk noted it.
+fn discarded_why(file: &str, node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    let loc = node.location();
+    DISCARDED.with(|ledger| {
+        ledger.borrow().get(file)?.iter().find(|d| {
+            d.start == loc.start_offset() && d.end == loc.end_offset() && d.text.as_bytes() == loc.as_slice()
+        }).map(|d| d.why)
+    })
+}
+
+/// The statements of `node`'s class, module and `class << self` bodies,
+/// nested ones too, that their walk discarded, with why.
+fn discarded_in<'pr>(node: &ruby_prism::Node<'pr>, file: &str, out: &mut Vec<(ruby_prism::Node<'pr>, &'static str)>) {
+    let body = if let Some(class) = node.as_class_node() {
+        class.body()
+    } else if let Some(module) = node.as_module_node() {
+        module.body()
+    } else if let Some(singleton) = node.as_singleton_class_node() {
+        singleton.body()
+    } else {
+        return;
+    };
+    for statement in body.map(flatten_statements).unwrap_or_default() {
+        if let Some(why) = discarded_why(file, &statement) {
+            out.push((statement, why));
+        } else {
+            discarded_in(&statement, file, out);
+        }
+    }
+}
+
+/// A body statement of a kind the walk has no carrier for. Declarations,
+/// calls, constant, class-variable, instance-variable and local writes
+/// are the walk's (or the passes after it); a literal does nothing.
+fn discarded_kind(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    use ruby_prism::Node as N;
+    Some(match node {
+        N::WhileNode { .. } | N::UntilNode { .. } | N::ForNode { .. } => "a loop",
+        N::BeginNode { .. } => "a `begin` block",
+        N::CaseNode { .. } | N::CaseMatchNode { .. } => "a `case` statement",
+        N::MultiWriteNode { .. } => "a multiple assignment",
+        N::GlobalVariableWriteNode { .. }
+        | N::GlobalVariableOrWriteNode { .. }
+        | N::GlobalVariableOperatorWriteNode { .. }
+        | N::GlobalVariableAndWriteNode { .. } => "a global variable write",
+        N::InstanceVariableOperatorWriteNode { .. } | N::InstanceVariableAndWriteNode { .. } => {
+            "an instance variable operator write"
+        }
+        N::ClassVariableOrWriteNode { .. }
+        | N::ClassVariableOperatorWriteNode { .. }
+        | N::ClassVariableAndWriteNode { .. } => "a class variable operator write",
+        N::LocalVariableOperatorWriteNode { .. }
+        | N::LocalVariableOrWriteNode { .. }
+        | N::LocalVariableAndWriteNode { .. } => "a local variable operator write",
+        N::YieldNode { .. } | N::SuperNode { .. } | N::ForwardingSuperNode { .. } => "a `yield` or `super`",
+        _ => return None,
+    })
 }
 
 impl DeclBody {
@@ -2378,6 +2543,7 @@ impl DeclBody {
         self.class_attribute_names.extend(other.class_attribute_names);
         self.class_attribute_effects.extend(other.class_attribute_effects);
         self.class_attr_seeds.extend(other.class_attr_seeds);
+        self.discarded.extend(other.discarded);
     }
 
     /// The class-body declarations an initializer must not precede.
@@ -3049,6 +3215,8 @@ fn walk_decl_body_in<'pr>(
     };
 
     let statements = flatten_statements(b);
+    let glob_autoload_loops: Vec<usize> =
+        super::autoload_glob::body_loops(&statements, file, None).into_iter().map(|found| found.start).collect();
     let mut body_locals: Vec<BodyLocal> = Vec::new();
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
@@ -3097,6 +3265,7 @@ fn walk_decl_body_in<'pr>(
             }
             Visibility::reject_conditional_declaration(&statement, file)?;
             reject_conditional_accessor(&statement, file)?;
+            out.discarded.push(Discarded::of(&statement, "a conditional statement"));
             continue;
         }
         // A call on a literal list (`%w(month year).each do |m| … end`)
@@ -3255,6 +3424,18 @@ fn walk_decl_body_in<'pr>(
                 value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
             }
             out.constants.push((name, value));
+            continue;
+        }
+        // `APPROVED, DECLINED, ERROR = 1, 2, 3` (activemerchant 1.137.0's
+        // response codes): one constant per target, in order, as below.
+        if let Some(writes) = constant_multi_write(stmt) {
+            for (name, value) in writes {
+                let mut value = ingest_expr(&value, file)?;
+                if guarded {
+                    value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
+                }
+                out.constants.push((name, value));
+            }
             continue;
         }
         // `Ref::Obj = Struct.new(:b)`: a write through a constant path.
@@ -3900,7 +4081,15 @@ fn walk_decl_body_in<'pr>(
                 if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
+            } else if !glob_autoload_loops.contains(&statement.location().start_offset()) {
+                // A call on a computed receiver (`Dir[...].each do … end`)
+                // is not carried; it is named in the file's program
+                // (`DeclBody::discarded`). A glob loop registering
+                // autoloads is the autoloader's (`ingest::autoload_glob`).
+                out.discarded.push(Discarded::of(&statement, "a call on a computed receiver"));
             }
+        } else if let Some(why) = discarded_kind(&statement) {
+            out.discarded.push(Discarded::of(&statement, why));
         }
         // Nested class/module declarations also fall through here; they
         // surface as separate entries via the plural API.
