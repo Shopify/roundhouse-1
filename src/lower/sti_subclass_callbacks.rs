@@ -82,16 +82,15 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
     // is plain Ruby inheritance, not STI, and stamping it would write a
     // column that does not exist. `sti_bases` is the one authority on
     // which subclasses are STI ones — it is what checks for the column.
-    let sti: crate::det::HashSet<ClassId> =
-        crate::lower::sti_bases(app).into_keys().collect();
+    let sti = crate::lower::sti_scope::sti_columns(app);
     for lc in &mut app.library_classes {
         // An STI subclass is a library class whose parent IS a model.
         if !lc.parent.as_ref().is_some_and(|p| models.contains(p)) {
             // A class further down (`Gold < Premium < Account`) inherits
             // its parent's stamp, which names the parent; its own runs
             // after it (see `stamp_inheritance_column`).
-            if sti.contains(&lc.name) {
-                stamp_inheritance_column(lc, false);
+            if let Some(col) = sti.get(&lc.name) {
+                stamp_inheritance_column(lc, false, col.as_str());
             }
             continue;
         }
@@ -108,8 +107,8 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
                 fold(lc, hook, &target);
             }
         }
-        if sti.contains(&lc.name) {
-            stamp_inheritance_column(lc, true);
+        if let Some(col) = sti.get(&lc.name) {
+            stamp_inheritance_column(lc, true, col.as_str());
         }
     }
 }
@@ -154,7 +153,7 @@ fn fold_targets(call: &Expr) -> Option<(&'static str, Vec<Symbol>)> {
 ///
 /// Declines when the subclass writes its own `initialize` — a
 /// hand-written constructor is somebody else's contract.
-fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool) {
+fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool, column: &str) {
     if lc.methods.iter().any(|m| m.name.as_str() == "initialize") {
         return;
     }
@@ -165,7 +164,7 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool)
         if direct {
             syn(ExprNode::Send {
                 recv: Some(syn(ExprNode::SelfRef)),
-                method: Symbol::from("type"),
+                method: Symbol::from(column),
                 args: vec![],
                 block: None,
                 parenthesized: true,
@@ -174,7 +173,7 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool)
             syn(ExprNode::Send {
                 recv: Some(syn(ExprNode::Var { id: crate::ident::VarId(0), name: attrs.clone() })),
                 method: Symbol::from("[]"),
-                args: vec![syn(ExprNode::Lit { value: Literal::Sym { value: Symbol::from("type") } })],
+                args: vec![syn(ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column) } })],
                 block: None,
                 parenthesized: false,
             })
@@ -200,7 +199,7 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool)
     });
     let stamp = syn(ExprNode::Send {
         recv: Some(syn(ExprNode::SelfRef)),
-        method: Symbol::from("type="),
+        method: Symbol::from(format!("{column}=")),
         args: vec![syn(ExprNode::Lit {
             value: Literal::Str { value: lc.name.0.as_str().to_string() },
         })],

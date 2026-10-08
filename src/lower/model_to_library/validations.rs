@@ -48,7 +48,7 @@ pub(crate) enum Finder {
     RecordClass,
     /// The declaring class, with `type IN (...)` when it is an STI
     /// subclass (itself and every subclass below it).
-    Declaring { class: ClassId, type_names: Vec<String> },
+    Declaring { class: ClassId, type_names: Vec<String>, type_column: String },
 }
 
 impl Declarer {
@@ -60,7 +60,7 @@ impl Declarer {
             finder: if super::markers::is_abstract_class(model) {
                 Finder::RecordClass
             } else {
-                Finder::Declaring { class: model.name.clone(), type_names: Vec::new() }
+                Finder::Declaring { class: model.name.clone(), type_names: Vec::new(), type_column: String::new() }
             },
         }
     }
@@ -1583,13 +1583,13 @@ fn inline_uniqueness_check(
     // An STI subclass's relation keeps its type condition: the rows of
     // the subclass and of every class below it.
     let base = match finder {
-        Finder::Declaring { type_names, .. } if !type_names.is_empty() => {
+        Finder::Declaring { type_names, type_column, .. } if !type_names.is_empty() => {
             let names = type_names
                 .iter()
                 .map(|n| Expr::new(s, ExprNode::Lit { value: Literal::Str { value: n.clone() } }))
                 .collect();
             let list = Expr::new(s, ExprNode::Array { elements: names, style: ArrayStyle::Brackets });
-            send(relation, "where", vec![hash(vec![(sym("type"), list)])])
+            send(relation, "where", vec![hash(vec![(sym(type_column.as_str()), list)])])
         }
         _ => relation,
     };

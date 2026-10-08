@@ -1234,6 +1234,8 @@ pub(crate) const MODEL_STATEMENT_CLAIMS: &[fn(&Expr) -> bool] = &[
     crate::lower::normalizes::claims,
     // A reproducible `default_scope` (applied by the runtime relation).
     crate::lower::default_scope::claims,
+    // A literal `self.inheritance_column = ...` (the STI column).
+    crate::lower::sti_scope::claims_inheritance_column,
 ];
 
 /// `delegate :a, :b, to: :t` on `model` whose every forwarder the Ruby
@@ -1957,7 +1959,7 @@ fn build_methods_for_dialect(
     // rationale as the macros above (a hand-written method wins).
     crate::lower::attached::push_attached_methods(&mut methods, model);
     push_user_methods(&mut methods, model);
-    push_dom_prefix_method(&mut methods, model);
+    push_dom_prefix_method(&mut methods, model, models);
     // AFTER push_user_methods, unlike the macros above: its skip guard
     // reads the accumulated list, so a model's own `to_param` (already
     // pushed) wins over the synthesized `@id.to_s`.

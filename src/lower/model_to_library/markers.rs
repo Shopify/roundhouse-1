@@ -33,7 +33,7 @@ use super::{fn_sig, seq, with_ty};
 /// models (`primary_abstract_class` marker present) — those are never
 /// instantiated, and ApplicationRecord's lowered shape is tested
 /// against the abstract-marker-only baseline.
-pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model) {
+pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model, models: &[Model]) {
     if is_primary_abstract_class(model) {
         return;
     }
@@ -93,7 +93,7 @@ pub(super) fn push_dom_prefix_method(methods: &mut Vec<MethodDef>, model: &Model
             ExprNode::Case {
                 scrutinee: Expr::new(
                     Span::synthetic(),
-                    ExprNode::Ivar { name: Symbol::from("type") },
+                    ExprNode::Ivar { name: Symbol::from(crate::lower::sti_scope::inheritance_column(model, models)) },
                 ),
                 arms,
             },

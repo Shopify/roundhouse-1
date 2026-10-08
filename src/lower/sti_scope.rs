@@ -97,6 +97,172 @@ const STI_CONSTRUCTORS: &[&str] = &["new", "create", "create!", "build"];
 /// would filter on a column that isn't there.
 const INHERITANCE_COLUMN: &str = "type";
 
+/// `self.inheritance_column = "kind"` / `:kind` / `nil` in a model body:
+/// the literal, empty for `nil` (Rails' writer stores `value.to_s`).
+pub(crate) fn inheritance_column_write(expr: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else { return None };
+    if !matches!(&*recv.node, ExprNode::SelfRef) || method.as_str() != "inheritance_column=" {
+        return None;
+    }
+    match args.as_slice() {
+        [arg] => match &*arg.node {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+            ExprNode::Lit { value: Literal::Nil } => Some(String::new()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a model-body statement is a literal `inheritance_column`
+/// write (`model_to_library::MODEL_STATEMENT_CLAIMS`): read here for the
+/// STI column, and answered at run time by the class method
+/// [`push_inheritance_column_method`] writes.
+pub(crate) fn claims_inheritance_column(expr: &Expr) -> bool {
+    inheritance_column_write(expr).is_some()
+}
+
+/// The literal `inheritance_column` write in `model`'s own body, the
+/// last one winning.
+fn own_inheritance_column(model: &crate::dialect::Model) -> Option<String> {
+    model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. }
+            | crate::dialect::ModelBodyItem::ClassBody { expr, .. } => inheritance_column_write(expr),
+            _ => None,
+        })
+        .last()
+}
+
+/// `model`'s inheritance column (a class attribute): its own literal
+/// setting or the nearest model ancestor's, else `type`. Empty when set
+/// to `nil`; a name the table lacks (`:_type_disabled`) disables STI
+/// just as well, since [`sti_bases`] asks the table for it.
+pub(crate) fn inheritance_column(model: &crate::dialect::Model, models: &[crate::dialect::Model]) -> String {
+    let mut cursor = Some(model);
+    for _ in 0..16 {
+        let Some(m) = cursor else { break };
+        if let Some(col) = own_inheritance_column(m) {
+            return col;
+        }
+        cursor = m.parent.as_ref().and_then(|p| models.iter().find(|o| &o.name == p));
+    }
+    INHERITANCE_COLUMN.to_string()
+}
+
+/// `def self.inheritance_column = "kind"` on a model that sets it (Ruby
+/// family, beside the default-scope class methods): what the runtime's
+/// `inheritance_column` reader (`Serialization`'s except) answers, the
+/// subclasses inheriting it.
+pub(crate) fn push_inheritance_column_method(methods: &mut Vec<MethodDef>, model: &crate::dialect::Model) {
+    let Some(col) = own_inheritance_column(model) else { return };
+    if methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "inheritance_column") {
+        return;
+    }
+    let mut body = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: col } });
+    body.ty = Some(Ty::Str);
+    methods.push(MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from("inheritance_column"),
+        receiver: MethodReceiver::Class,
+        params: Vec::new(),
+        body,
+        signature: None,
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    });
+}
+
+/// A model's subclass on a table with no inheritance column (no STI)
+/// loads as the relation's class, as Rails' `instantiate` does on its
+/// receiver: `MarkdownRule.first` is a `MarkdownRule`, with its methods.
+/// The model's synthesized loaders name the model (`Rule.from_stmt`,
+/// `Rule.new`); for a model with such subclasses they call through the
+/// receiver class instead, which a subclass's inherited loader is.
+/// Ruby family (`emit::ruby`, beside `apply_sti_hydration`): a strict
+/// target's subclass is no subtype to return. Models without plain
+/// subclasses are left byte-identical.
+pub(crate) fn apply_plain_subclass_hydration(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
+    let sti = sti_bases(app);
+    let models: HashSet<&ClassId> = app.models.iter().map(|m| &m.name).collect();
+    let mut plain: HashSet<ClassId> = HashSet::default();
+    // The subclasses are the app's library classes (as `sti_bases`
+    // reads them); `lcs` are the lowered models.
+    for lc in &app.library_classes {
+        if sti.contains_key(&lc.name) {
+            continue;
+        }
+        if let Some(parent) = lc.parent.as_ref().filter(|p| models.contains(p)) {
+            plain.insert(parent.clone());
+        }
+    }
+    if plain.is_empty() {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        if !plain.contains(&lc.name) {
+            continue;
+        }
+        let owner = lc.name.clone();
+        for m in &mut lc.methods {
+            if m.receiver != MethodReceiver::Class || !m.name_span.is_synthetic() {
+                continue;
+            }
+            let factory = matches!(m.name.as_str(), "from_stmt" | "from_row");
+            through_receiver(&mut m.body, &owner, factory);
+        }
+    }
+}
+
+/// `Owner.from_stmt(..)` / `Owner.from_row(..)` / `Owner.instantiate(..)`
+/// (and, inside a factory, `Owner.new(..)`) -> the implicit-self call.
+fn through_receiver(expr: &mut Expr, owner: &ClassId, factory: bool) {
+    expr.node.for_each_child_mut(&mut |c| through_receiver(c, owner, factory));
+    let ExprNode::Send { recv, method, .. } = &mut *expr.node else { return };
+    let loader = matches!(method.as_str(), "from_stmt" | "from_row" | "instantiate") || (factory && method.as_str() == "new");
+    if !loader {
+        return;
+    }
+    let names_owner = recv.as_ref().is_some_and(|r| match &*r.node {
+        ExprNode::Const { path } => {
+            path.iter().map(|s| s.as_str().trim_start_matches("::")).collect::<Vec<_>>().join("::") == owner.0.as_str()
+        }
+        _ => false,
+    });
+    if names_owner {
+        *recv = None;
+    }
+}
+
+/// Each STI class's inheritance column, keyed by the subclasses
+/// ([`sti_bases`]) and by their base models.
+pub(crate) fn sti_columns(app: &App) -> HashMap<ClassId, Symbol> {
+    let mut out: HashMap<ClassId, Symbol> = HashMap::default();
+    for (sub, base) in sti_bases(app) {
+        let Some(model) = app.models.iter().find(|m| m.name == base) else { continue };
+        let col = Symbol::from(inheritance_column(model, &app.models));
+        out.insert(sub, col.clone());
+        out.insert(base, col);
+    }
+    out
+}
+
+/// The inheritance column of `class` (an STI subclass or base), `type`
+/// when the map has none.
+fn column_of<'a>(cols: &'a HashMap<ClassId, Symbol>, class: &ClassId) -> &'a str {
+    cols.get(class).map(|c| c.as_str()).unwrap_or(INHERITANCE_COLUMN)
+}
+
 /// The synthesized recast entry point `becomes!` lowers to.
 const BECOMES_FROM: &str = "becomes_from";
 
@@ -160,19 +326,20 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
             super::default_scope::push_subclass_methods(lc);
         }
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &mut recast));
+    let cols = sti_columns(app);
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &cols, &mut recast));
     for view in &mut app.views {
-        rewrite(&mut view.body, &roots, &types, &mut recast);
+        rewrite(&mut view.body, &roots, &types, &cols, &mut recast);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &roots, &types, &mut recast);
+            rewrite(setup, &roots, &types, &cols, &mut recast);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &roots, &types, &mut recast);
+            rewrite(&mut t.body, &roots, &types, &cols, &mut recast);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &roots, &types, &mut recast);
+            rewrite(&mut m.body, &roots, &types, &cols, &mut recast);
         }
     }
     push_becomes_from(app, &bases, &recast);
@@ -245,6 +412,7 @@ fn push_becomes_from(app: &mut App, bases: &HashMap<ClassId, ClassId>, recast: &
         })
         .collect();
 
+    let sti_cols = sti_columns(app);
     for lc in &mut app.library_classes {
         if !recast.contains(&lc.name) {
             continue;
@@ -283,7 +451,7 @@ fn push_becomes_from(app: &mut App, bases: &HashMap<ClassId, ClassId>, recast: &
             if col.as_str() == "id" {
                 continue;
             }
-            let value = if col.as_str() == INHERITANCE_COLUMN {
+            let value = if col.as_str() == column_of(&sti_cols, base) {
                 // The stamp: a recast row belongs to the new subclass.
                 Expr::new(
                     Span::synthetic(),
@@ -446,13 +614,13 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
                 break;
             }
             if let Some(base) = model_named(&parent) {
-                let has_type = app
-                    .schema
-                    .tables
-                    .get(&base.table.0)
-                    .is_some_and(|t| {
-                        t.columns.iter().any(|c| c.name.as_str() == INHERITANCE_COLUMN)
-                    });
+                let column = inheritance_column(base, &app.models);
+                let has_type = !column.is_empty()
+                    && app
+                        .schema
+                        .tables
+                        .get(&base.table.0)
+                        .is_some_and(|t| t.columns.iter().any(|c| c.name.as_str() == column));
                 if has_type {
                     out.insert(lc.name.clone(), base.name.clone());
                 }
@@ -509,9 +677,10 @@ fn rewrite(
     expr: &mut Expr,
     bases: &HashMap<ClassId, ClassId>,
     types: &HashMap<ClassId, Vec<String>>,
+    cols: &HashMap<ClassId, Symbol>,
     recast: &mut HashSet<ClassId>,
 ) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, types, recast));
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, types, cols, recast));
     if rewrite_becomes(expr, bases, recast) {
         return;
     }
@@ -531,8 +700,9 @@ fn rewrite(
             .join("::"),
     ));
     let Some(_) = bases.get(&named) else { return };
+    let column = column_of(cols, &named).to_string();
     if constructing {
-        stamp_type(expr, &named);
+        stamp_type(expr, &named, &column);
         return;
     }
     let base = bases.get(&named).expect("checked above");
@@ -556,7 +726,7 @@ fn rewrite(
                         Expr::new(
                             span,
                             ExprNode::Lit {
-                                value: Literal::Sym { value: Symbol::from(INHERITANCE_COLUMN) },
+                                value: Literal::Sym { value: Symbol::from(column.as_str()) },
                             },
                         ),
                         type_value(span, &named, types),
@@ -662,14 +832,14 @@ fn const_class_id(path: &[Symbol]) -> ClassId {
 /// (a params object, a variable) is left alone, because there is no
 /// literal to fold into and building a `merge` here would hand the
 /// constructor a shape it does not take.
-fn stamp_type(expr: &mut Expr, sub: &ClassId) {
+fn stamp_type(expr: &mut Expr, sub: &ClassId, column: &str) {
     let span = expr.span;
     let ExprNode::Send { args, .. } = &mut *expr.node else { return };
     let Some(attrs) = args.last_mut() else { return };
     let ExprNode::Hash { entries, .. } = &mut *attrs.node else { return };
     let already = entries.iter().any(|(k, _)| {
         matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
-            if value.as_str() == INHERITANCE_COLUMN)
+            if value.as_str() == column)
     });
     if already {
         return;
@@ -677,7 +847,7 @@ fn stamp_type(expr: &mut Expr, sub: &ClassId) {
     entries.push((
         Expr::new(
             span,
-            ExprNode::Lit { value: Literal::Sym { value: Symbol::from(INHERITANCE_COLUMN) } },
+            ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column) } },
         ),
         Expr::new(
             span,
