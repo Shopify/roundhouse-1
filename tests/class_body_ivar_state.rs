@@ -93,14 +93,30 @@ fn a_class_body_ivar_write_is_a_class_side_initializer() {
 }
 
 #[test]
-fn a_later_constant_reading_the_ivar_is_refused_not_reordered() {
+fn a_later_constant_reading_the_ivar_is_ordered_or_refused_not_reordered() {
+    // A body the emit can keep in source order writes the snapshot
+    // after the state it reads.
     let source = "module Registry\n  @items = []\n  SNAPSHOT = @items.dup\n  def self.items = @items\nend\n";
-    let err = module_named(source, "Registry").expect_err("refused");
-    assert!(format!("{err:?}").contains("source-order initialization"), "{err:?}");
+    let lc = module_named(source, "Registry").expect("ingest");
+    assert_eq!(lc.class_ivar_initializers.len(), 1);
+    let src = emitted("app/models/registry.rb", source);
+    let items = src.find("@items = []").unwrap_or_else(|| panic!("{src}"));
+    let snapshot = src.find("SNAPSHOT = ").unwrap_or_else(|| panic!("{src}"));
+    assert!(items < snapshot, "{src}");
     // A later constant that does not read class state keeps the module.
     let fine = "module Registry\n  @items = []\n  LIMIT = 3\n  def self.items = @items\nend\n";
     let lc = module_named(fine, "Registry").expect("ingest");
     assert_eq!(lc.class_ivar_initializers.len(), 1);
+    // One whose replayed DSL keeps the constants first is refused by
+    // name rather than emitted reading the state before its write.
+    let replayed = "class Plugin < Gem::Base\n  configure :early\n  @hooks = []\n  SNAPSHOT = @hooks.dup\nend\n";
+    let (src, diagnostics) = roundhouse::emit::diagnostics::scope(|| emitted("app/models/plugin.rb", replayed));
+    assert!(
+        diagnostics.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error
+            && d.message.contains("Plugin::SNAPSHOT")
+            && d.message.contains("source-order initialization")),
+        "{diagnostics:?}\n{src}"
+    );
 }
 
 #[test]

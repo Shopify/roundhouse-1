@@ -7881,8 +7881,24 @@ fn emit_library_class_decl_inner(
     // bodies' constant refs into LOAD time with it — `Sound::BUILTIN`
     // calls `initialize`, which reads `Sound::Image`. Those refs would
     // otherwise be classified body-only and left to the aggregator.
-    let (eager, deferred) = partition_deferred_constants(lc, app);
-    let load_time_bodies = !deferred.is_empty();
+    let (mut eager, mut deferred, initializers_call_self) = partition_deferred_constants(lc, app);
+    // State the source body writes on the class object (`@value = 1`,
+    // `@value ||= 7`) is read by the constants, calls and defs between
+    // its writes (`FIRST = @value`), so a body simple enough to keep in
+    // source order (`ordered_class_state`) writes its constants, state
+    // writes and defs in that order (`state_body` below), not constants,
+    // then state, then defs. Every constant is then written where the
+    // source has it, after the defs above it; one that calls them, or an
+    // initializer that does, runs those method bodies at load.
+    let ordered_state = ordered_class_state(lc, app);
+    let load_time_bodies = !deferred.is_empty() || (ordered_state && initializers_call_self);
+    if ordered_state {
+        eager = (0..lc.constants.len()).collect();
+        deferred.clear();
+    } else {
+        refuse_unordered_class_state(lc);
+    }
+    let (eager, deferred) = (eager, deferred);
 
     // Parent + body-derived `require_relative` headers. Helpers return
     // project-root-anchored paths; we relpath each one against `out_dir`
@@ -8055,8 +8071,9 @@ fn emit_library_class_decl_inner(
     for &i in &deferred {
         body_requires.extend(resolve_all(&lc.constants[i].1, true));
     }
-    // A class-variable initializer runs at load, after the constants.
-    for init in &lc.class_ivar_initializers {
+    // A class-variable initializer runs at load, after the constants
+    // (an ordered body's go with its constants, below).
+    for init in lc.class_ivar_initializers.iter().filter(|_| !ordered_state) {
         body_requires.extend(resolve_all(init, true));
     }
     for m in &lc.methods {
@@ -8081,9 +8098,55 @@ fn emit_library_class_decl_inner(
     // looks at this class's constants is churn (lobsters' `Markdowner`
     // requiring `user`), so the trigger is a required file whose own
     // load-time code reads one of the constants above it.
-    let per_const: Vec<BTreeSet<String>> =
-        eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect();
+    //
+    // An ordered body (`ordered_class_state`) runs its constants, state
+    // writes and defs in source order (`state_body`), and splits before
+    // each constant or state write that first needs a file reading an
+    // earlier constant, requiring only what that item needs: a later
+    // dependency waits for its own use, as Rails' autoload has it.
+    let state_body: Vec<StateItem> = if ordered_state { ordered_state_items(lc, &eager) } else { Vec::new() };
+    let mut state_splits: std::collections::BTreeMap<usize, BTreeSet<String>> = std::collections::BTreeMap::new();
+    let per_const: Vec<BTreeSet<String>> = if ordered_state {
+        Vec::new()
+    } else {
+        eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect()
+    };
     let readers = constant_readers(lc, app, &resolve);
+    if ordered_state {
+        let per_body: Vec<BTreeSet<String>> = state_body
+            .iter()
+            .map(|item| match item {
+                StateItem::Constant(i) => resolve_all(&lc.constants[*i].1, true),
+                StateItem::Initializer(i) => resolve_all(&lc.class_ivar_initializers[*i], true),
+                StateItem::Method(_) => BTreeSet::new(),
+            })
+            .collect();
+        for p in 1..per_body.len() {
+            let mut before: BTreeSet<String> = body_requires.clone();
+            before.extend(requires.iter().cloned());
+            for q in &per_body[..p] {
+                before.extend(q.iter().cloned());
+            }
+            let earlier: BTreeSet<&String> = state_body[..p]
+                .iter()
+                .filter_map(|item| match item {
+                    StateItem::Constant(i) => readers.get(lc.constants[*i].0.as_str()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            if per_body[p].iter().any(|r| !before.contains(r) && earlier.contains(r)) {
+                let needed: BTreeSet<String> = per_body[p].iter().filter(|r| !before.contains(*r)).cloned().collect();
+                state_splits.insert(p, needed);
+            }
+        }
+        let split_requires: BTreeSet<&String> = state_splits.values().flatten().collect();
+        for r in per_body.iter().flatten() {
+            if !split_requires.contains(r) {
+                body_requires.insert(r.clone());
+            }
+        }
+    }
     let mut split: Option<(usize, BTreeSet<String>)> = None;
     // A factory class cannot reopen: its header builds the class.
     let factory_class = matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }));
@@ -8663,9 +8726,36 @@ fn emit_library_class_decl_inner(
             }
         }
     };
-    match &split {
-        Some((at, reqs)) => {
-            render_constants(&mut s, &eager[..*at]);
+    // An ordered body's constants, state writes and defs, in source
+    // order, each nested class the source has above one written first.
+    let render_state = |s: &mut String, items: &[StateItem]| {
+        for item in items {
+            let at = match item {
+                StateItem::Constant(i) => {
+                    render_constants(s, &[*i]);
+                    continue;
+                }
+                StateItem::Initializer(i) => lc.class_ivar_initializers[*i].span,
+                StateItem::Method(i) => lc.methods[*i].name_span,
+            };
+            NestedPlacement::place(&lc.name, s, |kid| kid.file == at.file && kid.start < at.start);
+            match item {
+                StateItem::Initializer(i) => {
+                    write_body_lines(s, &body_pad, &super::emit_expr(&lc.class_ivar_initializers[*i]));
+                }
+                StateItem::Method(i) => {
+                    writeln!(s).unwrap();
+                    write_library_method(s, lc, *i, &body_pad, &instance_form);
+                    writeln!(s).unwrap();
+                }
+                StateItem::Constant(_) => {}
+            }
+        }
+    };
+    if ordered_state {
+        let mut start = 0;
+        for (at, reqs) in &state_splits {
+            render_state(&mut s, &state_body[start..*at]);
             for i in (0..depth).rev() {
                 writeln!(s, "{}end", "  ".repeat(i)).unwrap();
             }
@@ -8675,10 +8765,35 @@ fn emit_library_class_decl_inner(
             }
             writeln!(s).unwrap();
             open_header(&mut s);
-            render_constants(&mut s, &eager[*at..]);
+            start = *at;
         }
-        None => render_constants(&mut s, &eager),
+        render_state(&mut s, &state_body[start..]);
+    } else {
+        match &split {
+            Some((at, reqs)) => {
+                render_constants(&mut s, &eager[..*at]);
+                for i in (0..depth).rev() {
+                    writeln!(s, "{}end", "  ".repeat(i)).unwrap();
+                }
+                writeln!(s).unwrap();
+                for r in reqs {
+                    writeln!(s, "require_relative {r:?}").unwrap();
+                }
+                writeln!(s).unwrap();
+                open_header(&mut s);
+                render_constants(&mut s, &eager[*at..]);
+            }
+            None => render_constants(&mut s, &eager),
+        }
     }
+    // The defs an ordered body wrote above.
+    let written_in_state: Vec<usize> = state_body
+        .iter()
+        .filter_map(|item| match item {
+            StateItem::Method(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
     // One below every eagerly written constant: after them, unless a
     // constant written after the methods is above it too.
     NestedPlacement::place(&lc.name, &mut s, |kid| {
@@ -8715,8 +8830,10 @@ fn emit_library_class_decl_inner(
         .filter(|m| m.receiver == crate::dialect::MethodReceiver::Class)
         .map(|m| &m.name)
         .collect();
-    // The seeds written at their include (`carried_seed`) are not here.
-    let own_inits: Vec<&Expr> = lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).collect();
+    // The seeds written at their include (`carried_seed`) are not here,
+    // nor an ordered body's state, written with its constants above.
+    let own_inits: Vec<&Expr> =
+        lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).filter(|_| !ordered_state).collect();
     let late_at = own_inits
         .iter()
         .position(|init| is_self_call(init) || calls_own_class_method(init, &own_class_methods))
@@ -8866,6 +8983,10 @@ fn emit_library_class_decl_inner(
                 }
                 write_include(&mut s, inc, false);
             }
+            continue;
+        }
+        // Written in an ordered body's source order (`state_body`).
+        if written_in_state.contains(&index) {
             continue;
         }
         let conditional = lc.conditional_definitions.iter().position(|c| c.contains(m));
@@ -10053,7 +10174,9 @@ fn included_hook_may_define(module: &LibraryClass, method: &str) -> bool {
 /// SPELLED WITH THE CLASS NAME (`Sound.new(…)`) — or when it reads a
 /// constant that already deferred. A self-dispatch inside a STORED
 /// closure doesn't count: that body runs on call, not on load. Returns
-/// index lists so both groups keep source order.
+/// index lists so both groups keep source order, and whether a
+/// class-ivar initializer dispatches to this class the same way (its
+/// method bodies then run at load too).
 ///
 /// The class-name spelling is not hypothetical: `lower::class_body_new`
 /// gives a class body's bare `new` its receiver (a receiverless call is
@@ -10065,7 +10188,7 @@ fn included_hook_may_define(module: &LibraryClass, method: &str) -> bool {
 /// suite's 52 files. The fact the rule is about is "does this
 /// initializer dispatch to this class", and both spellings are that
 /// fact.
-fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Vec<usize>) {
+fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Vec<usize>, bool) {
     fn is_own_class(recv: &Option<Expr>, class_name: &str) -> bool {
         let Some(r) = recv else { return false };
         if matches!(&*r.node, ExprNode::SelfRef) { return true; }
@@ -10264,7 +10387,124 @@ fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Ve
             eager.push(i);
         }
     }
-    (eager, deferred)
+    let initializers_call_self = lc
+        .class_ivar_initializers
+        .iter()
+        .any(|init| calls_self(init, &own, &deferred_names, lc.name.0.as_str()));
+    (eager, deferred, initializers_call_self)
+}
+
+/// One statement of a body written in source order (`ordered_class_state`):
+/// a constant, a class-ivar initializer or a def, by index.
+#[derive(Clone, Copy)]
+enum StateItem {
+    Constant(usize),
+    Initializer(usize),
+    Method(usize),
+}
+
+/// A class-body write to the class object's own state: `@x = v`,
+/// `@x ||= v`, `@x &&= v`, `@x += v` (`ingest::library_class::
+/// with_class_body_ivar_writes`).
+fn is_class_state_write(expr: &Expr) -> bool {
+    matches!(&*expr.node,
+        ExprNode::Assign { target: crate::expr::LValue::Ivar { .. }, .. }
+            | ExprNode::OpAssign { target: crate::expr::LValue::Ivar { .. }, .. })
+}
+
+/// Whether `lc`'s body is written in source order: its constants, its
+/// class-ivar initializers and its defs interleaved as the source has
+/// them, instead of constants, then initializers, then defs. Ruby runs a
+/// class body top to bottom, and state the body writes on the class
+/// object (`@value = 1` … `FIRST = @value` … `@value = 2`) is read by
+/// what stands between the writes: a constant snapshot, a class method
+/// a later constant calls, an accessor a `class << self` redefines.
+///
+/// Only a body whose every one of those statements has a real position
+/// in one file and that has no other statement whose placement the emit
+/// decides separately: no replayed or modelled class-body calls, body
+/// statements, load-time conditional definitions, positioned or late
+/// includes, or Concern-carried attributes and `included do` statements.
+/// Lowered classes keep their own policy: a model, a controller (whose
+/// Concern methods carry another file's spans), a factory class, a
+/// railtie. Every other body keeps the constants-first order, and one
+/// that state makes wrong is refused (`refuse_unordered_class_state`).
+fn ordered_class_state(lc: &LibraryClass, app: &App) -> bool {
+    let Some(first) = lc.class_ivar_initializers.iter().find(|e| is_class_state_write(e) && !e.span.is_synthetic()) else {
+        return false;
+    };
+    let file = first.span.file;
+    let here = |span: &Span| !span.is_synthetic() && span.file == file;
+    lc.origin.is_none()
+        && !app.models.iter().any(|m| m.name == lc.name)
+        && !app.controllers.iter().any(|c| c.name == lc.name)
+        && !carried_railtie(lc, app)
+        && !replays_foreign_class_body(lc, app)
+        && modelled_class_body_calls(lc, app).is_empty()
+        && !lc.unknown_calls.iter().any(is_body_statement)
+        && lc.conditional_definitions.is_empty()
+        && app.included_class_attributes.get(&lc.name).is_none_or(|groups| groups.is_empty())
+        && app.included_block_statements.get(&lc.name).is_none_or(|statements| statements.is_empty())
+        && lc.includes.iter().all(|inc| hooked_include_position(lc, inc, app).is_none())
+        && late_includes(lc, app, &[]).is_empty()
+        && lc.class_ivar_initializers.iter().all(|e| here(&e.span))
+        && lc.constants.iter().all(|(_, value)| here(&value.span))
+        && lc.methods.iter().all(|m| m.name_span.is_synthetic() || here(&m.name_span))
+}
+
+/// An ordered body's statements (`ordered_class_state`) in source order:
+/// every constant, every initializer, and every def with a source
+/// position (a synthesized one, and an alias of an inherited method,
+/// follow with the rest of the defs).
+fn ordered_state_items(lc: &LibraryClass, eager: &[usize]) -> Vec<StateItem> {
+    let mut items: Vec<(u32, StateItem)> =
+        eager.iter().map(|&i| (lc.constants[i].1.span.start, StateItem::Constant(i))).collect();
+    items.extend(lc.class_ivar_initializers.iter().enumerate().map(|(i, e)| (e.span.start, StateItem::Initializer(i))));
+    items.extend(
+        lc.methods
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.name_span.is_synthetic() && inherited_alias(lc, m).is_none())
+            .map(|(i, m)| (m.name_span.start, StateItem::Method(i))),
+    );
+    // Stable: the accessors one `attr_accessor` declares share its position.
+    items.sort_by_key(|(start, _)| *start);
+    items.into_iter().map(|(_, item)| item).collect()
+}
+
+/// A body that writes class state but is not written in source order
+/// (`ordered_class_state`) writes its constants before that state: a
+/// constant the source has below a state write, and that reads an
+/// instance variable, would read the state before the write. Refused by
+/// name rather than emitted reading `nil`.
+fn refuse_unordered_class_state(lc: &LibraryClass) {
+    let Some(first) = lc.class_ivar_initializers.iter().filter(|e| is_class_state_write(e) && !e.span.is_synthetic()).map(|e| e.span).min_by_key(|span| span.start) else {
+        return;
+    };
+    for (name, value) in &lc.constants {
+        if value.span.is_synthetic() || value.span.file != first.file || value.span.start < first.start {
+            continue;
+        }
+        if crate::ingest::library_class::reads_instance_variable(value) {
+            let mut diagnostic = crate::lower::residue_diagnostic(
+                "library_class_body",
+                name.as_str(),
+                value.span,
+                "class state order",
+                format!(
+                    "`{}::{}` reads an instance variable after a class-level instance-variable write, \
+                     which requires source-order initialization; the other statements of the body of `{}` \
+                     (replayed calls, includes, conditional definitions, or lowered framework members) keep it \
+                     from being written in source order",
+                    lc.name.0.as_str(),
+                    name.as_str(),
+                    lc.name.0.as_str(),
+                ),
+            );
+            diagnostic.severity = crate::diagnostic::Severity::Error;
+            crate::emit::diagnostics::push(diagnostic);
+        }
+    }
 }
 
 /// Project-root-anchored require target for a parent class, if one is needed.

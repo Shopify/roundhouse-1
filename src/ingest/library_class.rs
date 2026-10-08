@@ -2334,43 +2334,31 @@ fn concerning_modules(
 }
 
 /// A class or module body's own instance-variable writes (`@registry =
-/// {} #: Hash[String, bool]`, Core's ModelUuidColumns), appended to the
-/// body's class-side initializers. They set the ivar on the class or
-/// module object itself, which its `def self.` methods then read; the
-/// walk used to drop them without a word, so the first `@registry << x`
-/// met nil.
+/// {} #: Hash[String, bool]`, Core's ModelUuidColumns; `@cache ||= {}`,
+/// `@count += 1`), appended to the body's class-side initializers. They
+/// set the ivar on the class or module object itself, which its `def
+/// self.` methods then read; the walk used to drop them without a word,
+/// so the first `@registry << x` met nil.
 ///
-/// The emitted body writes them after its constants, so a constant the
-/// source wrote after one of them and whose value reads an instance
-/// variable is refused rather than reordered. A class that replays its
-/// DSL interleaves the replayed calls with these writes by source
-/// position (`emit::ruby::library`). Writes inside `class << self`,
-/// blocks and methods are not this body's and stay where they are.
+/// The emitted body writes them in source order with its constants and
+/// defs when it can (`emit::ruby::library::ordered_class_state`: a
+/// constant between two writes reads the state the source gave it);
+/// one whose other statements keep that order from being written is
+/// refused there by name. Writes inside `class << self`, blocks and
+/// methods are not this body's and stay where they are.
 fn with_class_body_ivar_writes(
     mut initializers: Vec<Expr>,
     body: Option<ruby_prism::Node<'_>>,
     file: &str,
 ) -> IngestResult<Vec<Expr>> {
     let Some(body) = body else { return Ok(initializers) };
-    let mut seen_write = false;
     for stmt in flatten_statements(body) {
         if stmt.as_instance_variable_write_node().is_some()
             || stmt.as_instance_variable_or_write_node().is_some()
+            || stmt.as_instance_variable_and_write_node().is_some()
+            || stmt.as_instance_variable_operator_write_node().is_some()
         {
             initializers.push(ingest_expr(&stmt, file)?);
-            seen_write = true;
-            continue;
-        }
-        if !seen_write {
-            continue;
-        }
-        if let Some(constant) = stmt.as_constant_write_node() {
-            if reads_instance_variable(&ingest_expr(&constant.value(), file)?) {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "a constant reading an instance variable after a class-level instance-variable write requires source-order initialization".into(),
-                });
-            }
         }
     }
     Ok(initializers)
@@ -2426,7 +2414,7 @@ fn constant_multi_write<'a>(stmt: &ruby_prism::Node<'a>) -> Option<Vec<(Symbol, 
     Some(names.into_iter().map(Symbol::from).zip(elements).collect())
 }
 
-fn reads_instance_variable(expr: &Expr) -> bool {
+pub(crate) fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
     }
@@ -2555,7 +2543,17 @@ fn discarded_in<'pr>(node: &ruby_prism::Node<'pr>, file: &str, out: &mut Vec<(ru
     } else {
         return;
     };
+    // A class or module body's own compound ivar writes are its
+    // initializers (`with_class_body_ivar_writes`); a `class << self`
+    // body's write the singleton class's state, which nothing carries.
+    let state_writes_carried = node.as_singleton_class_node().is_none();
     for statement in body.map(flatten_statements).unwrap_or_default() {
+        if state_writes_carried
+            && (statement.as_instance_variable_operator_write_node().is_some()
+                || statement.as_instance_variable_and_write_node().is_some())
+        {
+            continue;
+        }
         if let Some(why) = discarded_why(file, &statement) {
             out.push((statement, why));
         } else {
