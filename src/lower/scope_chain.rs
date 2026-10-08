@@ -2057,6 +2057,34 @@ pub fn mentions_bare_chain_start(expr: &Expr) -> bool {
     found
 }
 
+/// Does `expr` call `all` / `where` / `find_by` on `model` through the
+/// receiver ingest's `qualify_model_class_method_ar_calls` wrote for a
+/// bare call (its span is the whole call's)? Such a body in the model's
+/// own class method roots on `self` (`rewrite_send`).
+pub fn mentions_implicit_self_query(expr: &Expr, model: &ClassId) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, model: &ClassId, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ExprNode::Send { recv: Some(r), method, .. } = &*e.node {
+            if let ExprNode::Const { path } = &*r.node {
+                let named = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                if named == model.0.as_str()
+                    && (r.span.is_synthetic() || r.span == e.span)
+                    && matches!(method.as_str(), "all" | "where" | "find_by")
+                {
+                    *found = true;
+                    return;
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, model, found));
+    }
+    walk(expr, model, &mut found);
+    found
+}
+
 /// Relation methods that return a Relation — calls on them stay on the
 /// receiver and the chain keeps its model. Terminals / Enumerable methods
 /// (`to_a`/`first`/`map`/`pluck`/…) are deliberately absent: they end the
@@ -3351,7 +3379,9 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
         // …and in a model's own class method, the `Asset.where(…)` /
         // `Asset.all` that `qualify_model_class_method_ar_calls` wrote
         // (the author wrote bare `where(…)`) is the implicit self too,
-        // so it seeds on `self` like the bare form. That receiver was
+        // so it seeds on `self` like the bare form (a `find_by` stays
+        // bare on the CRuby/JRuby trees: the runtime's class-level
+        // `find_by` runs on `self`'s relation). That receiver was
         // synthetic, and span filling gives it the whole call's span —
         // which an author-written `Asset.where` constant, a strict
         // sub-range of its call, never has; that one keeps its constant.
@@ -3359,7 +3389,8 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             if ctx.class_self_is_self
                 && ctx.scope_body.is_none()
                 && (r.span.is_synthetic() || r.span == span)
-                && (method.as_str() == "all" || method.as_str() == "where")
+                && (matches!(method.as_str(), "all" | "where")
+                    || (method.as_str() == "find_by" && crate::emit::ruby::native_keywords()))
                 && ctx
                     .class_self
                     .as_ref()

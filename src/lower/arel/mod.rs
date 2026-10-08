@@ -90,6 +90,30 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     ruby_read_values: bool,
     dialect: SqlDialect,
 ) -> bool {
+    rewrite_arel_in_method_with_ruby_values(expr, schema, registry, assocs, ruby_read_values, dialect, None)
+}
+
+/// As [`rewrite_arel_in_expr_with_ruby_values`] for a method body;
+/// `class_self` is the model when the body is that model's own class
+/// method. There, on the Ruby family, a fold whose root is the implicit
+/// self that ingest's `qualify_model_class_method_ar_calls` spelled with
+/// the constant (bare `all.to_a` → `Asset.all.to_a`) hydrates through
+/// `self.from_stmt`, as Rails' `Querying` loads `self.all`:
+/// `Asset.everything` reached as `BigAsset.everything` answers
+/// BigAssets. Same SQL; CRuby/JRuby trees only.
+pub(crate) fn rewrite_arel_in_method_with_ruby_values(
+    expr: &mut Expr,
+    schema: &Schema,
+    registry: &HashMap<ClassId, ClassInfo>,
+    assocs: &[crate::lower::model_associations::AssociationEdge],
+    ruby_read_values: bool,
+    dialect: SqlDialect,
+    class_self: Option<&ClassId>,
+) -> bool {
+    // The CRuby/JRuby trees only: spinel and the strict targets keep
+    // their output byte-identical.
+    let implicit_self =
+        class_self.filter(|_| ruby_read_values && crate::emit::ruby::native_keywords());
     // Names (ivars/locals) the body later refines with relation-chain
     // methods (`@moderations.where(...)` after `@moderations =
     // Moderation.all...`). Materializing the assigned chain here would
@@ -97,7 +121,7 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
     // runtime Relation path.
     let mut refined = crate::det::HashSet::default();
     collect_relation_refined_names(expr, &mut refined);
-    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, dialect);
+    let mut changed = rewrite_arel_inner(expr, schema, registry, assocs, &refined, ruby_read_values, implicit_self, dialect);
     // Both call sites hand us a METHOD BODY, and a body that is a
     // single statement is not a `Seq` — so the hoist post-pass inside
     // `rewrite_arel_inner`, which walks a Seq's statement list, had no
@@ -128,6 +152,37 @@ pub(crate) fn rewrite_arel_in_expr_with_ruby_values(
         }
     }
     changed
+}
+
+/// The chain's root is a `Model` constant that ingest wrote for an
+/// implicit-self call: span filling gave that synthetic receiver its
+/// whole call's span, which an author-written constant (a strict
+/// sub-range of its call) never has.
+fn rooted_on_implicit_self(expr: &Expr, owner: &ClassId) -> bool {
+    let mut cur = expr;
+    loop {
+        let ExprNode::Send { recv: Some(r), .. } = &*cur.node else { return false };
+        if let ExprNode::Const { path } = &*r.node {
+            let named = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            return named == owner.0.as_str() && (r.span.is_synthetic() || r.span == cur.span);
+        }
+        cur = r;
+    }
+}
+
+/// `Owner.from_stmt(stmt)` → `self.from_stmt(stmt)` in a folded body.
+fn hydrate_through_self(expr: &mut Expr, owner: &ClassId) {
+    if let ExprNode::Send { recv: Some(r), method, .. } = &mut *expr.node {
+        if method.as_str() == "from_stmt" {
+            if let ExprNode::Const { path } = &*r.node {
+                let named = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                if named == owner.0.as_str() {
+                    *r = Expr::new(r.span, ExprNode::SelfRef);
+                }
+            }
+        }
+    }
+    expr.node.for_each_child_mut(&mut |c| hydrate_through_self(c, owner));
 }
 
 const RELATION_REFINERS: &[&str] = &[
@@ -222,6 +277,7 @@ fn rewrite_arel_inner(
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &crate::det::HashSet<crate::ident::Symbol>,
     ruby_read_values: bool,
+    implicit_self: Option<&ClassId>,
     dialect: SqlDialect,
 ) -> bool {
     if let ExprNode::Assign { target, .. } = expr.node.as_ref() {
@@ -245,6 +301,13 @@ fn rewrite_arel_inner(
                 ruby_values::normalize(&mut op, schema);
             }
             let mut replacement = dialect.visit(&op, schema, &owner);
+            if implicit_self == Some(&owner) && rooted_on_implicit_self(expr, &owner) {
+                let preloads_self = matches!(&op, ArelOp::Select(sel)
+                    if sel.preloads.iter().any(|p| p.target_class == owner));
+                if !preloads_self {
+                    hydrate_through_self(&mut replacement, &owner);
+                }
+            }
             // The expansion replaces the recognized chain wholesale;
             // its provenance is the chain call site. Subtrees the
             // builder lifted out of the chain (predicate values, …)
@@ -278,15 +341,15 @@ fn rewrite_arel_inner(
         let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else {
             unreachable!("matched Send with recv above");
         };
-        let mut changed = rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, dialect);
+        let mut changed = rewrite_arel_spine_args(recv, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect);
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, dialect);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect);
         }
         return changed;
     }
     let mut changed = false;
     walk_subexprs_mut(expr, &mut |e| {
-        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, dialect)
+        changed |= rewrite_arel_inner(e, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect)
     });
     // Post-pass: when an Arel rewrite landed a multi-stmt hydrate Seq
     // in a *value* position — directly as an Assign value
@@ -319,18 +382,19 @@ fn rewrite_arel_spine_args(
     assocs: &[crate::lower::model_associations::AssociationEdge],
     refined: &crate::det::HashSet<crate::ident::Symbol>,
     ruby_read_values: bool,
+    implicit_self: Option<&ClassId>,
     dialect: SqlDialect,
 ) -> bool {
     let mut changed = false;
     if let ExprNode::Send { recv, args, block, .. } = &mut *expr.node {
         if let Some(r) = recv {
-            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, dialect);
+            changed |= rewrite_arel_spine_args(r, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect);
         }
         for a in args {
-            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, dialect);
+            changed |= rewrite_arel_inner(a, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect);
         }
         if let Some(b) = block {
-            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, dialect);
+            changed |= rewrite_arel_inner(b, schema, registry, assocs, refined, ruby_read_values, implicit_self, dialect);
         }
     }
     changed
