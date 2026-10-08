@@ -5,10 +5,8 @@
 //! `rescue Missing` checked clean and the emitted test failed with a
 //! `NameError` instead.
 //!
-//! Two kinds of name resolve in the emitted test where the resolver has
-//! no class for them:
-//!
-//! - A namespaced constant the Ruby-family test harness declares
+//! One kind of name resolves in the emitted test where the resolver has
+//! no class for it: a namespaced constant the Ruby-family test harness declares
 //!   (`runtime/spinel/test/test_helper.rb`: `ActiveSupport::Notifications`,
 //!   `ActiveSupport::Cache::MemoryStore`), read by exactly that path, and
 //!   not bound first to an app namespace around the test. The harness's
@@ -16,15 +14,10 @@
 //!   test naming one stays refused. Only the Ruby-family targets emit
 //!   this harness: `project` refuses each such read on a target whose
 //!   emitted harness does not declare it.
-//! - A class a test class, or a test class it inherits from, declares in
-//!   its body. The emit hoists it to file scope under its own name
-//!   (`emit::ruby`, inner classes), while the resolver answers the
-//!   lexical `WidgetTest::Local` no registry carries. A bare read of
-//!   exactly that name reaches the hoisted class unless an app namespace
-//!   of the same name is found first from the test's modules, or is
-//!   reopened by the hoist (`Shop::Late` for `module Shop`, `Late`).
-//!   A qualified read whose first segment is such a class reaches what
-//!   that class nests (`Local::Kind`), hoisted with it.
+//!
+//! A class a test class declares in its body is no such name: it is
+//! the test class's constant (`WidgetTest::Local`), registered and
+//! emitted under that name, which the resolver answers.
 
 use crate::det::HashSet;
 use std::sync::OnceLock;
@@ -84,16 +77,14 @@ pub(crate) fn is_harness_namespace(name: &str) -> bool {
     harness_namespaces().contains(name)
 }
 
-struct Scope<'a> {
-    /// Inner classes of the test class and the test classes it inherits from.
-    hoisted: Vec<&'a str>,
+struct Scope {
     /// The modules around the test class, innermost first (`Shop`).
     enclosing: Vec<String>,
     /// The test class's own path (`Shop::WidgetTest`).
     own: String,
 }
 
-impl Scope<'_> {
+impl Scope {
     /// Ruby binds a qualified read's first segment lexically: an app
     /// namespace of that name in the test class or a module around it
     /// (`Shop::ActiveSupport`) is what the read reaches, not the harness.
@@ -102,32 +93,17 @@ impl Scope<'_> {
             && !std::iter::once(&self.own).chain(&self.enclosing)
                 .any(|module| app_namespace(&format!("{module}::{}", written[0])))
     }
-
-    fn reaches_hoisted(&self, name: &str, app_namespace: &dyn Fn(&str) -> bool) -> bool {
-        self.hoisted.contains(&name)
-            && !app_namespace(name)
-            && !self.enclosing.iter().any(|module| app_namespace(&format!("{module}::{name}")))
-    }
 }
 
-fn scope<'a>(app: &'a App, module: &'a TestModule) -> Scope<'a> {
-    let mut hoisted = Vec::new();
-    let mut current = Some(module);
-    for _ in 0..32 {
-        let Some(tm) = current else { break };
-        hoisted.extend(tm.inner_classes.iter().map(|inner| inner.name.0.as_str()));
-        current = tm.parent.as_ref()
-            .and_then(|parent| app.test_modules.iter().find(|other| other.name == *parent && other.name != tm.name));
-    }
+fn scope(module: &TestModule) -> Scope {
     let segments: Vec<&str> = module.name.0.as_str().split("::").collect();
     let enclosing = (1..segments.len()).rev().map(|n| segments[..n].join("::")).collect();
-    Scope { hoisted, enclosing, own: module.name.0.as_str().to_string() }
+    Scope { enclosing, own: module.name.0.as_str().to_string() }
 }
 
-fn collect(expr: &Expr, scope: &Scope<'_>, app_namespace: &dyn Fn(&str) -> bool, out: &mut Found) {
+fn collect(expr: &Expr, scope: &Scope, app_namespace: &dyn Fn(&str) -> bool, out: &mut Found) {
     if let Some(DiagnosticKind::Unsupported { target, construct, detail }) = &expr.diagnostic {
         let provided = match &*expr.node {
-            ExprNode::Const { path } if path.len() == 1 => scope.reaches_hoisted(path[0].as_str(), app_namespace),
             ExprNode::Const { path } => {
                 let rooted = path[0].as_str().is_empty();
                 let written: Vec<&str> = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect();
@@ -139,14 +115,7 @@ fn collect(expr: &Expr, scope: &Scope<'_>, app_namespace: &dyn Fn(&str) -> bool,
                 if harness && construct.as_str() == "constant" {
                     out.harness.push((expr.span, written.join("::")));
                 }
-                // `TestClass::Subclass`, both declared in the test body:
-                // the first segment binds to the hoisted class, which
-                // carries the rest under the same path.
-                let hoisted = !rooted
-                    && written.len() > 1
-                    && scope.reaches_hoisted(written[0], app_namespace)
-                    && scope.hoisted.contains(&written.join("::").as_str());
-                harness || hoisted
+                harness
             }
             _ => false,
         };
@@ -179,7 +148,7 @@ fn walk(app: &App) -> Found {
     let app_namespace = |name: &str| resolver.has_source_namespace(name);
     let mut out = Found::default();
     for module in &app.test_modules {
-        let scope = scope(app, module);
+        let scope = scope(module);
         for (_, value) in &module.constants {
             collect(value, &scope, &app_namespace, &mut out);
         }

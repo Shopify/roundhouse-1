@@ -8746,25 +8746,39 @@ fn a_test_base_subclassing_its_outer_namesake_keeps_it() {
         .assert_passes();
 }
 
-/// A test class's inner class is hoisted to file scope under its own
-/// name. Where an app class of that name is found first from the test's
-/// module (`Shop::Late`), or is reopened by the hoist (`Report`), the
-/// bare read does not reach it: refused at the name.
+/// A test class's inner class is the test class's constant
+/// (`WidgetTest::Report`), as in Ruby, also where the app has a class
+/// of the same name (`Report`), or one the test's module finds first
+/// (`Shop::Late`). Hoisted under its bare name, it reopened that class,
+/// and the read was refused; written nested, both stay apart.
 #[test]
-fn an_inner_class_hoisted_over_an_app_class_is_refused() {
-    use roundhouse::project::BuildTarget;
-    for (model_path, model, test, name) in [
+fn an_inner_class_named_like_an_app_class_stays_apart() {
+    for (model_path, model, test, inner, app_class) in [
         ("app/models/report.rb", "class Report\n  def self.kind\n    \"app\"\n  end\nend\n",
-         "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  class Report < StandardError\n  end\n\n  test \"x\" do\n    assert_raises(Report) { raise Report, \"x\" }\n  end\nend\n", "Report"),
+         "require \"test_helper\"\n\nclass WidgetTest < ActiveSupport::TestCase\n  class Report < StandardError\n  end\n\n  test \"x\" do\n    assert_raises(Report) { raise Report, \"x\" }\n    assert_equal \"WidgetTest::Report\", Report.name\n    assert_equal \"app\", ::Report.kind\n  end\nend\n",
+         "WidgetTest::Report", "Report"),
         ("app/models/shop/late.rb", "module Shop\n  class Late\n    def self.kind\n      \"app\"\n    end\n  end\nend\n",
-         "require \"test_helper\"\n\nmodule Shop\n  class WidgetTest < ActiveSupport::TestCase\n    class Late < StandardError\n    end\n\n    test \"x\" do\n      assert_raises(Late) { raise Late, \"x\" }\n    end\n  end\nend\n", "Late"),
+         "require \"test_helper\"\n\nmodule Shop\n  class WidgetTest < ActiveSupport::TestCase\n    class Late < StandardError\n    end\n\n    test \"x\" do\n      assert_raises(Late) { raise Late, \"x\" }\n      assert_equal \"Shop::WidgetTest::Late\", Late.name\n      assert_equal \"app\", Shop::Late.kind\n    end\n  end\nend\n",
+         "Shop::WidgetTest::Late", "Shop::Late"),
     ] {
-        let (_, errors) = emit_and_run::empty_app()
+        let script = format!(
+            "{model}\nmodule Shop; end\nclass {inner} < StandardError; end\np [{inner}.name, {app_class}.kind, (begin; raise {inner}, \"x\"; rescue {inner}; :raised; end)]"
+        );
+        let shells = if inner.starts_with("Shop::") { "module Shop; class WidgetTest; end; end\n" } else { "class WidgetTest; end\n" };
+        let native = emit_and_run::ruby()
+            .arg("-e")
+            .arg(format!("{shells}{script}"))
+            .output()
+            .expect("native Ruby control");
+        assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+        assert_eq!(String::from_utf8_lossy(&native.stdout), format!("[\"{inner}\", \"app\", :raised]\n"));
+        let test_path = if inner.starts_with("Shop::") { "test/models/shop_widget_test.rb" } else { "test/models/widget_test.rb" };
+        emit_and_run::empty_app()
             .write(model_path, model)
             .write("test/test_helper.rb", "require \"active_support\"\n")
             .write("test/models/widget_test.rb", test)
-            .emit(BuildTarget::Ruby);
-        assert!(errors.iter().any(|e| e.contains(&format!("constant not supported (all targets): {name}"))), "{name}: {errors:?}");
+            .run_test(test_path)
+            .assert_passes();
     }
 }
 
@@ -9622,7 +9636,7 @@ fn same_named_classes_in_two_test_support_classes_stay_apart() {
         let (_, errors) = app().emit(target);
         for class in ["MockAlpha::Bucket", "MockBeta::Bucket"] {
             assert!(
-                errors.iter().any(|e| e.contains("namespaced class in a test-support class") && e.contains(class)),
+                errors.iter().any(|e| e.contains("nested class in a test file") && e.contains(class)),
                 "{target:?} {class}: {errors:?}"
             );
         }
@@ -9667,7 +9681,7 @@ fn a_test_file_helper_class_carries_its_nested_classes() {
         let (_, errors) = app().emit(target);
         for class in ["PriceRule::DiscountCode", "PriceRule::Batch"] {
             assert!(
-                errors.iter().any(|e| e.contains("namespaced class in a test-support class") && e.contains(class)),
+                errors.iter().any(|e| e.contains("nested class in a test file") && e.contains(class)),
                 "{target:?} {class}: {errors:?}"
             );
         }
@@ -9715,4 +9729,44 @@ fn rbs_sidecars_declare_outer_classes_as_classes() {
         .expect("spawn ruby");
     assert!(load.status.success(), "{}", String::from_utf8_lossy(&load.stderr));
     app().run_test("test/models/account_test.rb").assert_passes();
+}
+
+/// What a test class body declares is the test class's constant, as in
+/// Ruby: `ShopAnyEnabledTest::TestClass::Subclass`, whose `name` Core's
+/// shop_any_enabled_test builds a cache key from, and the module
+/// `ShopAnyEnabledTest::Helpers` the class includes. Hoisted, the class
+/// was named `TestClass::Subclass` and the module was dropped.
+#[test]
+fn a_test_class_body_keeps_its_classes_and_modules_under_its_name() {
+    use roundhouse::project::BuildTarget;
+    const BODY: &str = "  LIMIT = 4\n\n  class TestClass\n    def self.limit\n      LIMIT\n    end\n\n    class Subclass < TestClass\n    end\n  end\n\n  module Helpers\n    def helper_value\n      [:helped, LIMIT]\n    end\n\n    module Deep\n      def self.tag\n        :deep\n      end\n    end\n  end\n\n  include Helpers\n";
+    let script = "t = ShopAnyEnabledTest.allocate\np [ShopAnyEnabledTest::TestClass.name, ShopAnyEnabledTest::TestClass::Subclass.name, ShopAnyEnabledTest::TestClass::Subclass.limit, ShopAnyEnabledTest::Helpers.name, ShopAnyEnabledTest::Helpers::Deep.tag, t.helper_value]";
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("class ShopAnyEnabledTest\n{BODY}end\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "[\"ShopAnyEnabledTest::TestClass\", \"ShopAnyEnabledTest::TestClass::Subclass\", 4, \"ShopAnyEnabledTest::Helpers\", :deep, [:helped, 4]]\n"
+    );
+    let test = format!(
+        "require \"test_helper\"\n\nclass ShopAnyEnabledTest < ActiveSupport::TestCase\n{BODY}\n  test \"the body's constants keep the test class's name\" do\n    assert_equal \"ShopAnyEnabledTest::TestClass\", TestClass.name\n    assert_equal \"ShopAnyEnabledTest::TestClass::Subclass\", TestClass::Subclass.name\n    assert_equal 4, TestClass::Subclass.limit\n    assert_equal \"ShopAnyEnabledTest::Helpers\", Helpers.name\n    assert_equal :deep, Helpers::Deep.tag\n    assert_equal [:helped, 4], helper_value\n  end\nend\n"
+    );
+    let app = || {
+        emit_and_run::empty_app()
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/shop_any_enabled_test.rb", &test)
+    };
+    app().run_test("test/models/shop_any_enabled_test.rb").assert_passes();
+    for target in [BuildTarget::Typescript, BuildTarget::Crystal] {
+        let (_, errors) = app().emit(target);
+        for class in ["ShopAnyEnabledTest::TestClass", "ShopAnyEnabledTest::Helpers"] {
+            assert!(
+                errors.iter().any(|e| e.contains("nested class in a test file") && e.contains(&format!("`{class}`"))),
+                "{target:?} {class}: {errors:?}"
+            );
+        }
+    }
 }

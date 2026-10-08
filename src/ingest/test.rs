@@ -240,18 +240,18 @@ fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     find.0
 }
 
-/// A helper class of a test file (one beside the test class, or in its
-/// body) with every class and module it nests, each under its qualified
-/// name (`PriceRule::DiscountCode`), outer before inner. The nested ones
-/// used to be dropped without a word: only the helper itself was read.
-/// A nested class that declares tests never gets here: the file is
-/// refused by name (`refuse_unreached_test_classes`).
+/// A helper class or module of a test file (one beside the test class,
+/// or in its body) with every class and module it nests, each under its
+/// qualified name (`PriceRule::DiscountCode`), outer before inner. The
+/// nested ones, and modules in a test class body, used to be dropped
+/// without a word. A nested class that declares tests never gets here:
+/// the file is refused by name (`refuse_unreached_test_classes`).
 fn carried_classes(
-    class: &ruby_prism::ClassNode<'_>,
+    declaration: &ruby_prism::Node<'_>,
     scope: &[String],
     file: &str,
 ) -> IngestResult<Vec<crate::dialect::LibraryClass>> {
-    declared_classes_under(&class.as_node(), file, scope)
+    declared_classes_under(declaration, file, scope)
 }
 
 /// `def self.use_transactional_tests; <value>; end` on the test class.
@@ -286,10 +286,6 @@ fn ingest_test_class(
         message: "test class name must be a simple constant or path".into(),
     })?);
     let name = ClassId(Symbol::from(name_path.join("::")));
-    // The file's first top-level class taken as its module although it
-    // is not test-shaped: a test-support class (`ingest_test_files`).
-    let support_class = !is_test_class_node(class);
-
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
     });
@@ -358,22 +354,29 @@ fn ingest_test_class(
             }
             // Inline class declaration inside the test class —
             // `class Validatable; include ActiveRecord::Validations;
-            // ...; end`. Captured per-test-module so the emit can
-            // hoist them to file scope above the lowered test class.
+            // ...; end` — or module. Captured per-test-module; the
+            // Ruby emit writes it nested in the test class, ahead of
+            // the test class body.
+            //
+            // Each is the namespaced constant it is in Ruby: inside
+            // `ShopAnyEnabledTest`, `class TestClass` is
+            // `ShopAnyEnabledTest::TestClass`, and its `name` says so
+            // (Core builds cache keys from it). In a test-support class
+            // (`MockGCSInterface`) a second support file's
+            // `MockS3Interface::Bucket` is a different class, not a
+            // reopen of a shared `Bucket`. What the class or module
+            // nests comes with it (`carried_classes`).
             if let Some(inner) = stmt.as_class_node() {
                 // A nested test class is a module of its own
                 // (`push_with_nested_test_classes`).
                 if is_nested_test_class_node(&inner) {
                     continue;
                 }
-                // In a test-support class (`MockGCSInterface`, no test
-                // shape of its own) a nested class is the namespaced
-                // constant `MockGCSInterface::Bucket`, as in Ruby: a
-                // second support file's `MockS3Interface::Bucket` is a
-                // different class, not a reopen of a shared `Bucket`.
-                // What the class nests comes with it (`carried_classes`).
-                let scope: &[String] = if support_class { &name_path } else { &[] };
-                inner_classes.extend(carried_classes(&inner, scope, file)?);
+                inner_classes.extend(carried_classes(&inner.as_node(), &name_path, file)?);
+                continue;
+            }
+            if stmt.as_module_node().is_some() {
+                inner_classes.extend(carried_classes(&stmt, &name_path, file)?);
                 continue;
             }
             // Other non-test `def` — instance helper method
@@ -539,7 +542,7 @@ fn ingest_test_class(
     // would have Minitest find it under CRuby and run it against the
     // wrong assertion surface.)
     for (helper_scope, helper_node) in top_level_helper_nodes {
-        inner_classes.extend(carried_classes(helper_node, helper_scope, file)?);
+        inner_classes.extend(carried_classes(&helper_node.as_node(), helper_scope, file)?);
     }
 
     Ok(TestModule {
@@ -1184,7 +1187,7 @@ end
         assert_eq!(tms[0].tests.len(), 1);
         let helpers: Vec<&str> =
             tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
-        assert_eq!(helpers, ["Inner", "Models::Helper"]);
+        assert_eq!(helpers, ["Models::PostTest::Inner", "Models::Helper"]);
     }
 
     // Ingest reads every `.rb` file in the test directories, so a
@@ -1198,8 +1201,8 @@ end
 
     // A class nested in a top-level support class is that class's
     // constant (`MockStore::Bucket`), so two support files' `Bucket`s
-    // stay two classes. A test class's own inner classes keep the bare
-    // name every target's hoist expects.
+    // stay two classes. So is a test class's own (`StoreTest::Bucket`),
+    // whose `name` is that in Ruby.
     #[test]
     fn a_support_class_namespaces_its_nested_classes() {
         let src = "class MockStore\n  class Bucket\n    def x\n      1\n    end\n  end\nend\n";
@@ -1209,7 +1212,7 @@ end
         let src = "class StoreTest < ActiveSupport::TestCase\n  class Bucket\n  end\n\n  test \"t\" do\n    assert true\n  end\nend\n";
         let tms = ingest_test_files(src.as_bytes(), "store_test.rb").expect("ingest");
         let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
-        assert_eq!(names, ["Bucket"]);
+        assert_eq!(names, ["StoreTest::Bucket"]);
     }
 
     // A helper class, beside the test class or in its body, carries
@@ -1235,6 +1238,12 @@ class PriceRuleTest < ActiveSupport::TestCase
     end
   end
 
+  module Helpers
+    def helped
+      true
+    end
+  end
+
   test "t" do
     assert true
   end
@@ -1246,9 +1255,10 @@ end
         assert_eq!(
             names,
             [
-                "TestClass",
-                "TestClass::Subclass",
-                "TestClass::Subclass::Marks",
+                "PriceRuleTest::TestClass",
+                "PriceRuleTest::TestClass::Subclass",
+                "PriceRuleTest::TestClass::Subclass::Marks",
+                "PriceRuleTest::Helpers",
                 "Api::PriceRule",
                 "Api::PriceRule::DiscountCode",
             ]

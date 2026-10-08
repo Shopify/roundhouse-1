@@ -216,12 +216,10 @@ fn validate_activation(
         .chain(app.models.iter().map(|m| &m.name))
         .chain(app.controllers.iter().map(|c| &c.name))
         .chain(app.test_modules.iter().map(|t| &t.name))
+        // Test-body classes keep their Ruby names (`SupportTest::Support`),
+        // which is how the source walk below addresses them.
+        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter().map(|c| &c.name)))
         .cloned()
-        // Test ingest retains inner classes under file-local names; the
-        // source resolver correctly addresses their enclosing test class.
-        .chain(app.test_modules.iter().flat_map(|t| t.inner_classes.iter().map(|c| {
-            crate::ClassId(Symbol::from(format!("{}::{}", t.name.0, c.name.0)))
-        })))
         .collect();
     for (index, source) in app.sources.iter().enumerate().filter(|(_, s)| s.path.ends_with(".rb")) {
         let parsed = ruby_prism::parse(source.text.as_bytes());

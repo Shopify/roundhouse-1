@@ -1832,7 +1832,7 @@ pub fn target_files(
         report_keyword_params(app, target.as_str());
     }
     report_class_body_prepends(app, target);
-    report_namespaced_test_support_classes(app, target);
+    report_nested_test_file_classes(app, target);
     report_body_statements(app, target);
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         for controller in &app.controllers {
@@ -8588,13 +8588,14 @@ fn report_keyword_params(app: &App, target: &str) {
     }
 }
 
-/// A class nested in a test-support class keeps its namespace
-/// (`MockGCSInterface::Bucket`, `ingest::test`). The Ruby family writes
-/// it nested inside its owner (`emit::ruby::library`'s namespaced
-/// header); every other target's test emit hoists inner classes under
-/// one flat name, so two support files' `Bucket`s would collide there.
-/// Refused by name. Roda emits no test files.
-fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
+/// A class nested in a test file's class keeps its namespace, as in
+/// Ruby (`ShopAnyEnabledTest::TestClass`, `MockGCSInterface::Bucket`,
+/// `ingest::test`). The Ruby family writes it nested inside its owner
+/// (`emit::ruby::library`'s namespaced header); every other target's
+/// test emit hoists inner classes under one flat name, so two files'
+/// `Bucket`s would collide there and `name` would differ. Refused by
+/// name. Roda emits no test files.
+fn report_nested_test_file_classes(app: &App, target: BuildTarget) {
     if matches!(
         target,
         BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda
@@ -8602,8 +8603,9 @@ fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
         return;
     }
     for module in &app.test_modules {
-        // Nested in the test-support class itself, or in a helper class
-        // of the same file (`PriceRule::DiscountCode`).
+        // Nested in the test class itself (`ShopAnyEnabledTest::
+        // TestClass`), or in a helper class of the same file
+        // (`PriceRule::DiscountCode`).
         let nested = |name: &str| {
             let outers = std::iter::once(module.name.0.as_str())
                 .chain(module.inner_classes.iter().map(|c| c.name.0.as_str()));
@@ -8619,7 +8621,7 @@ fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
             emit::diagnostics::report_unsupported(
                 span,
                 target.as_str(),
-                "namespaced class in a test-support class",
+                "nested class in a test file",
                 format!(
                     "`{}`: this target hoists a test file's inner classes under a flat name; \
                      the Ruby family writes it nested in its outer class",
