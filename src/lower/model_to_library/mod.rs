@@ -32,6 +32,7 @@ mod composite_key;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub(crate) mod macro_replay;
+pub(crate) mod transaction_callbacks;
 pub use macro_replay::replay_model_macros;
 pub mod row;
 
@@ -1032,7 +1033,13 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // (`before_create -> { … }`) — both claimed by
         // markers::push_block_callback, on the shape it reads: a block,
         // or a parameterless lambda as the first argument.
-        if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
+        // The transaction callbacks' block forms, on the shapes
+        // `transaction_callbacks` lowers.
+        if self::transaction_callbacks::is_transaction_hook(name) {
+            if self::transaction_callbacks::claims(model, expr) {
+                continue;
+            }
+        } else if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
             if block.is_some() {
                 continue;
             }
@@ -1785,6 +1792,7 @@ fn build_methods_for_dialect(
     // `generate_token_for` wins.
     crate::lower::generates_token_for::push_token_for_methods(&mut methods, model);
     push_callback_methods(&mut methods, model);
+    self::transaction_callbacks::push_transaction_callback_methods(&mut methods, model, models);
 
     // File-grain catch-all (mirrors view_to_library's
     // build_library_class): whatever the synthesizers left span-less —

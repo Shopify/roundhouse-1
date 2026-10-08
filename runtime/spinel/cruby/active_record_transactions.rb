@@ -19,10 +19,17 @@
 # `ActiveRecord::Rollback` rolls the innermost transaction back and is
 # swallowed.
 #
-# Not ported: record enrollment (`add_transaction_record`: a record's
-# after_commit/after_rollback callbacks and state restore). The runtime's
-# record persistence does not enroll records, so a real transaction
-# refuses an enrollment by name rather than drop it. Query retry
+# Records enroll as Rails' do (transactions.rb `with_transaction_returning_status`,
+# below `ActiveRecord::Transactions`): save, the validation-skipping write
+# (`save_after_validation`), destroy, touch and update_attribute run in
+# `connection.transaction`, and the record's transaction callbacks (the
+# chains the compiler lowered into `_run_commit_callbacks` and its two
+# siblings, runtime/ruby/active_record/base.rb) run when the outermost
+# transaction commits, its rollback chain and state restore when one
+# rolls back. Every enrollment is held until the transaction finishes:
+# Rails holds a record without transaction callbacks in a write-time
+# transaction only weakly (`ensure_finalize`), so a collected one is not
+# restored there. Query retry
 # (`allow_retry`) is not modeled, BEGIN's included (see db_pg_cruby.rb).
 # `reconnect_can_restore_state?` also requires the session to hold no
 # transaction libpq reports, so a materialized clean transaction is not
@@ -276,10 +283,8 @@ module ActiveRecord
         @state.finalized?
       end
 
-      # Not ported: see the header.
-      def add_record(record, ensure_finalize = true)
-        raise NotImplementedError, "ActiveRecord transaction record enrollment (add_transaction_record: " \
-          "after_commit/after_rollback callbacks and state restore of #{record.class.name}) is not ported"
+      def add_record(record, _ensure_finalize = true)
+        (@records ||= []) << record
       end
 
       def before_commit(&block)
@@ -336,16 +341,71 @@ module ActiveRecord
       end
 
       def rollback_records
+        if records
+          begin
+            ite = unique_records
+
+            instances_to_run_callbacks_on = prepare_instances_to_run_callbacks_on(ite)
+
+            run_action_on_records(ite, instances_to_run_callbacks_on) do |record, should_run_callbacks|
+              record.rolledback!(force_restore_state: full_rollback?, should_run_callbacks: should_run_callbacks)
+            end
+          ensure
+            ite&.each do |i|
+              i.rolledback!(force_restore_state: full_rollback?, should_run_callbacks: false)
+            end
+          end
+        end
+
         @callbacks&.each(&:after_rollback)
       end
 
       def before_commit_records
         if @run_commit_callbacks
+          if records
+            if ActiveRecord.before_committed_on_all_records
+              ite = unique_records
+
+              instances_to_run_callbacks_on = records.each_with_object({}) do |record, candidates|
+                candidates[record._transaction_record_key] = record
+              end
+
+              run_action_on_records(ite, instances_to_run_callbacks_on) do |record, should_run_callbacks|
+                record.before_committed! if should_run_callbacks
+              end
+            else
+              records.uniq.each(&:before_committed!)
+            end
+          end
+
           @callbacks&.each(&:before_commit)
         end
+        # Note: When @run_commit_callbacks is false #commit_records takes care of appending
+        # remaining callbacks to the parent transaction
       end
 
       def commit_records
+        if records
+          begin
+            ite = unique_records
+
+            if @run_commit_callbacks
+              instances_to_run_callbacks_on = prepare_instances_to_run_callbacks_on(ite)
+
+              run_action_on_records(ite, instances_to_run_callbacks_on) do |record, should_run_callbacks|
+                record.committed!(should_run_callbacks: should_run_callbacks)
+              end
+            else
+              while record = ite.shift
+                # if not running callbacks, only adds the record to the parent transaction
+                connection.add_transaction_record(record)
+              end
+            end
+          ensure
+            ite&.each { |i| i.committed!(should_run_callbacks: false) }
+          end
+        end
+
         if @run_commit_callbacks
           @callbacks&.each(&:after_commit)
         elsif @callbacks
@@ -359,6 +419,48 @@ module ActiveRecord
       protected
         def append_callbacks(callbacks) # :nodoc:
           (@callbacks ||= []).concat(callbacks)
+        end
+
+      private
+        def unique_records
+          records.uniq(&:__id__)
+        end
+
+        # A candidate is looked up by the record's identity (Rails' `==`/
+        # `hash`: class and id, the object itself before it has one).
+        def run_action_on_records(records, instances_to_run_callbacks_on)
+          while record = records.shift
+            should_run_callbacks = record.__id__ == instances_to_run_callbacks_on[record._transaction_record_key].__id__
+
+            yield record, should_run_callbacks
+          end
+        end
+
+        def prepare_instances_to_run_callbacks_on(records)
+          records.each_with_object({}) do |record, candidates|
+            next unless record._trigger_transactional_callbacks?
+
+            key = record._transaction_record_key
+            earlier_saved_candidate = candidates[key]
+
+            next if earlier_saved_candidate && record.class.run_commit_callbacks_on_first_saved_instances_in_transaction
+
+            # If the candidate instance destroyed itself in the database, then
+            # instances which were added to the transaction afterwards, and which
+            # think they updated themselves, are wrong. They should not replace
+            # our candidate as an instance to run callbacks on
+            next if earlier_saved_candidate&.destroyed? && !record.destroyed?
+
+            # If the candidate instance was created inside of this transaction,
+            # then instances which were subsequently loaded from the database
+            # and updated need that state transferred to them so that
+            # the after_create_commit callbacks are run
+            record._new_record_before_last_commit = true if earlier_saved_candidate&._new_record_before_last_commit
+
+            # The last instance to save itself is likeliest to have internal
+            # state that matches what's committed to the database
+            candidates[key] = record
+          end
         end
     end
 
@@ -936,8 +1038,160 @@ module ActiveRecord
     end
   end
 
+  # active_record.rb `ActiveRecord.before_committed_on_all_records` and
+  # Base's `run_commit_callbacks_on_first_saved_instances_in_transaction`:
+  # the value config/application.rb leaves (the compiler synthesizes the
+  # reader on Rails::Application when it is not the framework default).
+  class << self
+    def before_committed_on_all_records
+      app = Rails.application
+      app.respond_to?(:active_record_before_committed_on_all_records) ? app.active_record_before_committed_on_all_records : false
+    end
+  end
+
+  # transactions.rb, the record side.
+  module Transactions
+    def save(*, **)
+      with_transaction_returning_status { super }
+    end
+
+    def save_after_validation
+      with_transaction_returning_status { super }
+    end
+
+    def destroy
+      with_transaction_returning_status { super }
+    end
+
+    def touch(*, **)
+      with_transaction_returning_status { super }
+    end
+
+    def update_attribute(name, value)
+      with_transaction_returning_status { super }
+    end
+
+    attr_accessor :_new_record_before_last_commit
+
+    # The enrollment does what base.rb's write-time pair does without a
+    # transaction port.
+    def _transaction_write_begin; end
+    def _transaction_write_end; end
+
+    def _transaction_record_key # :nodoc:
+      key = id
+      new_record? || key.nil? || key == 0 || key == "" ? self : [self.class, key]
+    end
+
+    def before_committed! # :nodoc:
+      _run_before_commit_callbacks
+    end
+
+    def committed!(should_run_callbacks: true) # :nodoc:
+      @_start_transaction_state = nil
+      if should_run_callbacks
+        @_committed_already_called = true
+        _run_commit_hooks
+      end
+    ensure
+      @_committed_already_called = @_trigger_update_callback = @_trigger_destroy_callback = false
+    end
+
+    def rolledback!(force_restore_state: false, should_run_callbacks: true) # :nodoc:
+      if should_run_callbacks
+        _transaction_rolled_back
+      end
+    ensure
+      restore_transaction_record_state(force_restore_state)
+      clear_transaction_record_state
+      @_trigger_update_callback = @_trigger_destroy_callback = false if force_restore_state
+    end
+
+    def with_transaction_returning_status # :nodoc:
+      _with_transaction_connection do |connection|
+        status = nil
+        connection.transaction do
+          connection.add_transaction_record(self)
+          remember_transaction_record_state
+
+          status = yield
+          raise ActiveRecord::Rollback unless status
+        end
+        @_last_transaction_return_status = status
+        status
+      end
+    end
+
+    private
+      # `self.class.with_connection`, or with no pool in the handler the
+      # adapter Db leases (as `Base.transaction`).
+      def _with_transaction_connection
+        if self.class.connection_handler.connection_pool_names.empty?
+          return Db.with_connection { yield Db.current_adapter }
+        end
+        self.class.with_connection do |connection|
+          connection.pool.with_pool_transaction_isolation_level(ActiveRecord.default_transaction_isolation_level, connection.transaction_open?) do
+            yield connection
+          end
+        end
+      end
+
+      def remember_transaction_record_state
+        @_start_transaction_state ||= {
+          id: id,
+          new_record: new_record?,
+          persisted: @persisted,
+          previously_new_record: @id_previously_changed,
+          destroyed: @destroyed,
+          last_saved_attributes: @__last_saved_attributes,
+          level: 0
+        }
+        @_start_transaction_state[:level] += 1
+
+        if @_committed_already_called
+          @_new_record_before_last_commit = false
+        else
+          @_new_record_before_last_commit = @_start_transaction_state[:new_record]
+        end
+      end
+
+      def clear_transaction_record_state
+        return unless @_start_transaction_state
+        @_start_transaction_state[:level] -= 1
+        @_start_transaction_state = nil if @_start_transaction_state[:level] < 1
+      end
+
+      # The attribute values stay as written; what the record was before
+      # the transaction comes back: new or persisted, destroyed, its id,
+      # and the Dirty baseline (Rails restores the attributes' original
+      # values and forgets the last save's changes).
+      def restore_transaction_record_state(force_restore_state = false)
+        if restore_state = @_start_transaction_state
+          if force_restore_state || restore_state[:level] <= 1
+            @persisted = restore_state[:persisted]
+            @id_previously_changed = restore_state[:previously_new_record]
+            @destroyed = restore_state[:destroyed]
+            @__last_saved_attributes = restore_state[:last_saved_attributes]
+            @saved_changes = nil
+            self.id = restore_state[:id] if id != restore_state[:id]
+          end
+        end
+      end
+  end
+
   class Base
+    prepend Transactions
+
     class << self
+      def run_commit_callbacks_on_first_saved_instances_in_transaction
+        app = Rails.application
+        if app.respond_to?(:active_record_run_commit_callbacks_on_first_saved_instances_in_transaction)
+          app.active_record_run_commit_callbacks_on_first_saved_instances_in_transaction
+        else
+          true
+        end
+      end
+
       # transactions.rb ClassMethods#transaction. With no pool in the
       # handler (a program driving Db's databases directly), the adapter
       # Db leases for the current database.

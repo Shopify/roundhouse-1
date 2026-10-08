@@ -613,8 +613,31 @@ fn body_stmts(m: &roundhouse::dialect::MethodDef) -> Vec<roundhouse::Expr> {
 fn self_call_name(e: &roundhouse::Expr) -> &str {
     match &*e.node {
         roundhouse::ExprNode::Send { recv: None, method, .. } => method.as_str(),
+        roundhouse::ExprNode::Send { recv: Some(r), method, .. }
+            if matches!(&*r.node, roundhouse::ExprNode::SelfRef) =>
+        {
+            method.as_str()
+        }
         other => panic!("expected self-call; got {other:?}"),
     }
+}
+
+/// `(guard, call)` of each statement of the lowered `_run_commit_callbacks`.
+fn commit_chain_calls(lc: &roundhouse::dialect::LibraryClass) -> Vec<(String, String)> {
+    let chain = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_run_commit_callbacks")
+        .expect("_run_commit_callbacks");
+    body_stmts(chain)
+        .iter()
+        .map(|stmt| match &*stmt.node {
+            roundhouse::ExprNode::If { cond, then_branch, .. } => {
+                (self_call_name(cond).to_string(), self_call_name(then_branch).to_string())
+            }
+            _ => (String::new(), self_call_name(stmt).to_string()),
+        })
+        .collect()
 }
 
 #[test]
@@ -651,18 +674,11 @@ end
         vec!["mark_submitter", "record_initial_upvote"]
     );
 
-    // `after_commit ..., on: :create` remaps onto the runtime's
-    // after_create_commit hook; no plain after_commit override appears.
-    let acc = lc
-        .methods
-        .iter()
-        .find(|m| m.name.as_str() == "after_create_commit")
-        .expect("after_create_commit");
-    assert_eq!(
-        body_stmts(acc).iter().map(self_call_name).collect::<Vec<_>>(),
-        vec!["recreate_links"]
-    );
+    // `after_commit ..., on: :create` is a callback of the commit chain,
+    // guarded by the create action; no runtime hook override appears.
+    assert_eq!(commit_chain_calls(&lc), vec![("_transaction_include_create?".to_string(), "recreate_links".to_string())]);
     assert!(!names.contains(&"after_commit"), "{names:?}");
+    assert!(!names.contains(&"after_create_commit"), "{names:?}");
 
     // `before_validation ..., on: :create` guards on new_record? —
     // accurate at validation time (the insert hasn't happened yet).
@@ -764,16 +780,18 @@ end
         other => panic!("expected new_record? guard; got {other:?}"),
     }
 
-    // after_commit retargets the per-lifecycle runtime hook.
-    let acc = lc
+    // after_commit's block becomes a method the commit chain calls on
+    // create.
+    assert_eq!(
+        commit_chain_calls(&lc),
+        vec![("_transaction_include_create?".to_string(), "_user_transaction_callback_1".to_string())]
+    );
+    let block = lc
         .methods
         .iter()
-        .find(|m| m.name.as_str() == "after_create_commit")
-        .expect("after_create_commit");
-    assert_eq!(
-        body_stmts(acc).iter().map(self_call_name).collect::<Vec<_>>(),
-        vec!["recreate_links"]
-    );
+        .find(|m| m.name.as_str() == "_user_transaction_callback_1")
+        .expect("the block's method");
+    assert_eq!(body_stmts(block).iter().map(self_call_name).collect::<Vec<_>>(), vec!["recreate_links"]);
     assert!(!names.contains(&"after_commit"), "{names:?}");
 
     // Optionless block form is unchanged by this path.

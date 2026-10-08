@@ -400,11 +400,15 @@ class PostgreSQLRuntimeTest
     first.reload
     assert_equal "updated", first.Title
     assert_equal false, first.enabled
-    Db.exec("BEGIN")
-    Entry._adapter_truncate
-    assert_equal 0, Entry.count
-    assert_equal 1, Entry.create!(Title: "rollback", enabled: true).id
-    Db.exec("ROLLBACK")
+    # A save runs in `connection.transaction`, as Rails' does, so the
+    # rolled-back block is the transaction API's, not a raw BEGIN (which
+    # the save's own COMMIT would end, on Rails too).
+    Entry.transaction do
+      Entry._adapter_truncate
+      assert_equal 0, Entry.count
+      assert_equal 1, Entry.create!(Title: "rollback", enabled: true).id
+      raise ActiveRecord::Rollback
+    end
     assert_equal 2, Entry.count
     loaded.destroy!
     assert_equal 1, Entry.count
@@ -418,7 +422,9 @@ class PostgreSQLRuntimeTest
     connection = ActiveRecord::Base.connection
     connection.begin_isolated_db_transaction(:serializable)
     assert_equal "serializable", scalar("SHOW transaction_isolation")
-    Entry.create!(Title: "discard isolated", enabled: true)
+    # A statement in the low-level transaction: a save would open (and
+    # commit) its own through the transaction manager, as on Rails.
+    Db.exec(%q(INSERT INTO entries ("Title", enabled) VALUES ('discard isolated', true)))
     connection.exec_rollback_db_transaction
     assert_equal 1, Entry.count
     # Rails 8.2 postgresql/database_statements.rb:60 fetches the level:

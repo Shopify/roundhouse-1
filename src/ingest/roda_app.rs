@@ -141,6 +141,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         attribute_aliases: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
+        after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
         visibility_overrides: Vec::new(),

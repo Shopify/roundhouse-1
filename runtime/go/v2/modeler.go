@@ -43,4 +43,9 @@ type Modeler interface {
 	AfterCreateCommit()
 	AfterUpdateCommit()
 	AfterDestroyCommit()
+	// Lowered transaction-callback chains (after_commit,
+	// after_rollback, before_commit); Base's stubs are empty.
+	RunCommitCallbacks()
+	RunRollbackCallbacks()
+	RunBeforeCommitCallbacks()
 }

@@ -150,6 +150,15 @@ pub struct Model {
     /// The unclaimed-DSL checks skip them. Empty for nearly every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claimed_body_calls: Vec<crate::span::Span>,
+    /// `ActiveRecord.run_after_transaction_callbacks_in_order_defined` as
+    /// the app's config/application.rb leaves it (`load_defaults` 7.1+
+    /// sets it, an explicit `config.active_record.` write wins; Rails'
+    /// default is false). It decides where each `after_commit` /
+    /// `after_rollback` declaration enters its chain, so in which order
+    /// the chain runs (`model_to_library::transaction_callbacks`). The
+    /// same for every model of an app.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_transaction_callbacks_in_order: bool,
     /// Rails' `ignored_columns`, as the class-body writes of the model and
     /// its model ancestors leave it, when none of them is still a column
     /// of the table (`analyze::ignored_columns`). Those writes run at class
@@ -964,6 +973,21 @@ pub struct Callback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<CallbackOn>,
     pub condition: Option<Expr>,
+    /// A transaction callback's actions (`CallbackHook::is_transaction`):
+    /// `on: [:create, :update]`, or what a sugar spelling enforces
+    /// (`after_save_commit`). Any one of them runs it — Rails'
+    /// `transaction_include_any_action?`. Empty runs it on every action;
+    /// `on` stays None for these hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_any: Vec<CallbackOn>,
+    /// A transaction callback's callback OBJECT (`after_commit
+    /// Foo::Callbacks.new(:create)`), evaluated once where the class body
+    /// declares it and sent `<hook>(record)`; `targets` is empty then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<Expr>,
+    /// `prepend: true`: placed at the front of its chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepend: bool,
 }
 
 /// The `on:` restriction on a lifecycle callback declaration.
@@ -998,6 +1022,18 @@ pub enum CallbackHook {
     /// name and fires it in the right two places.
     AfterSaveCommit,
     AfterRollback,
+    /// `before_commit`: runs on each record of the outermost transaction
+    /// before its COMMIT.
+    BeforeCommit,
+}
+
+impl CallbackHook {
+    /// A transaction callback: one of the `commit`, `rollback` and
+    /// `before_commit` chains a record runs when the transaction it took
+    /// part in finishes, rather than inline in its save or destroy.
+    pub fn is_transaction(self) -> bool {
+        matches!(self, Self::AfterCommit | Self::AfterSaveCommit | Self::AfterRollback | Self::BeforeCommit)
+    }
 }
 
 /// A formal parameter on a `MethodDef`. Carries the parameter name, an
