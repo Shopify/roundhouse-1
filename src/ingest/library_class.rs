@@ -3417,9 +3417,17 @@ fn walk_decl_body_in<'pr>(
     // statement is not captured (`body_statement`).
     let mut default_visibility_nonpublic = false;
     // Body statements are captured (`expr::BODY_STATEMENT`) in a
-    // declaration's own body only: in `class << self` they run on the
-    // singleton class.
-    let captures_statements = declaration_body && !force_class_receiver;
+    // declaration's own body, and in its `class << self`, where they run
+    // on the singleton class (`expr::SINGLETON_BODY`).
+    let captures_statements = declaration_body;
+    let body_statement = |node: &ruby_prism::Node<'_>, file: &str| {
+        body_statement(node, file).map(|mut e| {
+            if force_class_receiver {
+                e.decisions |= crate::expr::SINGLETON_BODY;
+            }
+            e
+        })
+    };
     // Names from the `module_function :a, :b` form, plus the positions
     // of the direct `def`s in this body they may promote. Tracking
     // positions (rather than searching `methods` by name at the end)
@@ -3495,6 +3503,11 @@ fn walk_decl_body_in<'pr>(
         // Any other is captured like a call on a constant, replayed where
         // the body is replayed and reported where it is dropped, not
         // skipped with no diagnostic.
+        //
+        // In `class << self` it runs on the singleton class, which no
+        // replay of the class body is: there it is a body statement,
+        // carried inside a `class << self` of its own or named
+        // (cldr.rb's `["t", "translate", …].each do |m| class_eval … end`).
         if let Some(call) = statement.as_call_node()
             && call.receiver().is_some_and(|r| r.as_array_node().is_some())
             && let Ok(e) = ingest_expr(&statement, file)
@@ -3507,6 +3520,12 @@ fn walk_decl_body_in<'pr>(
                             m.receiver = MethodReceiver::Class;
                         }
                         out.methods.push(m);
+                    }
+                }
+                None if force_class_receiver => {
+                    out.discarded.push(Discarded::of(&statement, "a call on a literal list"));
+                    if captures_statements && !default_visibility_nonpublic && !module_function_active {
+                        out.unknown_calls.extend(body_statement(&statement, file));
                     }
                 }
                 None => out.unknown_calls.push(e),

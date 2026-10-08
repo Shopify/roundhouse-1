@@ -671,6 +671,15 @@ pub struct App {
     /// (`concern_accessors::carried_included_blocks`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_included_blocks: Vec<ClassId>,
+    /// The library classes and modules the source declared inside a
+    /// `class << self` (Core's `ElasticSearch::TaxCodeIndexing`'s
+    /// `TaxCodeSourceBuilder`, which its class methods read bare). Ruby
+    /// puts them on the singleton class: `X.singleton_class::Helper`, not
+    /// `X::Helper`. Each is named `X::Helper` here, as analysis and the
+    /// other targets hoist it; the Ruby family writes it back inside
+    /// `class << self` and reads it there (`emit::ruby::singleton_scoped`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub singleton_scoped_classes: Vec<ClassId>,
     /// The `included do` statements a plain includer runs where its
     /// `include` runs, keyed by the includer, each with the direct include
     /// it runs after (the root its Concern hangs off), in the order Rails
@@ -1421,6 +1430,7 @@ impl App {
             concern_prepended_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             carried_included_blocks: Vec::new(),
+            singleton_scoped_classes: Vec::new(),
             included_block_statements: HashMap::default(),
             included_class_attributes: HashMap::default(),
             render_edges: HashMap::default(),

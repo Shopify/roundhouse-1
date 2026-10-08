@@ -181,6 +181,13 @@ pub const SINGLETON_CONSTANT_REF: u64 = 1 << 25;
 /// than CRuby/JRuby refuse a kept one by name.
 pub const BODY_STATEMENT: u64 = 1 << 26;
 
+/// On a [`BODY_STATEMENT`] the source wrote inside `class << self`
+/// (`%i[a b].each { |n| define_method(n) { … } }` there defines class
+/// methods): Ruby runs it with the singleton class as `self`, definee
+/// and innermost lexical scope. The Ruby family writes it back inside a
+/// `class << self … end` of its own, in place.
+pub const SINGLETON_BODY: u64 = 1 << 27;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
@@ -1931,7 +1938,7 @@ mod tests {
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
-            SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT,
+            SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
         ];
         let mut seen = 0u64;
         for bit in bits {

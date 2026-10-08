@@ -5,8 +5,11 @@
 //! inside `class << self`, and its class methods return them by bare
 //! name. Ingest did not look into that body, so both modules were
 //! dropped and each read emitted as a `roundhouse: constant not
-//! supported` raise. They are hoisted into the enclosing scope, as the
-//! constants such a body writes already are.
+//! supported` raise. Analysis hoists them into the enclosing scope, as
+//! the constants such a body writes already are. The emit writes them
+//! in the owner's file (inside its `class << self` on the CRuby tree,
+//! `tests/singleton_scoped_classes_cruby.rs`): a file of their own would
+//! have to reopen the singleton class, which no autoload reaches.
 
 use roundhouse::analyze::diagnose;
 use roundhouse::emit::ruby::emit_library;
@@ -64,9 +67,9 @@ fn a_module_in_a_singleton_body_is_read_at_its_hoisted_name() {
         .collect();
     assert!(serializer.contains("Outer::Serializer::ASer") && serializer.contains("Outer::Serializer::BSer"), "{serializer}");
     assert!(!serializer.contains("roundhouse:"), "{serializer}");
-    // Rails' `underscore` names the files (`ASer` -> `a_ser`, as
-    // Zeitwerk expects; `naming::snake_case` since adf504b5e).
+    // Written in the owner's file, not a file of their own.
+    assert!(serializer.contains("module ASer") && serializer.contains("class BSer"), "{serializer}");
     for name in ["/a_ser.rb", "/b_ser.rb"] {
-        assert!(files.iter().any(|f| f.path.to_string_lossy().ends_with(name)), "{name} emitted");
+        assert!(!files.iter().any(|f| f.path.to_string_lossy().ends_with(name)), "{name} emitted apart");
     }
 }

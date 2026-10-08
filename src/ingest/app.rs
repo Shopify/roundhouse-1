@@ -2999,7 +2999,39 @@ end
         model.subclass_default_scope = scoped.contains(&model.name);
     }
     keep_carried_body_statements(&mut app);
+    app.singleton_scoped_classes = singleton_scoped_classes(&app);
     Ok(app)
+}
+
+/// `App::singleton_scoped_classes`: the library classes a source file
+/// declares in a `class << self`, and the namespace modules there that
+/// enclose one (`module Builders; class Inner`).
+fn singleton_scoped_classes(app: &App) -> Vec<crate::ident::ClassId> {
+    let mut known: crate::det::HashSet<&str> = crate::det::HashSet::default();
+    for lc in &app.library_classes {
+        let name = lc.name.0.as_str();
+        known.insert(name);
+        let mut prefix = name;
+        while let Some((outer, _)) = prefix.rsplit_once("::") {
+            known.insert(outer);
+            prefix = outer;
+        }
+    }
+    let mut out: Vec<crate::ident::ClassId> = Vec::new();
+    for source in &app.sources {
+        if !source.text.contains("class << self") {
+            continue;
+        }
+        let parsed = ruby_prism::parse(source.text.as_bytes());
+        for name in super::util::singleton_scoped_declarations(&parsed.node()) {
+            if known.contains(name.as_str()) {
+                out.push(crate::ident::ClassId(crate::ident::Symbol::from(name.as_str())));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out.dedup();
+    out
 }
 
 /// The macros a model subclass declares that Rails defines on it: ingest

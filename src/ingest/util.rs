@@ -394,6 +394,59 @@ fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
     }
 }
 
+/// The full names of the classes and modules `node` (a file's program)
+/// declares directly inside a `class << self` of a class or module,
+/// named as the walks above hoist them (`X::Helper` for `class X; class
+/// << self; class Helper`). Their own nested declarations follow from
+/// the name.
+pub(super) fn singleton_scoped_declarations(node: &Node<'_>) -> Vec<String> {
+    fn walk(node: &Node<'_>, scope: &[String], in_singleton: bool, out: &mut Vec<String>) {
+        let named = |path: Option<Vec<String>>| {
+            let mut inner = scope.to_vec();
+            inner.extend(path.unwrap_or_default());
+            inner
+        };
+        if let Some(c) = node.as_class_node() {
+            let inner = named(class_name_path(&c));
+            if in_singleton && inner.len() > scope.len() {
+                out.push(inner.join("::"));
+            }
+            if let Some(body) = c.body() {
+                walk(&body, &inner, false, out);
+            }
+            return;
+        }
+        if let Some(m) = node.as_module_node() {
+            let inner = named(module_name_path(&m));
+            if in_singleton && inner.len() > scope.len() {
+                out.push(inner.join("::"));
+            }
+            if let Some(body) = m.body() {
+                walk(&body, &inner, false, out);
+            }
+            return;
+        }
+        if let Some(p) = node.as_program_node() {
+            walk(&p.statements().as_node(), scope, false, out);
+            return;
+        }
+        if let Some(s) = node.as_statements_node() {
+            for stmt in s.body().iter() {
+                walk(&stmt, scope, in_singleton, out);
+            }
+            return;
+        }
+        if let Some(body) = hoisted_singleton_body(node) {
+            if !scope.is_empty() {
+                walk(&body, scope, true, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &[], false, &mut out);
+    out
+}
+
 /// The body of a `class << self` inside a class or module. Ruby puts
 /// the classes and modules declared there on the singleton class
 /// (Core's `ConnectionSerializer` keeps its column serializers there
