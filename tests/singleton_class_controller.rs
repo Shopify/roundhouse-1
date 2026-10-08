@@ -22,7 +22,7 @@ const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\n  \
 fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
     let mut tree: HashMap<PathBuf, Vec<u8>> = [
         ("db/schema.rb", SCHEMA),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         (
             "app/controllers/application_controller.rb",
             "class ApplicationController < ActionController::Base\nend\n",

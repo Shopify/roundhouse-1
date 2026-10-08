@@ -14,7 +14,7 @@ fn failed_sends(body: &str) -> Vec<(String, String)> {
             "db/schema.rb",
             "ActiveRecord::Schema.define do\n  create_table \"lines\", force: :cascade do |t|\n    t.integer \"qty\", null: false\n  end\nend\n",
         ),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
         ("app/models/line.rb", "class Line < ApplicationRecord\n  def cents\n    1\n  end\nend\n"),
         (
             "app/controllers/application_controller.rb",

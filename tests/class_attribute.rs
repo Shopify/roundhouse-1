@@ -147,6 +147,9 @@ fn model_class_attribute_behaves_as_in_activerecord_after_emission() {
         assert!(expected.iter().any(|line| line == probe), "native control lacks {probe:?}: {expected:#?}");
     }
     let run = emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"plans\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write("app/models/plan.rb", PLAN)
         .write("app/models/pro_plan.rb", PRO_PLAN)
         .run_ruby(MODEL_SCRIPT);
@@ -239,6 +242,9 @@ p [CaShared.left, CaShared.right, CaShared.third]
     );
     assert_eq!(expected, ["[[:a], true]"], "native control");
     let run = emit_and_run::real_blog()
+        // A concrete model reads its table: ActiveRecord raises on the first
+        // query without one, and check refuses it (model_table_not_in_schema).
+        .edit("db/schema.rb", "create_table \"articles\", force: :cascade do |t|", "create_table \"shared_plans\", force: :cascade do |t|\n  end\n\n  create_table \"articles\", force: :cascade do |t|")
         .write("app/models/shared_plan.rb", SHARED_DEFAULT_PLAN)
         .run_ruby(model_script);
     run.assert_passes();
