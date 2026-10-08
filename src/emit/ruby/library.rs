@@ -8953,8 +8953,7 @@ fn hooked_include_position(lc: &LibraryClass, inc: &ClassId, app: &App) -> Optio
 /// `prepended` for a `prepend`).
 fn hooked_mixin_position(lc: &LibraryClass, inc: &ClassId, app: &App, hook: &str) -> Option<usize> {
     let bare = |c: &ClassId| c.0.as_str().trim_start_matches("::").to_string();
-    let target = bare(inc);
-    let module = app.library_classes.iter().find(|m| m.is_module && bare(&m.name) == target)?;
+    let module = first_module_bare_named(&bare(inc), app)?;
     let hook = module.methods.iter().find(|m| {
         m.receiver == MethodReceiver::Class && m.name.as_str() == hook && m.params.len() == 1
     })?;
@@ -9570,6 +9569,8 @@ struct NameIndex {
     superclass_nestings: std::cell::RefCell<std::collections::BTreeMap<u32, std::rc::Rc<Vec<(usize, Vec<String>)>>>>,
     /// `conditional_declarations`.
     conditional_declarations: HashMap<String, String>,
+    /// `first_module_bare_named`'s answers, on first use.
+    first_modules_bare: std::cell::OnceCell<HashMap<String, usize>>,
 }
 
 thread_local! {
@@ -9601,6 +9602,7 @@ impl NameIndex {
             constant_paths: std::cell::OnceCell::new(),
             superclass_nestings: std::cell::RefCell::default(),
             conditional_declarations: conditional_declarations(app),
+            first_modules_bare: std::cell::OnceCell::new(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -9672,6 +9674,27 @@ pub(crate) fn library_classes_named<'a>(name: &str, app: &'a App) -> Vec<&'a Lib
             .map(|js| js.iter().map(|&j| &app.library_classes[j]).collect())
             .unwrap_or_default(),
         None => app.library_classes.iter().filter(|lc| lc.name.0.as_str() == name).collect(),
+    }
+}
+
+/// The first library module whose name, less any leading `::`, is
+/// `target`.
+fn first_module_bare_named<'a>(target: &str, app: &'a App) -> Option<&'a LibraryClass> {
+    let bare = |lc: &'a LibraryClass| lc.name.0.as_str().trim_start_matches("::");
+    match NameIndex::current(app) {
+        Some(index) => {
+            let first = index.first_modules_bare.get_or_init(|| {
+                let mut first: HashMap<String, usize> = HashMap::default();
+                for (j, lc) in app.library_classes.iter().enumerate() {
+                    if lc.is_module {
+                        first.entry(bare(lc).to_string()).or_insert(j);
+                    }
+                }
+                first
+            });
+            first.get(target).map(|&j| &app.library_classes[j])
+        }
+        None => app.library_classes.iter().find(|lc| lc.is_module && bare(lc) == target),
     }
 }
 
@@ -11082,7 +11105,7 @@ fn resolve_app_module<'a>(lc: &LibraryClass, path: &[Symbol], app: &'a App) -> O
     let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
     (0..=scope.len()).rev().find_map(|n| {
         let name = if n == 0 { written.clone() } else { format!("{}::{written}", scope[..n].join("::")) };
-        app.library_classes.iter().find(|c| c.is_module && c.origin.is_none() && c.name.0.as_str() == name)
+        library_classes_named(&name, app).into_iter().find(|c| c.is_module && c.origin.is_none())
     })
 }
 
