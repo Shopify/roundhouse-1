@@ -8790,12 +8790,20 @@ fn model_callback_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
 pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let extensions = app_extension_calls(lc, app);
     let prepends = app_prepend_calls(lc, app);
+    // An STI subclass's class macro call its model claims runs as
+    // written: one that retypes columns the model compiled as retypable
+    // declares the types on the subclass, one that sets the model's
+    // query constraints sets the same list
+    // (`analyze::retypable_attributes::claimed_body_calls`).
+    let parent = lc.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p));
+    let claimed = |c: &Expr| parent.is_some_and(|m| m.claimed_body_calls.contains(&c.span));
     lc.unknown_calls
         .iter()
         .filter(|c| {
             crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
+                || claimed(c)
         })
         .collect()
 }

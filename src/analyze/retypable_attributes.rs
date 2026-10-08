@@ -42,8 +42,11 @@ use crate::ident::Symbol;
 const LATER_BLOCKS: &[&str] = &["define_method", "define_singleton_method", "lambda", "proc", "new", "instance_exec"];
 
 /// The model's retypable columns, in table order: those its own body's
-/// calls name, and its model ancestors' (an STI subclass shares the
-/// table, and Rails applies a superclass's declarations to it).
+/// calls name, its model ancestors' (an STI subclass shares the table,
+/// and Rails applies a superclass's declarations to it), and those of the
+/// STI subclasses that ingest keeps as library classes: they inherit the
+/// model's compiled accessors, and their own declarations apply to them
+/// alone (the runtime's declared types are per class).
 pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
     let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
     let mut names: Vec<String> = Vec::new();
@@ -59,7 +62,28 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         }
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
+    for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
+        names.extend(call_names);
+    }
     table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())).map(|c| c.name.clone()).collect()
+}
+
+/// The body calls of the model's STI subclasses (library classes whose
+/// superclass is the model) of an app class macro reaching `target`,
+/// each with its class and the literal names it passes.
+fn sti_subclass_macro_calls<'a>(
+    model: &'a Model,
+    app: &'a App,
+    target: &str,
+) -> Vec<(&'a LibraryClass, &'a Expr, Vec<String>)> {
+    let mut out = Vec::new();
+    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+        let side = ClassSide::of_sti_subclass(lc, model, app);
+        for (call, names) in calls_reaching(&side, lc.unknown_calls.iter(), target, false) {
+            out.push((lc, call, names));
+        }
+    }
+    out
 }
 
 /// `attribute_type_unevaluated` for each column a body call can retype,
@@ -74,6 +98,24 @@ pub(crate) fn diagnose(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
             for col in table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())) {
                 let kind = DiagnosticKind::AttributeTypeUnevaluated {
                     model: Symbol::from(model.name.0.as_str()),
+                    attribute: col.name.clone(),
+                    call: method.clone(),
+                };
+                let mut d = Diagnostic {
+                    span: call.span,
+                    severity: Diagnostic::default_severity(&kind),
+                    kind,
+                    message: String::new(),
+                };
+                d.message = Diagnostic::stub_text(&d.kind);
+                out.push(d);
+            }
+        }
+        for (lc, call, names) in sti_subclass_macro_calls(model, app, "attribute") {
+            let ExprNode::Send { method, .. } = &*call.node else { continue };
+            for col in table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())) {
+                let kind = DiagnosticKind::AttributeTypeUnevaluated {
+                    model: Symbol::from(lc.name.0.as_str()),
                     attribute: col.name.clone(),
                     call: method.clone(),
                 };
@@ -168,11 +210,10 @@ pub(crate) fn carries_query_constraints(expr: &Expr, columns: &[Symbol]) -> bool
 /// (the inherited-macro replay).
 ///
 /// For an STI subclass (a library class to ingest whose superclass is
-/// the model) only the `query_constraints` kind: its Ruby emit drops the
-/// call (`emit::ruby::modelled_class_body_calls`), and for the model's
-/// list that is what Rails answers anyway (`query_constraints_list` falls
-/// back to the base class's when the primary key is the same). A dropped
-/// retyping macro changes the subclass's types, so it stays refused.
+/// the model) both kinds, and its Ruby emit carries them as written
+/// (`emit::ruby::modelled_class_body_calls`): a retyping call declares
+/// the types on the subclass alone, as in Rails, and a
+/// `query_constraints` one sets the model's list on it.
 ///
 /// `model_to_library::unclaimed_unknowns` and the STI subclass check skip
 /// these by span. Needs the model's `retypable_attributes` and
@@ -182,6 +223,14 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
     let side = ClassSide::of(model, app);
     let body: Vec<&Expr> = body_statements(model).collect();
     for (call, names) in calls_reaching(&side, body.iter().copied(), "attribute", false) {
+        if literal_call(call)
+            && !names.is_empty()
+            && names.iter().all(|n| model.retypable_attributes.iter().any(|c| c.as_str() == n))
+        {
+            out.push(call.span);
+        }
+    }
+    for (_, call, names) in sti_subclass_macro_calls(model, app, "attribute") {
         if literal_call(call)
             && !names.is_empty()
             && names.iter().all(|n| model.retypable_attributes.iter().any(|c| c.as_str() == n))

@@ -58,6 +58,15 @@
 //! `find` is left alone because the arel pass inlines `<Model>.find` to
 //! a primary-key SELECT — re-rooting it would move that work onto the
 //! Relation path for no scoping gain a primary key can use.
+//!
+//! **A subclass with declarations of its own keeps its root.** A
+//! subclass body call its model claims (`Model::claimed_body_calls`:
+//! Core's `model_uuid_attributes` in a subclass) runs on the subclass
+//! and declares attribute types there alone, and a relation binds its
+//! values through its own model's types. Re-rooted on the base,
+//! `SpecialItem.where(ref: 66)` bound 66 as the base's uuid column. Such
+//! a subclass scopes on itself: `SpecialItem.where(type: "SpecialItem")`,
+//! which the runtime Relation runs with the subclass as its model.
 
 use crate::det::{HashMap, HashSet};
 
@@ -120,23 +129,41 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
             }
         }
     }
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &bases, &mut recast));
+    // Subclasses with declarations of their own root on themselves.
+    let roots: HashMap<ClassId, ClassId> = bases
+        .iter()
+        .map(|(sub, base)| {
+            let root = if declares_own_types(app, sub, base) { sub } else { base };
+            (sub.clone(), root.clone())
+        })
+        .collect();
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &mut recast));
     for view in &mut app.views {
-        rewrite(&mut view.body, &bases, &mut recast);
+        rewrite(&mut view.body, &roots, &mut recast);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &bases, &mut recast);
+            rewrite(setup, &roots, &mut recast);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &bases, &mut recast);
+            rewrite(&mut t.body, &roots, &mut recast);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &bases, &mut recast);
+            rewrite(&mut m.body, &roots, &mut recast);
         }
     }
     push_becomes_from(app, &bases, &recast);
     stamp_sti_subclasses(app, &bases);
+}
+
+/// Whether the STI subclass `sub` has a body call its base model claims
+/// (`Model::claimed_body_calls`), which runs on the subclass as written.
+fn declares_own_types(app: &App, sub: &ClassId, base: &ClassId) -> bool {
+    let Some(model) = app.models.iter().find(|m| &m.name == base) else { return false };
+    app.library_classes
+        .iter()
+        .find(|lc| &lc.name == sub)
+        .is_some_and(|lc| lc.unknown_calls.iter().any(|c| model.claimed_body_calls.contains(&c.span)))
 }
 
 /// Record each base model's STI subclasses on the model itself
@@ -415,6 +442,9 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
     out
 }
 
+/// `bases` maps each STI subclass to the class its scoped relation roots
+/// on: its base model, or itself when it declares attribute types of its
+/// own (`apply_sti_scope_lowering`).
 fn rewrite(
     expr: &mut Expr,
     bases: &HashMap<ClassId, ClassId>,
