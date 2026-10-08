@@ -16,7 +16,11 @@ pub fn native_and_emitted(
     loads: &[&str],
 ) -> (Vec<String>, Vec<String>) {
     assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
-    let native_root: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-native"));
+    // Per process: parallel runs sharing a target directory must not
+    // rewrite each other's app (the driver names its databases the same
+    // way). Kept when a side fails, for inspection.
+    let native_root: PathBuf =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-native-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&native_root);
     for (path, text) in files {
         let full = native_root.join(path);
@@ -51,5 +55,7 @@ pub fn native_and_emitted(
         assert_eq!(run["ok"], true, "{side} run failed:\n{}", run["stderr"].as_str().unwrap_or(""));
         run["lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect()
     };
-    (lines("native"), lines("emitted"))
+    let answered = (lines("native"), lines("emitted"));
+    let _ = std::fs::remove_dir_all(&native_root);
+    answered
 }
