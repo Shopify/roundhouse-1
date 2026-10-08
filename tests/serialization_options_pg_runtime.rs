@@ -7,6 +7,9 @@
 //! the inheritance column excepted) and `as_json` (a `format:`
 //! StringInquirer) override the record's, against native Rails 8.2 on
 //! the same local PostgreSQL database.
+use roundhouse::expr::{Expr, ExprNode, LValue};
+use roundhouse::ty::Ty;
+
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -236,6 +239,10 @@ const SHOP: &str = r##"class Shop < ApplicationRecord
     plan == "paid"
   end
 
+  def cached_fields_size
+    cached_serialization_fields.size + 1
+  end
+
   def contact_email
     "#{name}@example.com"
   end
@@ -299,12 +306,13 @@ const PROBE: &str = r##"class SerializationOptionsProbe
     out << "options: #{s.serialization_options({ only: :name }).inspect}"
     c = Car.create!(wheels: 4)
     out << "sti: #{c.as_json(only: [:type, :wheels]).inspect} #{c.as_json(methods: [{ kind: :type }]).except("id").inspect}"
+    out << "cached: #{s.cached_serialization_fields.inspect} #{s.cached_fields_size} #{c.serialization_options({}).keys.inspect}"
     out
   end
 end
 "##;
 
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 12] = [
     r##"default: {"id" => 1, "name" => "a", "label" => "shop a", "customer_email" => "a@example.com"}"##,
     r##"settings: {"id" => 1, "label" => "shop a", "pre_launch_enabled" => true, "plan_inquiry" => "paid", "extra" => {"x" => 1}}"##,
     r##"fields: {"name" => "a", "customer_email" => "a@example.com"}"##,
@@ -316,6 +324,7 @@ const EXPECTED: [&str; 11] = [
     r##"product except: {}"##,
     r##"options: {only: ["name"], methods: [:label, {customer_email: :contact_email}], except: ["type"]}"##,
     r##"sti: {"type" => "Car", "wheels" => 4} {"kind" => "Car"}"##,
+    r##"cached: [] 1 [:only, :except]"##,
 ];
 
 /// What native Rails requires, in order: the initializer first, as
@@ -343,13 +352,7 @@ const FILES: [(&str, &str); 10] = [
     ("app/models/serialization_options_probe.rb", PROBE),
 ];
 
-fn overlay(files: &[(&str, &str)]) -> emit_and_run::Overlay {
-    files.iter().fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
-}
-
-#[test]
-#[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
-fn serialization_options_matches_native_rails_on_postgresql() {
+fn pg_files() -> Vec<(&'static str, &'static str)> {
     let mut files = vec![
         ("roundhouse.yml", "database_adapter: postgresql\n"),
         ("config/database.yml", DATABASE_YML),
@@ -357,6 +360,17 @@ fn serialization_options_matches_native_rails_on_postgresql() {
         ("db/structure.sql", STRUCTURE),
     ];
     files.extend(FILES);
+    files
+}
+
+fn overlay(files: &[(&str, &str)]) -> emit_and_run::Overlay {
+    files.iter().fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
+}
+
+#[test]
+#[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn serialization_options_matches_native_rails_on_postgresql() {
+    let files = pg_files();
     let (emitted, errors) = overlay(&files).emit(roundhouse::project::BuildTarget::Ruby);
     let (native, emitted_lines) = pg_probe::native_and_emitted(
         "serialization-options",
@@ -370,4 +384,38 @@ fn serialization_options_matches_native_rails_on_postgresql() {
     let real: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
     assert!(real.is_empty(), "{}", errors.join("\n"));
     assert_eq!(emitted_lines, native, "emitted");
+}
+
+/// The analyzer sees the mixin where the boot runs it: above
+/// ActiveRecord::Base, so a record's `cached_serialization_fields` (only
+/// SerializationOptions defines it) and `serializable_hash` resolve to the
+/// module's methods.
+#[test]
+fn a_record_reaches_serialization_options_statically() {
+    let tree = pg_files()
+        .into_iter()
+        .map(|(path, text)| (std::path::PathBuf::from(path), text.as_bytes().to_vec()))
+        .collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let mut analyzer = roundhouse::analyze::Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+    let shop = app.models.iter().find(|m| m.name.0.as_str() == "Shop").expect("Shop");
+    let size = shop.methods().find(|m| m.name.as_str() == "cached_fields_size").expect("cached_fields_size");
+    assert_eq!(size.body.ty, Some(Ty::Int), "{:?}", size.body);
+    // `h = s.serializable_hash(only: [:name], methods: [{ mail: :contact_email }])`
+    let probe = app.library_classes.iter().find(|c| c.name.0.as_str() == "SerializationOptionsProbe").expect("probe");
+    let lines = probe.methods.iter().find(|m| m.name.as_str() == "lines").expect("lines");
+    fn assigned<'a>(e: &'a Expr, local: &str, out: &mut Option<&'a Expr>) {
+        if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
+            if name.as_str() == local {
+                *out = Some(value);
+            }
+        }
+        e.node.for_each_child(&mut |c| assigned(c, local, out));
+    }
+    let mut h = None;
+    assigned(&lines.body, "h", &mut h);
+    // The module's `HashWithIndifferentAccess.new`, String-keyed.
+    let ty = h.expect("h assigned").ty.clone();
+    assert!(matches!(&ty, Some(Ty::Hash { key, .. }) if **key == Ty::Str), "s.serializable_hash(...): {ty:?}");
 }

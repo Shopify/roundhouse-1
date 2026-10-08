@@ -1371,6 +1371,9 @@ impl Analyzer {
         for declaration in &app.library_classes {
             if let Some(info) = classes.get_mut(&declaration.name) { info.is_module = declaration.is_module; }
         }
+        // A boot initializer's `on_load(:active_record) { include M }`:
+        // M joins Base's ancestry, as the emitted boot runs it.
+        registry::load_hook_mixins::register(app, &mut classes);
 
 
         assert!(
