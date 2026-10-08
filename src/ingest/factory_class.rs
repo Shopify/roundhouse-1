@@ -163,14 +163,36 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
     Ok(out)
 }
 
+/// `singleton`: `body` is a `class << self` directly in the declaration
+/// `scope` names. Ruby binds a constant written there on the singleton
+/// class (CRuby 4.0: `M.singleton_class.const_defined?(:X, false)`),
+/// which no class is emitted for. Every walk that lowers that body
+/// carries its constants on the declaration instead
+/// (`library_class::walk_decl_body_in`, `singleton_class`), which its
+/// methods read by bare name all the same, so the factory class is
+/// `Scope::X` too. Only its constant writes are classes here; a class
+/// or module nested in it is not visited.
 fn collect(
     body: Option<Node<'_>>,
     scope: &[String],
     file: &str,
     out: &mut Vec<LibraryClass>,
 ) -> IngestResult<()> {
+    collect_in(body, scope, file, out, false)
+}
+
+fn collect_in(
+    body: Option<Node<'_>>,
+    scope: &[String],
+    file: &str,
+    out: &mut Vec<LibraryClass>,
+    singleton: bool,
+) -> IngestResult<()> {
     let Some(body) = body else { return Ok(()) };
     for stmt in flatten_statements(body) {
+        if singleton && stmt.as_constant_write_node().is_none() {
+            continue;
+        }
         if let Some(write) = stmt.as_constant_write_node() {
             let value = write.value();
             let factory = match factory_block(&value) {
@@ -195,6 +217,10 @@ fn collect(
                 let mut inner = scope.to_vec();
                 inner.extend(name);
                 collect(module.body(), &inner, file, out)?;
+            }
+        } else if let Some(sc) = stmt.as_singleton_class_node() {
+            if !scope.is_empty() && sc.expression().as_self_node().is_some() {
+                collect_in(sc.body(), scope, file, out, true)?;
             }
         }
     }

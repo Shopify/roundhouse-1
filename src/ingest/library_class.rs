@@ -990,7 +990,7 @@ pub(super) fn library_class_and_struct_base(
         conditional_definitions,
         class_attribute_effects,
         ..
-    } = walk_decl_body(class.body(), &owner, file, false)?;
+    } = walk_declaration_body(class.body(), &owner, file)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
     }
@@ -1954,7 +1954,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         conditional_definitions,
         class_attribute_effects,
         ..
-    } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
     admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
@@ -2666,12 +2666,43 @@ fn walk_decl_body<'pr>(
     Ok(out)
 }
 
+/// [`walk_decl_body`] on a `class`/`module` declaration's own body,
+/// one `factory_class::factory_classes` visits: a factory class written
+/// in a `class << self` directly inside it is claimed there.
+fn walk_declaration_body<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<DeclBody> {
+    let visibility = Visibility::resolve_library(body.as_ref(), file, None)?;
+    let mut out = walk_decl_body_in(body, owner, file, false, &visibility, true)?;
+    out.visibility_overrides = visibility.overrides();
+    Ok(out)
+}
+
 fn walk_decl_body_with_visibility<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
     file: &str,
     force_class_receiver: bool,
     visibility: &Visibility,
+) -> IngestResult<DeclBody> {
+    walk_decl_body_in(body, owner, file, force_class_receiver, visibility, false)
+}
+
+/// `declaration_body`: `body` is a `class`/`module` body that
+/// `factory_class::factory_classes` visits, or a `class << self`
+/// directly inside one (which it visits too). A factory class write in
+/// such a body is claimed as a class there; in any other carrier
+/// (`class_methods do`, `class << klass` in an `included` hook, a
+/// `class << self` in a factory block) it is refused.
+fn walk_decl_body_in<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+    force_class_receiver: bool,
+    visibility: &Visibility,
+    declaration_body: bool,
 ) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
@@ -2840,10 +2871,13 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             // `NAME = Struct.new(...) do … end` is a class, which
             // `factory_class::factory_classes` builds from the same
-            // statement. Not in a singleton or class-method carrier:
-            // that constant belongs to a scope no class is emitted for.
+            // statement. In a `class << self` directly in a declaration
+            // body it is carried on the declaration, as every constant
+            // of that `class << self` is (see `factory_class::collect`).
+            // Not in any other singleton or class-method carrier: that
+            // constant belongs to a scope no class is emitted for.
             if super::factory_class::is_factory_class_write(stmt) {
-                if force_class_receiver {
+                if force_class_receiver && !declaration_body {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
                         message: "Struct.new/Data.define body block in a singleton or class-method \
@@ -2984,7 +3018,8 @@ fn walk_decl_body_with_visibility<'pr>(
         // `class << self ... end` — singleton class block. Body
         // defines class-level methods on the enclosing scope.
         if let Some(sc) = stmt.as_singleton_class_node() {
-            out.extend(walk_decl_body_with_visibility(sc.body(), owner, file, true, visibility)?);
+            let claimed = declaration_body && !force_class_receiver && sc.expression().as_self_node().is_some();
+            out.extend(walk_decl_body_in(sc.body(), owner, file, true, visibility, claimed)?);
             continue;
         }
         // `module ClassMethods … end` is not folded here: it is its own

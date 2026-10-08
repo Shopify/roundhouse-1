@@ -404,3 +404,84 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
         assert!(!app.library_classes.iter().any(|c| c.name.0.as_str() == "X"), "{source}");
     }
 }
+
+/// `X = Struct.new(...) do … end` inside `class << self` (Core's
+/// `Merchandising::FilterQueryBuilder::QUERY`) is a class like any other
+/// factory write, and the constants after it read it. Ruby binds `X` on
+/// the singleton class; the walks carry every `class << self` constant
+/// on the declaration (`singleton_class`), and the factory class with
+/// them, so the methods that read it by bare name run the same. In a
+/// model's `class << self` too, where the model walk must not replay the
+/// write a second time.
+#[test]
+fn a_factory_class_in_class_self_is_a_class_its_constants_read() {
+    const BUILDER: &str = r##"module Merch
+  module FilterBuilder
+    MAPPING = { price: "variants.price" }.freeze
+
+    class << self
+      def build(field) = query(field)
+
+      private
+
+      QUERY = Struct.new(:index) do
+        def multi_index? = false
+
+        def unavailable_fields = []
+      end
+      PRODUCT_QUERY = QUERY.new(:products)
+
+      def query(field)
+        [PRODUCT_QUERY.multi_index?, PRODUCT_QUERY.index, QUERY.members, MAPPING[field]]
+      end
+    end
+  end
+end
+"##;
+    const ARTICLE_ROWS: &str = r##"class Article < ApplicationRecord
+  class << self
+    Row = Struct.new(:n) do
+      def twice = n * 2
+    end
+
+    def doubled_row(n) = Row.new(n).twice
+  end
+
+"##;
+    let script = "p Merch::FilterBuilder.build(:price), Merch::FilterBuilder.respond_to?(:query), \
+                  Merch::FilterBuilder.private_methods.include?(:query)\n";
+    let expected = "[false, :products, [:index], \"variants.price\"]\nfalse\ntrue\n";
+    let native = Command::new("ruby").arg("-e").arg(format!("{BUILDER}\n{script}")).output().expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+
+    let run = emit_and_run::real_blog().write("app/lib/merch/filter_builder.rb", BUILDER).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+
+    // The model's singleton factory class, through the model walk.
+    let model = emit_and_run::real_blog()
+        .edit("app/models/article.rb", "class Article < ApplicationRecord\n", ARTICLE_ROWS)
+        .run_ruby("p Article.doubled_row(3), Article::Row.new(4).twice\n");
+    model.assert_passes();
+    assert_eq!(model.stdout, "6\n8\n");
+}
+
+/// The other class-method carriers bind the constant somewhere no class
+/// is emitted for, and stay named refusals.
+#[test]
+fn a_factory_class_in_other_class_method_carriers_is_refused() {
+    let source = "module Conf\n  module Greeting\n    extend ActiveSupport::Concern\n\n    class_methods do\n      \
+                  X = Struct.new(:a) do\n        def b = a\n      end\n    end\n\n    def hi = 1\n  end\nend\n";
+    survey::activate();
+    let result = ingest_app_from_tree(HashMap::from_iter([(
+        PathBuf::from("app/models/concerns/conf/greeting.rb"),
+        source.as_bytes().to_vec(),
+    )]));
+    let gaps = survey::drain();
+    result.expect("survey retains the app");
+    assert!(
+        gaps.iter().any(|gap| gap.to_string().contains("in a singleton or class-method carrier is not modeled")),
+        "{gaps:?}"
+    );
+}
