@@ -102,6 +102,7 @@ pub fn ingest_sequel_model(
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
         ignored_columns: Vec::new(),
+        composite_primary_key: Vec::new(),
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,

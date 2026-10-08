@@ -24,7 +24,7 @@
 //! constant that resolves to `Component::TrustedId` or a subclass (the
 //! macro's own `TypeError` check), and a literal `attribute:`. The
 //! `attribute: :id` form is left alone: its body branches on
-//! `composite_primary_key?`, which the runtime does not model. A call
+//! `composite_primary_key?`, which this step does not evaluate. A call
 //! left alone stays a dropped model-DSL statement.
 //!
 //! Interim: this step is keyed on the module and macro name, which a

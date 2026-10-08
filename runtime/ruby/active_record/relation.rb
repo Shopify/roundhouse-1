@@ -1628,6 +1628,8 @@ module ActiveRecord
     # `@model.primary_key` (not a hard-coded `id` column) and casts the
     # way `find` does, so uuid / string keys survive (#310).
     def ids
+      # Rails' ids on a composite primary key: one key tuple per record.
+      return to_a.map { |record| record.id } if @model.composite_primary_key?
       prior = @select_sql
       key = @model.primary_key
       @select_sql = "#{@table}.#{key} AS v"
@@ -1653,6 +1655,9 @@ module ActiveRecord
     # raise for the same reason — an exception a caller rescues must not
     # leave the relation altered.
     def find(id)
+      if @model.composite_primary_key?
+        raise NotImplementedError, "roundhouse: find on a relation of #{@model.name}, whose primary key is composite, is not supported"
+      end
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
       prior_limit = @limit

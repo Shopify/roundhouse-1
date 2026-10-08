@@ -27,6 +27,7 @@ pub use schema::col_storage_name;
 pub use schema::shakeable_synthesized_names;
 pub(crate) mod validations;
 mod associations;
+mod composite_key;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub mod row;
@@ -1650,6 +1651,10 @@ fn build_methods_for_dialect(
                 );
             }
         }
+        // A composite primary key re-keys what the passes above
+        // synthesized: `id` is the tuple, the `id` column `id_value`.
+        // Before the model's own methods, which win over the tuple's.
+        self::composite_key::rekey(&mut methods, model, table);
     }
 
     push_validate_method(&mut methods, model);
@@ -1702,6 +1707,9 @@ fn build_methods_for_dialect(
     // After push_user_methods too: a model that writes its own
     // `cache_key` keeps it.
     self::markers::push_cache_key_methods(&mut methods, model, schema);
+    // The identity methods above read the key slot; a composite key's
+    // read the tuple.
+    self::composite_key::rekey_identity(&mut methods, model);
     push_broadcasts_methods(&mut methods, model);
     // `has_secure_token` — the token default folds into the
     // `before_create` hook, so it runs BEFORE `push_callback_methods`:

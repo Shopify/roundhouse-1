@@ -67,7 +67,6 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // Columns an app macro can retype at load, typed gradually.
     out.extend(super::retypable_attributes::diagnose(app));
     // Models Rails would key on every column of a composite primary key.
-    out.extend(super::retypable_attributes::diagnose_composite_primary_keys(app));
     // Model class-body statements no lowering claims: each is dropped
     // from the emitted class, with whatever it did at load.
     out.extend(crate::lower::model_to_library::diagnose_unclaimed_model_dsl(app));
@@ -403,7 +402,6 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             DiagnosticKind::IngestRefused { .. } => Diagnostic::stub_text(kind),
             // Produced by `retypable_attributes::diagnose` as a returned list.
             DiagnosticKind::AttributeTypeUnevaluated { .. } => Diagnostic::stub_text(kind),
-            DiagnosticKind::CompositePrimaryKey { .. } => Diagnostic::stub_text(kind),
         };
         out.push(Diagnostic {
             span: expr.span,

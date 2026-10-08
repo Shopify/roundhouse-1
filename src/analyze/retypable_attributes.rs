@@ -91,42 +91,28 @@ pub(crate) fn diagnose(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
     out
 }
 
-/// `composite_primary_key` for each model whose table has a composite
-/// primary key and which declares no `self.primary_key`, itself or
-/// through a model ancestor. The compiled record keys on one column
-/// (`adapter_emit::key_column`); Rails keys such a model on all of them.
-pub(crate) fn diagnose_composite_primary_keys(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
-    use crate::diagnostic::{Diagnostic, DiagnosticKind};
-    let mut out = Vec::new();
-    for model in &app.models {
-        let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
-        if table.primary_key_columns.is_empty() {
-            continue;
-        }
-        let mut declared = false;
-        let mut at = Some(model);
-        let mut visited: Vec<&str> = Vec::new();
-        while let Some(m) = at {
-            if declared || visited.contains(&m.name.0.as_str()) {
-                break;
-            }
-            visited.push(m.name.0.as_str());
-            declared = m.primary_key.is_some();
-            at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
-        }
-        if declared {
-            continue;
-        }
-        let kind = DiagnosticKind::CompositePrimaryKey {
-            model: Symbol::from(model.name.0.as_str()),
-            table: table.name.clone(),
-            columns: table.primary_key_columns.clone(),
-        };
-        let mut d = Diagnostic { span: model.span, severity: Diagnostic::default_severity(&kind), kind, message: String::new() };
-        d.message = Diagnostic::stub_text(&d.kind);
-        out.push(d);
+/// The columns of the table's composite primary key when the model
+/// declares no `self.primary_key`, itself or through a model ancestor:
+/// Rails then keys the model on all of them (`primary_key` is the list,
+/// `id` the tuple of their values; `Model::composite_primary_key`).
+pub(crate) fn composite_primary_key(model: &Model, app: &App) -> Vec<Symbol> {
+    let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
+    if table.primary_key_columns.is_empty() {
+        return Vec::new();
     }
-    out
+    let mut at = Some(model);
+    let mut visited: Vec<&str> = Vec::new();
+    while let Some(m) = at {
+        if visited.contains(&m.name.0.as_str()) {
+            break;
+        }
+        visited.push(m.name.0.as_str());
+        if m.primary_key.is_some() {
+            return Vec::new();
+        }
+        at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
+    }
+    table.primary_key_columns.clone()
 }
 
 /// The columns of the `query_constraints` call that decides the model's

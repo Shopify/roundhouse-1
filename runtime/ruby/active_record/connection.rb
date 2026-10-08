@@ -280,10 +280,34 @@ module ActiveRecord
     # Reject nil before a key-typed adapter can coerce it to a real
     # zero/empty-string key.
     def self.find(id)
+      return _find_composite_primary_key(id) if composite_primary_key?
       raise RecordNotFound, "Couldn't find #{name} with id=#{id}" if id.nil?
       result = _find_primary_key_input(id)
       raise RecordNotFound, "Couldn't find #{name} with id=#{id}" if result.nil?
       result
+    end
+
+    # Rails' find on a composite primary key (core.rb, finder_methods.rb):
+    # one key tuple finds one record, an Array of tuples one per tuple,
+    # in order; a missing one raises.
+    def self._find_composite_primary_key(id)
+      columns = composite_query_constraints_list
+      unless id.is_a?(Array) && !id.empty?
+        raise ArgumentError, "Expected an Array of #{columns.inspect} values, got #{id.inspect}"
+      end
+      return id.map { |key| _find_composite_primary_key(key) } if id.first.is_a?(Array)
+      conditions = {}
+      columns.each_with_index { |column, i| conditions[column.to_sym] = id[i] }
+      record = where(conditions).take
+      raise RecordNotFound, "Couldn't find #{name} with #{columns.inspect}=#{id.inspect}" if record.nil?
+      record
+    end
+
+    # Rails' `composite_primary_key?`: models on a table keyed on several
+    # columns that declare no `primary_key` override it (emitted), with
+    # `primary_key` as the column list and `id` as the tuple.
+    def self.composite_primary_key?
+      false
     end
 
     # Schema-generated models override this with one normalization path
@@ -629,6 +653,7 @@ module ActiveRecord
     # `primary_key` is not ported, so there is no implicit list.
     def self.query_constraints_list
       return @query_constraints_list if @query_constraints_list
+      return _compiled_query_constraints if composite_primary_key?
       parent = superclass
       return nil if parent.equal?(ActiveRecord::Base) || !parent.respond_to?(:query_constraints_list) || parent.abstract_class?
       parent.primary_key == primary_key ? parent.query_constraints_list : nil

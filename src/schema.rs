@@ -35,8 +35,8 @@ pub struct Table {
     /// A composite primary key's columns in key order (structure.sql's
     /// `PRIMARY KEY (shop_id, id)`). No column is flagged `primary_key`
     /// then: a model keys its records on its declared `self.primary_key`,
-    /// and one that declares none is reported (`composite_primary_key`),
-    /// since Rails keys it on every column here.
+    /// and one that declares none on every column here, as Rails does
+    /// (`Model::composite_primary_key`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primary_key_columns: Vec<Symbol>,
 }

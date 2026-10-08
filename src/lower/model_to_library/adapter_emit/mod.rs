@@ -1110,13 +1110,21 @@ use crate::lower::arel::visitor::concat_chain as arel_concat;
 /// none (a composite key, `Table.primary_key_columns`, as Core's
 /// `PRIMARY KEY((shop_id) HASH, id ASC, island ASC)` with
 /// `self.primary_key = :id`) — the column Rails' find / update /
-/// destroy use. A model on a composite key that declares none is
-/// reported (`composite_primary_key`).
+/// destroy use. A model on a composite key that declares none
+/// (`Model::composite_primary_key`) has no single key column: its `id` column
+/// when that is part of the key, else its first column, is the one the
+/// INSERT answers (`composite_key::rekey` builds the tuple around it).
 fn key_column<'a>(model: &Model, table: &'a Table) -> Option<&'a crate::schema::Column> {
-    super::primary_key_column(table).or_else(|| {
-        let named = model.primary_key.as_ref()?;
-        table.columns.iter().find(|c| &c.name == named)
-    })
+    super::primary_key_column(table)
+        .or_else(|| {
+            let named = model.primary_key.as_ref()?;
+            table.columns.iter().find(|c| &c.name == named)
+        })
+        .or_else(|| {
+            let keys = &model.composite_primary_key;
+            let named = keys.iter().find(|k| k.as_str() == "id").or(keys.first())?;
+            table.columns.iter().find(|c| &c.name == named)
+        })
 }
 
 fn key_column_name(model: &Model, table: &Table) -> Symbol {

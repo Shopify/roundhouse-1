@@ -275,6 +275,7 @@ mod tests {
             query_constraints: Vec::new(),
             claimed_body_calls: Vec::new(),
             ignored_columns: Vec::new(),
+            composite_primary_key: Vec::new(),
             span: crate::span::Span::synthetic(),
             visibility_overrides: Vec::new(),
         }

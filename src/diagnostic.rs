@@ -76,7 +76,6 @@ impl Diagnostic {
             DiagnosticKind::IngestUnsupported { .. } => "ingest_unsupported",
             DiagnosticKind::IngestRefused { .. } => "ingest_unsupported",
             DiagnosticKind::AttributeTypeUnevaluated { .. } => "attribute_type_unevaluated",
-            DiagnosticKind::CompositePrimaryKey { .. } => "composite_primary_key",
         }
     }
 
@@ -274,12 +273,6 @@ impl Diagnostic {
                 model.as_str(),
                 attribute.as_str(),
                 call.as_str()
-            ),
-            DiagnosticKind::CompositePrimaryKey { model, table, columns } => format!(
-                "`{}` declares no `self.primary_key` and its table `{}` has a composite primary key ({}); Rails keys its records on every one of those columns, the compiled model keys them on `id` alone",
-                model.as_str(),
-                table.as_str(),
-                columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
             ),
         }
     }
@@ -611,11 +604,4 @@ pub enum DiagnosticKind {
     /// column is typed gradually. Warning: the program runs the real
     /// behavior; only the static type is open.
     AttributeTypeUnevaluated { model: Symbol, attribute: Symbol, call: Symbol },
-    /// `model`'s table has a composite primary key
-    /// (`Table.primary_key_columns`) and the model declares no
-    /// `self.primary_key` of its own or through a model ancestor, so
-    /// Rails keys its records on all of `columns`. A model that declares
-    /// one (Core's `self.primary_key = :id`) keys on it, as Rails does,
-    /// and is not reported.
-    CompositePrimaryKey { model: Symbol, table: Symbol, columns: Vec<Symbol> },
 }

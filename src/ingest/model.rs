@@ -695,6 +695,7 @@ pub(super) fn ingest_model_with_enum_constants(
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
         ignored_columns: Vec::new(),
+        composite_primary_key: Vec::new(),
         table: TableRef(Symbol::from(table_name)),
         primary_key,
         attributes,

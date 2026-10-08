@@ -2695,10 +2695,25 @@ end
         }
         model.retypable_attributes = cols;
     }
+    // A composite primary key the model declares no `self.primary_key`
+    // over: Rails keys the model on every column of it.
+    let composite: Vec<Vec<crate::ident::Symbol>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::composite_primary_key(m, &app)).collect();
+    for (model, cols) in app.models.iter_mut().zip(composite) {
+        model.composite_primary_key = cols;
+    }
     // The columns a `query_constraints` call in the body names; the
     // compiled update, destroy and reload key on them once it has run.
-    let constraints: Vec<Vec<crate::ident::Symbol>> =
-        app.models.iter().map(|m| crate::analyze::retypable_attributes::query_constraint_columns(m, &app)).collect();
+    // Without one, a composite primary key is the list, as Rails'
+    // `query_constraints_list` answers `primary_key` when it is an Array.
+    let constraints: Vec<Vec<crate::ident::Symbol>> = app
+        .models
+        .iter()
+        .map(|m| {
+            let named = crate::analyze::retypable_attributes::query_constraint_columns(m, &app);
+            if named.is_empty() { m.composite_primary_key.clone() } else { named }
+        })
+        .collect();
     for (model, cols) in app.models.iter_mut().zip(constraints) {
         // A direct call naming exactly those columns runs at class load
         // as written; the runtime's `query_constraints` sets the list.
