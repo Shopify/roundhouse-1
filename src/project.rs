@@ -6996,6 +6996,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let mut program_of_file: BTreeMap<String, String> = BTreeMap::new();
     let mut in_place: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut in_place_program: BTreeMap<String, String> = BTreeMap::new();
+    // The declarations files an autoload root maps their constant to (a
+    // source whose path names it): the files Zeitwerk manages, which it
+    // ignores as shadowed when the constant is already defined at setup
+    // (`RoundhouseAutoload.register`).
+    let mut declared_path_named: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (anchor, sources) in &declaring {
         let stem = anchor.strip_prefix("models/").unwrap_or(anchor);
         let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
@@ -7014,6 +7019,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 fold(&named.join("/")) == wanted && autoload_root(dir)
             })
             .collect();
+        if !named.is_empty() {
+            declared_path_named.insert(anchor.clone());
+        }
         let owner = match named.as_slice() {
             [one] => Some(**one),
             _ => None,
@@ -7039,6 +7047,32 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             }
         }
     }
+    // The same for a file with no support-file declarations (an
+    // app/models file, compiled as the app's own): whether any source's
+    // path under an autoload root names the anchor's constant
+    // (app/models/codes/country.rb for models/codes/country), and not an
+    // initializer's `module PublicSuffix` body (models/public_suffix).
+    let fold_stem = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
+    let root_named_stems: std::collections::BTreeSet<String> = app
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let rel = source.path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&source.path);
+            rel.strip_suffix(".rb")
+        })
+        .flat_map(|path| {
+            let segments: Vec<&str> = path.split('/').collect();
+            (1..segments.len())
+                .filter(|&i| autoload_root(&segments[..i]))
+                .map(|i| fold_stem(&segments[i..].join("/")))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let path_named = |anchor: &str| {
+        declared_path_named.contains(anchor)
+            || (!declaring.contains_key(anchor)
+                && root_named_stems.contains(&fold_stem(anchor.strip_prefix("models/").unwrap_or(anchor))))
+    };
     let as_loaded = |anchor: &str| {
         program_of_file.get(anchor).or_else(|| in_place_program.get(anchor)).cloned().unwrap_or_else(|| anchor.to_string())
     };
@@ -7050,6 +7084,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         file: Option<String>,
         all_module: bool,
         seen: bool,
+        path_named: bool,
     }
     // A plain gem's files, which its `require`s load: under the `lib/`
     // of a gem the lockfile names (a vendored `<name>-<version>/lib`, a
@@ -7244,6 +7279,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             child.all_module &= *is_module;
             if i == last {
                 child.file = Some(anchor.clone());
+                child.path_named = path_named(anchor);
             }
             parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
         }
@@ -7337,6 +7373,18 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             write!(body, "[:{name}, {file}, {}]", child.all_module).unwrap();
         }
         body.push_str("],\n");
+    }
+    body.push_str("  }.freeze\n");
+    // The constants' files no autoload root maps to their constant (an
+    // initializer's `module PublicSuffix` body): Zeitwerk manages none
+    // of them, so none is shadowed (`RoundhouseAutoload.shadowed?`).
+    body.push_str("  UNNAMED_FILES = {\n");
+    for children in namespaces.values() {
+        for child in children.values() {
+            if let Some(file) = child.file.as_ref().filter(|_| !child.path_named) {
+                writeln!(body, "    {:?} => true,", as_loaded(file)).unwrap();
+            }
+        }
     }
     body.push_str("  }.freeze\n");
     let list = |names: &mut dyn Iterator<Item = &str>| -> String {
@@ -8160,6 +8208,9 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # it into loading. Its own children are registered first, as Zeitwerk
   # sets up an already-defined namespace's autoloads at setup: its
   # file's body may run code that reaches them (`@x = Child.new`).
+  # Except a file Zeitwerk manages (its path names the constant: not in
+  # UNNAMED_FILES) whose constant a gem's own code defined: Zeitwerk
+  # ignores that file as shadowed (`shadowed?`), so it does not load.
   def self.register(mod)
     key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
     entries = NAMESPACES[key] or return
@@ -8190,8 +8241,37 @@ const AUTOLOAD_RUNTIME: &str = r##"
       child = mod.const_get(name, false)
       register(child) if child.is_a?(Module)
       next unless file
+      next if !UNNAMED_FILES.key?(file) && shadowed?(mod, name, file)
       if @deferred then @deferred << file else require path(file) end
     end
+  end
+
+  # The emitted tree (app/models.rb's directory's parent): runtime/, app/.
+  TREE = File.dirname(ROOT)
+
+  # Whether `mod::name`, defined before its autoload was set up, was
+  # defined by a gem's own file, outside this tree (the native proto gem's
+  # gen/proto/shopify/common/country_code.rb, which shopify_spanner
+  # requires at boot, before the in-repo proto-shopify engine's copy of
+  # it registers). Zeitwerk ignores the managed file of an already-defined
+  # constant (`autoload_file`: "ignored because ... is already defined"),
+  # so Ruby keeps the gem's definition and never runs the file. A constant
+  # this tree defined (a runtime class an app file reopens), one Ruby
+  # itself defines (`Comparable`) or one with no file (`-e`) keeps the
+  # file's load. Zeitwerk's eager load skips a shadowed file too
+  # (`shadowed_file?`).
+  def self.shadowed?(mod, name, file)
+    location = mod.const_source_location(name, false)
+    source = location&.first
+    return false unless source.is_a?(String) && source.start_with?("/") && File.file?(source)
+    # ROOT is a real path (`__dir__`); a file loaded through a load path
+    # entry may not be.
+    return false if File.realpath(source).start_with?("#{TREE}/")
+    (@shadowed ||= {})[file] = true
+  end
+
+  def self.shadowed_file?(file)
+    @shadowed&.key?(file) || false
   end
 
   # Registers like `register`, but the files of constants already defined
@@ -8215,7 +8295,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
   end
 
   def self.eager_load!
-    ALL_FILES.each { |file| require path(file) }
+    ALL_FILES.each { |file| require path(file) unless shadowed_file?(file) }
   end
 
   # The trailer of the file a constant's autoload loads, for a constant a
@@ -8245,7 +8325,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
     end
 
     def eager_load(force: false)
-      @files.each { |file| require RoundhouseAutoload.path(file) }
+      @files.each { |file| require RoundhouseAutoload.path(file) unless RoundhouseAutoload.shadowed_file?(file) }
       nil
     end
 
