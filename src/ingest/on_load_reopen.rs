@@ -39,8 +39,10 @@
 //! stays open.
 //!
 //! Direct receiverless `include` calls with literal module names are carried
-//! for known framework hooks. Other include shapes are reported without
-//! executing the hook. This is not an exhaustive ledger of hook bodies;
+//! for known framework hooks. Other include shapes in those hooks are
+//! reported without executing the hook. A hook with no class to reopen,
+//! whose block declares nothing, is not this pass's: the file program
+//! registers it as written ([`registered_as_written`]). This is not an exhaustive ledger of hook bodies;
 //! nested/conditional calls and other executable statements remain gaps.
 
 use ruby_prism::Node;
@@ -77,6 +79,9 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
         }
         let Some(recv) = call.receiver() else { continue };
         if constant_path_of(&recv).map(|p| p.join("::")).as_deref() != Some("ActiveSupport") {
+            continue;
+        }
+        if registered_as_written(&call) {
             continue;
         }
         let hook = call
@@ -151,6 +156,40 @@ pub(super) fn ingest_on_load_reopens(source: &[u8], file: &str, app: &mut App) {
         }
         carry_hook_includes(body, &hook, file, app);
     }
+}
+
+/// A file's top-level `ActiveSupport.on_load(:hook) do … end` that its
+/// file program carries as the statement it is
+/// (`library_class::program_items`). Ruby registers the block with
+/// lazy_load_hooks when the file loads and runs it only when something
+/// fires `:hook` (activesupport 8.1.4 lazy_load_hooks.rb), so the
+/// emitted file registers it the same way, with the runtime's port of
+/// lazy_load_hooks; a tree without the port refuses it
+/// (`project::reject_unported_load_hooks`). Shopify Core's
+/// granular_exceptions.rb mixes its Trilogy translations in this way, on
+/// a hook only the MySQL adapter fires.
+///
+/// Not this shape, and read by this pass instead: a hook it carries as a
+/// reopen of the hooked class ([`hook_class`]), and a block that
+/// declares a class or module (a reopen, or a module defined in it).
+pub(super) fn registered_as_written(call: &ruby_prism::CallNode<'_>) -> bool {
+    if constant_id_str(&call.name()) != "on_load"
+        || call.receiver().and_then(|r| constant_path_of(&r)).map(|p| p.join("::")).as_deref() != Some("ActiveSupport")
+    {
+        return false;
+    }
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let [hook] = args.as_slice() else { return false };
+    let Some(hook) = hook.as_symbol_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()) else {
+        return false;
+    };
+    let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+    if hook_class(&hook).is_some() {
+        return false;
+    }
+    block.body().is_none_or(|body| {
+        find_all_classes_with_scope(&body).is_empty() && find_all_modules_with_scope(&body).is_empty()
+    })
 }
 
 /// The framework class a load hook hands its block, for the hooks whose

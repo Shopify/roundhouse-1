@@ -8586,17 +8586,26 @@ fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a Libr
 /// different classes: inside `module Delivery`, `::Operation` is the
 /// top-level class and `Operation` is `Delivery::Operation` once that
 /// exists. Core's delivery operations subclass both.
+///
+/// A file-level `A::B = Class.new(Parent)` (the ingest's
+/// `file_class_new_path_write`, whose parent span is the `Class.new`
+/// argument) is rooted too: the write runs at the top level, so Ruby
+/// reads `Parent` there, while the emitted header sits inside `module A`,
+/// where a bare `Parent` would find `A::Parent` first.
 fn written_parent(lc: &LibraryClass, parent: &ClassId, app: &App) -> String {
     let text = parent.0.as_str();
     let span = lc.parent_span;
-    let rooted = !text.starts_with("::")
-        && !span.is_synthetic()
-        && (span.file.0 as usize)
-            .checked_sub(1)
-            .and_then(|i| app.sources.get(i))
-            .and_then(|file| file.text.get(span.start as usize..span.end as usize))
-            .is_some_and(|written| written.trim_start().starts_with("::") && written.trim_start().trim_start_matches("::") == text);
-    if rooted { format!("::{text}") } else { text.to_string() }
+    let source = (!span.is_synthetic())
+        .then(|| (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)))
+        .flatten();
+    let written = source.and_then(|file| file.text.get(span.start as usize..span.end as usize));
+    let rooted_as_written = written
+        .is_some_and(|written| written.trim_start().starts_with("::") && written.trim_start().trim_start_matches("::") == text);
+    let class_new_argument = lc.name.0.as_str().contains("::")
+        && source
+            .and_then(|file| file.text.get(..span.start as usize))
+            .is_some_and(|before| before.trim_end().ends_with("Class.new("));
+    if !text.starts_with("::") && (rooted_as_written || class_new_argument) { format!("::{text}") } else { text.to_string() }
 }
 
 /// The body calls that name a class-side method a loaded gem's module

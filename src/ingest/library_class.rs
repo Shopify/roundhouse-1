@@ -110,8 +110,19 @@ fn library_classes(
     // At file level the constant is Object's, not the first class's.
     let mut file_constants = file_level_constants(&root, file)?;
     let mut top_level = Vec::new();
+    // `A::B = Class.new(C)` (`file_class_new_path_write`): its `C` is
+    // read at the top level, so it takes no lexical resolution below,
+    // and its span is where the parent is written (the Ruby emit roots
+    // it: `ruby::library::written_parent`).
+    let mut path_written: HashSet<ClassId> = HashSet::default();
     file_constants.retain(|(name, value, _)| match class_new_declaration(&[], name, value) {
-        Some(class) => {
+        Some(mut class) => {
+            if name.as_str().contains("::") {
+                path_written.insert(class.name.clone());
+                if let ExprNode::Send { args, .. } = &*value.node {
+                    class.parent_span = args[0].span;
+                }
+            }
             top_level.push(class);
             false
         }
@@ -150,7 +161,10 @@ fn library_classes(
     // first. Written in full, the emitted file can require the class
     // it subclasses. A name this file does not declare stays as written.
     let declared: HashSet<ClassId> = top_level.iter().map(|class| class.name.clone()).collect();
-    for class in top_level.iter_mut().filter(|class| synthesized.contains(&class.name)) {
+    for class in top_level
+        .iter_mut()
+        .filter(|class| synthesized.contains(&class.name) && !path_written.contains(&class.name))
+    {
         let Some(parent) = &class.parent else { continue };
         let name = class.name.0.as_str();
         let mut scope: Vec<&str> = name.split("::").collect();
@@ -249,7 +263,10 @@ fn file_guard_offset(root: &ruby_prism::Node<'_>) -> Option<usize> {
 /// (`return unless ENV["EXFILTRATE_TYPES"]`). Not carried, and named:
 /// a file-level `case` holding declarations, and a statement the
 /// expression ingest refuses. `ActiveSupport.on_load` is
-/// `on_load_reopen`'s and `autoload` the autoloader's.
+/// `on_load_reopen`'s, except a hook carried here as the statement it is
+/// (`on_load_reopen::registered_as_written`), and `autoload` the
+/// autoloader's. A file-level `A::B = Class.new(C)` is a declaration
+/// (`file_class_new_path_write`), not a statement.
 pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) -> Option<crate::app::FileProgram> {
     use crate::app::ProgramItem;
     let result = super::prism::parse(source, file);
@@ -386,7 +403,10 @@ fn program_items(
         // A constant before any guard rides on the file's first class
         // (`carry_file_constants`); after one, or in a branch, it is a
         // statement.
-        if stmt.as_constant_write_node().is_some() && !in_branch && !*guarded {
+        if (stmt.as_constant_write_node().is_some() || file_class_new_path_write(stmt).is_some())
+            && !in_branch
+            && !*guarded
+        {
             continue;
         }
         // A Zeitwerk loader the file holds (`LOADER =` above, or a
@@ -432,7 +452,9 @@ fn program_items(
                 && call.receiver().is_some_and(|r| {
                     r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "ActiveSupport")
                 });
-            if on_load {
+            // A hook this file registers as written falls through to
+            // `statement` (`on_load_reopen::registered_as_written`).
+            if on_load && !super::on_load_reopen::registered_as_written(&call) {
                 continue;
             }
         }
@@ -837,6 +859,10 @@ fn file_level_constants(
         if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
             after_declarations = true;
         }
+        if let Some((path, write)) = file_class_new_path_write(&stmt) {
+            out.push((Symbol::from(path.join("::")), ingest_expr(&write.value(), file)?, after_declarations));
+            continue;
+        }
         let Some(cw) = stmt.as_constant_write_node() else { continue };
         if is_sorbet_type_alias(&cw.value()) {
             if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
@@ -863,6 +889,35 @@ fn file_level_constants(
         out.push((Symbol::from(constant_id_str(&cw.name())), value, after_declarations));
     }
     Ok(out)
+}
+
+/// `A::B = Class.new(Parent)` at file level, with the path it writes:
+/// a class declaration like the plain-constant form
+/// ([`class_new_declaration`]). Ruby names the class `A::B` when the
+/// write assigns it, and the statement runs at the top level, so
+/// `Parent` is looked up from there and not from `A`. A target whose
+/// prefix is not a constant path (`klass::B =`) is not this shape.
+fn file_class_new_path_write<'pr>(
+    stmt: &ruby_prism::Node<'pr>,
+) -> Option<(Vec<String>, ruby_prism::ConstantPathWriteNode<'pr>)> {
+    fn static_path(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+        if let Some(c) = node.as_constant_read_node() {
+            return Some(vec![constant_id_str(&c.name()).to_string()]);
+        }
+        let p = node.as_constant_path_node()?;
+        let mut out = match p.parent() {
+            None => Vec::new(),
+            Some(parent) => static_path(&parent)?,
+        };
+        out.push(constant_id_str(&p.name()?).to_string());
+        Some(out)
+    }
+    let write = stmt.as_constant_path_write_node()?;
+    if !super::initializer_constants::is_class_new_declaration(&write.value()) {
+        return None;
+    }
+    let path = static_path(&write.target().as_node())?;
+    Some((path, write))
 }
 
 pub(super) fn library_class_from_node(

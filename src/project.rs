@@ -1223,6 +1223,63 @@ fn reject_wide_integer_literals(app: &App, target: BuildTarget) -> Result<(), St
     Ok(())
 }
 
+/// A support file's `ActiveSupport.on_load(:hook) do … end`, which its
+/// file program registers as written
+/// (`ingest::on_load_reopen::registered_as_written`), calls the runtime's
+/// port of lazy_load_hooks. Only the PostgreSQL CRuby tree loads that
+/// port (`ruby_family_runtime_files`); any other tree would raise
+/// NoMethodError where the file loads, so it refuses the statement.
+fn reject_unported_load_hooks(app: &App, target: BuildTarget) -> Result<(), String> {
+    if matches!(target, BuildTarget::Ruby) && primary_postgresql(app) {
+        return Ok(());
+    }
+    fn visit(items: &[crate::app::ProgramItem], target: &str, found: &mut bool) {
+        use crate::app::ProgramItem;
+        for item in items {
+            match item {
+                ProgramItem::Statement(expr) => {
+                    let crate::expr::ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else { continue };
+                    let active_support = matches!(&*recv.node, crate::expr::ExprNode::Const { path }
+                        if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport"]));
+                    if !active_support || method.as_str() != "on_load" {
+                        continue;
+                    }
+                    let hook = match args.first().map(|a| &*a.node) {
+                        Some(crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => value.as_str().to_string(),
+                        _ => "?".to_string(),
+                    };
+                    *found = true;
+                    emit::diagnostics::report_unsupported(
+                        expr.span,
+                        target,
+                        "load_hook_registration",
+                        &format!(
+                            "`ActiveSupport.on_load(:{hook})` registers with lazy_load_hooks, whose runtime port \
+                             only the PostgreSQL CRuby tree carries"
+                        ),
+                    );
+                }
+                ProgramItem::Branch { then_items, else_items, .. } => {
+                    visit(then_items, target, found);
+                    visit(else_items, target, found);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = false;
+    for program in &app.file_programs {
+        visit(&program.items, target.as_str(), &mut found);
+    }
+    if found {
+        return Err(format!(
+            "{}: a support file's `ActiveSupport.on_load` registration needs the PostgreSQL CRuby tree",
+            target.as_str()
+        ));
+    }
+    Ok(())
+}
+
 /// Keep admitted Data factories outside unverified target emitters.
 fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(), String> {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel) {
@@ -1585,6 +1642,7 @@ pub fn target_files(
     reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_data_factories(app, target)?;
     reject_wide_integer_literals(app, target)?;
+    reject_unported_load_hooks(app, target)?;
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);

@@ -1,5 +1,7 @@
-//! Known literal load-hook mixins are carried; unsupported hooks and
-//! dynamic includes remain reported gaps. This does not model Markdown DSLs.
+//! Known literal load-hook mixins are carried; dynamic includes in those
+//! hooks remain reported gaps, and a hook with no class to reopen is
+//! registered as written by the file program. This does not model
+//! Markdown DSLs.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -31,8 +33,12 @@ fn tree(hooks: &str) -> HashMap<PathBuf, Vec<u8>> {
 
 #[test]
 fn direct_includes_report_only_uncarried_hook_shapes() {
-    // First hook is Writebook's installer, verbatim. Later hooks prove
-    // that a literal-name-only recognizer cannot silently skip other shapes.
+    // First hook is Writebook's installer, verbatim. The second names a
+    // hook with no class to reopen: the file program registers it as
+    // written (`on_load_reopen::registered_as_written`), as Ruby does
+    // when the file loads, and the PostgreSQL CRuby tree runs it if
+    // anything fires the hook; other trees refuse it by name
+    // (tests/file_class_new_paths.rs). It is no ingest gap.
     let files = tree(
         r#"ActiveSupport.on_load :active_record do
   include LabelMacro
@@ -49,26 +55,28 @@ end
     let gaps = survey::drain();
     let mut surveyed = result.expect("survey ingest");
     let messages: Vec<_> = gaps.iter().map(ToString::to_string).collect();
-    assert_eq!(messages.len(), 2, "one gap per uncarried include: {messages:?}");
-    for (hook, include) in [
-        ("action_text_markdown", "include First, Second"),
-        (
-            "action_text_markdown",
-            "include choose_mixin(\"märgistus\")",
-        ),
-    ] {
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|m| m.contains("lib/rails_ext/hooks.rb")
-                    && m.contains(&format!("on_load(:{hook})"))
-                    && m.contains(&format!("`{include}`"))
-                    && m.contains("load-hook mixin installation is unsupported"))
-                .count(),
-            1
-        );
-    }
-    assert_eq!(surveyed, strict, "reporting must not change ingested IR");
+    assert_eq!(messages, Vec::<String>::new());
+    let program = surveyed
+        .file_programs
+        .iter()
+        .find(|p| p.source.ends_with("lib/rails_ext/hooks.rb"))
+        .expect("the hooks file's program");
+    let registered: Vec<_> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            roundhouse::app::ProgramItem::Statement(expr) => match &*expr.node {
+                ExprNode::Send { method, args, block: Some(_), .. } if method.as_str() == "on_load" => {
+                    args.first().map(|a| format!("{:?}", a.node))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(registered.len(), 1, "{:?}", program.items);
+    assert!(registered[0].contains("action_text_markdown"), "{registered:?}");
+    assert_eq!(surveyed, strict, "survey mode must not change ingested IR");
     assert!(surveyed.library_classes.iter().any(|class|
         class.name.0.as_str() == "ActiveRecord::Base"
             && class.includes.iter().any(|id| id.0.as_str() == "LabelMacro")));
