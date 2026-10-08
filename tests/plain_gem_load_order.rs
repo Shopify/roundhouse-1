@@ -32,6 +32,17 @@ type Gem<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 /// `entry` required from config/application.rb); both must print
 /// `expected`.
 fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) -> emit_and_run::Run {
+    same_as_native_from(case, gems, entry, script, expected, false)
+}
+
+/// [`same_as_native`], the gems carried in the repository instead: each
+/// under `gems/<name>`, a lockfile `PATH` source whose spec Core's
+/// Gemfile names `in_repo-<name>` (`in_repo_gem("graphql-cardinal")`).
+fn same_as_native_in_repo(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) -> emit_and_run::Run {
+    same_as_native_from(case, gems, entry, script, expected, true)
+}
+
+fn same_as_native_from(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str, in_repo: bool) -> emit_and_run::Run {
     let root = std::env::temp_dir().join(format!("roundhouse-plain-gem-load-order-{case}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mut native = emit_and_run::ruby();
@@ -50,18 +61,30 @@ fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected:
     assert!(native.status.success(), "native control failed:\n{}", String::from_utf8_lossy(&native.stderr));
     assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native control");
 
-    let specs: String = gems.iter().map(|(name, _)| format!("    {name} (1.0.0)\n")).collect();
-    let deps: String = gems.iter().map(|(name, _)| format!("  {name}\n")).collect();
-    let sources: String = gems.iter().map(|(name, _)| format!("  {name}: vendor/gems/{name}-1.0.0\n")).collect();
-    let mut overlay = emit_and_run::empty_app()
-        .write("roundhouse.yml", &format!("gem_sources:\n{sources}"))
-        .write("Gemfile.lock", &format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nDEPENDENCIES\n{deps}"))
+    let mut overlay = if in_repo {
+        let paths: String = gems
+            .iter()
+            .map(|(name, _)| format!("PATH\n  remote: gems/{name}\n  specs:\n    in_repo-{name} (1.0.0)\n\n"))
+            .collect();
+        let deps: String = gems.iter().map(|(name, _)| format!("  in_repo-{name}!\n")).collect();
+        emit_and_run::empty_app()
+            .write("Gemfile.lock", &format!("{paths}GEM\n  remote: https://rubygems.org/\n  specs:\n\nDEPENDENCIES\n{deps}"))
+    } else {
+        let specs: String = gems.iter().map(|(name, _)| format!("    {name} (1.0.0)\n")).collect();
+        let deps: String = gems.iter().map(|(name, _)| format!("  {name}\n")).collect();
+        let sources: String = gems.iter().map(|(name, _)| format!("  {name}: vendor/gems/{name}-1.0.0\n")).collect();
+        emit_and_run::empty_app()
+            .write("roundhouse.yml", &format!("gem_sources:\n{sources}"))
+            .write("Gemfile.lock", &format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nDEPENDENCIES\n{deps}"))
+    };
+    overlay = overlay
         .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
         .write("config/application.rb", &format!("require_relative \"boot\"\nrequire {entry:?}\n"))
         .write("lib/strict.rb", STRICT);
     for (name, files) in gems {
         for (path, text) in *files {
-            overlay = overlay.write(&format!("vendor/gems/{name}-1.0.0/lib/{path}"), text);
+            let at = if in_repo { format!("gems/{name}/lib/{path}") } else { format!("vendor/gems/{name}-1.0.0/lib/{path}") };
+            overlay = overlay.write(&at, text);
         }
     }
     let run = overlay.run_ruby(script);
@@ -296,4 +319,30 @@ fn a_require_of_a_file_of_autoloads_opens_its_modules() {
     ];
     let run = same_as_native("autoloads", &[("ks", KS)], "ks", "p Ks.kinds\n", "[:log, \"Ks::Errors::ConfigError\"]\n");
     assert!(!run.stderr.contains("LoadError") && !run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
+}
+
+/// graphql-cardinal 1.5.9, an in-repo gem (`gems/graphql-cardinal`,
+/// locked as `in_repo-graphql-cardinal`): cardinal.rb opens `class
+/// Executor; class ExecutionField; end; end` and later requires
+/// cardinal/executor.rb, whose first line requires executor/hot_paths.rb,
+/// which reopens `class Executor` to define `HotPaths`. The gem was not
+/// read as a plain gem (its directory is not its spec's name), so
+/// `Executor` autoloaded executor.rb's program; the merged declarations,
+/// loaded from cardinal.rb's program, required hot_paths.rb, whose
+/// `class Executor` ran that autoload back into hot_paths.rb (a circular
+/// require).
+#[test]
+fn an_in_repo_gems_files_load_where_its_requires_give() {
+    const CD: &[(&str, &str)] = &[
+        (
+            "cd.rb",
+            "module Cd\n  class Executor\n    class Field; end\n  end\nend\n\nrequire_relative \"cd/executor\"\n",
+        ),
+        (
+            "cd/executor.rb",
+            "require_relative \"executor/hot_paths\"\n\nmodule Cd\n  class Executor\n    include HotPaths\n\n    def run\n      [hot, Field.name]\n    end\n  end\nend\n",
+        ),
+        ("cd/executor/hot_paths.rb", "module Cd\n  class Executor\n    module HotPaths\n      def hot\n        :hot\n      end\n    end\n  end\nend\n"),
+    ];
+    let _ = same_as_native_in_repo("in-repo", &[("cd", CD)], "cd", "p Cd::Executor.new.run\n", "[:hot, \"Cd::Executor::Field\"]\n");
 }

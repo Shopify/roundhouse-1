@@ -5889,9 +5889,37 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                     .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         })
     };
+    // A lockfile PATH gem's directory, whatever its spec is named (Core's
+    // `in_repo_gem("graphql-cardinal", require: "graphql/cardinal")` locks
+    // `in_repo-graphql-cardinal` at `gems/graphql-cardinal`), where
+    // native boot requires its entry (Bundler.require) and so its own
+    // requires load its files. Not one holding an `app/` (an engine or
+    // component), nor a library no boot require enters, whose `lib/`
+    // keeps the rules above.
+    let rel_of = |path: &str| -> String {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    let path_gem_dirs: Vec<String> = app
+        .gem_lock
+        .iter()
+        .flat_map(|lock| lock.path_sources.iter())
+        .map(|(remote, _)| remote.trim_start_matches("./").trim_end_matches('/').to_string())
+        .filter(|remote| !remote.is_empty() && !remote.starts_with('/') && !remote.starts_with(".."))
+        .filter(|remote| {
+            let engine = format!("{remote}/app/");
+            !app.sources.iter().any(|source| rel_of(&source.path).starts_with(&engine))
+        })
+        .filter(|remote| {
+            let lib = format!("{remote}/lib/");
+            app.boot_loads.iter().chain(&app.boot_conditional_loads).any(|load| rel_of(&load.source).starts_with(&lib))
+        })
+        .collect();
     // The gem `lib/` directory a source is under (`vendor/gems/verdict-19.34.0/lib`).
     let gem_lib = |source: &str| -> Option<String> {
         let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+        if let Some(dir) = path_gem_dirs.iter().find(|dir| rel.starts_with(&format!("{dir}/lib/"))) {
+            return Some(format!("{dir}/lib"));
+        }
         let segments: Vec<&str> = rel.split('/').collect();
         (1..segments.len().saturating_sub(1))
             .find(|&i| segments[i] == "lib" && gem_dir(segments[i - 1]))
