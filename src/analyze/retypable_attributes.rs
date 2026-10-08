@@ -227,14 +227,15 @@ pub(crate) fn carries_query_constraints(expr: &Expr, columns: &[Symbol]) -> bool
 }
 
 /// A direct `serialize :col, coder: Coder[, type: Class][, comparable:
-/// true|false]` body statement over a string or text column of `table`,
+/// true|false]` body statement over a string, text or binary (bytea)
+/// column of `table`,
 /// with an app's coder (not `JSON` or `YAML`: `lower::serialize` lowers
 /// the JSON one, and Rails' own coders are not ported). Rails builds the
 /// column serializer from the coder when the call runs and decorates the
 /// column's type with Type::Serialized, so the column takes the
 /// retypable path and the model carries the call as written
-/// (`ModelBodyItem::ClassBody`) for the runtime's `serialize`. A binary
-/// or json column, `default:` and other options stay unclaimed.
+/// (`ModelBodyItem::ClassBody`) for the runtime's `serialize`. A json
+/// column, `default:` and other options stay unclaimed.
 pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
     if method.as_str() != "serialize" || !on_self(recv) {
@@ -264,7 +265,7 @@ pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Op
         }
     }
     let column = table.columns.iter().find(|c| c.name.as_str() == name)?;
-    (coder && matches!(column.col_type, crate::schema::ColumnType::String { .. } | crate::schema::ColumnType::Text))
+    (coder && matches!(column.col_type, crate::schema::ColumnType::String { .. } | crate::schema::ColumnType::Text | crate::schema::ColumnType::Binary))
         .then(|| column.name.clone())
 }
 

@@ -36,6 +36,12 @@
 #   decorator and the `type:` check `serialize` builds over an app coder,
 #   are ported (type/serialized.rb, coders/column_serializer.rb; see
 #   them below). The JSON and YAML coders are not.
+# - PostgreSQL's OID::Bytea (connection_adapters/postgresql/oid/bytea.rb)
+#   is ported for the tree's driver, which hands a bytea column back
+#   already decoded (PG::BasicTypeMapForResults' bytea decoder): the
+#   answer Rails' adapter gives with `decode_bytea` and marks
+#   `@ar_pg_bytea_decoded`. So a String it deserializes counts as
+#   decoded and is not unescaped again.
 # - The other types (Date, Time, Float, Json) are not
 #   ported. The registries are (see the end of this file); a built-in
 #   name whose class is missing raises NotImplementedError on lookup,
@@ -1195,6 +1201,34 @@ module ActiveRecord
         ColumnSerializer.new(attr_name, coder, type)
       else
         coder
+      end
+    end
+  end
+end
+
+module ActiveRecord
+  module ConnectionAdapters
+    module PostgreSQL
+      module OID # :nodoc:
+        # connection_adapters/postgresql/oid/bytea.rb (8.2.0.alpha), the
+        # type a PostgreSQL bytea column answers. A String is the
+        # driver's decoded value (see the header); Rails dups a marked
+        # one only to drop the marker, which the tree's Strings do not
+        # carry.
+        class Bytea < ActiveModel::Type::Binary # :nodoc:
+          def deserialize(value)
+            case value
+            when nil
+              nil
+            when ActiveModel::Type::Binary::Data
+              value.to_s
+            when ::String
+              value
+            else
+              raise NotImplementedError, "OID::Bytea#deserialize(#{value.class}): only the driver's decoded String is ported"
+            end
+          end
+        end
       end
     end
   end

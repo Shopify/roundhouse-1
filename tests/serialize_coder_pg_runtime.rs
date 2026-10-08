@@ -9,7 +9,8 @@
 //! decorates the column's type with Type::Serialized: reads load, writes
 //! and binds dump, a nil column loads as `type.new`, a value equal to the
 //! empty load stores NULL and a value of the wrong class raises
-//! SerializationTypeMismatch. The model compiles the column as retypable
+//! SerializationTypeMismatch. A bytea column reads and binds the coder's
+//! binary String. The model compiles the column as retypable
 //! and the call runs as written at class load against the runtime's
 //! `serialize`. The JSON and YAML coders keep their own paths.
 #[path = "support/emit_and_run.rs"]
@@ -23,6 +24,7 @@ const STRUCTURE: &str = r#"CREATE TABLE notes (
     tags text,
     meta character varying,
     body text,
+    points bytea,
     CONSTRAINT notes_pkey PRIMARY KEY (id)
 );
 "#;
@@ -45,6 +47,19 @@ const NOTE: &str = r#"class Note < ApplicationRecord
   serialize :tags, coder: PipeCoder, type: Array
   serialize :meta, coder: PairsCoder.new(";"), type: Hash
   serialize :body, coder: UpcaseCoder
+  serialize :points, coder: PackCoder, type: Array
+end
+"#;
+
+/// A coder to a binary String, over a bytea column.
+const PACK_CODER: &str = r#"class PackCoder
+  def self.load(payload)
+    payload.nil? ? nil : payload.unpack("N*")
+  end
+
+  def self.dump(value)
+    value.nil? ? nil : value.pack("N*")
+  end
 end
 "#;
 
@@ -106,7 +121,7 @@ const PROBE: &str = r##"class SerializeCoderProbe
     out = []
     fresh = Note.new(title: "f")
     out << "new: #{fresh.tags.inspect} #{fresh.meta.inspect} #{fresh.body.inspect}"
-    a = Note.create!(title: "a", tags: ["x", "y"], meta: { "k" => "v", "n" => "1" }, body: "Hello")
+    a = Note.create!(title: "a", tags: ["x", "y"], meta: { "k" => "v", "n" => "1" }, body: "Hello", points: [1, 258])
     b = Note.create!(title: "b")
     out << "read: #{a.tags.inspect} #{a.meta.inspect} #{a.body.inspect} #{b.tags.inspect} #{b.meta.inspect}"
     out << "raw: #{RawNote.order(:id).map { |r| [r.tags, r.meta, r.body] }.inspect}"
@@ -114,6 +129,7 @@ const PROBE: &str = r##"class SerializeCoderProbe
     out << "where: #{Note.where(tags: ["x", "y"]).count} #{Note.where(body: "hello").count}"
     found = Note.find(a.id)
     out << "find: #{found.tags.inspect} #{found.meta.inspect} #{found.body.inspect}"
+    out << "bytea: #{found.points.inspect} #{b.points.inspect} #{RawNote.find(a.id).points.inspect} #{RawNote.find(a.id).points.encoding} #{Note.where(points: [1, 258]).count}"
     b.tags = ["q"]
     b.meta = {}
     b.save!
@@ -136,13 +152,14 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 10] = [
+const EXPECTED: [&str; 11] = [
     "new: [] {} nil",
     r#"read: ["x", "y"] {"k" => "v", "n" => "1"} "hello" [] {}"#,
     r#"raw: [["x|y", "k=v;n=1", "HELLO"], [nil, nil, nil]]"#,
     r#"pluck: [["x", "y"], []]"#,
     "where: 1 1",
     r#"find: ["x", "y"] {"k" => "v", "n" => "1"} "hello""#,
+    r#"bytea: [1, 258] [] "\x00\x00\x00\x01\x00\x00\x01\x02" ASCII-8BIT 1"#,
     r#"update: ["q"] {} "q" nil"#,
     r#"in place: ["x", "y", "z"]"#,
     r#"mismatch: can't serialize `tags`: was supposed to be a Array, but was a String. -- "oops""#,
@@ -150,8 +167,9 @@ const EXPECTED: [&str; 10] = [
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 7] = [
+const LOADS: [&str; 8] = [
     "app/models/pipe_coder",
+    "app/models/pack_coder",
     "app/models/pairs_coder",
     "app/models/upcase_coder",
     "app/models/application_record",
@@ -160,7 +178,7 @@ const LOADS: [&str; 7] = [
     "app/models/serialize_coder_probe",
 ];
 
-const FILES: [(&str, &str); 11] = [
+const FILES: [(&str, &str); 12] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -171,6 +189,7 @@ const FILES: [(&str, &str); 11] = [
     ("app/models/pipe_coder.rb", PIPE_CODER),
     ("app/models/pairs_coder.rb", PAIRS_CODER),
     ("app/models/upcase_coder.rb", UPCASE_CODER),
+    ("app/models/pack_coder.rb", PACK_CODER),
     ("app/models/serialize_coder_probe.rb", PROBE),
 ];
 

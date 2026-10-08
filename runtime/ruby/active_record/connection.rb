@@ -837,6 +837,7 @@ module ActiveRecord
       when :text then ActiveRecord::Type::Text.new
       when :boolean then ActiveRecord::Type::Boolean.new
       when :binary then ActiveRecord::Type::Binary.new
+      when :bytea then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Bytea.new
       when :immutable_string then ActiveRecord::Type::ImmutableString.new
       when :value then ActiveRecord::Type::Value.new
       else
