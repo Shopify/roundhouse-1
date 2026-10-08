@@ -288,3 +288,34 @@ fn a_dependency_on_a_program_loading_now_loads_its_declarations_not_the_program_
     assert_eq!(run.stdout, "shield entry\nbooted\n\"v1.0\"\n", "{}", run.stderr);
     assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
 }
+
+/// Core's lib/minitest/type_exfiltrator_plugin/wrappers/test_wrapper.rb
+/// (a program: it requires its helpers) declares Wrappers::TestWrapper
+/// and reopens Minitest::Test to include TestWrapper::Plugin;
+/// gems/ci/lib/ci/minitest_ext.rb reopens Minitest::Test too. The
+/// merged Minitest::Test declarations required TestWrapper's
+/// declarations directly, whose `class TestWrapper` resolved its
+/// autoload into the program, which required the in-flight declarations
+/// again: a circular require, fatal under Core's StrictWarning.
+#[test]
+fn a_reopened_class_needing_a_programs_constant_does_not_re_enter_its_declarations() {
+    let run = emit_and_run::empty_app()
+        .write("config/environments/development.rb", LAZY)
+        .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
+        .write("config/application.rb", "require_relative \"boot\"\nrequire \"ci\"\n")
+        .write(
+            "lib/strict.rb",
+            "$VERBOSE = true\n\nmodule Strict\n  def warn(msg, category: nil, **)\n    raise \"strict: #{msg}\" if msg.include?(\"circular require\") || msg.include?(\"to define\")\n\n    super\n  end\nend\nWarning.extend(Strict)\n",
+        )
+        .write("lib/ci.rb", "require \"json\"\nrequire \"ci/ext\"\nputs \"ci entry\"\n")
+        .write("lib/ci/ext.rb", "require \"json\"\n\nmodule Mt\n  class Test\n    def self.unordered\n      :unordered\n    end\n  end\nend\n")
+        .write("lib/mt/plug/helper.rb", "module Mt\n  module Plug\n    HELPED = :helped\n  end\nend\n")
+        .write(
+            "lib/mt/plug/wrappers/tw.rb",
+            "require \"json\"\nrequire_relative \"../helper\"\n\nIGNORED = %i[setup].freeze\n\nmodule Mt\n  module Plug\n    module Wrappers\n      class Tw\n        module Plugin\n          def plugged\n            :plugged\n          end\n        end\n      end\n    end\n  end\n\n  class Test\n    include Mt::Plug::Wrappers::Tw::Plugin\n  end\nend\n",
+        )
+        .run_ruby("puts \"booted\"\np Mt::Test.unordered\np Mt::Test.new.plugged\np IGNORED\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "ci entry\nbooted\n:unordered\n:plugged\n[:setup]\n", "{}", run.stderr);
+    assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
+}

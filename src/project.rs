@@ -7032,6 +7032,18 @@ fn relative_path(from_dir: &str, to: &str) -> String {
 /// program is loading now (`require_through`): secure_headers.rb requires
 /// headers/content_security_policy, whose policy_management depends on
 /// SecureHeaders; natively nothing there requires secure_headers.rb back.
+///
+/// A declarations file other programs declare too (a class several
+/// source files reopen) is no file only its program loads: another
+/// program loads it first (Core's gems/ci minitest_ext.rb reopening
+/// Minitest::Test), and its dependency on this program's constant
+/// (test_wrapper.rb's `include TestWrapper::Plugin`, merged into
+/// Minitest::Test's declarations) goes through the program too, naming
+/// the requiring file. The program requires that file among its
+/// declarations, which is loading now: `require_declaration` leaves it
+/// to finish, where Ruby's require of it would be a circular one (and
+/// required directly, the declarations file's `class TestWrapper` fired
+/// its autoload into the program, which required it back).
 fn load_declarations_through_their_program(
     files: &mut [(String, String)],
     app: &App,
@@ -7050,6 +7062,16 @@ fn load_declarations_through_their_program(
                 for name in names {
                     own.insert(format!("models/{}", crate::emit::ruby::library_file_stem(name.0.as_str(), app)));
                 }
+            }
+        }
+    }
+    // Declarations files more than one program declares.
+    let mut seen: BTreeSet<&String> = BTreeSet::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    for declared in declarations_of.values() {
+        for file in declared {
+            if !seen.insert(file) {
+                shared.insert(file.clone());
             }
         }
     }
@@ -7084,13 +7106,27 @@ fn load_declarations_through_their_program(
         // The program a dependency loads through, unless this file is
         // that program or one of its declarations, or a program loading
         // its own declarations there (a file reopening the constant).
-        let through = |anchor: &str| -> Option<&String> {
+        // A file another program declares too names itself (`from`).
+        let reopened = shared.contains(own);
+        let through = |anchor: &str| -> Option<(&String, bool)> {
             let program = program_of_file.get(anchor)?;
+            let declares_own = declarations_of.get(program).is_some_and(|d| d.contains(own));
             let theirs = program == own
-                || declarations_of.get(program).is_some_and(|d| d.contains(own))
+                || (declares_own && !reopened)
                 || declarations_of.get(own).is_some_and(|d| d.contains(anchor));
-            (!theirs).then_some(program)
+            (!theirs).then_some((program, declares_own))
         };
+        let through_call = |program: &String, anchor: &str, from: bool| -> String {
+            if from {
+                format!("RoundhouseAutoload.require_through({program:?}, {anchor:?}, {own:?})")
+            } else {
+                format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})")
+            }
+        };
+        // This program's require of a declarations file another program
+        // declares too.
+        let shared_declaration =
+            |anchor: &str| shared.contains(anchor) && declarations_of.get(own).is_some_and(|d| d.contains(anchor));
         let mut changed = false;
         let mut out = String::with_capacity(content.len());
         for line in content.split_inclusive('\n') {
@@ -7103,9 +7139,10 @@ fn load_declarations_through_their_program(
                 // A file loading before app/models.rb (an initializer's
                 // constant, boot.rb) keeps its direct require.
                 target.strip_prefix("app/").and_then(|anchor| {
-                    through(anchor).map(|program| {
+                    through(anchor).map(|(program, from)| {
                         format!(
-                            "defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through({program:?}, {anchor:?}) : require_relative({:?})",
+                            "defined?(RoundhouseAutoload) ? {} : require_relative({:?})",
+                            through_call(program, anchor, from),
                             relative(dir, &format!("app/{program}"))
                         )
                     })
@@ -7113,7 +7150,11 @@ fn load_declarations_through_their_program(
             } else if let Some(anchor) =
                 text.strip_prefix("require RoundhouseAutoload.path(\"").and_then(|r| r.strip_suffix("\")"))
             {
-                through(anchor).map(|program| format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})"))
+                match through(anchor) {
+                    Some((program, from)) => Some(through_call(program, anchor, from)),
+                    None if shared_declaration(anchor) => Some(format!("RoundhouseAutoload.require_declaration({anchor:?})")),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -7184,16 +7225,38 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # being required on its way: then the declarations file, as the program
   # itself loads it. Requiring the in-flight program is a circular
   # require natively absent, which Core's StrictWarning raises.
-  def self.require_through(program, declarations)
+  #
+  # `from`: the requiring file, when the program declares it too and
+  # another program loads it first (load_declarations_through_their_program).
+  # It is loading now, and the program's require of it
+  # (`require_declaration`) leaves it to finish.
+  def self.require_through(program, declarations, from = nil)
     @loaded_programs ||= {}
     if @loaded_programs.key?(program) || !@entered&.key?(program)
-      require path(program)
+      return require path(program) unless from
+      @waiting ||= {}
+      waiting = @waiting.key?(from)
+      @waiting[from] = true
+      begin
+        require path(program)
+      ensure
+        @waiting.delete(from) unless waiting
+      end
     elsif $LOADED_FEATURES.include?(path(program))
       @loaded_programs[program] = true
       require path(program)
     else
       require path(declarations)
     end
+  end
+
+  # A program's require of a declarations file other programs declare
+  # too: not the one waiting on this program (`require_through`'s
+  # `from`), which is loading now and finishes after it; requiring it
+  # again would be a circular require, which Core's StrictWarning raises.
+  def self.require_declaration(file)
+    return false if @waiting&.key?(file)
+    require path(file)
   end
 
   # A file-level statement of a support file's program: runs it, and
