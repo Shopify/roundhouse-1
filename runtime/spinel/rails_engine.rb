@@ -30,9 +30,20 @@
 # I18n::Railtie. The rest are refused when the engine has what they would
 # apply (error[engine_initializer_not_applied]): `add_locales` without
 # I18n::Railtie, `add_view_paths`, `add_mailer_preview_paths`, `add_fixture_paths`,
-# `prepend_helpers_path`. Not ported: the engine as a Rack endpoint
-# (`app`, `call`, `routes`, `helpers`, `load_seed`), and generators,
-# console, runner and tasks loading.
+# `prepend_helpers_path`.
+#
+# `routes` is Rails': the engine's route set
+# (`config.route_set_class.new_with_config(config)`, ActionDispatch's
+# RouteSet, below) collects the blocks a class body appends (graphql
+# 2.6.11's `class Dashboard < Rails::Engine` has `routes do … end`).
+# Rails evaluates them when it loads the routes (`finalize!`, through the
+# routes reloader `add_routing_paths` registers the set with); this
+# tree's routes are compiled from config/routes.rb, so `add_routing_paths`
+# names each block it would draw (error[route_set_not_drawn]) and boot
+# goes on. Not ported: drawing a route set at run time (Mapper, Journey),
+# `make_routes_lazy`'s LazyRouteSet, the engine as a Rack endpoint
+# (`app`, `call`, `helpers`, `load_seed`), and generators, console,
+# runner and tasks loading.
 require "pathname"
 require_relative "rails_railtie"
 
@@ -401,6 +412,14 @@ module Rails
       paths["app/helpers"].existent
     end
 
+    # Defines the routes for this engine. If a block is given to
+    # routes, it is appended to the engine.
+    def routes(&block)
+      @routes ||= config.route_set_class.new_with_config(config)
+      @routes.append(&block) if block_given?
+      @routes
+    end
+
     # Define the configuration object for the engine.
     def config
       @config ||= Engine::Configuration.new(self.class.find_root(self.class.called_from))
@@ -434,7 +453,14 @@ module Rails
     initializer :make_routes_lazy, before: :bootstrap_hook do |app|
     end
 
+    # Rails registers a route set the engine has with the routes
+    # reloader, which finalizes it, evaluating its appended blocks, when
+    # it loads the routes. The tree's route table is compiled, so the
+    # blocks are named instead (ActionDispatch::Routing::RouteSet#eval_block).
     initializer :add_routing_paths do |app|
+      if routes?
+        Railtie.not_run_unless_it_runs("#{self.class.name} initializer :add_routing_paths") { routes.finalize! }
+      end
     end
 
     # As Rails', where I18n::Railtie owns `config.i18n`
@@ -474,6 +500,10 @@ module Rails
     initializer :engines_blank_point do
       # We need this initializer so all extra initializers added in engines are
       # consistently executed after all the initializers above across all engines.
+    end
+
+    def routes? # :nodoc:
+      @routes
     end
 
     private
@@ -523,7 +553,7 @@ module Rails
         @root = root
         @middleware = Railtie::Configuration::MiddlewareStackProxy.new
         @javascript_path = "javascript"
-        @route_set_class = nil
+        @route_set_class = ActionDispatch::Routing::RouteSet
         @default_scope = nil
         @autoload_paths = []
         @autoload_once_paths = []
@@ -583,6 +613,114 @@ module Rails
 
       def all_eager_load_paths # :nodoc:
         eager_load_paths + paths.eager_load
+      end
+    end
+  end
+end
+
+module ActionDispatch
+  module Routing
+    # actionpack 8.2.0.alpha lib/action_dispatch/routing/route_set.rb: the
+    # route set an engine's `routes` returns, as far as an engine's class
+    # body and initializers reach it. It keeps the blocks `append` and
+    # `prepend` collect, as Rails' does; evaluating one (`draw`,
+    # `finalize!`, `clear!`) needs ActionDispatch::Routing::Mapper and
+    # Journey, which this tree does not port (its routes are compiled
+    # from config/routes.rb), and raises error[route_set_not_drawn],
+    # naming the block.
+    class RouteSet
+      attr_accessor :disable_clear_and_finalize, :resources_path_names
+      attr_accessor :default_url_options, :draw_paths
+      attr_reader :env_key, :polymorphic_mappings
+
+      def self.default_resources_path_names
+        { new: "new", edit: "edit" }
+      end
+
+      def self.new_with_config(config)
+        route_set_config = DEFAULT_CONFIG.dup
+
+        # engines apparently don't have this set
+        if config.respond_to? :relative_url_root
+          route_set_config.relative_url_root = config.relative_url_root
+        end
+
+        if config.respond_to? :api_only
+          route_set_config.api_only = config.api_only
+        end
+
+        if config.respond_to? :default_scope
+          route_set_config.default_scope = config.default_scope
+        end
+
+        new route_set_config
+      end
+
+      Config = Struct.new :relative_url_root, :api_only, :default_scope
+
+      DEFAULT_CONFIG = Config.new(nil, false, nil)
+
+      def initialize(config = DEFAULT_CONFIG.dup)
+        self.resources_path_names = self.class.default_resources_path_names
+        self.default_url_options = {}
+        self.draw_paths = []
+
+        @config                     = config
+        @append                     = []
+        @prepend                    = []
+        @disable_clear_and_finalize = false
+        @finalized                  = false
+        @env_key                    = "ROUTES_#{object_id}_SCRIPT_NAME"
+        @polymorphic_mappings       = {}
+      end
+
+      def relative_url_root
+        @config.relative_url_root
+      end
+
+      def api_only?
+        @config.api_only
+      end
+
+      def default_scope
+        @config.default_scope
+      end
+
+      def default_scope=(new_default_scope)
+        @config.default_scope = new_default_scope
+      end
+
+      def draw(&block)
+        clear! unless @disable_clear_and_finalize
+        eval_block(block)
+        finalize! unless @disable_clear_and_finalize
+        nil
+      end
+
+      def append(&block)
+        @append << block
+      end
+
+      def prepend(&block)
+        @prepend << block
+      end
+
+      def eval_block(block)
+        site = block.source_location&.first(2)&.join(":")
+        raise NotImplementedError, "error[route_set_not_drawn]: the routes block at #{site} is not drawn: this tree's routes are compiled from config/routes.rb, and drawing a route set at run time (ActionDispatch::Routing::Mapper) is not ported"
+      end
+      private :eval_block
+
+      def finalize!
+        return if @finalized
+        @append.each { |blk| eval_block(blk) }
+        @finalized = true
+      end
+
+      def clear!
+        @finalized = false
+        @polymorphic_mappings.clear
+        @prepend.each { |blk| eval_block(blk) }
       end
     end
   end
