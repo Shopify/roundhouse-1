@@ -7881,8 +7881,22 @@ fn emit_library_class_decl_inner(
             writeln!(s).unwrap();
         }
         match conditional {
+            // After every def (below).
+            None if inherited_alias(lc, m).is_some() => {}
             Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad),
             None => write_library_method(&mut s, lc, index, &body_pad),
+        }
+    }
+    // An alias of an ancestor's method (`MethodAlias::inherited`) binds
+    // what the class then answers to the name: an override a pass wrote
+    // here for an inherited method stands for that method (a class
+    // method building `self`), so the alias follows every def. The
+    // class's own definition of the name would have kept the alias
+    // from resolving to an ancestor (`ingest::inherited_alias`).
+    for (index, m) in lc.methods.iter().enumerate() {
+        if inherited_alias(lc, m).is_some() {
+            writeln!(s).unwrap();
+            write_library_method(&mut s, lc, index, &body_pad);
         }
     }
 
@@ -8028,6 +8042,21 @@ fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pa
     // it keeps looking up the original's name, as in the source. The
     // alias takes the original's visibility; a different one on the
     // copy is a later visibility change, written after it.
+    // One of an ancestor's method (`MethodAlias::inherited`) is the
+    // native alias too: Ruby finds the original through the ancestors,
+    // and the alias keeps its visibility.
+    if let Some(alias) = inherited_alias(lc, m) {
+        let (to, from) = (m.name.as_str(), alias.original.as_str());
+        match m.receiver {
+            MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
+            MethodReceiver::Class => {
+                writeln!(s, "{body_pad}class << self").unwrap();
+                writeln!(s, "{body_pad}  alias_method :{to}, :{from}").unwrap();
+                writeln!(s, "{body_pad}end").unwrap();
+            }
+        }
+        return;
+    }
     if let Some(original) = native_alias_original(lc, index) {
         let (to, from) = (m.name.as_str(), original.name.as_str());
         match m.receiver {
@@ -8140,6 +8169,10 @@ fn write_conditional_definitions(
 /// and body spans; a replacing def has its own). Anything else (an
 /// original redefined in place, or a copy whose original a later pass
 /// dropped or moved) keeps the copied def.
+fn inherited_alias<'a>(lc: &'a LibraryClass, m: &MethodDef) -> Option<&'a crate::dialect::MethodAlias> {
+    lc.method_aliases.iter().find(|a| a.inherited && a.name == m.name && a.receiver == m.receiver)
+}
+
 fn native_alias_original(lc: &LibraryClass, index: usize) -> Option<&MethodDef> {
     let m = &lc.methods[index];
     let alias = lc.method_aliases.iter().find(|a| a.name == m.name && a.receiver == m.receiver)?;

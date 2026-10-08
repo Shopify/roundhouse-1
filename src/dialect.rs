@@ -1115,6 +1115,12 @@ pub struct MethodAlias {
     pub name: Symbol,
     pub receiver: MethodReceiver,
     pub original: Symbol,
+    /// The original is an app ancestor's, not this class's
+    /// (`ingest::inherited_alias`): the copy is that ancestor's method,
+    /// and the Ruby family writes the native alias, which Ruby resolves
+    /// through the ancestors.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inherited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

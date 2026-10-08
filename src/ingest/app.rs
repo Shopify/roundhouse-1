@@ -746,6 +746,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // What the support files `require_relative`, for the files no walk
     // reaches (below).
     let mut relative_requires: Vec<PathBuf> = Vec::new();
+    let mut held: Vec<HeldSupportFile> = Vec::new();
     for sub in support_roots(vfs, dir, &roots, &path_gems, &lib_ignores) {
         let sub = sub.as_str();
         let support_dir = dir.join(sub);
@@ -837,22 +838,21 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
                     }
                 }
             }
-            match super::library_class::ingest_app_library_classes(&source, &path_str) {
-                Ok(classes) => {
-                    // What the file runs at load beyond its
-                    // declarations: its file program, in source order;
-                    // what that cannot carry is named where the source
-                    // has it.
-                    if let Some(program) = super::library_class::file_program(&source, &path_str, &classes) {
-                        report_not_carried(&source, &program.items, &mut app);
-                        app.file_programs.push(program);
-                    }
-                    if !classes.is_empty() && declarations_only(&source) {
-                        loaded_support.insert(entry.clone());
-                    }
-                    support_classes.push((entry.clone(), classes.iter().map(|c| c.name.clone()).collect()));
-                    app.library_classes.extend(classes);
-                }
+            let (ingested, deferred) = super::inherited_alias::capturing(|| {
+                super::library_class::ingest_app_library_classes(&source, &path_str)
+            });
+            match ingested {
+                // An `alias` of a method the file does not define holds
+                // the file back until every support file is in, where
+                // `inherited_alias::decide` looks the original up.
+                Ok(classes) if !deferred.is_empty() => held.push(HeldSupportFile {
+                    entry: entry.clone(),
+                    source: source.to_vec(),
+                    at: (app.library_classes.len(), app.file_programs.len(), support_classes.len()),
+                    classes,
+                    deferred,
+                }),
+                Ok(classes) => carry_support_file(&mut app, &entry, &source, classes, &mut loaded_support, &mut support_classes, None),
                 Err(err) => drop_library_file(&mut app, &path_str, &err),
             }
             // A reopen deferred behind `ActiveSupport.on_load` is
@@ -860,6 +860,31 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             // this reads the one shape that is carried and says so
             // for the rest.
             super::on_load_reopen::ingest_on_load_reopens(&source, &path_str, &mut app);
+        }
+    }
+    // The held-back files, carried where the walk had them (so the
+    // classes and file programs keep the walk's order) when their
+    // aliases resolve, refused at the alias otherwise.
+    let verdicts = {
+        let files: Vec<(Vec<crate::dialect::LibraryClass>, Vec<crate::span::Span>)> =
+            held.iter().map(|h| (h.classes.clone(), h.deferred.clone())).collect();
+        super::inherited_alias::decide(&app.library_classes, &files)
+    };
+    let mut shift = (0, 0, 0);
+    for (file, carried) in held.into_iter().zip(verdicts) {
+        let path_str = file.entry.display().to_string();
+        if carried {
+            let at = (file.at.0 + shift.0, file.at.1 + shift.1, file.at.2 + shift.2);
+            let before = (app.library_classes.len(), app.file_programs.len(), support_classes.len());
+            carry_support_file(&mut app, &file.entry, &file.source, file.classes, &mut loaded_support, &mut support_classes, Some(at));
+            shift.0 += app.library_classes.len() - before.0;
+            shift.1 += app.file_programs.len() - before.1;
+            shift.2 += support_classes.len() - before.2;
+        } else {
+            let err = super::inherited_alias::refusal(&path_str);
+            let site = file.deferred[0];
+            super::error_site::note(&err, site.start as usize, site.end as usize);
+            drop_library_file(&mut app, &path_str, &err);
         }
     }
     // A file a support file `require_relative`s that no walk reaches and
@@ -2451,6 +2476,9 @@ end
     super::delegate::lower_delegates(&mut app);
     super::class_eval_macro::qualify_inherited_includes(&mut app);
     super::class_eval_macro::expand_class_eval_macros(&mut app);
+    // After the includes are qualified and the passes above have made
+    // their methods: an alias of an ancestor's method copies it.
+    super::inherited_alias::resolve(&mut app);
     // Channels, before the concern splices for the same reason `Current`
     // is: this turns a class-body macro into real methods, and every
     // later pass reads methods.
@@ -2739,6 +2767,56 @@ end
         model.claimed_body_calls = spans;
     }
     Ok(app)
+}
+
+/// A support file the walk holds back for `inherited_alias::decide`:
+/// its classes, the spans of the aliases deferred, and where in
+/// `library_classes`, `file_programs` and the support classes the walk
+/// had it.
+struct HeldSupportFile {
+    entry: PathBuf,
+    source: Vec<u8>,
+    at: (usize, usize, usize),
+    classes: Vec<crate::dialect::LibraryClass>,
+    deferred: Vec<crate::span::Span>,
+}
+
+/// A support file whose library-class ingest succeeded, carried: its
+/// file program (what it runs at load beyond its declarations, in
+/// source order; what that cannot carry named where the source has it)
+/// and its classes. Appended, or inserted `at` the walk's place for a
+/// held-back file.
+fn carry_support_file(
+    app: &mut App,
+    entry: &Path,
+    source: &[u8],
+    classes: Vec<crate::dialect::LibraryClass>,
+    loaded_support: &mut crate::det::HashSet<PathBuf>,
+    support_classes: &mut Vec<(PathBuf, Vec<crate::ident::ClassId>)>,
+    at: Option<(usize, usize, usize)>,
+) {
+    let path_str = entry.display().to_string();
+    if let Some(program) = super::library_class::file_program(source, &path_str, &classes) {
+        report_not_carried(source, &program.items, app);
+        match at {
+            Some((_, programs, _)) => app.file_programs.insert(programs, program),
+            None => app.file_programs.push(program),
+        }
+    }
+    if !classes.is_empty() && declarations_only(source) {
+        loaded_support.insert(entry.to_path_buf());
+    }
+    let names = (entry.to_path_buf(), classes.iter().map(|c| c.name.clone()).collect());
+    match at {
+        Some((libraries, _, supports)) => {
+            support_classes.insert(supports, names);
+            app.library_classes.splice(libraries..libraries, classes).for_each(drop);
+        }
+        None => {
+            support_classes.push(names);
+            app.library_classes.extend(classes);
+        }
+    }
 }
 
 /// A support-dir file whose library-class ingest failed. The walk goes

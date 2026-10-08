@@ -766,6 +766,13 @@ impl Visibility {
             "`class << self` inside a load-time conditional definition is not modeled"
         } else if stmt.as_constant_write_node().is_some() {
             "a constant assigned in a load-time conditional definition is not modeled"
+        } else if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
+            // graphql-client's query_typename.rb declares
+            // `InsertTypenameVisitor` only in the branch that finds
+            // graphql-ruby's node mutation API; defined either way, the
+            // class would exist where Ruby leaves it undefined.
+            "a class or module declared in a load-time conditional definition is not modeled \
+             (Ruby defines it only when its branch runs)"
         } else if wrapped_declaration(stmt).is_some()
             || stmt.as_call_node().is_some_and(|c| {
                 c.receiver().is_none()
