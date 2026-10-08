@@ -287,7 +287,33 @@ fn untyped_subexpressions_baseline() {
     // exists? key dispatch (#549 / #403): 519 -> 523, MEASURED. Four new
     // Base sites from exists? / _exists_primary_key_input (nil guard +
     // cast + adapter). Companion RBS probe stays at zero residual.
-    const CEILING: usize = 523;
+    // 523 -> 546, MEASURED per site with this collector (first-parent
+    // bisect from f18d0f349; site sets diffed at each merge parent):
+    // - ac677e9e4 (origin/main merge): upstream 5db153f96 measured 523
+    //   (no headroom), fork 13cb60d2d 484 under its own ceiling of 500;
+    //   the merge measures 536. +16 Base sites from 11a666400's
+    //   attribute surface: _cast_type_for_spec (10: `spec`/`kind` and the
+    //   `spec[1]` reads), abstract_class= (2: the `value` param and its
+    //   ivar assign), type_for_attribute (2: `attribute_name.to_s` recv
+    //   and `spec` in the fetch block), attribute_types (2: the each_key `name`
+    //   and its type_for_attribute arg). -3 upstream
+    //   _cast_primary_key sites the merge resolves.
+    // - cf04d6d13 (ar-errors, merged 43323af00): +10 error_classes.rb
+    //   sites: AdapterError#connection_pool, ConnectionNotEstablished
+    //   #set_pool (2), DatabaseConnectionError.hostname_error /
+    //   .username_error, NoDatabaseError.db_error (interpolated params),
+    //   SQLWarning#sql= (2), SoleRecordExceeded#initialize
+    //   (`record&.name`), UnknownPrimaryKey#initialize (`model.table_name`).
+    // Untypable by inference alone: each is a parameter (or an ivar or
+    // hash value fed only by one) of an entry point with no caller under
+    // runtime/ruby/active_record. The values come from app code or from
+    // the emitted model's schema_column_types override, and this probe
+    // has neither. connection.rbs / error_classes.rbs declare every one.
+    // 43323af00 through ffbaf0de7: identical site set. (The companion
+    // RBS probe is NOT at zero here: 6 type_for_attribute /
+    // attribute_types sites, the unbound `&block` and the sig-less
+    // `ActiveModel::Type.default_value`.)
+    const CEILING: usize = 546;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\
