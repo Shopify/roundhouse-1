@@ -2531,6 +2531,11 @@ end
     app.dropped_files = survey::dropped_files();
     // After every body exists: which carried aliases a check reads.
     super::sorbet_check::settle_type_aliases(&mut app);
+    // After every class, splice and parent exists: an `include
+    // ActionView::Helpers::*` is dropped only when each member its
+    // includer, subclasses and includers call through it is answered in
+    // the emitted tree, and refused otherwise.
+    super::view_helper_includes::settle(&mut app);
     // Survey mode goes on past a file whose class ingest failed, as the
     // support-dir walk does outside it: each is an error at the
     // construct that failed it too, not only a punch-list entry.

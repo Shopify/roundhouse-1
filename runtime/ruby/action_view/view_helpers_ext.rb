@@ -190,6 +190,15 @@ module ActionView
       distance_of_time_in_words(from_time, Time.now, include_seconds: include_seconds)
     end
 
+    # Rails' `alias_method :distance_of_time_in_words_to_now,
+    # :time_ago_in_words` — the same words, under the name Core's
+    # customer models call through `include ActionView::Helpers::
+    # DateHelper`. A def rather than an alias so the strict targets that
+    # transpile this file see an ordinary module function.
+    def self.distance_of_time_in_words_to_now(from_time, include_seconds: false)
+      time_ago_in_words(from_time, include_seconds: include_seconds)
+    end
+
     def self.distance_of_time_in_words(from_time, to_time, include_seconds: false)
       # Rails writes this as `from_time, to_time = to_time, from_time if
       # from_time > to_time`, reassigning its own parameters through a

@@ -79,6 +79,7 @@ pub mod survey;
 pub mod test;
 pub mod util;
 pub mod view;
+mod view_helper_includes;
 mod visibility;
 mod zeitwerk;
 
