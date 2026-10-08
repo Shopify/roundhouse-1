@@ -377,6 +377,7 @@ pub(super) fn ingest_model_with_enum_constants(
     let mut enum_defaults: IndexMap<Symbol, Literal> = IndexMap::new();
     let mut class_attr_defaults: IndexMap<Symbol, Expr> = IndexMap::new();
     let mut primary_key: Option<Symbol> = None;
+    let mut composite_primary_key: Vec<Symbol> = Vec::new();
     let visibility = Visibility::resolve(class.body().as_ref(), file, None)?;
     let mut visibility_overrides = visibility.overrides();
     if let Some(class_body) = class.body() {
@@ -431,6 +432,13 @@ pub(super) fn ingest_model_with_enum_constants(
             // next statement.
             if let Some(pk) = parse_primary_key_decl(&stmt) {
                 primary_key = Some(pk);
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
+            // `self.primary_key = [:shop_id, :id]`: a composite key, in
+            // the order written (`Model::composite_primary_key`).
+            if let Some(keys) = parse_composite_primary_key_decl(&stmt) {
+                composite_primary_key = keys;
                 prev_end = Some(stmt.location().end_offset());
                 continue;
             }
@@ -695,7 +703,7 @@ pub(super) fn ingest_model_with_enum_constants(
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
         ignored_columns: Vec::new(),
-        composite_primary_key: Vec::new(),
+        composite_primary_key,
         table: TableRef(Symbol::from(table_name)),
         primary_key,
         attributes,
@@ -3000,6 +3008,27 @@ fn parse_primary_key_decl(stmt: &Node<'_>) -> Option<Symbol> {
     let first = args.arguments().iter().next()?;
     let name = string_value(&first).or_else(|| symbol_value(&first))?;
     Some(Symbol::from(name.as_str()))
+}
+
+/// `self.primary_key = [:shop_id, :id]` — Rails' composite primary key,
+/// a literal list of two or more string/symbol column names.
+fn parse_composite_primary_key_decl(stmt: &Node<'_>) -> Option<Vec<Symbol>> {
+    let call = stmt.as_call_node()?;
+    call.receiver()?.as_self_node()?;
+    if constant_id_str(&call.name()) != "primary_key=" {
+        return None;
+    }
+    let args = call.arguments()?;
+    if args.arguments().len() != 1 {
+        return None;
+    }
+    let array = args.arguments().iter().next()?.as_array_node()?;
+    let keys = array
+        .elements()
+        .iter()
+        .map(|e| string_value(&e).or_else(|| symbol_value(&e)).map(|n| Symbol::from(n.as_str())))
+        .collect::<Option<Vec<_>>>()?;
+    (keys.len() > 1).then_some(keys)
 }
 
 /// Bind one direct literal string/symbol `self.table_name` before reading the schema.

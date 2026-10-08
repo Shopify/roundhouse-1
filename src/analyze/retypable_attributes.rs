@@ -133,15 +133,14 @@ pub(crate) fn diagnose(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
     out
 }
 
-/// The columns of the table's composite primary key when the model
-/// declares no `self.primary_key`, itself or through a model ancestor:
-/// Rails then keys the model on all of them (`primary_key` is the list,
-/// `id` the tuple of their values; `Model::composite_primary_key`).
+/// The model's composite primary key (`primary_key` is the list, `id`
+/// the tuple of their values; `Model::composite_primary_key`): the
+/// nearest list declaration (`self.primary_key = [..]`, which ingest
+/// records on the model) of the model or a model ancestor, else the
+/// table's composite primary key columns when none of them declares a
+/// single key, which Rails then keys the model on.
 pub(crate) fn composite_primary_key(model: &Model, app: &App) -> Vec<Symbol> {
     let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
-    if table.primary_key_columns.is_empty() {
-        return Vec::new();
-    }
     let mut at = Some(model);
     let mut visited: Vec<&str> = Vec::new();
     while let Some(m) = at {
@@ -149,6 +148,9 @@ pub(crate) fn composite_primary_key(model: &Model, app: &App) -> Vec<Symbol> {
             break;
         }
         visited.push(m.name.0.as_str());
+        if !m.composite_primary_key.is_empty() {
+            return m.composite_primary_key.clone();
+        }
         if m.primary_key.is_some() {
             return Vec::new();
         }

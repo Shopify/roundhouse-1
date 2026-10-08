@@ -141,9 +141,11 @@ pub struct Model {
     /// within this one. Empty for nearly every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_columns: Vec<String>,
-    /// The table's composite primary key columns when the model declares
-    /// no `self.primary_key` (`analyze::retypable_attributes::
-    /// composite_primary_key`). Rails' `primary_key` is then this list,
+    /// The model's composite primary key: a `self.primary_key = [..]`
+    /// list (ingest records the model's own), else the table's composite
+    /// primary key columns when the model declares no single key
+    /// (`analyze::retypable_attributes::composite_primary_key`, which
+    /// stamps the effective list). Rails' `primary_key` is then this list,
     /// `id` the tuple of their values and `id_value` the `id` column; the
     /// list is also the model's `query_constraints` unless the body names
     /// one. Empty for nearly every model.
