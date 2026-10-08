@@ -3209,9 +3209,9 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             // keyword marks have to survive that.
             let slot = crate::lower::keyword_marks::SlotMarks::of(expr);
             // So does the analyzer's routing of an `errors` hash read
-            // (`expr::ERRORS_HASH_READ`), while the send stays that read.
+            // (`expr::ERRORS_PORT_CALL`), while the send stays that read.
             let routed = match &*expr.node {
-                ExprNode::Send { method, .. } if expr.decisions & crate::expr::ERRORS_HASH_READ != 0 => Some(method.clone()),
+                ExprNode::Send { method, .. } if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 => Some(method.clone()),
                 _ => None,
             };
             let model = rewrite_send(expr, ctx, locals);
@@ -3220,7 +3220,7 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             });
             slot.restore(expr);
             if routed.as_ref().is_some_and(|m| matches!(&*expr.node, ExprNode::Send { method, .. } if method == m)) {
-                expr.decisions |= crate::expr::ERRORS_HASH_READ;
+                expr.decisions |= crate::expr::ERRORS_PORT_CALL;
             }
             model
         }

@@ -1,14 +1,17 @@
 # frozen_string_literal: true
 
-# `errors.attribute_names`, `to_hash`, `as_json` and `messages`, ported
-# from activemodel 8.2.0.alpha (Shopify/rails 5813559f, the version Core
-# pins: lib/active_model/errors.rb, `#attribute_names` is
-# `@errors.map(&:attribute).uniq.freeze`, `#to_hash(full_messages =
+# `errors.attribute_names`, `to_hash`, `as_json`, `messages` and
+# `merge!`, ported from activemodel 8.2.0.alpha (Shopify/rails 5813559f,
+# the version Core pins: lib/active_model/errors.rb, `#attribute_names`
+# is `@errors.map(&:attribute).uniq.freeze`, `#to_hash(full_messages =
 # false)` is `group_by_attribute.transform_values { |errors|
 # errors.map(&message_method) }`, `#as_json(options = nil)` is
-# `to_hash(options && options[:full_messages])` and `#messages` is that
-# Hash with an empty default, frozen; `#add`'s `normalize_arguments`
-# symbolizes each attribute) for the CRuby and JRuby trees.
+# `to_hash(options && options[:full_messages])`, `#messages` is that
+# Hash with an empty default, frozen, `#merge!(other)` imports each of
+# `other.errors` as a NestedError unless `other` is this collection;
+# `#add`'s `normalize_arguments` symbolizes each attribute) for the
+# CRuby and JRuby trees, with an Error per recorded message (`objects`)
+# for what `merge!` answers.
 #
 # The emitted record's `errors` is the shared runtime's accumulator, an
 # Array of full messages: the validates lowering bakes "Title can't be
@@ -40,27 +43,31 @@
 # - A receiver that is not the accumulator (an Array the app built)
 #   answers the attributes recorded on it, usually none, from
 #   `attribute_names`; any other object answers the read itself.
+# - An Error built here is not an ActiveModel::Error and keeps no
+#   record (`base` raises). Its type and options are known only where the
+#   push recorded them; otherwise `raw_type`, `options`, `details` and
+#   equality raise naming the message, and `merge!` into Rails'
+#   collection adds the short message as written (Rails' `add(attr,
+#   message)`, whose type is that message).
 # - On the PostgreSQL tree a record over the ActiveModel::Validations
-#   port has Rails' ActiveModel::Errors, which answers each read itself.
+#   port has Rails' ActiveModel::Errors, which answers each read itself;
+#   `merge!` between it and the accumulator goes through the records.
 module ActiveModel
   module ErrorAttributes
     PAIRS = :@__roundhouse_error_attributes
     # A recorded message whose short message is not known.
     UNSPLIT = Object.new.freeze
+    # A recorded message whose type or options are not known.
+    UNKNOWN = Object.new.freeze
     EMPTY = [].freeze
 
     # `errors << message`, recording `attribute` for it, and its short
     # message: what follows `prefix`, when given and the message starts
     # with it. Returns the accumulator, as `<<` does.
-    def self.add(errors, attribute, message, prefix = nil)
+    def self.add(errors, attribute, message, prefix = nil, type = UNKNOWN, options = UNKNOWN)
       errors << message
-      pairs = errors.instance_variable_get(PAIRS)
-      unless pairs
-        pairs = []
-        errors.instance_variable_set(PAIRS, pairs)
-      end
       short = prefix && message.is_a?(String) && message.start_with?(prefix) ? message[prefix.length..] : UNSPLIT
-      pairs << [attribute.to_sym, message, short]
+      pairs_of(errors) << [attribute.to_sym, message, short, type, options]
       errors
     end
 
@@ -117,6 +124,178 @@ module ActiveModel
       hash.default = EMPTY
       hash.freeze
     end
+
+    # Rails' `merge!(other)`: `other`'s errors appended, each with its
+    # attribute, short message, type and options (an ActiveModel::Errors
+    # holds NestedErrors over them, whose full message is this record's
+    # `"%{attribute} %{message}"`). Answers `other`'s errors, as Rails'
+    # `other.errors.each` does.
+    def self.merge!(errors, other)
+      unless errors.is_a?(Array)
+        return errors.merge!(other) unless other.is_a?(Array)
+        # A port record's collection (runtime/active_model_validations.rb)
+        # taking the accumulator's errors: added as the lowering recorded
+        # them, the short message kept as written.
+        each_record(other) do |message, record|
+          raise unkeyed("merge!", message) unless record
+          raise unsplit("merge!", message, record) if record[2].equal?(UNSPLIT)
+          if record[3].equal?(UNKNOWN)
+            errors.add(record[0], record[2])
+          else
+            options = record[4].equal?(UNKNOWN) ? {} : record[4]
+            errors.add(record[0], record[3], **options, message: record[2])
+          end
+        end
+        return objects(other)
+      end
+      return objects(errors) if errors.equal?(other)
+      if other.is_a?(Array)
+        each_record(other) do |message, record|
+          errors << message
+          pairs_of(errors) << record.dup if record
+        end
+      else
+        other.errors.each do |error|
+          name = error.attribute.to_s
+          short = error.message
+          prefix = name == "base" ? "" : "#{ActiveSupport.humanize(name)} "
+          add(errors, error.attribute, "#{prefix}#{short}", prefix, error.raw_type, error.options)
+        end
+      end
+      objects(other)
+    end
+
+    # Rails' `objects` (`errors`): an Error for each message, in order.
+    # A message pushed without its attribute is an Error whose readers
+    # raise naming it.
+    def self.objects(errors)
+      return errors.objects unless errors.is_a?(Array)
+      out = []
+      each_record(errors) { |message, record| out << Error.new(message, record) }
+      out
+    end
+
+    # One message of the accumulator, as Rails' ActiveModel::Error
+    # answers it (activemodel's error.rb): its attribute, type
+    # (`raw_type`, `:invalid` when nil), options, short and full message,
+    # `details`, `match?` and `strict_match?`, and equality over them.
+    # Its record (`base`) is not kept.
+    class Error
+      CALLBACKS_OPTIONS = [:if, :unless, :on, :allow_nil, :allow_blank, :strict].freeze
+      MESSAGE_OPTIONS = [:message].freeze
+
+      def initialize(full_message, record)
+        @full = full_message
+        @record = record
+        return unless record
+        @attribute = record[0]
+        @type = record[3].equal?(UNKNOWN) ? UNKNOWN : (record[3] || :invalid)
+        @options = record[4]
+      end
+
+      def attribute
+        keyed![0]
+      end
+
+      def raw_type
+        type = keyed![3]
+        raise ErrorAttributes.unrecorded("type", @full, @record) if type.equal?(UNKNOWN)
+        type
+      end
+
+      def type
+        raw_type || :invalid
+      end
+
+      def options
+        options = keyed![4]
+        raise ErrorAttributes.unrecorded("options", @full, @record) if options.equal?(UNKNOWN)
+        options
+      end
+
+      def message
+        short = keyed![2]
+        raise ErrorAttributes.unsplit("Error#message", @full, @record) if short.equal?(UNSPLIT)
+        short
+      end
+
+      def full_message
+        keyed!
+        @full
+      end
+
+      def base
+        raise "roundhouse: ActiveModel::Error#base: the emitted record's errors do not keep their record"
+      end
+
+      def details
+        { error: raw_type }.merge(options.except(*CALLBACKS_OPTIONS, *MESSAGE_OPTIONS))
+      end
+      alias_method :detail, :details
+
+      def match?(attribute, type = nil, **options)
+        return false if self.attribute != attribute || (type && self.type != type)
+        options.each { |key, value| return false if self.options[key] != value }
+        true
+      end
+
+      def strict_match?(attribute, type, **options)
+        return false unless match?(attribute, type)
+        options.except(*CALLBACKS_OPTIONS, *MESSAGE_OPTIONS) == self.options.except(*CALLBACKS_OPTIONS, *MESSAGE_OPTIONS)
+      end
+
+      def ==(other)
+        other.is_a?(Error) && attributes_for_hash == other.attributes_for_hash
+      end
+      alias_method :eql?, :==
+
+      def hash
+        attributes_for_hash.hash
+      end
+
+      protected
+
+      def attributes_for_hash
+        [attribute, raw_type, options.except(*CALLBACKS_OPTIONS)]
+      end
+
+      private
+
+      def keyed!
+        raise ErrorAttributes.unkeyed("ActiveModel::Error", @full) unless @record
+        @record
+      end
+
+      def instance_variables_to_inspect
+        [:@attribute, :@type, :@options].freeze
+      end
+    end
+
+    def self.unkeyed(read, message)
+      RuntimeError.new("roundhouse: #{read}: #{message.inspect} was added without its attribute " \
+                       "(a push the errors lowering did not record)")
+    end
+
+    def self.unsplit(read, message, record)
+      RuntimeError.new("roundhouse: #{read}: #{message.inspect} on #{record[0].inspect} was added " \
+                       "without its short message (only the full message is known)")
+    end
+
+    def self.unrecorded(what, message, record)
+      RuntimeError.new("roundhouse: ActiveModel::Error: the #{what} of #{message.inspect} on #{record[0].inspect} " \
+                       "was not recorded by the push that added it")
+    end
+
+    # The records kept on an accumulator, created on first use.
+    def self.pairs_of(errors)
+      pairs = errors.instance_variable_get(PAIRS)
+      unless pairs
+        pairs = []
+        errors.instance_variable_set(PAIRS, pairs)
+      end
+      pairs
+    end
+    private_class_method :pairs_of
 
     # Each message in `errors` with the record pushed for it, or nil:
     # the very String first, else an equal one, each record used once.
