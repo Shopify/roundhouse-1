@@ -31,7 +31,6 @@ use crate::span::Span;
 
 use super::IngestError;
 use super::IngestResult;
-use super::expr::ingest_expr;
 use super::util::symbol_value;
 
 /// A literal-shaped `cattr_*` / `mattr_*` declaration.
@@ -82,7 +81,7 @@ pub(crate) fn declaration(call: &ruby_prism::CallNode<'_>, kw: &str, file: &str)
                     Some("instance_writer") => 1,
                     Some("instance_accessor") => 2,
                     Some("default") => {
-                        default = Some(ingest_expr(&assoc.value(), file)?);
+                        default = Some(seed_value(&assoc.value(), kw, file)?);
                         continue;
                     }
                     Some("location") => continue,
@@ -106,7 +105,7 @@ pub(crate) fn declaration(call: &ruby_prism::CallNode<'_>, kw: &str, file: &str)
             return Err(unsupported("a block with parameters"));
         }
         let body = match block.body() {
-            Some(body) => ingest_expr(&body, file)?,
+            Some(body) => seed_value(&body, kw, file)?,
             None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
         };
         if default.as_ref().is_none_or(is_nil) {
@@ -125,6 +124,23 @@ pub(crate) fn declaration(call: &ruby_prism::CallNode<'_>, kw: &str, file: &str)
         instance_writer: flags[1].unwrap_or(true) && accessor,
         default,
     })
+}
+
+/// A default (or default block body) as the seed stores it. Survey
+/// ingest stands `nil` in for a gap inside an expression and records it;
+/// a seed holding that `nil` would store a value the source never
+/// computes, so the declaration is refused instead (the gap stays
+/// recorded). Strict ingest, so a trailing `#:` ascription is the value's.
+fn seed_value(node: &ruby_prism::Node<'_>, kw: &str, file: &str) -> IngestResult<Expr> {
+    let before = super::survey::recorded_len();
+    let value = super::expr::ingest_expr_strict(node, file)?;
+    if super::survey::is_active() && super::survey::recorded_len() != before {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("`{kw}` with a default ingest could not read whole is not modeled"),
+        });
+    }
+    Ok(value)
 }
 
 fn is_attribute_name(name: &str) -> bool {

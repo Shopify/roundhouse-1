@@ -102,6 +102,22 @@ module Db
     @cv        = ConditionVariable.new
     @quarantined = []
     @missing_connections = 0
+    # Puma `before_worker_boot` re-configure sets @owner_pid to the child
+    # and therefore skips `adopt_after_fork`. Drop any inherited
+    # checkpoint-lock FD without LOCK_UN (same rule as adopt) and forget
+    # the parent's checkpointer pid so the child's first lease starts a
+    # fresh loop. Normal master boot never holds the flock; this closes
+    # the gap if it ever did.
+    inherited = @checkpoint_lock_file
+    if inherited && !inherited.closed?
+      begin
+        inherited.close
+      rescue StandardError
+      end
+    end
+    @checkpoint_lock_file = nil
+    @checkpointer_pid = nil
+    @checkpoint_warn_at = nil
     @memory    = path == ":memory:" ? {} : nil
     @pool      = @memory ? nil : open_pool
     @owner_pid = Process.pid
@@ -241,6 +257,8 @@ module Db
           end
         end
         @checkpoint_lock_file = nil
+        @checkpointer_pid = nil
+        @checkpoint_warn_at = nil
         # The parent's handles are simply dropped. They are already
         # discarded by the gem's fork safety, and closing a descriptor
         # this process shares with its parent is not ours to do.
@@ -470,6 +488,62 @@ module Db
 
   def self.exec(sql)
     record_query(sql)
+    write(sql) { |conn, s| run_exec(conn, s) }
+  end
+
+  # A write that returns rows (`INSERT … RETURNING`, roundhouse#91). It
+  # runs under exec's discipline (query cache cleared, snapshot ended,
+  # write permit), reads every row before the permit goes back, and
+  # answers a replay handle over them: step/column_*/finalize as for a
+  # read. `changes` is the write's row count.
+  def self.exec_returning(sql)
+    v = loaded_sqlite_version
+    if !returning_supported?(v)
+      raise "Db.exec_returning: RETURNING needs SQLite 3.35 or newer; this process loads " + v.to_s
+    end
+    record_query(sql)
+    rows = nil
+    names = nil
+    write(sql) do |conn, s|
+      stmt = conn.prepare(s)
+      begin
+        names = stmt.columns
+        rows = stmt.execute.to_a
+      rescue StandardError => e
+        raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
+        raise
+      ensure
+        stmt.close
+      end
+    end
+    hit = { rows: rows, names: names, eof: true, sql: sql }
+    { stmt: nil, row: nil, cached: false, replay: hit, pos: 0, sql: sql }
+  end
+
+  # Test-only hook, matching the Spinel SQLite shim's (db.rb) accessor of
+  # the same name: always 0 here, since an exec_returning handle is a
+  # plain Ruby Hash — there is no persistent array of outstanding
+  # captures to leak.
+  def self.qc_cursor_count
+    0
+  end
+
+  # RETURNING arrived in SQLite 3.35.0 (3035000). An older library gets
+  # a clear error rather than a syntax error, as #91 agreed.
+  def self.returning_supported?(version_number)
+    version_number >= 3035000
+  end
+
+  # The library the gem loaded (not the one it was compiled against), as
+  # 3035000 for 3.35.0.
+  def self.loaded_sqlite_version
+    text = defined?(SQLite3::SQLITE_LOADED_VERSION) ? SQLite3::SQLITE_LOADED_VERSION : SQLite3::SQLITE_VERSION
+    major, minor, patch = text.split(".").map(&:to_i)
+    major * 1_000_000 + minor.to_i * 1000 + patch.to_i
+  end
+
+  # exec's write path; the block runs the statement on the connection.
+  def self.write(sql)
     # Any exec is (per the Db contract) DDL or a write — Rails
     # invalidates the whole query cache on write; so do we.
     qcache = Fiber[:rh_qcache]
@@ -484,7 +558,7 @@ module Db
     if permit_owned?
       # Inside this fiber's own transaction: the permit is already held.
       begin
-        run_exec(conn, sql)
+        yield(conn, sql)
       ensure
         release_permit if sql == "ROLLBACK" || (sql == "COMMIT" && !conn.transaction_active?)
       end
@@ -492,14 +566,14 @@ module Db
       # Inside a transaction that began WITHOUT the permit (its wait
       # timed out — see `acquire_permit`): SQLite's lock is already
       # held, so there is nothing to queue for.
-      run_exec(conn, sql)
+      yield(conn, sql)
     elsif sql == "BEGIN"
       # IMMEDIATE, as Rails 8's SQLite adapter begins: the write lock is
       # taken at BEGIN, not at the first write, so a transaction never
       # fails part way through upgrading a stale read.
       got = acquire_permit
       begin
-        run_exec(conn, "BEGIN IMMEDIATE")
+        yield(conn, "BEGIN IMMEDIATE")
       rescue Exception
         release_permit if got
         raise
@@ -507,7 +581,7 @@ module Db
     else
       got = acquire_permit
       begin
-        run_exec(conn, sql)
+        yield(conn, sql)
       ensure
         release_permit if got
       end
@@ -670,10 +744,33 @@ module Db
   # Tests, scripts and the console never ask, and keep SQLite's default.
   CHECKPOINT_INTERVAL = 0.25
   CHECKPOINT_RESTART_FRAMES = 8192 # ~32 MB of 4 KB pages
+  # Cap failure noise: the loop keeps its 250 ms cadence (no Campfire-style
+  # backoff that slows copying), but a stuck disk / permission / corruption
+  # path must not stay completely silent either. One warn per interval.
+  CHECKPOINT_WARN_INTERVAL = 30.0
 
   def self.checkpoint_in_background!
     @checkpoint_wanted = true
   end
+
+  # Rate-limited visibility for checkpoint_loop failures. Resets the
+  # suppress window only by time, not by success — a later success simply
+  # stops calling this. Private: the loop is the only production caller;
+  # tests reach it via `send`.
+  def self.warn_checkpoint_failure(error)
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    last = @checkpoint_warn_at
+    return if last && (now - last) < CHECKPOINT_WARN_INTERVAL
+    @checkpoint_warn_at = now
+    begin
+      warn "[db] WAL checkpoint failed: #{error.class}: #{error.message}"
+    rescue StandardError
+      # A failing warning sink must not kill the checkpointer thread —
+      # wal_autocheckpoint is already 0 on serving connections.
+      nil
+    end
+  end
+  private_class_method :warn_checkpoint_failure
 
   def self.prepare_for_checkpointer(conn)
     start_checkpointer if @checkpointer_pid != Process.pid
@@ -737,9 +834,20 @@ module Db
   end
 
   def self.checkpoint_loop(path)
-    conn = SQLite3::Database.new(path)
-    conn.busy_handler_timeout = 100
     lock_path = checkpoint_lock_path(path)
+    # Open can fail (permissions, missing file mid-deploy). Do not let
+    # the thread die after prepare_for_checkpointer already set
+    # wal_autocheckpoint=0 — warn and retry on the same cadence.
+    conn = nil
+    until conn
+      begin
+        conn = SQLite3::Database.new(path)
+        conn.busy_handler_timeout = 100
+      rescue StandardError => error
+        warn_checkpoint_failure(error)
+        sleep CHECKPOINT_INTERVAL
+      end
+    end
     loop do
       # Hold the flock for the whole inner loop (Campfire #319), not
       # per tick: releasing every 250ms lets a sibling overlap a
@@ -750,6 +858,7 @@ module Db
         sleep CHECKPOINT_INTERVAL
         next
       end
+      held_error = nil
       begin
         loop do
           sleep CHECKPOINT_INTERVAL
@@ -765,12 +874,17 @@ module Db
             end
           end
         end
-      rescue StandardError
-        # A busy or failed checkpoint is retried on the next outer
-        # pass; the log only grows meanwhile.
+      rescue StandardError => error
+        held_error = error
       ensure
+        # Release before warn so a blocked $stderr cannot extend the
+        # exclusive flock and delay sibling takeover.
         release_checkpoint_lock(lock)
       end
+      # Retry on the next outer pass (same 250 ms cadence). Warn at
+      # most once per CHECKPOINT_WARN_INTERVAL so a persistent failure
+      # is visible without a multi-contender log storm.
+      warn_checkpoint_failure(held_error) if held_error
     end
   end
 

@@ -160,11 +160,13 @@ pub mod send_dispatch;
 pub mod relation_counted_terminal;
 pub(crate) mod secure_password;
 pub mod attached;
+pub mod attachment_model;
 pub mod attached_url;
 pub mod send_file;
 pub mod helper_kwargs;
 pub mod kwrest_forward;
 pub mod column_ops;
+pub mod generated_write_guard;
 pub mod signed_id;
 pub(crate) mod secure_token;
 pub mod rich_text;
@@ -556,7 +558,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // so it has no ordering constraints of its own.
     ("module_mixins", &[]),
     ("transaction_ground", &[]),
-    ("column_ops", &[]),
+    ("generated_write_guard", &[]),
+    ("column_ops", &["generated_write_guard"]),
     // `signed_id(purpose: :avatar)` → the runtime SignedId call, with
     // the model name folded into the purpose. BEFORE `duration`: the
     // `expires_in:` argument this wraps in `.to_i` is an
@@ -599,7 +602,7 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // include dropped. Reads only the class's own writer surface and
     // writes only new methods, so no ordering constraints.
     ("active_model_model", &[]),
-    ("update_kwargs", &[]),
+    ("update_kwargs", &["generated_write_guard"]),
     // `record.update!(creator: user)` -> `update!(creator_id: user.id)`.
     // AFTER `update_kwargs`, which INLINES the same shape into typed
     // writer assignments when it can — and a `belongs_to` writer is the
@@ -920,6 +923,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("module_mixins");
     transaction_ground::apply_transaction_grounding(app);
     ran!("transaction_ground");
+    diags.extend(generated_write_guard::apply(app));
+    ran!("generated_write_guard");
     column_ops::apply_column_ops_lowering(app);
     ran!("column_ops");
     signed_id::apply_signed_id_lowering(app);

@@ -260,7 +260,7 @@ fn every_fixpoint_loop_settles_well_under_the_cap() {
     let (_, rounds) = analyzed();
     // The wallet cycle has period 4: it shows itself on the fifth
     // round, and its dependents settle in the next few.
-    for (name, n) in [("production", rounds.production), ("tests", rounds.tests), ("absorb", rounds.absorb)] {
+    for (name, n) in [("production", rounds.production.rounds()), ("tests", rounds.views_and_tests.rounds()), ("absorb", rounds.absorb.rounds())] {
         assert!(n.is_some_and(|n| n <= 8), "{name} loop did not settle: {rounds:?}");
     }
 }
@@ -345,7 +345,7 @@ fn instance_and_class_defs_of_one_name_keep_their_own_params() {
 #[test]
 fn a_return_that_feeds_its_own_argument_settles_on_the_join_of_its_cycle() {
     let a = analyzed_full();
-    assert!(a.rounds.production.is_some_and(|n| n <= 8), "{:?}", a.rounds);
+    assert!(a.rounds.production.rounds().is_some_and(|n| n <= 8), "{:?}", a.rounds);
     let [param] = params(&a.app, "PaymentGateway", "without_killswitched_wallets", MethodReceiver::Instance) else {
         panic!("one param")
     };

@@ -165,6 +165,7 @@ pub(super) fn insert_inferred_return(
     method: &Symbol,
     ty: Ty,
 ) {
+    let ty = super::fixpoint_bound::bound(ty);
     match table.get(method) {
         None => {
             table.insert(method.clone(), ty);

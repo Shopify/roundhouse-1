@@ -895,6 +895,16 @@ module Db
     result&.clear
   end
 
+  # A write with a RETURNING clause (an INSERT hydrating its generated
+  # columns): runs once, now, as `exec` does, and answers a handle over
+  # the returned rows (step?/column_*/finalize, as for a read). Executing
+  # clears the query cache and sets `changes`, by the command tag.
+  def self.exec_returning(sql)
+    handle = prepare_uncached(sql)
+    execute_handle(handle)
+    handle
+  end
+
   def self.last_insert_rowid
     raise NotImplementedError, "PostgreSQL inserts require an explicit RETURNING key"
   end

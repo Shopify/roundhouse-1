@@ -413,7 +413,7 @@ fn restore_kwrest_on_typed_send(expr: &mut Expr, sigs: &Signatures) {
 fn restore_kwrest_splat(args: &mut Vec<Expr>, params: &[Param]) {
     if args
         .iter()
-        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::KeywordSplat { .. }))
+        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. }))
         || params.iter().any(|p| p.forwarding)
     {
         return;
@@ -582,7 +582,7 @@ fn erased_splat_against(args: &[Expr], params: &[Param]) -> Option<ErasedSplat> 
     let last = args.last()?;
     // Full packets are explicit source facts, not erased hash expressions
     // from which this pass can recover an anonymous keyword splat.
-    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::KeywordSplat { .. }))
+    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. }))
         || params.iter().any(|p| p.forwarding)
     {
         return None;

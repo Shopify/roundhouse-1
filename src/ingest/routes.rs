@@ -21,7 +21,7 @@
 //! the resource name and optional `controllers:` overrides; it does
 //! not claim Warden or Devise controller runtime.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use crate::det::{HashMap, HashSet};
 
 use indexmap::IndexMap;
@@ -38,6 +38,29 @@ use super::util::{
     symbol_or_string_value, symbol_value,
 };
 use super::{IngestError, IngestResult};
+
+/// Source-backed Rails engines that the whole-app walker can identify
+/// without booting Rails. Keys are exact fully-qualified engine constants
+/// (`Catalog::Engine`); `namespace` is the explicit literal
+/// `isolate_namespace` value used to resolve engine-local controllers.
+#[derive(Clone, Debug)]
+pub(super) struct EngineRouteSource {
+    pub source: Vec<u8>,
+    pub file: String,
+    pub namespace: String,
+    pub app_root: String,
+}
+
+/// Ruby from host and engine app roots, prepared for the mounted-helper
+/// boundary check. ERB is compiled for AST inspection and keeps its offset map.
+#[derive(Clone, Debug)]
+pub(super) struct RouteHelperSource {
+    pub source: Vec<u8>,
+    pub original: String,
+    pub file: String,
+    pub engine_class: Option<String>,
+    pub erb_map: Option<Vec<crate::erb::ErbSegment>>,
+}
 
 pub fn ingest_routes(source: &[u8], file: &str) -> IngestResult<RouteTable> {
     ingest_routes_with_draws(source, file, &HashMap::default())
@@ -68,17 +91,46 @@ pub fn ingest_routes_with_dsl(
     draws: &HashMap<String, (Vec<u8>, String)>,
     block_wrappers: &HashSet<String>,
 ) -> IngestResult<RouteTable> {
+    ingest_routes_with_engines(
+        source,
+        file,
+        draws,
+        block_wrappers,
+        &HashMap::default(),
+        &OnceCell::new(),
+        &|| Vec::new(),
+    )
+}
+
+/// Whole-app route ingest with path-sourced isolated engine route sets.
+/// A direct engine mount expands to an ordinary scope so the shared
+/// flattener and target routers own path and controller composition. The
+/// helper-source loader runs only after a mount is accepted and reaches the
+/// proxy-use scan; its `OnceCell` snapshot is reused by later accepted mounts.
+pub(super) fn ingest_routes_with_engines(
+    source: &[u8],
+    file: &str,
+    draws: &HashMap<String, (Vec<u8>, String)>,
+    block_wrappers: &HashSet<String>,
+    engine_routes: &HashMap<String, EngineRouteSource>,
+    helper_sources: &OnceCell<Vec<RouteHelperSource>>,
+    load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
+) -> IngestResult<RouteTable> {
     super::sources::register(file, &String::from_utf8_lossy(source));
     let result = super::prism::parse(source, file);
     let root = result.node();
     let cx = Ctx {
         draws,
         wrappers: block_wrappers,
+        engine_routes,
+        helper_sources,
+        load_helper_sources,
         concerns: RefCell::new(HashMap::default()),
         active: RefCell::new(Vec::new()),
         hoisted: RefCell::new(Vec::new()),
         diagnostics: RefCell::new(Vec::new()),
         mount_scope_depth: Cell::new(0),
+        mounted_engines: RefCell::new(HashSet::default()),
     };
 
     // Every `Rails.application.routes.draw do … end` in the file: Rails
@@ -163,6 +215,12 @@ struct Ctx<'a> {
     draws: &'a HashMap<String, (Vec<u8>, String)>,
     /// App-defined block-taking DSL methods (see [`ingest_routes_with_dsl`]).
     wrappers: &'a HashSet<String>,
+    /// Exact source-backed engine classes with literal isolated namespaces.
+    engine_routes: &'a HashMap<String, EngineRouteSource>,
+    /// Per-route-ingest snapshot shared by all accepted-mount helper scans.
+    helper_sources: &'a OnceCell<Vec<RouteHelperSource>>,
+    /// Invoked by the first accepted mount that reaches helper-use diagnosis.
+    load_helper_sources: &'a dyn Fn() -> Vec<RouteHelperSource>,
     /// `concern :name do |options| … end`, by name. A concern is a macro
     /// re-run at each `concerns :name` call site, so its body is kept as
     /// source and re-read there.
@@ -176,6 +234,9 @@ struct Ctx<'a> {
     diagnostics: RefCell<Vec<Diagnostic>>,
     /// Fixed runtime mounts cannot inherit path/constraint DSL wrappers.
     mount_scope_depth: Cell<usize>,
+    /// One route set cannot mount the same engine class more than once
+    /// in this supported slice: Rails route helper proxies are mount-specific.
+    mounted_engines: RefCell<HashSet<String>>,
 }
 
 impl Ctx<'_> {
@@ -221,6 +282,586 @@ fn runtime_cable_mount(call: &ruby_prism::CallNode<'_>) -> bool {
         }
     }
     server && path.as_deref() == Some("/cable") && call.block().is_none()
+}
+
+/// Attach a located unsupported-mount diagnostic and the matching survey
+/// record to the original mount or engine route call.
+fn route_mount_gap(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+    cx: &Ctx<'_>,
+    detail: &str,
+) {
+    let location = call.location();
+    cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
+        Span {
+            file: super::sources::file_id(file),
+            start: location.start_offset() as u32,
+            end: location.end_offset() as u32,
+        },
+        None,
+        "route mount",
+        detail,
+    ));
+    super::survey::record(&IngestError::Unsupported {
+        file: file.into(),
+        message: format!("route mount: {detail}"),
+    });
+}
+
+/// Supported first slice: a bare top-level `mount Foo::Engine, at: "/prefix"`
+/// whose engine source was found under an in-tree PATH gem and explicitly
+/// declares a literal `isolate_namespace`. Other mount shapes remain errors.
+fn ingest_literal_engine_mount(
+    call: &ruby_prism::CallNode<'_>,
+    file: &str,
+    cx: &Ctx<'_>,
+) -> Option<RouteSpec> {
+    let unsupported = |detail: &str| {
+        route_mount_gap(call, file, cx, detail);
+        None
+    };
+    if cx.mount_scope_depth.get() != 0 {
+        return unsupported("only top-level literal engine mounts are composed");
+    }
+    if call.receiver().is_some() || call.block().is_some() {
+        return unsupported("receiver-qualified and block mounts are not composed");
+    }
+    let Some(args) = call.arguments() else {
+        return unsupported("mount requires an exact engine constant and literal `at:` prefix");
+    };
+    let args: Vec<_> = args.arguments().iter().collect();
+    if args.len() != 2 {
+        return unsupported("mount supports only an exact engine constant and one literal `at:` option");
+    }
+    let Some(engine_parts) = constant_path_of(&args[0]) else {
+        return unsupported("Rack applications and dynamic mount targets are not composed");
+    };
+    let engine_name = engine_parts.join("::");
+    let Some(option_hash) = args[1].as_keyword_hash_node() else {
+        return unsupported("mount supports only the literal keyword form `at: \"/prefix\"`");
+    };
+    let option_items: Vec<_> = option_hash.elements().iter().collect();
+    if option_items.len() != 1 {
+        return unsupported("mount options beyond a literal `at:` prefix, including `as:`, are not composed");
+    }
+    let Some(assoc) = option_items[0].as_assoc_node() else {
+        return unsupported("mount requires a literal `at:` prefix");
+    };
+    if symbol_value(&assoc.key()).as_deref() != Some("at") {
+        return unsupported("mount supports only a literal `at:` prefix; helper options are not composed");
+    }
+    let Some(literal_path) = string_value(&assoc.value()) else {
+        return unsupported("dynamic mount paths are not composed");
+    };
+    let Some(path) = literal_mount_prefix(&literal_path) else {
+        return unsupported("mount path must be one absolute, static, non-root prefix without a trailing slash");
+    };
+    let Some(engine) = cx.engine_routes.get(&engine_name) else {
+        return unsupported("engine target is not a unique, readable, in-tree PATH Rails engine with literal `isolate_namespace`");
+    };
+    if !cx.mounted_engines.borrow_mut().insert(engine_name.clone()) {
+        return unsupported("mounting the same engine class more than once is not composed");
+    }
+
+    let engine_source = String::from_utf8_lossy(&engine.source);
+    super::sources::register(&engine.file, &engine_source);
+    let parsed = super::prism::parse(&engine.source, &engine.file);
+    if parsed.errors().next().is_some() {
+        return unsupported("engine route source has a Ruby parse error");
+    }
+    let draws = top_level_engine_draws(parsed.node(), &engine_name);
+    let top_level_statements = parsed
+        .node()
+        .as_program_node()
+        .map(|program| program.statements().body().iter().count())
+        .unwrap_or_default();
+    if draws.len() != 1 || top_level_statements != 1 {
+        return unsupported("engine route source must contain exactly one top-level matching `<Engine>.routes.draw` block and no other top-level code");
+    }
+    let mut entries = Vec::new();
+    let empty_draws = HashMap::default();
+    let empty_wrappers = HashSet::default();
+    let empty_engine_routes = HashMap::default();
+    let empty_helper_sources = OnceCell::new();
+    let empty_helper_loader = || Vec::new();
+    for draw in draws {
+        let Some(block) = draw.block().and_then(|node| node.as_block_node()) else { continue };
+        let Some(body) = block.body() else { continue };
+        if let Some(detail) = unsupported_engine_route_guard(&body) {
+            route_mount_gap(&draw, &engine.file, cx, detail);
+            return None;
+        }
+        if has_mount_block_call(&body, &["authenticated", "unauthenticated", "devise_scope"]) {
+            route_mount_gap(&draw, &engine.file, cx, "Devise visibility wrappers in engine routes are not enforced and cannot be composed");
+            return None;
+        }
+        if has_mount_block_call(&body, &["direct"]) {
+            route_mount_gap(&draw, &engine.file, cx, "engine `direct` URL helpers and mounted helper proxies are not composed");
+            return None;
+        }
+        if !engine_route_body_is_plain(&body) {
+            route_mount_gap(
+                &draw,
+                &engine.file,
+                cx,
+                "engine routes support only literal root and HTTP shortcut declarations; dynamic targets, resource DSL and unmodeled wrappers are not composed",
+            );
+            return None;
+        }
+        let engine_cx = Ctx {
+            draws: &empty_draws,
+            wrappers: &empty_wrappers,
+            engine_routes: &empty_engine_routes,
+            helper_sources: &empty_helper_sources,
+            load_helper_sources: &empty_helper_loader,
+            concerns: RefCell::new(HashMap::default()),
+            active: RefCell::new(Vec::new()),
+            hoisted: RefCell::new(Vec::new()),
+            diagnostics: RefCell::new(Vec::new()),
+            mount_scope_depth: Cell::new(1),
+            mounted_engines: RefCell::new(HashSet::default()),
+        };
+        match ingest_route_body(body, &engine.file, None, &engine_cx) {
+            Ok(mut inner) => {
+                if !engine_cx.diagnostics.borrow().is_empty() {
+                    route_mount_gap(&draw, &engine.file, cx, "engine route set contains nested or unsupported mounts");
+                    return None;
+                }
+                entries.append(&mut inner);
+            }
+            Err(_) => {
+                route_mount_gap(&draw, &engine.file, cx, "engine route set contains unsupported routing DSL");
+                return None;
+            }
+        }
+    }
+    diagnose_engine_helper_uses(&engine_name, &engine.namespace, &entries, cx);
+
+    Some(RouteSpec::Scope {
+        path: Some(path),
+        module: Some(engine.namespace.clone()),
+        as_prefix: None,
+        defaults: IndexMap::new(),
+        nest: false,
+        // Route dispatch shares the host table. Engine helper names do not:
+        // Rails keeps them on a per-mount proxy, which remains unsupported.
+        suppress_helpers: true,
+        entries,
+    })
+}
+
+/// Reject helper calls that would require Rails' engine-specific route helper
+/// proxy. Scan host and engine sources separately so valid host helpers keep
+/// their meaning while engine and mounted-proxy helpers remain explicit gaps.
+fn diagnose_engine_helper_uses(
+    engine_class: &str,
+    namespace: &str,
+    entries: &[RouteSpec],
+    cx: &Ctx<'_>,
+) {
+    let engine_helpers = engine_route_helper_methods(entries);
+    let proxy = namespace.split("::").map(crate::naming::snake_case).collect::<Vec<_>>().join("_");
+    let proxy = if proxy.is_empty() { "engine".to_string() } else { proxy };
+    let mounted_helpers: HashSet<String> = [
+        format!("{proxy}_path"),
+        format!("{proxy}_url"),
+    ]
+    .into_iter()
+    .collect();
+    let helper_sources = cx.helper_sources.get_or_init(|| (cx.load_helper_sources)());
+    for source in helper_sources {
+        let engine_origin = source.engine_class.as_deref() == Some(engine_class);
+        let parsed = ruby_prism::parse(&source.source);
+        let mut finder = HelperUseFinder {
+            engine_helpers: &engine_helpers,
+            mounted_helpers: &mounted_helpers,
+            proxy: &proxy,
+            engine_origin,
+            matches: Vec::new(),
+        };
+        ruby_prism::Visit::visit(&mut finder, &parsed.node());
+        if finder.matches.is_empty() {
+            continue;
+        }
+        super::sources::register(&source.file, &source.original);
+        for (location, helper) in finder.matches {
+            let mut start = location.start_offset() as u32;
+            let mut end = location.end_offset() as u32;
+            if let Some(map) = &source.erb_map {
+                start = crate::erb::translate_offset(map, start);
+                end = crate::erb::translate_offset(map, end).max(start);
+            }
+            let span = Span { file: super::sources::file_id(&source.file), start, end };
+            let origin = if engine_origin {
+                format!("engine `{engine_class}`")
+            } else {
+                "host source".to_string()
+            };
+            let detail = format!(
+                "{origin} uses `{helper}` from an isolated engine mount; engine helper proxies are not composed"
+            );
+            cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
+                span,
+                None,
+                "route mount",
+                &detail,
+            ));
+            super::survey::record(&IngestError::Unsupported {
+                file: source.file.clone(),
+                message: format!("route mount: {detail}"),
+            });
+        }
+    }
+}
+
+/// Derive the path and URL helper names from the isolated engine's unscoped
+/// routes; these names are used only for diagnostics, never added to the host.
+fn engine_route_helper_methods(entries: &[RouteSpec]) -> HashSet<String> {
+    let mut app = crate::App::new();
+    app.routes.entries.push(RouteSpec::Scope {
+        path: None,
+        module: None,
+        as_prefix: None,
+        defaults: IndexMap::new(),
+        nest: false,
+        suppress_helpers: false,
+        entries: entries.to_vec(),
+    });
+    let mut methods = HashSet::default();
+    for route in crate::lower::flatten_routes(&app) {
+        if !route.named || route.as_name.is_empty() {
+            continue;
+        }
+        methods.insert(format!("{}_path", route.as_name));
+        methods.insert(format!("{}_url", route.as_name));
+    }
+    methods
+}
+
+/// Track direct or literal-reflective engine helper calls within one source,
+/// using its host/engine origin to distinguish unsupported proxy use.
+struct HelperUseFinder<'h, 'pr> {
+    engine_helpers: &'h HashSet<String>,
+    mounted_helpers: &'h HashSet<String>,
+    proxy: &'h str,
+    engine_origin: bool,
+    matches: Vec<(ruby_prism::Location<'pr>, String)>,
+}
+
+impl<'h, 'pr> ruby_prism::Visit<'pr> for HelperUseFinder<'h, 'pr> {
+    /// Record helper calls whose resolution depends on an unmodeled engine
+    /// proxy, then visit children to catch nested proxy/helper chains.
+    fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+        if let Some(helper) = effective_literal_call_name(call) {
+            let engine_helper = self.engine_helpers.contains(&helper);
+            let mounted_helper = self.mounted_helpers.contains(&helper);
+            let receiver = call.receiver();
+            let matched = if self.engine_origin {
+                (engine_helper || mounted_helper)
+                    && receiver.as_ref().is_none_or(|recv| recv.as_self_node().is_some())
+            } else {
+                (engine_helper
+                    && receiver.as_ref().is_some_and(|recv| engine_proxy_receiver(recv, self.proxy)))
+                    || (mounted_helper
+                        && (receiver.as_ref().is_none()
+                            || receiver.as_ref().is_some_and(|recv| {
+                                recv.as_self_node().is_some()
+                                    || receiver_chain_has(recv, "url_helpers")
+                                    || receiver_chain_has(recv, "routes")
+                                    || receiver_chain_has(recv, "main_app")
+                            })))
+            };
+            if matched {
+                self.matches.push((call.location(), helper));
+            }
+        }
+        ruby_prism::visit_call_node(self, call);
+    }
+}
+
+/// Resolve the called method when the source uses a literal reflective
+/// dispatcher. Other dynamic `send` forms remain outside this targeted scan.
+fn effective_literal_call_name(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    let method = constant_id_str(&call.name());
+    if matches!(method, "send" | "public_send" | "__send__") {
+        call.arguments()
+            .and_then(|args| args.arguments().iter().next())
+            .and_then(|argument| symbol_or_string_value(&argument))
+    } else {
+        Some(method.to_string())
+    }
+}
+
+/// Recognize a literal mounted-engine proxy call, optionally invoked on `self`.
+fn engine_proxy_receiver(node: &Node<'_>, proxy: &str) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    effective_literal_call_name(&call).as_deref() == Some(proxy)
+        && call.receiver().is_none_or(|receiver| receiver.as_self_node().is_some())
+}
+
+/// Search a receiver chain for a named Rails routing context, including a
+/// literal reflective call such as `public_send(:routes)`.
+fn receiver_chain_has(node: &Node<'_>, name: &str) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    effective_literal_call_name(&call).as_deref() == Some(name)
+        || call.receiver().is_some_and(|recv| receiver_chain_has(&recv, name))
+}
+
+/// Validate a static absolute mount prefix and return its relative route-scope
+/// path. Roots, trailing slashes, empty segments, and Rails pattern syntax are
+/// excluded so matching remains anchored at a path-segment boundary.
+fn literal_mount_prefix(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path == "/" || path.ends_with('/') || path.contains("//") {
+        return None;
+    }
+    if path.chars().any(|ch| matches!(ch, ':' | '*' | '(' | ')' | '?' | '#' | '\\')) {
+        return None;
+    }
+    let relative = path.trim_start_matches('/');
+    if relative.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+        return None;
+    }
+    Some(relative.to_string())
+}
+
+/// Find top-level `Engine.routes.draw` calls owned by this exact engine class.
+/// Nested draws and calls for another engine do not satisfy the mount grammar.
+fn top_level_engine_draws<'pr>(
+    root: Node<'pr>,
+    engine_name: &str,
+) -> Vec<ruby_prism::CallNode<'pr>> {
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    program.statements().body().iter().filter_map(|stmt| stmt.as_call_node())
+        .filter(|draw| {
+            constant_id_str(&draw.name()) == "draw" && draw.block().is_some()
+                && draw.receiver().and_then(|recv| recv.as_call_node()).is_some_and(|routes| {
+                    constant_id_str(&routes.name()) == "routes"
+                        && routes.receiver().and_then(|owner| constant_path_of(&owner))
+                            .is_some_and(|parts| parts.join("::") == engine_name)
+                })
+        })
+        .collect()
+}
+
+/// Check an engine route subtree for routing wrappers whose behavior the
+/// literal mount slice does not model, such as Devise guards or `direct`.
+fn has_mount_block_call(node: &Node<'_>, names: &[&str]) -> bool {
+    struct Finder<'a> {
+        names: &'a [&'a str],
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'_> {
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            if self.names.iter().any(|name| constant_id_str(&call.name()) == *name) {
+                self.found = true;
+                return;
+            }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let mut finder = Finder { names, found: false };
+    ruby_prism::Visit::visit(&mut finder, node);
+    finder.found
+}
+
+/// Conditions and routing constraints change whether a Rails engine route
+/// is reachable. The shared route parser deliberately flattens these host
+/// DSL forms; doing that inside a mount could expose a route or erase a
+/// request predicate, so the literal-engine slice rejects them first.
+fn unsupported_engine_route_guard(node: &Node<'_>) -> Option<&'static str> {
+    struct GuardFinder {
+        detail: Option<&'static str>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for GuardFinder {
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            self.detail.get_or_insert("conditional engine routes are not composed");
+            ruby_prism::visit_if_node(self, node);
+        }
+
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            self.detail.get_or_insert("conditional engine routes are not composed");
+            ruby_prism::visit_unless_node(self, node);
+        }
+
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            if constant_id_str(&call.name()) == "prepend" {
+                self.detail.get_or_insert("engine route prepends are not composed");
+            }
+            if constant_id_str(&call.name()) == "constraints"
+                || call.arguments().is_some_and(|arguments| {
+                    arguments.arguments().iter().any(|argument| {
+                        let has_constraints_key = |elements: Vec<Node<'pr>>| {
+                            elements.into_iter().any(|element| {
+                                element.as_assoc_node().is_some_and(|assoc| {
+                                    symbol_value(&assoc.key()).as_deref() == Some("constraints")
+                                })
+                            })
+                        };
+                        argument
+                            .as_keyword_hash_node()
+                            .is_some_and(|hash| has_constraints_key(hash.elements().iter().collect()))
+                            || argument
+                                .as_hash_node()
+                                .is_some_and(|hash| has_constraints_key(hash.elements().iter().collect()))
+                    })
+                })
+            {
+                self.detail.get_or_insert("engine route constraints, including lambda predicates, are not composed");
+            }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let mut finder = GuardFinder { detail: None };
+    ruby_prism::Visit::visit(&mut finder, node);
+    finder.detail
+}
+
+/// The host route walker intentionally ignores some Ruby statement kinds
+/// and receiver-qualified calls while continuing through the route table.
+/// A mounted engine cannot use that recovery path: a skipped branch or a
+/// dynamic target such as `root to: redirect(root_path)` would change the
+/// engine's exported route set. This first slice admits only literal root
+/// and HTTP shortcut entries with path/controller targets the shared route
+/// parser preserves exactly.
+fn engine_route_body_is_plain(node: &Node<'_>) -> bool {
+    let Some(statements) = node.as_statements_node() else { return false };
+    statements.body().iter().all(|statement| {
+        let Some(call) = statement.as_call_node() else { return false };
+        if call.receiver().is_some() {
+            return false;
+        }
+        if call.block().is_some() {
+            return false;
+        }
+        let method = constant_id_str(&call.name());
+        if method == "root" {
+            return engine_root_call_is_literal(&call);
+        }
+        if http_method_from(method).is_some() {
+            return engine_explicit_call_is_literal(&call, method);
+        }
+        false
+    })
+}
+
+/// Accept a root route only when it has one literal controller/action target
+/// and, optionally, a literal helper alias.
+fn engine_root_call_is_literal(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(arguments) = call.arguments() else { return false };
+    let mut target = None;
+    let mut as_seen = false;
+    for argument in arguments.arguments().iter() {
+        if let Some(value) = string_value(&argument) {
+            if target.replace(value).is_some() {
+                return false;
+            }
+            continue;
+        }
+        let Some(hash) = argument.as_keyword_hash_node() else { return false };
+        for element in hash.elements().iter() {
+            let Some(assoc) = element.as_assoc_node() else { return false };
+            let Some(key) = symbol_value(&assoc.key()) else { return false };
+            match key.as_str() {
+                "to" => {
+                    let Some(value) = string_value(&assoc.value()) else { return false };
+                    if target.replace(value).is_some() {
+                        return false;
+                    }
+                }
+                "as" => {
+                    if as_seen || symbol_or_string_value(&assoc.value()).is_none_or(|name| name.is_empty()) {
+                        return false;
+                    }
+                    as_seen = true;
+                }
+                _ => return false,
+            }
+        }
+    }
+    target.is_some_and(|value| valid_controller_action(&value))
+}
+
+/// Validate the literal path and target option shapes supported for HTTP
+/// shortcuts and `match`; dynamic values and unrecognized options fail closed.
+fn engine_explicit_call_is_literal(call: &ruby_prism::CallNode<'_>, method: &str) -> bool {
+    let Some(arguments) = call.arguments() else { return false };
+    let mut path_seen = false;
+    let mut target = false;
+    let mut controller = false;
+    let mut action = false;
+    let mut as_seen = false;
+    let mut via_seen = false;
+    for argument in arguments.arguments().iter() {
+        if string_value(&argument).is_some() || symbol_value(&argument).is_some() {
+            if path_seen {
+                return false;
+            }
+            path_seen = true;
+            continue;
+        }
+        let Some(hash) = argument.as_keyword_hash_node() else { return false };
+        for element in hash.elements().iter() {
+            let Some(assoc) = element.as_assoc_node() else { return false };
+            let key_node = assoc.key();
+            if string_value(&key_node).is_some() {
+                let Some(value) = string_value(&assoc.value()) else { return false };
+                if path_seen || !valid_controller_action(&value) {
+                    return false;
+                }
+                path_seen = true;
+                target = true;
+                continue;
+            }
+            let Some(key) = symbol_value(&key_node) else { return false };
+            match key.as_str() {
+                "to" => {
+                    let Some(value) = string_value(&assoc.value()) else { return false };
+                    if !valid_controller_action(&value) || target {
+                        return false;
+                    }
+                    target = true;
+                }
+                "controller" => {
+                    if controller || symbol_or_string_value(&assoc.value()).is_none_or(|name| name.is_empty()) {
+                        return false;
+                    }
+                    controller = true;
+                }
+                "action" => {
+                    if action || symbol_or_string_value(&assoc.value()).is_none_or(|name| name.is_empty()) {
+                        return false;
+                    }
+                    action = true;
+                }
+                "as" => {
+                    if as_seen || symbol_or_string_value(&assoc.value()).is_none_or(|name| name.is_empty()) {
+                        return false;
+                    }
+                    as_seen = true;
+                }
+                "via" if method == "match" => {
+                    if via_seen {
+                        return false;
+                    }
+                    via_seen = true;
+                }
+                _ => return false,
+            }
+        }
+    }
+    path_seen
+        && ((target && !controller && !action)
+            || (!target && controller && action))
+        && (method != "match" || match_via_names(call).is_ok())
+}
+
+/// Check the plain nonempty `controller#action` target shape consumed by the
+/// shared route parser.
+fn valid_controller_action(value: &str) -> bool {
+    value
+        .split_once('#')
+        .is_some_and(|(controller, action)| !controller.is_empty() && !action.is_empty())
 }
 
 struct Concern {
@@ -406,6 +1047,14 @@ fn ingest_route_stmts<'pr>(
         }
 
         if call.receiver().is_some() {
+            if constant_id_str(&call.name()) == "mount" {
+                route_mount_gap(
+                    &call,
+                    file,
+                    cx,
+                    "receiver-qualified mount targets are not composed",
+                );
+            }
             // `Rails.application.routes.draw` gets re-found as a nested
             // call when we walk a weird input; skip anything with an
             // explicit receiver here.
@@ -770,9 +1419,9 @@ fn ingest_route_call(
         return Ok(Some(entries.into_iter().reduce(|left, right| match (left, right) {
             (RouteSpec::Scope { mut entries, .. }, route) => {
                 entries.push(route);
-                RouteSpec::Scope { path: None, module: None, as_prefix: None, defaults: IndexMap::new(), nest: false, entries }
+                RouteSpec::Scope { path: None, module: None, as_prefix: None, defaults: IndexMap::new(), nest: false, suppress_helpers: false, entries }
             }
-            (left, right) => RouteSpec::Scope { path: None, module: None, as_prefix: None, defaults: IndexMap::new(), nest: false, entries: vec![left, right] },
+            (left, right) => RouteSpec::Scope { path: None, module: None, as_prefix: None, defaults: IndexMap::new(), nest: false, suppress_helpers: false, entries: vec![left, right] },
         }).expect("via produced a route")));
     }
     match method {
@@ -794,6 +1443,7 @@ fn ingest_route_call(
             as_prefix: None,
             defaults: IndexMap::new(),
             nest: true,
+            suppress_helpers: false,
             entries: block_entries(call, file, None, cx)?,
         })),
         "draw" | "load" | "instance_eval" => ingest_route_file_include(call, &method, file, cx),
@@ -808,31 +1458,14 @@ fn ingest_route_call(
         // how to build a URL for a model. It names no route and defines
         // no helper, so there is nothing for the table to hold.
         "resolve" => Ok(None),
-        // Keep supported siblings and the ordinary error stream. A mount
-        // is not a parse failure, and --allow-unsupported can inspect the
-        // incomplete output. Only the existing fixed runtime cable endpoint
-        // is exempt; this does not add engine route composition.
+        // Keep supported siblings and the ordinary error stream. The one
+        // composed mount form is a literal isolated PATH engine; Rack and
+        // dynamic mount forms retain a located gap.
         "mount" => {
             if cx.mount_scope_depth.get() == 0 && runtime_cable_mount(call) {
                 return Ok(None);
             }
-            let location = call.location();
-            let detail = "mounted Rack applications and engine routes are not composed into the host route table";
-            cx.diagnostics.borrow_mut().push(Diagnostic::unsupported(
-                Span {
-                    file: super::sources::file_id(file),
-                    start: location.start_offset() as u32,
-                    end: location.end_offset() as u32,
-                },
-                None,
-                "route mount",
-                detail,
-            ));
-            super::survey::record(&IngestError::Unsupported {
-                file: file.into(),
-                message: format!("route mount: {detail}"),
-            });
-            Ok(None)
+            Ok(ingest_literal_engine_mount(call, file, cx))
         }
         // `direct :fresh_user_avatar do |user, options| … end` — a
         // custom URL helper, not a route: it adds no path to the table,
@@ -862,6 +1495,7 @@ fn ingest_route_call(
             as_prefix: None,
             defaults: IndexMap::new(),
             nest: false,
+            suppress_helpers: false,
             entries: block_entries(call, file, parent, cx)?,
         })),
         // Unknown DSL — `concern`, `use_doorkeeper`, `authenticate`
@@ -1060,6 +1694,7 @@ fn ingest_namespace_route(
         as_prefix: Some(name),
         defaults: IndexMap::new(),
         nest: false,
+        suppress_helpers: false,
         entries,
     })
 }
@@ -1117,7 +1752,7 @@ fn ingest_scope_route(
         }
     }
     let entries = block_entries(call, file, None, cx)?;
-    Ok(RouteSpec::Scope { path, module, as_prefix, defaults, nest: false, entries })
+    Ok(RouteSpec::Scope { path, module, as_prefix, defaults, nest: false, suppress_helpers: false, entries })
 }
 
 /// `draw(:admin)` / `load(root.join("config", "routes", "admin.rb"))` /
@@ -1205,6 +1840,7 @@ fn ingest_route_file_include(
             as_prefix: None,
             defaults: IndexMap::new(),
             nest: false,
+            suppress_helpers: false,
             entries,
         }))
     })();
@@ -1313,6 +1949,7 @@ fn ingest_concerns(
         as_prefix: None,
         defaults: IndexMap::new(),
         nest: false,
+        suppress_helpers: false,
         entries,
     }))
 }
@@ -1701,6 +2338,7 @@ fn ingest_glob_draw_each(
             as_prefix: None,
             defaults: IndexMap::new(),
             nest: false,
+            suppress_helpers: false,
             entries: ingest_routes_file_entries(source, path, cx)?,
         });
     }
@@ -2281,3 +2919,161 @@ pub(super) fn controller_class_name(short: &str) -> String {
 /// Every action `resources`/`resource` can generate a route for.
 const ALL_RESOURCE_ACTIONS: [&str; 7] =
     ["index", "show", "new", "create", "edit", "update", "destroy"];
+
+#[cfg(test)]
+mod lazy_helper_source_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn engine_source(class: &str, namespace: &str, action: &str) -> EngineRouteSource {
+        let source = format!(
+            "{class}.routes.draw do\n  get \"/{action}\", to: \"{action}#index\", as: :{action}\nend\n"
+        );
+        EngineRouteSource {
+            source: source.into_bytes(),
+            file: format!("vendor/{}/config/routes.rb", namespace.to_lowercase()),
+            namespace: namespace.to_string(),
+            app_root: format!("vendor/{}/app", namespace.to_lowercase()),
+        }
+    }
+
+    fn eligible_engines() -> HashMap<String, EngineRouteSource> {
+        HashMap::from_iter([
+            (
+                "Catalog::Engine".to_string(),
+                engine_source("Catalog::Engine", "Catalog", "products"),
+            ),
+            (
+                "Billing::Engine".to_string(),
+                engine_source("Billing::Engine", "Billing", "items"),
+            ),
+        ])
+    }
+
+    fn ingest_with_loader(
+        source: &str,
+        engines: &HashMap<String, EngineRouteSource>,
+        helper_sources: &OnceCell<Vec<RouteHelperSource>>,
+        load_helper_sources: &dyn Fn() -> Vec<RouteHelperSource>,
+    ) -> RouteTable {
+        ingest_routes_with_engines(
+            source.as_bytes(),
+            "config/routes.rb",
+            &HashMap::default(),
+            &HashSet::default(),
+            engines,
+            helper_sources,
+            load_helper_sources,
+        )
+        .expect("route input is supported by the parser")
+    }
+
+    #[test]
+    fn helper_sources_stay_unloaded_without_an_accepted_mount() {
+        super::super::sources::reset();
+        let engines = eligible_engines();
+        let loads = Cell::new(0);
+        let loader = || {
+            loads.set(loads.get() + 1);
+            Vec::new()
+        };
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  get \"/home\", to: \"home#index\"\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+        assert_eq!(loads.get(), 0, "unmounted eligible engines must not scan sources");
+        assert!(helper_sources.get().is_none());
+        assert!(routes.diagnostics.is_empty());
+
+        // An unsupported mount still reports its existing located diagnostic,
+        // but it must not trigger the helper scan before admission succeeds.
+        super::super::sources::reset();
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  get \"/home\", to: \"home#index\"\n  mount Catalog::Engine, at: ENV.fetch(\"MOUNT_PATH\")\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+        assert_eq!(loads.get(), 0, "unsupported mounts must not scan sources");
+        assert!(helper_sources.get().is_none());
+        let diagnostic = routes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message.contains("route mount")
+                    && diagnostic.message.contains("dynamic mount paths")
+            })
+            .expect("unsupported dynamic mount diagnostic is retained");
+        let route_file_id = super::super::sources::file_id("config/routes.rb");
+        assert_ne!(route_file_id.0, 0, "mount source must be registered");
+        assert_eq!(diagnostic.span.file, route_file_id);
+        assert_eq!(
+            super::super::sources::line_at("config/routes.rb", diagnostic.span.start as usize),
+            Some(3),
+            "mount diagnostic keeps its original source location"
+        );
+        assert!(!routes.entries.is_empty(), "the sibling host route is retained");
+    }
+
+    #[test]
+    fn accepted_mounts_share_one_helper_snapshot_and_keep_source_spans() {
+        super::super::sources::reset();
+
+        let engines = eligible_engines();
+        let loads = Cell::new(0);
+        let loader = || {
+            loads.set(loads.get() + 1);
+            let original =
+                "catalog.products_path\ncatalog_path\nbilling.items_path\nbilling_path\n";
+            vec![RouteHelperSource {
+                source: original.as_bytes().to_vec(),
+                original: original.to_string(),
+                file: "app/controllers/route_helpers.rb".to_string(),
+                engine_class: None,
+                erb_map: None,
+            }]
+        };
+        let helper_sources = OnceCell::new();
+        let routes = ingest_with_loader(
+            "Rails.application.routes.draw do\n  mount Catalog::Engine, at: \"/catalog\"\n  mount Billing::Engine, at: \"/billing\"\nend\n",
+            &engines,
+            &helper_sources,
+            &loader,
+        );
+
+        assert_eq!(
+            loads.get(),
+            1,
+            "accepted mounts must reuse the collected snapshot"
+        );
+        assert!(helper_sources.get().is_some());
+        assert_eq!(
+            routes.diagnostics.len(),
+            4,
+            "engine and mounted-proxy helper uses remain diagnosed"
+        );
+        let helper_file_id = super::super::sources::file_id("app/controllers/route_helpers.rb");
+        assert_ne!(helper_file_id.0, 0, "diagnostic source must be registered");
+        assert!(routes.diagnostics.iter().all(|diagnostic| {
+            diagnostic.message.contains("engine helper proxies are not composed")
+                && diagnostic.span.file == helper_file_id
+        }));
+        let mut diagnostic_lines: Vec<_> = routes
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                super::super::sources::line_at(
+                    "app/controllers/route_helpers.rb",
+                    diagnostic.span.start as usize,
+                )
+                .expect("helper source span maps to a registered line")
+            })
+            .collect();
+        diagnostic_lines.sort_unstable();
+        assert_eq!(diagnostic_lines, vec![1, 2, 3, 4]);
+    }
+}

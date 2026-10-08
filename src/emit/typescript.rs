@@ -2722,6 +2722,12 @@ fn collect_ivar_assignments(
             }
         }
         ExprNode::Cast { value, .. } => collect_ivar_assignments(value, out),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_ivar_assignments(key, out);
+                collect_ivar_assignments(value, out);
+            }
+        }
         ExprNode::Lit { .. }
         | ExprNode::Var { .. }
         | ExprNode::Ivar { .. }

@@ -322,7 +322,6 @@ fn synth_adapter_last(model: &Model, table: &Table, schema: &Schema, dialect: Sq
 /// `self.class.<async_method>`.
 fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let owner = &model.name;
-    use crate::expr::{LValue, Literal};
     use crate::schema::ColumnType;
 
     // An integer key is the database's to assign: it stays out of the
@@ -348,7 +347,7 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key || supplied_key.is_some())
+        .filter(|c| c.generated.is_none() && (!c.primary_key || supplied_key.is_some()))
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
@@ -358,63 +357,57 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
         })
         .collect();
 
-    let op = ArelOp::Insert(Insert {
+    let insert = Insert {
         table: TableRef(table.name.clone()),
         assignments,
         returns_rowid: supplied_key.is_none(),
-    });
-
-    let (body, ret_ty) = match supplied_key {
-        None => (dialect.visit(&op, schema, owner), Ty::Int),
-        Some(k) => {
-            let key_ivar = || ivar_ref(&k.name);
-            let mut exprs = Vec::new();
-            // A uuid key left blank is minted here, as the
-            // `gen_random_uuid()` default the Postgres schema declares
-            // would have on insert — SQLite has no such default. A
-            // string key (`id: :string`) is the app's to supply, as in
-            // Rails, where a NULL one fails the NOT NULL constraint.
-            // A retypable key holds the declared type's value, which the
-            // app assigns (Core's ids come from GenerateOid before create).
-            if matches!(k.col_type, ColumnType::Uuid) && !super::schema::is_retypable(model, k) {
-                let blank = Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Send {
-                        recv: Some(key_ivar()),
-                        method: Symbol::from("=="),
-                        args: vec![arel_lit_str(String::new())],
-                        block: None,
-                        parenthesized: false,
-                    },
-                );
-                let mint = Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Send {
-                        recv: Some(Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Const { path: vec![Symbol::from("SecureRandom")] },
-                        )),
-                        method: Symbol::from("uuid"),
-                        args: vec![],
-                        block: None,
-                        parenthesized: false,
-                    },
-                );
-                exprs.push(Expr::new(
-                    Span::synthetic(),
-                    ExprNode::If {
-                        cond: blank,
-                        then_branch: Expr::new(
-                            Span::synthetic(),
-                            ExprNode::Assign { target: LValue::Ivar { name: k.name.clone() }, value: mint },
-                        ),
-                        else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
-                    },
-                ));
-            }
-            exprs.push(dialect.visit(&op, schema, owner));
-            exprs.push(key_ivar());
-            (Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), key_ty(model, table))
+    };
+    let op = ArelOp::Insert(insert.clone());
+    let generated: Vec<&crate::schema::Column> =
+        table.columns.iter().filter(|c| c.generated.is_some()).collect();
+    let ret_ty = if supplied_key.is_some() { key_ty(model, table) } else { Ty::Int };
+    // A uuid key left blank is minted here, as the `gen_random_uuid()`
+    // default the Postgres schema declares would have on insert — SQLite
+    // has no such default. A string key (`id: :string`) is the app's to
+    // supply, as in Rails, where a NULL one fails the NOT NULL constraint.
+    // A retypable key holds the declared type's value, which the app
+    // assigns (Core's ids come from GenerateOid before create).
+    let uuid_mint = supplied_key
+        .filter(|k| matches!(k.col_type, ColumnType::Uuid) && !super::schema::is_retypable(model, k))
+        .map(uuid_key_mint_expr);
+    let body = if generated.is_empty() {
+        // Keep ordinary inserts on their established exec/last-rowid path.
+        let mut exprs = Vec::new();
+        if let Some(mint) = uuid_mint {
+            exprs.push(mint);
+        }
+        exprs.push(dialect.visit(&op, schema, owner));
+        if let Some(k) = supplied_key {
+            exprs.push(ivar_ref(&k.name));
+        }
+        if exprs.len() == 1 {
+            exprs.pop().expect("one ordinary insert expression")
+        } else {
+            Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+        }
+    } else {
+        let returning_key = key_column(model, table)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| Symbol::from("rowid"));
+        let returning_columns: Vec<Symbol> =
+            generated.iter().map(|c| c.name.clone()).collect();
+        let insert = dialect.visit_insert_returning(
+            &insert,
+            schema,
+            &returning_key,
+            key_is_integer(model, table),
+            &returning_columns,
+        );
+        let hydrated = hydrate_generated_after_insert(model, table, &generated, insert, &ret_ty);
+        if let Some(mint) = uuid_mint {
+            Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![mint, hydrated] })
+        } else {
+            hydrated
         }
     };
 
@@ -437,6 +430,212 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
     }
 }
 
+/// Mint a UUID primary key before insertion when its slot is blank. SQLite
+/// has no `gen_random_uuid()` default, so this mirrors the runtime's existing
+/// client-side UUID behavior for both ordinary and generated-column inserts.
+fn uuid_key_mint_expr(key: &crate::schema::Column) -> Expr {
+    use crate::expr::LValue;
+
+    let blank = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(ivar_ref(&key.name)),
+            method: Symbol::from("=="),
+            args: vec![arel_lit_str(String::new())],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let mint = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const { path: vec![Symbol::from("SecureRandom")] },
+            )),
+            method: Symbol::from("uuid"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: blank,
+            then_branch: Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: LValue::Ivar { name: key.name.clone() }, value: mint },
+            ),
+            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        },
+    )
+}
+
+/// After the INSERT has produced its key, read the database-owned generated
+/// values from that statement and fill only storage slots still holding nil.
+/// Reading the key and generated values from one `RETURNING` result avoids a
+/// second database operation before save records the new identity. Explicit
+/// non-nil assignments remain visible through create callbacks; explicit nil
+/// is treated as unset, matching Rails' generated-attribute behavior.
+fn hydrate_generated_after_insert(
+    model: &Model,
+    table: &Table,
+    generated: &[&crate::schema::Column],
+    insert_returning: Expr,
+    key_ty: &Ty,
+) -> Expr {
+    let db = ClassId(Symbol::from("Db"));
+    let inserted_key = Symbol::from("__rh_inserted_key");
+    let stmt = Symbol::from("__rh_generated_stmt");
+    let staged_key = Symbol::from("__rh_returning_key");
+    let staged_values: Vec<Symbol> = generated
+        .iter()
+        .enumerate()
+        .map(|(index, _)| Symbol::from(format!("__rh_generated_value_{index}")))
+        .collect();
+
+    let key_read = if key_is_integer(model, table) {
+        let mut parsed = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(arel_db_call(
+                    &db,
+                    "column_text",
+                    vec![var_ref(&stmt), arel_lit_int(0)],
+                )),
+                method: Symbol::from("to_i"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        parsed.ty = Some(Ty::Int);
+        parsed
+    } else {
+        let key_read_method = key_column(model, table)
+            .map(super::schema::column_read_method_for)
+            .unwrap_or("column_int");
+        arel_db_call(&db, key_read_method, vec![var_ref(&stmt), arel_lit_int(0)])
+    };
+    let mut reads = vec![arel_assign(
+        &staged_key,
+        crate::lower::typing::with_ty(key_read, key_ty.clone()),
+    )];
+    for (index, (col, staged)) in generated.iter().zip(&staged_values).enumerate() {
+        let storage = super::schema::col_storage_name(col);
+        let mut is_nil = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(ivar_ref(&storage)),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        is_nil.ty = Some(Ty::Bool);
+        let value = crate::lower::typing::with_ty(
+            arel_db_call(
+                &db,
+                super::schema::column_read_method_for(col),
+                vec![var_ref(&stmt), arel_lit_int((index + 1) as i64)],
+            ),
+            super::ty_of_column_slot(col),
+        );
+        // Read values into locals first. No generated slot is changed until
+        // every required read and statement finalization has succeeded.
+        reads.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: is_nil,
+                then_branch: arel_assign(staged, value),
+                else_branch: arel_assign(staged, ivar_ref(&storage)),
+            },
+        ));
+    }
+    reads.push(crate::lower::typing::with_ty(var_ref(&staged_key), key_ty.clone()));
+
+    let mut step = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const { path: vec![Symbol::from("Db")] },
+            )),
+            method: Symbol::from("step?"),
+            args: vec![var_ref(&stmt)],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    step.ty = Some(Ty::Bool);
+    let mut missing_row = Expr::new(
+        Span::synthetic(),
+        ExprNode::Raise { value: arel_lit_str(format!(
+            "INSERT ... RETURNING produced no row for `{}`",
+            table.name.as_str(),
+        )) },
+    );
+    missing_row.ty = Some(Ty::Bottom);
+    let mut read_row = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: step,
+            then_branch: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: reads }),
+            else_branch: missing_row,
+        },
+    );
+    read_row.ty = Some(key_ty.clone());
+    let mut finalized_read = Expr::new(
+        Span::synthetic(),
+        ExprNode::BeginRescue {
+            body: read_row,
+            rescues: vec![],
+            else_branch: None,
+            ensure: Some(arel_db_call(&db, "finalize", vec![var_ref(&stmt)])),
+            implicit: false,
+        },
+    );
+    finalized_read.ty = Some(key_ty.clone());
+
+    let mut stmts = vec![
+        arel_assign(&stmt, insert_returning),
+        arel_assign(&inserted_key, finalized_read),
+    ];
+    for (col, staged) in generated.iter().zip(&staged_values) {
+        let storage = super::schema::col_storage_name(col);
+        let mut is_nil = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(ivar_ref(&storage)),
+                method: Symbol::from("nil?"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        is_nil.ty = Some(Ty::Bool);
+        let assign = Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: crate::expr::LValue::Ivar { name: storage },
+                value: var_ref(staged),
+            },
+        );
+        stmts.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: is_nil,
+                then_branch: assign,
+                else_branch: super::nil_lit(),
+            },
+        ));
+    }
+    stmts.push(crate::lower::typing::with_ty(var_ref(&inserted_key), key_ty.clone()));
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs: stmts })
+}
+
 /// `def _adapter_update` — instance method; reads ivars + @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
 fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
@@ -445,7 +644,7 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
     let assignments: Vec<Assignment> = table
         .columns
         .iter()
-        .filter(|c| !c.primary_key)
+        .filter(|c| !c.primary_key && c.generated.is_none())
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
@@ -454,6 +653,7 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
             },
         })
         .collect();
+    let has_assignments = !assignments.is_empty();
 
     let update = |conditions: Predicate| {
         ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions) })
@@ -472,7 +672,10 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
         name: Symbol::from("_adapter_update"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body,
+        // A model whose only non-key attributes are generated columns has
+        // nothing to write on update. Do not render `UPDATE ... SET WHERE`;
+        // generated values are database-owned and a no-op save stays a no-op.
+        body: if has_assignments { body } else { super::nil_lit() },
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -1125,6 +1328,15 @@ fn key_column<'a>(model: &Model, table: &'a Table) -> Option<&'a crate::schema::
             let named = keys.iter().find(|k| k.as_str() == "id").or(keys.first())?;
             table.columns.iter().find(|c| &c.name == named)
         })
+}
+
+/// The implicit SQLite rowid is integer-valued, as are the integer key
+/// types handled by `last_insert_rowid` on the ordinary insert path.
+fn key_is_integer(model: &Model, table: &Table) -> bool {
+    use crate::schema::ColumnType;
+    key_column(model, table)
+        .map(|column| matches!(column.col_type, ColumnType::Integer | ColumnType::BigInt))
+        .unwrap_or(true)
 }
 
 fn key_column_name(model: &Model, table: &Table) -> Symbol {

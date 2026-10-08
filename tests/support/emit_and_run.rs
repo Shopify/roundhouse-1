@@ -47,7 +47,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use roundhouse::analyze::diagnose;
-use roundhouse::diagnostic::Severity;
+use roundhouse::diagnostic::{Diagnostic, Severity};
 use roundhouse::ingest::ingest_app;
 use roundhouse::project::BuildTarget;
 
@@ -192,7 +192,24 @@ impl Overlay {
         (Emitted(dir), errors)
     }
 
+    /// Emit and retain structured errors plus the source catalogue that
+    /// resolves each diagnostic's `FileId`. Tests that make provenance
+    /// claims should inspect that mapping rather than grep `Debug` spans.
+    pub fn emit_with_app(
+        self,
+        target: BuildTarget,
+    ) -> (Emitted, roundhouse::App, Vec<Diagnostic>) {
+        let (dir, app, errors) = self.emit_app_tree(target);
+        (Emitted(dir), app, errors)
+    }
+
     fn emit_tree(self, target: BuildTarget) -> (PathBuf, Vec<String>) {
+        let (emitted, _app, errors) = self.emit_app_tree(target);
+        let errors = errors.into_iter().map(|d| format!("{:?}: {}", d.span, d.message)).collect();
+        (emitted, errors)
+    }
+
+    fn emit_app_tree(self, target: BuildTarget) -> (PathBuf, roundhouse::App, Vec<Diagnostic>) {
         let scratch = scratch_dir();
         let source = scratch.join("app");
         copy_tree(&self.base, &source);
@@ -231,22 +248,19 @@ impl Overlay {
             .into_iter()
             .chain(lower_diags)
             .filter(|d| d.severity == Severity::Error)
-            .map(|d| format!("{:?}: {}", d.span, d.message))
             .collect();
 
         let emitted = scratch.join("emitted");
         let (files, emit_diags) = roundhouse::emit::diagnostics::scope(|| {
             roundhouse::project::target_files(&app, &source, target)
         });
-        errors.extend(emit_diags.into_iter()
-            .filter(|d| d.severity == Severity::Error)
-            .map(|d| format!("{:?}: {}", d.span, d.message)));
+        errors.extend(emit_diags.into_iter().filter(|d| d.severity == Severity::Error));
         let files = files.expect("target files");
         roundhouse::project::write_to_dir(&files, &emitted).expect("write ruby target tree");
         // The verbatim passthrough the CLI writes after the tree.
         roundhouse::project::write_binary_assets(&app.binary_assets, &files, &emitted)
             .expect("write verbatim assets");
-        (emitted, errors)
+        (emitted, app, errors)
     }
 }
 

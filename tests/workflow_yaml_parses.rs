@@ -24,8 +24,11 @@ fn spinel_cache_download_failure_falls_back_without_hiding_build_failures() {
 
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let job = &workflow["jobs"]["build-spinel"];
-    assert_eq!(job["continue-on-error"].as_bool(), Some(true));
+    let job = &workflow["jobs"]["spinel-build"];
+    assert_eq!(
+        job["continue-on-error"].as_str(),
+        Some("${{ needs.plan.outputs.spinel-advisory == 'true' }}")
+    );
     let steps = job["steps"].as_sequence().unwrap();
     let step = |name: &str| {
         steps
@@ -191,7 +194,7 @@ fn campfire_docker_recipe_avoids_a_frontend_pull_and_ships_executable_boot() {
 fn campfire_docker_smoke_caches_apt_for_eight_hours_and_always_builds() {
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let job = &workflow["jobs"]["smoke-campfire-docker"];
+    let job = &workflow["jobs"]["campfire-smoke-docker"];
     let steps = job["steps"].as_sequence().unwrap();
     let step = |name: &str| {
         steps
@@ -280,6 +283,93 @@ fn campfire_docker_smoke_caches_apt_for_eight_hours_and_always_builds() {
             !uses.contains("setup-buildx") && !uses.contains("build-push-action"),
             "local BuildKit cache under actions/cache; no build-push-action GHA backend"
         );
+    }
+}
+
+#[test]
+fn host_libvips_dev_jobs_share_cached_apt_deb_install() {
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let action: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(".github/actions/ci-apt-install-cached/action.yml").unwrap(),
+    )
+    .unwrap();
+    assert_eq!(action["runs"]["using"].as_str(), Some("composite"));
+    let action_steps = action["runs"]["steps"].as_sequence().unwrap();
+    let restore = action_steps
+        .iter()
+        .find(|step| step["uses"].as_str() == Some("actions/cache/restore@v6"))
+        .expect("restore apt .deb archives");
+    assert_eq!(restore["continue-on-error"].as_bool(), Some(true));
+    let restore_keys = match &restore["with"]["restore-keys"] {
+        serde_yaml_ng::Value::String(s) => s.clone(),
+        serde_yaml_ng::Value::Sequence(items) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("restore-keys shape: {other:?}"),
+    };
+    assert!(
+        restore_keys.contains("steps.key.outputs.prefix"),
+        "{restore_keys}"
+    );
+    let save = action_steps
+        .iter()
+        .find(|step| step["uses"].as_str() == Some("actions/cache/save@v6"))
+        .expect("save apt .deb archives");
+    assert_eq!(save["continue-on-error"].as_bool(), Some(true));
+    assert_eq!(
+        save["if"].as_str(),
+        Some(
+            "steps.cache.outputs.cache-hit != 'true' && steps.install.outputs.harvested == 'true'"
+        )
+    );
+    let install = action_steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Install apt packages"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(install.contains("ci-apt-archives") && install.contains("ci-apt-install"));
+
+    let shared = "libvips-dev libsqlite3-dev libjemalloc-dev sqlite3";
+    for (job_name, step_name) in [
+        (
+            "campfire-spinel-build",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-spinel-compare",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-spinel-db",
+            "System libvips + libsqlite3-dev + libjemalloc-dev",
+        ),
+        (
+            "campfire-smoke",
+            "Install libsqlite3-dev + libjemalloc-dev + libvips-dev",
+        ),
+    ] {
+        let steps = workflow["jobs"][job_name]["steps"].as_sequence().unwrap();
+        let step = steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some(step_name))
+            .unwrap_or_else(|| panic!("{job_name}: missing {step_name}"));
+        assert_eq!(
+            step["uses"].as_str(),
+            Some("./.github/actions/ci-apt-install-cached"),
+            "{job_name}"
+        );
+        assert_eq!(step["timeout-minutes"].as_u64(), Some(20), "{job_name}");
+        assert_eq!(
+            step["with"]["packages"].as_str(),
+            Some(shared),
+            "{job_name}: shared package set for one cache key"
+        );
+        // Still a .deb cache around ci-apt-install — never a dpkg-state restore.
+        assert!(step.get("run").is_none(), "{job_name}");
     }
 }
 
@@ -448,6 +538,17 @@ fn pr_archives_remain_tested_without_pages_publication_work() {
             Some(format!("steps.{id}.outputs.{output} == 'present'").as_str())
         );
     }
+    let build_archives = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Build selected archives or the complete site"))
+        .unwrap()["run"]
+        .as_str()
+        .unwrap();
+    assert!(
+        build_archives.contains(r#"[ -n "$TARGETS" ]"#)
+            && build_archives.contains("No browse archives selected"),
+        "empty plan archives must not invoke --archives ''"
+    );
     let archives = steps
         .iter()
         .find(|step| step["name"].as_str() == Some("Upload browse archives"))
@@ -508,13 +609,13 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
 
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let producer = &workflow["jobs"]["build-campfire-compare-spinel"];
-    let consumer = &workflow["jobs"]["campfire-compare-spinel"];
+    let producer = &workflow["jobs"]["campfire-spinel-build"];
+    let consumer = &workflow["jobs"]["campfire-spinel-compare"];
     assert_eq!(producer["continue-on-error"].as_bool(), Some(true));
     assert_eq!(consumer["continue-on-error"].as_bool(), Some(true));
     assert_eq!(
         consumer["needs"][0].as_str(),
-        Some("build-campfire-compare-spinel")
+        Some("campfire-spinel-build")
     );
     assert_eq!(consumer["needs"][1].as_str(), Some("plan"));
     assert_eq!(
@@ -524,7 +625,7 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
     assert_eq!(
         consumer["if"].as_str(),
         Some(
-            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-compare-spinel') && needs.build-campfire-compare-spinel.outputs.artifact-id != '' }}"
+            "${{ !cancelled() && contains(fromJSON(needs.plan.outputs.jobs), 'campfire-spinel-compare') && needs.campfire-spinel-build.outputs.artifact-id != '' }}"
         )
     );
     let steps = producer["steps"].as_sequence().unwrap();
@@ -538,28 +639,45 @@ fn campfire_comparisons_require_an_uploaded_binary_and_report_blocking() {
         .starts_with("actions/upload-artifact@"));
     assert_eq!(
         upload["with"]["name"].as_str(),
-        Some("campfire-compare-spinel")
+        Some("campfire-spinel-binary")
     );
-    let matrix = consumer["strategy"]["matrix"]["include"]
-        .as_sequence()
-        .unwrap();
-    let modes: Vec<_> = matrix
+    assert!(
+        consumer.get("strategy").is_none(),
+        "GC modes share one job after setup; no matrix"
+    );
+    assert_eq!(consumer["timeout-minutes"].as_u64(), Some(75));
+    let consumer_steps = consumer["steps"].as_sequence().unwrap();
+    let walks: Vec<_> = consumer_steps
         .iter()
-        .map(|entry| {
-            (
-                entry["gc"].as_str().unwrap(),
-                entry["flag"].as_str().unwrap(),
-            )
+        .filter_map(|step| {
+            let id = step["id"].as_str()?;
+            let run = step["run"].as_str()?;
+            if !id.starts_with("walk-") {
+                return None;
+            }
+            Some((id, run))
         })
         .collect();
     assert_eq!(
-        modes,
-        [
-            ("default", ""),
-            ("minor-gc", "--minor-gc"),
-            ("verify-gen", "--verify-gen")
-        ]
+        walks
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["walk-default", "walk-minor-gc", "walk-verify-gen"]
     );
+    assert!(walks[0].1.contains("--spinel /tmp/campfire"));
+    assert!(!walks[0].1.contains("--minor-gc"));
+    assert!(walks[1].1.contains("--minor-gc"));
+    assert!(walks[2].1.contains("--verify-gen"));
+    assert!(consumer_steps.iter().all(|step| {
+        step["uses"].as_str() != Some("./.github/actions/setup-rust")
+            && step["uses"].as_str() != Some("Swatinem/rust-cache@v2")
+            && step
+                .get("with")
+                .and_then(|w| w.get("name"))
+                .and_then(|n| n.as_str())
+                != Some("spinel-dist")
+    }));
 
     let report = steps
         .iter()
@@ -831,7 +949,7 @@ fn campfire_failure_capture_keeps_the_original_exit_and_actual_c() {
 
     let workflow: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let job = &workflow["jobs"]["build-campfire-compare-spinel"];
+    let job = &workflow["jobs"]["campfire-spinel-build"];
     assert_eq!(job["continue-on-error"].as_bool(), Some(true));
     let steps = job["steps"].as_sequence().unwrap();
     let step = |name: &str| {
@@ -1021,8 +1139,8 @@ fn spinel_model_differential_does_not_wait_for_the_gc_comparison_build() {
     let src = fs::read_to_string(".github/workflows/ci.yml").expect("read CI workflow");
     let ci: serde_yaml_ng::Value = serde_yaml_ng::from_str(&src).expect("parse CI workflow");
     let jobs = &ci["jobs"];
-    let db = &jobs["campfire-db-differential-spinel"];
-    assert_eq!(db["needs"][0].as_str(), Some("build-spinel"));
+    let db = &jobs["campfire-spinel-db"];
+    assert_eq!(db["needs"][0].as_str(), Some("spinel-build"));
     assert_eq!(db["needs"][1].as_str(), Some("plan"));
     assert_eq!(db["continue-on-error"].as_bool(), Some(true));
 
@@ -1038,25 +1156,26 @@ fn spinel_model_differential_does_not_wait_for_the_gc_comparison_build() {
         "do not gate it on a GC matrix value"
     );
 
-    let gc = &jobs["campfire-compare-spinel"];
+    let gc = &jobs["campfire-spinel-compare"];
     assert_eq!(
         gc["needs"][0].as_str(),
-        Some("build-campfire-compare-spinel")
+        Some("campfire-spinel-build")
     );
     assert_eq!(gc["needs"][1].as_str(), Some("plan"));
-    let modes: Vec<_> = gc["strategy"]["matrix"]["include"]
+    assert!(
+        gc.get("strategy").is_none(),
+        "GC modes are sequential steps, not a matrix"
+    );
+    let walk_ids: Vec<_> = gc["steps"]
         .as_sequence()
-        .expect("GC matrix")
+        .unwrap()
         .iter()
-        .map(|mode| (mode["gc"].as_str().unwrap(), mode["flag"].as_str().unwrap()))
+        .filter_map(|step| step["id"].as_str())
+        .filter(|id| id.starts_with("walk-"))
         .collect();
     assert_eq!(
-        modes,
-        [
-            ("default", ""),
-            ("minor-gc", "--minor-gc"),
-            ("verify-gen", "--verify-gen")
-        ]
+        walk_ids,
+        ["walk-default", "walk-minor-gc", "walk-verify-gen"]
     );
     assert!(gc["steps"]
         .as_sequence()
@@ -1094,28 +1213,41 @@ fn pr_reuse_never_masks_validation_failures_or_changes_the_job_graph() {
             .as_str()
             .unwrap()
             .contains("scripts/ci-reuse.py probe"));
-        assert!(job.get("continue-on-error").is_none());
         let validation_ids: &[&str] = match name {
             "store-check" => {
+                assert!(job.get("continue-on-error").is_none());
                 assert_eq!(job["needs"][0].as_str(), Some("generate-fixture"));
                 assert_eq!(job["needs"][1].as_str(), Some("plan"));
                 &["build", "check"]
             }
             "writebook-inventory" => {
+                assert!(job.get("continue-on-error").is_none());
                 assert_eq!(job["needs"].as_str(), Some("plan"));
                 &["inventory", "report"]
             }
             "browser-smoke-typescript" => {
+                assert!(job.get("continue-on-error").is_none());
                 assert_eq!(job["needs"][0].as_str(), Some("generate-fixture"));
                 assert_eq!(job["needs"][1].as_str(), Some("plan"));
                 &["browser"]
             }
             "smoke" => {
+                assert!(job.get("continue-on-error").is_none());
                 assert_eq!(job["needs"][0].as_str(), Some("build-site"));
                 assert_eq!(
                     probe["if"].as_str(),
                     Some("github.event_name == 'pull_request' && matrix.target == 'rust'")
                 );
+                &["smoke"]
+            }
+            // Shares smoke steps (incl. rust reuse probe). Ledger-advisory at
+            // the job level when extras-advisory; focus makes it hard.
+            "smoke-extra" => {
+                assert_eq!(
+                    job["continue-on-error"].as_str(),
+                    Some("${{ needs.plan.outputs.extras-advisory == 'true' }}")
+                );
+                assert_eq!(job["needs"][0].as_str(), Some("build-site"));
                 &["smoke"]
             }
             _ => panic!("unaudited reuse job: {name}"),
@@ -1148,11 +1280,31 @@ fn pr_reuse_never_masks_validation_failures_or_changes_the_job_graph() {
         [
             "browser-smoke-typescript",
             "smoke",
+            "smoke-extra",
             "store-check",
             "writebook-inventory"
         ]
     );
     assert!(ci["on"].get("pull_request_target").is_none());
+    // Fork / first-time contributor PRs must use the same pull_request path.
+    // Org "Approve and run" is a GitHub setting, not workflow logic — see docs/ci.
+    let serialized = serde_yaml_ng::to_string(&ci).unwrap();
+    for needle in [
+        "pull_request_target",
+        "head.repo.full_name",
+        "head.repo.name",
+        "isFork",
+        "fork == false",
+        "fork == true",
+        ".fork ==",
+    ] {
+        assert!(
+            !serialized.contains(needle),
+            "CI must not gate on fork identity via {needle}"
+        );
+    }
+    assert!(ci["on"].get("pull_request").is_some());
+    assert_eq!(ci["permissions"]["contents"].as_str(), Some("read"));
 }
 
 #[test]

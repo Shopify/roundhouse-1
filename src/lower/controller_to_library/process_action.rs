@@ -8,6 +8,7 @@ use crate::ident::{Symbol, VarId};
 use crate::span::Span;
 use crate::ty::Ty;
 
+use super::rewrites;
 use super::util::method_name_for_action;
 
 /// A statement in the synthesized before_action preamble — the filter
@@ -286,6 +287,15 @@ pub(super) fn synthesize_process_action(
         body.inherit_span(first.body.span);
     }
 
+    // Action bodies already run `rewrite_request_format` through
+    // `lower_action_body`. Everything *spliced into* this dispatcher —
+    // filter `if:`/`unless:` lambdas, block-form filter bodies
+    // (`before_action -> { … }`), and `rescue_from` handlers — skips
+    // that pipeline. One pass over the finished body closes the class
+    // of gap (map_expr walks If / Seq / Lambda / BeginRescue). The
+    // transform is idempotent on already-rewritten action-arm Sends.
+    body = rewrites::rewrite_request_format(&body);
+
     let param_sym = Symbol::from(param);
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -429,6 +439,11 @@ fn cond_from_guards(
     if let Some(name) = unless_cond {
         conds.push(negate(predicate(name)));
     }
+    // `request.format.<pred>?` in these exprs is rewritten once over
+    // the finished `process_action` body in `synthesize_process_action`
+    // (same helper action bodies get via `lower_action_body`). Do not
+    // re-apply here — that would special-case only the guard combiner
+    // and leave block-form filter / rescue bodies still raw.
     if let Some(c) = if_cond_expr {
         conds.push(c.clone());
     }

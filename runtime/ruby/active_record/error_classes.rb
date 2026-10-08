@@ -115,15 +115,6 @@ module ActiveRecord
     end
   end
 
-  class SoleRecordExceeded < ActiveRecordError
-    attr_reader :record
-
-    def initialize(record = nil)
-      @record = record
-      super "Wanted only one #{record&.name || "record"}"
-    end
-  end
-
   class InvalidForeignKey < WrappedDatabaseException
   end
 

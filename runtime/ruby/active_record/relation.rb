@@ -1353,6 +1353,43 @@ module ActiveRecord
       out
     end
 
+    # `sole`'s loaded-relation reading: the first two (or fewer) of an
+    # already-loaded page, still in relation order — the loaded-cache
+    # counterpart to `loaded_tail`, and every `loaded`-touching step of
+    # it (the cap, the indexing loop) lives in THIS top-level helper
+    # rather than inline in `sole` itself. `@records`'s own ivar type
+    # carries an untyped/poly component, and `sole` also assigns the
+    # unloaded branch's `to_a` Array to a `rows` local of its own;
+    # splitting the loaded branch's work out to a call boundary, same
+    # as `loaded_tail`, gives `loaded` here its own concrete `Array
+    # [Base]` type from the narrowed (non-nil) argument rather than
+    # carrying that poly residue into `sole`'s body, which is what the
+    # ceiling tests on this runtime's type precision caught.
+    def loaded_sole_rows(loaded)
+      cap = loaded.length < 2 ? loaded.length : 2
+      out = []
+      i = 0
+      while i < cap
+        out << loaded[i]
+        i += 1
+      end
+      out
+    end
+
+    # `sole`'s unloaded-probe size: `min(2, limit)`, nil meaning the
+    # usual 2, clamped at 0 or above. A top-level helper rather than a
+    # local computed inline in `sole` with an if/else (one arm the
+    # literal `2`, the other derived from `@limit`): merging those two
+    # origins into one local left it an unresolved type variable where
+    # `sole` assigns it back to `@limit` — same `Integer? -> Integer`
+    # call-boundary fix as `loaded_head`, above.
+    def sole_probe_limit(limit)
+      return 2 if limit.nil?
+      return 0 if limit < 0
+      return 2 if limit > 2
+      limit
+    end
+
     def count
       rows = ActiveRecord.adapter.select_rows(count_sql)
       rows.length == 0 ? 0 : rows[0]["n"].to_i
@@ -1806,6 +1843,73 @@ module ActiveRecord
     def find_by!(conditions)
       record = find_by(conditions)
       raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
+      record
+    end
+
+    # `sole` (Rails 7.0) — the relation's one record: `RecordNotFound`
+    # when it matches none, `SoleRecordExceeded` when it matches more.
+    # Rails reads `first(2)` and checks the size, so one query of at
+    # most two rows tells the three cases apart.
+    #
+    # A LOADED relation decides from the memoized `@records` instead of
+    # re-querying — Rails' own `first(2)` reads the loaded Array once
+    # `loaded?` — so a caller that already has the page in memory (an
+    # eager-loaded association, a prior `each`) costs no second trip to
+    # the database.
+    #
+    # Unloaded, `first_n` cannot serve the probe: it always asks for
+    # its own `n`, which would override a SMALLER existing `@limit`
+    # (`limit(1).sole` must probe 1 row, not 2, so two matching rows
+    # settle as the first one rather than `SoleRecordExceeded`; a
+    # `limit(0)` relation must probe 0 and always read as
+    # `RecordNotFound`), and it unconditionally clears `@records`
+    # afterward, which would discard a cache this branch never had to
+    # begin with. So the probe borrows and restores `@limit` itself,
+    # capped at the relation's own limit (nil meaning the usual 2,
+    # clamped at 0 or above), and restores `@records` to nil — what it
+    # was, since this branch only runs when the relation is unloaded —
+    # rather than to whatever the probe's own LIMIT happened to cache.
+    def sole
+      loaded = @records
+      unless loaded.nil?
+        rows = loaded_sole_rows(loaded)
+        raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+        raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
+        return rows[0]
+      end
+      prior_limit = @limit
+      @limit = sole_probe_limit(prior_limit)
+      rows = to_a
+      @limit = prior_limit
+      @records = nil
+      raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+      raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
+      rows[0]
+    end
+
+    # `find_sole_by(conditions)` — Rails' `where(conditions).sole`. A
+    # terminal, so its predicate is popped as in `find_by`; popped in an
+    # `ensure` because `sole` raises on the two answers that are not one
+    # record, and a caller that rescues must get the relation back as
+    # it was.
+    #
+    # `add_condition` unconditionally clears `@records` — it has no way
+    # to know in advance whether the new predicate still matches a
+    # loaded set — so a relation that was loaded before this call loses
+    # its memo the moment the temporary condition is pushed. The
+    # `ensure` restores the ORIGINAL `@records` saved before that push,
+    # not whatever `sole`'s own probe leaves behind, so a loaded
+    # relation's records are intact afterward whether `sole` returns or
+    # raises.
+    def find_sole_by(conditions)
+      prior_records = @records
+      pushed = add_condition(conditions, [], false)
+      begin
+        record = sole
+      ensure
+        @wheres.pop if pushed
+        @records = prior_records
+      end
       record
     end
 

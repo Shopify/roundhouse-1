@@ -8,6 +8,8 @@
 //! in-memory tree (wasm transpile entry point). [`ingest_app`] is the
 //! convenience wrapper for the disk case.
 
+use std::cell::OnceCell;
+use std::collections::HashSet;
 use crate::det::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -29,7 +31,7 @@ use super::library_class::{
     ingest_helper_method_names, ingest_library_classes, ingest_rails_application_singleton_methods,
 };
 use super::model::ingest_model_with_enum_constants;
-use super::routes::ingest_routes_with_dsl;
+use super::routes::{EngineRouteSource, RouteHelperSource, ingest_routes_with_engines};
 use super::schema::{ingest_migration, ingest_schema};
 use super::structure_sql::ingest_structure_sql;
 use super::test::ingest_test_files;
@@ -396,8 +398,33 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let engine_dirs = super::initializers::engines_in_initializer_order(vfs, dir, &path_gems);
     let boot_initializers: Vec<std::path::PathBuf> =
         super::initializers::initializer_files(vfs, dir, &engine_dirs);
+    let engine_routes = engine_route_sources(vfs, dir, &path_gems);
     let additional_test_paths = additional_test_paths(vfs, dir)?;
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
+    let roots = app_roots(vfs, dir, &path_gems);
+    let lib_ignores: Vec<String> = vfs
+        .read(&dir.join("config/application.rb"))
+        .ok()
+        .map(|s| extract_autoload_lib_ignores(&s))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|ignored| !lib_dir_is_explicitly_required(vfs, dir, ignored))
+        .collect();
+    // Helper-source scanning reads and compiles a second copy of app sources.
+    // Defer it until an engine mount is accepted and needs proxy diagnostics;
+    // the same snapshot serves every accepted mount in this route set.
+    let helper_sources = OnceCell::new();
+    let load_helper_sources = || {
+        route_helper_sources(
+            vfs,
+            dir,
+            &path_gems,
+            &engine_routes,
+            &roots,
+            &additional_test_paths,
+            &lib_ignores,
+        )
+    };
     let mut app = App::new();
     app.gem_source_dirs = gem_sources
         .iter()
@@ -550,7 +577,6 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     }
 
     // Packwerk packages and in-repository engines share the root app's passes.
-    let roots = app_roots(vfs, dir, &path_gems);
     app.app_roots = roots.iter().map(|r| r.display().to_string()).collect();
     // A namespace's `table_name_prefix` has to be known BEFORE the model
     // it prefixes is ingested, and file order does not guarantee that
@@ -560,14 +586,6 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // Hoisted above the models pre-pass: the base set below has to
     // cover BOTH trees before either is classified, and the support
     // roots need this to be enumerated.
-    let lib_ignores: Vec<String> = vfs
-        .read(&dir.join("config/application.rb"))
-        .ok()
-        .map(|s| extract_autoload_lib_ignores(&s))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|ignored| !lib_dir_is_explicitly_required(vfs, dir, ignored))
-        .collect();
     let ignored_lib_file = |entry: &Path| {
         entry.strip_prefix(dir.join("lib")).is_ok_and(|rel| {
             rel.components().next().is_some_and(|c| {
@@ -2059,11 +2077,14 @@ end
                 }
             }
             let block_wrappers = mapper_extension_block_methods(&app, vfs, dir);
-            if let Some(routes) = unwrap_or_record(ingest_routes_with_dsl(
+            if let Some(routes) = unwrap_or_record(ingest_routes_with_engines(
                 &source,
                 &routes_path.display().to_string(),
                 &draw_files,
                 &block_wrappers,
+                &engine_routes,
+                &helper_sources,
+                &load_helper_sources,
             ))? {
                 // `to: redirect("/x")` routes point at actions nobody
                 // wrote, so write them: one controller, one action per
@@ -2651,6 +2672,7 @@ end
     // later pass reads methods.
     super::channel_callbacks::lower_channel_callbacks(&mut app);
     super::channel_callbacks::lower_channel_names(&mut app);
+    super::on_load_reopen::apply_pending(&mut app);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     splice_deferred_mixes_in_extends(&mut app, &concern_class_method_spans);
@@ -2780,6 +2802,17 @@ end
     for model in &mut app.models {
         model.after_transaction_callbacks_in_order = transaction_callbacks_in_order;
     }
+    crate::lower::attachment_model::synthesize_attachment_model(&mut app);
+    // Second chance for `on_load(:active_storage_attachment)` includes
+    // whose target was only synthesized above; then splice ONLY those
+    // models so `has_many_attached` from the concern lands — a full
+    // re-splice would duplicate every concern already expanded at the
+    // first pass (doubled scopes, unique-constraint failures at run).
+    let late_on_load = super::on_load_reopen::apply_pending(&mut app);
+    if !late_on_load.is_empty() {
+        splice_concerns_into_models_named(&mut app, &concern_class_method_spans, &late_on_load);
+    }
+    super::on_load_reopen::drain_pending(&mut app);
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     super::test::resolve_test_parents(&mut app);
     super::library_class::resolve_library_parents(&mut app);
@@ -3553,6 +3586,21 @@ fn walk_binary_assets<V: Vfs + ?Sized>(vfs: &V, root: &Path, dir: &Path, app: &m
 /// Strict targets get the DSL items the same way; module
 /// methods-via-include remain their separate, ledger-visible gap.
 fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
+    splice_concerns_into_models_named(app, carriers, &[]);
+}
+
+/// Splice concern `included do` bodies into models.
+///
+/// When `only` is empty, every model is visited (the first pass). When
+/// non-empty, only models whose [`ClassId`] name is listed — the late
+/// `on_load(:active_storage_attachment)` path after Attachment /
+/// Markdown synthesis, which must not re-expand includes already
+/// spliced on the first pass.
+fn splice_concerns_into_models_named(
+    app: &mut App,
+    carriers: &[ConcernClassMethodSpans],
+    only: &[crate::ident::Symbol],
+) {
     use crate::dialect::ModelBodyItem;
     use crate::expr::ExprNode;
     use crate::ident::ClassId;
@@ -3602,6 +3650,9 @@ fn splice_concerns_into_models(app: &mut App, carriers: &[ConcernClassMethodSpan
     defined.extend(app.models.iter().map(|m| m.name.0.as_str().to_string()));
 
     for model in &mut app.models {
+        if !only.is_empty() && !only.iter().any(|n| n == &model.name.0) {
+            continue;
+        }
         // Concerns already spliced into this model. A spliced item may
         // itself be an `include` (a concern's `included do include
         // Other end`), whose own items are spliced in turn; a concern
@@ -7761,6 +7812,639 @@ pub(super) fn declares_rails_engine<V: Vfs + ?Sized>(vfs: &V, lib_dir: &Path) ->
             visitor.found
         })
     })
+}
+
+/// Exact source-backed, isolated engines available to a literal `mount`.
+/// Only the PATH roots already confined by [`path_gem_dirs`] participate;
+/// each engine class must have one unambiguous `Rails::Engine` declaration,
+/// one direct literal `isolate_namespace`, and an in-tree routes file.
+fn engine_route_sources<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    path_gems: &[PathBuf],
+) -> HashMap<String, EngineRouteSource> {
+    struct Declaration {
+        engine_dir: PathBuf,
+        namespace: Option<String>,
+        is_rails_engine: bool,
+        plain_source_file: bool,
+    }
+
+    let mut declarations: HashMap<String, Vec<Declaration>> = HashMap::default();
+    for engine_dir in path_gems {
+        if !vfs.is_dir(&engine_dir.join("app")) {
+            continue;
+        }
+        let lib_dir = engine_dir.join("lib");
+        let Ok(mut files) = read_rb_files(vfs, &lib_dir) else { continue };
+        let app_dir = engine_dir.join("app");
+        if let Ok(app_files) = read_rb_files(vfs, &app_dir) {
+            files.extend(app_files);
+        }
+        files.sort();
+        files.dedup();
+        for file in files {
+            let Ok(source) = vfs.read(&file) else { continue };
+            let parsed = ruby_prism::parse(&source);
+            if parsed.errors().next().is_some() {
+                continue;
+            }
+            for (scope, class) in super::util::find_all_classes_with_scope(&parsed.node()) {
+                let Some(mut class_path) = super::util::class_name_path(&class) else { continue };
+                let mut qualified = scope;
+                qualified.append(&mut class_path);
+                let class_name = qualified.join("::");
+                // Count all `...::Engine` class declarations, not just the
+                // original Rails subclass. Ruby class reopenings commonly
+                // omit the superclass; accepting only the first matching
+                // subclass would miss later engine-name or initialization
+                // changes in another in-tree source file.
+                if !class_name.ends_with("::Engine") {
+                    continue;
+                }
+                let is_rails_engine = class.superclass().is_some_and(|parent| {
+                    super::util::constant_path_of(&parent)
+                        .is_some_and(|path| path.len() == 2 && path[0] == "Rails" && path[1] == "Engine")
+                });
+                let namespace = is_rails_engine.then(|| literal_isolated_namespace(&class)).flatten();
+                let plain_source_file = is_rails_engine
+                    && file.starts_with(&lib_dir)
+                    && plain_engine_declaration_file(&parsed.node(), &class_name);
+                declarations.entry(class_name).or_default().push(Declaration {
+                    engine_dir: engine_dir.clone(),
+                    namespace,
+                    is_rails_engine,
+                    plain_source_file,
+                });
+            }
+        }
+    }
+
+    let mut sources = HashMap::default();
+    for (class_name, declarations) in declarations {
+        if declarations.len() != 1 {
+            continue;
+        }
+        let declaration = declarations.into_iter().next().expect("one declaration");
+        if !declaration.is_rails_engine || !declaration.plain_source_file {
+            continue;
+        }
+        let Some(namespace) = declaration.namespace else { continue };
+        let engine_dir = declaration.engine_dir;
+        // For this slice the engine's isolating module must be exactly the
+        // namespace that owns its `Engine` class (`Catalog::Engine` →
+        // `isolate_namespace Catalog`). Other arrangements need Rails'
+        // own constant/proxy resolution rules and are not inferred here.
+        if class_name.strip_suffix("::Engine") != Some(namespace.as_str()) {
+            continue;
+        }
+        // The PATH gem's Ruby entrypoint runs before Rails mounts the
+        // engine. Admit only in-tree literal requires and declarations in
+        // lib/; executable file/class-body calls can register initializers,
+        // middleware, or route mutations outside the Engine class file.
+        if !plain_engine_library_sources(vfs, &engine_dir, &class_name) {
+            continue;
+        }
+        // Railties run files in config/initializers even when the Engine
+        // class itself is otherwise plain. This slice does not replay
+        // those side effects (middleware, route prepends, auth setup, …),
+        // so an engine carrying any such files remains an explicit mount
+        // gap. Checking directory presence also avoids following a hidden
+        // symlinked initializer through the original Rails runtime.
+        let initializers = engine_dir.join("config/initializers");
+        if vfs.is_dir(&initializers)
+            || path_has_symlink_component(vfs, &engine_dir, &initializers)
+        {
+            continue;
+        }
+        let Ok(relative) = engine_dir.strip_prefix(dir) else { continue };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let routes_path = engine_dir.join("config/routes.rb");
+        let Ok(source) = vfs.read(&routes_path) else { continue };
+        let app_root = engine_dir.join("app");
+        sources.insert(
+            class_name,
+            EngineRouteSource {
+                source,
+                file: routes_path.display().to_string(),
+                namespace,
+                app_root: app_root.display().to_string(),
+            },
+        );
+    }
+    sources
+}
+
+/// Sources where route helpers can be called. This is collected on the first
+/// accepted source-backed engine mount only, and only from the app roots the
+/// normal walker already treats as live code. Engine origin is retained for
+/// the helper boundary check so a host `root_path` can remain valid while an
+/// engine's same-named helper is rejected.
+fn route_helper_sources<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    path_gems: &[PathBuf],
+    engines: &HashMap<String, EngineRouteSource>,
+    roots: &[PathBuf],
+    additional_test_paths: &[PathBuf],
+    lib_ignores: &[String],
+) -> Vec<RouteHelperSource> {
+    if engines.is_empty() {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    let mut rb_files = std::collections::BTreeSet::new();
+    let mut mapped_view_files = std::collections::BTreeMap::new();
+    let mut jbuilder_files = std::collections::BTreeSet::new();
+    let mut roots_to_scan: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|root| ["models", "controllers", "helpers"].map(|layer| dir.join(root).join(layer)))
+        .collect();
+    roots_to_scan.extend(
+        support_roots(vfs, dir, roots, path_gems, lib_ignores)
+            .into_iter()
+            .map(|root| dir.join(root)),
+    );
+    // These are the non-app source roots that the normal Rails walker
+    // ingests as Ruby. Include the configured test roots too: a helper
+    // proxy used there still must not bind to a host helper accidentally.
+    roots_to_scan.extend([
+        dir.join("config"),
+    ]);
+    roots_to_scan.sort();
+    roots_to_scan.dedup();
+    for root in roots_to_scan {
+        if vfs.is_dir(&root) {
+            if let Ok(files) = read_rb_files(vfs, &root) {
+                rb_files.extend(files);
+            }
+        }
+    }
+    let mut test_roots: Vec<PathBuf> = [
+        "test/models",
+        "test/controllers",
+        "test/helpers",
+        "test/channels",
+        "test/lib",
+        "test/test_helpers",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    test_roots.extend(additional_test_paths.iter().cloned());
+    test_roots.sort();
+    test_roots.dedup();
+    for test_root in test_roots {
+        let test_dir = dir.join(&test_root);
+        if !path_has_symlink_component(vfs, dir, &test_dir) && vfs.is_dir(&test_dir) {
+            if let Ok(files) = read_test_rb_files(vfs, dir, &test_dir) {
+                rb_files.extend(files);
+            }
+        }
+    }
+    let test_helper = dir.join("test/test_helper.rb");
+    if !path_has_symlink_component(vfs, dir, &test_helper) && vfs.exists(&test_helper) {
+        rb_files.insert(test_helper);
+    }
+    for app_root in roots {
+        let views = dir.join(app_root).join("views");
+        if vfs.is_dir(&views) {
+            if let Ok(files) = read_erb_files(vfs, &views) {
+                for (file, engine) in files {
+                    // The name is historical; the walker returns every
+                    // supported mapped text-template engine (ERB, HAML,
+                    // Slim, Builder and Raw). The boundary scan needs the
+                    // same compiled Ruby and source map the view ingester
+                    // uses, or helper calls in a supported template could
+                    // fall back to a host helper silently.
+                    mapped_view_files.insert(file, engine);
+                }
+            }
+            if let Ok(files) = read_jbuilder_files(vfs, &views) {
+                jbuilder_files.extend(files);
+            }
+        }
+    }
+
+    // Engine route files are parsed separately for composition, so they do
+    // not appear under the host `config/` source walk. Include them here as
+    // engine-origin Ruby too: route options can evaluate helpers at draw
+    // time, and those calls must not fall through to a host helper.
+    for (engine_class, engine) in engines {
+        sources.push(RouteHelperSource {
+            source: engine.source.clone(),
+            original: String::from_utf8_lossy(&engine.source).into_owned(),
+            file: engine.file.clone(),
+            engine_class: Some(engine_class.clone()),
+            erb_map: None,
+        });
+    }
+
+    let mut engine_roots: Vec<(usize, String, PathBuf)> = engines
+        .iter()
+        .filter_map(|(class, engine)| {
+            let root = Path::new(&engine.app_root).parent()?.to_path_buf();
+            Some((root.components().count(), class.clone(), root))
+        })
+        .collect();
+    engine_roots.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    let engine_class = |path: &Path| {
+        engine_roots
+            .iter()
+            .find(|(_, _, root)| path.starts_with(root))
+            .map(|(_, class, _)| class.clone())
+    };
+    let ignored_lib_file = |entry: &Path| {
+        entry.strip_prefix(dir.join("lib")).is_ok_and(|rel| {
+            rel.components().next().is_some_and(|component| {
+                lib_ignores.iter().any(|ignored| component.as_os_str() == ignored.as_str())
+            })
+        })
+    };
+    for file in rb_files {
+        if ignored_lib_file(&file) {
+            continue;
+        }
+        let Ok(source) = vfs.read(&file) else { continue };
+        let original = String::from_utf8_lossy(&source).into_owned();
+        sources.push(RouteHelperSource {
+            source,
+            original,
+            file: file.display().to_string(),
+            engine_class: engine_class(&file),
+            erb_map: None,
+        });
+    }
+    for (file, engine) in mapped_view_files {
+        let Ok(original) = vfs.read_to_string(&file) else { continue };
+        let (ruby, erb_map) = engine.compile_fn()(&original);
+        sources.push(RouteHelperSource {
+            source: ruby.into_bytes(),
+            original,
+            file: file.display().to_string(),
+            engine_class: engine_class(&file),
+            erb_map: Some(erb_map),
+        });
+    }
+    for file in jbuilder_files {
+        let Ok(source) = vfs.read(&file) else { continue };
+        let original = String::from_utf8_lossy(&source).into_owned();
+        sources.push(RouteHelperSource {
+            source,
+            original,
+            file: file.display().to_string(),
+            engine_class: engine_class(&file),
+            erb_map: None,
+        });
+    }
+    sources
+}
+
+/// A class-local direct `isolate_namespace Some::Literal` call. Calls through
+/// receivers, dynamic arguments, and duplicate declarations are unavailable.
+fn literal_isolated_namespace(class: &ruby_prism::ClassNode<'_>) -> Option<String> {
+    let body = class.body()?;
+    let statements = super::util::flatten_statements(body);
+    if statements.len() != 1 {
+        return None;
+    }
+    let call = statements[0].as_call_node()?;
+    if super::util::constant_id_str(&call.name()) != "isolate_namespace"
+        || call.receiver().is_some()
+        || call.block().is_some()
+    {
+        return None;
+    }
+    let args = call.arguments()?;
+    let values: Vec<_> = args.arguments().iter().collect();
+    let namespace = (values.len() == 1)
+        .then(|| super::util::constant_path_of(&values[0]))
+        .flatten()
+        .map(|parts| parts.join("::"))?;
+    Some(namespace)
+}
+
+/// The engine class must be the only declaration in its source file, nested
+/// through plain namespace modules. This prevents a top-level side effect or
+/// a sibling declaration in `engine.rb` from changing the loaded engine
+/// after the route-only composition check.
+fn plain_engine_declaration_file(root: &Node<'_>, engine_name: &str) -> bool {
+    fn one_statement<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
+        let statements = if let Some(program) = node.as_program_node() {
+            program.statements()
+        } else {
+            node.as_statements_node()?
+        };
+        let mut body = statements.body().iter();
+        let statement = body.next()?;
+        body.next().is_none().then_some(statement)
+    }
+
+    fn follow_chain<'pr>(node: Node<'pr>, scope: &mut Vec<String>, engine_name: &str) -> bool {
+        if let Some(module) = node.as_module_node() {
+            let Some(name) = super::util::module_name_path(&module) else { return false };
+            let old_len = scope.len();
+            scope.extend(name);
+            let valid = module.body().and_then(|body| one_statement(&body))
+                .is_some_and(|statement| follow_chain(statement, scope, engine_name));
+            scope.truncate(old_len);
+            return valid;
+        }
+        let Some(class) = node.as_class_node() else { return false };
+        let Some(mut path) = super::util::class_name_path(&class) else { return false };
+        let mut qualified = scope.clone();
+        qualified.append(&mut path);
+        let Some(parent) = class.superclass() else { return false };
+        qualified.join("::") == engine_name
+            && super::util::constant_path_of(&parent)
+                .is_some_and(|parts| parts.len() == 2 && parts[0] == "Rails" && parts[1] == "Engine")
+            && literal_isolated_namespace(&class).is_some()
+    }
+
+    one_statement(root).is_some_and(|statement| follow_chain(statement, &mut Vec::new(), engine_name))
+}
+
+/// The engine library's source-level loading surface must be plain before a
+/// route-only mount is admitted. Literal requires may target another Ruby
+/// file under this same `lib/` tree (which is checked in this walk), plus the
+/// Rails engine bootstrap that supplies `Rails::Engine`. At file level, only
+/// those requires are allowed. Inside the engine's namespace, files may
+/// define modules, classes without custom superclasses, instance methods,
+/// ordinary `self` methods, and scalar constants. Ruby load-hook methods,
+/// aliases, other calls, conditionals, and computed constants remain an
+/// explicit mount gap.
+fn plain_engine_library_sources<V: Vfs + ?Sized>(
+    vfs: &V,
+    engine_dir: &Path,
+    engine_name: &str,
+) -> bool {
+    let lib_dir = engine_dir.join("lib");
+    let Ok(files) = read_rb_files(vfs, &lib_dir) else { return false };
+    let lib_files: HashSet<PathBuf> = files.iter().cloned().collect();
+    files.iter().all(|file| {
+        if path_has_symlink_component(vfs, &lib_dir, file) {
+            return false;
+        }
+        let Ok(source) = vfs.read(file) else { return false };
+        let parsed = ruby_prism::parse(&source);
+        if parsed.errors().next().is_some() {
+            return false;
+        }
+        let Some(program) = parsed.node().as_program_node() else { return false };
+        let mut scope = Vec::new();
+        program.statements().body().iter().all(|statement| {
+            plain_engine_library_statement(
+                vfs,
+                &lib_dir,
+                file,
+                &lib_files,
+                engine_name,
+                &mut scope,
+                &statement,
+                true,
+            )
+        })
+    })
+}
+
+/// Admit one statement from the engine library's narrow load-time grammar.
+/// Namespace modules may lead to the engine owner; executable definitions,
+/// constants, and the Engine declaration itself are checked at their exact
+/// namespace. Unknown AST shapes fail closed so boot effects are not skipped.
+fn plain_engine_library_statement<V: Vfs + ?Sized>(
+    vfs: &V,
+    lib_dir: &Path,
+    file: &Path,
+    lib_files: &HashSet<PathBuf>,
+    engine_name: &str,
+    scope: &mut Vec<String>,
+    statement: &Node<'_>,
+    top_level: bool,
+) -> bool {
+    if let Some(module) = statement.as_module_node() {
+        if module.constant_path().as_constant_path_node()
+            .is_some_and(|path| super::util::constant_path_is_rooted(&path))
+        {
+            return false;
+        }
+        let Some(name) = super::util::module_name_path(&module) else { return false };
+        let old_len = scope.len();
+        scope.extend(name);
+        // A nested engine can be declared under a chain of namespace
+        // modules (for example `Catalog::Admin::Engine`). Admit only the
+        // exact ancestor modules needed to reach its owner; executable
+        // declarations inside those ancestors remain rejected below.
+        let valid = engine_library_module_scope_is_admitted(scope, engine_name)
+            && module.body().is_none_or(|body| {
+                super::util::flatten_statements(body).iter().all(|inner| {
+                    plain_engine_library_statement(
+                        vfs, lib_dir, file, lib_files, engine_name, scope, inner, false,
+                    )
+                })
+            });
+        scope.truncate(old_len);
+        return valid;
+    }
+    if let Some(class) = statement.as_class_node() {
+        if class.constant_path().as_constant_path_node()
+            .is_some_and(|path| super::util::constant_path_is_rooted(&path))
+        {
+            return false;
+        }
+        let Some(name) = super::util::class_name_path(&class) else { return false };
+        let mut qualified = scope.clone();
+        qualified.extend(name.iter().cloned());
+        if qualified.join("::") == engine_name {
+            let is_rails_engine = class.superclass().is_some_and(|parent| {
+                super::util::constant_path_of(&parent)
+                    .is_some_and(|parts| parts.len() == 2 && parts[0] == "Rails" && parts[1] == "Engine")
+            });
+            let expected_namespace = engine_name.strip_suffix("::Engine");
+            return is_rails_engine
+                && expected_namespace.is_some_and(|expected| {
+                    literal_isolated_namespace(&class).as_deref() == Some(expected)
+                });
+        }
+        if !engine_library_scope_belongs_to_owner(&qualified, engine_name) {
+            return false;
+        }
+        // A superclass can run its `inherited` hook as this class is loaded.
+        // The first slice keeps library declarations to classes without one.
+        if class.superclass().is_some() {
+            return false;
+        }
+        let old_len = scope.len();
+        scope.extend(name);
+        let valid = class.body().is_none_or(|body| {
+            super::util::flatten_statements(body).iter().all(|inner| {
+                plain_engine_library_statement(
+                    vfs, lib_dir, file, lib_files, engine_name, scope, inner, false,
+                )
+            })
+        });
+        scope.truncate(old_len);
+        return valid;
+    }
+    if let Some(def) = statement.as_def_node() {
+        if top_level || !engine_library_scope_belongs_to_owner(scope, engine_name) {
+            return false;
+        }
+        if def.receiver().is_none() {
+            return true;
+        }
+        // Ordinary singleton helpers are safe declarations, but the Ruby
+        // loading callbacks can run while later engine classes are defined.
+        let method = super::util::constant_id_str(&def.name());
+        return def.receiver().is_some_and(|receiver| receiver.as_self_node().is_some())
+            && !engine_library_load_hook(method);
+    }
+    if let Some(write) = statement.as_constant_write_node() {
+        if !engine_library_scope_belongs_to_owner(scope, engine_name) {
+            return false;
+        }
+        let value = write.value();
+        return value.as_string_node().is_some()
+            || value.as_symbol_node().is_some()
+            || value.as_integer_node().is_some()
+            || value.as_float_node().is_some()
+            || value.as_true_node().is_some()
+            || value.as_false_node().is_some()
+            || value.as_nil_node().is_some();
+    }
+    if top_level {
+        if let Some(call) = statement.as_call_node() {
+            return engine_library_require_is_admitted(vfs, lib_dir, file, lib_files, &call);
+        }
+    }
+    false
+}
+
+/// Return whether methods, constants, or ordinary classes are scoped at the
+/// engine's owning namespace or below it.
+fn engine_library_scope_belongs_to_owner(scope: &[String], engine_name: &str) -> bool {
+    let Some(owner) = engine_name.strip_suffix("::Engine") else { return false };
+    let name = scope.join("::");
+    name == owner || name.strip_prefix(owner).is_some_and(|suffix| suffix.starts_with("::"))
+}
+
+/// Namespace wrappers may also occupy a strict ancestor on the path to the
+/// engine owner; their bodies are still checked statement by statement.
+fn engine_library_module_scope_is_admitted(scope: &[String], engine_name: &str) -> bool {
+    if engine_library_scope_belongs_to_owner(scope, engine_name) {
+        return true;
+    }
+    let Some(owner) = engine_name.strip_suffix("::Engine") else { return false };
+    let name = scope.join("::");
+    !name.is_empty() && owner.strip_prefix(&name).is_some_and(|suffix| suffix.starts_with("::"))
+}
+
+/// Ruby callbacks that can run while classes or modules are loaded or changed.
+/// Their definitions are excluded because the mount slice does not execute or
+/// model callback effects.
+fn engine_library_load_hook(method: &str) -> bool {
+    matches!(
+        method,
+        "inherited"
+            | "included"
+            | "extended"
+            | "prepended"
+            | "append_features"
+            | "prepend_features"
+            | "extend_object"
+            | "method_added"
+            | "method_removed"
+            | "method_undefined"
+            | "singleton_method_added"
+            | "singleton_method_removed"
+            | "singleton_method_undefined"
+            | "const_added"
+            | "const_missing"
+    )
+}
+
+/// Admit only literal requires whose resolved file is among the checked Ruby
+/// files under this engine's `lib/`, plus the Rails engine bootstrap require.
+fn engine_library_require_is_admitted<V: Vfs + ?Sized>(
+    vfs: &V,
+    lib_dir: &Path,
+    file: &Path,
+    lib_files: &HashSet<PathBuf>,
+    call: &ruby_prism::CallNode<'_>,
+) -> bool {
+    if call.receiver().is_some() || call.block().is_some() {
+        return false;
+    }
+    let method = super::util::constant_id_str(&call.name());
+    let require_relative = match method {
+        "require" => false,
+        "require_relative" => true,
+        _ => return false,
+    };
+    let Some(arguments) = call.arguments() else { return false };
+    let arguments: Vec<_> = arguments.arguments().iter().collect();
+    let Some(request) = (arguments.len() == 1)
+        .then(|| super::util::string_value(&arguments[0]))
+        .flatten()
+    else {
+        return false;
+    };
+    if !require_relative && matches!(request.as_str(), "rails/engine" | "rails/engine.rb") {
+        return true;
+    }
+    let base = if require_relative {
+        let Some(parent) = file.parent() else { return false };
+        parent
+    } else {
+        lib_dir
+    };
+    let Some(mut target) = normalize_engine_library_require(lib_dir, base, &request) else {
+        return false;
+    };
+    if target.extension().is_none() {
+        target.set_extension("rb");
+    }
+    lib_files.contains(&target)
+        && !path_has_symlink_component(vfs, lib_dir, &target)
+        && vfs.exists(&target)
+}
+
+/// Normalize a literal require path while keeping every intermediate step
+/// inside `lib/`, preventing an escape through an unchecked path or symlink
+/// before a later `..` returns to an in-tree destination.
+fn normalize_engine_library_require(
+    lib_dir: &Path,
+    base: &Path,
+    request: &str,
+) -> Option<PathBuf> {
+    let request = Path::new(request);
+    if request.is_absolute() {
+        return None;
+    }
+    let mut normalized = base.to_path_buf();
+    if !normalized.starts_with(lib_dir) {
+        return None;
+    }
+    for component in request.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                // Keep every intermediate path inside the checked tree.
+                // A lexical detour above lib/ could traverse an unchecked
+                // symlink and then return to a path that starts with lib/.
+                if normalized == lib_dir || !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+        if !normalized.starts_with(lib_dir) {
+            return None;
+        }
+    }
+    Some(normalized)
 }
 
 /// `<pkg>/app` for every Packwerk package that has an `app/`

@@ -279,6 +279,39 @@ check("child acquired after adopt closed inherited FD", status.exitstatus == 0)
     );
 }
 
+/// `before_worker_boot` calls `Db.configure`, which sets `@owner_pid` to
+/// the child and skips `adopt_after_fork`. Configure must still close an
+/// inherited checkpoint-lock FD without LOCK_UN and clear the parent's
+/// checkpointer pid.
+#[test]
+fn configure_closes_inherited_checkpoint_lock_after_fork() {
+    run(
+        "checkpoint_flock_configure",
+        r#"
+path = Db.instance_variable_get(:@path)
+lock_path = Db.checkpoint_lock_path(path)
+held = Db.try_checkpoint_lock(lock_path)
+check("parent acquired", held.is_a?(File))
+Db.instance_variable_set(:@checkpointer_pid, Process.pid)
+r, w = IO.pipe
+pid = fork do
+  w.close
+  r.read(1)
+  Db.configure(path, pool_size: 2)
+  check("checkpointer pid cleared", Db.instance_variable_get(:@checkpointer_pid).nil?)
+  got = Db.try_checkpoint_lock(lock_path)
+  exit(got.is_a?(File) ? 0 : 1)
+end
+r.close
+held.close
+w.write("x")
+w.close
+_pid, status = Process.wait2(pid)
+check("configure closed inherited FD so child acquired", status.exitstatus == 0)
+"#,
+    );
+}
+
 /// Once the server asks, serving connections stop checkpointing inside
 /// COMMIT and a background thread copies the log into the database
 /// file instead: the file grows without any request checkpointing.
@@ -300,6 +333,116 @@ deadline = Time.now + 5
 sleep 0.05 while File.size(path) <= before + 400_000 && Time.now < deadline
 check("background checkpoint copied the log (#{before} -> #{File.size(path)})",
       File.size(path) > before + 400_000)
+"#,
+    );
+}
+
+/// Rate-limit pin for `warn_checkpoint_failure` itself (observability
+/// garnish). Does **not** couple to `checkpoint_loop`'s rescue wire —
+/// deleting the rescue call would keep this green; takeover pins flock.
+#[test]
+fn checkpoint_failure_warn_is_rate_limited() {
+    run(
+        "checkpoint_warn",
+        r#"
+require "stringio"
+Db.instance_variable_set(:@checkpoint_warn_at, nil)
+buf = StringIO.new
+real = $stderr
+$stderr = buf
+begin
+  Db.send(:warn_checkpoint_failure, RuntimeError.new("first"))
+  Db.send(:warn_checkpoint_failure, RuntimeError.new("second"))
+  Db.instance_variable_set(
+    :@checkpoint_warn_at,
+    Process.clock_gettime(Process::CLOCK_MONOTONIC) - Db::CHECKPOINT_WARN_INTERVAL - 1
+  )
+  Db.send(:warn_checkpoint_failure, RuntimeError.new("third"))
+ensure
+  $stderr = real
+end
+out = buf.string
+check("first failure warned", out.include?("first"))
+check("second failure suppressed inside the interval", !out.include?("second"))
+check("third failure warned after the interval", out.include?("third"))
+check("warn names the checkpoint", out.include?("WAL checkpoint failed"))
+# A raising warning sink must not escape — otherwise checkpoint_loop dies
+# after wal_autocheckpoint=0 with no restart.
+Db.instance_variable_set(:@checkpoint_warn_at, nil)
+def Kernel.warn(*)
+  raise IOError, "broken pipe"
+end
+begin
+  Db.send(:warn_checkpoint_failure, RuntimeError.new("sink"))
+rescue StandardError => e
+  raise "warn sink escaped: #{e.class}: #{e.message}"
+end
+"#,
+    );
+}
+
+/// Kill the flock holder: a surviving process's checkpointer must take
+/// the lock and copy the WAL (leader election / takeover). The leader
+/// only holds the flock — same shape as a wedged sibling worker — while
+/// the survivor has already opted into background checkpoints and grown
+/// the log with `wal_autocheckpoint=0`.
+#[test]
+fn checkpoint_flock_takeover_after_leader_exit() {
+    run(
+        "checkpoint_takeover",
+        r#"
+Db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB)")
+path = Db.instance_variable_get(:@path)
+lock_path = Db.checkpoint_lock_path(path)
+ready_r, ready_w = IO.pipe
+leader = fork do
+  ready_r.close
+  held = Db.try_checkpoint_lock(lock_path)
+  exit!(1) unless held.is_a?(File)
+  ready_w.write("1")
+  ready_w.close
+  sleep 60
+  exit!(0)
+end
+begin
+  ready_w.close
+  check("leader signalled ready", ready_r.read(1) == "1")
+  ready_r.close
+
+  baseline = File.size(path)
+  Db.checkpoint_in_background!
+  Db.with_connection do
+    st = Db.current_dbh.execute("PRAGMA wal_autocheckpoint")
+    check("survivor disabled autocheckpoint", st[0][0] == 0)
+    200.times { Db.exec("INSERT INTO t (b) VALUES (randomblob(4096))") }
+  end
+  # Leader still holds the flock: the survivor's loop is on :busy, so
+  # PASSIVE cannot run and the main db file stays near baseline while
+  # pages sit in the -wal file.
+  check("db file not yet grown under foreign flock",
+        File.size(path) <= baseline + 50_000)
+
+  Process.kill("KILL", leader)
+  _pid, status = Process.wait2(leader)
+  leader = nil
+  check("leader exited", status.signaled?)
+
+  deadline = Time.now + 5
+  sleep 0.05 while File.size(path) <= baseline + 400_000 && Time.now < deadline
+  check("survivor checkpointer took over and copied (#{baseline} -> #{File.size(path)})",
+        File.size(path) > baseline + 400_000)
+ensure
+  if leader
+    begin
+      Process.kill("KILL", leader)
+    rescue Errno::ESRCH
+    end
+    begin
+      Process.wait2(leader)
+    rescue Errno::ECHILD
+    end
+  end
+end
 "#,
     );
 }

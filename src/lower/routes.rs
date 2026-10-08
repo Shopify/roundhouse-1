@@ -42,6 +42,10 @@ pub struct FlatRoute {
     /// `comments` for `/replies/comments/page/:page` would otherwise
     /// shadow the real `/comments` helper).
     pub named: bool,
+    /// Whether this route's helper namespace belongs to the current app.
+    /// Isolated engine routes share dispatch but expose helpers only on a
+    /// mount proxy, so their routes must not seed the host helper registry.
+    pub helpers_enabled: bool,
     /// Route-forced response format — the `:format => "rss"` option on
     /// an explicit route (`get "/rss" => "home#index", :format =>
     /// "rss"`). Dispatch seeds the controller's `request_format` from
@@ -163,7 +167,7 @@ pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
 
 pub fn flatten_routes(app: &App) -> Vec<FlatRoute> {
     let mut out = Vec::new();
-    let ctx = Ctx::default();
+    let ctx = Ctx { helpers_enabled: true, ..Ctx::default() };
     for entry in &app.routes.entries {
         collect_flat_routes(entry, &mut out, &ctx);
     }
@@ -181,6 +185,9 @@ struct Ctx {
     module_prefix: String,
     /// Helper-name prefix: `admin_`.
     name_prefix: String,
+    /// Whether generated route helpers belong to the current table. Isolated
+    /// engine helpers live on an engine-specific proxy that is not modeled.
+    helpers_enabled: bool,
     /// Segment defaults from enclosing `scope defaults: { … }` entries,
     /// innermost last so a nested scope can override an outer one.
     param_defaults: Vec<(String, String)>,
@@ -462,8 +469,9 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     path: vpath,
                     controller: qualify_controller(&ctx.module_prefix, controller),
                     action: action.clone(),
-                    as_name: derived_name.clone(),
-                    named: named && i == 0,
+                    as_name: if ctx.helpers_enabled { derived_name.clone() } else { String::new() },
+                    named: named && i == 0 && ctx.helpers_enabled,
+                    helpers_enabled: ctx.helpers_enabled,
                     format: forced_format.clone().or_else(|| ctx.default_format()),
                     required_params,
                     param_defaults: defaults_for(ctx, &params),
@@ -512,10 +520,11 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 path,
                 controller: ClassId(Symbol::from(controller_class)),
                 action: Symbol::from(action_name),
-                as_name: helper,
+                as_name: if ctx.helpers_enabled { helper } else { String::new() },
                 path_params: vec![],
                 param_defaults: vec![],
-                named: true,
+                named: ctx.helpers_enabled,
+                helpers_enabled: ctx.helpers_enabled,
                 format: None,
                 required_params: 0,
                 int_params: vec![],
@@ -654,11 +663,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                     path: full_path.clone(),
                     controller: controller_class.clone(),
                     action: Symbol::from(action_name),
-                    as_name: as_name.clone(),
+                    as_name: if ctx.helpers_enabled { as_name.clone() } else { String::new() },
                     required_params: params.len(),
                     param_defaults: defaults_for(ctx, &params),
                     path_params: params.clone(),
-                    named: true,
+                    named: ctx.helpers_enabled,
+                    helpers_enabled: ctx.helpers_enabled,
                     format: ctx.default_format(),
                     int_params: vec![],
                     constraints: vec![],
@@ -680,11 +690,12 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                         path: full_path,
                         controller: controller_class.clone(),
                         action: Symbol::from(action_name),
-                        as_name,
+                        as_name: if ctx.helpers_enabled { as_name } else { String::new() },
                         required_params: params.len(),
                         param_defaults: defaults_for(ctx, &params),
                         path_params: params,
                         named: false,
+                        helpers_enabled: ctx.helpers_enabled,
                         format: ctx.default_format(),
                         int_params: vec![],
                         constraints: vec![],
@@ -692,8 +703,11 @@ fn collect_flat_routes(spec: &RouteSpec, out: &mut Vec<FlatRoute>, ctx: &Ctx) {
                 }
             }
         }
-        RouteSpec::Scope { path, module, as_prefix, defaults, nest, entries } => {
+        RouteSpec::Scope { path, module, as_prefix, defaults, nest, suppress_helpers, entries } => {
             let mut child = ctx.clone();
+            if *suppress_helpers {
+                child.helpers_enabled = false;
+            }
             // `nested do … end`: MATERIALIZE the pending parent nesting
             // now, so this scope's own `path`/`as` land INSIDE it. The
             // ordinary path below prefixes `ns_path` in FRONT of the

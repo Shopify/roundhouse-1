@@ -387,6 +387,68 @@ fn forwarding_declaration_and_call_round_trip_as_a_contract() {
 }
 
 #[test]
+fn mixed_anonymous_keyword_pairs_round_trip_as_an_ordered_group() {
+    use roundhouse::diagnostic::DiagnosticKind;
+    use roundhouse::expr::ExprNode;
+
+    let source = "class Probe\n  def relay(path, **)\n    target(kind: :get, path: path, **)\n  end\n  def target(kind:, path:, **)\n    [kind, path]\n  end\nend\n";
+    let group_names = |app: &roundhouse::App| {
+        let class = app
+            .library_classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "Probe")
+            .expect("Probe class");
+        let relay = class
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == "relay")
+            .expect("relay method");
+        let ExprNode::Send { args, .. } = &*relay.body.node else {
+            panic!("expected forwarded call, got {:?}", relay.body.node);
+        };
+        assert_eq!(args.len(), 1, "the keyword group is one call argument");
+        let ExprNode::ForwardKeywordsWithPairs { entries } = &*args[0].node else {
+            panic!("expected ordered anonymous keyword group, got {:?}", args[0].node);
+        };
+        entries
+            .iter()
+            .map(|(key, _)| match &*key.node {
+                ExprNode::Lit { value: roundhouse::expr::Literal::Sym { value } } => value.as_str().to_string(),
+                other => panic!("expected static symbol key, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let emit = |app: &roundhouse::App| {
+        let class = app
+            .library_classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "Probe")
+            .expect("Probe class");
+        format!(
+            "class Probe\n{}end\n",
+            class.methods.iter().map(roundhouse::emit::ruby::emit_method).collect::<String>()
+        )
+    };
+    let app = analyzed(source);
+    assert_eq!(group_names(&app), vec![String::from("kind"), String::from("path")]);
+    let errors = diagnose(&app);
+    assert!(
+        !errors.iter().any(|d| matches!(
+            &d.kind,
+            DiagnosticKind::Unsupported { construct, .. }
+                if construct.as_str() == "full argument forwarding"
+        )),
+        "anonymous keyword forwarding must not be diagnosed as full `...` forwarding: {errors:?}"
+    );
+    let first = emit(&app);
+    let again = analyzed(&first);
+    assert_eq!(group_names(&again), group_names(&app), "re-ingest must preserve the explicit pair group and its order");
+    let second = emit(&again);
+    assert_eq!(first, second, "mixed anonymous keyword forwarding must reach a Ruby IR fixed point");
+    assert!(first.contains("target(kind: :get, path: path, **)"), "{first}");
+}
+
+#[test]
 fn flattened_and_unknown_contracts_remain_errors_through_lowering() {
     for source in [
         "class Probe\n def call(...)\n target(...)\n end\n def target(a, b, factor: 2)\n (a-b)*factor\n end\nend",

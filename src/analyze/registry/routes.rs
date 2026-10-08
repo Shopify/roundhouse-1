@@ -32,6 +32,9 @@ pub(in crate::analyze) fn route_helper_names(app: &App) -> Vec<String> {
             .join("_")
     };
     for route in crate::lower::flatten_routes(app) {
+        if !route.helpers_enabled {
+            continue;
+        }
         for candidate in [route.as_name.clone(), path_candidate(&route.path)] {
             if candidate.is_empty() {
                 continue;

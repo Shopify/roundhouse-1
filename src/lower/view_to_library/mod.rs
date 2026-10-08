@@ -48,7 +48,7 @@ use crate::ident::{ClassId, Symbol, VarId};
 use crate::naming::{camelize_path, last_segment, singularize, snake_case};
 use crate::span::Span;
 
-use self::extra_params::collect_extra_params;
+use self::extra_params::{collect_extra_params, drop_closure_names};
 use self::form_wrapper::{FormWrapperHelper, form_wrapper_helpers};
 use self::walker::walk_body;
 
@@ -485,21 +485,21 @@ fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> Libra
 
     // A partial's locals are its interface: every `locals:` key any call
     // site passes becomes a trailing nil-default param (sorted; see
-    // render_locals_keys). Names the signature already carries (record,
-    // closure ivars, flash/defined? extras) are skipped.
+    // render_locals_keys). Names already on the signature as the record
+    // or flash/defined? extras are skipped here; closure ivars are
+    // dropped after append by `drop_closure_names` (raw key vs
+    // `safe_local` name).
     let mut extra_params = extra_params;
     if is_partial {
         let keys_map = &lx.locals_keys;
         if let Some(keys) = view_key_of(view).and_then(|k| keys_map.get(&k).cloned()) {
             for k in keys {
-                if k != arg_name
-                    && !closure_ivars.contains(&k)
-                    && !extra_params.contains(&k)
-                {
+                if k != arg_name && !extra_params.contains(&k) {
                     extra_params.push(k);
                 }
             }
         }
+        drop_closure_names(&mut extra_params, &closure_ivars);
     }
 
     // A bound form local is NOT interface (see `partial_form_bindings`):
@@ -2438,11 +2438,12 @@ pub(crate) fn partial_call_contracts(
             .unwrap_or_default();
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
-                if k != &record && !closure.contains(k) && !extras.contains(k) {
+                if k != &record && !extras.contains(k) {
                     extras.push(k.clone());
                 }
             }
         }
+        drop_closure_names(&mut extras, &closure);
         out.insert(key, PartialCallContract { record, closure, extras, keyword_extras: false });
     }
     out
@@ -2451,6 +2452,7 @@ pub(crate) fn partial_call_contracts(
 pub(crate) fn action_view_ivar_map(
     views: &[crate::dialect::View],
     controllers: &[crate::dialect::Controller],
+    models: &[crate::dialect::Model],
 ) -> crate::det::HashMap<(String, String), ViewArgs> {
     // The controller passes an action view its full render-tree ivar
     // closure (its own reads ∪ its partials' needs, including dynamic-
@@ -2458,6 +2460,7 @@ pub(crate) fn action_view_ivar_map(
     // deep partial reads (e.g. @user) is threaded even when the action
     // view itself doesn't read it.
     let closures = view_ivar_closures(views, controllers);
+    let json_closures = crate::lower::jbuilder_to_library::jbuilder_ivar_closures(views, models);
     let mut out = crate::det::HashMap::default();
     for v in views {
         let (dir, base) = split_view_name(v.name.as_str());
@@ -2506,13 +2509,12 @@ pub(crate) fn action_view_ivar_map(
             format!("{base}_{}", v.format.as_str())
         };
         let key = (module, stem);
-        // A json view has no closure entry (`view_ivar_closures` walks
-        // the ERB render tree, which a jbuilder template is not part
-        // of), so it lands on the direct-reads fallback — which is
-        // exactly right for it: a `json.partial!` child takes its
-        // record from the parent's collection expression, never from an
-        // ivar of its own. The jbuilder lowerer derives its PARAMS from
-        // the same call, so the two sides cannot disagree about arity.
+        // A json view's closure is the jbuilder render tree's
+        // (`jbuilder_ivar_closures`: its own reads and those of the
+        // partials it renders, which it passes on); `view_ivar_closures`
+        // walks the ERB tree, and a format-blind key would find an html
+        // twin's there. The jbuilder lowerer derives its PARAMS from the
+        // same map, so the two sides cannot disagree about arity.
         // The closure map is keyed the way `build_library_class` reads
         // it — `view_key_of`, the UNQUALIFIED stem — so a non-html view
         // must be looked up that way too. Reading it under the
@@ -2520,11 +2522,12 @@ pub(crate) fn action_view_ivar_map(
         // in READ order, and the call passed them in a different order
         // than the lowered view declares (lobsters' `stories.rss.builder`
         // got `@title` where it takes `stories`).
-        let ivars = view_key_of(v)
-            .and_then(|k| closures.get(&k))
-            .or_else(|| closures.get(&key))
-            .cloned()
-            .unwrap_or_else(|| view_read_ivars(&v.body));
+        let ivars = if v.jbuilder {
+            json_closures.get(&v.name).cloned()
+        } else {
+            view_key_of(v).and_then(|k| closures.get(&k)).or_else(|| closures.get(&key)).cloned()
+        }
+        .unwrap_or_else(|| view_read_ivars(&v.body));
         out.insert(
             key,
             ViewArgs {
@@ -2612,11 +2615,12 @@ pub(super) fn partial_extras_map(
             .unwrap_or_default();
         if let Some(keys) = keys_map.get(&key) {
             for k in keys {
-                if k != &arg_name && !closure.contains(k) && !extras.contains(k) {
+                if k != &arg_name && !extras.contains(k) {
                     extras.push(k.clone());
                 }
             }
         }
+        drop_closure_names(&mut extras, &closure);
         out.insert(key, extras);
     }
     // Mirror the def site's bound-form-local drop (the defined?-extras
@@ -3328,7 +3332,7 @@ pub(crate) fn ivar_ty(name: &str, known_models: &[String]) -> crate::ty::Ty {
 /// Type of a partial/layout's record arg: a layout's `body` is the
 /// rendered-HTML String; a partial's record is the singular model for its
 /// directory (`stories/_listdetail` → `Story`), else Untyped.
-fn record_arg_ty(dir: &str, is_layout: bool, known_models: &[String]) -> crate::ty::Ty {
+pub(crate) fn record_arg_ty(dir: &str, is_layout: bool, known_models: &[String]) -> crate::ty::Ty {
     use crate::ty::Ty;
     if is_layout {
         return Ty::Str;
@@ -3546,7 +3550,7 @@ fn rewrite_lvalue(lv: &LValue) -> LValue {
 /// local (`keywords`, the strict locals after the first) keeps its name,
 /// because callers pass it by that name. Every other local is a
 /// positional param named by `safe_local` (`for` → `for_`).
-fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
+pub(crate) fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite_local_assigns_to_locals(c, keywords));
     let reserved_read = match &*expr.node {
@@ -3608,6 +3612,12 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                rewrite_defined_to_nil_check(key);
+                rewrite_defined_to_nil_check(value);
+            }
+        }
         ExprNode::Hash { entries, .. } => {
             for (k, v) in entries {
                 rewrite_defined_to_nil_check(k);

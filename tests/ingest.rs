@@ -1528,6 +1528,73 @@ end
 }
 
 #[test]
+fn cattr_and_verbatim_classvar_reads_share_storage() {
+    use roundhouse::expr::LValue;
+    use roundhouse::ingest::ingest_library_classes;
+    use roundhouse::{Expr, ExprNode};
+
+    // extras/keybase.rb shape: cattr_accessor and verbatim `@@X` share
+    // Rails class-variable storage; the `@@X = nil` seed is kept.
+    let src = br#"class Keybase
+  cattr_accessor :DOMAIN
+
+  @@DOMAIN = nil
+
+  def self.enabled?
+    @@DOMAIN.present?
+  end
+end
+"#;
+    let classes = ingest_library_classes(src, "extras/keybase.rb").expect("ingest");
+    let kb = &classes[0];
+
+    fn has_classvar(e: &Expr, cvar: &str) -> bool {
+        let mut found = false;
+        fn walk(e: &Expr, cvar: &str, found: &mut bool) {
+            if let ExprNode::Var { name, .. } = &*e.node {
+                if name.as_str() == cvar {
+                    *found = true;
+                }
+            }
+            e.node.for_each_child(&mut |c| walk(c, cvar, found));
+        }
+        walk(e, cvar, &mut found);
+        found
+    }
+
+    assert!(
+        kb.class_ivar_initializers.iter().any(|expr| {
+            matches!(
+                &*expr.node,
+                ExprNode::Assign {
+                    target: LValue::Var { name, .. },
+                    ..
+                } if name.as_str() == "@@DOMAIN"
+            )
+        }),
+        "@@DOMAIN = nil seed must survive"
+    );
+    let enabled = kb
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "enabled?")
+        .expect("enabled? ingested");
+    assert!(
+        has_classvar(&enabled.body, "@@DOMAIN"),
+        "class-method @@DOMAIN read must keep shared class-variable storage"
+    );
+    let reader = kb
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "DOMAIN")
+        .expect("cattr reader synthesized");
+    assert!(
+        has_classvar(&reader.body, "@@DOMAIN"),
+        "accessor reads @@DOMAIN"
+    );
+}
+
+#[test]
 fn non_nil_classvar_initializers_are_retained_in_source_order() {
     use roundhouse::ingest::ingest_library_classes;
 
@@ -2066,6 +2133,37 @@ fn class_method_classvar_writes_keep_native_shared_storage() {
     }
 }
 
+#[test]
+fn class_method_classvar_writes_keep_shared_inheritance_storage() {
+    use roundhouse::expr::ExprNode;
+    for method in ["def self.bump", "class << self; def bump"] {
+        for write in ["@@count ||= 11", "@@count = 14", "@@count &&= 17", "@@count += 3", "@@count -= 1"] {
+            let extra_end = if method.starts_with("class") { "end" } else { "" };
+            let source = format!("class Parent; {method}; {write}; @@count; end; {extra_end}; end\nclass Child < Parent; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("shared @@ storage must ingest on class methods");
+            let bump = classes[0]
+                .methods
+                .iter()
+                .find(|m| m.name.as_str() == "bump")
+                .expect("bump");
+            let mut saw = false;
+            bump.body.node.for_each_child(&mut |c| {
+                if matches!(&*c.node, ExprNode::Var { name, .. } if name.as_str() == "@@count") {
+                    saw = true;
+                }
+            });
+            // OpAssign / Assign targets are LValues, not child Exprs — also
+            // accept bodies whose emitted text would read @@count.
+            let text = format!("{:?}", bump.body.node);
+            assert!(
+                saw || text.contains("@@count"),
+                "expected @@count in bump body: {text}"
+            );
+        }
+    }
+}
+
 /// A splat multi-write whose RHS is not an array literal destructures
 /// what Ruby does: `Array.try_convert(value) || [value]` (to_ary, or the
 /// value wrapped). The behavior itself is checked against CRuby in
@@ -2126,6 +2224,40 @@ fn native_classvar_writes_are_the_modeled_cattr_storage() {
 }
 
 #[test]
+fn mattr_and_native_classvar_writes_share_storage() {
+    // Rails mattr/cattr is @@; a hand-written @@ write is the same slot.
+    for declaration in ["cattr_accessor", "mattr_accessor"] {
+        let source = format!(
+            "class Probe; {declaration} :count; def bump; @@count = 11; end; def self.current; @@count; end; end"
+        );
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .expect("shared @@ storage must ingest");
+        assert!(
+            classes[0].class_ivar_initializers.iter().any(|expr| {
+                matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Var { name, .. },
+                        ..
+                    } if name.as_str() == "@@count"
+                ) || matches!(
+                    &*expr.node,
+                    ExprNode::If { else_branch, .. } if matches!(
+                        &*else_branch.node,
+                        ExprNode::Assign {
+                            target: LValue::Var { name, .. },
+                            ..
+                        } if name.as_str() == "@@count"
+                    )
+                )
+            }),
+            "mattr seeds @@count = nil: {:?}",
+            classes[0].class_ivar_initializers
+        );
+    }
+}
+
+#[test]
 fn cattr_defaults_keep_source_order_with_native_initializers() {
     use roundhouse::ExprNode;
     for declaration in ["cattr_reader", "cattr_writer", "cattr_accessor", "mattr_reader", "mattr_writer", "mattr_accessor"] {
@@ -2145,6 +2277,47 @@ fn cattr_defaults_keep_source_order_with_native_initializers() {
                     if matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Nil })),
                     "{source}: the authored write keeps its place: {inits:?}");
                 assert!(inits[0].span.start < inits[1].span.start, "{source}: {inits:?}");
+            }
+            // Standalone parseable defaults seed @@attr = <value>.
+            let source = format!("class Probe; {call}; end");
+            let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+                .expect("standalone class-attribute default must seed");
+            let seed_value = classes[0].class_ivar_initializers.iter().find_map(|expr| {
+                match &*expr.node {
+                    ExprNode::Assign {
+                        target: roundhouse::expr::LValue::Var { name, .. },
+                        value,
+                    } if name.as_str() == "@@count" => Some(value),
+                    // Nil defaults are conditional (`unless class_variable_defined?`).
+                    ExprNode::If { else_branch, .. } => match &*else_branch.node {
+                        ExprNode::Assign {
+                            target: roundhouse::expr::LValue::Var { name, .. },
+                            value,
+                        } if name.as_str() == "@@count" => Some(value),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            });
+            assert!(
+                seed_value.is_some(),
+                "missing @@count seed for {call}: {:?}",
+                classes[0].class_ivar_initializers
+            );
+            let value = seed_value.unwrap();
+            let expected_nil = default == "default: nil";
+            assert_eq!(
+                matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Nil }),
+                expected_nil,
+                "{call}: {:?}",
+                value.node
+            );
+            if default == "default: 41" || default.is_empty() {
+                assert!(
+                    matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Int { value: 41 } }),
+                    "{call}: {:?}",
+                    value.node
+                );
             }
         }
         // A splatted option hash may carry anything: refused, not guessed.
@@ -2401,6 +2574,71 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
     ).unwrap();
     let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
     assert_eq!(probe.class_ivar_initializers.len(), 1);
+
+    // Plain ClassMethods cattr (no source @@) seeds `@@flag` too. In Ruby
+    // `cattr_accessor` inside `module ClassMethods` defines the class
+    // variable on ClassMethods itself (Module#mattr_accessor on self), so
+    // the seed and the accessor belong to the carrier, not to Probe.
+    let classes = ingest_library_classes(
+        b"module Probe; module ClassMethods; cattr_accessor :flag; end; end",
+        "probe.rb",
+    ).unwrap();
+    let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+    let carrier = classes.iter().find(|class| class.name.0.as_str() == "Probe::ClassMethods").unwrap();
+    let seeds_flag = |inits: &[roundhouse::expr::Expr]| inits.iter().any(|expr| {
+        matches!(
+            &*expr.node,
+            roundhouse::expr::ExprNode::Assign {
+                target: roundhouse::expr::LValue::Var { name, .. },
+                ..
+            } if name.as_str() == "@@flag"
+        ) || matches!(
+            &*expr.node,
+            roundhouse::expr::ExprNode::If { else_branch, .. } if matches!(
+                &*else_branch.node,
+                roundhouse::expr::ExprNode::Assign {
+                    target: roundhouse::expr::LValue::Var { name, .. },
+                    ..
+                } if name.as_str() == "@@flag"
+            )
+        )
+    });
+    assert!(
+        seeds_flag(&carrier.class_ivar_initializers),
+        "ClassMethods cattr must seed @@flag on its own module: {:?}",
+        carrier.class_ivar_initializers
+    );
+    assert!(probe.class_ivar_initializers.is_empty(), "{:?}", probe.class_ivar_initializers);
+    assert!(carrier.methods.iter().any(|m| m.name.as_str() == "flag"));
+}
+
+#[test]
+fn direct_class_and_module_compound_ivar_writes_are_initializers() {
+    use roundhouse::expr::OpAssignOp;
+    use roundhouse::ingest::ingest_library_classes;
+
+    for kind in ["class", "module"] {
+        let source = format!("{kind} Probe\n  @cache ||= 7\n  @cache &&= 8\n  @cache += 1\n  \
+            class << self\n    @singleton_cache ||= 9\n  end\n  def self.cache; @cache; end\nend\n");
+        let classes = ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
+        let probe = classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap();
+        assert!(probe.unknown_calls.is_empty(), "compound writes belong to the initializer list");
+        assert_eq!(probe.class_ivar_initializers.len(), 3, "{kind} body loses a compound write");
+        for (initializer, expected_op) in probe.class_ivar_initializers.iter()
+            .zip([OpAssignOp::OrOr, OpAssignOp::AndAnd, OpAssignOp::Add])
+        {
+            assert!(matches!(&*initializer.node,
+                ExprNode::OpAssign { target: LValue::Ivar { name }, op, .. }
+                    if name.as_str() == "cache" && *op == expected_op));
+            assert_eq!(&source[initializer.span.start as usize..initializer.span.end as usize],
+                match expected_op {
+                    OpAssignOp::OrOr => "@cache ||= 7",
+                    OpAssignOp::AndAnd => "@cache &&= 8",
+                    OpAssignOp::Add => "@cache += 1",
+                    _ => unreachable!(),
+                });
+        }
+    }
 }
 
 /// Parameters after a rest (`->(*, payload)`, `|*rest, a, b|`) used to

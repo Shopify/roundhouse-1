@@ -27,10 +27,13 @@
 #
 # `#start` (the INSTANCE method) becomes lazy: it marks the client
 # started and opens nothing. The package's `self.start` connects
-# eagerly — `http.start` runs BEFORE the block is yielded — which would
-# put a real TLS connect to www.example.com ahead of any stub. Deferring
-# the connect to the first request that no stub answers is what puts
-# the double above the transport.
+# eagerly — it hands its block to `http.start`, which connects BEFORE
+# yielding — which would put a real TLS connect to www.example.com
+# ahead of any stub. Deferring the connect to the first request that no
+# stub answers is what puts the double above the transport. The lazy
+# `start` keeps CRuby's block form (yield, then finish in an ensure):
+# since matz/spinel#8048 that is the only way the package's
+# `self.start`, `get_response` and `post_form` reach their block.
 #
 # `self.start` is NOT redefined, and `ipaddr:` — the keyword campfire's
 # DNS-rebinding pin is written on — is the PACKAGE's to honour: since
@@ -95,9 +98,24 @@ module Net
     # package's `finish` closes whatever is open and clears the flags,
     # so a `start`/`finish` pair around nothing but stubbed requests
     # touches no descriptor at all.
+    #
+    # With a block: CRuby's block form, still lazy. Yield the session,
+    # answer the block's value, finish in an ensure. A `start` that
+    # dropped the block made `Net::HTTP.start(...) { |http|
+    # http.request(req) }` answer the session and send nothing (see the
+    # header). `finish if started?` rather than the package's
+    # `do_finish`: `finish` raises IOError on a session the block already
+    # finished, and `do_finish` is absent from packages before #8048.
+    # `yield`, not the `&blk` `#request` needs: the package's own `start`
+    # yields too, and every caller of it holds a typed `HTTP.new`.
     def start
       @started = true
-      self
+      return self unless block_given?
+      begin
+        yield self
+      ensure
+        finish if started?
+      end
     end
 
     # The URL this connection would put on the wire for `path`, in the

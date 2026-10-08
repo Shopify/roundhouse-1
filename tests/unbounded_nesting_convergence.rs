@@ -172,7 +172,7 @@ fn params<'a>(app: &'a App, class: &str, method: &str, side: MethodReceiver) -> 
 #[test]
 fn every_fixpoint_loop_settles_before_the_cap() {
     let a = analyzed();
-    for (name, n) in [("production", a.rounds.production), ("tests", a.rounds.tests), ("absorb", a.rounds.absorb)] {
+    for (name, n) in [("production", a.rounds.production.rounds()), ("tests", a.rounds.views_and_tests.rounds()), ("absorb", a.rounds.absorb.rounds())] {
         assert!(n.is_some_and(|n| n <= 8), "{name} loop did not settle: {:?}", a.rounds);
     }
 }

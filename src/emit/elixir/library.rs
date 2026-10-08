@@ -456,6 +456,9 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
         ExprNode::Hash { entries, .. } => entries
             .iter()
             .any(|(k, v)| references_var(k, name) || references_var(v, name)),
+        ExprNode::ForwardKeywordsWithPairs { entries } => entries
+            .iter()
+            .any(|(k, v)| references_var(k, name) || references_var(v, name)),
         ExprNode::Array { elements, .. } => elements.iter().any(|x| references_var(x, name)),
         ExprNode::StringInterp { parts } => parts.iter().any(|p| {
             matches!(p, InterpPart::Expr { expr } if references_var(expr, name))

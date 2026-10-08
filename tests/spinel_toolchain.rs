@@ -39,6 +39,35 @@ mod class_attribute;
 mod class_configuration;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/anonymous_keywords.rs"]
+mod anonymous_keywords;
+
+/// The native counterpart of the generic emitted-Ruby regression test.
+#[test]
+#[ignore = "requires Spinel; run in its CI lane"]
+fn anonymous_keyword_forwarding_runs_natively() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/services/keyword_forwarder.rb",
+            anonymous_keywords::SOURCE,
+        )
+        .run_spinel(anonymous_keywords::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("anonymous keyword forwarding contract passed"));
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/keyword_forwarder.rb"))
+        .expect("emitted keyword forwarding class");
+    assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
+    assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
+
+#[path = "support/engine_mount.rs"]
+mod engine_mount;
+
+#[test]
+#[ignore = "requires the Spinel toolchain, run in its CI lane"]
+fn literal_isolated_engine_mount_dispatches_on_native_http() {
+    engine_mount::spinel_http_witness();
+}
 
 #[test]
 #[ignore = "requires the Spinel toolchain, run in its CI lane"]

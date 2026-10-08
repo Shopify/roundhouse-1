@@ -182,7 +182,9 @@ fn bundled_class_constants_are_ledgered_only_on_targets_without_them() {
   def index
     [URI::HTTP, URI::InvalidURIError, Net::OpenTimeout, Net::ReadTimeout,
      Net::HTTPRedirection, Net::HTTPOK, StringIO, OpenSSL::OpenSSLError,
-     Rails::HTML5::SafeListSanitizer, JSON, JSON::ParserError, Struct, Mutex]
+     Rails::HTML5::SafeListSanitizer, JSON, JSON::ParserError, Struct, Mutex,
+     Queue, SizedQueue, Thread::Queue, Thread::SizedQueue, Thread::Mutex,
+     ThreadError, ClosedQueueError, Comparable, Enumerable, JSON::GeneratorError]
   end
 end
 "#),
@@ -206,18 +208,25 @@ end
             roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
                 if construct.as_str() == "bundled_constant"
         )).collect();
-        if matches!(target, BuildTarget::Ruby | BuildTarget::Spinel) {
+        if target == BuildTarget::Ruby {
             assert!(gaps.is_empty(), "{target:?}: {gaps:?}");
+        } else if target == BuildTarget::Spinel {
+            assert_eq!(gaps.len(), 1, "{gaps:?}");
+            assert!(gaps[0].message.contains("JSON::GeneratorError"));
+            assert_eq!(gaps[0].severity, roundhouse::diagnostic::Severity::Error);
+            assert!(!gaps[0].span.is_synthetic(), "{gaps:?}");
         } else if target == BuildTarget::Jruby {
             assert_eq!(gaps.len(), 1, "{gaps:?}");
             assert!(gaps[0].message.contains("Rails::HTML5::SafeListSanitizer"));
             assert_eq!(gaps[0].severity, roundhouse::diagnostic::Severity::Error);
             assert!(!gaps[0].span.is_synthetic(), "{gaps:?}");
         } else {
-            assert_eq!(gaps.len(), 13, "{target:?}: {gaps:?}");
+            assert_eq!(gaps.len(), 23, "{target:?}: {gaps:?}");
             for name in ["URI::HTTP", "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
                 "Net::HTTPRedirection", "Net::HTTPOK", "StringIO", "OpenSSL::OpenSSLError",
-                "Rails::HTML5::SafeListSanitizer", "JSON", "JSON::ParserError", "Struct", "Mutex"] {
+                "Rails::HTML5::SafeListSanitizer", "JSON", "JSON::ParserError", "Struct", "Mutex",
+                "Queue", "SizedQueue", "Thread::Queue", "Thread::SizedQueue", "Thread::Mutex",
+                "ThreadError", "ClosedQueueError", "Comparable", "Enumerable", "JSON::GeneratorError"] {
                 let gap = gaps.iter().find(|d| d.message.contains(name)).expect(name);
                 assert_eq!(gap.severity, roundhouse::diagnostic::Severity::Error);
                 assert!(!gap.span.is_synthetic(), "{gap:?}");
@@ -343,6 +352,48 @@ end
             roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
                 if matches!(construct.as_str(), "bundled_constant" | "ruby_family_runtime_constant")
         )), "{target:?}: {diags:?}");
+    }
+}
+
+#[test]
+fn spinel_json_generator_rescue_does_not_hide_class_values_in_its_branches() {
+    let tree = [
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("app/controllers/probes_controller.rb", r#"class ProbesController < ActionController::Base
+  def index(value)
+    begin
+      JSON.generate(value)
+    rescue JSON::GeneratorError
+      JSON::GeneratorError
+    rescue ::JSON::GeneratorError
+      ::JSON::GeneratorError
+    else
+      JSON::GeneratorError
+    ensure
+      JSON::GeneratorError
+    end
+  end
+end
+"#),
+    ].into_iter().map(|(path, text)| (PathBuf::from(path), text.as_bytes().to_vec())).collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    let mut analysis = roundhouse::session::analyze_and_lower(&mut app);
+    analysis.extend(roundhouse::analyze::diagnose(&app));
+    assert!(!analysis.iter().any(|d| d.severity == roundhouse::diagnostic::Severity::Error), "{analysis:?}");
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        let (files, diags) = roundhouse::emit::diagnostics::scope(|| target_files(&app, Path::new("."), target));
+        files.expect("target files");
+        let gaps: Vec<_> = diags.iter().filter(|d| matches!(
+            &d.kind,
+            roundhouse::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+                if construct.as_str() == "bundled_constant"
+        )).collect();
+        assert_eq!(gaps.len(), if target == BuildTarget::Spinel { 4 } else { 0 }, "{target:?}: {gaps:?}");
+        for gap in gaps {
+            assert!(gap.message.contains("JSON::GeneratorError"));
+            assert_eq!(gap.severity, roundhouse::diagnostic::Severity::Error);
+            assert!(!gap.span.is_synthetic(), "{gap:?}");
+        }
     }
 }
 

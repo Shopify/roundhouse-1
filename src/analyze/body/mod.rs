@@ -24,6 +24,15 @@ use crate::ty::{Row, Ty};
 
 /// A break in a bytes block can replace the method's String result. Nested
 /// lambdas/iterators and while/until loops own their breaks independently.
+// `Class[C]` is a class object that dispatch unwraps to `C`.
+fn instance_shaped(ty: &Ty) -> bool {
+    match ty {
+        Ty::Class { id, .. } => id.0.as_str() != "Class",
+        Ty::Union { variants } => variants.iter().all(|v| matches!(v, Ty::Nil) || instance_shaped(v)),
+        _ => false,
+    }
+}
+
 fn bytes_block_has_escaping_break(e: &Expr) -> bool {
     match &*e.node {
         ExprNode::Break { .. } => true,
@@ -153,6 +162,8 @@ pub struct Ctx {
     /// a block's `super` is its method's. `None` outside a method body
     /// and wherever the caller does not say.
     pub enclosing_def: Option<(Symbol, bool)>,
+    // `!class_side` cannot stand in: scope bodies type with it false, and their bare `active` is the scope.
+    pub instance_body: bool,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -285,6 +296,21 @@ pub struct ClassInfo {
     /// lookup (the lexical scope, then the ancestors), never by its last
     /// segment alone.
     pub app_declared: bool,
+}
+
+impl ClassInfo {
+    /// Whether `name` is one of this model's real SCHEMA TABLE columns.
+    /// `attributes` is built once, straight off `Schema::tables` (see
+    /// `ingest::model::row_from_table`), never merged with method-only
+    /// surface like a `has_secure_password` reader or a plain `def` —
+    /// so this is a strictly narrower, more precise test than "does
+    /// `instance_methods` know this name," which also answers yes for
+    /// synthesized non-column readers (`password_reset_token`). Shared
+    /// by the body-typer's and the arel lowerer's dynamic-finder
+    /// handling (#558) so a per-column check can't drift between them.
+    pub fn has_schema_column(&self, name: &Symbol) -> bool {
+        self.attributes.fields.contains_key(name)
+    }
 }
 
 /// Resolve a single-segment Const ref (like `Const { path:
@@ -1182,6 +1208,12 @@ impl<'a> BodyTyper<'a> {
         false
     }
 
+    // `x.class` is not a class reference to `is_class_object`, yet types as the same flat `Ty::Class` as an instance.
+    fn is_instance(&self, expr: &Expr, ctx: &Ctx) -> bool {
+        !self.is_class_object(expr, ctx)
+            && !matches!(&*expr.node, ExprNode::Send { method, args, .. } if method.as_str() == "class" && args.is_empty())
+    }
+
     fn is_module_callback(&self, recv_ty: Option<&Ty>, method: &Symbol) -> bool {
         matches!(method.as_str(), "included" | "prepended" | "append_features" | "prepend_features")
             && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes().get(id).is_some_and(|c| c.is_module && c.has_class_method(method)))
@@ -1717,7 +1749,7 @@ impl<'a> BodyTyper<'a> {
                 if let Some(b) = block {
                     let method = crate::ident::Symbol::from("super");
                     let block_ctx = self.block_ctx_for(
-                        ctx, Some(&Ty::Untyped), &method, args.as_deref().unwrap_or(&[]), b);
+                        ctx, Some(&Ty::Untyped), &method, args.as_deref().unwrap_or(&[]), false, b);
                     self.analyze_expr(b, &block_ctx);
                 }
                 // `super` invokes the parent's same-name method. In an
@@ -2323,12 +2355,28 @@ impl<'a> BodyTyper<'a> {
                         }
                     }
                 }
+                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
+                    || (recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                        && send::is_module_protocol(method) && self.self_is_module_instance(ctx))
+                    || send::is_module_query_on_module_value(method, recv_ty.as_ref())
+                    // `x.class` is a class object, though not a known one:
+                    // enough for a query, not for `define_method`.
+                    || (send::is_module_query(method) && recv.as_ref().is_some_and(|r| self.is_class_of_value(r, ctx)));
                 let block_ret = if let Some(b) = block {
-                    let mut block_ctx = self.block_ctx_for(ctx, recv_ty.as_ref(), method, args, b);
+                    let mut block_ctx = self.block_ctx_for(
+                        ctx,
+                        recv_ty.as_ref(),
+                        method,
+                        args,
+                        class_object_receiver,
+                        b,
+                    );
                     if matches!(method.as_str(), "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec") {
                         if let Some(receiver) = recv.as_ref() {
                             block_ctx.self_ty = recv_ty.clone();
                             block_ctx.class_side = self.is_class_object(receiver, ctx);
+                            block_ctx.instance_body = matches!(method.as_str(), "instance_eval" | "instance_exec")
+                                && self.is_instance(receiver, ctx);
                         }
                     }
                     // `ActiveSupport.on_load(:hook) { … }`: lazy_load_hooks
@@ -2543,7 +2591,10 @@ impl<'a> BodyTyper<'a> {
                     }
                     return self.dispatch(Some(&objects), method, block_ret.as_ref(), args);
                 }
-                let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
+                let instance_receiver = recv.as_ref().map_or(ctx.instance_body, |r| self.is_instance(r, ctx))
+                    && recv_ty.as_ref().is_some_and(instance_shaped);
+                let dispatched =
+                    self.dispatch_on(recv_ty.as_ref(), method, block_ret.as_ref(), args, instance_receiver);
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;
                     if matches!(method.as_str(), "+" | "-" | "*" | "/" | "**" | "%" | "<" | "<=" | ">" | ">=")
@@ -2581,13 +2632,8 @@ impl<'a> BodyTyper<'a> {
                 }
                 // What every object and every module answers, when the
                 // receiver's own table did not. App analyzer only.
-                let class_object_receiver = recv.as_ref().map_or(ctx.class_side, |r| self.is_class_object(r, ctx))
-                    || (recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
-                        && send::is_module_protocol(method) && self.self_is_module_instance(ctx))
-                    || send::is_module_query_on_module_value(method, recv_ty.as_ref())
-                    // `x.class` is a class object, though not a known one:
-                    // enough for a query, not for `define_method`.
-                    || (send::is_module_query(method) && recv.as_ref().is_some_and(|r| self.is_class_of_value(r, ctx)));
+                // `class_object_receiver` was resolved above for block binding
+                // so it matches the same class/instance table preference.
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && (recv.is_some() || (ctx.self_ty.is_some() && send::is_module_protocol(method)))
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
@@ -3414,6 +3460,13 @@ impl<'a> BodyTyper<'a> {
             }
 
             ExprNode::ForwardArgs | ExprNode::ForwardKeywords => Ty::Untyped,
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries.iter_mut() {
+                    self.analyze_expr(key, ctx);
+                    self.analyze_expr(value, ctx);
+                }
+                Ty::Untyped
+            }
 
             ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
                 // Splat propagates the inner expression's type

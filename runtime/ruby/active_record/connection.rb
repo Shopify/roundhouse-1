@@ -1010,6 +1010,16 @@ module ActiveRecord
       ActiveRecord::Relation.new(self).find_by(conditions.to_h)
     end
 
+    # `Model.find_sole_by(attrs)` — Rails' `where(attrs).sole`; see
+    # Relation#find_sole_by. `Model.sole` is the same on the whole table.
+    def self.find_sole_by(conditions)
+      ActiveRecord::Relation.new(self).find_sole_by(conditions.to_h)
+    end
+
+    def self.sole
+      ActiveRecord::Relation.new(self).sole
+    end
+
     # Rails-shape `all` fallback, same story as `where` above: a lazy
     # Relation so refiner chains the lowerers left dynamic
     # (`Category.all.order("category asc, tags.tag asc")…` on lobsters'

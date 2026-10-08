@@ -85,6 +85,24 @@ in `src/project.rs`. Shape notes worth knowing:
   `scaffold/` tree overlaid into
   every emitted Ruby/Spinel project, and a `test/` tree of
   target-specific test files.
+- `runtime/spinel/db_pg.rb` implements the same `Db` contract over
+  PostgreSQL, on the pure-Ruby spinel-pg driver (no libpq). No target
+  selects it yet. `tests/spinel_pg_db.rs` compiles it with Spinel and
+  runs it against a live server.
+  - `Db.exec_returning` answers the returned rows.
+  - `Db.last_insert_rowid` reads the inserted table's own sequence, so
+    it works for serial and identity keys only; any other key raises.
+  - Server errors whose SQLSTATE ActiveRecord names are raised as that
+    class through `runtime/spinel/pg_errors.rb`.
+  - A transaction keeps its connection, and a lease that ends inside
+    one rolls it back.
+  - The pool is sharded per thread, as `runtime/spinel/db.rb`'s is.
+    `Db.prepare` runs through a named statement cached per connection
+    (at most 128, closed on the server when evicted); finalizing a read
+    releases its handle and keeps the statement. There is no request
+    query cache yet.
+  - The SQLite-only boot hooks (read snapshot, checkpointer) do
+    nothing there, and `seed_from_file` raises.
 
 ## Framework runtime — `runtime/ruby/`
 
@@ -4295,3 +4313,66 @@ façade, which stands aside only when the app registers both `stddev` and
 
 Found 2026-09-25 bringing current lobsters' benchmark routes up on the
 ruby lane; the spinel install landed the same day.
+
+### `request.format.json?` raised NoMethodError — the predicate stays on `request_format`, not a Mime-typed `Request#format` — FIXED
+
+`protect_from_forgery unless: -> { request.format.json? }` — Rails' own
+guide idiom for an API controller that still inherits
+`ActionController::Base` — raised `NoMethodError` on every dispatched
+action: `private method 'format' called for nil` outside a real
+dispatch (`request` is nil until a dispatcher parks one, as in a
+unit-style `controller.process_action` call), or `undefined method
+'json?' for an instance of String` behind a real one (the shared
+`ActionDispatch::Request#format` is a plain `attr_reader` over a name
+String; the CRuby overlay's twin carries no `format` at all).
+
+**Why the fix is not a typed `Mime::Type` on `Request#format`.** The
+per-request format is already modeled elsewhere, correctly: every
+controller carries `request_format`, a plain Symbol attribute the
+dispatcher sets from the path's `.json` suffix / a `(.:format)` route
+segment / a route-forced format (`main.rb`, both ruby-family lanes),
+and action bodies already compare against it directly (`if
+request_format == :json`, the Jbuilder-lowerer's `respond_to`
+flatten). A `request.format.html?`-shaped call in an ACTION body was
+already rewritten to `self.request_format == :html` at the AST level
+(`lower::controller_to_library::rewrites::rewrite_request_format`) —
+precisely because the Request object's own `format` cannot answer the
+predicate on either lane. Giving `Request#format` a real Mime-typed
+value instead would duplicate that state in two places that could
+disagree (a `request_format` and a `request.format` seeded from
+different negotiations), and would still leave the CRuby overlay's
+Request with nothing to return. `runtime/ruby/mime.rb`'s ported
+`Mime::Type` — used elsewhere, for the Mime registry's own callers —
+deliberately omits `json?`/`html?` for a related reason (its own
+comment: "a call beyond [`lookup`/`lookup_by_extension`/`[]`] stays an
+honest gap"); `request.format` is answered from `request_format`
+instead of reopening that gap.
+
+**Where the gap was.** `rewrite_request_format` ran over action bodies
+only (`lower_action_body`). Expressions spliced into the synthesized
+`process_action` — filter `if:`/`unless:` lambdas (`protect_from_forgery`
+and any `before_action …, if:`/`unless:`), block-form filter bodies
+(`before_action -> { … }`), and `rescue_from` handlers — bypass that
+pipeline. The guide idiom
+`protect_from_forgery unless: -> { request.format.json? }` was the
+first shape that surfaced; structurally every dispatcher-embedded expr
+had the same hole.
+
+**Fix.** `synthesize_process_action` runs `rewrite_request_format` once
+over the finished dispatcher body (after rescue wrapping). `map_expr`
+walks guards, block-form filter bodies, and rescue handlers in one
+pass — the same helper action bodies already get, applied at the
+dispatcher boundary rather than bolted into `cond_from_guards` alone.
+
+**What was verified.**
+`tests/protect_from_forgery_unless_request_format.rs`'s
+`protect_from_forgery_unless_request_format_json_does_not_raise`: a
+`:json`-formatted dispatch skips the forgery check and runs the action
+(previously `NoMethodError`); an html POST with no token still hits
+the check and is blocked (422) — proving the rewritten guard still
+protects a non-json request, not just stopped raising.
+
+Found 2026-10-07 probing `request.format` on a from-scratch Rails API
+app under `--target spinel`; reproduces identically under `--target
+ruby`, since both lanes consume the same `controller_to_library`
+universal IR.

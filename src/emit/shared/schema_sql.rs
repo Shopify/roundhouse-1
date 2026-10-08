@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use crate::schema::{Column, ColumnType, Index, Schema, Table};
+use crate::schema::{Column, ColumnType, GeneratedColumnStorage, Index, Schema, Table};
 
 /// The SQL engine a schema renders for: how it spells identifiers,
 /// column types and key columns, and which partial-index predicates it
@@ -122,10 +122,22 @@ impl Dialect {
 /// multi-statement execution (Postgres' pg gem, MySQL drivers),
 /// and gives clearer per-statement error reporting in any adapter.
 /// Adapters that DO accept multi-statement (better-sqlite3) just
-/// `join("\n")` the list.
+/// `join("\n")` the list. The IR-facing API is infallible for its
+/// existing callers; an invalid generated-column schema reports an
+/// Unsupported diagnostic and returns no partial DDL.
 pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
-    render_schema_statements_for(schema, Dialect::Sqlite)
-        .unwrap_or_else(|e| unreachable!("every schema renders as SQLite: {e}"))
+    match render_schema_statements_for(schema, Dialect::Sqlite) {
+        Ok(statements) => statements,
+        Err(error) => {
+            let _ = crate::emit::diagnostics::report_unsupported(
+                crate::span::Span::synthetic(),
+                "sqlite",
+                "generated schema",
+                error,
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// [`render_schema_statements`] in `dialect`. The statements are the
@@ -134,10 +146,10 @@ pub fn render_schema_statements(schema: &Schema) -> Vec<String> {
 /// types, key columns and partial-index predicates
 /// ([`Dialect::index_predicate`]) differ per engine.
 ///
-/// `Err` names a table the dialect has no DDL for: a virtual table is
-/// SQLite's own construct (Rails' SQLite3 adapter is the one that dumps
-/// `create_virtual_table`), so SQLite never errors.
+/// `Err` names a schema shape this dialect cannot represent, including
+/// unsupported generated expressions and virtual tables on PostgreSQL.
 pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result<Vec<String>, String> {
+    validate_schema_for_dialect(schema, dialect)?;
     let mut out: Vec<String> = Vec::new();
     for (_name, table) in &schema.tables {
         // A virtual table is built by its MODULE, not from a column
@@ -175,6 +187,15 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
                 dialect.ident(col.name.as_str()),
                 dialect.column_type(&col.col_type)
             );
+            if let Some(generated) = &col.generated {
+                line.push_str(" GENERATED ALWAYS AS (");
+                line.push_str(&generated.expression);
+                line.push_str(") ");
+                line.push_str(match generated.storage {
+                    GeneratedColumnStorage::Stored => "STORED",
+                    GeneratedColumnStorage::Virtual => "VIRTUAL",
+                });
+            }
             if !col.nullable {
                 line.push_str(" NOT NULL");
             }
@@ -188,12 +209,16 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
         for idx in &table.indexes {
             let cols: Vec<String> = idx.columns.iter().map(|c| dialect.ident(c.as_str())).collect();
             let unique = if idx.unique { "UNIQUE " } else { "" };
+            let using = match (dialect, idx.using.as_deref()) {
+                (Dialect::Postgres, Some(method)) => format!(" USING {}", dialect.ident(method)),
+                _ => String::new(),
+            };
             let predicate = dialect
                 .index_predicate(table, idx)
                 .map(|p| format!(" WHERE {p}"))
                 .unwrap_or_default();
             out.push(format!(
-                "CREATE {unique}INDEX IF NOT EXISTS {} ON {} ({}){predicate}",
+                "CREATE {unique}INDEX IF NOT EXISTS {} ON {}{using} ({}){predicate}",
                 dialect.ident(idx.name.as_str()),
                 dialect.ident(table.name.as_str()),
                 cols.join(", "),
@@ -201,6 +226,41 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
         }
     }
     Ok(out)
+}
+
+/// Reject a schema that a target dialect cannot represent. Current
+/// SQLite target callers use the infallible wrapper, so project assembly
+/// invokes this gate before emitting any files; the PostgreSQL renderer
+/// also checks it directly.
+pub fn validate_schema_for_dialect(schema: &Schema, dialect: Dialect) -> Result<(), String> {
+    for table in schema.tables.values() {
+        if let Some(vm) = &table.virtual_module {
+            if dialect != Dialect::Sqlite {
+                return Err(format!(
+                    "table `{}` is an SQLite virtual table (`USING {}`), which {dialect:?} has no DDL for",
+                    table.name.as_str(),
+                    vm.module
+                ));
+            }
+        }
+        for (column, reason) in crate::schema::generated::validate_table(table) {
+            return Err(format!("generated column unsupported: {}.{column}: {reason}", table.name.as_str()));
+        }
+        if dialect == Dialect::Postgres {
+            if let Some(column) = table.columns.iter().find(|column| {
+                column.generated.as_ref().is_some_and(|generated| {
+                    generated.storage == GeneratedColumnStorage::Virtual
+                })
+                }) {
+                return Err(format!(
+                    "Roundhouse PostgreSQL DDL renderer does not yet support virtual generated columns: `{}.{}`",
+                    table.name.as_str(),
+                    column.name.as_str()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Joined-string form of `render_schema_statements` — kept for
@@ -346,6 +406,7 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
         | ColumnType::DateTime
         | ColumnType::Time
         | ColumnType::Json
+        | ColumnType::Jsonb
         | ColumnType::Uuid => "TEXT",
         ColumnType::Reference { .. } => "INTEGER",
     }
@@ -355,9 +416,8 @@ fn sqlite_type(ct: &ColumnType) -> &'static str {
 /// creates for it (`NATIVE_DATABASE_TYPES`; `datetime` is Rails 7+'s
 /// `timestamp(6)`), in the spelling `pg_dump` prints.
 ///
-/// The IR is what ingest left: `jsonb` and `json` are both `Json`,
-/// which renders `jsonb` — the type Postgres apps use, and the one that
-/// has equality and a btree index; `timestamptz` is a `DateTime`, and
+/// Ingest preserves `json` and `jsonb` independently so PostgreSQL schema
+/// output retains the source type. `timestamptz` is a `DateTime`, and
 /// `citext` and the network types render as their text storage. A
 /// decimal scale without a precision, which Rails rejects, renders as a
 /// bare `numeric`.
@@ -377,7 +437,8 @@ fn postgres_type(ct: &ColumnType) -> String {
         ColumnType::DateTime => "timestamp(6) without time zone".into(),
         ColumnType::Time => "time without time zone".into(),
         ColumnType::Binary => "bytea".into(),
-        ColumnType::Json => "jsonb".into(),
+        ColumnType::Json => "json".into(),
+        ColumnType::Jsonb => "jsonb".into(),
         ColumnType::Uuid => "uuid".into(),
     }
 }
@@ -395,7 +456,15 @@ mod tests {
     }
 
     fn column(name: &str, col_type: ColumnType, nullable: bool, primary_key: bool) -> Column {
-        Column { name: Symbol::from(name), col_type, nullable, default: None, primary_key }
+        Column {
+            name: Symbol::from(name),
+            col_type,
+            nullable,
+            default: None,
+            primary_key,
+            generated: None,
+            generated_text_compatible: None,
+        }
     }
 
     fn table(name: &str, columns: Vec<Column>, indexes: Vec<Index>) -> Table {
@@ -454,6 +523,82 @@ end
                  ON \"articles\" (\"title\", \"author_id\")",
             ]
         );
+    }
+
+    #[test]
+    fn postgres_preserves_btree_gin_and_custom_index_methods() {
+        let schema_rb = r#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.jsonb "payload"
+    t.string "slug"
+    t.index ["payload"], name: "index_documents_on_payload_gin", using: :gin
+    t.index ["slug"], name: "index_documents_on_slug_btree", using: :btree
+    t.index ["slug"], name: "index_documents_on_slug_custom", using: "custom_method"
+  end
+end
+"#;
+        let schema = ingest_schema(schema_rb.as_bytes(), "db/schema.rb").expect("schema");
+        let indexes = &schema.tables[&Symbol::from("documents")].indexes;
+        assert_eq!(indexes[0].using.as_deref(), Some("gin"));
+        assert_eq!(indexes[1].using.as_deref(), Some("btree"));
+        assert_eq!(indexes[2].using.as_deref(), Some("custom_method"));
+
+        assert_eq!(
+            render_schema_statements_for(&schema, Dialect::Postgres).unwrap()[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_payload_gin\" ON \"documents\" USING \"gin\" (\"payload\")",
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_slug_btree\" ON \"documents\" USING \"btree\" (\"slug\")",
+                "CREATE INDEX IF NOT EXISTS \"index_documents_on_slug_custom\" ON \"documents\" USING \"custom_method\" (\"slug\")",
+            ]
+        );
+        // PostgreSQL method metadata is intentionally absent from SQLite DDL.
+        assert_eq!(
+            render_schema_statements_for(&schema, Dialect::Sqlite).unwrap()[1..],
+            [
+                "CREATE INDEX IF NOT EXISTS index_documents_on_payload_gin ON documents (payload)",
+                "CREATE INDEX IF NOT EXISTS index_documents_on_slug_btree ON documents (slug)",
+                "CREATE INDEX IF NOT EXISTS index_documents_on_slug_custom ON documents (slug)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dynamic_index_method_is_an_ingest_error() {
+        let source = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: index_method
+  end
+end
+"#;
+        let error = ingest_schema(source, "db/schema.rb").unwrap_err();
+        assert!(error.to_string().contains("must be a literal symbol or string"), "{error}");
+    }
+
+    #[test]
+    fn schema_rb_folds_method_names_and_rejects_sql_quoting() {
+        let source = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: "GIN"
+  end
+end
+"#;
+        let schema = ingest_schema(source, "db/schema.rb").expect("schema");
+        assert_eq!(
+            schema.tables[&Symbol::from("documents")].indexes[0].using.as_deref(),
+            Some("gin")
+        );
+
+        let invalid = br#"ActiveRecord::Schema[8.1].define(version: 1) do
+  create_table "documents", force: :cascade do |t|
+    t.string "body"
+    t.index ["body"], using: "odd\"method"
+  end
+end
+"#;
+        let error = ingest_schema(invalid, "db/schema.rb").unwrap_err();
+        assert!(error.to_string().contains("ASCII unquoted SQL identifier"), "{error}");
     }
 
     /// An integer's `limit:` is a byte size: solid_cache's `key_hash`
@@ -637,8 +782,8 @@ end
             (ColumnType::DateTime, "timestamp(6) without time zone"),
             (ColumnType::Time, "time without time zone"),
             (ColumnType::Binary, "bytea"),
-            // Ingest folds `jsonb` and `json` into one `Json`.
-            (ColumnType::Json, "jsonb"),
+            (ColumnType::Json, "json"),
+            (ColumnType::Jsonb, "jsonb"),
             (ColumnType::Uuid, "uuid"),
             // Not something Rails emits (it rejects a scale without a
             // precision): the scale is dropped rather than a precision
@@ -666,6 +811,7 @@ end
                 name: Symbol::from("index_user_on_createdAt"),
                 columns: vec![Symbol::from("createdAt")],
                 unique: true,
+                using: None,
                 predicate: None,
             }],
         )]);

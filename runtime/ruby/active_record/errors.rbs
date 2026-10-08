@@ -36,6 +36,12 @@ module ActiveRecord
     def initialize: (?String message) -> void
   end
 
+  # Raised by `Relation#sole` / `find_sole_by` when more than one
+  # record matches.
+  class SoleRecordExceeded < ActiveRecordError
+    def initialize: (?String message) -> void
+  end
+
   # Raised by `Base#save!` when validation fails. `record` is the
   # invalid model; `attr_reader :record` lowers to a getter at ingest.
   class RecordInvalid < ActiveRecordError

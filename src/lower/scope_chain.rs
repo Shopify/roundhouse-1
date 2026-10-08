@@ -1891,6 +1891,7 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
                         "find"
                             | "find_by"
                             | "find_by!"
+                            | "find_sole_by"
                             | "destroy_by"
                             | "delete_by"
                             | "destroy_all"
@@ -2396,7 +2397,7 @@ const CLASS_ROOT_TERMINALS: &[&str] = &["pluck", "ids", "destroy_by", "delete_by
 fn is_relation_terminal(name: &str, args: &[Expr], block: Option<&Expr>) -> bool {
     match name {
         "find" => args.len() == 1 && block.is_none(),
-        "find_by" | "find_by!" => block.is_none(),
+        "find_by" | "find_by!" | "find_sole_by" => block.is_none(),
         // Bulk WRITES are terminals too — they end the chain and answer
         // a count / an Array of destroyed records, never a relation.
         // `Array` answers none of them, so an association-read receiver
@@ -2990,7 +2991,8 @@ fn lower_relation_args(
         // are `find_by`'s — a list that names some of them renames
         // `user:` to `user_id:` on one spelling and emits the
         // nonexistent `memberships.user` column on the next.
-        "where" | "not" | "find_by" | "find_by!" | "destroy_by" | "delete_by" | "exists?" => {
+        "where" | "not" | "find_by" | "find_by!" | "find_sole_by" | "destroy_by" | "delete_by"
+        | "exists?" => {
             // `where(connected_at: TTL.ago..)` — a RANGE value. Rails
             // renders `>=` / `<=` / `<` / BETWEEN; the runtime's
             // `column_predicate` has no Range arm and falls through to
@@ -4040,6 +4042,53 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     true,
                                 );
                                 return Some(target);
+                            }
+                            // `find_sole_by` on a seeded association —
+                            // `gadget.widgets.find_sole_by(created_at:
+                            // a..b)` — is routed through `where(...).sole`
+                            // rather than kept on its own spelling, so its
+                            // single condition hash takes the ordinary
+                            // `where` path: `lower_relation_args` only
+                            // converts a Range VALUE ("where(connected_at:
+                            // TTL.ago..)", above) for "where"/"not"/
+                            // "find_by"/"find_by!", so a Range reaching it
+                            // as "find_sole_by"'s own argument passed
+                            // through unconverted and compiled to `col =
+                            // <the range object>` — matches nothing, same
+                            // failure the comment above describes. Only
+                            // the single-hash shape `find_sole_by` is
+                            // actually called with is rewritten; anything
+                            // else falls through to the general lowering
+                            // below unchanged.
+                            if method.as_str() == "find_sole_by" && args.len() == 1 {
+                                let mut where_args = args;
+                                let _ = lower_relation_args(
+                                    &target,
+                                    &Symbol::from("where"),
+                                    &mut where_args,
+                                    ctx,
+                                );
+                                let where_call = syn(
+                                    span,
+                                    ExprNode::Send {
+                                        recv: Some(seed),
+                                        method: Symbol::from("where"),
+                                        args: where_args,
+                                        block: None,
+                                        parenthesized: true,
+                                    },
+                                );
+                                *expr = syn(
+                                    span,
+                                    ExprNode::Send {
+                                        recv: Some(where_call),
+                                        method: Symbol::from("sole"),
+                                        args: vec![],
+                                        block: None,
+                                        parenthesized: false,
+                                    },
+                                );
+                                return None;
                             }
                             // Chain method or terminal: stays on the seeded
                             // receiver. Chains keep the model; terminals end it.

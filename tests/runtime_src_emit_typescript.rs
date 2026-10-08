@@ -83,11 +83,12 @@ for (const [count, expected] of [
     assert!(run.status.success(), "{emitted}\n{}", String::from_utf8_lossy(&run.stderr));
 }
 
-/// Phase 1 second target: errors.rb has eight classes, in Rails'
-/// hierarchy: ActiveRecordError, under it AdapterError, RecordNotFound
-/// and RecordInvalid; StatementInvalid under AdapterError; ValueTooLong
-/// and WrappedDatabaseException under StatementInvalid, RecordNotUnique
-/// under WrappedDatabaseException. RecordInvalid has a synth attr_reader
+/// Phase 1 second target: errors.rb has nine classes, in Rails'
+/// hierarchy: ActiveRecordError, under it AdapterError, RecordNotFound,
+/// SoleRecordExceeded and RecordInvalid; StatementInvalid under
+/// AdapterError; ValueTooLong and WrappedDatabaseException under
+/// StatementInvalid, RecordNotUnique under WrappedDatabaseException.
+/// RecordInvalid has a synth attr_reader
 /// (`record`) and an `initialize` that calls `super(...)`. Validates parent extends
 /// (StandardError → Error), constructor synthesis, attr_reader-as-
 /// field detection, and `@ivar` → `this.x` in the constructor body.
@@ -101,7 +102,7 @@ fn errors_rb_transpiles_to_typescript_classes() {
     let classes = parse_library_with_rbs(&ruby, &rbs, "runtime/ruby/active_record/errors.rb")
         .expect("parse_library_with_rbs");
 
-    assert_eq!(classes.len(), 8, "expected 8 classes; got {}", classes.len());
+    assert_eq!(classes.len(), 9, "expected 9 classes; got {}", classes.len());
 
     let root = classes
         .iter()
@@ -121,6 +122,16 @@ fn errors_rb_transpiles_to_typescript_classes() {
     assert!(
         si_ts.contains("export class StatementInvalid extends AdapterError"),
         "StatementInvalid: {si_ts}"
+    );
+
+    let sole = classes
+        .iter()
+        .find(|c| c.name.0.as_str() == "ActiveRecord::SoleRecordExceeded")
+        .expect("ActiveRecord::SoleRecordExceeded");
+    let sole_ts = emit_library_class(sole).expect("emit SoleRecordExceeded");
+    assert!(
+        sole_ts.contains("export class SoleRecordExceeded extends ActiveRecordError"),
+        "SoleRecordExceeded: {sole_ts}"
     );
 
     let not_found = classes

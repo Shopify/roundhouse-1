@@ -245,8 +245,9 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
         ColumnType::DateTime if pg => spec("timestamp", None),
         ColumnType::DateTime => unported("ActiveModel::Type::DateTime with the time zone converter"),
         ColumnType::Time => unported("ActiveModel::Type::Time"),
-        ColumnType::Json if pg => unported("ActiveRecord::Type::Json or ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb"),
-        ColumnType::Json => unported("ActiveRecord::Type::Json"),
+        ColumnType::Json if pg => unported("ActiveRecord::Type::Json"),
+        ColumnType::Jsonb if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb"),
+        ColumnType::Json | ColumnType::Jsonb => unported("ActiveRecord::Type::Json"),
         ColumnType::Uuid if pg => spec("uuid", None),
         ColumnType::Uuid => unported("a uuid column type"),
     }

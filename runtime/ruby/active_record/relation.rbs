@@ -92,6 +92,8 @@ module ActiveRecord
     def reverse_order_term: (String term) -> String
     def reverse_one_order_term: (String term) -> String
     def loaded_tail: (Array[Base] loaded, Integer n) -> Array[Base]
+    def loaded_sole_rows: (Array[Base] loaded) -> Array[Base]
+    def sole_probe_limit: (Integer? limit) -> Integer
     # The keys are whatever the ordered column holds, and `<=>` on two
     # of them is an Integer or nil -- the only honest spellings.
     def compare_order_keys: (untyped a, untyped b) -> Integer?
@@ -260,6 +262,8 @@ module ActiveRecord
     def find_ids: (Array[Integer | Float | String] ids) -> Array[Base]
     def find_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base?
     def find_by!: (Hash[Symbol, untyped] | String | nil conditions) -> Base
+    def sole: () -> Base
+    def find_sole_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base
     def first_or_initialize: () -> Base
     def find_or_create_by: (Hash[Symbol, untyped] conditions) -> Base
 

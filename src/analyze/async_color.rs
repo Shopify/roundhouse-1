@@ -601,6 +601,9 @@ fn walk_expr<F: FnMut(&Expr) -> bool>(expr: &Expr, pred: &mut F) -> bool {
         ExprNode::Hash { entries, .. } => entries
             .iter()
             .any(|(k, v)| walk_expr(k, pred) || walk_expr(v, pred)),
+        ExprNode::ForwardKeywordsWithPairs { entries } => entries
+            .iter()
+            .any(|(k, v)| walk_expr(k, pred) || walk_expr(v, pred)),
         ExprNode::Array { elements, .. } => elements.iter().any(|e| walk_expr(e, pred)),
         ExprNode::StringInterp { parts } => parts.iter().any(|p| match p {
             InterpPart::Text { .. } => false,

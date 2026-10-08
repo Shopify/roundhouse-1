@@ -14,10 +14,446 @@ mod integer_query_find_by;
 
 #[path = "support/class_configuration.rs"]
 mod class_configuration;
+#[path = "support/runtime_block_signature.rs"]
+mod runtime_block_signature;
 #[path = "support/data_factory.rs"]
 mod data_factory;
 #[path = "support/rails_root_join.rs"]
 mod rails_root_join;
+#[path = "support/anonymous_keywords.rs"]
+mod anonymous_keywords;
+
+/// A generated text column on the real-blog Article model exercises the
+/// schema-to-runtime path together with Rails-style symbol callbacks. The
+/// create callbacks must see the value returned by the database, while an
+/// update remains stale until the model is explicitly reloaded.
+#[test]
+fn generated_article_text_runs_through_callbacks_and_reload() {
+    emit_and_run::real_blog()
+        .edit(
+            "db/schema.rb",
+            "    t.string \"title\"\n    t.text \"body\"\n    t.datetime \"created_at\", null: false\n",
+            "    t.string \"title\"\n    t.text \"body\"\n    t.virtual \"display_text\", type: :string, as: \"coalesce(title, '') || ' / ' || coalesce(body, '')\", stored: true\n    t.datetime \"created_at\", null: false\n",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :body, presence: true, length: { minimum: 10 }\nend\n",
+            concat!(
+                "  validates :body, presence: true, length: { minimum: 10 }\n\n",
+                "  after_create :capture_generated_create\n",
+                "  after_update :capture_generated_update\n",
+                "  after_save :capture_generated_save\n\n",
+                "  def capture_generated_create\n    @generated_after_create = display_text\n  end\n\n",
+                "  def capture_generated_update\n    @generated_after_update = display_text\n  end\n\n",
+                "  def capture_generated_save\n    @generated_after_save = display_text\n  end\n\n",
+                "  def generated_after_create\n    @generated_after_create\n  end\n\n",
+                "  def generated_after_update\n    @generated_after_update\n  end\n\n",
+                "  def generated_after_save\n    @generated_after_save\n  end\n",
+                "end\n",
+            ),
+        )
+        .write(
+            "test/models/generated_column_article_test.rb",
+            r#"require "test_helper"
+
+class GeneratedColumnArticleTest < ActiveSupport::TestCase
+  test "generated text hydrates before create callbacks and reload refreshes updates" do
+    article = Article.create!(title: "Generated title", body: "A sufficiently long article body.")
+    original = "Generated title / A sufficiently long article body."
+
+    assert_equal original, article.display_text
+    assert_equal original, article.generated_after_create
+    assert_equal original, article.generated_after_save
+
+    article.update!(title: "Updated title")
+    assert_equal original, article.display_text
+    assert_equal original, article.generated_after_update
+    assert_equal original, article.generated_after_save
+    assert_equal "Updated title / A sufficiently long article body.", article.reload.display_text
+  end
+end
+"#,
+        )
+        .run_test("test/models/generated_column_article_test.rb")
+        .assert_passes();
+}
+
+/// The same anonymous keyword packet survives defaulting, local-name
+/// collisions, and a virtual override in emitted CRuby. Effectful input
+/// values also stay left-to-right and run once.
+#[test]
+fn anonymous_keyword_forwarding_runs_without_capturing_or_reordering_values() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/services/keyword_forwarder.rb",
+            anonymous_keywords::SOURCE,
+        )
+        .run_ruby(anonymous_keywords::ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("anonymous keyword forwarding contract passed"));
+    let emitted = std::fs::read_to_string(run.emitted.join("app/models/keyword_forwarder.rb"))
+        .expect("emitted keyword forwarding class");
+    assert!(emitted.contains("class KeywordForwarder"), "{emitted}");
+    assert!(emitted.contains("request(kind: :get, path: path, **)"), "{emitted}");
+}
+
+/// A class object and its instances that define the same names: each
+/// side's call types and runs as that side's method.
+#[test]
+fn same_named_class_and_instance_methods_run_on_their_own_side() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "app/models/greeter.rb",
+            "class Greeter
+  def self.call(name)
+    new(name).call
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def call
+    \"hello \" + @name
+  end
+end
+",
+        )
+        .edit(
+            "app/models/article.rb",
+            "  validates :title, presence: true\n",
+            "  validates :title, presence: true
+
+  def self.headline
+    [:class]
+  end
+
+  def headline
+    title.to_s
+  end
+
+  def shout
+    headline.upcase
+  end
+",
+        )
+        .run_ruby(
+            "raise \"class call\" unless Greeter.call(\"a\") == \"hello a\"
+raise \"instance call\" unless Greeter.new(\"b\").call == \"hello b\"
+raise \"class headline\" unless Article.headline == [:class]
+raise \"instance headline\" unless Article.new(title: \"hi\").shout == \"HI\"
+puts \"same-named sides passed\"
+",
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("same-named sides passed"));
+}
+
+#[path = "support/engine_mount.rs"]
+mod engine_mount;
+
+#[test]
+fn literal_isolated_engine_mount_runs_over_cruby_http() {
+    let run = engine_mount::overlay().run_ruby(engine_mount::CRUBY_ASSERTIONS);
+    run.assert_passes();
+    assert!(run.stdout.contains("literal engine mount CRuby HTTP contract passed"));
+}
+
+#[test]
+fn engine_helper_calls_are_explicit_instead_of_using_host_helpers() {
+    let controller = r#"module Catalog
+  class ProductsController < ActionController::Base
+    def index
+      render plain: products_path
+    end
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/products_controller.rb", controller)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "vendor/catalog/app/controllers/catalog/products_controller.rb", "products_path"),
+        "engine helper collision was not explicit:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn reflective_engine_helpers_and_proxy_calls_are_explicit() {
+    let engine_controller = r#"module Catalog
+  class ProductsController < ActionController::Base
+    def reflective_symbol
+      send(:products_path)
+    end
+
+    def reflective_string
+      public_send("items_path")
+    end
+  end
+end
+"#;
+    let host_controller = r#"class HostController < ApplicationController
+  def host_products_reflection
+    public_send(:products_path)
+  end
+
+  def reflective_mount_helper
+    self.send(:catalog_path)
+  end
+
+  def reflective_symbol_proxy
+    catalog.send(:products_path)
+  end
+
+  def reflective_string_proxy
+    self.catalog.public_send("items_path")
+  end
+
+  def reflective_private_proxy
+    self.catalog.__send__("products_path")
+  end
+
+  def reflective_proxy_then_direct_helper
+    public_send(:catalog).items_path
+  end
+
+  def reflective_proxy_and_helper_chain
+    self.public_send("catalog").public_send(:items_path)
+  end
+
+  def reflective_send_proxy_and_helper
+    send(:catalog).send("products_path")
+  end
+end
+"#;
+    let engine_routes = "Catalog::Engine.routes.draw do\n  get \"/products\", to: \"products#index\"\n  get \"/items\", to: \"products#index\", as: :items\nend\n";
+    let host_routes = "Rails.application.routes.draw do\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/host/products\", to: \"host#reflective_symbol_proxy\", as: :products\nend\n";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/products_controller.rb", engine_controller)
+        .write("vendor/catalog/config/routes.rb", engine_routes)
+        .write("app/controllers/host_controller.rb", host_controller)
+        .write("config/routes.rb", host_routes)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    for (path, needle) in [
+        ("vendor/catalog/app/controllers/catalog/products_controller.rb", "send(:products_path)"),
+        ("vendor/catalog/app/controllers/catalog/products_controller.rb", "public_send(\"items_path\")"),
+        ("app/controllers/host_controller.rb", "catalog.send(:products_path)"),
+        ("app/controllers/host_controller.rb", "self.catalog.public_send(\"items_path\")"),
+        ("app/controllers/host_controller.rb", "self.catalog.__send__(\"products_path\")"),
+        ("app/controllers/host_controller.rb", "public_send(:catalog).items_path"),
+        ("app/controllers/host_controller.rb", "self.public_send(\"catalog\").public_send(:items_path)"),
+        ("app/controllers/host_controller.rb", "send(:catalog).send(\"products_path\")"),
+        ("app/controllers/host_controller.rb", "self.send(:catalog_path)"),
+    ] {
+        assert!(
+            engine_mount::has_error_on_source_line(&app, &errors, path, needle),
+            "reflective helper use {needle} in {path} was not a located mount error:\n{}",
+            engine_mount::describe_errors(&app, &errors)
+        );
+    }
+    assert!(
+        !engine_mount::has_error_on_source_line(
+            &app,
+            &errors,
+            "app/controllers/host_controller.rb",
+            "public_send(:products_path)"
+        ),
+        "host-authored products_path reflection was rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn host_engine_helper_proxy_calls_are_explicit() {
+    let host = r#"class HostController < ApplicationController
+  def index
+    render plain: "host root"
+  end
+
+  def root_helper
+    render plain: root_path
+  end
+
+  def products_helper
+    render plain: products_path
+  end
+
+  def engine_proxy
+    render plain: catalog.products_path
+  end
+
+  def self_engine_proxy
+    render plain: self.catalog.items_path
+  end
+
+  def after
+    render plain: "host after"
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("app/controllers/host_controller.rb", host)
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  root \"host#index\"\n  get \"/root-helper\", to: \"host#root_helper\"\n  get \"/products-helper\", to: \"host#products_helper\"\n  get \"/engine-proxy\", to: \"host#engine_proxy\"\n  get \"/self-engine-proxy\", to: \"host#self_engine_proxy\"\n  get \"/products\", to: \"products#index\", as: :products\n  get \"/catalog/products\", to: \"products#index\", as: :host_catalog_products\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/catalog/items\", to: \"items#index\", as: :host_catalog_items\n  get \"/after\", to: \"host#after\"\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "app/controllers/host_controller.rb", "products_path"),
+        "mounted engine proxy calls were not explicit:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    assert!(
+        engine_mount::has_error_on_source_line(&app, &errors, "app/controllers/host_controller.rb", "self.catalog.items_path"),
+        "self.catalog.items_path receiver was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn host_root_helper_is_kept_while_engine_root_helper_is_an_error() {
+    let home = r#"module Catalog
+  class HomeController < ActionController::Base
+    def index
+      render plain: root_path
+    end
+  end
+end
+"#;
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write("vendor/catalog/app/controllers/catalog/home_controller.rb", home)
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, "vendor/catalog/app/controllers/catalog/home_controller.rb", "root_path"),
+        "engine root helper did not retain an explicit error:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    assert!(
+        !engine_mount::has_error_in_source(&app, &errors, "app/controllers/host_controller.rb", "root_path"),
+        "the legitimate host root_path call was rejected: {errors:?}"
+    );
+}
+
+#[test]
+fn isolated_engine_paths_do_not_create_or_shadow_host_helpers() {
+    let host = r#"class HostController < ApplicationController
+  def index
+    render plain: "host root"
+  end
+
+  def fake_engine_helper
+    render plain: "host action"
+  end
+end
+"#;
+    let (emitted, app, errors) = engine_mount::overlay()
+        .write("app/controllers/host_controller.rb", host)
+        .write(
+            "config/routes.rb",
+            "Rails.application.routes.draw do\n  root \"host#index\"\n  mount Catalog::Engine, at: \"/catalog\"\n  get \"/host/catalog/products\", to: \"host#fake_engine_helper\", as: :catalog_products\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.is_empty(),
+        "literal engine mount reported unexpected errors:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+    let helpers = std::fs::read_to_string(emitted.join("app/route_helpers.rb")).expect("route helpers");
+    assert_eq!(
+        helpers.matches("def self.catalog_products_path").count(),
+        1,
+        "the host-authored route helper must remain available exactly once: {helpers}"
+    );
+    assert!(
+        helpers.contains("\"/host/catalog/products\""),
+        "catalog_products_path must retain the host route's path: {helpers}"
+    );
+    assert!(
+        !helpers.contains("def self.catalog_items_path"),
+        "the isolated engine's catalog_items_path leaked into host helpers: {helpers}"
+    );
+}
+
+#[test]
+fn helper_proxy_uses_in_library_jbuilder_and_configured_test_sources_are_explicit() {
+    let sources = [
+        (
+            "lib/engine_proxy_reference.rb",
+            "class EngineProxyReference\n  def self.path\n    catalog.products_path\n  end\nend\n",
+        ),
+        (
+            "app/views/host/index.json.jbuilder",
+            "json.url catalog.products_path\n",
+        ),
+        (
+            "spec/engine_proxy_reference_spec.rb",
+            "class EngineProxyReferenceSpec\n  def path\n    catalog.products_path\n  end\nend\n",
+        ),
+        (
+            "vendor/catalog/lib/catalog/path_reference.rb",
+            r#"module Catalog
+  class PathReference
+    def path
+      products_path
+    end
+
+    def self.engine_home
+      products_path
+    end
+
+    class Engine
+      def self.reference
+        "plain nested helper class"
+      end
+    end
+  end
+end
+"#,
+        ),
+    ];
+    for (path, source) in sources {
+        let mut overlay = engine_mount::overlay().write(path, source);
+        if path.starts_with("spec/") {
+            overlay = overlay.write("roundhouse.yml", "test_paths:\n  - spec\n");
+        }
+        let (_emitted, app, errors) = overlay.emit_with_app(roundhouse::project::BuildTarget::Ruby);
+        assert!(
+            engine_mount::has_error_in_source(&app, &errors, path, "products_path"),
+            "route helper call in {path} was not an explicit mount gap:\n{}",
+            engine_mount::describe_errors(&app, &errors)
+        );
+    }
+}
+
+#[test]
+fn engine_haml_helper_calls_keep_their_source_boundary() {
+    let path = "vendor/catalog/app/views/home/index.html.haml";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write(path, "= root_path\n")
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, path, "root_path"),
+        "bare engine helper in HAML was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
+
+#[test]
+fn dynamic_engine_route_targets_keep_their_source_boundary() {
+    let path = "vendor/catalog/config/routes.rb";
+    let (_emitted, app, errors) = engine_mount::overlay()
+        .write(
+            path,
+            "Catalog::Engine.routes.draw do\n  root to: redirect(root_path)\n  get \"/products\", to: \"products#index\"\nend\n",
+        )
+        .emit_with_app(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        engine_mount::has_error_in_source(&app, &errors, path, "dynamic targets"),
+        "dynamic engine route target was not rejected:\n{}",
+        engine_mount::describe_errors(&app, &errors)
+    );
+}
 
 #[test]
 fn critic_corrections_preserve_class_objects_reflection_and_operators() {
@@ -3265,6 +3701,155 @@ fn a_partial_reading_a_reserved_word_local_assign_runs() {
     run.assert_passes();
 }
 
+/// `Rails.application.routes.recognize_path` in a helper. `check` was
+/// clean, and the emitted app raised NameError on `#routes`. Each
+/// expected value is the output of Rails 7.2.4 for the same routes.
+/// Rails returns Symbol keys with String values, puts `:format` last,
+/// and raises `ActionController::RoutingError` when no route matches.
+/// Rails takes a full URL, and normalizes any other path: one leading
+/// slash, no doubled slashes and no trailing slash. The error message
+/// shows the normalized path.
+/// The `:method` of the second argument is the verb, a Symbol or a
+/// String in any case, and GET is the default. A verb that Rails does
+/// not accept raises `ActionController::UnknownHttpMethod`, which is not
+/// a `RoutingError`. The helper rescues it as a `StandardError`: app
+/// code that names the class gets a `check` error.
+/// The emitted view does not escape the result of a helper call, and
+/// Rails does. The `(&quot;|")` alternative in the message check only
+/// tolerates that gap, which exists before this test.
+#[test]
+fn a_helper_recognizes_a_path_with_the_application_routes() {
+    let run = on_the_index(
+        emit_and_run::real_blog().write(
+            "app/helpers/articles_helper.rb",
+            r##"module ArticlesHelper
+  def route_of(path, environment = {})
+    recognized = Rails.application.routes.recognize_path(path, environment)
+    recognized.map { |key, value| "#{key}=#{value}" }.join(" ")
+  rescue ActionController::RoutingError => e
+    "none: #{e.message}"
+  rescue StandardError => e
+    "#{e.class.name}: #{e.message}"
+  end
+end
+"##,
+        ),
+        r#"<i id="rp-index"><%= route_of("/articles") %></i>
+<i id="rp-show"><%= route_of("/articles/7?tab=comments") %></i>
+<i id="rp-fragment"><%= route_of("/articles/7#comments") %></i>
+<i id="rp-root"><%= route_of("/") %></i>
+<i id="rp-json"><%= route_of("/articles/7.json") %></i>
+<i id="rp-missing"><%= route_of("/nowhere") %></i>
+<i id="rp-get"><%= route_of("/articles", method: :get) %></i>
+<i id="rp-post"><%= route_of("/articles", method: :post) %></i>
+<i id="rp-string"><%= route_of("/articles/7/comments/3", method: "Delete") %></i>
+<i id="rp-no-verb"><%= route_of("/articles", method: :put) %></i>
+<i id="rp-direct"><%= Rails.application.routes.recognize_path("/articles", method: :post)[:action] %></i>
+<i id="rp-head"><%= route_of("/articles/7", method: :head) %></i>
+<i id="rp-any"><%= route_of("/articles", method: :any) %></i>
+<i id="rp-foo"><%= route_of("/articles", method: :foo) %></i>
+<i id="rp-url"><%= route_of("http://example.com/articles/7") %></i>
+<i id="rp-url-port"><%= route_of("https://example.com:3000/articles?x=1") %></i>
+<i id="rp-relative"><%= route_of("articles/7") %></i>
+<i id="rp-relative-miss"><%= route_of("nowhere") %></i>
+<i id="rp-relative-url-query"><%= route_of("articles/7?next=http://x") %></i>
+<i id="rp-doubled"><%= route_of("/articles//7") %></i>
+<i id="rp-trailing-miss"><%= route_of("/nowhere/") %></i>
+<i id="rp-bad-uri"><%= route_of("/articles/a b") %></i>
+<i id="rp-url-trailing"><%= route_of("http://example.com/articles/7/") %></i>
+<i id="rp-percent"><%= route_of("/nowhere/%7e") %></i>
+<i id="rp-bad-uri-first"><%= route_of("/a b", method: :foo) %></i>
+<i id="rp-same"><%= Rails.application.routes.recognize_path("/articles/7.json") == { controller: "articles", action: "show", id: "7", format: "json" } %></i>
+"#,
+        r#"    assert_match(/<i id="rp-index">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-show">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-fragment">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-root">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-json">controller=articles action=show id=7 format=json<\/i>/, response.body)
+    assert_match(/<i id="rp-missing">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-get">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-post">controller=articles action=create<\/i>/, response.body)
+    assert_match(/<i id="rp-string">controller=comments action=destroy article_id=7 id=3<\/i>/, response.body)
+    assert_match(/<i id="rp-no-verb">none: No route matches (&quot;|")\/articles(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-direct">create<\/i>/, response.body)
+    assert_match(/<i id="rp-head">controller=articles action=show id=7<\/i>/, response.body)
+    assert_includes(response.body, '<i id="rp-any">ActionController::UnknownHttpMethod: ANY, accepted HTTP methods are OPTIONS, GET, HEAD, POST, PUT, DELETE, TRACE, CONNECT, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK, VERSION-CONTROL, REPORT, CHECKOUT, CHECKIN, UNCHECKOUT, MKWORKSPACE, UPDATE, LABEL, MERGE, BASELINE-CONTROL, MKACTIVITY, ORDERPATCH, ACL, SEARCH, MKCALENDAR, and PATCH</i>')
+    assert_match(/<i id="rp-foo">ActionController::UnknownHttpMethod: FOO, accepted HTTP methods are OPTIONS, GET, /, response.body)
+    assert_match(/<i id="rp-url">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-url-port">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-relative">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-relative-miss">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-relative-url-query">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-doubled">controller=articles action=show id=7<\/i>/, response.body)
+    assert_match(/<i id="rp-trailing-miss">none: No route matches (&quot;|")\/nowhere(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-bad-uri">none: bad URI \(is not URI\?\): (&quot;|")\/articles\/a b(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-url-trailing">none: No route matches (&quot;|")http:\/\/example.com\/articles\/7\/(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-percent">none: No route matches (&quot;|")\/nowhere\/%7E(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-bad-uri-first">none: bad URI \(is not URI\?\): (&quot;|")\/a b(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-same">true<\/i>/, response.body)
+"#,
+    );
+    run.assert_passes();
+}
+
+/// `recognize_path` gives the Rails controller path, not the flat
+/// router name, for a namespaced controller, for the health controller
+/// and for the Active Storage controllers. It skips a redirect route and
+/// tries the later routes, as Rails does. The app has no root route, so
+/// `/` matches no route. Each expected value is the output of Rails
+/// 7.2.4 for the same routes.
+#[test]
+fn a_helper_recognizes_controller_paths_and_skips_redirect_routes() {
+    let run = on_the_index(
+        emit_and_run::real_blog()
+            .edit("config/routes.rb", "  root \"articles#index\"\n", "")
+            .edit(
+                "config/routes.rb",
+                "  resources :articles do",
+                "  namespace :admin do\n    resources :articles, only: [:index]\n  end\n  \
+                 get \"old\", to: redirect(\"/articles\")\n  \
+                 get \"moved\", to: redirect(\"/articles\")\n  \
+                 get \"moved\", to: \"articles#index\"\n  \
+                 get \"up\" => \"rails/health#show\"\n  \
+                 resources :articles do",
+            )
+            .write(
+                "app/controllers/admin/articles_controller.rb",
+                "class Admin::ArticlesController < ApplicationController\n  def index\n    @articles = Article.all\n  end\nend\n",
+            )
+            .write("app/views/admin/articles/index.html.erb", "<p>admin</p>\n")
+            .write(
+                "app/helpers/articles_helper.rb",
+                r##"module ArticlesHelper
+  def route_of(path)
+    recognized = Rails.application.routes.recognize_path(path)
+    recognized.map { |key, value| "#{key}=#{value}" }.join(" ")
+  rescue ActionController::RoutingError => e
+    "none: #{e.message}"
+  end
+end
+"##,
+            ),
+        r#"<i id="rp-namespaced"><%= route_of("/admin/articles") %></i>
+<i id="rp-redirect"><%= route_of("/old") %></i>
+<i id="rp-after-redirect"><%= route_of("/moved") %></i>
+<i id="rp-health"><%= route_of("/up") %></i>
+<i id="rp-disk"><%= route_of("/rails/active_storage/disk/k/x.png") %></i>
+<i id="rp-blob"><%= route_of("/rails/active_storage/blobs/redirect/abc/x.png") %></i>
+<i id="rp-no-root"><%= route_of("/") %></i>
+"#,
+        r#"    assert_match(/<i id="rp-namespaced">controller=admin\/articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-redirect">none: No route matches (&quot;|")\/old(&quot;|")<\/i>/, response.body)
+    assert_match(/<i id="rp-after-redirect">controller=articles action=index<\/i>/, response.body)
+    assert_match(/<i id="rp-health">controller=rails\/health action=show<\/i>/, response.body)
+    assert_match(/<i id="rp-disk">controller=active_storage\/disk action=show encoded_key=k filename=x format=png<\/i>/, response.body)
+    assert_match(/<i id="rp-blob">controller=active_storage\/blobs\/redirect action=show signed_id=abc filename=x format=png<\/i>/, response.body)
+    assert_match(/<i id="rp-no-root">none: No route matches (&quot;|")\/(&quot;|")<\/i>/, response.body)
+"#,
+    );
+    run.assert_passes();
+}
+
 /// B4 in NEXUS_BUGS.md: a partial in `app/views/application/` that a
 /// view in another directory renders. Rails looks in the view's own
 /// directory first, so a same-name partial there wins.
@@ -5930,6 +6515,50 @@ fn a_template_only_action_is_fed_by_its_before_action() {
         .assert_passes();
 }
 
+#[test]
+fn array_and_hash_checks_preserve_members() {
+    emit_and_run::real_blog()
+        .write("app/lib/container_narrowing_probe.rb", r##"class ContainerNarrowingProbe
+  def self.array_members
+    value = ["alpha", "beta"]
+    if value.is_a?(Array)
+      value.map { |item| item.upcase }
+    else
+      raise("not an Array")
+    end
+  end
+  def self.hash_members
+    value = {"answer" => 41}
+    if value.is_a?(Hash)
+      value.map { |key, item| "#{key.upcase}=#{item + 1}" }
+    else
+      raise("not a Hash")
+    end
+  end
+  def self.nested_members
+    value = [{"name" => "alpha"}, {"name" => "beta"}]
+    if value.is_a?(Array)
+      value.map do |item|
+        if item.is_a?(Hash)
+          item.fetch("name").upcase
+        else
+          raise("not a Hash")
+        end
+      end
+    else
+      raise("not an Array")
+    end
+  end
+end
+"##)
+        .run_ruby(r#"
+raise "Array members changed" unless ContainerNarrowingProbe.array_members == ["ALPHA", "BETA"]
+raise "Hash members changed" unless ContainerNarrowingProbe.hash_members == ["ANSWER=42"]
+raise "nested members changed" unless ContainerNarrowingProbe.nested_members == ["ALPHA", "BETA"]
+"#)
+        .assert_passes();
+}
+
 const ARTICLES_CONTROLLER: &str = "app/controllers/articles_controller.rb";
 const TRACK_FILTER: &str = "  def track\n    \
                               @tracked = %w[index show].include?(action_name)\n    \
@@ -6974,6 +7603,8 @@ end
 mod relation_finders;
 #[path = "emit_and_run/attach_hash.rs"]
 mod attach_hash;
+#[path = "emit_and_run/many_attached.rs"]
+mod many_attached;
 
 /// A controller under `ActionController::API`, the base `rails new
 /// --api` writes, dispatches (#163). The runtime defined only `Base`,
@@ -7733,62 +8364,6 @@ class CollectionConstants
 end
 "#)
         .run_ruby("raise 'qualified lowered constants' unless CollectionConstants.values == ['bb', true]")
-        .assert_passes();
-}
-
-#[path = "support/runtime_block_signature.rs"]
-mod runtime_block_signature;
-
-#[test]
-fn an_rbs_array_block_runs_after_app_emission() {
-    emit_and_run::real_blog()
-        .write("app/lib/batch.rb", runtime_block_signature::RUBY)
-        .write("sig/batch.rbs", runtime_block_signature::RBS)
-        .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
-        .assert_passes();
-}
-
-#[test]
-fn array_and_hash_checks_preserve_members() {
-    emit_and_run::real_blog()
-        .write("app/lib/container_narrowing_probe.rb", r##"class ContainerNarrowingProbe
-  def self.array_members
-    value = ["alpha", "beta"]
-    if value.is_a?(Array)
-      value.map { |item| item.upcase }
-    else
-      raise("not an Array")
-    end
-  end
-  def self.hash_members
-    value = {"answer" => 41}
-    if value.is_a?(Hash)
-      value.map { |key, item| "#{key.upcase}=#{item + 1}" }
-    else
-      raise("not a Hash")
-    end
-  end
-  def self.nested_members
-    value = [{"name" => "alpha"}, {"name" => "beta"}]
-    if value.is_a?(Array)
-      value.map do |item|
-        if item.is_a?(Hash)
-          item.fetch("name").upcase
-        else
-          raise("not a Hash")
-        end
-      end
-    else
-      raise("not an Array")
-    end
-  end
-end
-"##)
-        .run_ruby(r#"
-raise "Array members changed" unless ContainerNarrowingProbe.array_members == ["ALPHA", "BETA"]
-raise "Hash members changed" unless ContainerNarrowingProbe.hash_members == ["ANSWER=42"]
-raise "nested members changed" unless ContainerNarrowingProbe.nested_members == ["ALPHA", "BETA"]
-"#)
         .assert_passes();
 }
 
@@ -9769,4 +10344,33 @@ fn a_test_class_body_keeps_its_classes_and_modules_under_its_name() {
             );
         }
     }
+}
+
+#[test]
+fn an_rbs_array_block_runs_after_app_emission() {
+    emit_and_run::real_blog()
+        .write("app/lib/batch.rb", runtime_block_signature::RUBY)
+        .write("sig/batch.rbs", runtime_block_signature::RBS)
+        .run_ruby("raise 'wrong sum' unless Batch.new.consume == 3")
+        .assert_passes();
+}
+
+/// `pairs.to_h` with no block reads each element as a [key, value] pair; the
+/// ivar rewritten through it keeps its String keys and Integer values.
+#[test]
+fn an_ivar_rewritten_through_sort_by_to_h_runs() {
+    emit_and_run::real_blog()
+        .edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  def word_counts\n    @word_counts = {}\n    body.split.each do |w|\n      @word_counts[w] = 0 if @word_counts[w].nil?\n      @word_counts[w] += 1\n    end\n    @word_counts = @word_counts.sort_by { |k, v| [-v, k] }.to_h\n  end\n\n  def top_word\n    word_counts.keys.first\n  end\n",
+        )
+        .run_ruby(
+            r#"article = Article.create!(title: "Counts", body: "b a b c b a")
+counts = article.word_counts
+raise counts.inspect unless counts == { "b" => 3, "a" => 2, "c" => 1 }
+raise article.top_word.inspect unless article.top_word == "b"
+"#,
+        )
+        .assert_passes();
 }

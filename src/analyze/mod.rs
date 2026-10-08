@@ -69,6 +69,9 @@ pub(crate) mod forwarding;
 mod filter_targets;
 pub mod graphql;
 mod harvest_return;
+mod fixpoint_bound;
+mod fixpoint_rounds;
+pub use fixpoint_rounds::{FixpointRounds, LoopEnd};
 mod dirty_retype;
 mod superclass_binding;
 mod typing_mode;
@@ -187,8 +190,8 @@ pub struct Analyzer {
     /// at the recursion point (see `recursion`), which is what lets the
     /// fixpoint settle on recursive data shapes.
     recursive_methods: crate::det::HashSet<(ClassId, bool, Symbol)>,
-    /// Rounds each fixpoint loop of the last [`Self::analyze`] took to
-    /// settle; see [`Self::fixpoint_rounds`].
+    /// How each fixpoint loop of the last [`Self::analyze`] ended; see
+    /// [`Self::fixpoint_rounds`].
     fixpoint_rounds: FixpointRounds,
     /// See [`Self::constant_rounds`].
     constant_rounds: usize,
@@ -403,25 +406,6 @@ struct ParamTables {
     defined: BTreeSet<ParamKey>,
 }
 
-/// How many rounds each of [`Analyzer::analyze`]'s fixpoint loops ran
-/// before its signature stopped moving. `Some(n)` (1-based, at most
-/// [`FIXPOINT_CAP`]) means the n-th round's check found nothing moved;
-/// `None` means all `FIXPOINT_CAP` rounds ran and the last one still
-/// moved. `absorb` is `Some(0)` when view unification moved no
-/// production signature and the absorb loop never ran.
-///
-/// The `ROUNDHOUSE_TIMINGS` span labels count differently: each loop's
-/// first round has its own label (`typing passes (views after
-/// fixpoint)`, `typing passes (after view unify)`), and the rest are
-/// `round 1` … `round N-1`, so with a cap of 40 `round 39: absorb
-/// production` is the fortieth round. The `fixpoint rounds:` timing line prints this value.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FixpointRounds {
-    pub production: Option<usize>,
-    pub tests: Option<usize>,
-    pub absorb: Option<usize>,
-}
-
 /// Rounds a whole-program fixpoint loop may run.
 ///
 /// A backstop, not a budget: a loop that settles stops there. On the
@@ -436,23 +420,6 @@ pub const FIXPOINT_CAP: usize = 40;
 /// for asking whether a loop that reaches the cap would settle later.
 pub fn fixpoint_cap() -> usize {
     std::env::var("ROUNDHOUSE_FIXPOINT_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(FIXPOINT_CAP)
-}
-
-impl std::fmt::Display for FixpointRounds {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let one = |name: &str, n: Option<usize>| match n {
-            Some(0) => format!("{name} not run"),
-            Some(n) => format!("{name} settled in {n} of {}", fixpoint_cap()),
-            None => format!("{name} at cap {}, still moving", fixpoint_cap()),
-        };
-        write!(
-            f,
-            "{}; {}; {}",
-            one("production", self.production),
-            one("tests", self.tests),
-            one("absorb", self.absorb)
-        )
-    }
 }
 
 /// One call site's evidence for a `def`'s parameters: the receiver's
@@ -911,6 +878,42 @@ impl Analyzer {
                     id: ClassId(Symbol::from("ActiveStorage::Attached")),
                     args: vec![],
                 });
+            }
+            for (_span, attr) in crate::lower::attached::many_attached_attrs(model) {
+                cls.instance_methods.entry(attr).or_insert(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::AttachedMany")),
+                    args: vec![],
+                });
+            }
+            // `ActiveStorage::Attachment` helpers synthesized by
+            // `lower::attachment_model::push_attachment_record_methods`
+            // at the emit seam — register here so `attachment.url` /
+            // `.filename` resolve in check the same way the reader
+            // macros do.
+            if crate::lower::attachment_model::is_attachment_model(model) {
+                let blob = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Blob")),
+                    args: vec![],
+                };
+                let filename = Ty::Class {
+                    id: ClassId(Symbol::from("ActiveStorage::Filename")),
+                    args: vec![],
+                };
+                let nilable = |ty: Ty| Ty::Union {
+                    variants: vec![ty, Ty::Nil],
+                };
+                cls.instance_methods
+                    .entry(Symbol::from("blob"))
+                    .or_insert(nilable(blob));
+                cls.instance_methods
+                    .entry(Symbol::from("url"))
+                    .or_insert(Ty::Str);
+                cls.instance_methods
+                    .entry(Symbol::from("filename"))
+                    .or_insert(nilable(filename));
+                cls.instance_methods
+                    .entry(Symbol::from("content_type"))
+                    .or_insert(nilable(Ty::Str));
             }
             // `attr_accessor :x` — and `attr_accessor *CONST`, which is
             // how campfire's `Opengraph::Metadata` names its four. The
@@ -1453,11 +1456,6 @@ impl Analyzer {
         &self.classes
     }
 
-    /// Rounds the last [`Self::analyze`]'s fixpoint loops took.
-    pub fn fixpoint_rounds(&self) -> FixpointRounds {
-        self.fixpoint_rounds
-    }
-
     /// The most rounds one constant registry build of the last
     /// [`Self::analyze`] took to settle its values.
     pub fn constant_rounds(&self) -> usize {
@@ -1477,6 +1475,12 @@ impl Analyzer {
         side: MethodReceiver,
     ) -> Option<&[Ty]> {
         self.inferred_params.get(&(class.clone(), method.clone(), side)).map(|v| v.as_slice())
+    }
+
+    /// How the fixpoint loops of the last [`Self::analyze`] ended; all
+    /// [`LoopEnd::NotRun`] before it.
+    pub fn fixpoint_rounds(&self) -> FixpointRounds {
+        self.fixpoint_rounds
     }
 
     /// Walk the app, annotating every expression's `ty` field, then
@@ -1689,6 +1693,11 @@ impl Analyzer {
             )
         });
 
+        let mut rounds = FixpointRounds {
+            production: LoopEnd::RanToCap,
+            views_and_tests: LoopEnd::RanToCap,
+            absorb: LoopEnd::NotRun,
+        };
         // Whole-program fixpoint: harvest returns + unify params, re-type,
         // repeat until the registry signature stabilizes. Each round
         // carries a fact one link further, so the cap bounds the longest
@@ -1724,7 +1733,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
-                self.fixpoint_rounds.production = Some(round + 1);
+                rounds.production = LoopEnd::Settled(round);
                 break;
             }
             drop(_sig);
@@ -1823,7 +1832,7 @@ impl Analyzer {
             if self.inference_matches(&prev_hints.sig)
                 && self.block_value_matches(&prev_hints)
             {
-                self.fixpoint_rounds.tests = Some(round + 1);
+                rounds.views_and_tests = LoopEnd::Settled(round);
                 break;
             }
             self.refresh_dirty_hints(&mut prev_hints);
@@ -1832,6 +1841,7 @@ impl Analyzer {
             fixpoint_debug::report("absorb entry vs production", &production_sig, &self.capture_inference_sig());
         }
         if !self.inference_matches(&production_sig) {
+            rounds.absorb = LoopEnd::RanToCap;
             let mut absorb_hints = self.capture_dirty_hints();
             let mut cycles = cycles.next_loop();
             // The view/test rounds above moved signatures that
@@ -1880,14 +1890,13 @@ impl Analyzer {
                 if self.inference_matches(&absorb_hints.sig)
                     && self.block_value_matches(&absorb_hints)
                 {
-                    self.fixpoint_rounds.absorb = Some(round + 1);
+                    rounds.absorb = LoopEnd::Settled(round);
                     break;
                 }
                 absorb_dirty = self.dirty_classes_for_retype(app, &absorb_hints);
                 self.refresh_dirty_hints(&mut absorb_hints);
             }
         } else {
-            self.fixpoint_rounds.absorb = Some(0);
             // View unify did not move production signatures, but helper
             // *bodies* still need a pass against view-inferred params
             // (`highlight_searched_content`'s `content` is only called
@@ -1922,6 +1931,7 @@ impl Analyzer {
                 )
             });
         }
+        self.fixpoint_rounds = rounds;
         crate::timings::note(format_args!("fixpoint rounds: {}", self.fixpoint_rounds));
         // Wave 12 types views once against production-only helper
         // returns, then unifies helper params from those sites. Helper
@@ -2169,7 +2179,7 @@ impl Analyzer {
                 class_objects: Default::default(),
                 constants: Default::default(),
                 annotate_self_dispatch: false,
-                in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             self.body_typer().analyze_expr(&mut helper.body, &ctx);
         }
@@ -2622,7 +2632,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: shared.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                     };
                     let deps = body::DepRecorder::default();
                     let mut value = match std::mem::replace(&mut cur[index], Cur::Source) {
@@ -3088,7 +3098,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             for item in model.body.iter_mut() {
                 if let ModelBodyItem::Unknown { expr, .. } = item {
@@ -3105,7 +3115,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // Pass A: type every method body with only `@attributes`
@@ -3174,7 +3184,7 @@ impl Analyzer {
                     local_bindings: HashMap::default(),
                     class_objects: Default::default(),
                     constants: class_constants.clone(),
-                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                    annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                 };
 
                 for scope in model.scopes_mut() {
@@ -3226,7 +3236,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: global_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
             if retype {
                 for item in controller.body.iter_mut() {
@@ -3247,7 +3257,7 @@ impl Analyzer {
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
                 constants: class_constants.clone(),
-                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // Snapshot this controller's own segment of the filter chain
@@ -3798,7 +3808,7 @@ impl Analyzer {
                             local_bindings: HashMap::default(),
                             class_objects: Default::default(),
                             constants: meta.class_constants.clone(),
-                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                            annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                         };
                         // Seed helper-method params from the inferred-params
                         // table too, so `period(query)`'s body resolves on
@@ -4307,7 +4317,7 @@ impl Analyzer {
                         class_objects: Default::default(),
                         constants: class_constants.clone(),
                         annotate_self_dispatch: false,
-                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                        in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                     };
                     let origin = app
                         .concern_spliced_actions
@@ -4553,7 +4563,7 @@ impl Analyzer {
                 ivar_bindings: HashMap::default(),
                 local_bindings: HashMap::default(),
                 class_objects: Default::default(),
-                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
             };
 
             // The initializers run in order on the class object, so one
@@ -4709,7 +4719,7 @@ impl Analyzer {
                     ivar_bindings: reseeded,
                     local_bindings: HashMap::default(),
                     class_objects: Default::default(),
-                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None,
+                    constants: Default::default(), annotate_self_dispatch: false, in_view: false, class_side: false, claimed_macro_template: false, enclosing_def: None, instance_body: false,
                 };
                 for method in &mut lc.methods {
                     let mut mctx = self.seed_method_params(&reseeded_ctx, &lc_name, method, true);
@@ -4887,6 +4897,12 @@ impl Analyzer {
             let mut targets = Vec::new();
             extract_partial_render_sites(&view.body, &view.name, &mut throwaway, &mut targets);
             record_render_edges(&mut render_edges, &view.name, targets);
+        }
+        // A jbuilder template renders its partials through
+        // `json.partial!` / `json.array!` and the `partial:` option, not
+        // `render`, and its partials read its ivars all the same.
+        for (renderer, targets) in crate::lower::jbuilder_to_library::jbuilder_render_edges(app) {
+            record_render_edges(&mut render_edges, &renderer, targets);
         }
 
         // Propagate each renderer's ivar context onto the partials it
@@ -5197,6 +5213,7 @@ impl Analyzer {
         let mut ctx = base.clone();
         ctx.class_side = matches!(method.receiver, crate::dialect::MethodReceiver::Class);
         ctx.enclosing_def = Some((method.name.clone(), ctx.class_side));
+        ctx.instance_body = !ctx.class_side;
         // Class-method bodies named after a first-class model DSL
         // (`has_markdown`, `has_rich_text`, …) are macro templates —
         // association/`scope` leftovers inside them are claimed at
@@ -5209,6 +5226,7 @@ impl Analyzer {
                 method.name.as_str(),
                 "generates_token_for"
                     | "has_one_attached"
+                    | "has_many_attached"
                     | "has_rich_text"
                     | "has_markdown"
                     | "has_secure_token"
@@ -5286,6 +5304,7 @@ impl Analyzer {
         let from_origin =
             origin.and_then(|m| self.inferred_params.get(&(m.clone(), action_name.clone(), MethodReceiver::Instance)));
         let mut ctx = base.clone();
+        ctx.instance_body = true;
         for (i, name) in params.fields.keys().enumerate() {
             if self.declared_untyped_param(class_id, action_name, false, Some(i), name) {
                 ctx.local_bindings.insert(name.clone(), Ty::Untyped);
@@ -6676,6 +6695,12 @@ impl Analyzer {
             })
             .filter(|(_, includes)| !includes.is_empty())
             .collect();
+        // `self.classes` is a HashMap: without a fixed order the
+        // includers' observations reach the module's slot in a
+        // different order every run, and a union's variant order (or
+        // any order-sensitive join) leaks into the emitted signature.
+        let mut targets = targets;
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
         let mut adds: Vec<(ParamKey, Vec<Ty>)> = Vec::new();
         for (id, includes) in targets {
             let mut queue = includes;
@@ -6718,7 +6743,7 @@ impl Analyzer {
                 entry.resize(tys.len(), Ty::Var { var: crate::ident::TyVar(0) });
             }
             for (slot, observed) in entry.iter_mut().zip(tys.into_iter()) {
-                *slot = unify_param_ty(slot.clone(), observed);
+                *slot = fixpoint_bound::bound(unify_param_ty(slot.clone(), observed));
             }
         }
     }
@@ -6892,7 +6917,7 @@ impl Analyzer {
         mut arg_tys: Vec<Ty>,
         kw: SiteKeywords,
     ) -> Vec<Ty> {
-        if let Some(shape) = shape.filter(|s| s.keywords_by_kind) {
+        if let Some(shape) = shape.filter(|s| s.keywords_by_kind || kw.anonymous_forward) {
             if kw.group {
                 if let Some(placed) =
                     Self::bind_keyword_group(shape, &arg_tys, &kw.keys, kw.splat.as_ref())
@@ -7065,7 +7090,7 @@ impl Analyzer {
                 // chases — the reverse call graph now decides retype,
                 // so Class-only receivers would leave callers of
                 // `records.first.foo` off the frontier.
-                let recv_classes: Vec<ClassId> = match recv {
+                let mut recv_classes: Vec<ClassId> = match recv {
                     Some(r) => r
                         .ty
                         .as_ref()
@@ -7080,6 +7105,31 @@ impl Analyzer {
                         .into_iter()
                         .collect(),
                 };
+                // An `x.class` site is a class-side call (`site_side`
+                // below), but `apply_param_sites` moves a site to the
+                // other side when only that side defines the name. For
+                // `self.class.get(url, opts)` under HTTParty (a class-side
+                // `get` the app never defines) that would feed the
+                // instance `def get`, which then wrapped its own
+                // `{ query: params }` one level deeper every round. Drop
+                // an `x.class` site for a receiver that defines the name
+                // only as an instance method; when it also defines
+                // `def self.<name>`, the per-side params key already keeps
+                // the site off the instance method. Constant receivers
+                // stay: `UserMailer.welcome(user)` and an `extend self`
+                // module's `GlobalPath.cdn_path(p)` are how their instance
+                // methods run.
+                let via_dot_class = recv.as_ref().is_some_and(|r| {
+                    matches!(&*r.node, ExprNode::Send { method: m, args, .. }
+                        if m.as_str() == "class" && args.is_empty())
+                });
+                if via_dot_class {
+                    recv_classes.retain(|c| {
+                        !self.classes.get(c).is_some_and(|k| {
+                            k.instance_methods.contains_key(method) && !k.class_methods.contains_key(method)
+                        })
+                    });
+                }
                 if !recv_classes.is_empty() {
                     let arg_tys: Vec<Ty> = args
                         .iter()
@@ -7134,6 +7184,10 @@ impl Analyzer {
                             }
                             if all_sym { pairs } else { Vec::new() }
                         }
+                        // The anonymous packet is merged after these
+                        // pairs, so it can overwrite every explicit key.
+                        // Keep the group as unknown keyword evidence below
+                        // instead of inferring the explicit values as final.
                         _ => Vec::new(),
                     };
                     // Whether the last argument is the call's keyword
@@ -7141,7 +7195,10 @@ impl Analyzer {
                     // `**splat`, never a positional `{…}` literal.
                     let group = matches!(
                         args.last().map(|a| &*a.node),
-                        Some(ExprNode::Hash { kwargs: true, .. } | ExprNode::KeywordSplat { .. })
+                        Some(ExprNode::Hash { kwargs: true, .. }
+                            | ExprNode::KeywordSplat { .. }
+                            | ExprNode::ForwardKeywords
+                            | ExprNode::ForwardKeywordsWithPairs { .. })
                     );
                     // The splat merges over the literal, so each literal
                     // key may take the splat's value too.
@@ -7154,9 +7211,20 @@ impl Analyzer {
                                     .collect();
                                 (joined, Some(v))
                             }),
+                        Some(ExprNode::ForwardKeywordsWithPairs { .. }) => {
+                            // The opaque forwarded packet merges after the
+                            // literal entries and can override each key.
+                            // Its values are unavailable, so the signature
+                            // binder leaves named parameters uninferred.
+                            (Vec::new(), None)
+                        }
                         _ => (keys, None),
                     };
-                    let kw_tys = SiteKeywords { group, keys, splat };
+                    let anonymous_forward = matches!(
+                        args.last().map(|a| &*a.node),
+                        Some(ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. })
+                    );
+                    let kw_tys = SiteKeywords { group, keys, splat, anonymous_forward };
                     // `Klass.new(a, b)` hands its arguments to
                     // `initialize` — that is all `Class#new` does with
                     // them — so the site is evidence for the
@@ -7212,6 +7280,12 @@ impl Analyzer {
                 for (k, v) in entries {
                     self.collect_send_sites(k, self_class, side, helpers, out);
                     self.collect_send_sites(v, self_class, side, helpers, out);
+                }
+            }
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    self.collect_send_sites(key, self_class, side, helpers, out);
+                    self.collect_send_sites(value, self_class, side, helpers, out);
                 }
             }
             ExprNode::If { cond, then_branch, else_branch } => {
@@ -8203,7 +8277,8 @@ fn observe_into(entry: &mut Vec<Ty>, arg_tys: Vec<Ty>) {
     }
     for (slot, observed) in entry.iter_mut().zip(arg_tys) {
         let before = std::mem::replace(slot, Ty::Untyped);
-        *slot = unify_param_ty(before, observed);
+        // Bounded: the slot is the next round's input (`fixpoint_bound`).
+        *slot = fixpoint_bound::bound(unify_param_ty(before, observed));
     }
 }
 
@@ -8212,7 +8287,8 @@ fn observe_into(entry: &mut Vec<Ty>, arg_tys: Vec<Ty>) {
 /// joinrules at a higher level — we operate on `Ty` directly, so the
 /// rules are:
 /// - same type → keep
-/// - one side is `Ty::Var` (no info yet) → take the other
+/// - one side is `Ty::Var` (no info yet) → take the other, including
+///   when the other is `Untyped` (`Var` is the bottom of the join)
 /// - one side is `Untyped` (an argument nobody could type) → take the
 ///   other: an untyped observation says nothing about the value, and
 ///   letting it into the union turns every concrete observation into
@@ -8227,10 +8303,13 @@ fn unify_param_ty(stored: Ty, observed: Ty) -> Ty {
     if stored == observed {
         return stored;
     }
-    // `Var` before `Untyped`: either order of a Var and an Untyped
-    // observation must give Untyped. Taking whichever came second made
-    // the join depend on iteration order, and `param_ty_with_default`
-    // reads the two differently (a Var slot falls back to the default).
+    // `Var` is checked on both sides before `Untyped` so the join is
+    // commutative: `Var` (no observation) is below `Untyped` (an
+    // observed argument nobody could type), and `Untyped` is below a
+    // concrete type. Testing `Var | Untyped` together on `stored`
+    // first made `unify(Untyped, Var) = Var` but `unify(Var, Untyped)
+    // = Untyped`, so the result depended on the order call sites
+    // arrived in (#209).
     if matches!(stored, Ty::Var { .. }) {
         return observed;
     }
@@ -8594,6 +8673,9 @@ struct SiteKeywords {
     /// keyword the literal does not name can receive. `keys` then holds
     /// the literal's pairs.
     splat: Option<Ty>,
+    /// The opaque final `**` can override the explicit pairs, so they are
+    /// not type evidence for the receiving named parameters.
+    anonymous_forward: bool,
 }
 
 /// How a call's arguments map onto the slots of the `def` it reaches;
@@ -9081,7 +9163,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // Short-circuit compound assignment to an ivar (`@x ||= y`,
@@ -9094,7 +9176,7 @@ pub(crate) fn extract_ivar_assignments_in(
                     Some(prev) => crate::analyze::body::union_of(prev, ty),
                     None => ty,
                 };
-                out.insert(name.clone(), merged);
+                out.insert(name.clone(), fixpoint_bound::bound(merged));
             }
         }
         // `@a, @b = expr` — destructuring assignment. Each ivar target
@@ -9113,7 +9195,7 @@ pub(crate) fn extract_ivar_assignments_in(
                             Some(prev) => crate::analyze::body::union_of(prev, ty),
                             None => ty,
                         };
-                        out.insert(name.clone(), merged);
+                        out.insert(name.clone(), fixpoint_bound::bound(merged));
                     }
                 }
             }
@@ -9272,7 +9354,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // the Crystal collector's "fresh entry" branch.
         out.insert(
             name.clone(),
-            Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) },
+            fixpoint_bound::bound(Ty::Hash { key: Box::new(Ty::Str), value: Box::new(incoming.clone()) }),
         );
         return;
     };
@@ -9290,7 +9372,7 @@ fn widen_hash_ivar_value(out: &mut HashMap<Symbol, Ty>, name: &Symbol, incoming:
         // The general widening is exactly the canonical type join.
         Box::new(crate::analyze::body::union_of((**value).clone(), incoming.clone()))
     };
-    out.insert(name.clone(), Ty::Hash { key, value });
+    out.insert(name.clone(), fixpoint_bound::bound(Ty::Hash { key, value }));
 }
 
 // Diagnostic emission -----------------------------------------------------

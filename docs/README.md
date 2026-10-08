@@ -49,6 +49,8 @@ references explain design, while working plans are point-in-time proposals.
 ## Reference
 
 - [`writebook.md`](writebook.md) — pinned external-corpus inventory and its limits.
+- [`ractor-ledger.md`](ractor-ledger.md) — what stops campfire's CRuby
+  emit from serving on worker Ractors, by owner (dated snapshot).
 
 ## Working plans
 

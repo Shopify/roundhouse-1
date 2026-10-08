@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
+    // CARGO_MANIFEST_DIR is Cargo-injected for build scripts; Cargo does not
+    // honor rerun-if-env-changed for it (cargo#8693). Switching checkouts that
+    // share a target dir is covered by reading the env at execution time below.
     embed_runtime_files();
     embed_rbs_files();
     println!("cargo:rerun-if-env-changed=ROUNDHOUSE_COMMIT");

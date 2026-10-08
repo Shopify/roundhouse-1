@@ -85,11 +85,16 @@ module Tep
     end
 
     # What the server must answer instead of reading this request's body:
-    # 400 for a Content-Length that is not a byte count, 413 for one past
-    # `max`, 0 to go ahead. Decided from the headers alone, so a refused
+    # 400 for unsupported Transfer-Encoding or an invalid Content-Length,
+    # 413 for a length past `max`, 0 to go ahead. Decided from the headers alone, so a refused
     # body is never read — each server asks this BEFORE its drain, since
     # the drain itself is what held the bytes.
     def body_refusal(max)
+      # There is no request chunk decoder. Even an empty field is a
+      # Transfer-Encoding, so check presence, not its string value.
+      if @req_headers.key?("transfer-encoding")
+        return 400
+      end
       cl = content_length
       if cl < 0
         return 400

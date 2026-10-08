@@ -397,6 +397,51 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         );
         classes.insert(attached_id.clone(), attached);
 
+        // `has_many_attached` proxy — `attachments` answers
+        // `ManyAttachment` (runtime join-row value), not the
+        // synthesized Attachment MODEL, so the registry can name it
+        // without racing the model loop.
+        {
+            let many_row_id = ClassId(Symbol::from("ActiveStorage::ManyAttachment"));
+            let mut many_row = ClassInfo::default();
+            many_row.instance_methods.insert(Symbol::from("id"), Ty::Int);
+            many_row.instance_methods.insert(
+                Symbol::from("blob"),
+                Ty::Union {
+                    variants: vec![class_ty(&blob_id), Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("filename"),
+                Ty::Union {
+                    variants: vec![class_ty(&filename_id), Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("content_type"),
+                Ty::Union {
+                    variants: vec![Ty::Str, Ty::Nil],
+                },
+            );
+            many_row.instance_methods.insert(Symbol::from("url"), Ty::Str);
+            classes.insert(many_row_id.clone(), many_row);
+
+            let many_id = ClassId(Symbol::from("ActiveStorage::AttachedMany"));
+            let mut many = ClassInfo::default();
+            many.instance_methods.insert(Symbol::from("attached?"), Ty::Bool);
+            many.instance_methods.insert(
+                Symbol::from("attachments"),
+                Ty::Array {
+                    elem: Box::new(class_ty(&many_row_id)),
+                },
+            );
+            many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("attach"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("purge"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("destroy"), Ty::Nil);
+            classes.insert(many_id, many);
+        }
+
         let mut blob = ClassInfo::default();
         for (m, ty) in [
             ("id", Ty::Int),
@@ -413,6 +458,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("audio?", Ty::Bool),
             ("variable?", Ty::Bool),
             ("url", Ty::Str),
+            // Attachment#url and Attached#url call `redirect_url`;
+            // register it beside `url` so synthesized helpers type.
+            ("redirect_url", Ty::Str),
             // Action Text's `_blob` partial: a previewable or variable
             // blob renders through `representation(transformations)`.
             ("representable?", Ty::Bool),

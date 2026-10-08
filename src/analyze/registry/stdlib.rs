@@ -220,6 +220,26 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("clear", Ty::Nil), ("push", Ty::Untyped), ("pop", Ty::Untyped), ("flush", Ty::Untyped),
         ("nestable", Ty::Bool), ("nestable=", Ty::Bool),
     ], &[]);
+    // GlobalID mint + Locator — unsigned `param`/`uri`/`signed` and the
+    // locate / locate_signed class methods. Return types for locate*
+    // with a literal `only:` are refined in `body/send.rs` to the named
+    // model (nilable); Untyped here is the gradual fallback for a
+    // computed `only:`.
+    {
+        let mut gid = ClassInfo::default();
+        for m in ["param", "uri", "signed"] {
+            gid.class_methods.insert(Symbol::from(m), Ty::Str);
+        }
+        classes.insert(ClassId(Symbol::from("GlobalID")), gid);
+        let mut locator = ClassInfo::default();
+        locator
+            .class_methods
+            .insert(Symbol::from("locate"), Ty::Untyped);
+        locator
+            .class_methods
+            .insert(Symbol::from("locate_signed"), Ty::Untyped);
+        classes.insert(ClassId(Symbol::from("GlobalID::Locator")), locator);
+    }
 
     // `ActionController::BrowserBlocker.blocked?(user_agent, floors)` —
     // the gate `ingest::allow_browser` synthesizes into a controller
@@ -756,10 +776,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         "TypeError", "NameError", "NoMethodError", "IndexError",
         "KeyError", "RangeError", "IOError", "NotImplementedError",
         "FrozenError", "ZeroDivisionError", "StopIteration",
-        // Both CRuby's bundled libraries and Spinel's uri/net packages
-        // define these exception classes; emitted requires load them.
+        "ThreadError", "ClosedQueueError",
+        // CRuby's bundled libraries and Spinel's uri/net/json packages
+        // recognize these exception names; emitted requires load them.
         "URI::InvalidURIError", "Net::OpenTimeout", "Net::ReadTimeout",
-        "OpenSSL::OpenSSLError", "JSON::ParserError",
+        "OpenSSL::OpenSSLError", "JSON::ParserError", "JSON::GeneratorError",
         // Campfire tip: `rescue SystemCallError` / `OpenSSL::SSL::SSLError`
         // on pooled web-push connections; `rescue Vips::Error` beside
         // ActiveStorage::PreviewError when drawing attachment variants.
@@ -803,6 +824,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("SQLite3::SQLException", None),
         // The `sqlite3` gem's constraint error, raised by its driver on that tree.
         ("SQLite3::ConstraintException", None),
+        ("ActiveRecord::SoleRecordExceeded", None),
         // Not `ActiveRecord::Base`: no instance surface is registered there, so `e.record.errors` would still fail.
         ("ActiveRecord::RecordInvalid", Some(("record", Ty::Untyped))),
         // Names overlap `project::RUBY_FAMILY_RUNTIME_CONSTANTS` (emit
@@ -981,6 +1003,14 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // (`Fiber[:db_handle]`, Spinel's scheduled server); `project`
     // refuses it where a target supplies none. No surface is invented.
     register_stdlib_class(classes, "Fiber", &[], &[]);
+    // The queue constructors, Thread's core aliases, and the standard
+    // mixins likewise need exact entries for source constant resolution.
+    // No queue element, synchronization or mixin method types are added;
+    // the Ruby-family runtimes supply the actual behavior.
+    for name in ["Queue", "SizedQueue", "Thread::Queue", "Thread::SizedQueue",
+        "Thread::Mutex", "Comparable", "Enumerable"] {
+        register_stdlib_class(classes, name, &[], &[]);
+    }
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
     // Registered so the analyzer does not report it as unknown. The
     // element type is not known from a scalar argument.

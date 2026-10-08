@@ -292,6 +292,78 @@ module Db
     nil
   end
 
+  # A write that returns rows (`INSERT … RETURNING`, roundhouse#91),
+  # as in db_cruby.rb: the query cache is cleared, every row is read
+  # before the statement closes, and the handle replays them (step,
+  # column_*, finalize as for a read). `changes` is the write's row count.
+  def self.exec_returning(sql)
+    v = loaded_sqlite_version
+    if !returning_supported?(v)
+      raise "Db.exec_returning: RETURNING needs SQLite 3.35 or newer; this driver bundles " + v.to_s
+    end
+    record_query(sql)
+    qcache = Fiber[:rh_qcache]
+    qcache.clear unless qcache.nil?
+    rows = []
+    names = []
+    st = current_dbh.raw.create_statement
+    begin
+      if st.execute(sql)
+        rs = st.get_result_set
+        begin
+          md = rs.get_meta_data
+          n = md.get_column_count
+          names = (1..n).map { |k| md.get_column_name(k) }
+          while rs.next
+            rows << (1..n).map { |k| rs.get_object(k) }
+          end
+        ensure
+          rs.close
+        end
+      end
+    rescue StandardError => e
+      raise ActiveRecord::RecordNotUnique, e.message if Db.unique_violation?(e.message)
+      raise
+    ensure
+      st.close
+    end
+    handle = Stmt.new(nil, false)
+    handle.sql = sql
+    handle.replay = { rows: rows, names: names, eof: true }
+    handle
+  end
+
+  # Test-only hook, matching the Spinel SQLite shim's (db.rb) accessor of
+  # the same name: always 0 here, since an exec_returning handle is a
+  # plain Stmt object — there is no persistent array of outstanding
+  # captures to leak.
+  def self.qc_cursor_count
+    0
+  end
+
+  # RETURNING arrived in SQLite 3.35.0 (3035000). An older library gets
+  # a clear error rather than a syntax error, as #91 agreed.
+  def self.returning_supported?(version_number)
+    version_number >= 3035000
+  end
+
+  # The SQLite the JDBC driver bundles, as 3035000 for 3.35.0. Asked
+  # once per process.
+  def self.loaded_sqlite_version
+    @sqlite_version ||= begin
+      st = current_dbh.raw.create_statement
+      begin
+        rs = st.execute_query("SELECT sqlite_version()")
+        rs.next
+        major, minor, patch = rs.get_string(1).to_s.split(".").map(&:to_i)
+        rs.close
+        major * 1_000_000 + minor.to_i * 1000 + patch.to_i
+      ensure
+        st.close
+      end
+    end
+  end
+
   # A UNIQUE-index violation is `ActiveRecord::RecordNotUnique`, not
   # whatever this driver raises. Rails' contract is what apps write
   # against — campfire's sign-up rescues it to turn a lost race into a

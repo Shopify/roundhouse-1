@@ -146,6 +146,13 @@ impl super::Analyzer {
             | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
 
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (key, value) in entries {
+                    self.visit_effects(key, ctx, out);
+                    self.visit_effects(value, ctx, out);
+                }
+            }
+
             ExprNode::Return { value } => self.visit_effects(value, ctx, out),
 
             ExprNode::Super { args, block } => {

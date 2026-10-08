@@ -44,6 +44,11 @@ module Db
   def self.bind_int_opt: (Integer, Integer, Integer?) -> void
   def self.bind_text_opt: (Integer, Integer, String?) -> void
   def self.bind_bool_opt: (Integer, Integer, bool?) -> void
+  # A write with a RETURNING clause (roundhouse#91): runs like `exec`
+  # (and clears the query cache like it), then answers a handle over the
+  # returned rows: step?/column_*/finalize as for a read. `changes` is
+  # the write's affected-row count.
+  def self.exec_returning: (String) -> Integer
   def self.last_insert_rowid: () -> Integer
   def self.changes: () -> Integer
   # Query-log capture (issue #27) — records the SQL each prepare/exec

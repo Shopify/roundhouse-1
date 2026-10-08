@@ -3831,6 +3831,11 @@ fn walk_decl_body_in<'pr>(
                 if let Some(source) = out.methods.iter().rposition(|method| method.name.as_str() == from && method.receiver == receiver) {
                     let mut copy = out.methods[source].clone();
                     copy.name = Symbol::from(to.as_str());
+                    copy.name_span = Span {
+                        file: super::sources::file_id(file),
+                        start: alias.location().start_offset() as u32,
+                        end: alias.location().end_offset() as u32,
+                    };
                     visibility.apply(&statement, &mut copy);
                     out.method_aliases.push(crate::dialect::MethodAlias {
                         name: copy.name.clone(),
@@ -4118,10 +4123,10 @@ fn walk_decl_body_in<'pr>(
                         //   attr_writer :foo  → def foo=(v); @foo = v; end
                         //   attr_accessor :foo → both
                         // The `cattr_*` / `mattr_*` (ActiveSupport class- and
-                        // module-level attribute accessors) generate the same
-                        // pair on the *singleton*, so a bare `Keybase.DOMAIN`
-                        // resolves; we model the class form (Rails also makes
-                        // instance-level copies, not needed by the corpus).
+                        // module-level attribute accessors) use @@ storage
+                        // shared across the class hierarchy. We model the
+                        // class form (Rails also makes instance-level
+                        // copies; models synthesize those separately).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
                         if is_class_attr && !force_class_receiver {
@@ -4149,11 +4154,19 @@ fn walk_decl_body_in<'pr>(
                         } else {
                             MethodReceiver::Instance
                         };
+                        // Keep generated accessors at their source declaration when
+                        // initializers and methods are emitted in body order.
+                        let name_span = Span {
+                            file: super::sources::file_id(file),
+                            start: call.location().start_offset() as u32,
+                            end: call.location().end_offset() as u32,
+                        };
                         for name in &names {
                             let want_reader = kw.ends_with("_reader") || kw.ends_with("_accessor");
                             let want_writer = kw.ends_with("_writer") || kw.ends_with("_accessor");
                             if want_reader {
                                 let mut method = synth_attr_reader(owner, name, recv);
+                                method.name_span = name_span;
                                 visibility.apply(&statement, &mut method);
                                 // Skip when a `def` of this name already
                                 // walked (unusual order); a later `def`
@@ -4166,6 +4179,7 @@ fn walk_decl_body_in<'pr>(
                             }
                             if want_writer {
                                 let mut method = synth_attr_writer(owner, name, recv);
+                                method.name_span = name_span;
                                 visibility.apply(&statement, &mut method);
                                 if !out.methods.iter().any(|e| {
                                     e.name == method.name && e.receiver == method.receiver
@@ -4190,6 +4204,11 @@ fn walk_decl_body_in<'pr>(
                             alias_source(&call, &out.methods, force_class_receiver).unwrap();
                         let mut copy = out.methods[source].clone();
                         copy.name = Symbol::from(to.as_str());
+                        copy.name_span = Span {
+                            file: super::sources::file_id(file),
+                            start: call.location().start_offset() as u32,
+                            end: call.location().end_offset() as u32,
+                        };
                         visibility.apply(&statement, &mut copy);
                         out.method_aliases.push(crate::dialect::MethodAlias {
                             name: copy.name.clone(),
@@ -6059,6 +6078,7 @@ fn unknown_is_block_callback(item: &crate::dialect::ModelBodyItem) -> bool {
 const CONCERN_MODEL_MACROS: &[&str] = &[
     "generates_token_for",
     "has_one_attached",
+    "has_many_attached",
     "has_rich_text",
     "has_markdown",
     "has_secure_token",

@@ -1273,6 +1273,12 @@ fn collect_untyped_lowered(
         | ExprNode::ForwardKeywords
         | ExprNode::Defined { .. }
         | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_untyped_lowered(key, path, out);
+                collect_untyped_lowered(value, path, out);
+            }
+        }
         ExprNode::If { cond, then_branch, else_branch } => {
             collect_untyped_lowered(cond, &format!("{path}/if.cond"), out);
             collect_untyped_lowered(then_branch, &format!("{path}/if.then"), out);
@@ -1611,11 +1617,13 @@ fn unclaimed_model_dsl_reports_spanned_error() {
     use roundhouse::ingest::ingest_model;
     use roundhouse::schema::Schema;
 
-    // `has_many_attached` is the unclaimed one; `has_one_attached` is
-    // claimed by lower::attached and must not report beside it.
+    // `unclaimed_macro` stands in for any Unknown DSL; `has_one_attached`
+    // and `has_many_attached` are both claimed by lower::attached and
+    // must not report beside it.
     let source = br#"class Clip < ApplicationRecord
   has_one_attached :audio
   has_many_attached :stems
+  unclaimed_macro :flag
 
   validates :name, presence: true
 end
@@ -1631,13 +1639,13 @@ end
     let unsupported: Vec<_> = diags
         .iter()
         .filter(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
-            if construct.as_str() == "has_many_attached"))
+            if construct.as_str() == "unclaimed_macro"))
         .collect();
     assert_eq!(unsupported.len(), 1, "exactly one report: {diags:?}");
     assert!(
         !diags.iter().any(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
-            if construct.as_str() == "has_one_attached")),
-        "has_one_attached is claimed by lower::attached and must not report: {diags:?}"
+            if construct.as_str() == "has_one_attached" || construct.as_str() == "has_many_attached")),
+        "has_*_attached are claimed by lower::attached and must not report: {diags:?}"
     );
     let d = unsupported[0];
     assert_eq!(d.severity, Severity::Error, "the class does not run it: a check error");

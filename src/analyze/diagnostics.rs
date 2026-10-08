@@ -511,6 +511,7 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
         && !matches!(
             &*expr.node,
             ExprNode::Seq { .. } | ExprNode::ForwardArgs | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
         )
     {
         let kind = DiagnosticKind::GradualUntyped {
@@ -752,6 +753,12 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
             if let Some(v) = value { diagnose_expr(v, out); }
         }
         ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => diagnose_expr(value, out),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                diagnose_expr(key, out);
+                diagnose_expr(value, out);
+            }
+        }
         ExprNode::MultiAssign { targets, value } => {
             diagnose_expr(value, out);
             for target in targets {

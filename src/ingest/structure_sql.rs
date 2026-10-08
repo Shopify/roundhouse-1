@@ -33,7 +33,10 @@
 
 use crate::det::HashSet;
 
-use crate::schema::{Column, ColumnType, ForeignKey, Index, ReferentialAction, Schema, Table};
+use crate::schema::{
+    Column, ColumnType, ForeignKey, GeneratedColumn, GeneratedColumnStorage, Index,
+    ReferentialAction, Schema, Table,
+};
 use crate::{Symbol, TableRef};
 
 use super::{IngestError, IngestResult};
@@ -154,7 +157,7 @@ fn dispatch_statement(
         return;
     }
     if starts_with_ci(stmt, "CREATE UNIQUE INDEX") || starts_with_ci(stmt, "CREATE INDEX") {
-        handle_create_index(stmt, schema);
+        handle_create_index(stmt, file, schema, gaps);
         return;
     }
     if starts_with_ci(stmt, "ALTER TABLE") {
@@ -322,10 +325,31 @@ fn handle_create_table(
     // inspected — none of it changes the column list, and schema.rb
     // has no equivalent to round-trip it into anyway. (MySQL's table
     // options — `ENGINE`, `DEFAULT CHARSET`, `COLLATE`, `ROW_FORMAT` —
-    // sit there too.) A key over a column the walk dropped cannot
-    // apply, the same retain-filter `handle_create_index` uses.
+    // sit there too.)
+    let mut table = Table {
+        name: Symbol::from(table_name.as_str()),
+        columns,
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        virtual_module: None,
+        primary_key_columns,
+    };
+    let invalid_generated = crate::schema::generated::validate_table(&table);
+    for (column, reason) in &invalid_generated {
+        gaps.push(IngestError::Unsupported {
+            file: file.into(),
+            message: format!("generated column dropped: {table_name}.{column}: {reason}"),
+        });
+    }
+    if !invalid_generated.is_empty() {
+        table.columns.retain(|col| {
+            !invalid_generated.iter().any(|(name, _)| name == col.name.as_str())
+        });
+    }
+    // A key over a column the walk dropped cannot apply, the same
+    // retain-filter `handle_create_index` uses.
     keys.retain(|k| {
-        let kept = k.columns.iter().all(|c| columns.iter().any(|col| col.name == *c));
+        let kept = k.columns.iter().all(|c| table.columns.iter().any(|col| col.name == *c));
         if !kept && k.unique {
             gaps.push(IngestError::Unsupported {
                 file: file.into(),
@@ -334,18 +358,9 @@ fn handle_create_table(
         }
         kept
     });
+    table.indexes = keys;
     let table_sym = Symbol::from(table_name.clone());
-    schema.tables.insert(
-        table_sym.clone(),
-        Table {
-            name: Symbol::from(table_name.clone()),
-            columns,
-            indexes: keys,
-            foreign_keys: Vec::new(),
-            virtual_module: None,
-            primary_key_columns,
-        },
-    );
+    schema.tables.insert(table_sym.clone(), table);
     // MySQL declares foreign keys in the table body; read them as the
     // `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` Postgres writes.
     for seg in &inline_fks {
@@ -425,7 +440,7 @@ fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
     if columns.is_empty() {
         return None;
     }
-    Some(Index { name: Symbol::from(name), columns, unique, predicate: None })
+    Some(Index { name: Symbol::from(name), columns, unique, using: None, predicate: None })
 }
 
 /// `[CONSTRAINT name] PRIMARY KEY (cols)` inside the column-list parens
@@ -496,29 +511,50 @@ fn parse_column_def(
         return Ok(None);
     }
 
-    // `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` (both dialects):
-    // the database computes the value and rejects writes to it, so an
-    // ordinary column would be a wrong model. Postgres' identity form
-    // (`GENERATED … AS IDENTITY`) is an ordinary writable key.
-    let words = top_level_words(modifiers);
-    let generated_as = words
-        .windows(3)
-        .find(|w| w[0].1 == "GENERATED" && w[1].1 == "ALWAYS" && w[2].1 == "AS")
-        .map(|w| w[2].0 + "AS".len());
-    if let Some(after_as) = generated_as {
-        if modifiers[after_as..].trim_start().starts_with('(') {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: format!("column dropped: {table}.{col_name} is a generated column (computed by the database)"),
-            });
-        }
-    }
-
+    let generated = parse_generated_modifier(modifiers).map_err(|message| IngestError::Unsupported {
+        file: file.into(),
+        message: format!("generated column dropped: {table}.{col_name}: {message}"),
+    })?;
     let (nullable, default) = parse_modifiers(modifiers);
+    if generated.is_some() && default.is_some() {
+        return Err(unsupported_col(file, table, &col_name, "generated column also has DEFAULT"));
+    }
     let col_type = resolve_column_type(type_phrase, enum_types)
         .ok_or_else(|| unsupported_col(file, table, &col_name, type_phrase))?;
+    let generated_text_compatible = has_nonportable_text_source_type(type_phrase, enum_types)
+        .then_some(false);
 
-    Ok(Some(Column { name: Symbol::from(col_name), col_type, nullable, default, primary_key: false }))
+    Ok(Some(Column {
+        name: Symbol::from(col_name),
+        col_type,
+        nullable,
+        default,
+        primary_key: false,
+        generated,
+        generated_text_compatible,
+    }))
+}
+
+/// Keep only the negative type provenance that `ColumnType` cannot
+/// express. `inet`, `interval`, enums, `citext`, and fixed `character`
+/// spellings normalize to text-like Rust types for ordinary app typing,
+/// but are not admitted as portable operands/results in our generated
+/// text-expression subset. Unbounded `character varying`/`varchar` and
+/// `text` already normalize faithfully and need no marker; a text typmod
+/// is marked because this IR does not retain it.
+fn has_nonportable_text_source_type(
+    type_phrase: &str,
+    enum_types: &HashSet<String>,
+) -> bool {
+    let (mut base, first_type_modifier, _) = strip_parens_capture_nums(type_phrase);
+    if let Some(dot) = base.rfind('.') {
+        base = base[dot + 1..].to_string();
+    }
+    matches!(
+        base.as_str(),
+        "inet" | "cidr" | "macaddr" | "macaddr8" | "interval" | "character" | "char" | "bpchar" | "citext"
+    ) || enum_types.contains(&base)
+        || (base == "text" && first_type_modifier.is_some())
 }
 
 fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> IngestError {
@@ -591,7 +627,8 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
         },
         "double precision" | "real" | "float4" | "float8" | "float" | "double" => ColumnType::Float,
         "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => ColumnType::Binary,
-        "json" | "jsonb" => ColumnType::Json,
+        "json" => ColumnType::Json,
+        "jsonb" => ColumnType::Jsonb,
         "uuid" => ColumnType::Uuid,
         "inet" | "cidr" | "macaddr" | "macaddr8" => ColumnType::String { limit: None },
         "interval" => ColumnType::String { limit: None },
@@ -737,7 +774,7 @@ fn index_entry_columns(entry: &str) -> Option<Vec<Symbol>> {
 /// survey report with a purely-cosmetic gap (this dump alone has
 /// several thousand plain indexes and only a handful of expression
 /// ones).
-fn handle_create_index(stmt: &str, schema: &mut Schema) {
+fn handle_create_index(stmt: &str, file: &str, schema: &mut Schema, gaps: &mut Vec<IngestError>) {
     let Some(mut rest) = strip_prefix_ci(stmt, "CREATE") else { return };
     rest = rest.trim_start();
     let unique = if let Some(r2) = strip_prefix_ci(rest, "UNIQUE") {
@@ -763,6 +800,39 @@ fn handle_create_index(stmt: &str, schema: &mut Schema) {
     let after_table = &rest[consumed2..];
 
     let Some(open) = find_first_open_paren(after_table, 0) else { return };
+    let access_clause = &after_table[..open];
+    let access_start = skip_sql_trivia(access_clause, 0);
+    let using = if access_start == access_clause.len() {
+        None
+    } else {
+        let Some(method_start) = consume_sql_keyword_ci(access_clause, access_start, "USING")
+        else {
+            gaps.push(IngestError::Unsupported {
+                file: file.into(),
+                message: "CREATE INDEX clause before the column list is not modeled".into(),
+            });
+            return;
+        };
+        let method_start = skip_sql_trivia(access_clause, method_start);
+        let method = &access_clause[method_start..];
+        let quoted = method.starts_with('"');
+        match read_index_access_method(method) {
+            Some((name, consumed))
+                if !name.is_empty()
+                    && skip_sql_trivia(access_clause, method_start + consumed)
+                        == access_clause.len() =>
+            {
+                Some(if quoted { name } else { name.to_ascii_lowercase() })
+            }
+            _ => {
+                gaps.push(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "CREATE INDEX access method is not a SQL identifier".into(),
+                });
+                return;
+            }
+        }
+    };
     let Some(close) = matching_close_paren(after_table, open) else { return };
     let body = &after_table[open + 1..close];
 
@@ -797,6 +867,7 @@ fn handle_create_index(stmt: &str, schema: &mut Schema) {
                 name: Symbol::from(index_name),
                 columns: cols,
                 unique,
+                using,
                 predicate,
             });
         }
@@ -1313,6 +1384,85 @@ fn read_ident(s: &str, start: usize) -> Option<(String, usize)> {
     }
 }
 
+/// Read exactly one PostgreSQL index access method identifier. Unlike
+/// [`read_ident`], schema qualifiers are not stripped: `USING public.gin`
+/// is not the same identifier as `USING gin` and must not be normalized.
+fn read_index_access_method(s: &str) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.first() == Some(&b'"') {
+        let mut i = 1;
+        let mut name = String::new();
+        while i < bytes.len() {
+            if bytes[i] == b'\0' {
+                return None;
+            }
+            if bytes[i] == b'"' {
+                if bytes.get(i + 1) == Some(&b'"') {
+                    name.push('"');
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                return (!name.is_empty() && name.len() <= 63).then_some((name, i));
+            }
+            let char_len = utf8_char_len(bytes[i]).min(bytes.len() - i);
+            name.push_str(&s[i..i + char_len]);
+            i += char_len;
+        }
+        return None;
+    }
+
+    let first = *bytes.first()?;
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return None;
+    }
+    let mut end = 1;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'$'))
+    {
+        end += 1;
+    }
+    (end <= 63).then_some((s[..end].to_string(), end))
+}
+
+/// Skip SQL whitespace and comments but leave quoted identifiers and
+/// literals untouched. PostgreSQL accepts comments wherever whitespace
+/// can separate tokens, including around `USING` and its method name.
+fn skip_sql_trivia(s: &str, start: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i..i + 2) == Some(&b"--"[..])
+            || bytes.get(i..i + 2) == Some(&b"/*"[..])
+        {
+            i = skip_quoted_or_comment(bytes, i).unwrap_or(bytes.len());
+        } else {
+            return i;
+        }
+    }
+}
+
+/// Consume one case-insensitive keyword at a known token boundary and
+/// return the byte immediately after it. Identifier-continuation bytes
+/// (including non-ASCII UTF-8 bytes) keep the text in the same token, so
+/// malformed `USINGgin` cannot be mistaken for `USING gin`. Whitespace,
+/// SQL comments, and quoted identifiers are valid token separators.
+fn consume_sql_keyword_ci(s: &str, start: usize, keyword: &str) -> Option<usize> {
+    let end = start.checked_add(keyword.len())?;
+    if !s.get(start..end)?.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if let Some(next) = s.as_bytes().get(end) {
+        if next.is_ascii_alphanumeric() || *next == b'_' || *next == b'$' || *next >= 0x80 {
+            return None;
+        }
+    }
+    Some(end)
+}
+
 /// Tokenize `s` into its depth-0 (outside any parens), non-quoted
 /// words, each paired with its byte offset in `s`. Every keyword
 /// search in this module (`PRIMARY KEY`, `REFERENCES`, `ON DELETE`, a
@@ -1420,6 +1570,81 @@ fn find_modifier_start(rest: &str) -> usize {
         }
     }
     rest.len()
+}
+
+/// Parse the supported PostgreSQL generated-column modifier. Any other
+/// form containing `GENERATED` fails explicitly so it cannot become an
+/// ordinary writable column after its expression is discarded.
+fn parse_generated_modifier(modifiers: &str) -> Result<Option<GeneratedColumn>, String> {
+    let words = top_level_words(modifiers);
+    let generated_positions: Vec<usize> =
+        words.iter().filter(|(_, word)| word == "GENERATED").map(|(pos, _)| *pos).collect();
+    let Some(&generated_pos) = generated_positions.first() else { return Ok(None) };
+    if generated_positions.len() != 1 {
+        return Err("multiple GENERATED clauses are unsupported".into());
+    }
+
+    if !only_optional_nullability(&modifiers[..generated_pos]) {
+        return Err("only NULL or NOT NULL may precede GENERATED ALWAYS".into());
+    }
+
+    let after_generated = consume_sql_keyword_ci(modifiers, generated_pos, "GENERATED")
+        .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let after_always = consume_sql_keyword_ci(
+        modifiers,
+        skip_sql_trivia(modifiers, after_generated),
+        "ALWAYS",
+    )
+    .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let after_as = consume_sql_keyword_ci(
+        modifiers,
+        skip_sql_trivia(modifiers, after_always),
+        "AS",
+    )
+    .ok_or_else(|| "expected GENERATED ALWAYS AS".to_string())?;
+    let open = skip_sql_trivia(modifiers, after_as);
+    if modifiers.as_bytes().get(open) != Some(&b'(') {
+        return Err("generated expression must be parenthesized".into());
+    }
+    let close = matching_close_paren(modifiers, open)
+        .ok_or_else(|| "generated expression has an unclosed parenthesis".to_string())?;
+    let expression = modifiers[open + 1..close].to_string();
+    if expression.trim().is_empty() {
+        return Err("generated expression is empty".into());
+    }
+
+    let storage_start = skip_sql_trivia(modifiers, close + 1);
+    let (storage, storage_end) = if let Some(end) = consume_sql_keyword_ci(modifiers, storage_start, "STORED") {
+        (GeneratedColumnStorage::Stored, end)
+    } else if let Some(end) = consume_sql_keyword_ci(modifiers, storage_start, "VIRTUAL") {
+        (GeneratedColumnStorage::Virtual, end)
+    } else {
+        return Err("generated expression must end in STORED or VIRTUAL".into());
+    };
+
+    if !only_optional_nullability(&modifiers[storage_end..]) {
+        return Err("only NULL or NOT NULL may follow the generated storage mode".into());
+    }
+
+    Ok(Some(GeneratedColumn { expression, storage }))
+}
+
+/// Consume only an optional `NULL` or `NOT NULL` clause plus SQL trivia.
+/// Checking the full suffix prevents punctuation, string literals, or
+/// other modifiers from being silently ignored.
+fn only_optional_nullability(s: &str) -> bool {
+    let start = skip_sql_trivia(s, 0);
+    if start == s.len() {
+        return true;
+    }
+    if let Some(end) = consume_sql_keyword_ci(s, start, "NULL") {
+        return skip_sql_trivia(s, end) == s.len();
+    }
+    let Some(after_not) = consume_sql_keyword_ci(s, start, "NOT") else { return false };
+    let Some(after_null) = consume_sql_keyword_ci(s, skip_sql_trivia(s, after_not), "NULL") else {
+        return false;
+    };
+    skip_sql_trivia(s, after_null) == s.len()
 }
 
 /// From a column definition's modifier tail: whether the column is
@@ -1569,6 +1794,28 @@ mod tests {
     }
 
     #[test]
+    fn structure_sql_index_methods_are_single_identifiers() {
+        let quoted = r#""Odd""Method""#;
+        let (name, consumed) = read_index_access_method(quoted).unwrap();
+        assert_eq!(name, "Odd\"Method");
+        assert_eq!(consumed, quoted.len());
+
+        let qualified = "public.gin";
+        let (_, consumed) = read_index_access_method(qualified).unwrap();
+        assert!(!qualified[consumed..].is_empty(), "qualifier must not be discarded");
+        assert!(read_index_access_method("\"gin").is_none(), "unterminated quote");
+        assert!(read_index_access_method("\"\"").is_none(), "empty quoted name");
+    }
+
+    #[test]
+    fn structure_sql_rejects_a_schema_qualified_index_method() {
+        let sql = br#"CREATE TABLE widgets (payload jsonb);
+CREATE INDEX widgets_payload_idx ON widgets USING public.gin (payload);"#;
+        let error = ingest_structure_sql(sql, "db/structure.sql").unwrap_err();
+        assert!(error.to_string().contains("CREATE INDEX access method is not a SQL identifier"), "{error}");
+    }
+
+    #[test]
     fn strip_parens_capture_nums_extracts_precision_and_scale() {
         let (base, n1, n2) = strip_parens_capture_nums("numeric(20,2)");
         assert_eq!(base, "numeric");
@@ -1592,7 +1839,8 @@ mod tests {
             Some(ColumnType::String { limit: Some(255) })
         ));
         assert!(matches!(resolve_column_type("bigint", &enums), Some(ColumnType::BigInt)));
-        assert!(matches!(resolve_column_type("jsonb", &enums), Some(ColumnType::Json)));
+        assert!(matches!(resolve_column_type("json", &enums), Some(ColumnType::Json)));
+        assert!(matches!(resolve_column_type("jsonb", &enums), Some(ColumnType::Jsonb)));
         assert!(matches!(resolve_column_type("uuid", &enums), Some(ColumnType::Uuid)));
         assert!(matches!(
             resolve_column_type("numeric(10,2)", &enums),

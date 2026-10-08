@@ -220,6 +220,33 @@ module ActiveStorage
     # `Attached::One#destroy` — see the .rb: purge under Rails' name.
     def destroy: () -> nil
   end
+
+  # Join-row value behind `AttachedMany#attachments` — mirrors the
+  # Attachment MODEL surface the runtime cannot name without gradual.
+  class ManyAttachment
+    @id: Integer
+    @blob: ActiveStorage::Blob?
+    def initialize: (Integer id, ActiveStorage::Blob? blob) -> void
+    def id: () -> Integer
+    def blob: () -> ActiveStorage::Blob?
+    def filename: () -> ActiveStorage::Filename?
+    def content_type: () -> String?
+    def url: () -> String
+  end
+
+  # `has_many_attached` proxy — always non-nil; `attach_blob` appends.
+  class AttachedMany
+    @record_type: String
+    @record_id: Integer
+    @name: String
+    def initialize: (String record_type, Integer record_id, String name) -> void
+    def attached?: () -> bool
+    def attachments: () -> Array[ActiveStorage::ManyAttachment]
+    def attach_blob: (ActiveStorage::Blob blob) -> nil
+    def attach: (String data, String filename, String content_type) -> nil
+    def purge: () -> nil
+    def destroy: () -> nil
+  end
 end
 
 # See the .rb: Active Storage's engine-mounted route helpers, reopened

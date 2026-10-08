@@ -60,6 +60,18 @@ incorrect `Book | untyped` union. The inventory admits exactly those two
 additional warnings, without dropping the call warnings, changing the
 Writebook pin, or relaxing error, gap, emission or corpus checks.
 
+The anonymous keyword-forwarding recovery in PR #614 ingests five previously
+skipped helper bodies across `ArrangementHelper`, `BooksHelper`, and
+`LeavesHelper`. Their `tag.div`, `button_to`, `tag.li`, `tag.nav`, and
+`form_with` destinations still lack verified retained keyword contracts, so
+the inventory records five explicit all-target errors at those calls and ten
+`gradual_untyped` warnings at their view callers. The five corresponding
+ingest-gap occurrences and old Spinel keyword-rest declaration errors are
+removed; corpus identities, lowering residue, and Ruby-emission residue are
+unchanged. This reviewed inventory change records recovered source and its
+remaining limits, not runnable Writebook helper or whole-app support. The
+corpus pin and the inventory gate are unchanged.
+
 ## Roadmap, not a support claim
 
 1. **Routes.** [PR #199](https://github.com/rubys/roundhouse/pull/199) owns the

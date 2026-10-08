@@ -884,6 +884,13 @@ pub enum ExprNode {
     /// This is an opaque packet sourced from the enclosing anonymous
     /// keyword-rest formal, not a value or a synthetic local binding.
     ForwardKeywords,
+    /// Ordered literal keyword pairs followed by anonymous keyword
+    /// forwarding (`key: value, **`) in call argument position. The
+    /// forwarded packet merges after the explicit pairs, so it may
+    /// override them; each pair expression still evaluates once and in
+    /// source order. The pair values are children for typing/effects,
+    /// while the opaque forwarded packet is not a capturable value.
+    ForwardKeywordsWithPairs { entries: Vec<(Expr, Expr)> },
     /// Native Ruby syntax query. The operand is syntax, not a value child:
     /// generic typing/lowering must not resolve or rewrite it. Reachability
     /// may inspect it to retain methods whose existence is being queried.
@@ -992,6 +999,7 @@ impl ExprNode {
             ExprNode::Splat { .. } => "Splat",
             ExprNode::ForwardArgs => "ForwardArgs",
             ExprNode::ForwardKeywords => "ForwardKeywords",
+            ExprNode::ForwardKeywordsWithPairs { .. } => "ForwardKeywordsWithPairs",
             ExprNode::Defined { .. } => "Defined",
             ExprNode::KeywordSplat { .. } => "KeywordSplat",
             ExprNode::MultiAssign { .. } => "MultiAssign",
@@ -1044,6 +1052,12 @@ impl ExprNode {
             | ExprNode::ForwardKeywords
             | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
                     f(k);
@@ -1266,6 +1280,12 @@ impl ExprNode {
             | ExprNode::ForwardKeywords
             | ExprNode::Defined { .. }
             | ExprNode::SelfRef => {}
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
             ExprNode::Hash { entries, .. } => {
                 for (k, v) in entries {
                     f(k);

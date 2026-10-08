@@ -342,6 +342,15 @@ fn runtime(native: bool) {
             root.join("runtime/spinel/db_cruby.rb")
         )
     };
+    // The shims raise ActiveRecord::RecordNotUnique, which an app gets
+    // from runtime/ruby/active_record/errors.rb; stub it as the other
+    // shim harnesses do. The CRuby prelude already loads the real class
+    // (a `WrappedDatabaseException`), so only the native one is stubbed.
+    let prelude = if native {
+        format!("{prelude}module ActiveRecord\n  class RecordNotUnique < StandardError\n  end\nend\n")
+    } else {
+        prelude
+    };
     let clear = r#"
 # Both shims clear bindings on release. Probe a missing bind on idle reuse
 # directly, since a generated reader overwrites every slot and cannot see it.

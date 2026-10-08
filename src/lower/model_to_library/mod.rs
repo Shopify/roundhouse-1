@@ -432,6 +432,7 @@ pub(crate) fn lower_models_inner_for_dialect(
             if !unfold {
                 crate::lower::arel::rewrite_arel_in_method_with_ruby_values(
                     &mut method.body, schema, &classes, &[], ruby_read_values, dialect,
+                    &HashSet::default(),
                     (method.receiver == crate::dialect::MethodReceiver::Class).then_some(&model.name),
                 );
             }
@@ -1005,13 +1006,12 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         if matches!(name, "attr_accessor" | "attr_reader" | "attr_writer") {
             continue;
         }
-        // `has_one_attached :name` (with or without the variants
-        // block) — claimed by lower::attached on exactly that shape, a
-        // name and any block. Campfire's three (`avatar`, `attachment`,
+        // `has_one_attached` / `has_many_attached :name` (with or
+        // without a variants block) — claimed by lower::attached on
+        // exactly that shape. Campfire's three (`avatar`, `attachment`,
         // `logo`) were reported as not lowered on every emit while the
-        // attachment lowering ran on each. `has_many_attached` is not
-        // claimed by anything and keeps warning.
-        if name == "has_one_attached" {
+        // attachment lowering ran on each.
+        if name == "has_one_attached" || name == "has_many_attached" {
             if let ExprNode::Send { args, .. } = &*expr.node {
                 if !args.is_empty() {
                     continue;
@@ -1699,6 +1699,11 @@ pub fn writable_field_set(
     for (_span, attr) in crate::lower::attached::attached_attrs(model) {
         writable.insert(attr);
     }
+    // `has_many_attached` is claimed for the proxy reader / `.attach` /
+    // `.attachments` surface only. There is no `attr=` / after_save
+    // writer yet (Many appends via the proxy, not mass-assign), so the
+    // attrs stay OUT of the writable set — putting them in would make
+    // `update(uploads: …)` / permit emit a missing writer (inv. 6).
     writable
 }
 
@@ -1713,11 +1718,12 @@ pub(crate) fn model_defines_writer(model: &Model, field: &crate::ident::Symbol) 
 /// time a forwarding contract question needs it, and the two questions.
 ///
 /// The forwarding analysis asks whether synthesis keeps a source
-/// contract: a model's own forwarding method, or a method it inherits that
-/// a synthesized override could shadow. Building every model that could be
-/// asked about cost seconds per forwarding pass on Core, where the passes
-/// ask about few declarations; so the analysis finds the models a span
-/// concerns and asks only about those. Each answer is the one the whole-
+/// contract: a model's own forwarding method, or a declaration (own or
+/// inherited) a source packet selects that a synthesized override could
+/// shadow. Building every model that could be asked about cost seconds
+/// per forwarding pass on Core, where the passes ask about few
+/// declarations; so the analysis finds the models a span concerns and asks
+/// only about those. Each answer is the one the whole-
 /// model check gave for that source.
 ///
 /// Source lookup stays with the caller: inherited library contracts can
@@ -1798,10 +1804,12 @@ impl<'a> ModelSynthesis<'a> {
                 .is_none_or(|m| !Self::preserved(source, m))
     }
 
-    /// Does a synthesized method of the model at `position` override the
-    /// inherited `source` without its contract? No own method means normal
-    /// inheritance survives.
-    pub(crate) fn drops_inherited(&self, position: usize, source: &MethodDef) -> bool {
+    /// Does a synthesized method of the model at `position` override
+    /// `source`, a declaration its lookup selects for a selector that
+    /// receives source argument packets (its own or an inherited one),
+    /// without its contract? No synthesized same-name method means the
+    /// source declaration survives.
+    pub(crate) fn drops_selected(&self, position: usize, source: &MethodDef) -> bool {
         self.built(position)
             .iter()
             .rev()
@@ -1974,9 +1982,12 @@ fn build_methods_for_dialect(
     // Named plain-text association (`has_markdown`) — same slot; the
     // record's `content` column needs no coder override.
     crate::lower::plain_text_attr::push_plain_text_methods(&mut methods, model, schema);
-    // `has_one_attached` — the attachment-EXISTENCE reader, over the
-    // synthesized `ActiveStorage::Attachment` row. Same ordering
-    // rationale as the macros above (a hand-written method wins).
+    // `has_one_attached` / `has_many_attached` — the attachment
+    // readers, over the synthesized `ActiveStorage::Attachment` row.
+    // Same ordering rationale as the macros above (a hand-written
+    // method wins). The Attachment MODEL itself gets its blob helpers
+    // here too (`url` / `filename` / `content_type`).
+    crate::lower::attachment_model::push_attachment_record_methods(&mut methods, model);
     crate::lower::attached::push_attached_methods(&mut methods, model);
     // The ruby family writes column accessors into the model's
     // GeneratedAttributeMethods module (`emit::ruby::library`), so a
@@ -3238,21 +3249,25 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
         ColumnType::Boolean => Ty::Bool,
         ColumnType::Date | ColumnType::DateTime | ColumnType::Time => Ty::Str,
         ColumnType::Binary => Ty::Str,
-        // A `json` column is stored TEXT and nothing parses it: the
+        // A schema-less `json` or `jsonb` column is stored TEXT and nothing
+        // parses it: the
         // Row field, hydration, `[]`, `attributes` and the adapter's
         // escape all move the serialized string. `Hash[String, String]`
         // was a declaration no synthesized path implemented. What gives
         // such a column STRUCTURE is a `has_json` declaration, and that
         // is modeled as typed per-key accessors over this text
         // (`lower::has_json`), not as a Hash the whole column decodes to.
-        ColumnType::Json => Ty::Str,
+        ColumnType::Json | ColumnType::Jsonb => Ty::Str,
         ColumnType::Uuid => Ty::Str,
         ColumnType::Reference { .. } => Ty::Int,
     }
 }
 
 /// The column's type AS STORED IN A RECORD — `ty_of_column` widened with
-/// `Nil` when the schema says the column is nullable. Rails' unset value
+/// `Nil` when the schema says the column is nullable or the column is
+/// database-generated. A generated attribute is unset on a new record
+/// until the INSERT computes it, even when the database column is NOT NULL.
+/// Rails' unset value
 /// for such a column is NULL, not the type's zero: a nullable unique
 /// column left unset must not collide row-to-row (lobsters'
 /// `users.password_reset_token`), and `where(merged_story_id: nil)` has
@@ -3268,7 +3283,7 @@ pub fn ty_of_column(t: &ColumnType) -> Ty {
 /// doesn't change.
 pub fn ty_of_column_slot(col: &Column) -> Ty {
     let base = ty_of_column(&col.col_type);
-    if col.nullable && !col.primary_key {
+    if (col.nullable || col.generated.is_some()) && !col.primary_key {
         Ty::Union { variants: vec![base, Ty::Nil] }
     } else {
         base

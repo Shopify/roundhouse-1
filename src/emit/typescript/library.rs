@@ -1414,6 +1414,12 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
                 collect_class_refs(v, out);
             }
         }
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (k, v) in entries {
+                collect_class_refs(k, out);
+                collect_class_refs(v, out);
+            }
+        }
         ExprNode::Array { elements, .. } => {
             for el in elements {
                 collect_class_refs(el, out);
@@ -1785,6 +1791,12 @@ fn rewrite_free(e: &Expr) -> Expr {
             value: rewrite_free(value),
             target_ty: target_ty.clone(),
         },
+        ExprNode::ForwardKeywordsWithPairs { entries } => ExprNode::ForwardKeywordsWithPairs {
+            entries: entries
+                .iter()
+                .map(|(key, value)| (rewrite_free(key), rewrite_free(value)))
+                .collect(),
+        },
         ExprNode::Lit { .. }
         | ExprNode::Var { .. }
         | ExprNode::Ivar { .. }
@@ -2063,6 +2075,12 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
         },
         ExprNode::KeywordSplat { value } => ExprNode::KeywordSplat {
             value: rewrite(value, super_method),
+        },
+        ExprNode::ForwardKeywordsWithPairs { entries } => ExprNode::ForwardKeywordsWithPairs {
+            entries: entries
+                .iter()
+                .map(|(key, value)| (rewrite(key, super_method), rewrite(value, super_method)))
+                .collect(),
         },
         ExprNode::MultiAssign { targets, value } => ExprNode::MultiAssign {
             targets: targets.clone(),

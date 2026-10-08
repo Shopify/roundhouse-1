@@ -120,6 +120,21 @@ module ActiveRecord
       end
   end
 
+  # Rails' constructor takes the model `sole` found too many rows for and
+  # names it. The class and its message-only constructor are the shared
+  # errors.rb's; the shared `sole` (relation.rb) hands the message it
+  # built, which is kept as given.
+  class SoleRecordExceeded
+    attr_reader :record
+
+    def initialize(record = nil)
+      return super(record) if record.is_a?(String)
+
+      @record = record
+      super "Wanted only one #{record&.name || "record"}"
+    end
+  end
+
   # Not modeled: ActiveSupport::ActionableError's "Create database"
   # action.
   class NoDatabaseError

@@ -180,8 +180,8 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
         e: &Expr,
     ) -> bool {
         let rest = |m: &MethodDef| m.params.iter().any(crate::dialect::Param::is_nameless_rest);
-        destination(app, contracts, context, e).is_some_and(|(m, _)| !rest(m))
-            && virtual_destinations(contracts, context, e).is_ok_and(|v| v.iter().all(|(m, _)| !rest(m)))
+        destination(app, contracts, context, e).is_some_and(|resolved| !rest(resolved.method))
+            && virtual_destinations(contracts, context, e).is_ok_and(|v| v.iter().all(|(_, (m, _))| !rest(m)))
     }
     #[allow(clippy::too_many_arguments)]
     fn visit(
@@ -652,7 +652,10 @@ fn walk(
     let forwards_keywords = match &*e.node {
         ExprNode::Send { args, .. } | ExprNode::Super { args: Some(args), .. } => args
             .iter()
-            .any(|a| matches!(&*a.node, ExprNode::ForwardKeywords)),
+            .any(|a| matches!(
+                &*a.node,
+                ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. }
+            )),
         _ => false,
     };
     if forwards_keywords {
@@ -663,7 +666,12 @@ fn walk(
         let reason = if !source_ok {
             Some("anonymous keyword forwarding has no enclosing anonymous keyword-rest declaration")
         } else if enclosing.unsupported_formals.is_some()
-            || contracts.unretained(&enclosing.name_span)
+            || contracts.unretained_in_lookup(
+                owner,
+                &enclosing.name,
+                enclosing.name_span,
+                enclosing.receiver,
+            )
             || !contracts.verified(owner)
         {
             Some("anonymous keyword forwarding source declaration cannot be verified")
@@ -704,7 +712,8 @@ fn walk(
             contract_error(
                 Some((owner, enclosing)),
                 e,
-                destination(app, contracts, Some((owner, enclosing)), e),
+                destination(app, contracts, Some((owner, enclosing)), e)
+                    .map(|resolved| (resolved.method, resolved.model)),
                 contracts,
             )
         };
@@ -783,46 +792,86 @@ fn accepts_keywords(method: &MethodDef) -> bool {
     method.params.iter().any(|p| p.forwarding || p.keyword)
 }
 
+/// Fail closed unless a source packet reaches a declaration with preserved
+/// keyword ABI and every reachable model/virtual override retains it. Ordinary
+/// sends use indexed lookup; `super` retains the conservative global source-span
+/// synthesis guard because its runtime ancestor path is not fully represented.
 fn keyword_contract_error(
     context: Option<(&ClassId, &MethodDef)>,
     call: &Expr,
-    resolved: Option<(&MethodDef, bool)>,
+    resolved: Option<ResolvedDestination<'_>>,
     contracts: &SourceContractIndex<'_>,
 ) -> Option<&'static str> {
-    let Some((method, _)) = resolved else {
+    let Some(resolved) = resolved else {
         return Some("forwarding destination's declaration cannot be verified");
     };
+    let method = resolved.method;
     if method.unsupported_formals.is_some() {
         return Some("forwarding destination has an unrepresented parameter declaration");
     }
     if method.params.iter().any(|p| p.from_keyword || p.from_kwrest) {
         return Some("forwarding destination has flattened keyword parameters");
     }
-    if contracts.unretained(&method.name_span) {
+    let unretained = if matches!(&*call.node, ExprNode::Super { .. }) {
+        contracts.unretained(&method.name_span)
+    } else {
+        contracts.unretained_in_lookup(
+            &resolved.lookup_owner,
+            &method.name,
+            method.name_span,
+            method.receiver,
+        )
+    };
+    if unretained {
         return Some("model method synthesis does not preserve this source declaration");
     }
     let Ok(destinations) = virtual_destinations(contracts, context, call) else {
         return Some("forwarding destination's declaration cannot be verified");
     };
     if !accepts_keywords(method)
-        || destinations.iter().any(|(candidate, _)| {
+        || destinations.iter().any(|(_, (candidate, _))| {
             !accepts_keywords(candidate)
                 || candidate.unsupported_formals.is_some()
                 || candidate.params.iter().any(|p| p.from_keyword || p.from_kwrest)
-                || contracts.unretained(&candidate.name_span)
         })
     {
         return Some("forwarding destination has no verified keyword parameter ABI");
     }
+    if destinations.iter().any(|(owner, (candidate, _))| {
+        contracts.unretained_in_lookup(
+            owner,
+            &candidate.name,
+            candidate.name_span,
+            candidate.receiver,
+        )
+    }) {
+        return Some("model method synthesis does not preserve this source declaration");
+    }
     None
 }
 
+/// A source-resolved call target plus the receiver's original lookup start.
+/// Keeping the owner is necessary to distinguish an affected model lookup
+/// from an unrelated sibling that happens to share the declaration span.
+struct ResolvedDestination<'a> {
+    method: &'a MethodDef,
+    model: bool,
+    /// The source receiver class, before method lookup walks through its
+    /// parents. A synthesized method on an intermediate model can shadow the
+    /// declaration selected by the source-only index for this receiver.
+    lookup_owner: ClassId,
+}
+
+/// Resolve only destinations whose source receiver and dispatch path are
+/// represented well enough to check an argument contract. Unknown receiver
+/// provenance, association methods, and unresolved `super` ancestors return
+/// `None` instead of borrowing an inferred ABI.
 fn destination<'a>(
     app: &App,
     contracts: &SourceContractIndex<'a>,
     context: Option<(&ClassId, &MethodDef)>,
     e: &Expr,
-) -> Option<(&'a MethodDef, bool)> {
+) -> Option<ResolvedDestination<'a>> {
     let owner_dependent = match &*e.node {
         ExprNode::Send { recv: None, .. } | ExprNode::Super { .. } => true,
         ExprNode::Send { recv: Some(r), .. } => matches!(&*r.node, ExprNode::SelfRef),
@@ -883,7 +932,13 @@ fn destination<'a>(
                 }
                 // A source-defined class .new wins over constructor
                 // dispatch; an instance method called new is ordinary.
-                contracts.effective_call(c, method, receiver)
+                contracts
+                    .effective_call(c, method, receiver)
+                    .map(|(method, model)| ResolvedDestination {
+                        method,
+                        model,
+                        lookup_owner: c.clone(),
+                    })
             })
         }
         ExprNode::Super { .. } => {
@@ -894,6 +949,11 @@ fn destination<'a>(
                 enclosing.receiver,
                 &mut HashSet::default(),
             )
+            .map(|(method, model)| ResolvedDestination {
+                method,
+                model,
+                lookup_owner: owner.clone(),
+            })
         }
         _ => None,
     }
@@ -964,7 +1024,7 @@ fn contract_error(
         Ok(candidates) => candidates,
         Err(reason) => return Some(reason),
     };
-    for candidate in candidates {
+    for (_, candidate) in candidates {
         if declaration_error(candidate).is_some()
             || contracts.unretained(&candidate.0.name_span)
         {
@@ -974,11 +1034,13 @@ fn contract_error(
     None
 }
 
+/// Enumerate source-visible self-dispatch overrides. An incomplete or reopened
+/// lookup hierarchy is an error rather than evidence that no override exists.
 fn virtual_destinations<'a>(
     contracts: &SourceContractIndex<'a>,
     context: Option<(&ClassId, &MethodDef)>,
     call: &Expr,
-) -> Result<Vec<(&'a MethodDef, bool)>, &'static str> {
+) -> Result<Vec<(ClassId, (&'a MethodDef, bool))>, &'static str> {
     let (Some((owner, enclosing)), ExprNode::Send { recv, method, .. }) = (context, &*call.node)
     else {
         return Ok(vec![]);
@@ -1171,8 +1233,18 @@ fn keyword_calls_with_index(
                 } else {
                     KeywordPolicy::NativeRuby
                 };
-                if resolved.is_some_and(|(m, _)| m.params.iter().any(|p| p.forwarding)) {
-                    if contract_error(context, e, resolved, contracts).is_none() {
+                if resolved
+                    .as_ref()
+                    .is_some_and(|d| d.method.params.iter().any(|p| p.forwarding))
+                {
+                    if contract_error(
+                        context,
+                        e,
+                        resolved.map(|d| (d.method, d.model)),
+                        contracts,
+                    )
+                    .is_none()
+                    {
                         KeywordPolicy::Native
                     } else {
                         ruby_native
@@ -1185,7 +1257,8 @@ fn keyword_calls_with_index(
                     KeywordPolicy::NativeSuper
                 } else if resolved.is_none()
                     || virtual_destinations(contracts, context, e).map_or(true, |v| {
-                        v.iter().any(|(m, _)| m.params.iter().any(|p| p.forwarding))
+                        v.iter()
+                            .any(|(_, (m, _))| m.params.iter().any(|p| p.forwarding))
                     })
                 {
                     // Ordinary lexical method, full virtual override: neither
@@ -1347,8 +1420,18 @@ fn possible_full_destination(
 }
 
 fn has_forwarding(args: &[Expr]) -> bool {
-    args.iter()
-        .any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+    args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs))
+}
+
+fn has_source_packet(args: &[Expr]) -> bool {
+    args.iter().any(|a| {
+        matches!(
+            &*a.node,
+            ExprNode::ForwardArgs
+                | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
+        )
+    })
 }
 
 fn constant_names_class(expr: &Expr, class: &ClassId) -> bool {
@@ -1592,9 +1675,14 @@ struct SourceContractIndex<'a> {
     virtual_calls: RefCell<HashMap<(ClassId, Symbol, MethodReceiver), VirtualCalls<'a>>>,
 }
 
-type VirtualCalls<'a> = Result<Vec<(&'a MethodDef, bool)>, &'static str>;
+type VirtualCalls<'a> = Result<Vec<(ClassId, (&'a MethodDef, bool))>, &'static str>;
 
 impl<'a> SourceContractIndex<'a> {
+    /// Build source lookup. Whether model synthesis preserves a declaration
+    /// is answered later, per span, for the selectors source argument packets
+    /// reach (`unretained_models`), which bounds the model-synthesis survey
+    /// without omitting inherited contracts selected through sends or
+    /// explicit packet `super`.
     fn new(app: &'a App) -> Self {
         let mut index = Self {
             parents: HashMap::default(),
@@ -1728,38 +1816,46 @@ impl<'a> SourceContractIndex<'a> {
     }
 
     /// Is the source contract declared at `span` one that model synthesis
-    /// does not preserve? A model's own forwarding method counts when the
-    /// synthesized class drops its contract; a method a model inherits
-    /// under a selector some packet is sent to (a full selector, or one a
-    /// forwarding send names) counts when a synthesized override drops it.
+    /// does not preserve for some model? The global answer, for `super`
+    /// (whose runtime ancestor path is not fully represented) and for the
+    /// full-forwarding checks; ordinary sends ask `unretained_in_lookup`.
+    fn unretained(&self, span: &Span) -> bool {
+        !self.unretained_models(span).is_empty()
+    }
+
+    /// The models whose synthesis does not preserve the source contract
+    /// declared at `span`. A model's own forwarding method counts when the
+    /// synthesized class drops its contract; a declaration a model's lookup
+    /// selects (own or inherited) under a selector some source packet is
+    /// sent to (a full selector, one a packet send names, or the enclosing
+    /// selector of a packet `super`) counts when a synthesized override
+    /// drops it.
     ///
     /// Answered per span: only the models that declare `span` or reach its
     /// declaring class through superclass/include edges can contribute, and
     /// only those are synthesized, once each. The answer is the one a survey
     /// of every model would give for that span. Synthesis runs in its own
     /// diagnostic scope, so asking later changes nothing else.
-    fn unretained(&self, span: &Span) -> bool {
-        if self.full_selectors.is_empty() {
-            return false;
-        }
+    fn unretained_models(&self, span: &Span) -> Rc<HashSet<ClassId>> {
         let survey = self.unretained.get_or_init(|| Unretained::new(self));
         survey.queries.set(survey.queries.get() + 1);
-        if let Some(&known) = survey.answers.borrow().get(span) {
-            return known;
+        if let Some(known) = survey.answers.borrow().get(span) {
+            return known.clone();
         }
-        let answer = self.unretained_span(survey, span);
-        survey.answers.borrow_mut().insert(*span, answer);
+        let answer = Rc::new(self.unretained_span(survey, span));
+        survey.answers.borrow_mut().insert(*span, answer.clone());
         answer
     }
 
-    fn unretained_span(&self, survey: &Unretained<'a>, span: &Span) -> bool {
+    fn unretained_span(&self, survey: &Unretained<'a>, span: &Span) -> HashSet<ClassId> {
+        let mut models: HashSet<ClassId> = HashSet::default();
         for &(position, source) in survey.own.get(span).into_iter().flatten() {
             if survey.synthesis.drops_own(position, source) {
-                return true;
+                models.insert(self.app.models[position].name.clone());
             }
         }
         let Some(declared) = survey.declared.get(span) else {
-            return false;
+            return models;
         };
         let names = survey.names.get_or_init(|| self.forwarded_selectors());
         for (owner, source) in declared {
@@ -1786,6 +1882,9 @@ impl<'a> SourceContractIndex<'a> {
             positions.sort_unstable();
             for position in positions {
                 let model = &self.app.models[position];
+                if models.contains(&model.name) {
+                    continue;
+                }
                 let Some((found, _)) = self.declaration(
                     &model.name,
                     &source.name,
@@ -1794,40 +1893,47 @@ impl<'a> SourceContractIndex<'a> {
                 ) else {
                     continue;
                 };
-                if std::ptr::eq(found, *source)
-                    && !model.methods().any(|own| std::ptr::eq(own, found))
-                    && survey.synthesis.drops_inherited(position, source)
-                {
-                    return true;
+                // The selected declaration can be the model's own or an
+                // inherited one; a same-name synthesized override must
+                // retain its source contract either way.
+                if std::ptr::eq(found, *source) && survey.synthesis.drops_selected(position, source) {
+                    models.insert(model.name.clone());
                 }
             }
         }
-        false
+        models
     }
 
-    /// Selectors a packet may be sent to: every full (`...`) selector, and
-    /// every selector a forwarding send names (`new` also reaches
-    /// `initialize`). Ordinary inherited contracts matter only for these;
-    /// looking up every unrelated selector would make the question
-    /// quadratic in the source inventory.
+    /// Selectors a source argument packet may be sent to: every full
+    /// (`...`) selector, every selector a send passing `...`, `**` or
+    /// `k: v, **` names (`new` also reaches `initialize`), and the
+    /// enclosing selector of a `super` passing one (`super` carries no
+    /// selector on its own node). Ordinary inherited contracts matter only
+    /// for these; looking up every unrelated selector would make the
+    /// question quadratic in the source inventory.
     fn forwarded_selectors(&self) -> HashSet<Symbol> {
         let _span = crate::timings::begin("forwarding unretained: selectors");
         let mut names = self.full_selectors.clone();
-        fn collect(e: &Expr, names: &mut HashSet<Symbol>) {
+        fn collect(e: &Expr, enclosing: &Symbol, names: &mut HashSet<Symbol>) {
             if let ExprNode::Send { method, args, .. } = &*e.node
-                && has_forwarding(args)
+                && has_source_packet(args)
             {
                 names.insert(method.clone());
                 if method.as_str() == "new" {
                     names.insert(Symbol::from("initialize"));
                 }
             }
-            e.node.for_each_child(&mut |child| collect(child, names));
+            if let ExprNode::Super { args: Some(args), .. } = &*e.node
+                && has_source_packet(args)
+            {
+                names.insert(enclosing.clone());
+            }
+            e.node.for_each_child(&mut |child| collect(child, enclosing, names));
         }
         for (_, method) in methods(self.app) {
-            collect(&method.body, &mut names);
+            collect(&method.body, &method.name, &mut names);
             for default in method.params.iter().filter_map(|p| p.default.as_ref()) {
-                collect(default, &mut names);
+                collect(default, &method.name, &mut names);
             }
         }
         names
@@ -2059,7 +2165,7 @@ impl<'a> SourceContractIndex<'a> {
             return false;
         }
         let Ok(overrides) = self.virtual_calls(owner, method, MethodReceiver::Instance) else { return false };
-        if !overrides.iter().all(yields_only) {
+        if !overrides.iter().all(|(_, found)| yields_only(found)) {
             return false;
         }
         // A module a class body prepends (which the index does not
@@ -2223,13 +2329,67 @@ impl<'a> SourceContractIndex<'a> {
                     return Err("forwarding virtual dispatch through reopened fragments cannot be verified");
                 }
                 if let Some(candidate) = self.effective_call(child, method, receiver) {
-                    candidates.push(candidate);
+                    candidates.push((child.clone(), candidate));
                 }
             }
             Ok(candidates)
         })();
         self.virtual_calls.borrow_mut().insert(key, answer.clone());
         answer
+    }
+
+    /// Whether model synthesis shadows this source declaration anywhere in
+    /// the receiver's method-lookup chain. Descendants can inherit the
+    /// incompatible method generated by an intermediate model even when they
+    /// have no conflicting synthesis of their own; an unrelated sibling
+    /// receiver does not inherit another model's loss.
+    fn unretained_in_lookup(
+        &self,
+        owner: &ClassId,
+        selector: &Symbol,
+        span: Span,
+        receiver: MethodReceiver,
+    ) -> bool {
+        fn reaches(
+            index: &SourceContractIndex<'_>,
+            models: &HashSet<ClassId>,
+            owner: &ClassId,
+            selector: &Symbol,
+            receiver: MethodReceiver,
+            seen: &mut HashSet<ClassId>,
+        ) -> Option<bool> {
+            if !seen.insert(owner.clone()) {
+                return None;
+            }
+            if models.contains(owner) {
+                return Some(true);
+            }
+            let declarations = match receiver {
+                MethodReceiver::Instance => &index.instance,
+                MethodReceiver::Class => &index.class,
+            };
+            if declarations.contains_key(&(owner.clone(), selector.clone())) {
+                // A source declaration at this point in the lookup chain
+                // blocks later ancestors. If it is the requested method,
+                // its source contract is still present; if it differs, the
+                // source resolver should have selected that nearer method.
+                return Some(false);
+            }
+            if receiver == MethodReceiver::Instance {
+                for module in index.includes(owner).iter().rev() {
+                    if let Some(result) = reaches(index, models, module, selector, receiver, seen) {
+                        return Some(result);
+                    }
+                }
+            }
+            index
+                .parent(owner)
+                .and_then(|parent| reaches(index, models, parent, selector, receiver, seen))
+        }
+        let models = self.unretained_models(&span);
+        !models.is_empty()
+            && reaches(self, &models, owner, selector, receiver, &mut HashSet::default())
+                .unwrap_or(false)
     }
 
     fn verified_hierarchy(&self, owner: &ClassId, seen: &mut HashSet<ClassId>) -> bool {
@@ -2489,7 +2649,7 @@ struct Unretained<'a> {
     names: OnceCell<HashSet<Symbol>>,
     /// Model positions by name.
     models_named: HashMap<ClassId, Vec<usize>>,
-    answers: RefCell<HashMap<Span, bool>>,
+    answers: RefCell<HashMap<Span, Rc<HashSet<ClassId>>>>,
     queries: std::cell::Cell<usize>,
 }
 

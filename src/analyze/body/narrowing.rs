@@ -280,6 +280,11 @@ fn is_nil_lit(e: &Expr) -> bool {
 
 /// A constant path used as a class argument to `is_a?` — map built-in
 /// class names to their structural types, user classes to `Ty::Class`.
+///
+/// `core` is path-shape only (`Array` / `::Array`). Callers must type the
+/// condition first so Const analysis has already run `qualify_resolved_path`;
+/// otherwise a lexically shadowed `Array` still looks bare and becomes a
+/// structural container. Synthetic unit-test Const paths stay as written.
 fn const_to_ty(e: &Expr) -> Option<Ty> {
     let ExprNode::Const { path } = &*e.node else {
         return None;
@@ -447,10 +452,11 @@ fn narrow_class_object(current: &Ty, class: &Ty) -> Ty {
     }
 }
 
-/// Given a current type and a narrower one, return the narrower form.
-/// `String | Nil ∩ String = String`; `Post ∩ Post = Post`; anything
-/// else returns the narrower type on the assumption the check would
-/// have succeeded (matches Ruby's `is_a?` semantics at run time).
+/// Given a current type and a narrower one, return the intersection.
+/// `String | Nil ∩ String = String`; matching Array/Hash spines keep
+/// `current` (via [`ty_compatible`]) so known members survive; when no
+/// variant is compatible, fall back to `narrower` on the assumption the
+/// check would have succeeded (matches Ruby's `is_a?` at run time).
 fn intersect_with(current: &Ty, narrower: &Ty) -> Ty {
     match current {
         Ty::Union { variants } => {
@@ -470,11 +476,10 @@ fn intersect_with(current: &Ty, narrower: &Ty) -> Ty {
 }
 
 /// Preserve known members; only ParamValue supplies a recursive contract.
+/// Array/Hash spine matches go through [`ty_compatible`] (same owner as
+/// else-branch [`remove_variant`]) rather than a duplicated match arm.
 fn intersect_variant(current: &Ty, narrower: &Ty) -> Option<Ty> {
     match (current, narrower) {
-        (Ty::Array { .. }, Ty::Array { .. }) | (Ty::Hash { .. }, Ty::Hash { .. }) => {
-            Some(current.clone())
-        }
         (Ty::Class { id, .. }, Ty::Array { .. }) if id.0.as_str() == super::send::PARAM_VALUE => {
             Some(Ty::Array { elem: Box::new(super::send::param_value_ty()) })
         }
@@ -508,9 +513,11 @@ fn remove_variant(current: &Ty, ty: &Ty) -> Ty {
     }
 }
 
-/// Structural equality on types — pre-subtyping approximation.
-/// Used only by narrowing today; full subtype checks can replace it
-/// when polymorphism lands.
+/// Equality, plus Array/Hash spine matches ignoring member types.
+/// Owns the container-spine predicate for both [`intersect_variant`]
+/// (then-branch: keep `current`) and [`remove_variant`] (else-branch:
+/// drop every Array/Hash). Pre-subtyping approximation; full subtype
+/// checks can replace it when polymorphism lands.
 fn ty_compatible(a: &Ty, b: &Ty) -> bool {
     a == b
         || matches!(

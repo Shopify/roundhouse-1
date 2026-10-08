@@ -101,4 +101,5 @@ class GlobalID
   # for a uuid-keyed model; the mint only ever calls `to_s` on it.
   def self.param: (String model_name, Integer | String id) -> String
   def self.uri: (String model_name, Integer | String id) -> String
+  def self.signed: (String model_name, Integer | String id, String | Symbol purpose) -> String
 end

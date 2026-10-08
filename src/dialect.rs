@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::EffectSet;
-use crate::expr::{Expr, Literal};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::span::Span;
 use crate::ty::{Row, Ty};
@@ -92,9 +92,11 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub enum_defaults: IndexMap<Symbol, crate::expr::Literal>,
 
-    /// `mattr_accessor :x, default: …` / `cattr_accessor(:x) { … }` —
-    /// class-ivar seeds lowered into `LibraryClass::class_ivar_initializers`.
-    /// Symbol-only mattr/cattr leave this empty (readers start nil).
+    /// `mattr_*` / `cattr_*` seeds lowered into
+    /// `LibraryClass::class_ivar_initializers` as `@@attr = <expr>`.
+    /// Plain (no `default:`) declarations store `nil` so first read
+    /// matches Rails' `class_variable_set`. Non-nil `default:` / block
+    /// values are also stored here.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub class_attr_defaults: IndexMap<Symbol, crate::expr::Expr>,
 
@@ -1611,6 +1613,28 @@ pub struct TopLevelConstant {
     pub after_declarations: bool,
 }
 
+impl LibraryClass {
+    /// Direct source `@ivar` / compound `@ivar` writes — the shapes that
+    /// need source-ordered emission. Synthetic `mattr_*` / `cattr_*` `@@`
+    /// seeds and other framework initialization stay on the partitioned
+    /// path.
+    pub fn has_source_ivar_initializers(&self) -> bool {
+        self.class_ivar_initializers.iter().any(|expr| {
+            !expr.span.is_synthetic()
+                && matches!(
+                    &*expr.node,
+                    ExprNode::Assign {
+                        target: LValue::Ivar { .. },
+                        ..
+                    } | ExprNode::OpAssign {
+                        target: LValue::Ivar { .. },
+                        ..
+                    }
+                )
+        })
+    }
+}
+
 /// What synthesized a `LibraryClass`. Used by per-target collapsers to
 /// fold structurally-equivalent instances back to a generic shape (e.g.
 /// `Record<string, FieldType>`-style narrowing in TS) when the target
@@ -2423,6 +2447,11 @@ pub enum RouteSpec {
         /// `:bot_key` after `:room_id` rather than in front of `/rooms`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         nest: bool,
+        /// Keep routes dispatchable without exporting their helper names
+        /// into the enclosing application. Isolated engine helpers belong
+        /// to the engine's mounted proxy, which this runtime does not model.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        suppress_helpers: bool,
         entries: Vec<RouteSpec>,
     },
 }

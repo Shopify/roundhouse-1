@@ -684,4 +684,18 @@ class GlobalID
   def self.uri(model_name, id)
     "gid://" + Rails.application.global_id_app + "/" + model_name + "/" + id.to_s
   end
+
+  # Mint a signed GlobalID for `(model_name, id)` under `purpose` —
+  # the write half of `GlobalID::Locator.locate_signed`. Same
+  # `signed_global_ids` envelope ActionText attachables use; purpose
+  # is coerced with `to_s` so Symbol and String mints verify alike.
+  def self.signed(model_name, id, purpose)
+    ActionController::MessageVerifier.gid_envelope(
+      Rails.application.secret_key_base,
+      "signed_global_ids",
+      ActionController::MessageVerifier.json_string(uri(model_name, id)),
+      purpose.to_s,
+      ""
+    )
+  end
 end

@@ -228,6 +228,36 @@ pub struct SqliteVisitor;
 
 pub struct PostgresVisitor;
 
+impl SqlDialect {
+    /// Execute an insert that returns selected columns from that same
+    /// statement. Generated-column persistence uses this to hydrate the
+    /// database-owned values without a second, post-commit SELECT.
+    pub(crate) fn visit_insert_returning(
+        self,
+        ins: &Insert,
+        schema: &Schema,
+        returning_key: &Symbol,
+        key_is_integer: bool,
+        returning_columns: &[Symbol],
+    ) -> Expr {
+        let key_ident = self.ident(returning_key.as_str());
+        // Spinel snapshots SQLite integer cells through sqlite3_column_int
+        // (32-bit). Return integer keys as text so the shared result capture
+        // does not truncate them before the adapter parses them back.
+        let key_projection = if key_is_integer {
+            format!("CAST({key_ident} AS TEXT)")
+        } else {
+            key_ident
+        };
+        let mut projection = vec![key_projection];
+        projection.extend(returning_columns.iter().map(|column| self.ident(column.as_str())));
+        let projection = projection.join(", ");
+        let mut segments = insert_segments(ins, schema, self);
+        segments.push(lit_str(format!(" RETURNING {projection}")));
+        db_call(&ClassId(Symbol::from(DB_MOD)), "exec_returning", vec![concat_chain(segments)])
+    }
+}
+
 impl ArelVisitor for SqlDialect {
     fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
         match op {
@@ -926,14 +956,51 @@ fn emit_exists(sel: &Select, table: &Table, param: bool, dialect: SqlDialect) ->
 fn visit_insert(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Expr {
     let table = lookup_table(schema, &ins.table.0);
     let db = ClassId(Symbol::from(DB_MOD));
+    let mut segments = insert_segments(ins, schema, dialect);
 
+    if dialect == SqlDialect::Postgres && ins.returns_rowid {
+        let keys: Vec<_> = table.columns.iter().filter(|c| c.primary_key).collect();
+        if keys.len() != 1 || !matches!(keys[0].col_type, ColumnType::Integer | ColumnType::BigInt) {
+            let detail = "PostgreSQL generated insert identity requires one integer primary key";
+            crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                Span::synthetic(), None, "postgresql_insert_identity", detail,
+            ));
+            let mut stub = nil_lit();
+            stub.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                target: None, construct: Symbol::from("postgresql_insert_identity"), detail: detail.into(),
+            });
+            return stub;
+        }
+        segments.push(lit_str(format!(" RETURNING {}", dialect.ident(keys[0].name.as_str()))));
+        return db_call(&db, "insert_returning_int", vec![concat_chain(segments)]);
+    }
+
+    let exec_call = db_call(&db, "exec", vec![concat_chain(segments)]);
+    if !ins.returns_rowid {
+        return exec_call;
+    }
+    let last_id = db_call(&db, "last_insert_rowid", vec![]);
+    seq(vec![exec_call, last_id])
+}
+
+/// Compose the INSERT statement before the visitor chooses `exec`,
+/// `insert_returning_int` or `exec_returning`, as the segments
+/// `concat_chain` joins. Keeping value escaping here ensures every path
+/// retains the same inline, schema-ordered write semantics. A row with no
+/// column to write (an integer key and generated columns only) inserts
+/// `DEFAULT VALUES`, which both engines accept.
+fn insert_segments(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Vec<Expr> {
+    let _ = lookup_table(schema, &ins.table.0); // validates table exists; not consumed beyond that
+    let db = ClassId(Symbol::from(DB_MOD));
+    if ins.assignments.is_empty() {
+        return vec![lit_str(format!("INSERT INTO {} DEFAULT VALUES", dialect.ident(ins.table.0.as_str())))];
+    }
     let cols_csv = ins
         .assignments
         .iter()
         .map(|a| dialect.ident(a.column.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-
     let mut segments: Vec<Expr> = vec![lit_str(format!(
         "INSERT INTO {} ({}) VALUES (",
         dialect.ident(ins.table.0.as_str()),
@@ -946,35 +1013,7 @@ fn visit_insert(ins: &Insert, schema: &Schema, dialect: SqlDialect) -> Expr {
         segments.push(escape_value(&db, &a.value, dialect));
     }
     segments.push(lit_str(")".to_string()));
-
-    if dialect == SqlDialect::Postgres {
-        if ins.assignments.is_empty() {
-            segments = vec![lit_str(format!("INSERT INTO {} DEFAULT VALUES", dialect.ident(ins.table.0.as_str())))];
-        }
-        if ins.returns_rowid {
-            let keys: Vec<_> = table.columns.iter().filter(|c| c.primary_key).collect();
-            if keys.len() != 1 || !matches!(keys[0].col_type, ColumnType::Integer | ColumnType::BigInt) {
-                let detail = "PostgreSQL generated insert identity requires one integer primary key";
-                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
-                    Span::synthetic(), None, "postgresql_insert_identity", detail,
-                ));
-                let mut stub = nil_lit();
-                stub.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
-                    target: None, construct: Symbol::from("postgresql_insert_identity"), detail: detail.into(),
-                });
-                return stub;
-            }
-            segments.push(lit_str(format!(" RETURNING {}", dialect.ident(keys[0].name.as_str()))));
-            return db_call(&db, "insert_returning_int", vec![concat_chain(segments)]);
-        }
-    }
-
-    let exec_call = db_call(&db, "exec", vec![concat_chain(segments)]);
-    if !ins.returns_rowid {
-        return exec_call;
-    }
-    let last_id = db_call(&db, "last_insert_rowid", vec![]);
-    seq(vec![exec_call, last_id])
+    segments
 }
 
 fn visit_update(upd: &Update, schema: &Schema, dialect: SqlDialect) -> Expr {
@@ -1465,6 +1504,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: true,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                     Column {
                         name: Symbol::from("title"),
@@ -1472,6 +1513,8 @@ mod tests {
                         nullable: false,
                         default: None,
                         primary_key: false,
+                        generated: None,
+                        generated_text_compatible: None,
                     },
                 ],
                 indexes: vec![],
@@ -1673,6 +1716,35 @@ mod tests {
         // exec ; last_insert_rowid
         assert_eq!(outer_kind(&body), "seq");
         assert_eq!(seq_len(&body), 2);
+    }
+
+    #[test]
+    fn insert_without_assignments_uses_default_values() {
+        let (schema, owner) = fixture_schema();
+        for returns_rowid in [false, true] {
+            let op = ArelOp::Insert(Insert {
+                table: TableRef(Symbol::from("articles")),
+                assignments: vec![],
+                returns_rowid,
+            });
+            let body = SqliteVisitor.visit(&op, &schema, &owner);
+            let exec = if returns_rowid {
+                let ExprNode::Seq { exprs } = body.node.as_ref() else {
+                    panic!("insert must return the last row id");
+                };
+                assert_eq!(exprs.len(), 2);
+                &exprs[0]
+            } else {
+                &body
+            };
+            let ExprNode::Send { method, args, .. } = exec.node.as_ref() else {
+                panic!("insert must execute SQL");
+            };
+            assert_eq!(method.as_str(), "exec");
+            assert!(matches!(args[0].node.as_ref(),
+                ExprNode::Lit { value: Literal::Str { value } }
+                    if value == "INSERT INTO articles DEFAULT VALUES"));
+        }
     }
 
     #[test]

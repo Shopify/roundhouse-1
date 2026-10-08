@@ -18,9 +18,7 @@ impl Drop for Fixture {
     }
 }
 
-fn run(dir: &Path, program: &str, args: &[&str], commit: Option<&str>) -> String {
-    let mut cmd = Command::new(program);
-    cmd.current_dir(dir).args(args);
+fn scrub_git_env(cmd: &mut Command) {
     for key in [
         "GIT_DIR",
         "GIT_COMMON_DIR",
@@ -28,10 +26,16 @@ fn run(dir: &Path, program: &str, args: &[&str], commit: Option<&str>) -> String
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "ROUNDHOUSE_COMMIT",
     ] {
         cmd.env_remove(key);
     }
+}
+
+fn run(dir: &Path, program: &str, args: &[&str], commit: Option<&str>) -> String {
+    let mut cmd = Command::new(program);
+    cmd.current_dir(dir).args(args);
+    scrub_git_env(&mut cmd);
+    cmd.env_remove("ROUNDHOUSE_COMMIT");
     if let Some(commit) = commit {
         cmd.env("ROUNDHOUSE_COMMIT", commit);
     }
@@ -223,13 +227,13 @@ fn a_reused_build_script_reads_the_executing_manifest_directory() {
     assert!(compile.status.success(), "{}", String::from_utf8_lossy(&compile.stderr));
     let out_dir = f.root.join("out");
     fs::create_dir(&out_dir).unwrap();
-    let output = Command::new(&binary)
-        .current_dir(&f.linked)
+    let mut cmd = Command::new(&binary);
+    cmd.current_dir(&f.linked)
         .env("CARGO_MANIFEST_DIR", &f.linked)
-        .env("OUT_DIR", &out_dir)
-        .env_remove("ROUNDHOUSE_COMMIT")
-        .output()
-        .unwrap();
+        .env("OUT_DIR", &out_dir);
+    scrub_git_env(&mut cmd);
+    cmd.env_remove("ROUNDHOUSE_COMMIT");
+    let output = cmd.output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let table = fs::read_to_string(out_dir.join("runtime_files.rs")).unwrap();
     assert!(table.contains(f.linked.join("runtime/ruby/probe.rb").to_str().unwrap()),
@@ -258,13 +262,13 @@ fn main() {
     git(&f.linked, &["commit", "-m", "distinct runtime"]);
     let shared = f.root.join("shared-target");
     let build = |dir: &Path, text: &str| {
-        let output = Command::new(env!("CARGO"))
-            .current_dir(dir)
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.current_dir(dir)
             .args(["run", "--quiet", "--offline"])
-            .env("CARGO_TARGET_DIR", &shared)
-            .env_remove("ROUNDHOUSE_COMMIT")
-            .output()
-            .unwrap();
+            .env("CARGO_TARGET_DIR", &shared);
+        scrub_git_env(&mut cmd);
+        cmd.env_remove("ROUNDHOUSE_COMMIT");
+        let output = cmd.output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let expected = format!("{}|{text}", git(dir, &["rev-parse", "--short=8", "HEAD"]));
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected,

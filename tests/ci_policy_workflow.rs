@@ -130,7 +130,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     for name in [
         "build-roundhouse",
         "build-wasm",
-        "build-spinel",
+        "spinel-build",
         "writebook-inventory",
     ] {
         assert_eq!(jobs[name]["needs"].as_str(), Some("plan"), "{name}");
@@ -152,7 +152,7 @@ fn speculative_fanout_retains_selection_and_real_prerequisites() {
     for name in [
         "build-roundhouse",
         "build-wasm",
-        "build-spinel",
+        "spinel-build",
         "writebook-inventory",
         "store-check",
         "browser-smoke-typescript",
@@ -402,7 +402,11 @@ fn resource_and_harness_helpers_preserve_failures_and_contracts() {
 
 #[test]
 fn routing_and_required_results_reject_false_green() {
-    for test in ["tests/ci_plan_test.py", "tests/ci_archive_evidence_test.py"] {
+    for test in [
+        "tests/ci_plan_test.py",
+        "tests/ci_plan_focus_test.py",
+        "tests/ci_archive_evidence_test.py",
+    ] {
         let result = std::process::Command::new("python3")
             .args(["-B", test, "-v"])
             .output()
@@ -422,15 +426,77 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     assert_eq!(
-        jobs["compare"]["strategy"]["matrix"]["target"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[rust, typescript]").unwrap()
+        jobs["compare"]["strategy"]["matrix"]["target"].as_str(),
+        Some("${{ fromJSON(needs.plan.outputs.compare) }}")
     );
     assert_eq!(jobs["compare"]["steps"], jobs["compare-extra"]["steps"]);
+    let compare_steps = jobs["compare"]["steps"].as_sequence().unwrap();
+    let controller_identity = compare_steps
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .expect("the selected Rust compare lane executes controller identity values");
+    assert_eq!(
+        controller_identity["if"].as_str(),
+        Some("${{ !cancelled() && matrix.target == 'rust' }}")
+    );
+    let identity_run = controller_identity["run"].as_str().unwrap();
+    let cargo_command = concat!(
+        "cargo test --locked --test rust_toolchain ",
+        "real_blog_controller_identity_values_match_rails -- --ignored --nocapture --exact"
+    );
+    assert!(
+        identity_run.contains(&format!("if output=$({cargo_command} 2>&1); then")),
+        "the required Rust toolchain command and exact filter must be preserved:\n{identity_run}"
+    );
+    let success_check =
+        "grep -Fxq 'test real_blog_controller_identity_values_match_rails ... ok' <<< \"$output\"";
+    assert!(
+        identity_run.contains(success_check),
+        "the selected outer test must produce its exact success line:\n{identity_run}"
+    );
+    assert!(
+        controller_identity["continue-on-error"].is_null()
+            || controller_identity["continue-on-error"].as_bool() == Some(false),
+        "the Rust controller identity regression must be required"
+    );
     assert_eq!(
         jobs["compare-extra"]["strategy"]["max-parallel"].as_u64(),
         Some(7)
     );
+    assert_eq!(
+        jobs["compare-extra"]["continue-on-error"].as_str(),
+        Some("${{ needs.plan.outputs.extras-advisory == 'true' }}")
+    );
     assert_eq!(jobs["smoke"]["strategy"]["max-parallel"].as_u64(), Some(6));
+    assert_eq!(
+        jobs["smoke-extra"]["strategy"]["matrix"]["target"].as_str(),
+        Some("${{ fromJSON(needs.plan.outputs.smoke-extra) }}")
+    );
+    assert_eq!(
+        jobs["smoke-extra"]["continue-on-error"].as_str(),
+        Some("${{ needs.plan.outputs.extras-advisory == 'true' }}")
+    );
+    assert_eq!(jobs["smoke"]["steps"], jobs["smoke-extra"]["steps"]);
+    let spinel_coe = "${{ needs.plan.outputs.spinel-advisory == 'true' }}";
+    for name in [
+        "spinel-build",
+        "spinel-toolchain",
+        "spinel-compare",
+        "spinel-framework",
+    ] {
+        assert_eq!(
+            jobs[name]["continue-on-error"].as_str(),
+            Some(spinel_coe),
+            "{name} CoE must follow plan spinel-advisory"
+        );
+    }
+    assert_eq!(
+        ci["jobs"]["plan"]["outputs"]["spinel-advisory"].as_str(),
+        Some("${{ steps.plan.outputs.spinel-advisory }}")
+    );
     let smoke_guard = jobs["smoke"]["if"].as_str().unwrap();
     for condition in [
         "!cancelled()",
@@ -442,32 +508,68 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
             "selected smoke must run after its skipped WASM ancestor: {condition}"
         );
     }
-    assert_eq!(
-        jobs["campfire-compare-spinel"]["strategy"]["max-parallel"].as_u64(),
-        Some(3)
+    let gc = &jobs["campfire-spinel-compare"];
+    assert!(
+        gc.get("strategy").is_none(),
+        "GC modes run sequentially in one job, not a matrix"
     );
-    let gc = &jobs["campfire-compare-spinel"];
-    assert_eq!(gc["strategy"]["fail-fast"].as_bool(), Some(false));
+    assert_eq!(gc["timeout-minutes"].as_u64(), Some(75));
     for mode in ["default", "minor-gc", "verify-gen"] {
         assert_eq!(
             gc["outputs"][mode].as_str(),
             Some(format!("${{{{ steps.result.outputs.{mode} }}}}").as_str()),
-            "concurrent GC legs must report distinct mode keys"
+            "sequential GC walks must report distinct mode keys"
         );
     }
-    let report = gc["steps"]
-        .as_sequence()
-        .unwrap()
+    let steps = gc["steps"].as_sequence().unwrap();
+    for (id, flag) in [
+        ("walk-default", "--spinel /tmp/campfire"),
+        ("walk-minor-gc", "--spinel --minor-gc /tmp/campfire"),
+        ("walk-verify-gen", "--spinel --verify-gen /tmp/campfire"),
+    ] {
+        let walk = steps
+            .iter()
+            .find(|step| step["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing {id} step"));
+        assert_eq!(walk["continue-on-error"].as_bool(), Some(true));
+        assert_eq!(walk["timeout-minutes"].as_u64(), Some(20));
+        let run = walk["run"].as_str().unwrap();
+        assert!(
+            run.contains("--reuse") && run.contains(flag),
+            "{id} must reuse the binary with {flag}: {run}"
+        );
+    }
+    assert!(
+        steps.iter().all(|step| {
+            step["uses"].as_str() != Some("./.github/actions/setup-rust")
+                && !step["uses"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("Swatinem/rust-cache@")
+        }),
+        "--reuse walks must not pay setup-rust / rust-cache"
+    );
+    let report = steps
         .iter()
         .find(|step| step["id"].as_str() == Some("result"))
         .unwrap();
     assert_eq!(report["if"].as_str(), Some("always()"));
-    assert_eq!(report["env"]["MODE"].as_str(), Some("${{ matrix.gc }}"));
-    assert_eq!(report["env"]["STATUS"].as_str(), Some("${{ job.status }}"));
     assert_eq!(
-        report["run"].as_str(),
-        Some("echo \"$MODE=$STATUS\" >> \"$GITHUB_OUTPUT\"")
+        report["env"]["DEFAULT"].as_str(),
+        Some("${{ steps.walk-default.outcome }}")
     );
+    assert_eq!(
+        report["env"]["MINOR_GC"].as_str(),
+        Some("${{ steps.walk-minor-gc.outcome }}")
+    );
+    assert_eq!(
+        report["env"]["VERIFY_GEN"].as_str(),
+        Some("${{ steps.walk-verify-gen.outcome }}")
+    );
+    assert!(report["run"]
+        .as_str()
+        .unwrap()
+        .contains("echo \"default=$DEFAULT\""));
     assert!(
         ci["on"]["pull_request"].get("paths-ignore").is_none(),
         "summary must run even for documentation-only PRs"
@@ -490,6 +592,80 @@ fn compact_and_extra_compare_share_commands_but_not_results() {
     assert_eq!(ci["permissions"]["contents"].as_str(), Some("read"));
     assert!(ci["permissions"].get("pages").is_none());
     assert!(ci["permissions"].get("id-token").is_none());
+}
+
+/// Verifies the required Rust identity step needs execution and preserves Cargo failures.
+#[cfg(unix)]
+#[test]
+fn rust_identity_ci_guard_requires_execution_and_propagates_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let step = ci["jobs"]["compare"]["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|step| {
+            step["name"].as_str()
+                == Some("cargo test --test rust_toolchain controller identity values")
+        })
+        .unwrap();
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rust-identity-ci-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let cargo = root.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+printf '<%s>\n' "$@" >> "$CARGO_LOG"
+case "$CARGO_MODE" in
+  success) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 0 ;;
+  zero_match) printf '%s\n' 'running 0 tests'; exit 0 ;;
+  forged_success_on_failure) printf '%s\n' 'test real_blog_controller_identity_values_match_rails ... ok'; exit 37 ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cargo_args = "<test>\n<--locked>\n<--test>\n<rust_toolchain>\n<real_blog_controller_identity_values_match_rails>\n<-->\n<--ignored>\n<--nocapture>\n<--exact>\n";
+    for (mode, expected_status) in [
+        ("success", 0),
+        ("zero_match", 1),
+        ("forged_success_on_failure", 37),
+    ] {
+        let log = root.join("cargo.log");
+        fs::write(&log, "").unwrap();
+        let result = Command::new("bash")
+            .args(["-e", "-o", "pipefail", "-c", step["run"].as_str().unwrap()])
+            .env("CARGO_LOG", &log)
+            .env("CARGO_MODE", mode)
+            .env("CARGO_TERM_COLOR", "always")
+            .env(
+                "PATH",
+                format!("{}:{}", root.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(expected_status),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(fs::read_to_string(log).unwrap(), cargo_args);
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -642,7 +818,7 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
 
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
-    let step = ci["jobs"]["framework-tests-spinel"]["steps"]
+    let step = ci["jobs"]["spinel-framework"]["steps"]
         .as_sequence()
         .unwrap()
         .iter()
@@ -692,18 +868,62 @@ fn focused_framework_loop_runs_every_selection_and_preserves_failure() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// The PostgreSQL Db gate runs in the native framework loop: the job has
+/// a PostgreSQL service, checks spinel-pg out at a pinned commit only when
+/// the plan selects the gate, and hands both to the loop step.
+#[test]
+fn framework_loop_supplies_postgres_and_pinned_spinel_pg_to_the_pg_gate() {
+    let ci: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
+    let sha = ci["env"]["SPINEL_PG_SHA"].as_str().unwrap();
+    assert!(
+        sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "SPINEL_PG_SHA must be a full commit sha: {sha}"
+    );
+    let job = &ci["jobs"]["spinel-framework"];
+    let service = &job["services"]["postgres"];
+    assert!(service["image"].as_str().unwrap().starts_with("postgres:"));
+    assert_eq!(service["ports"][0].as_str(), Some("5432:5432"));
+    assert!(service["options"].as_str().unwrap().contains("pg_isready"));
+    let steps = job["steps"].as_sequence().unwrap();
+    let checkout = steps
+        .iter()
+        .find(|step| step["with"]["repository"].as_str() == Some("rubys/spinel-pg"))
+        .expect("spinel-pg checkout");
+    assert_eq!(
+        checkout["with"]["ref"].as_str(),
+        Some("${{ env.SPINEL_PG_SHA }}")
+    );
+    assert_eq!(checkout["with"]["path"].as_str(), Some("spinel-pg"));
+    assert!(checkout["if"].as_str().unwrap().contains("'spinel_pg_db'"));
+    let run = steps
+        .iter()
+        .find(|step| step["name"].as_str() == Some("Run selected native framework checks"))
+        .unwrap();
+    assert_eq!(
+        run["env"]["SPINEL_PG_DIR"].as_str(),
+        Some("${{ github.workspace }}/spinel-pg")
+    );
+    assert!(
+        run["env"]["DATABASE_URL"]
+            .as_str()
+            .unwrap()
+            .contains("@127.0.0.1:5432/")
+    );
+}
+
 #[test]
 fn spinel_jobs_are_selected_explicitly_and_archive_evidence_reaches_pages() {
     let ci: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&fs::read_to_string(".github/workflows/ci.yml").unwrap()).unwrap();
     let jobs = &ci["jobs"];
     for name in [
-        "framework-tests-spinel",
-        "campfire-db-differential-spinel",
-        "toolchain-spinel",
-        "compare-spinel",
-        "smoke-spinel",
-        "smoke-campfire",
+        "spinel-framework",
+        "campfire-spinel-db",
+        "spinel-toolchain",
+        "spinel-compare",
+        "spinel-smoke",
+        "campfire-smoke",
     ] {
         let job = &jobs[name];
         let needs = job["needs"]
@@ -723,7 +943,7 @@ fn spinel_jobs_are_selected_explicitly_and_archive_evidence_reaches_pages() {
 
     for (job_name, artifact_name) in [
         ("build-site", "browse-archives"),
-        ("build-campfire-archive", "campfire-archive"),
+        ("campfire-archive-build", "campfire-archive"),
     ] {
         let upload = jobs[job_name]["steps"]
             .as_sequence()
@@ -737,11 +957,11 @@ fn spinel_jobs_are_selected_explicitly_and_archive_evidence_reaches_pages() {
     let report = &jobs["archive-results"];
     for dependency in [
         "build-site",
-        "build-campfire-archive",
+        "campfire-archive-build",
         "smoke",
-        "smoke-spinel",
-        "smoke-campfire",
-        "smoke-campfire-docker",
+        "spinel-smoke",
+        "campfire-smoke",
+        "campfire-smoke-docker",
     ] {
         assert!(
             report["needs"]

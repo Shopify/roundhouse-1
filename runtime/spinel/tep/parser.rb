@@ -41,6 +41,10 @@ module Tep
       i = 1
       while i < lines.length
         line = lines[i]
+        # Reject malformed field names and obs-fold before reading framing.
+        if line.gsub(/\A[!#$%&'*+.^_`|~0-9A-Za-z-]+:/, "") == line
+          return nil
+        end
         colon = line.index(":")
         unless colon.nil?
           name  = line[0, colon].downcase

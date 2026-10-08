@@ -793,6 +793,51 @@ fn seed_well_known_classes(
         .or_insert(adapter_iface);
 }
 
+/// Private typing view: re-attach this file's full `Ty::Fn` for methods
+/// that declare a block. Shared registries are often return-only
+/// (`ret` stripped); `block_params_for` needs the Fn. Non-block entries
+/// already present in `classes` still win (registry-seeded returns).
+///
+/// When the caller registry lacks the enclosing class, `or_default`
+/// would otherwise build a sparse `ClassInfo` with only block-bearing
+/// methods — `send(name)` then unions to `Nil` instead of `Untyped`,
+/// and `{ (instance) -> void }` siblings stay unresolved. For those
+/// classes, also fill non-block local signatures with `or_insert`.
+/// Never mutates `classes`.
+fn typing_classes_with_local_block_contracts(
+    classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    methods: &[MethodDef],
+) -> crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
+    let declares_block: crate::det::HashSet<&Symbol> = methods
+        .iter()
+        .filter(|m| matches!(m.signature, Some(Ty::Fn { block: Some(_), .. })))
+        .filter_map(|m| m.enclosing_class.as_ref())
+        .collect();
+
+    let mut typing_classes = classes.clone();
+    for m in methods {
+        let (Some(enclosing), Some(sig)) = (&m.enclosing_class, &m.signature) else {
+            continue;
+        };
+        if !declares_block.contains(enclosing) {
+            continue;
+        }
+        let info = typing_classes
+            .entry(crate::ident::ClassId(enclosing.clone()))
+            .or_default();
+        let table = match m.receiver {
+            MethodReceiver::Instance => &mut info.instance_methods,
+            MethodReceiver::Class => &mut info.class_methods,
+        };
+        if matches!(sig, Ty::Fn { block: Some(_), .. }) {
+            table.insert(m.name.clone(), sig.clone());
+        } else {
+            table.entry(m.name.clone()).or_insert_with(|| sig.clone());
+        }
+    }
+    typing_classes
+}
+
 /// Same as `parse_methods_with_rbs` but takes a pre-built class
 /// registry — so cross-class method dispatch during body-typing can
 /// resolve. Used by the runtime-sweep test, which builds a unified
@@ -947,25 +992,7 @@ pub fn parse_methods_with_rbs_in_ctx(
     // Reads now resolve cleanly even when they lexically precede
     // the assignment (e.g. `@cache ||= compute` lowers to a `BoolOp`
     // whose left arm reads the unset ivar).
-    //
-    // Restore this file's block contracts in a private typing table.
-    let mut typing_classes = classes.clone();
-    for m in &methods {
-        let (Some(enclosing), Some(sig @ Ty::Fn { block: Some(_), .. })) =
-            (&m.enclosing_class, &m.signature)
-        else { continue };
-        let info = typing_classes
-            .entry(crate::ident::ClassId(enclosing.clone()))
-            .or_default();
-        match m.receiver {
-            MethodReceiver::Instance => {
-                info.instance_methods.insert(m.name.clone(), sig.clone());
-            }
-            MethodReceiver::Class => {
-                info.class_methods.insert(m.name.clone(), sig.clone());
-            }
-        }
-    }
+    let typing_classes = typing_classes_with_local_block_contracts(classes, &methods);
     let typer = crate::analyze::BodyTyper::new(&typing_classes);
 
     // Extract module-level constants from the .rb so dispatch on
@@ -979,6 +1006,7 @@ pub fn parse_methods_with_rbs_in_ctx(
      -> crate::analyze::Ctx {
         let mut ctx = crate::analyze::Ctx::default();
         ctx.enclosing_def = Some((m.name.clone(), matches!(m.receiver, MethodReceiver::Class)));
+        ctx.class_side = m.receiver == MethodReceiver::Class;
         if let Some(Ty::Fn { params, .. }) = &m.signature {
             for (param, p) in m.params.iter().zip(params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), p.ty.clone());

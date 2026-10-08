@@ -288,6 +288,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         // record itself (not `Self | Nil` like `find_by`).
         return_kind: Some(ReturnKind::SelfType),
     },
+    // `sole` / `find_sole_by` (Rails 7.0) raise unless exactly one row
+    // matches, so they answer the record itself, like `find_by!`.
+    CatalogedMethod {
+        name: "sole",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
     // `find_or_initialize_by` reads, and on a miss builds an unsaved
     // instance in memory — a SELECT with no write either way.
     CatalogedMethod {
@@ -751,8 +767,10 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     // ---- Instance-method writes ----
     // Mutations on a loaded record. Rails bangs-vs-non-bangs
-    // convention: non-bang returns Bool (success/failure);
-    // bang returns Self or raises on failure.
+    // convention: non-bang returns Bool (success/failure); bangs that
+    // share the compiled `Base` method (`save!`/`destroy`/`destroy!`)
+    // return `ActiveRecord::Base` per the sidecar (not Self — see
+    // `save!` below); monomorphized constructors stay SelfType.
     CatalogedMethod {
         name: "save",
         receiver: ReceiverContext::Instance,
@@ -760,12 +778,24 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::Bool),
     },
+    // `save!` is declared `() -> Base` in
+    // `runtime/ruby/active_record/base.rbs`, literally — not `self` or
+    // `instance` (RBS self-types the parser doesn't read yet, per that
+    // file's own comment). Unlike `find`/`create!`, `save!` is never
+    // monomorphized per model at emit time: every model shares the one
+    // compiled `Base#save!`, which returns a `Base`-typed value no
+    // matter which subclass calls it. Seeding `SelfType` here told a
+    // caller like `WidgetStamp#run` (whose tail is `widget.save!`) that
+    // the call answers `Widget`, so roundhouse emitted `-> Widget` for
+    // `run` — a claim the shared runtime function can't back, and
+    // spinel's AOT build refused the mismatched pointer types
+    // (roundhouse#296). `ClassRef` matches the sidecar literally.
     CatalogedMethod {
         name: "save!",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::SelfType),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
     },
     CatalogedMethod {
         name: "update",
@@ -781,19 +811,21 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::SelfType),
     },
+    // `destroy`/`destroy!` are `() -> Base` in the same sidecar, for
+    // the same reason `save!` is — see the comment there.
     CatalogedMethod {
         name: "destroy",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::SelfType),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
     },
     CatalogedMethod {
         name: "destroy!",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::SelfType),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
     },
     CatalogedMethod {
         name: "delete",
@@ -826,13 +858,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     // ---- Instance-method reads ----
     // `#reload` refreshes from the DB — writes-vs-reads-wise it's
     // a read, but carries the DbRead effect because it issues a
-    // SELECT.
+    // SELECT. Also `() -> Base` in the sidecar — see `save!` above.
     CatalogedMethod {
         name: "reload",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbRead,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::SelfType),
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
     },
     // ---- Instance-method state predicates ----
     // Pure — query in-memory flags the record already carries.
@@ -1440,6 +1472,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::SelfType),
     },
     CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
         name: "first!",
         receiver: ReceiverContext::Relation,
         effect: EffectClass::DbRead,
@@ -1823,7 +1862,7 @@ mod tests {
         // SqliteAdapter classified as Read must still be in the
         // catalog as DbRead under at least one receiver context.
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "where", "limit", "offset", "order", "group", "having",
             "joins", "includes", "preload", "select", "distinct",
             "count", "exists?", "pluck", "pick", "take",
@@ -1881,7 +1920,7 @@ mod tests {
     #[test]
     fn terminal_reads_are_classified() {
         for m in [
-            "all", "find", "find_by", "find_by!", "first", "last",
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
             "take", "count", "exists?", "pluck", "pick",
             "sum", "average", "maximum", "minimum",
         ] {

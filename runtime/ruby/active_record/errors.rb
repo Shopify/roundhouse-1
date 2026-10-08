@@ -90,6 +90,19 @@ module ActiveRecord
     end
   end
 
+  # Rails raises this from `sole` / `find_sole_by` when more than one
+  # record matches ("Wanted only one Widget"), under ActiveRecordError.
+  # Rails passes the relation and names its model; the shared `sole`
+  # (relation.rb) builds the message itself, so the constructor here
+  # takes a message only, as for the classes above. The CRuby tree's
+  # overlay adds Rails' model-taking constructor and `record` reader
+  # (ruby_overlay/runtime/active_record_statement_errors.rb).
+  class SoleRecordExceeded < ActiveRecordError
+    def initialize(message = "Wanted only one record")
+      super(message)
+    end
+  end
+
   # validations.rb: raised by `save!` when validation fails.
   class RecordInvalid < ActiveRecordError
     attr_reader :record

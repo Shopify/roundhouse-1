@@ -108,6 +108,8 @@ module ActiveRecord
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
     def self.where: (Hash[Symbol, untyped] conditions) -> Relation
     def self.find_by: (Hash[String | Symbol, untyped] conditions) -> Base?
+    def self.find_sole_by: (Hash[String | Symbol, untyped] conditions) -> Base
+    def self.sole: () -> Base
     def self.all: () -> Relation
     # default_scope (`lower::default_scope` emits the declaring model's).
     self.@_unscoped_depth: Integer?

@@ -1,0 +1,6 @@
+# Typing for runtime/spinel/pg_errors.rb.
+module PgErrors
+  UNIQUE_VIOLATION: String
+  STRING_DATA_RIGHT_TRUNCATION: String
+  def self.raise_mapped: (String sqlstate, String message) -> nil
+end
