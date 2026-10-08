@@ -85,7 +85,7 @@ pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 /// A call on a receiver typed as Rails' `ActiveModel::Errors` that the
 /// models' `Array[String]` accumulator cannot answer by itself
 /// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `details`,
-/// `merge!`):
+/// `merge!`, and Enumerable over the Errors, [`errors_enumerable`]):
 /// the messages by attribute, or another collection's errors. The CRuby
 /// and JRuby trees write it `ActiveModel::ErrorAttributes.<method>(errors,
 /// ...)` over what each push records (`emit::ruby::expr::
@@ -101,6 +101,27 @@ pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
         "to_hash" | "as_json" => args <= 1 && !block,
         "messages" | "details" => args == 0 && !block,
         "merge!" => args == 1 && !block,
+        _ => errors_enumerable(method, args, block),
+    }
+}
+
+/// Whether `errors.<method>` is Enumerable over the collection's Errors
+/// (Rails' ActiveModel::Errors includes Enumerable over `each`, which
+/// yields each ActiveModel::Error, plus ActiveSupport's core_ext), or
+/// `errors.errors` / `objects`, the Errors themselves: the accumulator
+/// holds full-message Strings, so these run over
+/// `ActiveModel::ErrorAttributes.objects(errors)`. A blockless count,
+/// emptiness or truth query answers the same over the messages and
+/// stays on the accumulator.
+pub fn errors_enumerable(method: &str, args: usize, block: bool) -> bool {
+    match method {
+        "errors" | "objects" => args == 0 && !block,
+        "each" | "any?" | "none?" | "all?" | "one?" | "count" => block,
+        "map" | "collect" | "flat_map" | "collect_concat" | "filter_map" | "select" | "filter" | "reject"
+        | "find" | "detect" | "find_index" | "first" | "to_a" | "entries" | "each_with_object"
+        | "each_with_index" | "inject" | "reduce" | "group_by" | "partition" | "sort_by" | "min_by"
+        | "max_by" | "sum" | "take" | "drop" | "take_while" | "drop_while" | "uniq" | "tally"
+        | "each_slice" | "zip" | "index_by" | "index_with" | "pluck" | "many?" => true,
         _ => false,
     }
 }
@@ -259,6 +280,11 @@ pub enum IrHint {
     /// trees dedupe the two (`emit::ruby::collection_autosave`); every
     /// other emit ignores it.
     InvalidErrorType,
+    /// On a view's `errors.each do |error| ... end` whose block the view
+    /// lowering rewrote onto the accumulator's full-message Strings
+    /// (`error.full_message` read as `error`): it iterates the messages,
+    /// so it is not Enumerable over the Errors (`errors_enumerable`).
+    ErrorMessagesEach,
     /// On the reader send `lower::assoc_loaded` collapsed
     /// `record.association(:name).target` onto (`record.name`). Rails'
     /// `target` answers the loaded record(s), nil or [] when nothing has

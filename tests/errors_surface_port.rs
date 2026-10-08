@@ -185,6 +185,39 @@ const PROBE: &str = r##"class SurfaceProbe
       post.errors.merge!(invalid("LOUD").errors)
       post.errors.details
     end
+    show(out, "each over the errors") do
+      entry = Entry.new(title: "x", code: "abc", kind: "spam", pages: "lots", terms: "0", rank: 1)
+      entry.valid?
+      seen = []
+      entry.errors.each { |error| seen << [error.attribute, error.type, error.message] }
+      seen
+    end
+    show(out, "map over the errors") do
+      post = invalid("LOUD")
+      [post.errors.map(&:full_message), post.errors.map { |error| [error.attribute, error.raw_type] },
+       post.errors.collect(&:details), post.errors.flat_map { |error| [error.attribute, error.message] }]
+    end
+    show(out, "queries over the errors") do
+      post = invalid("LOUD")
+      [post.errors.first.attribute, post.errors.find { |error| error.attribute == :author_id }.full_message,
+       post.errors.any? { |error| error.attribute == :base }, post.errors.none? { |error| error.type == :blank },
+       post.errors.count { |error| error.attribute == :base }, post.errors.one? { |error| error.attribute == :base },
+       post.errors.all? { |error| error.match?(error.attribute) }, post.errors.find_index { |error| error.attribute == :author_id }]
+    end
+    show(out, "collections of the errors") do
+      post = invalid("LOUD")
+      [post.errors.select { |error| error.attribute == :base }.map(&:message),
+       post.errors.reject { |error| error.attribute == :base }.map(&:message),
+       post.errors.filter_map { |error| error.message if error.attribute == :author_id },
+       post.errors.group_by(&:attribute).transform_values { |errors| errors.map(&:message) },
+       post.errors.each_with_object({}) { |error, out| out[error.attribute] = error.type },
+       post.errors.sort_by { |error| error.attribute.to_s }.map(&:attribute),
+       post.errors.to_a.size, post.errors.errors.map(&:attribute), post.errors.objects.map(&:message)]
+    end
+    show(out, "a validator's errors") do
+      found = check(nil)
+      [found.errors.map(&:full_message), found.errors.map(&:details), found.errors.first.strict_match?(:name, :blank)]
+    end
     show(out, "then revalidated") do
       post = invalid("")
       post.errors.merge!(invalid("LOUD").errors)
@@ -210,6 +243,11 @@ const EXPECTED: &[&str] = &[
     r#"details of a long title: {title: [{error: :too_long, count: 8}]}"#,
     r#"details of each add: [{base: [{error: "custom text"}]}, {code: [{error: :blank}]}, {code: [{error: :invalid}]}, {code: [{error: :invalid}]}]"#,
     r#"details after merge: {title: [{error: :blank}], base: [{error: "no shouting"}], author_id: [{error: "must be set"}]}"#,
+    r#"each over the errors: [[:post, :blank, "must exist"], [:title, :too_short, "is too short (minimum is 2 characters)"], [:code, :invalid, "is invalid"], [:kind, :exclusion, "is reserved"], [:pages, :not_a_number, "is not a number"], [:terms, :accepted, "must be accepted"], [:rank, :greater_than, "must be greater than 2"]]"#,
+    r#"map over the errors: [["no shouting", "Author must be set"], [[:base, "no shouting"], [:author_id, "must be set"]], [{error: "no shouting"}, {error: "must be set"}], [:base, "no shouting", :author_id, "must be set"]]"#,
+    r#"queries over the errors: [:base, "Author must be set", true, true, 1, true, true, 1]"#,
+    r#"collections of the errors: [["no shouting"], ["must be set"], ["must be set"], {base: ["no shouting"], author_id: ["must be set"]}, {base: "no shouting", author_id: "must be set"}, [:author_id, :base], 2, [:base, :author_id], ["no shouting", "must be set"]]"#,
+    r#"a validator's errors: [["Name can't be blank"], [{error: :blank}], true]"#,
     r#"then revalidated: {}"#,
 ];
 
@@ -311,7 +349,14 @@ fn unrecorded_options_raise_from_details() {
 #[test]
 fn spinel_refuses_the_calls() {
     let (dir, errors) = app().emit(BuildTarget::Spinel);
-    for call in ["ActiveModel::Errors#merge!", "ActiveModel::Errors#details"] {
+    for call in [
+        "ActiveModel::Errors#merge!",
+        "ActiveModel::Errors#details",
+        "ActiveModel::Errors#each",
+        "ActiveModel::Errors#map",
+        "ActiveModel::Errors#first",
+        "ActiveModel::Errors#group_by",
+    ] {
         assert!(
             errors.iter().any(|e| e.contains(call)
                 && e.contains("declared by the Ruby-family runtime (runtime/active_model_errors.rb), which spinel does not emit")),
@@ -365,6 +410,15 @@ const PORT_PROBE: &str = r##"class PortProbe
       check.errors.merge!(post.errors)
       [check.errors.full_messages, check.errors.to_hash, check.errors.details]
     end
+    show(out, "each side's errors") do
+      check = PortCheck.new(nil)
+      check.valid?
+      post = Post.new(title: "LOUD")
+      post.valid?
+      check.errors.merge!(post.errors)
+      [check.errors.map { |error| [error.attribute, error.type] }, post.errors.map(&:details),
+       check.errors.select { |error| error.attribute == :base }.map(&:full_message), check.errors.first.message]
+    end
     out
   end
 end
@@ -373,6 +427,7 @@ end
 const PORT_EXPECTED: &[&str] = &[
     r#"record takes a port's: [["no shouting", "Author must be set", "Name can't be blank"], {base: ["no shouting"], author_id: ["must be set"], name: ["can't be blank"]}]"#,
     r#"port takes a record's: [["Name can't be blank", "no shouting", "Author must be set"], {name: ["can't be blank"], base: ["no shouting"], author_id: ["must be set"]}, {name: [{error: :blank}], base: [{error: "no shouting"}], author_id: [{error: "must be set"}]}]"#,
+    r#"each side's errors: [[[:name, :blank], [:base, "no shouting"], [:author_id, "must be set"]], [{error: "no shouting"}, {error: "must be set"}], ["no shouting"], "can't be blank"]"#,
 ];
 
 const DATABASE_YML: &str = "test:\n  adapter: postgresql\n  encoding: unicode\n  database: rh_e2e_errors_surface\n";
