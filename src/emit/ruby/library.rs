@@ -6803,8 +6803,18 @@ fn emit_library_class_decl_inner(
     // The same calls the body writes below (`replayed` there): a
     // lowered `mixes_in_class_methods` runs in every body, and reads its
     // modules at load (widget/describable.rb's `ClassMethods`, a plain
-    // gem's nested module no autoload defines).
-    let own_calls = if railtie || replays_all { Vec::new() } else { app_extension_calls(lc, app) };
+    // gem's nested module no autoload defines). A `prepend` of an app
+    // module too: essentials' patches/money_ext.rb reopens the
+    // shopify-money gem's `Money` to `prepend MoneyOverride`, the reopen
+    // is written in the gem's class file, and nothing else loads
+    // MoneyOverride's file before it runs.
+    let own_calls: Vec<&Expr> = if railtie || replays_all {
+        Vec::new()
+    } else {
+        let mut calls = app_extension_calls(lc, app);
+        calls.extend(app_prepend_calls(lc, app).into_iter().map(|(call, _)| call));
+        calls
+    };
     let replayed = |call: &&Expr| {
         replays_all
             || crate::ingest::sorbet_check::is_mixes_in(call)

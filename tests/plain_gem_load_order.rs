@@ -1,7 +1,7 @@
 //! A plain gem's files load in the order its requires give, and each
 //! file's declarations are defined where the file runs.
 //!
-//! Shapes from Core's r16-pre1 boot (emit at ec8afa59a), each
+//! Three shapes from Core's r16-pre1 boot (emit at ec8afa59a), each
 //! checked against CRuby on the same files with circular-require
 //! warnings raising (Core's StrictWarning):
 //!
@@ -14,6 +14,10 @@
 //!   `Declaration = Data.define(...)` and then `Policy::DEFAULT =
 //!   Policy.new(...)`, which builds Declarations. DEFAULT is emitted in
 //!   the namespace's file, and it loaded ahead of Declaration's.
+//! - essentials' patches/money_ext.rb: `module MoneyOverride`, then
+//!   `class Money; prepend MoneyOverride; end`, reopening the
+//!   shopify-money gem's class. The prepend is written in the gem's
+//!   class file, which did not load MoneyOverride's.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -143,5 +147,25 @@ end
         "rm",
         "p Rm::Mutex::Input.new.families\nputs Rm::Mutex::VERSION\nputs Rm::Mutex::SPACE\np Rm::Mutex::Policy::DEFAULT.declarations.last.mode\n",
         "[\"theme\", \"checkout\"]\n0.1\n10\n:exclusive\n",
+    );
+}
+
+#[test]
+fn a_patch_files_prepend_on_another_gems_class_finds_its_module() {
+    const COIN: &[(&str, &str)] =
+        &[("coin.rb", "class Coin\n  def initialize(value)\n    @value = value\n  end\n\n  def value\n    @value\n  end\nend\n")];
+    const ESS: &[(&str, &str)] = &[
+        ("ess.rb", "require \"coin\"\nrequire_relative \"patches/coin_ext\"\n"),
+        (
+            "patches/coin_ext.rb",
+            "module CoinOverride\n  def value\n    super * 2\n  end\nend\n\nmodule CoinFromCents\n  def from_cents(cents)\n    new(cents / 100.0)\n  end\nend\n\nclass Coin\n  extend CoinFromCents\n  prepend CoinOverride\nend\n",
+        ),
+    ];
+    same_as_native(
+        "prepend",
+        &[("coin", COIN), ("ess", ESS)],
+        "ess",
+        "puts Coin.new(3).value\nputs Coin.from_cents(250).value\np Coin.ancestors.first(2)\n",
+        "6\n5.0\n[CoinOverride, Coin]\n",
     );
 }
