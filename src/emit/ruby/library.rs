@@ -1444,7 +1444,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         assoc_class_methods: &assoc_class_methods,
         user_returns: &user_returns,
         unique_keys: &unique_keys,
-        track_targets: super::expr::native_keywords() && app_reads_association_state(app),
+        track_targets: super::expr::native_keywords(),
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
@@ -1738,9 +1738,9 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
     }
     // The CRuby and JRuby trees, which run the native comparisons
     // (tests/errors_association_ports.rs), also memoize a polymorphic
-    // belongs_to, load the target on assignment and invalidate an
-    // inherited key's writer; the other trees keep the non-polymorphic
-    // memoization and their own key writers.
+    // belongs_to and invalidate an inherited key's writer; the other
+    // trees keep the non-polymorphic memoization (and its writer's
+    // load) and their own key writers.
     let native = super::expr::native_keywords();
     let stale_state = native && app_calls_association(app);
     for lc in lcs.iter_mut() {
@@ -1750,10 +1750,14 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
             own.retain(|(_, _, type_column)| type_column.is_none());
         }
         for (name, _, _) in &own {
+            // The guard the preload pass puts on a reader when the app
+            // runs `includes`; every reader memoizes behind it.
+            ensure_cache_guard(lc, name);
             memoize_reader(lc, name);
-            if native {
-                load_on_assign(lc, name, stale_state);
-            }
+            // Every tree: with the guard in place, a writer that left
+            // the cache alone would leave the reader answering the
+            // record it held before.
+            load_on_assign(lc, name, stale_state);
         }
         let mut keys = own;
         let mut seen = vec![model.name.clone()];
@@ -1773,6 +1777,96 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
                 invalidate_on_fk_write(lc, &name, &type_column, stale_state);
             }
         }
+    }
+}
+
+/// A synthesized association reader opens with `return @<name>_cache
+/// if @<name>_loaded` (`preload_cache_guard`): a has_many / has_one
+/// reader always does, a belongs_to one once `apply_preload_lowering`
+/// ran. One without it gets it here, so a target the writer holds (an
+/// unsaved record, or any on the CRuby and JRuby trees) answers the
+/// read, as Rails' does. A hand-written reader is left alone.
+fn ensure_cache_guard(lc: &mut LibraryClass, name: &Symbol) {
+    let loaded = Symbol::from(format!("{}_loaded", name.as_str()));
+    let Some(m) = lc.methods.iter_mut().find(|m| {
+        &m.name == name && m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.name_span.is_synthetic()
+    }) else {
+        return;
+    };
+    let guarded = matches!(&*m.body.node, ExprNode::Seq { exprs }
+        if exprs.first().is_some_and(|g| matches!(&*g.node,
+            ExprNode::If { cond, .. } if matches!(&*cond.node, ExprNode::Ivar { name } if name == &loaded))));
+    if guarded {
+        return;
+    }
+    let old = std::mem::replace(&mut m.body, Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }));
+    m.body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![preload_cache_guard(name), old] });
+}
+
+/// Ruby-family pre-emit pass: `record.reload` drops every association
+/// target the record holds, as Rails' (`@association_cache = {}`): the
+/// model's `_adapter_reload`, which re-reads the row, also clears each
+/// `@<name>_loaded`, so the next read of an association loads it again
+/// for the reloaded keys. The associations are the model's and its
+/// model ancestors' (an abstract base's or an STI parent's), whose
+/// readers it inherits.
+pub(crate) fn apply_reload_resets_associations(lcs: &mut [LibraryClass], app: &App) {
+    // The belongs_to stale record `invalidate_on_fk_write` keeps.
+    let stale_state = super::expr::native_keywords() && app_calls_association(app);
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        let mut names: Vec<Symbol> = Vec::new();
+        let mut stale: Vec<Symbol> = Vec::new();
+        let mut seen: Vec<ClassId> = Vec::new();
+        let mut cursor = Some(model);
+        while let Some(m) = cursor {
+            if seen.contains(&m.name) {
+                break;
+            }
+            seen.push(m.name.clone());
+            for a in m.associations() {
+                if !names.contains(a.name()) {
+                    names.push(a.name().clone());
+                    if stale_state && matches!(a, crate::dialect::Association::BelongsTo { .. }) {
+                        stale.push(a.name().clone());
+                    }
+                }
+            }
+            cursor = m.parent.as_ref().and_then(|p| app.models.iter().find(|pm| &pm.name == p));
+        }
+        let Some(reload) = lc
+            .methods
+            .iter_mut()
+            .find(|m| m.name.as_str() == "_adapter_reload" && m.receiver == MethodReceiver::Instance)
+        else {
+            continue;
+        };
+        if names.is_empty() {
+            continue;
+        }
+        let span = reload.body.span;
+        let mut stmts = match &*reload.body.node {
+            ExprNode::Seq { exprs } => exprs.clone(),
+            _ => vec![reload.body.clone()],
+        };
+        // Before the method's value (its last statement).
+        let value = stmts.pop();
+        let flags = names
+            .iter()
+            .map(|n| format!("{}_loaded", n.as_str()))
+            .chain(stale.iter().map(|n| format!("{}_stale_loaded", n.as_str())));
+        for flag in flags {
+            stmts.push(Expr::new(
+                span,
+                ExprNode::Assign {
+                    target: LValue::Ivar { name: Symbol::from(flag) },
+                    value: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } }),
+                },
+            ));
+        }
+        stmts.extend(value);
+        reload.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
+        reload.mutates_self = true;
     }
 }
 
@@ -1848,13 +1942,14 @@ fn load_on_assign(lc: &mut LibraryClass, name: &Symbol, stale_state: bool) {
 ///
 /// Only a reader that returns its records as an Array (a `:through`
 /// reader answers a Relation, which memoizes its own records), only on
-/// the CRuby and JRuby trees, and only where the app reads the state
-/// (`app_reads_association_state`): elsewhere nothing can observe the
-/// difference but a re-query's freshness.
+/// the CRuby and JRuby trees. Rails' reader answers the target it
+/// loaded until `reload` / `reset`, so a record's in-memory changes
+/// (what `validates_associated` and autosave read) survive the next
+/// read.
 pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App) {
     use crate::dialect::Association;
 
-    if !super::expr::native_keywords() || !app_reads_association_state(app) {
+    if !super::expr::native_keywords() {
         return;
     }
     for lc in lcs.iter_mut() {
@@ -2000,34 +2095,6 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol) {
         value: syn(ExprNode::Lit { value: Literal::Bool { value: true } }),
     }));
     exprs.push(syn(ExprNode::Ivar { name: cache }));
-}
-
-/// The app observes association state: it calls `association(x)`, or
-/// reads `record.x.loaded?`, which `lower::assoc_loaded` writes as the
-/// flat `x_loaded?`.
-pub(crate) fn app_reads_association_state(app: &App) -> bool {
-    fn walk(e: &Expr, found: &mut bool) {
-        if *found {
-            return;
-        }
-        if let ExprNode::Send { method, args, .. } = &*e.node {
-            if args.is_empty() && method.as_str().ends_with("_loaded?") {
-                *found = true;
-                return;
-            }
-        }
-        e.node.for_each_child(&mut |c| walk(c, found));
-    }
-    if app_calls_association(app) {
-        return true;
-    }
-    let mut found = false;
-    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut found));
-    for view in &app.views {
-        walk(&view.body, &mut found);
-    }
-    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &mut found));
-    found
 }
 
 /// Ruby-family pre-emit pass: each model answers `association(name)`.
@@ -2250,44 +2317,40 @@ fn memoize_reader(lc: &mut LibraryClass, name: &Symbol) {
     ];
 }
 
-/// `def <fk>=(value); @<fk> = value; end` gains `@<name>_loaded = false`,
-/// and with `stale_state`, first records a loaded target going stale:
-/// `if @<name>_loaded; @<name>_stale_state = <fk>; @<name>_stale_loaded
-/// = true; end`.
+/// `def <fk>=(value); @<fk> = value; end` first drops a loaded target
+/// when the key changes: `@<name>_loaded = false if value != <fk>`, and
+/// with `stale_state`, records it going stale (`if @<name>_loaded;
+/// @<name>_stale_state = <fk>; @<name>_stale_loaded = true; end`).
+/// Rails' reader reloads only a stale target (`stale_target?`, the key
+/// differing from the one it was loaded for): writing the key it
+/// already holds keeps the target and its in-memory changes.
 fn invalidate_on_fk_write(lc: &mut LibraryClass, name: &Symbol, fk: &Symbol, stale_state: bool) {
     let writer = Symbol::from(format!("{}=", fk.as_str()));
     let Some(m) = lc
         .methods
         .iter_mut()
-        .find(|m| m.name == writer && m.receiver == MethodReceiver::Instance)
+        .find(|m| m.name == writer && m.receiver == MethodReceiver::Instance && m.params.len() == 1)
     else {
         return;
     };
     let span = m.body.span;
-    let reset = Expr::new(
-        span,
-        ExprNode::Assign {
-            target: LValue::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) },
-            value: Expr::new(span, ExprNode::Lit { value: Literal::Bool { value: false } }),
-        },
-    );
+    let n = name.as_str();
+    let (value, fk) = (m.params[0].name.as_str(), fk.as_str());
+    let record = if stale_state {
+        format!("    if @{n}_loaded\n      @{n}_stale_state = {fk}\n      @{n}_stale_loaded = true\n    end\n")
+    } else {
+        String::new()
+    };
+    let src = format!("def __invalidate({value})\n  if {value} != {fk}\n{record}    @{n}_loaded = false\n  end\nend\n");
+    let guard = crate::runtime_src::parse_methods(&src)
+        .unwrap_or_else(|e| panic!("invalidate_on_fk_write: generated source failed to parse: {e}\n{src}"))
+        .pop()
+        .expect("one method");
     let mut stmts = match &*m.body.node {
         ExprNode::Seq { exprs } => exprs.clone(),
         _ => vec![m.body.clone()],
     };
-    if stale_state {
-        let n = name.as_str();
-        let src = format!(
-            "def __stale\n  if @{n}_loaded\n    @{n}_stale_state = {}\n    @{n}_stale_loaded = true\n  end\nend\n",
-            fk.as_str()
-        );
-        let record = crate::runtime_src::parse_methods(&src)
-            .unwrap_or_else(|e| panic!("invalidate_on_fk_write: generated source failed to parse: {e}\n{src}"))
-            .pop()
-            .expect("one method");
-        stmts.insert(0, record.body);
-    }
-    stmts.push(reset);
+    stmts.insert(0, guard.body);
     m.body = Expr::new(span, ExprNode::Seq { exprs: stmts });
 }
 

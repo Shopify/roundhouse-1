@@ -380,6 +380,8 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // …and a has_many/has_one reader keeps the records it loads where the
     // app reads `loaded?` (same guard, same reason to run after preload).
     library::apply_collection_memoization(&mut lcs, app);
+    // `record.reload` drops the targets those caches hold, as Rails'.
+    library::apply_reload_resets_associations(&mut lcs, app);
     // Every association reader waits on its record's pending preload
     // (`lower::deferred_preload`): a Relation's includes run when a record
     // first reads an association, not when the rows arrive. After the two
