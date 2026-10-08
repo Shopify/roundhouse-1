@@ -241,6 +241,12 @@ fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr
         collect_classes(&body, scope, nesting, out);
         return;
     }
+    // A declaration in a `concerning` block binds in the block's lexical
+    // scope, the enclosing body (see `ConcerningCall`).
+    if let Some(body) = concerning_call(node).and_then(|c| c.block.body()) {
+        collect_classes(&body, scope, nesting, out);
+        return;
+    }
     if let Some(m) = node.as_module_node() {
         // Push the module's name onto the scope before descending —
         // bare class declarations inside qualify with the module
@@ -335,6 +341,10 @@ fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
     }
     if let Some(body) = hoisted_singleton_body(node) {
         collect_modules(&body, scope, out);
+        return;
+    }
+    if let Some(body) = concerning_call(node).and_then(|c| c.block.body()) {
+        collect_modules(&body, scope, out);
     }
 }
 
@@ -357,6 +367,7 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || is_marker_module(m.body())
         || body_has_constant_receiver_call(m.body())
         || body_has_mixin_include(m.body())
+        || !concerning_calls(m.body()).is_empty()
 }
 
 /// A body that includes a module by constant: the module is a mixin
@@ -618,6 +629,88 @@ pub(super) fn guarded_constant_write<'pr>(stmt: &Node<'pr>) -> Option<ruby_prism
         return None;
     }
     Some(write)
+}
+
+/// ActiveSupport's `Module#concerning` / `Module#concern` in a class or
+/// module body (`active_support/core_ext/module/concerning`):
+///
+/// ```ruby
+/// concerning :Behaviour do     # concern(:Behaviour) { … }; include Behaviour
+///   ACTION = "x"               # the ENCLOSING scope's constant
+///   def action = ACTION        # Behaviour's instance method
+/// end
+/// ```
+///
+/// `concern(topic, &block)` is `const_set topic, Module.new { extend
+/// ::ActiveSupport::Concern; module_eval(&block) }`; `concerning` then
+/// includes it (`prepend: true` prepends it). The block is a closure:
+/// its `def`s go into the new module (module_eval changes the default
+/// definee), while constants it writes, and nested declarations, bind in
+/// the block's lexical cref, the enclosing body.
+pub(super) struct ConcerningCall<'pr> {
+    pub topic: String,
+    /// `concerning` (true) or bare `concern` (false).
+    pub mixes_in: bool,
+    pub prepend: bool,
+    pub call: ruby_prism::CallNode<'pr>,
+    pub block: ruby_prism::BlockNode<'pr>,
+}
+
+/// `stmt` as a [`ConcerningCall`]: receiverless (or `self.`), a literal
+/// Symbol/String topic that names a constant, at most a literal
+/// `prepend: true|false`, and a parameterless block. Any other spelling
+/// is not one, and stays the captured call it was.
+pub(super) fn concerning_call<'pr>(stmt: &Node<'pr>) -> Option<ConcerningCall<'pr>> {
+    let call = stmt.as_call_node()?;
+    if !call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+        return None;
+    }
+    let mixes_in = match constant_id_str(&call.name()) {
+        "concerning" => true,
+        "concern" => false,
+        _ => return None,
+    };
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+    let (topic, rest) = args.split_first()?;
+    let topic = symbol_or_string_value(topic)?;
+    let constant_name = topic.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && topic.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !constant_name {
+        return None;
+    }
+    let mut prepend = false;
+    match rest {
+        [] => {}
+        [options] if mixes_in => {
+            let hash = options.as_keyword_hash_node()?;
+            for element in hash.elements().iter() {
+                let assoc = element.as_assoc_node()?;
+                if symbol_value(&assoc.key()).as_deref() != Some("prepend") {
+                    return None;
+                }
+                let value = assoc.value();
+                prepend = if value.as_true_node().is_some() {
+                    true
+                } else if value.as_false_node().is_some() || value.as_nil_node().is_some() {
+                    false
+                } else {
+                    return None;
+                };
+            }
+        }
+        _ => return None,
+    }
+    Some(ConcerningCall { topic, mixes_in, prepend, call, block })
+}
+
+/// The [`ConcerningCall`]s among a class or module body's statements.
+pub(super) fn concerning_calls<'pr>(body: Option<Node<'pr>>) -> Vec<ConcerningCall<'pr>> {
+    let Some(body) = body else { return Vec::new() };
+    flatten_statements(body).iter().filter_map(concerning_call).collect()
 }
 
 /// An `included do … end` block marks an ActiveSupport::Concern whose
