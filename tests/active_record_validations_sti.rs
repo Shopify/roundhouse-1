@@ -493,3 +493,231 @@ fn strict_validation_failed_is_a_check_error_on_a_strict_target() {
     assert_eq!(strict.len(), 2, "`strict: true` on Account and `validates!` on Premium: {errors:#?}");
     assert!(!errors.iter().any(|e| e.contains("PremiumError")), "{errors:#?}");
 }
+
+const CUSTOMER: &str = r##"class Customer < ApplicationRecord
+  has_many :orders
+  validates :name, presence: true
+  validates :name, length: { minimum: 3 }, on: :audit
+  validates_each :name do |record, attr, value, extra|
+    record.errors.add(:base, "#{attr} #{value} #{extra.inspect}") if value == "four"
+  end
+end
+"##;
+
+const LINE: &str = r##"class Line < ApplicationRecord
+  belongs_to :order
+  validates :sku, presence: true
+  validates :qty, numericality: { greater_than: 0 }, on: :update
+  validates :qty, numericality: { less_than: 100 }, on: :audit
+end
+"##;
+
+const RECEIPT: &str = r##"class Receipt < ApplicationRecord
+  belongs_to :order
+  validates :total, presence: true
+
+  def marked_for_destruction?
+    total == -1
+  end
+end
+"##;
+
+const ORDER: &str = r##"class Order < ApplicationRecord
+  belongs_to :customer, optional: true
+  has_many :lines
+  has_one :receipt
+  validates_associated :customer
+  validates_associated :lines
+  validates_associated :receipt, unless: -> { is_a?(RushOrder) }
+  validates_each :name, :code, allow_nil: true do |record, attr, value|
+    record.errors.add(attr, "starts with x") if value.to_s.start_with?("x")
+    record.errors.add(:base, "#{attr} is #{record.send(attr).to_s.size} long") if value.to_s.size > 6
+  end
+  validates_each :status do |record, attr|
+    record.errors.add(:base, "No #{attr}") if record.status.nil?
+  end
+  validates :code, presence: true, strict: true
+  validates! :code, length: { maximum: 5 }
+end
+"##;
+
+const RUSH: &str = r##"class RushOrder < Order
+  validates_each :name do |record, attr, value|
+    record.errors.add(attr, "is too short for rush") if value.to_s.size < 3
+  end
+  validates :receipt, associated: true
+end
+"##;
+
+const ORDER_PROBE: &str = r##"class OrderProbe
+  def self.line(label, record, context = nil)
+    valid = begin
+      context.nil? ? record.valid? : record.valid?(context)
+    rescue StandardError => e
+      "raised #{e.class}: #{e.message}"
+    end
+    "#{label}: #{valid} #{record.errors.full_messages.inspect} #{record.errors.attribute_names.inspect}"
+  end
+
+  def self.lines
+    out = []
+    c = Customer.create!(name: "Ann")
+    o = Order.create!(name: "o1", code: "c1", status: "new", customer: c)
+    Line.create!(order: o, sku: "a", qty: 1)
+    Line.create!(order: o, sku: "b", qty: 2)
+    Receipt.create!(order: o, total: 5)
+    o = Order.includes(:lines, :receipt).find(o.id)
+    o.customer = c
+    out << line("fresh", o)
+    o.customer.name = ""
+    out << line("bad customer", o)
+    out << "customer errors: #{o.customer.errors.full_messages.inspect}"
+    o.customer.name = "Al"
+    out << line("customer default ctx", o)
+    out << line("customer audit ctx", o, :audit)
+    out << line("customer create ctx", o, :create)
+    o.customer.name = "Ann"
+    lines = o.lines.to_a
+    lines[0].sku = ""
+    lines[1].qty = 0
+    out << line("bad lines", o)
+    out << "line errors: #{lines.map { |l| l.errors.full_messages }.inspect}"
+    lines[0].sku = "a"
+    out << line("line update ctx", o)
+    out << line("line audit ctx", o, :audit)
+    lines[1].qty = 200
+    out << line("line create ctx big", o, :create)
+    lines[1].qty = 2
+    o.receipt.total = nil
+    out << line("bad receipt", o)
+    o.receipt.total = -1
+    out << line("receipt marked", o)
+    o.receipt.total = 5
+    out << line("new without customer", Order.new(name: "n", code: "c", status: "s"))
+    out << line("each x", Order.new(name: "xname", code: "xc", status: "s"))
+    out << line("each long", Order.new(name: "a long name", code: "c", status: "s"))
+    out << line("each nil", Order.new(code: "c"))
+    out << line("strict code", Order.new(name: "n", status: "s"))
+    out << line("bang long", Order.new(name: "n", code: "toolong", status: "s"))
+    rush = RushOrder.create!(name: "rush", code: "r", status: "s")
+    Receipt.create!(order: rush, total: 1)
+    rush = RushOrder.includes(:receipt).find(rush.id)
+    out << line("rush ok", rush)
+    rush.name = "xy"
+    rush.receipt.total = nil
+    out << line("rush bad", rush)
+    out << line("order sibling", Order.new(name: "xy", code: "c", status: "s"))
+    out << line("each four", Customer.new(name: "four"))
+    out
+  end
+end
+"##;
+
+const ORDER_SCHEMA: &str = r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "customers", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "orders", force: :cascade do |t|
+    t.string "name"
+    t.string "code"
+    t.string "status"
+    t.integer "customer_id"
+    t.string "type"
+  end
+  create_table "lines", force: :cascade do |t|
+    t.integer "order_id"
+    t.string "sku"
+    t.integer "qty"
+  end
+  create_table "receipts", force: :cascade do |t|
+    t.integer "order_id"
+    t.integer "total"
+  end
+end
+"#;
+
+const ORDER_FILES: &[(&str, &str)] = &[
+    ("app/models/application_record.rb", APPLICATION_RECORD),
+    ("app/models/customer.rb", CUSTOMER),
+    ("app/models/line.rb", LINE),
+    ("app/models/receipt.rb", RECEIPT),
+    ("app/models/order.rb", ORDER),
+    ("app/models/rush_order.rb", RUSH),
+    ("app/models/order_probe.rb", ORDER_PROBE),
+];
+
+const ORDER_OBSERVE: &str = "puts OrderProbe.lines\n";
+
+/// `validates_associated` (every loaded record valid in the record's
+/// custom context, else its own default; nil and marked for destruction
+/// skipped; "is invalid" on the attribute), `validates_each` (the block
+/// called with the record, the attribute and its value, under
+/// `allow_nil:`, on a model and an STI subclass) and `validates!`.
+///
+/// The records are the ones the association holds: assigned through
+/// the writer or loaded with `includes`. (The emitted readers do not
+/// keep what they load, so `order.customer.name = ""` would change a
+/// copy the next read does not see.)
+///
+/// Rails' `has_many` also validates its records itself (`validate:
+/// true`, AutosaveAssociation): new ones, and every loaded one in a
+/// custom context, adding a second "is invalid", and then drops equal
+/// errors (`_ensure_no_duplicate_errors`). The emitted runtime has
+/// neither, so no line here has an invalid `has_many` record in a
+/// custom context, a new one, or two equal errors.
+const ORDER_EXPECT: &[&str] = &[
+    "fresh: true [] []",
+    "bad customer: false [\"Customer is invalid\"] [:customer]",
+    "customer errors: [\"Name can't be blank\"]",
+    "customer default ctx: true [] []",
+    "customer audit ctx: false [\"Customer is invalid\"] [:customer]",
+    "customer create ctx: true [] []",
+    "bad lines: false [\"Lines is invalid\"] [:lines]",
+    "line errors: [[\"Sku can't be blank\"], [\"Qty must be greater than 0\"]]",
+    "line update ctx: false [\"Lines is invalid\"] [:lines]",
+    "line audit ctx: true [] []",
+    "line create ctx big: true [] []",
+    "bad receipt: false [\"Receipt is invalid\"] [:receipt]",
+    "receipt marked: true [] []",
+    "new without customer: true [] []",
+    "each x: false [\"Name starts with x\", \"Code starts with x\"] [:name, :code]",
+    "each long: false [\"name is 11 long\"] [:base]",
+    "each nil: false [\"No status\"] [:base]",
+    "strict code: raised ActiveModel::StrictValidationFailed: Code can't be blank [] []",
+    "bang long: raised ActiveModel::StrictValidationFailed: Code is too long (maximum is 5 characters) [\"code is 7 long\"] [:base]",
+    "rush ok: true [] []",
+    "rush bad: false [\"Name starts with x\", \"Name is too short for rush\", \"Receipt is invalid\"] [:name, :receipt]",
+    "order sibling: false [\"Name starts with x\"] [:name]",
+    "each four: false [\"name four nil\"] [:base]",
+];
+
+#[test]
+fn validates_associated_each_and_bang_run_like_activerecord() {
+    let native = native_of("orders", ORDER_FILES, ORDER_SCHEMA, ORDER_OBSERVE);
+    compare(app_of(ORDER_FILES, ORDER_SCHEMA), native, ORDER_EXPECT, "app/models/order.rb", ORDER_OBSERVE);
+}
+
+/// What `validates_associated` / `validates_each` cannot be lowered to
+/// is a check error at the declaration: a block reading `self` (the
+/// class in Rails, the record in the emitted check), a block with a
+/// rest parameter, and `validates_associated` outside ActiveRecord.
+#[test]
+fn unmodeled_validates_associated_and_each_are_check_errors() {
+    let form = "class Form\n  include ActiveModel::Model\n  attr_accessor :item, :name\n  validates_associated :item\n  validates_each :name do |*args|\n    args[0].errors.add(args[1], \"bad\")\n  end\nend\n";
+    let app = app_of(ORDER_FILES, ORDER_SCHEMA)
+        .edit(
+            "app/models/rush_order.rb",
+            "value.to_s.size < 3",
+            "value.to_s.size < min_size",
+        )
+        .write("app/models/form.rb", form);
+    let (_dir, errors) = app.emit(BuildTarget::Ruby);
+    for seen in [
+        "`validates_each` not supported (all targets): on `name` in STI subclass `RushOrder`, a block that reads `self` (the class it was written in, not the record the emitted check runs on)",
+        "`validates_each` not supported (all targets): on `name`, a block with a rest or block parameter",
+        "`validates_associated` not supported (all targets): on `item`, on a class outside ActiveRecord (ActiveModel has no AssociatedValidator)",
+    ] {
+        assert!(errors.iter().any(|e| e.contains(seen)), "{seen}: {errors:#?}");
+    }
+    assert_eq!(errors.len(), 3, "{errors:#?}");
+}

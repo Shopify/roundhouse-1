@@ -234,7 +234,10 @@ pub(crate) fn validation_statements_split<'v>(
                 );
                 (vec![check], reader)
             } else {
-                let value = if any_assoc { reader } else { ivar(&v.attribute) };
+                // `validates_associated` / `validates_each` read the value
+                // as `read_attribute_for_validation` does, through the reader.
+                let read_by_send = any_assoc || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. });
+                let value = if read_by_send { reader } else { ivar(&v.attribute) };
                 (validation_rule_to_calls(model, &declarer.finder, &v.attribute, rule, attr_ty, &value, &text), value)
             };
             let prepend = options.is_some_and(|o| o.prepend);
@@ -741,6 +744,32 @@ fn validation_rule_to_calls(
             not(send(accept.clone(), "include?", vec![value.clone()])),
             text.push("accepted", None, || value.clone()),
         )],
+        // Reported by `roundhouse check`: ActiveModel has no
+        // AssociatedValidator.
+        ValidationRule::Associated if model.parent.is_none() => Vec::new(),
+        ValidationRule::Associated => vec![inline_associated_check(model, attr, value, text)],
+        // `validates_each :a do |record, attr, value| ... end`:
+        // BlockValidator's `@block.call(record, attribute, value)`, as
+        // a proc takes it (a parameter past the three reads nil).
+        ValidationRule::Each { callable, arity } => {
+            let s = Span::synthetic();
+            let mut args = vec![
+                Expr::new(s, ExprNode::SelfRef),
+                Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: attr.clone() } }),
+                value.clone(),
+            ];
+            args.resize_with((*arity).max(3), || Expr::new(s, ExprNode::Lit { value: Literal::Nil }));
+            vec![Expr::new(
+                s,
+                ExprNode::Send {
+                    recv: Some(callable.clone()),
+                    method: Symbol::from("call"),
+                    args: args.into_iter().take(*arity).collect(),
+                    block: None,
+                    parenthesized: true,
+                },
+            )]
+        }
         // `validate do ... end`: the block, called inside the record's
         // method (its `self`, as under `instance_exec`).
         // `validate SomeValidations.new` → `<object>.validate(self)`.
@@ -2095,6 +2124,75 @@ pub(crate) fn humanize(attr: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// `validates_associated :attr` (ActiveRecord's AssociatedValidator):
+///
+///   errors << "Attr is invalid" if Array(value).reject { |r|
+///     (r.respond_to?(:marked_for_destruction?) && r.marked_for_destruction?) ||
+///       r.valid?([:create, :update].include?(validation_context) ? nil : validation_context)
+///   }.any?
+///
+/// Each record validates in the record's own context when that is a
+/// custom one (`record_validation_context_for_association`), else in
+/// its own default; `reject` asks every record, so each one's errors
+/// are filled as in Rails. A collection association reads `to_a`, a
+/// singular one is `[]` when nil, and any other attribute is `Array()`.
+fn inline_associated_check(model: &Model, attr: &Symbol, value: &Expr, text: &ErrorText<'_>) -> Expr {
+    let s = Span::synthetic();
+    let sym = |name: &str| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+    let nil = || Expr::new(s, ExprNode::Lit { value: Literal::Nil });
+    let context = || {
+        Expr::new(
+            s,
+            ExprNode::Send { recv: None, method: Symbol::from("validation_context"), args: vec![], block: None, parenthesized: false },
+        )
+    };
+    let record = Symbol::from("associated_record");
+    let r = || local_read(&record);
+    let default_context = send(
+        Expr::new(s, ExprNode::Array { elements: vec![sym("create"), sym("update")], style: ArrayStyle::default() }),
+        "include?",
+        vec![context()],
+    );
+    let own_context = Expr::new(s, ExprNode::If { cond: default_context, then_branch: nil(), else_branch: context() });
+    let marked = bool_op(
+        BoolOpKind::And,
+        send(r(), "respond_to?", vec![sym("marked_for_destruction?")]),
+        send(r(), "marked_for_destruction?", vec![]),
+    );
+    let valid_object = bool_op(BoolOpKind::Or, marked, send(r(), "valid?", vec![own_context]));
+    let association = model.associations().find(|a| a.name() == attr);
+    let records = match association {
+        Some(Association::HasMany { .. } | Association::HasAndBelongsToMany { .. }) => send(value.clone(), "to_a", vec![]),
+        Some(Association::BelongsTo { .. } | Association::HasOne { .. }) => Expr::new(
+            s,
+            ExprNode::If {
+                cond: send(value.clone(), "nil?", vec![]),
+                then_branch: Expr::new(s, ExprNode::Array { elements: vec![], style: ArrayStyle::default() }),
+                else_branch: Expr::new(s, ExprNode::Array { elements: vec![value.clone()], style: ArrayStyle::default() }),
+            },
+        ),
+        None => Expr::new(
+            s,
+            ExprNode::Send { recv: None, method: Symbol::from("Array"), args: vec![value.clone()], block: None, parenthesized: true },
+        ),
+    };
+    let block = Expr::new(
+        s,
+        ExprNode::Lambda {
+            params: vec![record.clone()],
+            rest_param: None,
+            block_param: None,
+            body: valid_object,
+            block_style: crate::expr::BlockStyle::default(),
+        },
+    );
+    let invalid = Expr::new(
+        s,
+        ExprNode::Send { recv: Some(records), method: Symbol::from("reject"), args: vec![], block: Some(block), parenthesized: false },
+    );
+    if_with_nil_else(send(invalid, "any?", vec![]), text.push("invalid", None, || value.clone()))
 }
 
 // ── IR helpers ────────────────────────────────────────────────
