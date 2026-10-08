@@ -160,18 +160,20 @@ pub(super) fn resolve(app: &mut App) {
         if mine.is_empty() {
             continue;
         }
+        let spans: Vec<crate::span::Span> = mine.iter().map(|r| app.library_classes[i].unknown_calls[r.1].span).collect();
         let lc = &mut app.library_classes[i];
         let mut at = 0;
         lc.unknown_calls.retain(|_| {
             at += 1;
             !mine.iter().any(|r| r.1 == at - 1)
         });
-        for (_, _, copy, original, inherited) in mine {
+        for ((_, _, copy, original, inherited), span) in mine.into_iter().zip(spans) {
             lc.method_aliases.push(MethodAlias {
                 name: copy.name.clone(),
                 receiver: copy.receiver,
                 original: original.clone(),
                 inherited: *inherited,
+                span,
             });
             lc.methods.push(copy.clone());
         }

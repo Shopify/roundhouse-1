@@ -1832,6 +1832,7 @@ pub fn target_files(
         report_keyword_params(app, target.as_str());
     }
     report_class_body_prepends(app, target);
+    report_body_statements(app, target);
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         for controller in &app.controllers {
             if controller.class_methods().next().is_some() {
@@ -8414,6 +8415,34 @@ fn report_keyword_params(app: &App, target: &str) {
                     ),
                 );
             }
+        }
+    }
+}
+
+/// A class or module body statement the CRuby/JRuby tree writes back
+/// where the source has it (`emit::ruby::carries_body_statement`: a call
+/// on a computed receiver, `x if cond`, `begin`, `case`, a loop, such as
+/// a GraphQL enum's `Foo.values.each do |d| value d.serialize end`).
+/// Ruby runs it when the body loads; every other target has no place
+/// that runs it so, and refuses each one by name.
+fn report_body_statements(app: &App, target: BuildTarget) {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
+        return;
+    }
+    for lc in crate::emit::ruby::body_statement_classes(app) {
+        for call in lc.unknown_calls.iter().filter(|c| c.decisions & crate::expr::BODY_STATEMENT != 0) {
+            let written = crate::emit::ruby::emit_expr(call);
+            emit::diagnostics::report_unsupported(
+                call.span,
+                target.as_str(),
+                "class body statement",
+                format!(
+                    "`{}` in the body of `{}` runs where it stands when the body loads; this target has no \
+                     class body that runs it so, and the statement is dropped",
+                    written.lines().next().unwrap_or_default().trim(),
+                    lc.name.0.as_str()
+                ),
+            );
         }
     }
 }

@@ -8191,7 +8191,10 @@ fn emit_library_class_decl_inner(
     // above (`write_include`), where the source has it; replayed, the
     // record raised again at the end of a body whose include had run.
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
-        lc.unknown_calls.iter().filter(|c| !crate::analyze::is_include_refusal(c)).collect()
+        lc.unknown_calls
+            .iter()
+            .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
+            .collect()
     } else {
         let own = modelled_class_body_calls(lc, app);
         // A Concern's `included do` that ingest gave every class it runs
@@ -8206,11 +8209,38 @@ fn emit_library_class_decl_inner(
                 && !crate::analyze::is_include_refusal(call)
                 && !carried_block(call)
                 && !modelled_elsewhere(lc, call)
+                && !is_body_statement(call)
             {
                 report_dropped_class_body_call(lc, call);
             }
         }
-        own
+        own.into_iter().filter(|c| !is_body_statement(c)).collect()
+    };
+    // The body statements the ingest kept (`carries_body_statement`),
+    // written where the source has them on CRuby/JRuby: among the other
+    // replayed calls when no def is above them, else just before the
+    // first def below them (`positioned_statements`). Every other target
+    // refuses them by name (`project::report_body_statements`).
+    let mut positioned_statements: Vec<(usize, &Expr)> = Vec::new();
+    let mut flowing_statements: Vec<&Expr> = Vec::new();
+    if super::expr::native_keywords() && !railtie {
+        for call in lc.unknown_calls.iter().filter(|c| is_body_statement(c)) {
+            match body_statement_place(lc, call) {
+                Some(Some(at)) => positioned_statements.push((at, call)),
+                Some(None) => flowing_statements.push(call),
+                None => {}
+            }
+        }
+    }
+    let replayed: Vec<&Expr> = if flowing_statements.is_empty() {
+        replayed
+    } else {
+        lc.unknown_calls
+            .iter()
+            .filter(|c| {
+                replayed.iter().chain(flowing_statements.iter()).any(|r| std::ptr::eq(*r, *c))
+            })
+            .collect()
     };
     let instance_form = extend_self_instance_defs(lc, app, &replayed);
     // A replayed `prepend` whose module's `self.prepended(base)` hook
@@ -8588,6 +8618,13 @@ fn emit_library_class_decl_inner(
     };
     for (index, m) in lc.methods.iter().enumerate() {
         write_methodless(&mut s, &mut first, index);
+        // Every def above it is written, and none below.
+        for (_, call) in positioned_statements.iter().filter(|(at, _)| *at == index) {
+            if !std::mem::replace(&mut first, false) {
+                writeln!(s).unwrap();
+            }
+            write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
+        }
         // Written at its include (`carried_method`).
         if carried_method(m) {
             for (_, inc) in positioned.iter().filter(|(at, _)| *at == index) {
@@ -8616,6 +8653,7 @@ fn emit_library_class_decl_inner(
             writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();
             writeln!(s).unwrap();
         }
+
         match conditional {
             // After every def (below).
             None if inherited_alias(lc, m).is_some() => {}
@@ -8644,6 +8682,10 @@ fn emit_library_class_decl_inner(
     for (_, call) in positioned_prepends.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
         writeln!(s, "{body_pad}{}", super::emit_expr(call)).unwrap();
+    }
+    for (_, call) in positioned_statements.iter().filter(|(at, _)| *at >= lc.methods.len()) {
+        writeln!(s).unwrap();
+        write_body_lines(&mut s, &body_pad, &super::emit_expr(call));
     }
 
     if !tail_effects.is_empty() && !lc.methods.is_empty() {
@@ -9856,7 +9898,13 @@ pub(crate) fn replays_class_body(lc: &LibraryClass, app: &App) -> bool {
 /// `GraphQL::Schema::Interface`), unless it is a concern (its hooks are
 /// spliced into each includer).
 fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
-    if InlineDeclaration::active() || reopens_loaded_gem_class(lc, app) {
+    InlineDeclaration::active() || replays_foreign_base(lc, app)
+}
+
+/// [`replays_foreign_class_body`] by the class's base alone, as it is
+/// wherever the class is written.
+fn replays_foreign_base(lc: &LibraryClass, app: &App) -> bool {
+    if reopens_loaded_gem_class(lc, app) {
         return true;
     }
     if lc.is_module {
@@ -9877,6 +9925,242 @@ fn replays_foreign_class_body(lc: &LibraryClass, app: &App) -> bool {
         parent = library_classes_named(p.0.as_str(), app).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.as_ref());
     }
     false
+}
+
+/// The spans of the body statements the app's classes carry
+/// (`carries_body_statement`; the ingest keeps only those): no
+/// `file_statement_unsupported` gap where Ruby runs them, the file's
+/// program not naming them on CRuby/JRuby.
+pub(crate) fn carried_body_statement_spans(app: &App) -> crate::det::HashSet<Span> {
+    body_statement_classes(app)
+        .into_iter()
+        .flat_map(|lc| lc.unknown_calls.iter())
+        .filter(|c| is_body_statement(c))
+        .map(|c| c.span)
+        .collect()
+}
+
+/// The classes whose bodies can keep a statement whole: the library
+/// classes and the declarations a file program carries inline (in a
+/// file-level branch or behind a `return`).
+pub(crate) fn body_statement_classes(app: &App) -> Vec<&LibraryClass> {
+    fn inline<'a>(items: &'a [crate::app::ProgramItem], out: &mut Vec<&'a LibraryClass>) {
+        for item in items {
+            match item {
+                crate::app::ProgramItem::Inline(classes) => out.extend(classes.iter()),
+                crate::app::ProgramItem::Branch { then_items, else_items, .. } => {
+                    inline(then_items, out);
+                    inline(else_items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut classes: Vec<&LibraryClass> = app.library_classes.iter().collect();
+    for program in &app.file_programs {
+        inline(&program.items, &mut classes);
+    }
+    classes
+}
+
+/// `text`'s lines at `pad`, a blank line kept blank.
+fn write_body_lines(s: &mut String, pad: &str, text: &str) {
+    for line in text.lines() {
+        if line.is_empty() {
+            writeln!(s).unwrap();
+        } else {
+            writeln!(s, "{pad}{line}").unwrap();
+        }
+    }
+}
+
+/// Whether `call` is a class or module body statement the ingest
+/// captured whole (`expr::BODY_STATEMENT`).
+fn is_body_statement(call: &Expr) -> bool {
+    call.decisions & crate::expr::BODY_STATEMENT != 0
+}
+
+/// Whether the Ruby family writes `call`, a body statement the ingest
+/// captured (`expr::BODY_STATEMENT`: a call on a computed receiver,
+/// `x if cond`, `begin`, `case`, a loop), back into `lc`'s emitted body
+/// where the source has it, which runs it as Ruby does when the body
+/// loads. Core's GraphQL enum bodies, `Foo.values.each do |d| value
+/// d.serialize, description: d.description end` on graphql's
+/// `GraphQL::Schema::Enum`, and essentials' `Trilogy.public_instance_
+/// methods(false).each do |m| define_method(m) { … } end`.
+///
+/// It is, when
+/// - the body replays its class-body DSL (a foreign base's, a loaded
+///   gem's reopen, a carried railtie: `replays_class_body`), whose
+///   receiverless calls are the base's own; or the statement calls on
+///   the class only what any Ruby class answers (`define_method`,
+///   `const_get`, …) or a class method the class itself defines
+///   (`self_calls_answered`), so no runtime base's missing macro is
+///   reached; and
+/// - its place is kept (`body_statement_place`): it is written before
+///   the first def the source has below it, so every def above it is
+///   defined and none below, and when a def is above it nothing the
+///   body runs before the defs follows it in the source.
+///
+/// Not in a `class_eval` body (written by `class_eval_parts`) or a
+/// Concern's (spliced into each includer). Decided with the app in, for
+/// the ingest (`ingest::app::keep_carried_body_statements`), check (a
+/// carried statement is no `file_statement_unsupported` gap) and the
+/// emit alike; a statement it does not carry stays the gap its file's
+/// program names.
+pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) -> bool {
+    if !is_body_statement(call) || name_is_class_eval_body(lc) || call.span.is_synthetic() {
+        return false;
+    }
+    let replays = carried_railtie(lc, app) || replays_foreign_base(lc, app);
+    if !replays && (is_concern_body(lc) || !self_calls_answered(lc, call)) {
+        return false;
+    }
+    if statement_mixes_in(call)
+        && (!lc.includes.is_empty() || lc.unknown_calls.iter().any(|c| !std::ptr::eq(c, call) && statement_mixes_in(c)))
+    {
+        return false;
+    }
+    body_statement_place(lc, call).is_some()
+}
+
+/// Where a carried body statement is written: `Some(None)` among the
+/// body's other replayed calls, before the defs (no def of this file is
+/// above it in the source); `Some(Some(k))` just before `lc.methods[k]`
+/// (`k == methods.len()`: after the last), the first def below it. `None`
+/// when no place keeps the source's order: the same file's defs are not
+/// in source order, or a def is above it and a constant, replayed call or
+/// class-side initializer the body runs before the defs is below it (a
+/// body statement below it is written after it, below the same def).
+fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>> {
+    let here = |span: Span| !span.is_synthetic() && span.file == call.span.file;
+    let above = |span: Span| here(span) && span.start < call.span.start;
+    let below = |span: Span| here(span) && span.start > call.span.start;
+    // An alias copy carries its original's spans; it takes effect where
+    // its `alias_method` stands.
+    let mut defs: Vec<(usize, Span)> = Vec::new();
+    for (i, m) in lc.methods.iter().enumerate() {
+        let copied_at: Vec<Span> = lc
+            .method_aliases
+            .iter()
+            .filter(|a| a.name == m.name && a.receiver == m.receiver && here(a.span))
+            .filter(|a| {
+                if a.inherited {
+                    !here(m.name_span)
+                } else {
+                    lc.methods.iter().any(|o| {
+                        o.name == a.original
+                            && o.receiver == m.receiver
+                            && o.name_span == m.name_span
+                            && o.body.span == m.body.span
+                    })
+                }
+            })
+            .map(|a| a.span)
+            .collect();
+        match copied_at.as_slice() {
+            [] if here(m.name_span) => defs.push((i, m.name_span)),
+            [] => {}
+            [at] => defs.push((i, *at)),
+            _ => return None,
+        }
+    }
+    if !defs.windows(2).all(|w| w[0].1.start < w[1].1.start) {
+        return None;
+    }
+    if !defs.iter().any(|(_, span)| above(*span)) {
+        return Some(None);
+    }
+    let later_effect = lc
+        .constants
+        .iter()
+        .map(|(_, value)| value.span)
+        .chain(lc.unknown_calls.iter().filter(|c| !is_body_statement(c)).map(|c| c.span))
+        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
+        .any(below);
+    if later_effect {
+        return None;
+    }
+    Some(Some(defs.iter().find(|(_, span)| below(*span)).map(|(i, _)| *i).unwrap_or(lc.methods.len())))
+}
+
+/// Whether `call` includes, extends or prepends: the emitted body writes
+/// the class's own mixins at its top, so a statement mixing in is
+/// carried only when nothing else in the body does.
+fn statement_mixes_in(call: &Expr) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, found: &mut bool) {
+        if let ExprNode::Send { method, .. } = &*e.node
+            && matches!(method.as_str(), "include" | "extend" | "prepend")
+        {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |child| walk(child, found));
+    }
+    walk(call, &mut found);
+    found
+}
+
+/// What a class body statement may call on the class (no receiver, or
+/// `self`) outside a block that runs as a method: what `Module`, `Class`
+/// and `Kernel` give every class, so the call runs the same on any base.
+const ANY_CLASS_SELF_CALLS: &[&str] = &[
+    "define_method", "include", "extend", "prepend", "alias_method", "attr_reader", "attr_writer", "attr_accessor",
+    "const_get", "const_set", "const_defined?", "constants", "remove_const", "private_constant", "public_constant",
+    "instance_method", "public_instance_method", "instance_methods", "public_instance_methods",
+    "private_instance_methods", "protected_instance_methods", "method_defined?", "public_method_defined?",
+    "private_method_defined?", "protected_method_defined?", "remove_method", "undef_method", "ruby2_keywords",
+    "name", "to_s", "inspect", "ancestors", "superclass", "singleton_class", "instance_variable_get",
+    "instance_variable_set", "instance_variable_defined?", "respond_to?", "is_a?", "kind_of?", "frozen?",
+    "raise", "fail", "warn", "puts", "print", "p", "format", "sprintf", "lambda", "proc", "loop",
+    "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex", "caller", "caller_locations", "freeze",
+];
+
+/// Whether every call `call` makes on the class itself (no receiver, or
+/// `self`) is one any class answers ([`ANY_CLASS_SELF_CALLS`]) or a
+/// class method `lc` defines. A `define_method` block is a method body,
+/// run later on an instance, so its calls are not the class's. A block
+/// that rebinds `self` (`instance_eval`, `class_exec`, …) is not read.
+fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
+    let own: Vec<&Symbol> = lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).map(|m| &m.name).collect();
+    fn walk(e: &Expr, own: &[&Symbol], ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        if let ExprNode::Send { recv, method, args, block, .. } = &*e.node {
+            let on_self = match recv {
+                None => true,
+                Some(r) => matches!(&*r.node, ExprNode::SelfRef),
+            };
+            if matches!(
+                method.as_str(),
+                "instance_eval" | "instance_exec" | "class_eval" | "class_exec" | "module_eval" | "module_exec"
+            ) {
+                *ok = false;
+                return;
+            }
+            if on_self && !ANY_CLASS_SELF_CALLS.contains(&method.as_str()) && !own.contains(&method) {
+                *ok = false;
+                return;
+            }
+            if let Some(r) = recv {
+                walk(r, own, ok);
+            }
+            for a in args {
+                walk(a, own, ok);
+            }
+            if let Some(b) = block
+                && !(on_self && method.as_str() == "define_method")
+            {
+                walk(b, own, ok);
+            }
+            return;
+        }
+        e.node.for_each_child(&mut |child| walk(child, own, ok));
+    }
+    let mut ok = true;
+    walk(call, &own, &mut ok);
+    ok
 }
 
 /// Whether `lc` is a `class_eval` block's body (`ProgramItem::ClassEval`).
@@ -11469,6 +11753,10 @@ pub(super) fn emit_file_program(
                     }
                     writeln!(s, "{pad}end").unwrap();
                 }
+                // A body statement its class writes back in place
+                // (`carries_body_statement`) runs there.
+                ProgramItem::NotCarried { span, .. }
+                    if super::expr::native_keywords() && carried_body_statement_spans(app).contains(span) => {}
                 ProgramItem::NotCarried { span, message, .. } => {
                     let text = format!(
                         "roundhouse: error[file_statement_not_carried]: {}: {message}",

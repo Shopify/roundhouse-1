@@ -1235,6 +1235,11 @@ pub struct MethodAlias {
     /// through the ancestors.
     #[serde(default, skip_serializing_if = "is_false")]
     pub inherited: bool,
+    /// The `alias_method`/`alias` statement's span: where in the body
+    /// the copy takes effect (the copy itself carries the original's
+    /// spans). Synthetic when no statement is recorded.
+    #[serde(default, skip_serializing_if = "Span::is_synthetic")]
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
