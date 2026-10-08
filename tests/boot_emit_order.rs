@@ -70,3 +70,21 @@ fn a_nested_class_written_in_its_own_file_keeps_the_file_its_autoload_names() {
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
+/// monorepo_slices' slices_file_contract.rb: the contract's constants,
+/// then its validator classes, one of which reads a constant above it
+/// as its body loads (`/\A#{SLICE_LABEL_PREFIX}.+\z/`), then a constant
+/// built from a validator. Each nested class was spliced in ahead of
+/// all of its parent's constants, so the read raised NameError at boot.
+const SLICES_FILE_CONTRACT: &str = "module MonorepoSlices\n  class SlicesFileContract\n    MAX_GITHUB_LABEL_LENGTH = 50\n    SLICE_LABEL_PREFIX = \"Slice: \"\n    SLICE_LABEL_LENGTH = SLICE_LABEL_PREFIX.length\n\n    def self.validators = [DEFAULT_VALIDATOR]\n\n    class BaseValidator\n      def ok?(label) = label.length <= MAX_GITHUB_LABEL_LENGTH\n    end\n\n    class IssueTrackingLabelValidator < BaseValidator\n      ISSUE_LABEL_REGEX = /\\A#{SLICE_LABEL_PREFIX}.+\\z/\n\n      def ok?(label) = super && ISSUE_LABEL_REGEX.match?(label)\n    end\n\n    DEFAULT_VALIDATOR = IssueTrackingLabelValidator.new\n  end\nend\n";
+
+#[test]
+fn a_nested_class_loads_after_the_parent_constants_above_it() {
+    let files = [("lib/monorepo_slices/slices_file_contract.rb", SLICES_FILE_CONTRACT)];
+    let script = "c = MonorepoSlices::SlicesFileContract\np c::SLICE_LABEL_LENGTH, c.validators.map { |v| [v.class, v.ok?(\"Slice: x\"), v.ok?(\"x\")] }, c.constants.sort\n";
+    let expected = native(&files, &format!("require \"monorepo_slices/slices_file_contract\"\n{script}"));
+    assert_eq!(expected, "7\n[[MonorepoSlices::SlicesFileContract::IssueTrackingLabelValidator, true, false]]\n[:BaseValidator, :DEFAULT_VALIDATOR, :IssueTrackingLabelValidator, :MAX_GITHUB_LABEL_LENGTH, :SLICE_LABEL_LENGTH, :SLICE_LABEL_PREFIX]\n");
+    let run = emit_and_run::empty_app().write(files[0].0, files[0].1).run_ruby(script);
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+}
+
