@@ -46,6 +46,8 @@ require "active_support/logger"
 require "action_controller/metal/exceptions"
 require "action_view"
 require "active_support/core_ext/string/strip"
+require "active_support/core_ext/module/attribute_accessors.rb"
+require "active_support/core_ext/class/attribute_accessors"
 
 require "rails/engine"
 
@@ -161,6 +163,40 @@ module ProbeGem
      h.deep_transform_keys(&:to_s), { a: 1 }.assert_valid_keys(:a, :b), invalid]
   end
 
+  # state_machines-activemodel's and Core's component gems' module
+  # attributes.
+  module Settings
+    mattr_accessor :level, default: :info
+    mattr_reader(:built) { [:block] }
+    mattr_writer :sink, instance_writer: false
+    cattr_accessor :hidden, instance_accessor: false
+  end
+
+  class Holder
+    include Settings
+    cattr_accessor :count, default: 0
+  end
+
+  def self.mattr
+    Settings.level = :warn
+    Holder.count += 2
+    h = Holder.new
+    invalid = begin
+      Module.new { mattr_accessor :"bad-name" }
+    rescue NameError => e
+      e.message
+    end
+    singleton = begin
+      Class.new.singleton_class.mattr_accessor(:x)
+    rescue TypeError => e
+      e.message
+    end
+    Settings.sink = :io
+    [Settings.level, h.level, Settings.built, h.built, Settings.class_variable_get(:@@sink), h.respond_to?(:sink=),
+     Settings.respond_to?(:hidden), h.respond_to?(:hidden), Holder.count, h.count, (h.count = 5; Holder.count), invalid, singleton,
+     File.basename(Settings.instance_method(:level).source_location.first), File.basename(Holder.method(:count).source_location.first)]
+  end
+
   # typed_parameters' deprecation warning shape.
   def self.strip
     usage = <<-EOM
@@ -231,6 +267,7 @@ module ProbeGem
       try: try,
       hash_keys: hash_keys,
       strip: strip,
+      mattr: mattr,
       load_hooks: (ActiveSupport.run_load_hooks(:probe_gem_hook, :base); HOOKS),
       notifications: notifications,
       logger: logger,
@@ -315,6 +352,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // `included`/`prepended` blocks, a second `included` refused.
         "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
         "try: [nil, 3, nil, \"ABC\", nil, :nope]",
+        "mattr: [:warn, :warn, [:block], [:block], :io, false, true, false, 2, 2, 5, \"invalid attribute name: bad-name\", \"module attributes should be defined directly on class, not singleton\", \"probe_gem.rb\", \"probe_gem.rb\"]",
         "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
         "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",
         "Unknown key: :z. Valid keys are: :a, :b",

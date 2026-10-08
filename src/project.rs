@@ -4282,10 +4282,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     }
     // ActiveSupport::Concern, Hash's key extensions and Action Controller's
     // errors (8.2.0.alpha concern.rb, core_ext/hash/keys.rb,
-    // metal/exceptions.rb), which Rails loads before any gem, and
-    // String#strip_heredoc (core_ext/string/strip.rb): a native gem's
-    // require of one answers from runtime/features.
-    for port in ["active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip"] {
+    // metal/exceptions.rb), which Rails loads before any gem,
+    // String#strip_heredoc (core_ext/string/strip.rb) and Module#mattr_*
+    // (core_ext/module/attribute_accessors.rb): a native gem's require of
+    // one answers from runtime/features.
+    for port in [
+        "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
+        "active_support_module_attribute_accessors",
+    ] {
         let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
             .map_err(|e| format!("read {port} runtime: {e}"))?;
         files.push((format!("runtime/{port}.rb"), text));
@@ -4954,6 +4958,8 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    ("active_support/core_ext/module/attribute_accessors", &["active_support_module_attribute_accessors"]),
+    ("active_support/core_ext/class/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
@@ -9751,6 +9757,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_concern.rb"
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
+        && p != "runtime/active_support_module_attribute_accessors.rb"
         && p != "runtime/action_controller_exceptions.rb"
         && p != "runtime/active_support_attribute_accessors_per_thread.rb"
         && p != "runtime/active_support_inflector.rb"
