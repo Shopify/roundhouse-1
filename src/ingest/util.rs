@@ -229,6 +229,21 @@ pub(super) fn find_all_classes_with_nesting<'pr>(
     out
 }
 
+/// Each class with a superclass in `source`: the byte offset its
+/// superclass expression starts at, and the lexical nesting
+/// (`Module.nesting`, innermost first) at its `class` keyword, where Ruby
+/// reads that superclass. In a top-level `class Errs::Unavailable <
+/// Fallback` the nesting is empty, so `Fallback` is the top-level class
+/// even when `Errs::Fallback` exists.
+pub fn superclass_nestings(source: &[u8], file: &str) -> Vec<(usize, Vec<String>)> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    find_all_classes_with_nesting(&root)
+        .into_iter()
+        .filter_map(|(_, nesting, class)| class.superclass().map(|sup| (sup.location().start_offset(), nesting)))
+        .collect()
+}
+
 /// The nesting inside a body whose qualified path is `inner`.
 fn push_nesting(inner: &[String], nesting: &[String]) -> Vec<String> {
     std::iter::once(inner.join("::")).chain(nesting.iter().cloned()).collect()

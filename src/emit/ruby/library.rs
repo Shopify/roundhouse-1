@@ -8244,6 +8244,8 @@ struct NameIndex {
     carried: std::cell::OnceCell<std::rc::Rc<CarriedSources>>,
     /// `app_constant_paths`, on first use.
     constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
+    /// `superclass_nesting`'s parses, by source file id.
+    superclass_nestings: std::cell::RefCell<std::collections::BTreeMap<u32, std::rc::Rc<Vec<(usize, Vec<String>)>>>>,
 }
 
 thread_local! {
@@ -8273,6 +8275,7 @@ impl NameIndex {
             declared_in: declaring_files(app),
             carried: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
+            superclass_nestings: std::cell::RefCell::default(),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -9115,7 +9118,64 @@ fn written_parent(lc: &LibraryClass, parent: &ClassId, app: &App) -> String {
         && source
             .and_then(|file| file.text.get(..span.start as usize))
             .is_some_and(|before| before.trim_end().ends_with("Class.new("));
-    if !text.starts_with("::") && (rooted_as_written || class_new_argument) { format!("::{text}") } else { text.to_string() }
+    if !text.starts_with("::") && (rooted_as_written || class_new_argument) {
+        return format!("::{text}");
+    }
+    if !text.starts_with("::") {
+        if let Some(target) = source.and_then(|file| compact_header_parent(lc, text, span, &file.text, &file.path, app)) {
+            return target;
+        }
+    }
+    text.to_string()
+}
+
+/// The superclass of a class whose emitted nesting is not its source's,
+/// rooted at the class Ruby reads it as. Ruby evaluates the superclass in
+/// the lexical nesting at the `class` keyword, and a compact path does
+/// not enter its prefix: a top-level `class Errs::Unavailable < Fallback`
+/// has none, and in `module Errs::Api; class Client < Base` it is
+/// `Errs::Api` alone. The emitted header sits inside one body per
+/// segment (`module Errs` around `class Unavailable`), where a bare
+/// `Fallback` finds `Errs::Fallback` first. So the written name is
+/// resolved against the source's nesting (`superclass_nesting`),
+/// innermost first, then the top level: an app constant found there is
+/// the target. `None` where the two nestings bind the name alike.
+fn compact_header_parent(lc: &LibraryClass, text: &str, span: crate::span::Span, source: &str, path: &str, app: &App) -> Option<String> {
+    if !lc.name.0.as_str().contains("::") {
+        return None;
+    }
+    let nesting = superclass_nesting(span, source, path, app)?;
+    let segments: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    let emitted: Vec<String> = (1..segments.len()).rev().map(|i| segments[..i].join("::")).collect();
+    if nesting == emitted {
+        return None;
+    }
+    let paths = app_constant_paths(app);
+    let first = text.split("::").next().unwrap_or(text);
+    // The app constant each nesting binds the name's head to, else the
+    // top level's name.
+    let binds = |scopes: &[String]| -> Option<String> {
+        scopes.iter().find(|scope| paths.contains(&format!("{scope}::{first}"))).map(|scope| format!("{scope}::{text}"))
+    };
+    // A head no enclosing body of the source defines as an app constant
+    // is the top level's (Ruby then searches the innermost body's
+    // ancestors and Object; an app constant only the emitted nesting
+    // adds is in neither).
+    let native = binds(&nesting).unwrap_or_else(|| text.to_string());
+    let emitted = binds(&emitted).unwrap_or_else(|| text.to_string());
+    (native != emitted).then(|| format!("::{native}"))
+}
+
+/// The lexical nesting at the `class` keyword whose superclass starts at
+/// `span` (`ingest::util::superclass_nestings`), each file parsed once per
+/// installed `NameIndex`.
+fn superclass_nesting(span: crate::span::Span, source: &str, path: &str, app: &App) -> Option<Vec<String>> {
+    let parse = || std::rc::Rc::new(crate::ingest::util::superclass_nestings(source.as_bytes(), path));
+    let nestings = match NameIndex::current(app) {
+        Some(index) => index.superclass_nestings.borrow_mut().entry(span.file.0).or_insert_with(parse).clone(),
+        None => parse(),
+    };
+    nestings.iter().find(|(start, _)| *start == span.start as usize).map(|(_, nesting)| nesting.clone())
 }
 
 /// The body calls that name a class-side method a loaded gem's module
