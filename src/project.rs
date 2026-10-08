@@ -13619,8 +13619,8 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
 /// their class bodies: without the files the boot raised Errno::ENOENT
 /// (r17-pre2 boot survey). An app without a manifest has none; its data
 /// stays the YAML and JSON `walk_data_files_into` recognises.
-fn slice_named_data_files(root: &Path) -> std::collections::HashSet<String> {
-    let mut named = std::collections::HashSet::new();
+fn slice_named_data_files(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut named = std::collections::BTreeSet::new();
     let Some(manifest) = root.parent().map(|p| p.join("slice-manifest.json")) else { return named };
     let Ok(text) = fs::read_to_string(&manifest) else { return named };
     let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return named };
