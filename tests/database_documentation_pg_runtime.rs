@@ -240,3 +240,91 @@ fn database_documentation_matches_the_gem_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted, native, "emitted");
 }
+
+/// An app that compiles the gem from source (roundhouse.yml
+/// `gem_sources:`, as Core vendors database_documentation 3.2.0): the
+/// gem's own files are the gem, so the tree carries no port for it.
+/// Before, the port loaded with the gem facades and the compiled
+/// `DatabaseDocumentation::Constants` then reassigned the
+/// METADATA_PROJECT the port had defined: "already initialized
+/// constant", which Core's StrictWarning turns into a boot failure.
+const VENDORED_ENTRY: &str = "require \"database_documentation/constants\"\n\nmodule DatabaseDocumentation\n  VENDORED = true\nend\n";
+
+const VENDORED_CONSTANTS: &str = "module DatabaseDocumentation\n  module Constants\n    MAX_APPLICATION_AND_SCHEMA_NAME_LENGTH = 57\n    METADATA_PROJECT = \"shopify-metadata\"\n    METADATA_LOCATION = \"us\"\n  end\nend\n";
+
+/// Reads only what the vendored gem defines; the port would add its own
+/// names (ModelMetadata, Datatypes, Configuration, ...) beside them.
+const VENDORED_PROBE: &str = r##"class DocProbe
+  def self.lines
+    [
+      "namespace: #{DatabaseDocumentation.constants.sort.inspect}",
+      "constants: #{DatabaseDocumentation::Constants.constants.sort.inspect}",
+      "project: #{DatabaseDocumentation::Constants::METADATA_PROJECT} #{DatabaseDocumentation::Constants::METADATA_LOCATION}",
+    ]
+  end
+end
+"##;
+
+const VENDORED_EXPECTED: [&str; 3] = [
+    "namespace: [:Constants, :VENDORED]",
+    "constants: [:MAX_APPLICATION_AND_SCHEMA_NAME_LENGTH, :METADATA_LOCATION, :METADATA_PROJECT]",
+    "project: shopify-metadata us",
+];
+
+/// Native only: Bundler.require of the vendored gem, from its directory.
+const VENDORED_NATIVE_GEM: &str = "$LOAD_PATH.unshift(File.expand_path(\"../vendor/gems/database_documentation-3.2.0/lib\", __dir__))\nrequire \"database_documentation\"\n";
+
+const VENDORED_FILES: [(&str, &str); 9] = [
+    (
+        "roundhouse.yml",
+        "database_adapter: postgresql\ngem_sources:\n  database_documentation: vendor/gems/database_documentation-3.2.0\n",
+    ),
+    ("config/database.yml", DATABASE_YML),
+    ("config/application.rb", APPLICATION),
+    ("Gemfile", GEMFILE),
+    ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+    ("db/structure.sql", STRUCTURE),
+    ("vendor/gems/database_documentation-3.2.0/lib/database_documentation.rb", VENDORED_ENTRY),
+    ("vendor/gems/database_documentation-3.2.0/lib/database_documentation/constants.rb", VENDORED_CONSTANTS),
+    ("app/models/doc_probe.rb", VENDORED_PROBE),
+];
+
+fn vendored_overlay() -> emit_and_run::Overlay {
+    VENDORED_FILES.iter().fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
+}
+
+#[test]
+fn a_gem_compiled_from_source_carries_no_port() {
+    let (emitted, errors) = vendored_overlay().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let port = std::fs::read_to_string(emitted.join("runtime/database_documentation.rb"));
+    assert!(port.is_err(), "the port is carried: {:.400}", port.unwrap_or_default());
+    assert!(!emitted.join("runtime/features/database_documentation.rb").exists());
+    let facades = std::fs::read_to_string(emitted.join("runtime/gem_facades.rb")).unwrap();
+    assert!(!facades.contains("require_relative \"database_documentation\""), "{facades}");
+    // The compiled gem answers `require "database_documentation"`.
+    let models = std::fs::read_to_string(emitted.join("app/models.rb")).unwrap();
+    assert!(
+        models.contains("\"database_documentation\" => [\"models/roundhouse_files/vendor/gems/database_documentation-3.2.0/lib/database_documentation\"]"),
+        "no compiled feature for the gem's entry"
+    );
+}
+
+#[test]
+#[ignore = "requires pg gem, Core's pinned Rails and gem home, and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn a_gem_compiled_from_source_matches_the_gem_on_postgresql() {
+    let (emitted, errors) = vendored_overlay().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let native_files: Vec<(&str, &str)> =
+        VENDORED_FILES.iter().copied().chain([("native/database_documentation_gem.rb", VENDORED_NATIVE_GEM)]).collect();
+    let (native, emitted) = pg_probe::native_and_emitted(
+        "database-documentation-vendored",
+        &native_files,
+        &emitted,
+        "rh_e2e_database_documentation_vendored",
+        "DocProbe",
+        &["native/database_documentation_gem.rb", "app/models/doc_probe.rb"],
+    );
+    assert_eq!(native, VENDORED_EXPECTED, "native");
+    assert_eq!(emitted, native, "emitted");
+}
