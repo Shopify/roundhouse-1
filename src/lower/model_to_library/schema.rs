@@ -94,7 +94,7 @@ pub(super) fn push_schema_methods(
         model,
         &table.columns.iter().map(|c| (c.name.clone(), super::ty_of_column_slot(c))).collect(),
     );
-    let mut demanded: Option<crate::det::HashSet<Symbol>> = None;
+    let mut demanded: Option<std::rc::Rc<crate::det::HashSet<Symbol>>> = None;
     for col in &table.columns {
         methods.push(synth_attr_reader(owner, col, model));
         if model.enums.contains_key(&col.name) {
@@ -158,7 +158,7 @@ pub(super) fn push_schema_methods(
             // have to learn (rust's hand-written model impl, go's
             // call-form list), for an answer that is the constant
             // false/nil on those lanes anyway.
-            let demanded = demanded.get_or_insert_with(|| model_body_names(models));
+            let demanded = demanded.get_or_insert_with(|| demanded_names(models));
             for (name, runtime, ret) in pending_change_methods(col) {
                 if (demanded.contains(&name) || super::attribute_alias::demanded_as_alias(model, col, &name, demanded))
                     && !super::associations::model_defines_instance_method(model, &name)
@@ -182,7 +182,7 @@ pub(super) fn push_schema_methods(
             continue;
         };
         let Some(col) = table.columns.iter().find(|c| c.name == *foreign_key) else { continue };
-        let demanded = demanded.get_or_insert_with(|| model_body_names(models));
+        let demanded = demanded.get_or_insert_with(|| demanded_names(models));
         let prev = Symbol::from(format!("{}_previously_changed?", name.as_str()));
         if demanded.contains(&prev) && !super::associations::model_defines_instance_method(model, &prev) {
             methods.push(synth_column_dirty_pred(owner, col, prev));
@@ -2246,6 +2246,55 @@ fn pending_change_methods(col: &Column) -> Vec<(Symbol, &'static str, Ty)> {
         (Symbol::from(format!("will_save_change_to_{n}?")), "attribute_changed?", Ty::Bool),
         (Symbol::from(format!("{n}_was")), "attribute_was", Ty::Untyped),
     ]
+}
+
+/// [`model_body_names`] of one models slice, shared by every
+/// [`push_schema_methods`] over that slice while a
+/// [`share_model_body_names`] guard lives. Computed per call, the names
+/// walked every model body once per model with a column: quadratic in
+/// the models, ~140 s a model lowering on Shopify Core (1,321 tables).
+#[derive(Default)]
+pub(crate) struct ModelBodyNames(std::rc::Rc<std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<Symbol>>>>);
+
+type SharedBodyNames = (usize, usize, std::rc::Rc<std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<Symbol>>>>);
+
+thread_local! {
+    static MODEL_BODY_NAMES: std::cell::RefCell<Option<SharedBodyNames>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previously shared names when dropped. It borrows the
+/// slice, so the slice cannot change while its names are shared.
+pub(crate) struct ModelBodyNamesGuard<'a>(Option<SharedBodyNames>, std::marker::PhantomData<&'a [Model]>);
+
+impl Drop for ModelBodyNamesGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        MODEL_BODY_NAMES.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Share `cache`'s [`model_body_names`] of `models` with every
+/// [`push_schema_methods`] over `models` (the same slice) for the
+/// guard's life.
+pub(crate) fn share_model_body_names<'a>(models: &'a [Model], cache: &ModelBodyNames) -> ModelBodyNamesGuard<'a> {
+    let shared = (models.as_ptr() as usize, models.len(), cache.0.clone());
+    let previous = MODEL_BODY_NAMES.with(|slot| slot.borrow_mut().replace(shared));
+    ModelBodyNamesGuard(previous, std::marker::PhantomData)
+}
+
+/// [`model_body_names`] of `models`: the shared names when `models` is
+/// the shared slice.
+fn demanded_names(models: &[Model]) -> std::rc::Rc<crate::det::HashSet<Symbol>> {
+    let shared = MODEL_BODY_NAMES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(ptr, len, _)| *ptr == models.as_ptr() as usize && *len == models.len())
+            .map(|(_, _, cell)| cell.clone())
+    });
+    match shared {
+        Some(cell) => cell.get_or_init(|| std::rc::Rc::new(model_body_names(models))).clone(),
+        None => std::rc::Rc::new(model_body_names(models)),
+    }
 }
 
 /// Every method name a model body SENDS or names as a Symbol (`if:
