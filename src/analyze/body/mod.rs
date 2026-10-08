@@ -3169,7 +3169,7 @@ pub(super) fn lit_ty(lit: &Literal) -> Ty {
     match lit {
         Literal::Nil => Ty::Nil,
         Literal::Bool { .. } => Ty::Bool,
-        Literal::Int { .. } => Ty::Int,
+        Literal::Int { .. } | Literal::BigInt { .. } => Ty::Int,
         Literal::Float { .. } => Ty::Float,
         Literal::Str { .. } => Ty::Str,
         Literal::Sym { .. } => Ty::Sym,

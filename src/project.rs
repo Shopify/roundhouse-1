@@ -1191,6 +1191,38 @@ fn reject_unsupported_dates(app: &App, target: BuildTarget) -> Result<(), String
     Ok(())
 }
 
+/// An integer literal wider than 64 bits (`Literal::BigInt`, Core's
+/// `SIGN_BIT = 0x8000000000000000`) is an Integer like any other in
+/// Ruby, which has no fixed width. A target whose integers are fixed
+/// width (Spinel's included) has no value for it: refused by name at
+/// each literal, never truncated.
+fn reject_wide_integer_literals(app: &App, target: BuildTarget) -> Result<(), String> {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Roda) {
+        return Ok(());
+    }
+    fn visit(expr: &crate::expr::Expr, target: &str, found: &mut bool) {
+        if let crate::expr::ExprNode::Lit { value: crate::expr::Literal::BigInt { value } } = &*expr.node {
+            *found = true;
+            emit::diagnostics::report_unsupported(
+                expr.span,
+                target,
+                "integer_literal",
+                &format!("{value} does not fit in a 64-bit integer, the widest this target's integers are; use Ruby"),
+            );
+        }
+        expr.node.for_each_child(&mut |child| visit(child, target, found));
+    }
+    let mut found = false;
+    crate::lower::for_each_emit_body_ref(app, &mut |expr| visit(expr, target.as_str(), &mut found));
+    if found {
+        return Err(format!(
+            "{}: an integer literal wider than 64 bits is not supported; use Ruby",
+            target.as_str()
+        ));
+    }
+    Ok(())
+}
+
 /// Keep admitted Data factories outside unverified target emitters.
 fn reject_unsupported_data_factories(app: &App, target: BuildTarget) -> Result<(), String> {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Spinel) {
@@ -1552,6 +1584,7 @@ pub fn target_files(
     report_unsupported_bundled_constants(app, target);
     reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_data_factories(app, target)?;
+    reject_wide_integer_literals(app, target)?;
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
     report_unsupported_keys(app, target);

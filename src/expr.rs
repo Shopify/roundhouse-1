@@ -1164,6 +1164,11 @@ pub enum Literal {
     Nil,
     Bool { value: bool },
     Int { value: i64 },
+    /// An integer literal wider than `i64` (`0x8000000000000000`), as
+    /// its decimal digits, `-` signed. Ruby's Integer has no width, so
+    /// the Ruby family writes it as is; a target with fixed-width
+    /// integers refuses it (`project::reject_wide_integer_literals`).
+    BigInt { value: String },
     Float { value: f64 },
     Str { value: String },
     Sym { value: Symbol },

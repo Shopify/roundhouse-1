@@ -1532,6 +1532,7 @@ pub(super) fn emit_literal(lit: &Literal) -> String {
             if *value { "True".to_string() } else { "False".to_string() }
         }
         Literal::Int { value } => value.to_string(),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             let s = value.to_string();
             if s.contains('.') { s } else { format!("{s}.0") }

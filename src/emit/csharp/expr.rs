@@ -988,6 +988,7 @@ fn emit_literal(lit: &Literal) -> String {
         // `Ty::Int → long`; suffix `L` keeps integer literals in the
         // long-everywhere world (matches the `Db` primitive's `long` indices).
         Literal::Int { value } => format!("{value}L"),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             if value.fract() == 0.0 {
                 format!("{value:.1}")

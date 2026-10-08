@@ -1725,6 +1725,7 @@ pub(super) fn emit_literal(l: &Literal) -> String {
             // expecting `Int32` parameters aren't affected.
             format!("{value}_i64")
         }
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             let s = value.to_string();
             if s.contains('.') {

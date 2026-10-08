@@ -1011,17 +1011,16 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_integer_node().is_some() => {
             let i = n.as_integer_node().unwrap();
-            // A literal wider than `i64` is REPORTED, not zeroed. The
-            // `unwrap_or(0)` that stood here was silent, and it was
-            // reached: `0xffffffff` does not fit an `i32`, so campfire's
-            // `ipaddr.to_i & 0xffffffff` emitted `& 0`.
-            let Some(v) = super::util::integer_i64(&i.value()) else {
-                return Err(IngestError::Unsupported {
-                    file: file.to_string(),
-                    message: "integer literal does not fit in a 64-bit integer".to_string(),
-                });
-            };
-            ExprNode::Lit { value: Literal::Int { value: v } }
+            // A literal wider than `i64` is carried at full width, not
+            // zeroed. The `unwrap_or(0)` that stood here was silent, and
+            // it was reached: `0xffffffff` does not fit an `i32`, so
+            // campfire's `ipaddr.to_i & 0xffffffff` emitted `& 0`. Ruby's
+            // Integer has no width (Core's `SIGN_BIT =
+            // 0x8000000000000000`); a fixed-width target refuses it.
+            match super::util::integer_i64(&i.value()) {
+                Some(v) => ExprNode::Lit { value: Literal::Int { value: v } },
+                None => ExprNode::Lit { value: Literal::BigInt { value: super::util::integer_decimal(&i.value()) } },
+            }
         }
         n if n.as_float_node().is_some() => {
             let f = n.as_float_node().unwrap();

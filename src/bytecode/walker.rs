@@ -208,6 +208,11 @@ impl Walker {
                     "Literal::Regex in bytecode walker".to_string(),
                 ));
             }
+            Literal::BigInt { .. } => {
+                return Err(WalkError::NotYetSupported(
+                    "an integer literal wider than 64 bits in bytecode walker".to_string(),
+                ));
+            }
         }
         Ok(())
     }

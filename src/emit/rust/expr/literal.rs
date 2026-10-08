@@ -406,6 +406,7 @@ pub(crate) fn emit_literal(lit: &Literal) -> String {
         }
         Literal::Bool { value } => value.to_string(),
         Literal::Int { value } => format!("{value}_i64"),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             let s = value.to_string();
             if s.contains('.') { s } else { format!("{s}.0") }

@@ -133,7 +133,7 @@ fn a_gap_that_kept_the_class_is_not_named() {
     let diags = check(&[
         (
             "app/lib/settings.rb",
-            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def huge\n    99999999999999999999999\n  end\nend\n",
+            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def host\n    `hostname`\n  end\nend\n",
         ),
         ("app/lib/user.rb", "class User\n  def go\n    [Settings::A, Settings::B]\n  end\nend\n"),
     ]);
@@ -146,22 +146,22 @@ fn a_gap_that_kept_the_class_is_not_named() {
 }
 
 /// A gap in a constant's own value: ingest kept the module but held the
-/// constant as its `nil` placeholder. Core's
-/// `MetaobjectsInternal::Codec::DoubleLayout::SIGN_BIT =
-/// 0x8000000000000000` is wider than 64 bits. Its references are the
-/// gap's shadow; a sibling constant ingest compiled is not named.
+/// constant as its `nil` placeholder (here a shell command, which no
+/// target runs; Core's wider-than-64-bit `SIGN_BIT` was one before
+/// tests/wide_integer_literals.rs). Its references are the gap's
+/// shadow; a sibling constant ingest compiled is not named.
 #[test]
 fn a_constant_whose_value_was_the_gap_names_it() {
     let diags = check(&[
         (
             "app/lib/codec.rb",
-            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    SIGN_BIT = 0x8000000000000000 #: Integer\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        bits.anybits?(SIGN_BIT) ? TAG : 0\n      end\n    end\n  end\nend\n",
+            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    HOST = `hostname`\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        HOST.empty? ? TAG : bits\n      end\n    end\n  end\nend\n",
         ),
-        ("app/lib/user.rb", "class User\n  def go\n    [Codec::DoubleLayout::SIGN_BIT, Codec::DoubleLayout::TAG, Codec::Missing]\n  end\nend\n"),
+        ("app/lib/user.rb", "class User\n  def go\n    [Codec::DoubleLayout::HOST, Codec::DoubleLayout::TAG, Codec::Missing]\n  end\nend\n"),
     ]);
-    let d = constant_refusal(&diags, "Codec::DoubleLayout::SIGN_BIT", Severity::Info);
+    let d = constant_refusal(&diags, "Codec::DoubleLayout::HOST", Severity::Info);
     assert!(
-        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::SIGN_BIT was not compiled: integer literal"),
+        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::HOST was not compiled: shell command"),
         "{}",
         d.message
     );

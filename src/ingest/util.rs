@@ -107,6 +107,37 @@ pub(super) fn integer_i64(value: &ruby_prism::Integer<'_>) -> Option<i64> {
     i64::try_from(if negative { -acc } else { acc }).ok()
 }
 
+/// The decimal digits of a prism integer of any width, `-` signed:
+/// repeated division of its little-endian 32-bit limbs by 10^9.
+pub(super) fn integer_decimal(value: &ruby_prism::Integer<'_>) -> String {
+    let (negative, digits) = value.to_u32_digits();
+    let mut limbs: Vec<u32> = digits.to_vec();
+    let mut chunks: Vec<u32> = Vec::new();
+    while limbs.iter().any(|limb| *limb != 0) {
+        let mut rem: u64 = 0;
+        for limb in limbs.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*limb);
+            *limb = (cur / 1_000_000_000) as u32;
+            rem = cur % 1_000_000_000;
+        }
+        chunks.push(rem as u32);
+    }
+    let mut out = String::new();
+    if negative && !chunks.is_empty() {
+        out.push('-');
+    }
+    match chunks.split_last() {
+        None => out.push('0'),
+        Some((most, rest)) => {
+            out.push_str(&most.to_string());
+            for chunk in rest.iter().rev() {
+                out.push_str(&format!("{chunk:09}"));
+            }
+        }
+    }
+    out
+}
+
 // ---- Class / constant-path navigators ----------------------------------
 
 pub(super) fn find_first_class<'pr>(node: &Node<'pr>) -> Option<ruby_prism::ClassNode<'pr>> {

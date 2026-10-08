@@ -265,6 +265,7 @@ impl<'s> Interp<'s> {
             ExprNode::Lit { value } => match value {
                 Literal::Str { value } => Some(sql_str(value)),
                 Literal::Int { value } => Some(value.to_string()),
+                Literal::BigInt { value } => Some(value.clone()),
                 Literal::Float { value } => Some(value.to_string()),
                 Literal::Bool { value } => Some(if *value { "1" } else { "0" }.to_string()),
                 Literal::Nil => Some("NULL".to_string()),

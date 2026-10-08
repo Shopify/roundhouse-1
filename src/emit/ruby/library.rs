@@ -3291,6 +3291,7 @@ fn literal_key(e: &Expr) -> Option<String> {
             Literal::Nil => "nil".to_string(),
             Literal::Bool { value } => format!("b:{value}"),
             Literal::Int { value } => format!("i:{value}"),
+            Literal::BigInt { value } => format!("i:{value}"),
             Literal::Float { value } => format!("f:{value}"),
             Literal::Str { value } => format!("s:{value:?}"),
             Literal::Sym { value } => format!("y:{}", value.as_str()),
