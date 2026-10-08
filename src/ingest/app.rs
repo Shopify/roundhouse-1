@@ -841,6 +841,18 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             let (ingested, deferred) = super::inherited_alias::capturing(|| {
                 super::library_class::ingest_app_library_classes(&source, &path_str)
             });
+            if ingested.is_ok() {
+                // A Concern's `included do` is the same wherever the
+                // Concern lives (`app/utils`, `app/jobs`, `lib`):
+                // collected as under `app/models/concerns`, so it
+                // runs on each includer or is reported there.
+                let (concern_items, concern_enum_decls) =
+                    ingest_concern_model_items_with_constants(&source, &path_str, &enum_constants);
+                app.concern_model_items.extend(concern_items);
+                app.concern_prepended_items
+                    .extend(ingest_concern_prepended_items(&source, &path_str, &enum_constants));
+                concern_enums.extend(concern_enum_decls);
+            }
             match ingested {
                 // An `alias` of a method the file does not define holds
                 // the file back until every support file is in, where
@@ -2486,6 +2498,7 @@ end
     super::channel_callbacks::lower_channel_names(&mut app);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
+    splice_deferred_mixes_in_extends(&mut app, &concern_class_method_spans);
     // Before the macro expansions: a macro's generated body may read the
     // accessor (`session_accessor_prefix`), and a collision check reads
     // the includer's methods.
@@ -3797,6 +3810,126 @@ fn splice_concern_class_methods_into_includers(
     }
     app.concern_spliced_class_methods = spliced;
     app.class_methods_carrier_splices = carrier_splices;
+}
+
+/// `mixes_in_class_methods(M)` on a module a Concern depends on.
+///
+/// sorbet-runtime's hook extends whatever includes the module with `M`.
+/// ActiveSupport::Concern defers its own includes to its includer, so
+/// `Host` including `Gathering` (`include Mixed`) runs
+/// `Host.include(Mixed)` and `Host` is extended. The emitted Concern
+/// drops `extend ActiveSupport::Concern`, so its `include Mixed` runs at
+/// its definition and only `Gathering` is extended (natively it is too:
+/// `Module#include` calls `included` when `append_features` defers).
+/// Each class reaching such a module through Concerns alone gets the
+/// extend the deferred include performs (`App::class_methods_carrier_splices`,
+/// with no copies). A direct include already runs the hook in the emitted
+/// code; one through a plain module does not natively either; one its
+/// superclass chain has is skipped by Ruby.
+fn splice_deferred_mixes_in_extends(app: &mut App, carriers: &[ConcernClassMethodSpans]) {
+    use crate::det::{HashMap, HashSet};
+    use crate::expr::ExprNode;
+    use crate::ident::{ClassId, Symbol};
+
+    let defined: HashSet<&str> = app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+    // A constant written in the module's body resolves lexically.
+    let resolve = |owner: &ClassId, path: &[Symbol]| -> Option<ClassId> {
+        let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+        let mut scope: Vec<&str> = owner.0.as_str().split("::").collect();
+        loop {
+            let candidate =
+                if scope.is_empty() { written.clone() } else { format!("{}::{written}", scope.join("::")) };
+            if defined.contains(candidate.as_str()) {
+                return Some(ClassId(Symbol::from(candidate)));
+            }
+            scope.pop()?;
+        }
+    };
+    let mut mixes_in: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|lc| lc.is_module) {
+        for call in lc.unknown_calls.iter().filter(|call| super::sorbet_check::is_mixes_in(call)) {
+            let ExprNode::Send { args, .. } = &*call.node else { continue };
+            for arg in args.iter().skip(1) {
+                let ExprNode::Const { path } = &*arg.node else { continue };
+                if let Some(id) = resolve(&lc.name, path) {
+                    mixes_in.entry(lc.name.clone()).or_default().push(id);
+                }
+            }
+        }
+    }
+    if mixes_in.is_empty() {
+        return;
+    }
+    let concerns: HashSet<&ClassId> =
+        carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
+    let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for lc in &app.library_classes {
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().cloned());
+    }
+    let mut direct: HashMap<ClassId, (Option<ClassId>, Vec<ClassId>)> = HashMap::default();
+    for model in &app.models {
+        direct.insert(model.name.clone(), (model.parent.clone(), crate::analyze::model_includes(model)));
+    }
+    for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
+        direct.entry(lc.name.clone()).or_insert_with(|| (lc.parent.clone(), lc.includes.clone()));
+    }
+    let closure = |start: Vec<ClassId>, out: &mut HashSet<ClassId>| {
+        let mut stack = start;
+        while let Some(id) = stack.pop() {
+            if out.insert(id.clone()) {
+                stack.extend(module_includes.get(&id).into_iter().flatten().cloned());
+            }
+        }
+    };
+    let mut extends: Vec<(ClassId, Vec<ClassId>)> = Vec::new();
+    for (name, (parent, includes)) in &direct {
+        let mut inherited: HashSet<ClassId> = HashSet::default();
+        let mut visited: HashSet<ClassId> = HashSet::default();
+        let mut at = parent.clone();
+        while let Some(p) = at.take() {
+            if !visited.insert(p.clone()) {
+                break;
+            }
+            let Some((grand, parent_includes)) = direct.get(&p) else { break };
+            closure(parent_includes.clone(), &mut inherited);
+            at = grand.clone();
+        }
+        // Breadth first, in ancestor order: what each direct Concern
+        // include defers to this class, through Concerns only.
+        let mut seen: HashSet<ClassId> = includes.iter().cloned().collect();
+        let mut queue: Vec<ClassId> = includes
+            .iter()
+            .filter(|id| concerns.contains(id) && !inherited.contains(*id))
+            .flat_map(|id| module_includes.get(id).cloned().unwrap_or_default())
+            .collect();
+        let mut carried: Vec<ClassId> = Vec::new();
+        while !queue.is_empty() {
+            let id = queue.remove(0);
+            if inherited.contains(&id) || !seen.insert(id.clone()) {
+                continue;
+            }
+            for module in mixes_in.get(&id).into_iter().flatten() {
+                if !carried.contains(module) {
+                    carried.push(module.clone());
+                }
+            }
+            if concerns.contains(&id) {
+                queue.extend(module_includes.get(&id).into_iter().flatten().cloned());
+            }
+        }
+        if !carried.is_empty() {
+            extends.push((name.clone(), carried));
+        }
+    }
+    extends.sort_by(|a, b| a.0.0.as_str().cmp(b.0.0.as_str()));
+    for (name, carried) in extends {
+        let splices = app.class_methods_carrier_splices.entry(name).or_default();
+        for carrier in carried {
+            if !splices.iter().any(|splice| splice.carrier == carrier && splice.extend) {
+                splices.push(crate::app::ClassMethodsCarrierSplice { carrier, methods: Vec::new(), extend: true });
+            }
+        }
+    }
 }
 
 /// A class variable in a concern's class-side method belongs to the
