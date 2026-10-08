@@ -28,6 +28,9 @@
 # - `errors.attribute_names` on a receiver that is not the accumulator
 #   (an Array the app built) answers the attributes recorded on it,
 #   usually none.
+# - On the PostgreSQL tree a record over the ActiveModel::Validations
+#   port has Rails' ActiveModel::Errors, whose own `attribute_names`
+#   answers.
 module ActiveModel
   module ErrorAttributes
     PAIRS = :@__roundhouse_error_attributes
@@ -48,6 +51,10 @@ module ActiveModel
     # The attributes of the messages in `errors`, in order, each once,
     # frozen: Rails' `@errors.map(&:attribute).uniq.freeze`.
     def self.attribute_names(errors)
+      # A record over the ActiveModel::Validations port
+      # (runtime/active_model_validations.rb) holds Rails' collection,
+      # which answers this itself.
+      return errors.attribute_names if defined?(::ActiveModel::Errors) && errors.is_a?(::ActiveModel::Errors)
       pending = (errors.instance_variable_get(PAIRS) || []).dup
       names = []
       errors.each do |message|

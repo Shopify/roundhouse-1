@@ -4089,6 +4089,30 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let active_model = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_active_model.rb")
         .map_err(|e| format!("read Active Record ActiveModel runtime: {e}"))?;
     files.push(("runtime/active_record_active_model.rb".into(), active_model));
+    // ActiveModel::Validations builds on ActiveSupport::Callbacks (with
+    // its DescendantsTracker), the Validator bases and OptionMerger
+    // (`with_options`), which it requires, and translates its messages
+    // through I18n and activemodel's English locale, carried with i18n.
+    if active_model_ports.contains(&"active_model_validations") {
+        if !carries_i18n {
+            return Err("PostgreSQL bootstrap: app code includes ActiveModel::Validations, whose messages \
+                        translate through I18n, but the lockfile has no i18n (activesupport depends on it)"
+                .into());
+        }
+        for port in [
+            "active_support_callbacks",
+            "active_support_descendants_tracker",
+            "active_model_validator",
+            "active_support_option_merger",
+        ] {
+            let to = format!("runtime/{port}.rb");
+            if !files.iter().any(|(p, _)| *p == to) {
+                let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+                    .map_err(|e| format!("read {port} runtime: {e}"))?;
+                files.push((to, text));
+            }
+        }
+    }
     // Name#as_json and Serializers::JSON#as_json answer through
     // ActiveSupport::JSON's `as_json` table (runtime/spinel/
     // active_support_json.rb), which the naming port requires.
@@ -9491,6 +9515,8 @@ fn spinel_files_with_assertions(
             && p != "runtime/active_model_naming.rb"
             && p != "runtime/active_model_attribute_methods.rb"
             && p != "runtime/active_model_serialization.rb"
+            && p != "runtime/active_model_validations.rb"
+            && p != "runtime/active_support_option_merger.rb"
     });
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
@@ -12002,21 +12028,27 @@ fn carries_active_support_cache(files: &[(String, String)]) -> bool {
 }
 
 /// The ActiveModel ports (runtime/spinel/active_model_naming.rb,
-/// active_model_attribute_methods.rb, active_model_serialization.rb)
-/// the PostgreSQL CRuby tree carries, in load order. ActiveRecord::Base
-/// includes Conversion and Serializers::JSON there
-/// (runtime/spinel/cruby/active_record_active_model.rb), so the naming
-/// port, which holds Conversion, and the serialization port, whose
-/// Serializers::JSON extends its includer with Naming, always load; the
-/// attribute-methods port where the app's code (a gem compiled as source
-/// among it) names one of its modules. frozen_record 0.27.4's
-/// FrozenRecord::Base names it.
+/// active_model_attribute_methods.rb, active_model_serialization.rb,
+/// active_model_validations.rb) the PostgreSQL CRuby tree carries, in
+/// load order. ActiveRecord::Base includes Conversion and
+/// Serializers::JSON there (runtime/spinel/cruby/active_record_active_model.rb),
+/// so the naming port, which holds Conversion, and the serialization
+/// port, whose Serializers::JSON extends its includer with Naming, always
+/// load; the attribute-methods and validations ports where the app's code
+/// (a gem compiled as source among it) names one of their modules.
+/// frozen_record 0.27.4's FrozenRecord::Base names attribute methods;
+/// api_versioning's records, and Core's classes whose superclass is no
+/// model, include ActiveModel::Validations (a lowered model's include is
+/// gone by emit).
 fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
+    let validations =
+        carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"]);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [
         (true, "active_model_naming"),
         (attribute_methods, "active_model_attribute_methods"),
         (true, "active_model_serialization"),
+        (validations, "active_model_validations"),
     ]
     .into_iter()
     .filter_map(|(carried, port)| carried.then_some(port))

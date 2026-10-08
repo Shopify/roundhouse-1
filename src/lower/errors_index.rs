@@ -63,13 +63,16 @@ use crate::ty::Ty;
 /// recognizable `errors[…]` sites left dynamic, with the reason.
 pub fn apply_errors_index_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |body| {
-        rewrite(body, &mut diags);
-        ledger_messages(body, &mut diags);
+    let port = super::active_model_model::ValidationsPort::of(app);
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let site = (&port, owner.cloned());
+        rewrite(body, &site, &mut diags);
+        ledger_messages(body, &site, &mut diags);
     });
     super::for_each_test_body(app, &mut |body| {
-        rewrite(body, &mut diags);
-        ledger_messages(body, &mut diags);
+        let site = (&port, None);
+        rewrite(body, &site, &mut diags);
+        ledger_messages(body, &site, &mut diags);
     });
     diags
 }
@@ -144,14 +147,36 @@ fn rewrite_messages(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     }
 }
 
-fn rewrite(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, diags));
+/// The ActiveModel::Validations port's classes, and the body's owner.
+type Site<'a> = (&'a super::active_model_model::ValidationsPort, Option<crate::ident::ClassId>);
+
+/// Whether the `errors` this site reads (`errors[…]`, `errors.messages`
+/// or a question asked of it) is the port's ActiveModel::Errors, whose
+/// `[]` and `messages` are Rails' own and stay as written.
+fn on_port(expr: &Expr, site: &Site<'_>) -> bool {
+    let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { return false };
+    let errors = if is_errors_read(r) {
+        r
+    } else if is_messages_read(r) {
+        let ExprNode::Send { recv: Some(e), .. } = &*r.node else { return false };
+        e
+    } else {
+        return false;
+    };
+    site.0.answers(errors, site.1.as_ref())
+}
+
+fn rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, site, diags));
+    if on_port(expr, site) {
+        return;
+    }
     rewrite_messages(expr, diags);
     rewrite_index(expr, diags);
 }
 
-fn ledger_messages(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
-    if is_messages_read(expr) {
+fn ledger_messages(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
+    if is_messages_read(expr) && !on_port(expr, site) {
         diags.push(crate::lower::residue_diagnostic(
             "errors_index",
             "errors.messages",
@@ -162,7 +187,7 @@ fn ledger_messages(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
                 .to_string(),
         ));
     }
-    expr.node.for_each_child_mut(&mut |c| ledger_messages(c, diags));
+    expr.node.for_each_child_mut(&mut |c| ledger_messages(c, site, diags));
 }
 
 fn rewrite_index(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {

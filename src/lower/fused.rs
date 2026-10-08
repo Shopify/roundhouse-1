@@ -32,19 +32,22 @@ pub fn apply_fused_independent_rewrites(app: &mut App) {
     let skip_in = super::in_predicate::app_defines_in(app);
     let skip_including = super::including::app_defines_including(app);
     let skip_full_messages = super::errors_full_messages::app_defines_full_messages(app);
+    let port = super::active_model_model::ValidationsPort::of(app);
 
-    super::for_each_hook_body(app, &mut |body| {
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let full_messages = (!skip_full_messages).then_some((&port, owner));
         walk_postorder(body, &mut |e| {
-            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_hook_node(e, skip_exclude, skip_in, skip_including, full_messages);
         });
     });
+    let full_messages = (!skip_full_messages).then_some((&port, None));
     for view in &mut app.views {
         walk_postorder(&mut view.body, &mut |e| {
-            rewrite_view_node(e, skip_exclude, skip_in, skip_including, skip_full_messages);
+            rewrite_view_node(e, skip_exclude, skip_in, skip_including, full_messages);
         });
     }
     super::for_each_test_body(app, &mut |body| {
-        walk_postorder(body, &mut |e| rewrite_test_node(e, skip_full_messages));
+        walk_postorder(body, &mut |e| rewrite_test_node(e, full_messages));
     });
 }
 
@@ -424,12 +427,17 @@ fn is_format_suffix_wrap(e: &Expr, helpers: &HashSet<String>) -> bool {
         )
 }
 
+/// The errors_full_messages rewrite's inputs, or None when the app
+/// defines its own `full_messages` and the rewrite stands down: the
+/// ActiveModel::Validations port's classes, and the body's owner.
+type FullMessages<'a> = Option<(&'a super::active_model_model::ValidationsPort, Option<&'a crate::ident::ClassId>)>;
+
 fn rewrite_hook_node(
     e: &mut Expr,
     skip_exclude: bool,
     skip_in: bool,
     skip_including: bool,
-    skip_full_messages: bool,
+    full_messages: FullMessages<'_>,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -461,8 +469,8 @@ fn rewrite_hook_node(
     super::arel_attribute::rewrite_node(e);
     super::attr_or_assign::rewrite_node(e);
     super::group_count::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
+    if let Some((port, owner)) = full_messages {
+        super::errors_full_messages::rewrite_node(e, port, owner);
     }
     super::each_with_index::rewrite_node(e);
     // Last: produces `ActiveSupport.*` / Range nodes no earlier fused
@@ -476,7 +484,7 @@ fn rewrite_view_node(
     skip_exclude: bool,
     skip_in: bool,
     skip_including: bool,
-    skip_full_messages: bool,
+    full_messages: FullMessages<'_>,
 ) {
     super::pathname_ctor::rewrite_node(e);
     super::array_ordinal::rewrite_node(e);
@@ -503,20 +511,20 @@ fn rewrite_view_node(
     super::dirty_predicate_kwargs::rewrite_node(e);
     super::relation_select_block::rewrite_node(e);
     super::arel_attribute::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
+    if let Some((port, owner)) = full_messages {
+        super::errors_full_messages::rewrite_node(e, port, owner);
     }
     super::each_with_index::rewrite_node(e);
     super::time_calendar::rewrite_node(e);
 }
 
-fn rewrite_test_node(e: &mut Expr, skip_full_messages: bool) {
+fn rewrite_test_node(e: &mut Expr, full_messages: FullMessages<'_>) {
     super::save_without_validation::rewrite_node(e);
     super::enumerable_ext::rewrite_node(e);
     super::byte_size::rewrite_node(e);
     super::dirty_predicate_kwargs::rewrite_node(e);
-    if !skip_full_messages {
-        super::errors_full_messages::rewrite_node(e);
+    if let Some((port, owner)) = full_messages {
+        super::errors_full_messages::rewrite_node(e, port, owner);
     }
 }
 
