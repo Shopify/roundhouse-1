@@ -10738,7 +10738,17 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
 /// a module's `validates` runs on the module itself, which the module
 /// does not answer.
 fn active_model_validation_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let callback_call = |call: &Expr| {
+        matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
+            if matches!(method.as_str(), "before_validation" | "after_validation"))
+    };
+    // A body with no candidate call answers none, whatever its
+    // ancestry: decided before the ancestry walks (a scan of the
+    // library classes per parent), asked for every library class.
     if lc.is_module
+        || !lc.unknown_calls.iter().any(|call| {
+            crate::lower::active_model_model::validation_call(call).is_some() || callback_call(call)
+        })
         || app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql)
         || crate::lower::active_model_model::below_model(lc, app)
         || !includes_active_model_validations(lc, app)
@@ -10749,10 +10759,7 @@ fn active_model_validation_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a
     lc.unknown_calls
         .iter()
         .filter(|call| {
-            crate::lower::active_model_model::validation_call(call).is_some()
-                || (callbacks
-                    && matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
-                        if matches!(method.as_str(), "before_validation" | "after_validation")))
+            crate::lower::active_model_model::validation_call(call).is_some() || (callbacks && callback_call(call))
         })
         .collect()
 }

@@ -265,8 +265,8 @@ pub(crate) fn diagnose_dropped_validations(app: &App) -> Vec<Diagnostic> {
         // A class below a model is an STI subclass
         // `lower::sti_subclass_validations` lowers or refuses (and
         // `diagnose_unclaimed_model_dsl` reports).
-        if below_model(lc, app)
-            || !lc.unknown_calls.iter().any(|call| validation_call(call).is_some())
+        if !lc.unknown_calls.iter().any(|call| validation_call(call).is_some())
+            || below_model(lc, app)
             || crate::emit::ruby::replays_class_body(lc, app)
         {
             continue;
