@@ -23,8 +23,9 @@
 #   out below with the same results.
 # - `lookup_store` / `retrieve_store_class` find the stores this file
 #   defines, and MemCacheStore where runtime/active_support_mem_cache_store.rb
-#   is loaded (a tree whose app names the class). FileStore and
-#   RedisCacheStore are not ported (RedisCacheStore needs redis); asking
+#   or FileStore where runtime/active_support_file_store.rb is (each in a
+#   tree whose app names the class). RedisCacheStore is not ported (it
+#   needs redis); asking
 #   for a missing one raises the same "Could not find cache store adapter"
 #   error a missing native adapter does, naming what it needs.
 # - The :message_pack serializer needs ActiveSupport::MessagePack and the
@@ -106,10 +107,11 @@ module ActiveSupport
     # The stores this file defines, by `lookup_store` symbol.
     PORTED_STORES = %i(memory_store null_store).freeze
     # Native adapters this file does not define, and why one is missing.
-    # MemCacheStore is runtime/active_support_mem_cache_store.rb's, carried
-    # where the app names the class; `lookup_store` finds it once loaded.
+    # FileStore and MemCacheStore are runtime/active_support_file_store.rb's
+    # and runtime/active_support_mem_cache_store.rb's, each carried where
+    # the app names the class; `lookup_store` finds one once loaded.
     UNPORTED_STORES = {
-      file_store: "ActiveSupport::Cache::FileStore is not ported",
+      file_store: "ActiveSupport::Cache::FileStore is carried only where the app names the class",
       mem_cache_store: "ActiveSupport::Cache::MemCacheStore is carried only where the app names the class",
       redis_cache_store: "ActiveSupport::Cache::RedisCacheStore needs the redis gem, which is not ported",
     }.freeze
