@@ -8826,19 +8826,87 @@ fn carried_source_files(app: &App) -> CarriedSources {
     // file defines them all. One anchor would leave the rest to an
     // autoload a plain gem's constants do not have (widget/taggable.rb's
     // `Taggable::ClassMethods`, which `Taggable.included` reads).
+    //
+    // Not a namespace another file's program defines, whose path names
+    // it (paquito/errors.rb's `module Paquito`, paquito.rb's): this file
+    // only reopens it, each of its own files opens it on the way in, and
+    // that program is what loads this file. Its file comes with the
+    // program, where Ruby defines it.
+    //
+    // In source order, each file where the file finishes giving it: a
+    // value the file builds last (rollouts_mutex policy.rb's
+    // `Policy::DEFAULT = Policy.new(...)`, written in the namespace's
+    // file) needs what the file defined above it (`Declaration =
+    // Data.define`). A file the source writes nothing into (an empty
+    // class, a `Class.new`) goes first, in declaration order.
     let programs: BTreeSet<&str> = app.file_programs.iter().map(|p| p.source.as_str()).collect();
+    let fold = |text: &str| text.chars().filter(|c| *c != '_').collect::<String>().to_ascii_lowercase();
+    let mut anchor_sources: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (source, names) in &app.library_class_files {
+        for name in names {
+            anchor_sources
+                .entry(format!("models/{}", super::library_file_stem(name.0.as_str(), app)))
+                .or_default()
+                .push(source.as_str());
+        }
+    }
+    let owned_elsewhere = |anchor: &str, source: &str| {
+        let wanted = format!("/{}", fold(anchor.strip_prefix("models/").unwrap_or(anchor)));
+        anchor_sources.get(anchor).is_some_and(|sources| {
+            sources.iter().any(|other| {
+                *other != source
+                    && programs.contains(other)
+                    && fold(relative_source_path(app, other).strip_suffix(".rb").unwrap_or(other)).ends_with(&wanted)
+            })
+        })
+    };
+    let file_ids: BTreeMap<&str, u32> =
+        app.sources.iter().enumerate().map(|(i, f)| (f.path.as_str(), i as u32 + 1)).collect();
+    let last_written = |name: &str, file: u32| -> Option<u32> {
+        let mut last: Option<u32> = None;
+        let mut see = |span: crate::span::Span| {
+            if span.file.0 == file {
+                last = last.max(Some(span.end));
+            }
+        };
+        for lc in library_classes_named(name, app) {
+            see(lc.parent_span);
+            for method in &lc.methods {
+                see(method.name_span);
+                see(method.body.span);
+            }
+            for (_, value) in &lc.constants {
+                see(value.span);
+            }
+            for call in lc.unknown_calls.iter().chain(&lc.class_ivar_initializers) {
+                see(call.span);
+            }
+        }
+        last
+    };
     let mut declarations: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (source, names) in &app.library_class_files {
         if programs.contains(source.as_str()) {
             continue;
         }
-        let anchors = declarations.entry(relative_source_path(app, source).to_string()).or_default();
+        let file = file_ids.get(source.as_str()).copied().unwrap_or(0);
+        let mut anchors: Vec<(String, Option<u32>)> = Vec::new();
         for name in names {
             let anchor = format!("models/{}", super::library_file_stem(name.0.as_str(), app));
-            if !anchors.contains(&anchor) {
-                anchors.push(anchor);
+            if owned_elsewhere(&anchor, source) {
+                continue;
+            }
+            let at = last_written(name.0.as_str(), file);
+            match anchors.iter_mut().find(|(a, _)| *a == anchor) {
+                Some((_, last)) => *last = (*last).max(at),
+                None => anchors.push((anchor, at)),
             }
         }
+        anchors.sort_by_key(|(_, at)| *at);
+        declarations
+            .entry(relative_source_path(app, source).to_string())
+            .or_default()
+            .extend(anchors.into_iter().map(|(anchor, _)| anchor));
     }
     let app_files = app.sources.iter().map(|f| relative_source_path(app, &f.path).to_string()).collect();
     CarriedSources { anchors: table, declarations, app_files }
@@ -9212,14 +9280,20 @@ pub(super) fn emit_file_program(
                     let site = statement_site(app, *span);
                     match program_require_source(rel, feature, *relative, table) {
                         Some(Ok((source, anchor))) => {
-                            let mut anchors: Vec<String> = table
-                                .declarations
-                                .get(&source)
-                                .map(|d| d.iter().filter(|a| emitted.contains(*a)).cloned().collect())
-                                .unwrap_or_default();
-                            if anchors.is_empty() {
-                                anchors.push(anchor);
-                            }
+                            // A file that only reopens what another
+                            // program defines loads nothing of its own.
+                            let anchors: Vec<String> = match table.declarations.get(&source) {
+                                Some(declared) if declared.is_empty() => Vec::new(),
+                                Some(declared) => {
+                                    let mut anchors: Vec<String> =
+                                        declared.iter().filter(|a| emitted.contains(*a)).cloned().collect();
+                                    if anchors.is_empty() {
+                                        anchors.push(anchor);
+                                    }
+                                    anchors
+                                }
+                                None => vec![anchor],
+                            };
                             for anchor in anchors {
                                 if loaded.insert(anchor.clone()) {
                                     require_anchor(s, &anchor);
