@@ -9977,6 +9977,13 @@ impl CarriedSources {
     }
 }
 
+/// Each app source with no file program => the emitted files of the
+/// classes and modules it declares, in its order: what requiring it
+/// loads (`CarriedSources::declarations`).
+pub(super) fn declarations_by_source(app: &App) -> BTreeMap<String, Vec<String>> {
+    carried_sources(app).declarations.clone()
+}
+
 /// `carried_source_files`, built once per `App` while the lookup indexes
 /// are installed: every file program and carried railtie asks, and the
 /// table walks every library class.

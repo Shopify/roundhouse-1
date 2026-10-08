@@ -634,7 +634,7 @@ fn rewrite_require_relative<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs<'_
         let target = normalize(&file.parent().unwrap_or(Path::new("")).join(&rb));
         let shown = programs::relative(inputs.dir, &target);
         if inputs.loaded_support.contains(&target) {
-            *e.node = ExprNode::Lit { value: Literal::Nil };
+            *e.node = programs::require_of_support(inputs, &target);
             return;
         }
         failure = Some(if inputs.vfs.exists(&target) {

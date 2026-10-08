@@ -233,3 +233,29 @@ fn an_alias_no_ancestor_defines_still_refuses_its_file() {
     let row = text.lines().find(|l| l.contains("node.rb:5:5:")).unwrap_or_else(|| panic!("{text}"));
     assert!(row.contains("alias names a method this body has not defined"), "{row}");
 }
+
+/// A gem file of declarations only, required by config/application.rb.
+/// The boot list held file programs only, so a file with none loaded
+/// nothing, and a plain gem's constants have no autoload: `Gqlc::Plain`
+/// was undefined (NameError). Each class it declares now loads at that
+/// boot require, in the file's order (`Shapes` before `Plain`, whose
+/// body reads it).
+const PLAIN_DECLARATIONS: &[(&str, &str)] = &[(
+    "gqlc/plain.rb",
+    "module Gqlc\n  module Shapes\n    ALL = %i[a b c].freeze\n  end\n\n  class Plain\n    SIZE = Shapes::ALL.size\n\n    def self.x = SIZE\n  end\nend\n",
+)];
+
+#[test]
+fn a_gem_file_of_declarations_only_required_by_boot_is_loaded() {
+    let run = gem_same_as_native(
+        "gqlc",
+        PLAIN_DECLARATIONS,
+        "gqlc/plain",
+        "p Gqlc::Plain.x, Gqlc::Shapes::ALL.last\n",
+        "3\n:c\n",
+    );
+    let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).unwrap();
+    let shapes = models.find("  [\"models/gqlc/shapes\", nil], # config/application.rb:1\n");
+    let plain = models.find("  [\"models/gqlc/plain\", nil], # config/application.rb:1\n");
+    assert!(shapes.is_some() && plain.is_some() && shapes < plain, "{models}");
+}

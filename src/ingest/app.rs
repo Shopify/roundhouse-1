@@ -8627,7 +8627,12 @@ fn declarations_only(source: &[u8]) -> bool {
 /// registered). The emitted app requires every support class with the
 /// models (the `app/models` aggregator, before boot.rb applies the
 /// config readers), so the require is applied; what it would add is
-/// already there. A require of anything else stays a gap.
+/// already there. Only a file of the app's own `lib/` (the first entry),
+/// whose constants autoload: a gem's file has no autoload, so its
+/// require is left to the initializer's program, which loads its files
+/// where the initializer requires it
+/// (`initializer_programs::require_of_support`), or to the survey, which
+/// names it. A require of anything else stays a gap.
 fn require_of_loaded_support<V: Vfs + ?Sized>(
     source: &[u8],
     load_path: &[PathBuf],
@@ -8657,8 +8662,8 @@ fn require_of_loaded_support<V: Vfs + ?Sized>(
             continue;
         };
         let file = if name.ends_with(".rb") { name.clone() } else { format!("{name}.rb") };
-        let target = load_path.iter().map(|lib| lib.join(&file)).find(|p| vfs.exists(p));
-        if target.is_some_and(|t| loaded.contains(&t)) {
+        let found = load_path.iter().enumerate().map(|(i, lib)| (i, lib.join(&file))).find(|(_, p)| vfs.exists(p));
+        if found.is_some_and(|(i, t)| i == 0 && loaded.contains(&t)) {
             out.push((stmt.location().start_offset(), stmt.location().end_offset()));
         }
     }

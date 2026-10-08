@@ -274,9 +274,19 @@ fn rewrite<V: Vfs + ?Sized>(
             return;
         }
         let file = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
-        let target: Option<PathBuf> = load_path.iter().map(|lib| lib.join(&file)).find(|p| vfs.exists(p));
-        if target.as_ref().is_some_and(|t| loaded_support.contains(t)) {
-            *e.node = ExprNode::Lit { value: Literal::Nil };
+        let found = load_path.iter().enumerate().map(|(i, lib)| (i, lib.join(&file))).find(|(_, p)| vfs.exists(p));
+        let target: Option<PathBuf> = found.as_ref().map(|(_, p)| p.clone());
+        // A file of the app's own `lib/` (the first entry) autoloads; a
+        // gem's file has no autoload, and nothing here loads it.
+        if let Some((i, t)) = found.as_ref().filter(|(_, t)| loaded_support.contains(t)) {
+            if *i == 0 {
+                *e.node = ExprNode::Lit { value: Literal::Nil };
+            } else {
+                failure = Some(format!(
+                    "`require {feature:?}` loads {}, a gem file whose classes have no autoload, which a lifted load hook does not load",
+                    relative(t)
+                ));
+            }
             return;
         }
         failure = Some(match target {
