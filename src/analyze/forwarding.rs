@@ -1230,10 +1230,96 @@ fn keyword_calls_with_index(
             );
         }
     }
+    defined_method_supers(contracts, &mut plans);
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| {
         visit(app, contracts, None, e, &mut plans, true, false)
     });
     plans
+}
+
+/// A class body statement defining methods named from the superclass's
+/// own (`(Set.public_instance_methods(false) - SKIP).each do |name|
+/// define_method(name) do |*args, **kwargs, &block| … super(*args,
+/// **kwargs, &block) end end`): each `super` written directly in such a
+/// method body reaches the superclass's own declaration of its name,
+/// whatever the name. Where every such declaration has the native ABI
+/// ([`SourceContractIndex::own_methods_native`]) the Ruby family keeps
+/// the `super` as written; every other target refuses it by name.
+fn defined_method_supers(contracts: &SourceContractIndex<'_>, plans: &mut HashMap<Span, KeywordPolicy>) {
+    /// The constant whose own instance methods `e` lists, through a
+    /// difference with any list.
+    fn own_method_list(e: &Expr) -> Option<String> {
+        match &*e.node {
+            ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => match (method.as_str(), &args[..], &*recv.node) {
+                ("public_instance_methods" | "instance_methods", [flag], ExprNode::Const { path })
+                    if matches!(&*flag.node, ExprNode::Lit { value: crate::expr::Literal::Bool { value: false } }) =>
+                {
+                    Some(path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::"))
+                }
+                ("-", [_], _) => own_method_list(recv),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn reads(e: &Expr, name: &Symbol) -> bool {
+        match &*e.node {
+            ExprNode::Var { name: read, .. } => read == name,
+            ExprNode::Send { recv: None, method, args, block: None, .. } => method == name && args.is_empty(),
+            _ => false,
+        }
+    }
+    /// The `super`s with a keyword splat written in `e`, outside any
+    /// block it holds.
+    fn supers<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match &*e.node {
+            ExprNode::Lambda { .. } => return,
+            ExprNode::Super { args: Some(args), .. }
+                if args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) =>
+            {
+                out.push(e)
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| supers(c, out));
+    }
+    /// `define_method(name) do … end` bodies in `e` (the loop's body),
+    /// outside any other block.
+    fn defined<'e>(e: &'e Expr, name: &Symbol, out: &mut Vec<&'e Expr>) {
+        if let ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node
+            && method.as_str() == "define_method"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && let [arg] = &args[..]
+            && reads(arg, name)
+            && let ExprNode::Lambda { body, .. } = &*block.node
+        {
+            out.push(body);
+            return;
+        }
+        if matches!(&*e.node, ExprNode::Lambda { .. }) {
+            return;
+        }
+        e.node.for_each_child(&mut |c| defined(c, name, out));
+    }
+    for class in classes(contracts.app) {
+        for statement in class.unknown_calls.iter().filter(|c| c.decisions & crate::expr::BODY_STATEMENT != 0) {
+            let ExprNode::Send { recv: Some(list), method, block: Some(block), .. } = &*statement.node else { continue };
+            let ExprNode::Lambda { params, body, .. } = &*block.node else { continue };
+            let (Some(source), "each", [name]) = (own_method_list(list), method.as_str(), &params[..]) else { continue };
+            let mut bodies = Vec::new();
+            defined(body, name, &mut bodies);
+            let mut found = Vec::new();
+            for body in bodies {
+                supers(body, &mut found);
+            }
+            if found.is_empty() || !contracts.own_methods_native(&class.name, &source) {
+                continue;
+            }
+            for e in found {
+                plans.entry(e.span).and_modify(|p| *p = p.join(KeywordPolicy::NativeSuper)).or_insert(KeywordPolicy::NativeSuper);
+            }
+        }
+    }
 }
 
 fn possible_full_destination(
@@ -1999,6 +2085,66 @@ impl<'a> SourceContractIndex<'a> {
                 })
             })
         })
+    }
+
+    /// Is every instance method `source` declares itself, reached by a
+    /// `super` from `owner`, of the native ABI? `source` must be the
+    /// superclass `owner` names, with nothing between them (no app
+    /// include), and be a core, stdlib or port namespace nothing
+    /// prepends to, whose app reopening (if any) declares only methods
+    /// the Ruby family writes with their source keywords.
+    fn own_methods_native(&self, owner: &ClassId, source: &str) -> bool {
+        let world = external::world();
+        let id = ClassId(Symbol::from(source));
+        if self.modules.contains(owner)
+            || self.synthesized.contains(owner)
+            || !self.verified(owner)
+            || !self.includes(owner).is_empty()
+            || self.parent(owner) != Some(&id)
+            || self.mixed_into(owner)
+            || self.nested_constant(owner, source)
+            || self.mixed_into(&id)
+            || self.dynamic().touched.contains(last_segment(source))
+            || !world.own_methods_native(source)
+        {
+            return false;
+        }
+        if !self.fragments.contains_key(&id) {
+            return true;
+        }
+        self.verified(&id)
+            && !self.synthesized.contains(&id)
+            && !self.dynamic().prepends.contains_key(&id)
+            && self.instance.iter().filter(|((class, _), _)| *class == id).all(|(_, &(own, synthesized))| {
+                !synthesized
+                    && own.unsupported_formals.is_none()
+                    && crate::dialect::Param::keywords_written_as_keywords(&own.params)
+                    && !self.unretained(&own.name_span)
+            })
+    }
+
+    /// Could `written`, a relative constant in the body of `owner` or
+    /// in the namespace around it, name something nested there rather
+    /// than the top-level constant? Every lexical scope the name
+    /// `owner` spells is asked (a superset of the ones its source
+    /// opens): the runtime, the stdlib or the app declaring
+    /// `Scope::written`.
+    fn nested_constant(&self, owner: &ClassId, written: &str) -> bool {
+        if written.starts_with("::") {
+            return false;
+        }
+        let world = external::world();
+        let mut scope = owner.0.as_str();
+        loop {
+            let nested = format!("{scope}::{written}");
+            if world.declares(&nested) || self.fragments.contains_key(&ClassId(Symbol::from(nested.as_str()))) {
+                return true;
+            }
+            match scope.rsplit_once("::") {
+                Some((outer, _)) => scope = outer,
+                None => return false,
+            }
+        }
     }
 
     fn dynamic(&self) -> &Dynamic {

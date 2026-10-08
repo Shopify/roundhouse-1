@@ -247,6 +247,11 @@ impl World {
         self.suffixes.contains(name)
     }
 
+    /// The runtime or the stdlib declares `name`.
+    pub(super) fn declares(&self, name: &str) -> bool {
+        self.runtime_declares(name) || self.stdlib.contains(name)
+    }
+
     /// The runtime declares `name` (in any file).
     pub(super) fn runtime_declares(&self, name: &str) -> bool {
         self.runtime.contains_key(name) || self.aliases.contains_key(name)
@@ -345,6 +350,20 @@ impl World {
             None => self.through("Object", method, true, app_reopens),
             Some(None) => Step::Refuse,
             Some(Some(parent)) => self.through(parent, method, true, app_reopens),
+        }
+    }
+
+    /// Every instance method namespace `name` declares itself has the
+    /// native ABI: it is a core or stdlib namespace, or a port's, and
+    /// the runtime prepends nothing to it (which a `super` from a
+    /// subclass would reach first).
+    pub(super) fn own_methods_native(&self, name: &str) -> bool {
+        if self.aliases.contains_key(name) {
+            return false;
+        }
+        match self.runtime.get(name) {
+            Some(namespace) => !namespace.lowered && namespace.prepends.is_empty(),
+            None => self.stdlib.contains(name),
         }
     }
 

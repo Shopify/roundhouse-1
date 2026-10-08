@@ -374,6 +374,31 @@ fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
     }
 }
 
+#[test]
+fn super_in_methods_defined_from_the_superclass_own_list_binds_natively() {
+    // Core's Targeting::Shop::LazySegments shape: a class body loop
+    // defining a method for each of the superclass's own public methods,
+    // whose `super` therefore reaches that core declaration, whatever the
+    // name. The Ruby tree writes the statement and its `super` as written.
+    let source = "class ProbeSet < Set\n  SKIP = %i[initialize initialize_dup initialize_clone add add? << merge replace clear inspect to_s].freeze\n  (Set.public_instance_methods(false) - SKIP).each do |name|\n    define_method(name) do |*args, **kwargs, &block|\n      @probe_calls = (@probe_calls || 0) + 1\n      super(*args, **kwargs, &block)\n    end\n  end\n  def probe_calls\n    @probe_calls\n  end\nend\n";
+    let script = "s = ProbeSet.new([1, 2]); p s.include?(1); p s.to_a.sort; p s.size; p s.select { |x| x > 1 }.to_a; p s.probe_calls";
+    native_result(source, script, "true\n[1, 2]\n2\n[2]\n4\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe_set.rb", source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, "true\n[1, 2]\n2\n[2]\n4\n");
+    // Not shown: a superclass the runtime lowers (its Logger), and names
+    // listed off another class than the superclass.
+    for source in [
+        "class ProbeLog < Logger\n  (Logger.public_instance_methods(false) - [:initialize]).each do |name|\n    define_method(name) do |*args, **kwargs, &block|\n      super(*args, **kwargs, &block)\n    end\n  end\nend\n",
+        "class ProbeArr < Array\n  (Set.public_instance_methods(false) - [:initialize]).each do |name|\n    define_method(name) do |*args, **kwargs, &block|\n      super(*args, **kwargs, &block)\n    end\n  end\nend\n",
+    ] {
+        let (_, errors) = emit_and_run::real_blog()
+            .write("app/lib/probe_set.rb", source)
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(errors.iter().any(|e| e.contains("keyword splat")), "{source}: {errors:?}");
+    }
+}
+
 /// The output of `source` and then `script` under native activesupport
 /// (tests/support/rails_oracle.rb's copy) with its cache loaded.
 fn native_cache_result(source: &str, script: &str) -> String {
