@@ -62,3 +62,62 @@ fn secrets_credentials_keys_and_type_declarations_are_not_carried() {
         assert!(!emitted.join(path).exists(), "{path} was carried");
     }
 }
+
+/// A slice carries the non-Ruby files its manifest lists as data, any
+/// extension: Core's `CheckoutQueue::Lua::ScriptRunner` reads
+/// `File.join(SCRIPT_PATH, "enter_queue.lua")` (`SCRIPT_PATH =
+/// File.expand_path(__dir__)`) and `CheckoutQueue::Middleware` a
+/// `.graphql` schema beside it, in their class bodies; both boots raised
+/// Errno::ENOENT in the r17-pre2 survey. A non-YAML file the manifest
+/// does not list stays out.
+#[test]
+fn a_slice_carries_the_data_files_its_manifest_names_whatever_the_extension() {
+    use roundhouse::diagnostic::Severity;
+    let base = std::env::temp_dir().join(format!("roundhouse-slice-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("slice/root");
+    let write = |rel: &str, content: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    write("lib/queue/lua/enter_queue.lua", "return redis.call('GET', KEYS[1])\n");
+    write("lib/queue/schema/queue.graphql", "type Query { position: Int }\n");
+    write("lib/queue/notes.txt", "unlisted\n");
+    write(
+        "lib/queue/script_runner.rb",
+        "module Lineup\n  class ScriptRunner\n    SCRIPT_PATH = File.expand_path(\"lua\", __dir__)\n    ENTER = File.read(File.join(SCRIPT_PATH, \"enter_queue.lua\"))\n    ROOT_DIR = __dir__\n    SCHEMA = File.read(\"#{ROOT_DIR}/schema/queue.graphql\")\n  end\nend\n",
+    );
+    let entry = |path: &str, role: &str| format!("{{\"role\": {role:?}, \"core_path\": {path:?}, \"slice_path\": {path:?}}}");
+    let manifest = format!(
+        "{{\"files\": [{}, {}, {}]}}",
+        entry("lib/queue/script_runner.rb", "autoload"),
+        entry("lib/queue/lua/enter_queue.lua", "data"),
+        entry("lib/queue/schema/queue.graphql", "boot-config"),
+    );
+    std::fs::write(base.join("slice/slice-manifest.json"), manifest).unwrap();
+
+    let mut app = roundhouse::ingest::ingest_app(&root).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        roundhouse::project::target_files(&app, &root, roundhouse::project::BuildTarget::Ruby)
+    });
+    let errors: Vec<_> = diags.iter().filter(|d| d.severity == Severity::Error).map(|d| d.message.clone()).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let files = files.expect("target files");
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).filter(|p| p.starts_with("lib/queue/")).collect();
+    assert_eq!(paths, vec!["lib/queue/lua/enter_queue.lua", "lib/queue/schema/queue.graphql"]);
+
+    let emitted = base.join("emitted");
+    roundhouse::project::write_to_dir(&files, &emitted).expect("write tree");
+    let out = emit_and_run::ruby()
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .args(["-e", "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\np Lineup::ScriptRunner::ENTER\np Lineup::ScriptRunner::SCHEMA\n"])
+        .output()
+        .expect("ruby");
+    let _ = std::fs::remove_dir_all(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "\"return redis.call('GET', KEYS[1])\\n\"\n\"type Query { position: Int }\\n\"\n");
+}

@@ -187,7 +187,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         let nested = (last_of_name.get(lc.name.0.as_str()) == Some(&i))
             .then(|| children.get(lc.name.0.as_str()))
             .flatten()
-            .map(|kids| nested_blocks(lc, kids, app, &out_path));
+            .map(|kids| nested_blocks(lc, kids, app, &out_path, None));
         let mut files = match &nested {
             Some(nested) => {
                 let placing = NestedPlacement::install(lc, nested);
@@ -343,7 +343,17 @@ struct NestedBlocks {
 /// the tree lost every nested class while the `.rb` kept them all.
 /// Spelled nested inside the parent's `class`, which is what the
 /// standalone sidecar's `module Parent` wrapper said too.
-fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, parent_rb: &Path) -> NestedBlocks {
+///
+/// `inline`: the file program the parent and its kids are all written
+/// inline in (`ProgramItem::Inline`). Each kid renders at that path, so
+/// its requires are already the file's own, and no sidecar is written.
+fn nested_blocks(
+    parent: &LibraryClass,
+    kids: &[&LibraryClass],
+    app: &App,
+    parent_rb: &Path,
+    inline: Option<&Path>,
+) -> NestedBlocks {
     let depth = parent.name.0.as_str().split("::").count();
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
@@ -434,7 +444,7 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
         let stem = crate::naming::underscore(kid.name.0.as_str());
-        let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
+        let rb_path = inline.map_or_else(|| PathBuf::from(format!("app/models/{stem}.rb")), Path::to_path_buf);
         let render = || emit_library_class_decl(kid, app, rb_path.clone());
         // The file the blocks run in: a `__dir__` read in a child
         // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
@@ -449,6 +459,12 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
         // parent needs `../x`, which is a load error the day someone
         // reaches that constant.
         for line in lines.iter().filter(|l| l.starts_with("require_relative ")) {
+            if inline.is_some() {
+                if !hoisted.iter().any(|h| h == line) {
+                    hoisted.push(line.to_string());
+                }
+                continue;
+            }
             let Some(rest) = line.strip_prefix("require_relative ") else { continue };
             let target = rest.trim().trim_matches('"');
             let rebased = rebase_relative(&stem, parent.name.0.as_str(), target, app);
@@ -487,6 +503,9 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
         let Some(block) = unwrapped(&body, depth) else { continue };
         blocks.push((nested_position(parent, kid), block));
         names.push(kid.name.0.as_str().to_string());
+        if inline.is_some() {
+            continue;
+        }
         // The sidecar `emit_library_class_pair` would have written for
         // the child's own file, minus the same wrapper. Its type names
         // were resolved inside the child's enclosing segments, which
@@ -10481,6 +10500,49 @@ impl Drop for InlineDeclaration {
     }
 }
 
+/// The rendered declarations of one `ProgramItem::Inline`, enclosing
+/// class first. A class nested in another class of the same declaration
+/// (a factory class `DomainMock::MockDomain`, a `class Plain` in its
+/// body) is spliced into that class's body where the source has it, as
+/// the library emit does for a class's own file (`nested_blocks`,
+/// `NestedPlacement`). Rendered on its own after it, it reopened the
+/// enclosing class too late for that class's constants that read it
+/// (`DEFAULT_DOMAINS = [MockDomain.new(…)]`), and, the enclosing class
+/// being no library class, as a `module`.
+fn inline_declarations(classes: &[LibraryClass], app: &App, out_path: &Path) -> Vec<String> {
+    let owns = |c: &LibraryClass| {
+        !c.is_module && !matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }))
+    };
+    // The outermost class of the batch that encloses `name`.
+    let owner_of = |name: &str| -> Option<usize> {
+        let segments: Vec<&str> = name.split("::").collect();
+        (1..segments.len()).find_map(|n| {
+            let prefix = segments[..n].join("::");
+            classes.iter().rposition(|c| c.name.0.as_str() == prefix && owns(c))
+        })
+    };
+    let owners: Vec<Option<usize>> = classes.iter().map(|c| owner_of(c.name.0.as_str())).collect();
+    let mut out = Vec::new();
+    for (i, lc) in classes.iter().enumerate() {
+        if owners[i].is_some() {
+            continue;
+        }
+        let kids: Vec<&LibraryClass> =
+            classes.iter().zip(&owners).filter(|(_, o)| **o == Some(i)).map(|(c, _)| c).collect();
+        if kids.is_empty() {
+            out.push(emit_library_class_decl(lc, app, out_path.to_path_buf()).content);
+            continue;
+        }
+        let nested = nested_blocks(lc, &kids, app, out_path, Some(out_path));
+        let placing = NestedPlacement::install(lc, &nested);
+        let mut files = vec![emit_library_class_decl(lc, app, out_path.to_path_buf())];
+        let unplaced = placing.finish();
+        splice_nested(&mut files, lc, &nested, &unplaced);
+        out.push(files.remove(0).content);
+    }
+    out
+}
+
 /// A railtie or engine the app carries (`App::railties`): its class body
 /// is replayed statement by statement under `run_body_statement`.
 fn carried_railtie(lc: &LibraryClass, app: &App) -> bool {
@@ -11117,9 +11179,8 @@ pub(super) fn emit_file_program(
                 }
                 ProgramItem::Inline(classes) => {
                     let _inline = InlineDeclaration::enter();
-                    for lc in classes {
-                        let rendered = emit_library_class_decl(lc, app, out_path.to_path_buf());
-                        lines(s, pad, &rendered.content);
+                    for rendered in inline_declarations(classes, app, out_path) {
+                        lines(s, pad, &rendered);
                     }
                 }
                 ProgramItem::ClassEval { receiver, method, parts } => {

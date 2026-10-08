@@ -188,6 +188,15 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
     Ok(out)
 }
 
+/// [`factory_classes`] for one top-level declaration (`class`/`module`
+/// statement) of a file: what a file program carries inline
+/// (`library_class::program_items`).
+pub(super) fn factory_classes_under(declaration: &Node<'_>, file: &str) -> IngestResult<Vec<LibraryClass>> {
+    let mut out = Vec::new();
+    collect_stmt(declaration, &[], file, &mut out, false)?;
+    Ok(out)
+}
+
 /// `singleton`: `body` is a `class << self` directly in the declaration
 /// `scope` names. Ruby binds a constant written there on the singleton
 /// class (CRuby 4.0: `M.singleton_class.const_defined?(:X, false)`),
@@ -215,38 +224,49 @@ fn collect_in(
 ) -> IngestResult<()> {
     let Some(body) = body else { return Ok(()) };
     for stmt in flatten_statements(body) {
-        if singleton && stmt.as_constant_write_node().is_none() {
-            continue;
+        collect_stmt(&stmt, scope, file, out, singleton)?;
+    }
+    Ok(())
+}
+
+fn collect_stmt(
+    stmt: &Node<'_>,
+    scope: &[String],
+    file: &str,
+    out: &mut Vec<LibraryClass>,
+    singleton: bool,
+) -> IngestResult<()> {
+    if singleton && stmt.as_constant_write_node().is_none() {
+        return Ok(());
+    }
+    if let Some(write) = stmt.as_constant_write_node() {
+        let value = write.value();
+        let factory = match factory_block(&value) {
+            Some((call, block)) => Some((call, Some(block))),
+            // At file level only: see the module doc.
+            None if scope.is_empty() => blockless_factory(&value).map(|call| (call, None)),
+            None => None,
+        };
+        if let Some((call, block)) = factory {
+            let mut path = scope.to_vec();
+            path.push(constant_id_str(&write.name()).to_string());
+            out.push(factory_class(&path, &call, block.as_ref(), file)?);
         }
-        if let Some(write) = stmt.as_constant_write_node() {
-            let value = write.value();
-            let factory = match factory_block(&value) {
-                Some((call, block)) => Some((call, Some(block))),
-                // At file level only: see the module doc.
-                None if scope.is_empty() => blockless_factory(&value).map(|call| (call, None)),
-                None => None,
-            };
-            if let Some((call, block)) = factory {
-                let mut path = scope.to_vec();
-                path.push(constant_id_str(&write.name()).to_string());
-                out.push(factory_class(&path, &call, block.as_ref(), file)?);
-            }
-        } else if let Some(class) = stmt.as_class_node() {
-            if let Some(name) = class_name_path(&class) {
-                let mut inner = scope.to_vec();
-                inner.extend(name);
-                collect(class.body(), &inner, file, out)?;
-            }
-        } else if let Some(module) = stmt.as_module_node() {
-            if let Some(name) = module_name_path(&module) {
-                let mut inner = scope.to_vec();
-                inner.extend(name);
-                collect(module.body(), &inner, file, out)?;
-            }
-        } else if let Some(sc) = stmt.as_singleton_class_node() {
-            if !scope.is_empty() && sc.expression().as_self_node().is_some() {
-                collect_in(sc.body(), scope, file, out, true)?;
-            }
+    } else if let Some(class) = stmt.as_class_node() {
+        if let Some(name) = class_name_path(&class) {
+            let mut inner = scope.to_vec();
+            inner.extend(name);
+            collect(class.body(), &inner, file, out)?;
+        }
+    } else if let Some(module) = stmt.as_module_node() {
+        if let Some(name) = module_name_path(&module) {
+            let mut inner = scope.to_vec();
+            inner.extend(name);
+            collect(module.body(), &inner, file, out)?;
+        }
+    } else if let Some(sc) = stmt.as_singleton_class_node() {
+        if !scope.is_empty() && sc.expression().as_self_node().is_some() {
+            collect_in(sc.body(), scope, file, out, true)?;
         }
     }
     Ok(())

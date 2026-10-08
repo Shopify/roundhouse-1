@@ -426,6 +426,19 @@ fn program_items(
                         all.push(class);
                         all.extend(nested);
                     }
+                    // `X = Struct.new(:a) do … end` in the declaration:
+                    // a class of its own, which the body walk above
+                    // skips (`factory_class::is_factory_class_write`).
+                    // Without it the enclosing class lost the constant:
+                    // domain_mock.rb's `DEFAULT_DOMAINS` read a
+                    // `MockDomain` nothing defined.
+                    match super::factory_class::factory_classes_under(stmt, file) {
+                        Ok(factories) => all.extend(factories),
+                        Err(err) => {
+                            out.push(not_carried(stmt, format!("the ingest cannot carry this conditional definition: {err}")));
+                            continue;
+                        }
+                    }
                     // An enclosing namespace before what it nests.
                     all.sort_by_key(|c| c.name.0.as_str().matches("::").count());
                     out.push(ProgramItem::Inline(all));
