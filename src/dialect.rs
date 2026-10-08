@@ -2621,6 +2621,20 @@ impl TestModule {
 pub struct Test {
     pub name: String,
     pub body: Expr,
+    /// The method Minitest runs, exactly as the source defines it:
+    /// `def test_fooBar` is `test_fooBar`; `test "#call ok?", slow: true`
+    /// is ActiveSupport's `"test_#{name.gsub(/\s+/, '_')}"` over the name
+    /// Core's `TestTags` tagged (`test_#call_ok?_tag:slow:true`). The
+    /// CRuby (Minitest) emit defines and reports the test under it, so
+    /// emitted ids are native ids. Empty for a test built without one;
+    /// targets that need an identifier sanitize `name` instead.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method_name: String,
+    /// The test is a ToggleFlagsHelper `flags:` declaration: natively it
+    /// is not one method but `_FLAGS:` variants, each run under its flag
+    /// configuration, and nothing here models that.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub toggle_flags: bool,
 }
 
 /// One field's value in a fixture record.

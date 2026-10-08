@@ -11051,7 +11051,7 @@ fn splice_test_helpers(tm: &mut TestModule, helpers: &[LibraryClass]) {
             if tm.helpers.iter().any(|h| h.name == m.name) {
                 continue;
             }
-            if tm.tests.iter().any(|t| t.name == m.name.as_str()) {
+            if tm.tests.iter().any(|t| t.name == m.name.as_str() || t.method_name == m.name.as_str()) {
                 continue;
             }
             pool.push(m);
