@@ -38,6 +38,33 @@ use crate::{Symbol, TableRef};
 
 use super::{IngestError, IngestResult};
 
+/// The migration versions the dump records as run: every quoted number
+/// in its `INSERT INTO schema_migrations (version) VALUES …;` statements
+/// (quoted or schema-qualified table name). A migration whose version
+/// is not here is pending: `db:migrate` after loading the dump runs it.
+pub fn recorded_migration_versions(source: &[u8]) -> HashSet<String> {
+    let text = String::from_utf8_lossy(source);
+    let mut out = HashSet::default();
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find("INSERT INTO ") {
+        rest = &rest[at + "INSERT INTO ".len()..];
+        let end = rest.find(';').unwrap_or(rest.len());
+        let stmt = &rest[..end];
+        rest = &rest[end..];
+        let table = stmt.split_whitespace().next().unwrap_or("");
+        let table = table.rsplit('.').next().unwrap_or("").trim_matches(|c| c == '"' || c == '`');
+        if table != "schema_migrations" {
+            continue;
+        }
+        for quoted in stmt.split('\'').skip(1).step_by(2) {
+            if !quoted.is_empty() && quoted.bytes().all(|b| b.is_ascii_digit()) {
+                out.insert(quoted.to_string());
+            }
+        }
+    }
+    out
+}
+
 pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
     let text = String::from_utf8_lossy(source).into_owned();
     super::sources::register(file, &text);
