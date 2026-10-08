@@ -253,7 +253,11 @@ fn errors_hashes_run_like_rails() {
     assert!(probe.contains("ActiveModel::ErrorAttributes.to_hash(invalid(\"\").errors, true)"), "{probe}");
     let post = std::fs::read_to_string(run.emitted.join("app/models/post.rb")).unwrap();
     // The lowering states each short message's start; none is unsplit.
-    assert!(post.contains(r#"ActiveModel::ErrorAttributes.add(errors, :author_id, "Author must be set", "Author ")"#), "{post}");
+    // A String message is its own type (`expr::ErrorDetail::Message`).
+    assert!(
+        post.contains(r#"ActiveModel::ErrorAttributes.add(errors, :author_id, "Author must be set", "Author ", ActiveModel::ErrorAttributes::SHORT, {})"#),
+        "{post}"
+    );
     assert!(post.contains("ActiveModel::ErrorAttributes.add_humanized(errors, attribute, "), "{post}");
     assert_eq!(run.stdout, expected(), "emitted vs Rails' answers");
     assert_eq!(run.stdout, native(), "emitted vs native activerecord");

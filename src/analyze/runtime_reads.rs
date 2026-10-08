@@ -510,6 +510,7 @@ pub(crate) const GATED_METHODS: &[(&str, Typed, &str)] = &[
     ("as_json", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
     ("messages", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
     ("merge!", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
+    ("details", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
     ("association", Typed::Result("ActiveRecord::Associations::Association"), "ActiveRecord::Associations::Association"),
 ];
 

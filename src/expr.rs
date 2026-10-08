@@ -84,7 +84,8 @@ pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 
 /// A call on a receiver typed as Rails' `ActiveModel::Errors` that the
 /// models' `Array[String]` accumulator cannot answer by itself
-/// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `merge!`):
+/// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `details`,
+/// `merge!`):
 /// the messages by attribute, or another collection's errors. The CRuby
 /// and JRuby trees write it `ActiveModel::ErrorAttributes.<method>(errors,
 /// ...)` over what each push records (`emit::ruby::expr::
@@ -98,7 +99,7 @@ pub const ERRORS_PORT_CALL: u64 = 1 << 23;
 pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
     match method {
         "to_hash" | "as_json" => args <= 1 && !block,
-        "messages" => args == 0 && !block,
+        "messages" | "details" => args == 0 && !block,
         "merge!" => args == 1 && !block,
         _ => false,
     }
@@ -283,7 +284,45 @@ pub enum IrHint {
 pub struct ErrorTag {
     pub attribute: Symbol,
     pub short: ErrorShort,
+    /// The Error's type and options, as far as the lowering knows them.
+    #[serde(default)]
+    pub detail: ErrorDetail,
 }
+
+/// The type and options Rails' Error keeps for a push (`Error#raw_type`,
+/// `#options`; `errors.details` answers `{error: raw_type}` merged with
+/// the options but the callback and `message:` ones). The lowering that
+/// built the push says so; it is never read back off the text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorDetail {
+    /// Not known: the type and option reads refuse the message.
+    #[default]
+    Unknown,
+    /// `errors.add(:attr, "text")`: the type is the short message itself.
+    Message,
+    /// An error type (`:blank`, `:too_long`), with its options but the
+    /// callback and `message:` ones, or `None` where those are not known
+    /// (a uniqueness check's `existing_id`, a numericality bound's parsed
+    /// value).
+    Type { name: Symbol, options: Option<Vec<DetailOption>> },
+}
+
+/// One option of an [`ErrorDetail::Type`]: a literal, or the validated
+/// value / bound read the push's message reads too.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DetailOption {
+    pub key: Symbol,
+    pub value: Expr,
+}
+
+impl PartialEq for DetailOption {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.value == other.value
+    }
+}
+
+impl Eq for DetailOption {}
 
 /// Where a pushed full message's short message starts. The lowering that
 /// built the message says so; it is never read back off the text.

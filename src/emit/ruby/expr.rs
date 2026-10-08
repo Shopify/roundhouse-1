@@ -242,22 +242,53 @@ fn rails_string_blank(e: &Expr) -> Option<String> {
 /// Every other tree, and these trees for an app that never asks, keep
 /// the plain `<<`.
 fn error_attribute_push(e: &Expr) -> Option<String> {
-    use crate::expr::{ErrorShort, ErrorTag, IrHint};
+    use crate::expr::{ErrorDetail, ErrorShort, ErrorTag, IrHint};
     if !ERROR_ATTRIBUTES.with(Cell::get) {
         return None;
     }
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { return None };
-    let push = |attribute: String, msg: &Expr, short: &ErrorShort| match short {
+    // The Error's type and options, trailing (`expr::ErrorDetail`): the
+    // type alone where its options are not known, and the short message
+    // (`ErrorAttributes::SHORT`) where it is the type.
+    let detail_args = |detail: &ErrorDetail| match detail {
+        ErrorDetail::Unknown => String::new(),
+        ErrorDetail::Message => ", ActiveModel::ErrorAttributes::SHORT, {}".to_string(),
+        ErrorDetail::Type { name, options } => {
+            let mut out = format!(", {}", emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: name.clone() } }));
+            if let Some(options) = options {
+                let span = crate::span::Span::synthetic();
+                let entries = options
+                    .iter()
+                    .map(|o| {
+                        (Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Sym { value: o.key.clone() } }), o.value.clone())
+                    })
+                    .collect();
+                out.push_str(", ");
+                out.push_str(&emit_node(&ExprNode::Hash { entries, kwargs: false }));
+            }
+            out
+        }
+    };
+    let push = |attribute: String, msg: &Expr, short: &ErrorShort, detail: &ErrorDetail| match short {
         ErrorShort::After(prefix) => format!(
-            "ActiveModel::ErrorAttributes.add({}, {attribute}, {}, {})",
+            "ActiveModel::ErrorAttributes.add({}, {attribute}, {}, {}{})",
             emit_expr(recv),
             emit_expr(msg),
-            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Str { value: prefix.clone() } })
+            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Str { value: prefix.clone() } }),
+            detail_args(detail)
         ),
-        ErrorShort::AfterHumanized => {
-            format!("ActiveModel::ErrorAttributes.add_humanized({}, {attribute}, {})", emit_expr(recv), emit_expr(msg))
-        }
-        ErrorShort::Unknown => format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {})", emit_expr(recv), emit_expr(msg)),
+        ErrorShort::AfterHumanized => format!(
+            "ActiveModel::ErrorAttributes.add_humanized({}, {attribute}, {}{})",
+            emit_expr(recv),
+            emit_expr(msg),
+            detail_args(detail)
+        ),
+        ErrorShort::Unknown => match detail_args(detail) {
+            extra if extra.is_empty() => {
+                format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {})", emit_expr(recv), emit_expr(msg))
+            }
+            extra => format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {}, nil{extra})", emit_expr(recv), emit_expr(msg)),
+        },
     };
     // The analyzer types `attribute_names` on ActiveModel::Errors; a
     // lowered test body may carry the runtime reader's Array type instead,
@@ -271,13 +302,14 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         format!("ActiveModel::ErrorAttributes.{name}({})", written.join(", "))
     };
     match (e.hint.as_ref(), method.as_str(), args.as_slice()) {
-        (Some(IrHint::ErrorAttribute(ErrorTag { attribute, short })), "<<", [msg]) => Some(push(
+        (Some(IrHint::ErrorAttribute(ErrorTag { attribute, short, detail })), "<<", [msg]) => Some(push(
             emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: attribute.clone() } }),
             msg,
             short,
+            detail,
         )),
-        (Some(IrHint::ErrorAttributeLocal(ErrorTag { attribute, short })), "<<", [msg]) => {
-            Some(push(attribute.as_str().to_string(), msg, short))
+        (Some(IrHint::ErrorAttributeLocal(ErrorTag { attribute, short, detail })), "<<", [msg]) => {
+            Some(push(attribute.as_str().to_string(), msg, short, detail))
         }
         (_, "attribute_names", []) if errors_typed || errors_reader => Some(read("attribute_names")),
         // Rails' `to_hash(full_messages = false)`, `as_json(options =

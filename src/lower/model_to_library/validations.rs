@@ -83,9 +83,23 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             let mut check =
                 inline_belongs_to_check(name, foreign_key, target, *polymorphic);
             check.inherit_span(span);
-            // Rails adds `:required` to the association's name.
-            tag_error_attribute(&mut check, name);
-            stmts.push(check);
+            // Rails adds `:required` to the association's name:
+            // `validates_presence_of name, message: :required`, an Error
+            // of type :blank.
+            tag_error_detail(&mut check, name, &typed_detail("blank", vec![]));
+            // Rails runs it where `belongs_to` declared it, among the
+            // `validates` / `validate` lines (errors and full messages
+            // follow that order): before the first check written after
+            // it, while the checks stand in source order (a `prepend:`
+            // one does not).
+            let in_order = stmts.windows(2).all(|w| w[0].span.file != w[1].span.file || w[0].span.start <= w[1].span.start);
+            let at = in_order
+                .then(|| stmts.iter().position(|c| !c.span.is_synthetic() && c.span.file == span.file && c.span.start > span.start))
+                .flatten();
+            match at {
+                Some(at) if !span.is_synthetic() => stmts.insert(at, check),
+                _ => stmts.push(check),
+            }
         }
     }
 
@@ -230,7 +244,7 @@ pub(crate) fn validation_statements_split<'v>(
             let (checks, value) = if is_assoc && matches!(rule, ValidationRule::Presence) {
                 let check = if_with_nil_else(
                     send(reader.clone(), "nil?", vec![]),
-                    text.push("blank", None, || reader.clone()),
+                    text.push("blank", None, || reader.clone(), Detail::Bare),
                 );
                 (vec![check], reader)
             } else {
@@ -325,10 +339,13 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
             ),
             errors_push(format!("{human} confirmation doesn't match {human}")),
         ));
-        for check in &mut out[start..start + 2] {
-            tag_error_attribute(check, &attr);
-        }
-        tag_error_attribute(&mut out[start + 2], &confirmation_attr);
+        // Rails: `errors.add(attribute, :blank)`, BCrypt's
+        // `errors.add(attribute, :password_too_long)` and
+        // `validates_confirmation_of attribute, allow_nil: true`.
+        tag_error_detail(&mut out[start], &attr, &typed_detail("blank", vec![]));
+        tag_error_detail(&mut out[start + 1], &attr, &typed_detail("password_too_long", vec![]));
+        let human_lit = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: human.clone() } });
+        tag_error_detail(&mut out[start + 2], &confirmation_attr, &typed_detail("confirmation", vec![("attribute", human_lit)]));
     }
     out
 }
@@ -420,11 +437,27 @@ pub(crate) fn bind_class_scope(rule: &mut ValidationRule, class: &ClassId) {
 /// `as_json` and `messages` need the attribute (and the short message,
 /// `error_tag`) on the trees that record them.
 pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
+    tag_error_detail(check, attr, &crate::expr::ErrorDetail::Unknown);
+}
+
+/// `tag_error_attribute`, with the type and options Rails' Error keeps
+/// for each push (`errors.details`).
+fn tag_error_detail(check: &mut Expr, attr: &Symbol, detail: &crate::expr::ErrorDetail) {
     if is_errors_push(check) && check.hint.is_none() {
         let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
-        check.hint = Some(crate::expr::IrHint::ErrorAttribute(error_tag(attr, &args[0])));
+        check.hint = Some(crate::expr::IrHint::ErrorAttribute(error_tag(attr, &args[0], detail.clone())));
     }
-    check.node.for_each_child_mut(&mut |c| tag_error_attribute(c, attr));
+    check.node.for_each_child_mut(&mut |c| tag_error_detail(c, attr, detail));
+}
+
+/// An error type with options known as written (`ErrorDetail::Type`).
+fn typed_detail(name: &str, options: Vec<(&str, Expr)>) -> crate::expr::ErrorDetail {
+    crate::expr::ErrorDetail::Type {
+        name: Symbol::from(name),
+        options: Some(
+            options.into_iter().map(|(key, value)| crate::expr::DetailOption { key: Symbol::from(key), value }).collect(),
+        ),
+    }
 }
 
 /// `message` pushed for `attr`, with where its short message starts:
@@ -434,14 +467,14 @@ pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
 /// own shape (`after_prefix`); a message that does not show it is
 /// `ErrorShort::Unknown`, which the short-message reads refuse rather
 /// than key a wrong text.
-pub(crate) fn error_tag(attr: &Symbol, message: &Expr) -> crate::expr::ErrorTag {
+pub(crate) fn error_tag(attr: &Symbol, message: &Expr, detail: crate::expr::ErrorDetail) -> crate::expr::ErrorTag {
     let prefix = if attr.as_str() == "base" { String::new() } else { format!("{} ", humanize(attr.as_str())) };
     let short = if after_prefix(message, &prefix) {
         crate::expr::ErrorShort::After(prefix)
     } else {
         crate::expr::ErrorShort::Unknown
     };
-    crate::expr::ErrorTag { attribute: attr.clone(), short }
+    crate::expr::ErrorTag { attribute: attr.clone(), short, detail }
 }
 
 /// Whether every value `message` can take starts with `prefix`, as
@@ -842,7 +875,7 @@ fn validation_rule_to_calls(
         // Array(accept).include?(value)`.
         ValidationRule::Acceptance { accept } => vec![if_with_nil_else(
             not(send(accept.clone(), "include?", vec![value.clone()])),
-            text.push("accepted", None, || value.clone()),
+            text.push("accepted", None, || value.clone(), Detail::Bare),
         )],
         // Reported by `roundhouse check`: ActiveModel has no
         // AssociatedValidator.
@@ -903,7 +936,7 @@ fn validation_rule_to_calls(
         ValidationRule::FormatOf { regexp, without } => {
             let matched = send(resolve(regexp), "match?", vec![send(value.clone(), "to_s", vec![])]);
             let invalid = if *without { matched } else { not(matched) };
-            vec![if_with_nil_else(invalid, text.push("invalid", None, || value.clone()))]
+            vec![if_with_nil_else(invalid, text.push("invalid", None, || value.clone(), Detail::Value))]
         }
         // Reported by `roundhouse check` (`analyze::ingest_coverage`);
         // a weaker check here would pass records Rails rejects.
@@ -1128,7 +1161,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, value: &Expr, text
             "blank?",
             vec![value.clone()],
         );
-        return if_with_nil_else(blank, text.push("blank", None, || value.clone()));
+        return if_with_nil_else(blank, text.push("blank", None, || value.clone(), Detail::Bare));
     }
     // Temporal columns (schema-typed `Time`) store ISO-8601 text in
     // `@<attr>_raw`; `@<attr>` is never the storage slot (the ruby
@@ -1143,7 +1176,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, value: &Expr, text
             send(raw_ivar.clone(), "nil?", vec![]),
             send(raw_ivar, "empty?", vec![]),
         );
-        let push_err = text.push("blank", None, || ivar(attr));
+        let push_err = text.push("blank", None, || ivar(attr), Detail::Bare);
         return if_with_nil_else(cond, push_err);
     }
     let attr_ivar = ivar(attr);
@@ -1199,7 +1232,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, value: &Expr, text
         }
     };
     // `errors << "attr can't be blank"`
-    let push_err = text.push("blank", None, || ivar(attr));
+    let push_err = text.push("blank", None, || ivar(attr), Detail::Bare);
     // The wrapping `if cond then push_err end` (Nil else).
     if_with_nil_else(cond, push_err)
 }
@@ -1238,7 +1271,7 @@ fn inline_absence_check(value: &Expr, text: &ErrorText<'_>) -> Expr {
             parenthesized: false,
         },
     );
-    let push_err = text.push("present", None, || value.clone());
+    let push_err = text.push("present", None, || value.clone(), Detail::Bare);
     if_with_nil_else(not_blank, push_err)
 }
 
@@ -1258,9 +1291,9 @@ fn inline_inclusion_check(
 ) -> Expr {
     let member = send(list.clone(), if cover { "cover?" } else { "include?" }, vec![value.clone()]);
     if exclusion {
-        return if_with_nil_else(member, text.push("exclusion", None, || value.clone()));
+        return if_with_nil_else(member, text.push("exclusion", None, || value.clone(), Detail::Value));
     }
-    if_with_nil_else(not(member), text.push("inclusion", None, || value.clone()))
+    if_with_nil_else(not(member), text.push("inclusion", None, || value.clone(), Detail::Value))
 }
 
 /// Inline `validates :attr, format: { with: /re/ }` (`without:` with
@@ -1273,7 +1306,7 @@ fn inline_format_check(value: &Expr, pattern: &str, flags: &str, without: bool, 
     );
     let matched = send(regex_lit, "match?", vec![send(value.clone(), "to_s", vec![])]);
     let invalid = if without { matched } else { not(matched) };
-    if_with_nil_else(invalid, text.push("invalid", None, || value.clone()))
+    if_with_nil_else(invalid, text.push("invalid", None, || value.clone(), Detail::Value))
 }
 
 /// Inline `validates :attr, length: { minimum: M, maximum: N, is: K }`.
@@ -1357,7 +1390,7 @@ fn inline_length_check(
             )],
         );
         let count = Count::Static(Literal::Int { value: n as i64 });
-        let msg = text.push("too_short", Some(&count), || value.clone());
+        let msg = text.push("too_short", Some(&count), || value.clone(), Detail::Count);
         inner_stmts.push(if_with_nil_else(lt, msg));
     }
     if let Some(n) = max {
@@ -1370,7 +1403,7 @@ fn inline_length_check(
             )],
         );
         let count = Count::Static(Literal::Int { value: n as i64 });
-        let msg = text.push("too_long", Some(&count), || value.clone());
+        let msg = text.push("too_long", Some(&count), || value.clone(), Detail::Count);
         inner_stmts.push(if_with_nil_else(gt, msg));
     }
     let body_seq = seq(inner_stmts);
@@ -1385,7 +1418,7 @@ fn inline_length_check(
     let nil_branch = match min {
         Some(n) => {
             let count = Count::Static(Literal::Int { value: n as i64 });
-            text.push("too_short", Some(&count), || value.clone())
+            text.push("too_short", Some(&count), || value.clone(), Detail::Count)
         }
         None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
     };
@@ -1443,7 +1476,7 @@ fn inline_length_of_check(
         };
         // A rule-level `message:` wins over `too_short:` and the like.
         let own = ErrorText { message: text.message.or(check.message.as_ref()), ..*text };
-        own.push(kind, Some(count), || value.clone())
+        own.push(kind, Some(count), || value.clone(), Detail::Count)
     };
     let (inner, _) = peel_nilable(attr_ty);
     let length = match inner {
@@ -1618,7 +1651,7 @@ fn inline_uniqueness_check(
         }
     }
     let taken = send(local_read(&rel), "exists?", vec![]);
-    out.push(if_with_nil_else(taken, text.push("taken", None, || own_value.clone())));
+    out.push(if_with_nil_else(taken, text.push("taken", None, || own_value.clone(), Detail::Unknown)));
     out
 }
 
@@ -1711,15 +1744,21 @@ fn inline_comparison_check(attr: &Symbol, value: &Expr, checks: &[NumericCheck],
                 rescues: vec![crate::expr::RescueClause {
                     classes: vec![Expr::new(s, ExprNode::Const { path: vec![Symbol::from("ArgumentError")] })],
                     binding: Some(err.clone()),
-                    body: errors_push_expr(Expr::new(
-                        s,
-                        ExprNode::StringInterp {
-                            parts: vec![
-                                InterpPart::Text { value: format!("{human} ") },
-                                InterpPart::Expr { expr: send(local_read(&err), "message", vec![]) },
-                            ],
-                        },
-                    )),
+                    // Rails' `errors.add(attr_name, e.message)`: the
+                    // message is the type.
+                    body: {
+                        let mut push = errors_push_expr(Expr::new(
+                            s,
+                            ExprNode::StringInterp {
+                                parts: vec![
+                                    InterpPart::Text { value: format!("{human} ") },
+                                    InterpPart::Expr { expr: send(local_read(&err), "message", vec![]) },
+                                ],
+                            },
+                        ));
+                        tag_error_detail(&mut push, attr, &crate::expr::ErrorDetail::Message);
+                        push
+                    },
                 }],
                 else_branch: None,
                 ensure: None,
@@ -1748,7 +1787,7 @@ fn inline_comparison_check(attr: &Symbol, value: &Expr, checks: &[NumericCheck],
         send(Expr::new(s, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }), "blank?", vec![value.clone()]),
     );
     let (mut pre, _, count) = bound(first);
-    pre.push(text.push("blank", Some(&count), || value.clone()));
+    pre.push(text.push("blank", Some(&count), || value.clone(), Detail::CountValue));
     let blank_branch = rescued(seq(pre));
     let mut each: Vec<Expr> = Vec::new();
     for check in checks {
@@ -1763,7 +1802,7 @@ fn inline_comparison_check(attr: &Symbol, value: &Expr, checks: &[NumericCheck],
         };
         let (mut pre, bound_expr, count) = bound(check);
         let holds = send(value.clone(), op, vec![bound_expr]);
-        pre.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), || value.clone())));
+        pre.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), || value.clone(), Detail::CountValue)));
         each.push(rescued(seq(pre)));
     }
     vec![Expr::new(s, ExprNode::If { cond: blank, then_branch: blank_branch, else_branch: seq(each) })]
@@ -1853,7 +1892,7 @@ fn inline_numericality_check(
             NumericOp::Odd | NumericOp::Even => {
                 let parity = if check.op == NumericOp::Odd { "odd?" } else { "even?" };
                 let holds = send(send(number(), "to_i", vec![]), parity, vec![]);
-                compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), None, number)));
+                compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), None, number, Detail::Unknown)));
                 continue;
             }
             // `value.in?(range)`: Range#include?, which for numbers is
@@ -1878,7 +1917,7 @@ fn inline_numericality_check(
         } else {
             send(number(), op, vec![bound_expr])
         };
-        compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), number)));
+        compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), number, Detail::Unknown)));
     }
     let tail = if compares.is_empty() { nil() } else { seq(compares) };
     let tail = if only_integer {
@@ -1886,7 +1925,7 @@ fn inline_numericality_check(
             s,
             ExprNode::If {
                 cond: not(send(regex(integer_re), "match?", vec![send(raw(), "to_s", vec![])])),
-                then_branch: text.push("not_an_integer", None, raw),
+                then_branch: text.push("not_an_integer", None, raw, Detail::Value),
                 else_branch: tail,
             },
         )
@@ -1897,7 +1936,7 @@ fn inline_numericality_check(
         s,
         ExprNode::If {
             cond: send(number(), "nil?", vec![]),
-            then_branch: text.push("not_a_number", None, raw),
+            then_branch: text.push("not_a_number", None, raw, Detail::Value),
             else_branch: tail,
         },
     );
@@ -1936,6 +1975,23 @@ fn bigdecimal_to_s(f: f64) -> String {
     format!("{}0.{digits}e{}", if f < 0.0 { "-" } else { "" }, exp + 1)
 }
 
+/// The options a validator passes its error beside the callback and
+/// `message:` ones (activemodel's validators: presence, absence and
+/// acceptance none, length `count:`, inclusion, exclusion, format and
+/// numericality's `not_a_number` / `not_an_integer` the `value:`,
+/// comparison both), or `Unknown` where the push cannot say: a
+/// numericality bound's value is Rails' parsed number (a BigDecimal for
+/// a Float), uniqueness adds the `existing_id` it found, and
+/// validates_associated the association's records.
+#[derive(Clone, Copy)]
+pub(super) enum Detail {
+    Bare,
+    Count,
+    Value,
+    CountValue,
+    Unknown,
+}
+
 /// What a message's `%{count}` reads: a bound known when lowering, or
 /// one resolved on the run.
 pub(super) enum Count {
@@ -1959,12 +2015,45 @@ impl ErrorText<'_> {
     /// `errors << "<Attr> <message>"` for an error of type `kind`
     /// (`blank`, `too_long`, ...), its `%{count}` `count`, and the value
     /// `%{value}` and a callable message see.
-    fn push(&self, kind: &str, count: Option<&Count>, value: impl Fn() -> Expr) -> Expr {
+    ///
+    /// The push records Rails' Error type, `kind` whatever the message,
+    /// and the options the validator passes beside the callback and
+    /// `message:` ones (`detail`).
+    fn push(&self, kind: &str, count: Option<&Count>, value: impl Fn() -> Expr, detail: Detail) -> Expr {
+        let mut out = self.push_message(kind, count, &value);
+        let simple = |e: &Expr| match &*e.node {
+            ExprNode::Ivar { .. } | ExprNode::Var { .. } | ExprNode::Lit { .. } => true,
+            ExprNode::Send { recv: None, args, block: None, .. } => args.is_empty(),
+            _ => false,
+        };
+        let count = || match count {
+            Some(Count::Static(c)) => Some(Expr::new(Span::synthetic(), ExprNode::Lit { value: c.clone() })),
+            Some(Count::Dynamic(e)) => Some(e.clone()),
+            None => None,
+        }
+        .filter(simple);
+        let value = || Some(value()).filter(simple);
+        let options = match detail {
+            Detail::Bare => Some(vec![]),
+            Detail::Count => count().map(|c| vec![("count", c)]),
+            Detail::Value => value().map(|v| vec![("value", v)]),
+            Detail::CountValue => count().zip(value()).map(|(c, v)| vec![("count", c), ("value", v)]),
+            Detail::Unknown => None,
+        };
+        let detail = match options {
+            Some(options) => typed_detail(kind, options),
+            None => crate::expr::ErrorDetail::Type { name: Symbol::from(kind), options: None },
+        };
+        tag_error_detail(&mut out, self.attr, &detail);
+        out
+    }
+
+    fn push_message(&self, kind: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
         let human = humanize(self.attr.as_str());
         match self.message {
-            None => self.push_type(kind, count, &value),
-            Some(RuleMessage::Key { key }) => self.push_type(key.as_str(), count, &value),
-            Some(RuleMessage::Text { text }) => errors_push_expr(self.interpolate(text, count, &value)),
+            None => self.push_type(kind, count, value),
+            Some(RuleMessage::Key { key }) => self.push_type(key.as_str(), count, value),
+            Some(RuleMessage::Text { text }) => errors_push_expr(self.interpolate(text, count, value)),
             Some(RuleMessage::Value { expr }) => {
                 // `m = <expr>`, then a Proc's call or the String with
                 // the keys ActiveModel supplies interpolated.
@@ -2327,7 +2416,7 @@ fn inline_associated_check(model: &Model, attr: &Symbol, value: &Expr, text: &Er
         s,
         ExprNode::Send { recv: Some(records), method: Symbol::from("reject"), args: vec![], block: Some(block), parenthesized: false },
     );
-    if_with_nil_else(send(invalid, "any?", vec![]), text.push("invalid", None, || value.clone()))
+    if_with_nil_else(send(invalid, "any?", vec![]), text.push("invalid", None, || value.clone(), Detail::Unknown))
 }
 
 // ── IR helpers ────────────────────────────────────────────────

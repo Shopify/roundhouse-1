@@ -233,6 +233,22 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     let invalid_type = static_field
         && !sole_message
         && (msg.is_none() || symbol_type.as_ref().is_some_and(|t| t.as_str() == "invalid"));
+    // The Error's type and options (`errors.details`): Rails' default
+    // `:invalid` without a message or with `message:` alone (whose option
+    // `details` drops), the Symbol type, or a String message, which is
+    // its own type. A message of unknown type is not claimed.
+    let detail = match (&symbol_type, &msg) {
+        _ if sole_message => crate::expr::ErrorDetail::Type { name: Symbol::from("invalid"), options: Some(Vec::new()) },
+        (Some(t), _) => crate::expr::ErrorDetail::Type { name: t.clone(), options: Some(Vec::new()) },
+        (None, None) => crate::expr::ErrorDetail::Type { name: Symbol::from("invalid"), options: Some(Vec::new()) },
+        (None, Some(m))
+            if matches!(&*m.node, ExprNode::Lit { value: Literal::Str { .. } } | ExprNode::StringInterp { .. })
+                || m.ty == Some(Ty::Str) =>
+        {
+            crate::expr::ErrorDetail::Message
+        }
+        (None, Some(_)) => crate::expr::ErrorDetail::Unknown,
+    };
     if let Some(text) = translated {
         msg = Some(str_lit(span, text));
     }
@@ -316,11 +332,12 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // message on `base` and the run-time humanized prefix otherwise.
     let attribute = match &*field_expr.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(
-            super::model_to_library::validations::error_tag(value, &message),
+            super::model_to_library::validations::error_tag(value, &message, detail),
         )),
         ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(crate::expr::ErrorTag {
             attribute: name.clone(),
             short: crate::expr::ErrorShort::AfterHumanized,
+            detail,
         })),
         _ => None,
     };

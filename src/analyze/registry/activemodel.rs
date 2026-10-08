@@ -75,7 +75,19 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `errors[:title]` returns an Array<String> of messages for that attribute.
         ("[]", str_arr()),
         ("messages_for", str_arr()),
-        // Not `details`: the accumulator keeps no error type, so only the message projection `lower::errors_index` can ground types.
+        // `details`: each attribute's Errors as `{error: type, **options}`,
+        // which the accumulator keeps only where the push recorded them
+        // (runtime/spinel/active_model_errors.rb); recorded and refused
+        // as `attribute_names` is.
+        (
+            "details",
+            Ty::Hash {
+                key: Box::new(Ty::Sym),
+                value: Box::new(Ty::Array {
+                    elem: Box::new(Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+                }),
+            },
+        ),
         ("messages", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
         // `.each` yields an Error — registered via block_params_for below.
         ("each", error_ty.clone()),
