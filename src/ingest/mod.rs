@@ -27,6 +27,7 @@ mod concern_accessors;
 pub mod database_manifest;
 pub(crate) mod database_ownership;
 pub mod database_yml;
+mod database_yml_adapters;
 pub mod controller;
 pub mod environments;
 mod engine_config;

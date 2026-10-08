@@ -122,7 +122,8 @@ fn ingest<V: Vfs + ?Sized>(
     app: &mut App,
 ) -> IngestResult<()> {
     let path = dir.join(PATH);
-    let mut yml = DatabaseYml { path: PATH.to_string(), adapter, renderer: None, present: false, manifest };
+    let mut yml =
+        DatabaseYml { path: PATH.to_string(), adapter, renderer: None, present: false, manifest, test_adapters: Vec::new() };
     let text = match vfs.read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -145,6 +146,7 @@ fn ingest<V: Vfs + ?Sized>(
         }
     };
     yml.present = true;
+    yml.test_adapters = super::database_yml_adapters::test_adapters(&text);
     let label = path.display().to_string();
     // First-text-wins: the template is the text every span indexes.
     let file = super::sources::register(&label, &text);

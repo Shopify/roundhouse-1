@@ -11,8 +11,13 @@
 //! configuration that names a separate schema file (a manifest's
 //! `schema_source` other than the primary's) is held out, with a warning
 //! naming it, so the exclusion is visible.
+//!
+//! A model routed to a configuration whose `test` adapter
+//! `config/database.yml` states as other than the compiled-for PostgreSQL
+//! (Core's `core_general_1` stays trilogy) is `model_on_non_pg_database`,
+//! whatever its table: its queries never reach the PostgreSQL database.
 
-use crate::database::ModelDatabase;
+use crate::database::{DatabaseAdapter, ModelDatabase};
 use crate::det::HashSet;
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::lower::model_to_library::markers::is_abstract_class;
@@ -36,9 +41,19 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         let parent = parent.0.as_str().trim_start_matches("::");
         let sti = concrete.contains(parent)
             || model.name.0.as_str().rsplit_once("::").is_some_and(|(ns, _)| concrete.contains(format!("{ns}::{parent}").as_str()));
-        if sti || is_abstract_class(model) || app.schema.tables.contains_key(&model.table.0) {
-            continue;
-        }
+if sti || is_abstract_class(model) {
+    continue;
+}
+if let Some((config, adapter)) = non_pg_route(app, model) {
+    out.push(Diagnostic::unsupported(model.span, None, "model_on_non_pg_database", format!(
+        "`{}` reads table `{}` on database `{config}`, which `config/database.yml` gives adapter `{adapter}` in the test environment; the compiled PostgreSQL program does not reach it",
+        model.name.0, model.table.0
+    )));
+    continue;
+}
+if app.schema.tables.contains_key(&model.table.0) {
+    continue;
+}
         let separate = match app.model_databases.get(&model.name) {
             Some(ModelDatabase::Named { writing, .. }) => app
                 .databases
@@ -70,4 +85,13 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         )));
     }
     out
+}
+
+/// The routed configuration and its non-PostgreSQL `test` adapter, when
+/// the app is compiled for PostgreSQL and the file states one.
+fn non_pg_route<'a>(app: &'a App, model: &crate::dialect::Model) -> Option<(&'a str, &'a str)> {
+    let yml = app.database_yml.as_ref().filter(|y| y.adapter == DatabaseAdapter::Postgresql)?;
+    let Some(ModelDatabase::Named { writing, .. }) = app.model_databases.get(&model.name) else { return None };
+    let (config, adapter) = yml.test_adapters.iter().find(|(c, _)| c == writing)?;
+    (DatabaseAdapter::parse(adapter) != Some(DatabaseAdapter::Postgresql)).then_some((config.as_str(), adapter.as_str()))
 }

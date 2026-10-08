@@ -146,6 +146,11 @@ pub struct DatabaseYml {
     /// the resolved configurations against those recorded facts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub manifest: bool,
+    /// `(configuration, adapter)` for each `test` configuration whose
+    /// adapter the file states without running its ERB
+    /// (`ingest::database_yml_adapters`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_adapters: Vec<(String, String)>,
 }
 
 /// The database a model runs on, read from source.
