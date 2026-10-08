@@ -9160,7 +9160,8 @@ fn a_nameless_rest_is_refused_off_cruby() {
 /// (the class side, a test helper), split across reopened
 /// fragments, or declared beside `**nil`, the emitted program is not
 /// shown to keep it, so the declaration stays refused. So do `...` into
-/// it and a `delegate` to it. Other parameters beside the rest, reified
+/// it and a `delegate` to it that writes no `(...)` forwarder (a string
+/// name, a test class, `delegate_missing_to`). Other parameters beside the rest, reified
 /// methods and keyword splats into it run on the CRuby tree
 /// (`tests/ruby_anonymous_rest_dispatch.rs`), as do a module's own
 /// instance methods and an implicit `super` from it and from an override
@@ -9178,7 +9179,6 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("reopened", "class Probe\n  def first\n    :first\n  end\nend\n\nclass Probe\n  def m(*)\n    first\n  end\nend\n", "nameless rest in a reopened class fragment"),
         ("no_keywords", "class Probe\n  def m(*, **nil)\n    :ok\n  end\nend\n", "no-keywords constraint is not retained"),
         ("forwarded_into", "class Probe\n  def m(*)\n    :m\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
-        ("delegate", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("block_default_passes_on", "class Probe\n  def m(*)\n    [1].map { |x = [*]| x }\n  end\nend\n", "anonymous positional rest is not retained"),
         ("delegate_string", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("delegate_missing_to", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
@@ -9195,6 +9195,28 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
     let inner = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  class Wrapper\n    delegate :m, to: :probe\n\n    def probe\n      Probe.new\n    end\n  end\n\n  test \"t\" do\n    assert_equal 1, Wrapper.new.m(1, 2)\n  end\nend\n";
     let (_, errors) = nameless_rest_app("class Probe\n  def m(*)\n    :m\n  end\nend\n", inner).emit(BuildTarget::Ruby);
     assert!(errors.iter().any(|e| e.contains("delegate to an anonymous positional rest")), "test class delegate: {errors:?}");
+}
+
+/// A library class's `delegate :m, to: :probe` naming an admitted
+/// `def m(*)` is declined for the strict targets and written on the
+/// CRuby tree as Rails' `def m(...) = probe.m(...)`, which hands the
+/// rest what the caller passed (activesupport 8.2.0.alpha: `[:m, :m,
+/// :m]` here). Core reopens ActiveSupport::Multibyte::Chars so
+/// (lib/serialization_options/ext/multibyte_chars_ext.rb, `delegate
+/// :as_json, to: :wrapped_string`, beside app `def as_json(*)`s). The
+/// strict targets still refuse it by name.
+#[test]
+fn a_library_delegate_to_a_nameless_rest_forwards_on_cruby() {
+    use roundhouse::project::BuildTarget;
+    let probe = "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate :m, to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n";
+    let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    w = Wrapper.new\n    assert_equal [:m, :m, :m], [w.m, w.m(1, 2), w.m(1, k: 2) { 3 }]\n  end\nend\n";
+    let (_, errors) = nameless_rest_app(probe, test).emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("delegate to an anonymous positional rest")), "{errors:?}");
+    nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
+    for target in [BuildTarget::Jruby, BuildTarget::Spinel] {
+        let (_, errors) = nameless_rest_app(probe, test).emit(target);
+        assert!(errors.iter().any(|e| e.contains("argument-forwarding delegate to an anonymous positional rest")), "{target:?}: {errors:?}");
+    }
 }
 
 /// Keywords a call passes, however it reaches the method, land in the

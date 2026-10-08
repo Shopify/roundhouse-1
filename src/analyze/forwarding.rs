@@ -115,9 +115,9 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// keywords as positionals, so it is refused too: off the CRuby tree
 /// always, and there too where a flattened keyword is not written back.
 ///
-/// Three of these refusals hold only off the CRuby tree
+/// Four of these refusals hold only off the CRuby tree
 /// ([`OFF_RUBY_FAMILY`]); this returns the rest, which hold on every
-/// target. [`nameless_rest_refusals_off_ruby`] returns those three.
+/// target. [`nameless_rest_refusals_off_ruby`] returns those four.
 fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<'_>) -> Vec<Diagnostic> {
     keyword_splats_into_nameless_rest_with_index(app, contracts)
         .into_iter()
@@ -135,11 +135,15 @@ fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<
 /// override's implicit `super`, reaches the rest exactly as native Ruby's
 /// does, and the CRuby tree runs it as written. Every other target
 /// refuses the nameless rest declaration itself (`project.rs`); these
-/// name the call sites there too.
-const OFF_RUBY_FAMILY: [&str; 3] = [
+/// name the call sites there too. A library class's `delegate` the
+/// strict targets decline is written on the CRuby tree as the `(...)`
+/// forwarder Rails generates (`App::ruby_declined_delegate_forwarders`),
+/// which hands the rest what the caller passed, as native Ruby does.
+const OFF_RUBY_FAMILY: [&str; 4] = [
     "method object of an anonymous positional rest",
     "keyword splat into an anonymous positional rest",
     "implicit super with keywords into an anonymous positional rest",
+    "argument-forwarding delegate to an anonymous positional rest",
 ];
 
 fn off_ruby_family(d: &Diagnostic) -> bool {
@@ -318,31 +322,55 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
     // test class); the library-class pass leaves such a declaration in
     // `unknown_calls`, and a controller's stays a body item, so refuse
     // it here by name. `delegate_missing_to` names no method at all.
-    let delegations = classes(app).flat_map(|c| c.unknown_calls.iter()).chain(
+    // A library class's declaration ingest declined for the strict
+    // targets has its `(...)` forwarders on the CRuby tree, each placed
+    // at the name it forwards (`App::ruby_declined_delegate_forwarders`)
+    // and written unless the class defines that name itself: where
+    // every name reaching a rest has one, the refusal is off the CRuby
+    // tree only.
+    let delegations = classes(app).flat_map(|c| c.unknown_calls.iter().map(move |call| (Some(c), call))).chain(
         app.controllers.iter().flat_map(|c| c.body.iter()).filter_map(|item| match item {
-            crate::dialect::ControllerBodyItem::Unknown { expr, .. } => Some(expr),
+            crate::dialect::ControllerBodyItem::Unknown { expr, .. } => Some((None, expr)),
             _ => None,
         }),
     );
-    for call in delegations {
-        if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
-            && (method.as_str() == "delegate_missing_to"
-                || method.as_str() == "delegate"
-                    && args.iter().any(|a| match &*a.node {
-                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => selectors.contains(value),
-                        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
-                            selectors.iter().any(|s| s.as_str() == value)
-                        }
-                        _ => false,
-                    }))
-        {
-            out.push(Diagnostic::unsupported(
-                call.span,
-                None,
-                "delegate to an anonymous positional rest",
-                "no forwarder is written with the rest's arity",
-            ));
+    for (class, call) in delegations {
+        let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { continue };
+        let reaching: Vec<&Expr> = args
+            .iter()
+            .filter(|a| match &*a.node {
+                ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => selectors.contains(value),
+                ExprNode::Lit { value: crate::expr::Literal::Str { value } } => {
+                    selectors.iter().any(|s| s.as_str() == value)
+                }
+                _ => false,
+            })
+            .collect();
+        if !(method.as_str() == "delegate_missing_to" || method.as_str() == "delegate" && !reaching.is_empty()) {
+            continue;
         }
+        let forwarded_on_ruby = method.as_str() == "delegate"
+            && class.is_some_and(|class| {
+                let forwarders = app.ruby_declined_delegate_forwarders.get(&class.name);
+                reaching.iter().all(|a| {
+                    forwarders.into_iter().flatten().any(|f| {
+                        f.name_span == a.span
+                            && f.receiver == MethodReceiver::Instance
+                            && !classes(app).filter(|c| c.name == class.name).any(|c| {
+                                c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name == f.name)
+                            })
+                    })
+                })
+            });
+        let (construct, reason) = if forwarded_on_ruby {
+            (
+                "argument-forwarding delegate to an anonymous positional rest",
+                "this target writes no forwarder for it; the CRuby tree writes Rails' `(...)` forwarder",
+            )
+        } else {
+            ("delegate to an anonymous positional rest", "no forwarder is written with the rest's arity")
+        };
+        out.push(Diagnostic::unsupported(call.span, None, construct, reason));
     }
     out
 }
