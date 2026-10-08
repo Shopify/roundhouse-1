@@ -4911,11 +4911,27 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
 
 /// A Rails feature (`rails`, `active_support/...`, `action_...`): this
 /// tree's runtime ports answer it, so nothing requires it.
+/// A framework is its root feature and the files under it: a gem named
+/// like one (active_model_serializers, active_record_query_trace) is not.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
-    feature == "rails"
-        || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
-            .iter()
-            .any(|prefix| feature.starts_with(prefix))
+    const FRAMEWORKS: &[&str] = &[
+        "rails",
+        "active_support",
+        "active_record",
+        "active_model",
+        "active_job",
+        "active_storage",
+        "action_cable",
+        "action_controller",
+        "action_dispatch",
+        "action_mailbox",
+        "action_mailer",
+        "action_text",
+        "action_view",
+    ];
+    FRAMEWORKS.iter().any(|root| {
+        feature.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// runtime/gem_facades.rb's load of [`gem_source_dependencies`]. Not
@@ -13924,6 +13940,18 @@ fn walk_ruby(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_framework_feature_is_a_rails_framework_or_a_file_under_one() {
+        for feature in ["rails", "rails/railtie", "active_support", "active_support/core_ext/object/blank", "active_model", "action_controller", "action_dispatch/routing", "active_job"] {
+            assert!(super::is_framework_feature(feature), "{feature}");
+        }
+        // Gems named like a framework, and Core's own lib files (Core's
+        // components/delivery/lib/delivery.rb requires the first).
+        for feature in ["active_model_serializers", "active_record_query_trace", "active_record_connection_adapter", "action_policy", "activerecord-typedstore", "railsish", "active_shipping"] {
+            assert!(!super::is_framework_feature(feature), "{feature}");
+        }
+    }
+
     use super::*;
 
     /// A class body the emitter split around a cycle (close, require,
