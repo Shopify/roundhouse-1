@@ -104,13 +104,39 @@ pub fn ingest_app_from_tree(tree: HashMap<PathBuf, Vec<u8>>) -> IngestResult<App
 /// counted and, under survey mode, reported as a gap rather than
 /// silently dropped. Any parse trouble yields the defaults — the
 /// initializer is optional and often all comments.
+///
+/// Rails runs every `config/initializers/**/*.rb` in sorted order, so
+/// the declarations may sit in any of them: Core's are in
+/// `004_inflections.rb`. Reading only `inflections.rb` lost its
+/// `B2B`/`TOS` acronyms and `hardware` uncountable, and the tables of
+/// `ShopB2BReadinessScore` and `Retail::Hardware` were misnamed.
 pub fn ingest_inflections<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::naming::AppInflections {
-    use crate::expr::{Expr, ExprNode, Literal};
-    let path = dir.join("config/initializers/inflections.rb");
     let mut out = crate::naming::AppInflections::default();
-    let Ok(source) = vfs.read_to_string(&path) else { return out };
-    let file = path.to_string_lossy().into_owned();
-    let Ok(program) = super::expr::ingest_ruby_program(&source, &file) else { return out };
+    let mut files = Vec::new();
+    let mut pending = vec![dir.join("config/initializers")];
+    while let Some(current) = pending.pop() {
+        for entry in vfs.read_dir(&current).unwrap_or_default() {
+            if vfs.is_dir(&entry) {
+                pending.push(entry);
+            } else if entry.extension().is_some_and(|e| e == "rb") {
+                files.push(entry);
+            }
+        }
+    }
+    files.sort();
+    for path in files {
+        let Ok(source) = vfs.read_to_string(&path) else { continue };
+        if source.contains("inflect") {
+            ingest_inflections_file(&source, &path.to_string_lossy(), &mut out);
+        }
+    }
+    out
+}
+
+fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::AppInflections) {
+    use crate::expr::{Expr, ExprNode, Literal};
+    let Ok(program) = super::expr::ingest_ruby_program(source, file) else { return };
+    let regex_rules_before = out.regex_rules;
 
     fn strings(e: &Expr, out: &mut Vec<String>) {
         match &*e.node {
@@ -173,17 +199,16 @@ pub fn ingest_inflections<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> crate::naming
         }
         e.node.for_each_child(&mut |c| walk(c, file, out));
     }
-    walk(&program, &file, &mut out);
-    if out.regex_rules > 0 {
+    walk(&program, file, out);
+    let regex_rules = out.regex_rules - regex_rules_before;
+    if regex_rules > 0 {
         survey::record(&IngestError::Unsupported {
-            file: file.clone(),
+            file: file.to_string(),
             message: format!(
-                "{} inflect.plural/singular regex rule(s) not applied — only irregular, uncountable and acronym declarations are read",
-                out.regex_rules
+                "{regex_rules} inflect.plural/singular regex rule(s) not applied — only irregular, uncountable and acronym declarations are read"
             ),
         });
     }
-    out
 }
 
 /// A module or class an initializer defines at the top level, kept
@@ -855,6 +880,8 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         report_not_carried(&source, &program.items, &mut app);
         app.file_programs.push(program);
     }
+    // After every model exists: a nested model's table names its parent's.
+    super::model::nest_tables_in_model_parents(&mut app.models, &app.schema, &model_bases);
     app.library_class_files = support_classes
         .iter()
         .filter(|(_, names)| !names.is_empty())

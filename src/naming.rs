@@ -10,12 +10,61 @@ pub fn demodulize(class_name: &str) -> &str {
     class_name.rsplit("::").next().unwrap_or(class_name)
 }
 
+/// Rails `underscore` of one constant segment. An app acronym is one
+/// word first (`inflect.acronym "B2B"`: `ShopB2BReadinessScore` →
+/// `shop_b2b_readiness_score`, `RetailTOSCommitment` →
+/// `retail_tos_commitment`); then `_` goes before an uppercase letter
+/// that follows a lowercase letter or digit, and between an uppercase
+/// run and its last letter when a lowercase one follows
+/// (`HTMLParser` → `html_parser`). Without both, tables were misnamed
+/// (`shop_b2_breadiness_scores`, `retail_toscommitments`).
 pub fn snake_case(class_name: &str) -> String {
-    let mut s = String::with_capacity(class_name.len() + 4);
-    for (i, c) in class_name.char_indices() {
-        if c.is_uppercase() && i > 0 {
-            let prev = class_name.as_bytes()[i - 1] as char;
-            if prev.is_lowercase() || prev.is_ascii_digit() {
+    let word: Vec<char> = APP_INFLECTIONS.with(|a| {
+        let acronyms = &a.borrow().acronym;
+        if acronyms.is_empty() {
+            return class_name.chars().collect();
+        }
+        // `/(?:(?<=([A-Za-z\d]))|\b)(ACRONYMS)(?=\b|[^a-z])/` →
+        // `"#{$1 && '_'}#{$2.downcase}"`, alternatives in registration order.
+        let chars: Vec<char> = class_name.chars().collect();
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut out = Vec::with_capacity(chars.len() + 4);
+        let mut i = 0;
+        while i < chars.len() {
+            let after_alnum = i > 0 && chars[i - 1].is_ascii_alphanumeric();
+            let at_boundary = i == 0 || !is_word(chars[i - 1]);
+            let hit = (after_alnum || at_boundary)
+                .then(|| {
+                    acronyms.iter().find(|acr| {
+                        let len = acr.chars().count();
+                        acr.chars().eq(chars[i..].iter().take(len).copied())
+                            && !chars.get(i + len).is_some_and(|c| c.is_ascii_lowercase())
+                    })
+                })
+                .flatten();
+            match hit {
+                Some(acr) => {
+                    if after_alnum {
+                        out.push('_');
+                    }
+                    out.extend(acr.chars().map(|c| c.to_ascii_lowercase()));
+                    i += acr.chars().count();
+                }
+                None => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    });
+    // `/(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z\d])(?=[A-Z])/` → `_`, then downcase.
+    let mut s = String::with_capacity(word.len() + 4);
+    for (i, &c) in word.iter().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            let prev = word[i - 1];
+            let run_end = prev.is_ascii_uppercase() && word.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if prev.is_ascii_lowercase() || prev.is_ascii_digit() || run_end {
                 s.push('_');
             }
         }

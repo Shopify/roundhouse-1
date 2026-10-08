@@ -146,6 +146,60 @@ pub fn ingest_class_table_prefixes(source: &[u8], file: &str) -> TablePrefixes {
     out
 }
 
+/// Rails' `compute_table_name`: a base class nested in a concrete model
+/// prefixes its table with the parent's singular table name, after the
+/// module prefix. Core's `DraftOrder::AdditionalFee` reads
+/// `draft_order_additional_fees` and `Script::Version` `script_versions`;
+/// both read `additional_fees`/`versions`, tables no schema has, and
+/// every column was `no known method`. Runs after every model is
+/// ingested, outermost first, so a chain sees its parent's final table.
+/// A model that writes `self.table_name` keeps it; an STI subclass (its
+/// superclass a concrete model) keeps the base's table.
+pub(super) fn nest_tables_in_model_parents(
+    models: &mut [Model],
+    schema: &Schema,
+    model_bases: &super::library_class::ModelBases,
+) {
+    let index: crate::det::HashMap<String, usize> =
+        models.iter().enumerate().map(|(i, m)| (m.name.0.as_str().to_string(), i)).collect();
+    let concrete = |name: &str| !model_bases.contains(name) && index.contains_key(name);
+    let mut order: Vec<usize> = (0..models.len()).collect();
+    order.sort_by_key(|&i| models[i].name.0.as_str().matches("::").count());
+    for i in order {
+        let name = models[i].name.0.as_str().to_string();
+        let Some((parent, _)) = name.rsplit_once("::") else { continue };
+        if !concrete(parent)
+            || models[i].parent.as_ref().is_some_and(|p| concrete(p.0.as_str()))
+            || writes_table_name(&models[i])
+        {
+            continue;
+        }
+        let parent_table = models[index[parent]].table.0.to_string();
+        let undecorated = crate::naming::rails_table_name(&name);
+        let Some(prefix) = models[i].table.0.as_str().strip_suffix(undecorated.as_str()) else { continue };
+        let table = format!("{prefix}{}_{undecorated}", crate::naming::singularize(&parent_table));
+        models[i].attributes = match schema.tables.get(&Symbol::from(table.as_str())) {
+            Some(t) => row_from_table(t),
+            None => Row::closed(),
+        };
+        models[i].table = TableRef(Symbol::from(table));
+    }
+}
+
+/// Does the model's own class body write `self.table_name`? Unreadable
+/// counts as written, so the model keeps the table ingest gave it.
+fn writes_table_name(model: &Model) -> bool {
+    let Some(text) = super::sources::text_of_file(model.span.file) else { return true };
+    let result = super::prism::parse(text.as_bytes(), "");
+    let root = result.node();
+    super::util::find_all_classes_with_scope(&root)
+        .into_iter()
+        .find(|(_, class)| class.location().start_offset() == model.span.start as usize)
+        .is_none_or(|(_, class)| {
+            !matches!(class.body().map(|b| parse_table_name_decl(b, "")).transpose(), Ok(None | Some(None)))
+        })
+}
+
 /// The prefix each abstract base passes down: its own, else its parent's.
 /// `pairs` are the pre-pass's `(abstract class, parent)` pairs; a bare
 /// parent is found the way Ruby finds it, the child's enclosing scopes first.
