@@ -7653,6 +7653,21 @@ fn emit_library_class_decl_inner(
     if !lc.top_level_constants.is_empty() {
         return emit_with_top_level_constants(lc, app, out_path, synthesized_siblings);
     }
+    // A model's compiled column accessors go in its own
+    // GeneratedAttributeMethods module, included first, as Rails defines
+    // them, so a method of the class (the source's, or one a replayed
+    // macro defines) overrides them and supers into them.
+    let (generated_attributes, without_generated_attributes);
+    let lc = match generated_attribute_methods(lc, app) {
+        Some((module, rest)) => {
+            (generated_attributes, without_generated_attributes) = (Some(module), rest);
+            &without_generated_attributes
+        }
+        None => {
+            generated_attributes = None;
+            lc
+        }
+    };
     let name = lc.name.0.as_str();
     let out_dir = out_path
         .parent()
@@ -8001,6 +8016,20 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
+    if let Some(module) = &generated_attributes {
+        let inner_pad = format!("{body_pad}  ");
+        writeln!(s, "{body_pad}module GeneratedAttributeMethods").unwrap();
+        for index in 0..module.methods.len() {
+            if index > 0 {
+                writeln!(s).unwrap();
+            }
+            write_library_method(&mut s, module, index, &inner_pad, &[]);
+        }
+        writeln!(s, "{body_pad}end").unwrap();
+        writeln!(s, "{body_pad}private_constant :GeneratedAttributeMethods").unwrap();
+        writeln!(s, "{body_pad}include GeneratedAttributeMethods").unwrap();
+        writeln!(s).unwrap();
+    }
 
     let write_extend = |s: &mut String, carrier: &ClassId| {
         writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
@@ -8883,6 +8912,35 @@ fn extend_self_instance_defs(lc: &LibraryClass, app: &App, replayed: &[&Expr]) -
             !after_module_function && !origins.singleton.is_singleton_defined(m)
         })
         .collect()
+}
+
+/// On the Ruby family, a model's compiled column accessors
+/// (`lower::model_to_library::generated_attribute_method_names`, the
+/// synthesized defs of those names) as the methods of its
+/// GeneratedAttributeMethods module, and the class without them. An
+/// alias copy stays in the class, where its alias is written.
+fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryClass, LibraryClass)> {
+    if !super::expr::native_keywords() || lc.is_module || lc.origin.is_some() {
+        return None;
+    }
+    let model = app.models.iter().find(|m| m.name == lc.name)?;
+    let table = app.schema.tables.get(&model.table.0)?;
+    let names = crate::lower::model_to_library::generated_attribute_method_names(model, &app.models, table);
+    let generated = |m: &MethodDef| {
+        m.receiver == MethodReceiver::Instance
+            && m.name_span.is_synthetic()
+            && names.contains(&m.name)
+            && !lc.method_aliases.iter().any(|a| a.receiver == MethodReceiver::Instance && (a.name == m.name || a.original == m.name))
+    };
+    if !lc.methods.iter().any(&generated) {
+        return None;
+    }
+    let mut module = lc.clone();
+    module.methods.retain(&generated);
+    module.method_aliases.clear();
+    let mut rest = lc.clone();
+    rest.methods.retain(|m| !generated(m));
+    Some((module, rest))
 }
 
 /// `lc.methods[index]`, then its visibility.

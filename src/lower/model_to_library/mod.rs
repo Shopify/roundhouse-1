@@ -25,6 +25,7 @@ pub(crate) mod accessor_surface;
 pub(crate) mod schema;
 pub use schema::col_storage_name;
 pub use schema::shakeable_synthesized_names;
+pub(crate) use schema::generated_attribute_method_names;
 pub(crate) mod validations;
 mod associations;
 mod attribute_alias;
@@ -1956,7 +1957,17 @@ fn build_methods_for_dialect(
     // synthesized `ActiveStorage::Attachment` row. Same ordering
     // rationale as the macros above (a hand-written method wins).
     crate::lower::attached::push_attached_methods(&mut methods, model);
-    push_user_methods(&mut methods, model);
+    // The ruby family writes column accessors into the model's
+    // GeneratedAttributeMethods module (`emit::ruby::library`), so a
+    // model's own `def name=` overrides them and can `super` into them,
+    // as in Rails; it rides beside the synthesized accessor here.
+    let generated_attribute_overrides = match schema.tables.get(&model.table.0) {
+        Some(table) if crate::emit::ruby::native_keywords() => {
+            generated_attribute_method_names(model, models, table)
+        }
+        _ => Default::default(),
+    };
+    push_user_methods(&mut methods, model, &generated_attribute_overrides);
     push_dom_prefix_method(&mut methods, model);
     // AFTER push_user_methods, unlike the macros above: its skip guard
     // reads the accumulated list, so a model's own `to_param` (already
@@ -2025,8 +2036,14 @@ fn build_methods_for_dialect(
 ///     duplicate body name (the corpus does not redefine those). The
 ///     replace predicate matches unsigned bare-ivar attr_* halves only
 ///     (`signature: None`); schema column readers stamp a signature and
-///     are never replaced.
-fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+///     are never replaced. The ruby family keeps both for a generated
+///     attribute method (`generated_attribute_overrides`): the
+///     synthesized one is written into GeneratedAttributeMethods.
+fn push_user_methods(
+    methods: &mut Vec<MethodDef>,
+    model: &Model,
+    generated_attribute_overrides: &crate::det::HashSet<Symbol>,
+) {
     use crate::dialect::{AccessorKind, ModelBodyItem};
     use crate::expr::{ExprNode, LValue};
     for item in &model.body {
@@ -2070,6 +2087,14 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                 };
             if incoming_is_real && existing_is_attr_half {
                 methods[idx] = method.clone();
+            } else if incoming_is_real
+                && method.receiver == MethodReceiver::Instance
+                && existing.name_span.is_synthetic()
+                && generated_attribute_overrides.contains(&method.name)
+            {
+                // Ruby family only: the synthesized accessor moves to
+                // GeneratedAttributeMethods and this def overrides it.
+                methods.push(method.clone());
             }
             continue;
         }
