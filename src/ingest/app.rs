@@ -2717,21 +2717,28 @@ end
     // what the type casts to is decided when the class loads.
     let retypable: Vec<Vec<crate::ident::Symbol>> =
         app.models.iter().map(|m| crate::analyze::retypable_attributes::retypable_attributes(m, &app)).collect();
-    for (model, cols) in app.models.iter_mut().zip(retypable) {
+    let defaulted: Vec<Vec<crate::ident::Symbol>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::defaulted_attributes(m, &app)).collect();
+    for ((model, cols), defaulted) in app.models.iter_mut().zip(retypable).zip(defaulted) {
         for col in &cols {
             if let Some(ty) = model.attributes.fields.get_mut(col) {
                 *ty = crate::ty::Ty::Untyped;
             }
         }
         model.retypable_attributes = cols;
-        // A `serialize` with an app coder runs at class load as written;
-        // the runtime's `serialize` decorates the column's type.
+        model.defaulted_attributes = defaulted;
+        // A `serialize` with an app coder, or an `attribute` with a
+        // `default:`, runs at class load as written; the runtime's
+        // `serialize` decorates the column's type, its `attribute`
+        // records the default.
         if let Some(table) = app.schema.tables.get(&model.table.0) {
             for item in model.body.iter_mut() {
                 let crate::dialect::ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
                     continue;
                 };
-                if crate::analyze::retypable_attributes::serialized_column(expr, table).is_some() {
+                if crate::analyze::retypable_attributes::serialized_column(expr, table).is_some()
+                    || crate::analyze::retypable_attributes::defaulted_attribute(expr, table).is_some()
+                {
                     *item = crate::dialect::ModelBodyItem::ClassBody {
                         expr: expr.clone(),
                         leading_comments: std::mem::take(leading_comments),

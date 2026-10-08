@@ -236,23 +236,30 @@ pub(super) fn push_schema_methods(
     // def self._retypable_attribute_names — the columns whose compiled
     // accessors and binds consult a declared type, so the runtime's
     // `attribute` accepts them (and raises for any other). Only for a
-    // model that has some; Base answers [] for everyone else.
-    if !model.retypable_attributes.is_empty() {
+    // model that has some; Base answers [] for everyone else. Likewise
+    // `_defaulted_attribute_names`, the columns whose compiled
+    // `initialize` consults a declared default.
+    for (method, columns) in [
+        ("_retypable_attribute_names", &model.retypable_attributes),
+        ("_defaulted_attribute_names", &model.defaulted_attributes),
+    ] {
+        if columns.is_empty() {
+            continue;
+        }
         let names_ty = Ty::Array { elem: Box::new(Ty::Str) };
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
             has_anonymous_block: false,
             name_span: Span::synthetic(),
-            name: Symbol::from("_retypable_attribute_names"),
+            name: Symbol::from(method),
             receiver: MethodReceiver::Class,
             params: Vec::new(),
             body: with_ty(
                 Expr::new(
                     Span::synthetic(),
                     ExprNode::Array {
-                        elements: model
-                            .retypable_attributes
+                        elements: columns
                             .iter()
                             .map(|c| lit_str(c.as_str().to_string()))
                             .collect(),
@@ -2534,7 +2541,10 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         }
         // A retypable column starts from its schema default as stored
         // (deserialized, as Rails' FromDatabase default is) or nil, and a
-        // given value goes through the casting writer.
+        // given value goes through the casting writer. One an `attribute
+        // ..., default:` names takes, when the attrs leave it out, the
+        // class's declared default if it has one, through the casting
+        // writer too (Rails' UserProvidedDefault is a FromUser value).
         if is_retypable(model, col) {
             let stored = column_default_literal(model, col).unwrap_or_else(nil_lit);
             stmts.push(Expr::new(Span::synthetic(), ExprNode::Send {
@@ -2544,7 +2554,12 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
                 block: None,
                 parenthesized: true,
             }));
-            stmts.push(given_value_assign(col, &attrs, with_ty(lookup, Ty::Untyped)));
+            let given = given_value_assign(col, &attrs, with_ty(lookup, Ty::Untyped));
+            stmts.push(if model.defaulted_attributes.contains(&col.name) {
+                declared_default_assign(col, given)
+            } else {
+                given
+            });
             continue;
         }
         // is_id_column reference retained as a feature flag for
@@ -3592,6 +3607,42 @@ fn overrides_schema_default(model: &Model, col: &Column) -> bool {
 }
 
 // Not a new shape: the same `attrs.key?` guarded write `synth_update_hash` emits, which every target already compiles.
+/// `given` (`self.<col> = attrs[:<col>] if attrs.key?(:<col>)`) with an
+/// else branch: `self.<col> = self.class._attribute_default("<col>") if
+/// self.class._attribute_default?("<col>")`.
+fn declared_default_assign(col: &Column, given: Expr) -> Expr {
+    let ExprNode::If { cond, then_branch, .. } = &*given.node else { return given };
+    let class_call = |method: &str| {
+        let self_class = Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: Some(self_ref()),
+            method: Symbol::from("class"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        });
+        with_ty(Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: Some(self_class),
+            method: Symbol::from(method),
+            args: vec![lit_str(col.name.as_str().to_string())],
+            block: None,
+            parenthesized: true,
+        }), Ty::Untyped)
+    };
+    let assign = Expr::new(Span::synthetic(), ExprNode::Send {
+        recv: Some(self_ref()),
+        method: col_storage_setter(col),
+        args: vec![class_call("_attribute_default")],
+        block: None,
+        parenthesized: false,
+    });
+    let declared = Expr::new(Span::synthetic(), ExprNode::If {
+        cond: class_call("_attribute_default?"),
+        then_branch: assign,
+        else_branch: nil_lit(),
+    });
+    Expr::new(Span::synthetic(), ExprNode::If { cond: cond.clone(), then_branch: then_branch.clone(), else_branch: declared })
+}
+
 fn given_value_assign(col: &Column, attrs: &Symbol, value: Expr) -> Expr {
     let assign = Expr::new(
         Span::synthetic(),

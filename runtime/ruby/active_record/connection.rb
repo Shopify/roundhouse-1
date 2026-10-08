@@ -610,18 +610,48 @@ module ActiveRecord
     # type only for the names the compiler gave the dynamic path
     # (`_retypable_attribute_names`, emitted per model). For any other
     # name the call raises NotImplementedError instead of recording a type
-    # the compiled accessors would ignore. `default:` is not ported.
+    # the compiled accessors would ignore.
+    #
+    # A `default:` is the value a new record's attribute starts from when
+    # it is not given one (attribute_registration.rb's `define_default_
+    # attribute`, a UserProvidedDefault): a Proc is called for each
+    # record, and the value is cast through the attribute's type. The
+    # compiled `initialize` asks for it (`_attribute_default?`) for the
+    # columns the compiler saw a `default:` call name; for any other name
+    # a default raises like an unconsulted type. One difference: the
+    # compiled hydration builds a loaded record through `new`, so a Proc
+    # default runs for it too before the row's value replaces it.
     def self.attribute(name, type = nil, default: (no_default = true), **options)
       name = name.to_s
-      unless no_default
-        raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, default: ...): attribute defaults are not ported"
-      end
       unless _retypable_attribute_names.include?(name)
         raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
+      end
+      unless no_default
+        unless _defaulted_attribute_names.include?(name)
+          raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, default: ...): the compiled initialize does not consult a declared default for `#{name}`"
+        end
+        @__declared_attribute_defaults = (@__declared_attribute_defaults || {}).merge(name => default)
       end
       @__declared_attribute_types = (@__declared_attribute_types || {}).merge(name => [type, options]) if type
       _reset_attribute_types
       nil
+    end
+
+    # The class's declared defaults, a superclass's under its own.
+    def self._declared_attribute_defaults
+      parent = superclass
+      inherited = parent <= ActiveRecord::Base ? parent._declared_attribute_defaults : {}
+      own = @__declared_attribute_defaults || {} #: Hash[String, untyped]
+      inherited.merge(own)
+    end
+
+    def self._attribute_default?(name)
+      _declared_attribute_defaults.key?(name)
+    end
+
+    def self._attribute_default(name)
+      value = _declared_attribute_defaults[name]
+      value.is_a?(Proc) ? value.call : value
     end
     
     # attribute_methods/serialization.rb's `serialize(attr_name, coder:,
@@ -651,6 +681,12 @@ module ActiveRecord
     # The attribute names whose compiled accessors consult
     # `type_for_attribute`. Emitted models override it.
     def self._retypable_attribute_names
+      []
+    end
+
+    # The attribute names whose compiled `initialize` consults a declared
+    # default. Emitted models override it.
+    def self._defaulted_attribute_names
       []
     end
 
