@@ -1006,9 +1006,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // The queue constructors, Thread's core aliases, and the standard
     // mixins likewise need exact entries for source constant resolution.
     // No queue element, synchronization or mixin method types are added;
-    // the Ruby-family runtimes supply the actual behavior.
-    for name in ["Queue", "SizedQueue", "Thread::Queue", "Thread::SizedQueue",
-        "Thread::Mutex", "Comparable", "Enumerable"] {
+    // the Ruby-family runtimes supply the actual behavior. Not the
+    // top-level `Queue` / `SizedQueue`: Ruby's signatures alias them to
+    // these Thread classes (`Queue.name` is "Thread::Queue"), and an
+    // entry of their own would type `Queue` as a class of that name.
+    for name in ["Thread::Queue", "Thread::SizedQueue", "Thread::Mutex", "Comparable", "Enumerable"] {
         register_stdlib_class(classes, name, &[], &[]);
     }
     // `Array.wrap` is folded by `lower::enumerable_ext` before emit.
