@@ -112,10 +112,10 @@ end
         "app/models/application_record.rb",
         "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n  include Accessors\n  include ReadonlyRefs\n  extend Tagging\n  extend Marking\nend\n",
     ),
-    ("app/models/author.rb", "class Author < ApplicationRecord\nend\n"),
+    ("app/models/author.rb", "class Author < ApplicationRecord\n  def greet(greeting) = \"#{greeting}, #{name}\"\nend\n"),
     (
         "app/models/post.rb",
-        "class Post < ApplicationRecord\n  belongs_to :author\n  metadata_accessor :color, default: \"red\"\nend\n",
+        "class Post < ApplicationRecord\n  belongs_to :author\n  metadata_accessor :color, default: \"red\"\n  delegate :name, to: :author, prefix: true, allow_nil: true\n  delegate :greet, to: :author\n\n  def hello = greet(\"hi\")\nend\n",
     ),
     (
         "app/models/note.rb",
@@ -177,6 +177,8 @@ p [:audit, Note.audit_level, Post.audit_level, Memo.audit_level]
 p [:marked, ApplicationRecord.marked?, Note.marked?]
 memo = Memo.new
 p [:memo, memo.size, Memo.metadata_names, memo.draft_tag]
+written = Post.new(author_id: a.id)
+p [:delegate, written.author_name, Post.new.author_name, written.hello, written.greet("yo")]
 "#;
 
 const EXPECTED: &str = r#"[:post_without_author, false]
@@ -192,6 +194,7 @@ const EXPECTED: &str = r#"[:post_without_author, false]
 [:audit, :default, nil, :strict]
 [:marked, true, false]
 [:memo, 0, ["size"], "memo:draft"]
+[:delegate, "a", nil, "hi, a", "yo, a"]
 "#;
 
 fn app() -> emit_and_run::Overlay {

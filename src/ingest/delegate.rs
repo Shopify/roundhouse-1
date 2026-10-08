@@ -135,6 +135,121 @@ pub fn lower_delegates(app: &mut crate::App) {
     for (i, methods) in generated {
         app.library_classes[i].methods.extend(methods);
     }
+    for model in &mut app.models {
+        lower_model_delegates(model, &nameless_rest, &mut app.ruby_delegate_forwarders, &mut app.ruby_declined_delegate_forwarders);
+    }
+}
+
+/// A model's own `delegate :shop, to: :user`, expanded as a library
+/// class's is: each declaration this pass reproduces becomes its
+/// forwarder methods where it was written. One that needs argument
+/// forwarding stays an `Unknown` body statement, and the Ruby target
+/// writes its `(...)` forwarders (`App::ruby_declined_delegate_forwarders`,
+/// which the model lowering's report consults).
+fn lower_model_delegates(
+    model: &mut crate::dialect::Model,
+    decline: &crate::det::HashSet<String>,
+    full_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
+    declined_forwarders: &mut crate::det::HashMap<crate::ident::ClassId, Vec<MethodDef>>,
+) {
+    use crate::dialect::ModelBodyItem;
+    let is_delegate = |e: &Expr| {
+        matches!(&*e.node, ExprNode::Send { recv: None, method, .. } if method.as_str() == "delegate")
+    };
+    let calls: Vec<Expr> = model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            ModelBodyItem::Unknown { expr, .. } if is_delegate(expr) => Some(expr.clone()),
+            _ => None,
+        })
+        .collect();
+    if calls.is_empty() {
+        return;
+    }
+    let mut lc = LibraryClass {
+        conditional_definitions: Vec::new(),
+        method_aliases: Vec::new(),
+        top_level_constants: Vec::new(),
+        name: model.name.clone(),
+        is_module: false,
+        parent: model.parent.clone(),
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        methods: model.methods().cloned().collect(),
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        unknown_calls: calls,
+        class_ivar_initializers: Vec::new(),
+        visibility_overrides: Vec::new(),
+    };
+    let (methods, full, declined) = expand_delegates_declining(&mut lc, decline);
+    // The declarations the expansion consumed: those it left are declined.
+    let left: Vec<crate::span::Span> = lc.unknown_calls.iter().map(|e| e.span).collect();
+    let mut by_file_pos: Vec<MethodDef> = methods;
+    let mut body = Vec::with_capacity(model.body.len());
+    for item in std::mem::take(&mut model.body) {
+        match item {
+            ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line }
+                if is_delegate(&expr) && !left.contains(&expr.span) =>
+            {
+                // Each forwarder of this declaration, in the order written.
+                let names = delegated_names(&expr);
+                let mut first = true;
+                for name in names {
+                    let Some(at) = by_file_pos.iter().position(|m| m.name.as_str() == name && m.receiver == MethodReceiver::Instance) else { continue };
+                    let method = by_file_pos.remove(at);
+                    body.push(ModelBodyItem::Method {
+                        method,
+                        leading_comments: if first { leading_comments.clone() } else { Vec::new() },
+                        leading_blank_line: first && leading_blank_line,
+                    });
+                    first = false;
+                }
+            }
+            item => body.push(item),
+        }
+    }
+    // Anything not matched by name (none expected) still lands in the class.
+    body.extend(by_file_pos.into_iter().map(|method| ModelBodyItem::Method { method, leading_comments: Vec::new(), leading_blank_line: false }));
+    model.body = body;
+    if !full.is_empty() {
+        full_forwarders.entry(model.name.clone()).or_default().extend(full);
+    }
+    if !declined.is_empty() {
+        declined_forwarders.entry(model.name.clone()).or_default().extend(declined);
+    }
+}
+
+/// The method names a `delegate` declaration defines, prefix applied.
+fn delegated_names(call: &Expr) -> Vec<String> {
+    let ExprNode::Send { args, .. } = &*call.node else { return Vec::new() };
+    let mut names = Vec::new();
+    let (mut to, mut prefix) = (None, false);
+    for a in args {
+        match &*a.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => names.push(value.as_str().to_string()),
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    match (&*k.node, &*v.node) {
+                        (ExprNode::Lit { value: Literal::Sym { value: key } }, ExprNode::Lit { value: Literal::Sym { value } }) if key.as_str() == "to" => {
+                            to = Some(value.as_str().to_string())
+                        }
+                        (ExprNode::Lit { value: Literal::Sym { value: key } }, ExprNode::Lit { value: Literal::Bool { value: true } }) if key.as_str() == "prefix" => {
+                            prefix = true
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    match (prefix, to) {
+        (true, Some(to)) => names.into_iter().map(|n| format!("{to}_{n}")).collect(),
+        _ => names,
+    }
 }
 
 /// A call to one of Forwardable's definers (or ActiveSupport's

@@ -819,6 +819,12 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         if claimed_elsewhere(expr) {
             continue;
         }
+        // A `delegate` ingest left because its names are called with
+        // arguments: the Ruby emit writes its `(...)` forwarders
+        // (`ingest::delegate`, `App::ruby_declined_delegate_forwarders`).
+        if declined_delegate_forwarded(model, expr, app) {
+            continue;
+        }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;
@@ -1086,6 +1092,23 @@ pub(crate) const MODEL_STATEMENT_CLAIMS: &[fn(&Expr) -> bool] = &[
     // A reproducible `normalizes`.
     crate::lower::normalizes::claims,
 ];
+
+/// `delegate :a, :b, to: :t` on `model` whose every forwarder the Ruby
+/// emit writes from `App::ruby_declined_delegate_forwarders`.
+fn declined_delegate_forwarded(model: &Model, expr: &Expr, app: &crate::App) -> bool {
+    let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return false };
+    if method.as_str() != "delegate" {
+        return false;
+    }
+    let Some(forwarders) = app.ruby_declined_delegate_forwarders.get(&model.name) else { return false };
+    let mut names = args.iter().filter_map(|a| match &*a.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value),
+        _ => None,
+    });
+    let prefix = args.iter().any(|a| matches!(&*a.node, ExprNode::Hash { entries, .. } if entries.iter().any(|(k, _)|
+        matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "prefix"))));
+    !prefix && names.all(|n| forwarders.iter().any(|f| &f.name == n))
+}
 
 /// Whether some path in [`MODEL_STATEMENT_CLAIMS`] consumes `expr`.
 pub(crate) fn claimed_elsewhere(expr: &Expr) -> bool {
