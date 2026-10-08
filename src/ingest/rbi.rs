@@ -75,8 +75,43 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
     bundler: &[crate::app::BundlerGem],
 ) -> GemBoundary {
     let mut boundary = GemBoundary { loaded: crate::project::lock_loaded_gems(lock, bundler), ..GemBoundary::default() };
-    let Some(root) = rbi_dir(vfs, dir) else { return boundary };
-    let Ok(entries) = vfs.read_dir(&root) else { return boundary };
+    let loaded = boundary.loaded.clone();
+    read_gem_rbis(vfs, dir, lock, &mut boundary, |name| {
+        matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled)
+            || crate::project::ruby_tree_loads_gem(name)
+            || loaded.contains(name)
+            || crate::project::gem_requires_rails(name).is_some()
+    });
+    boundary
+}
+
+/// The RBIs of `gems` not read yet, for gems found to load natively
+/// after the boundary was read: a gem a gem source requires for certain
+/// (`ingest::gem_source_constants::scan_gem_source_requires`), such as
+/// opentelemetry-shopify's `require "opentelemetry/sdk"`, whose
+/// `Samplers::Decision` module and its constants the SDK's RBI declares.
+pub fn read_more_gem_rbis<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    lock: &Lockfile,
+    boundary: &mut GemBoundary,
+    gems: &std::collections::BTreeSet<String>,
+) {
+    let read: std::collections::BTreeSet<String> = boundary.namespaces.keys().cloned().collect();
+    read_gem_rbis(vfs, dir, lock, boundary, |name| gems.contains(name) && !read.contains(name));
+}
+
+/// Reads each gem's RBI that `wanted` selects into `boundary`, then
+/// records, per gem read, the classes with content it declares.
+fn read_gem_rbis<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    lock: &Lockfile,
+    boundary: &mut GemBoundary,
+    wanted: impl Fn(&str) -> bool,
+) {
+    let Some(root) = rbi_dir(vfs, dir) else { return };
+    let Ok(entries) = vfs.read_dir(&root) else { return };
 
     // gem name -> the RBI file to read. A gem locked at one version can
     // have RBIs for several (a stale one left behind); the locked
@@ -86,11 +121,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
         let Some(file) = path.file_name().and_then(|f| f.to_str()) else { continue };
         let Some(stem) = file.strip_suffix(".rbi") else { continue };
         let Some((name, version)) = stem.split_once('@') else { continue };
-        let read = matches!(fate_of(name), GemFate::Unknown | GemFate::Modeled)
-            || crate::project::ruby_tree_loads_gem(name)
-            || boundary.loaded.contains(name)
-            || crate::project::gem_requires_rails(name).is_some();
-        if lock.is_in_repo(name) || !read {
+        if lock.is_in_repo(name) || !wanted(name) {
             continue;
         }
         let Some(locked) = lock.version_of(name) else { continue };
@@ -107,7 +138,7 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
     files.sort();
     for (gem, path) in files {
         if let Ok(source) = vfs.read(&path) {
-            read_rbi(&source, &gem, &mut boundary);
+            read_rbi(&source, &gem, boundary);
             boundary.namespaces.entry(gem).or_default();
         }
     }
@@ -128,7 +159,6 @@ pub fn load_gem_boundary<V: Vfs + ?Sized>(
         }
     }
     boundary.namespaces = namespaces;
-    boundary
 }
 
 /// Declarations of one RBI file, merged into `out`. A class reopened

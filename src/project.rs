@@ -9914,8 +9914,14 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("shopify-money", "money.rb requires money_column when ActiveRecord is defined"),
     ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),
     ("opentelemetry-shopify", "it requires its railtie, and with it `active_support/parameter_filter`, when Rails is defined"),
-    ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
-    ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
+    // Not opentelemetry-sdk or opentelemetry-instrumentation-rack: each
+    // requires no Rails framework file (the gem home's probe loads none),
+    // and only opentelemetry-shopify requires them. Compiled as a gem
+    // source, its `require "opentelemetry/sdk"` loads the SDK natively,
+    // so the SDK's constants (`Samplers::Result`, read by its verbosity
+    // sampler at load) run as the gem's
+    // (`ingest::gem_source_constants::scan_gem_source_requires`); with
+    // no tree requiring them, they are a gem no emitted tree loads.
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),

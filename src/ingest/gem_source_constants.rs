@@ -151,7 +151,7 @@ const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "a
 /// a gem already read. Runs after the sources are registered, which the
 /// feature walk reads. A gem owning a feature required for certain (not
 /// only under an `if`) joins `GemBoundary::loaded`.
-pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
+pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Path, app: &mut crate::app::App) {
     let Some(lock) = app.gem_lock.as_ref() else { return };
     let (features, _, _) = crate::project::gem_source_dependencies_with(app, true);
     if features.is_empty() {
@@ -217,6 +217,9 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     // Bundler.require entry does: a constant its RBI declares
     // (elastic-transport's `Elastic::Transport::Transport::Errors::Gone`,
     // read by elasticsearch-shopify's errors.rb at load) runs as the gem's.
+    // Its RBI, which the boundary read before the gem sources were
+    // registered skipped, types those constants (`Decision::DROP`).
+    super::rbi::read_more_gem_rbis(vfs, dir, lock, &mut app.gem_boundary, &loads);
     app.gem_boundary.loaded.extend(loads);
     if found.is_empty() {
         return;

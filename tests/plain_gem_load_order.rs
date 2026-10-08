@@ -528,3 +528,60 @@ fn a_bare_read_of_a_private_constant_an_rbi_declares_stays_lexical() {
     assert!(run.success, "emitted tree failed in {}\n=== stderr ===\n{}", run.emitted.display(), run.stderr);
     assert_eq!(run.stdout, "\"Pb::Abstract\"\n");
 }
+
+/// opentelemetry-shopify's verbosity sampler, a gem source: `RESULT =
+/// OpenTelemetry::SDK::Trace::Samplers::Result` and `DECISION = ...::Decision`
+/// in its class, then `RESULT.new(decision: DECISION::DROP)` in a method.
+/// The SDK is a gem the gem source requires for certain, so it loads
+/// natively; `DECISION::DROP` is `DROP` in the aliased module, which only
+/// the SDK's RBI declares. An opentelemetry- gem is infrastructure by
+/// family, so the boundary did not read its RBI until the gem source's
+/// require made it a loaded gem. Each read was refused (a raise at the
+/// call).
+#[test]
+fn a_constant_read_through_a_class_alias_of_a_required_gems_module_runs() {
+    let home = std::env::temp_dir().join(format!("roundhouse-plain-gem-home-alias-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let lib = home.join("gems/opentelemetry-zz-1.0.0/lib");
+    std::fs::create_dir_all(lib.join("opentelemetry")).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        lib.join("opentelemetry/zz.rb"),
+        "module OpenTelemetry\n  module Zz\n    module Decision\n      DROP = :__drop__\n    end\n\n    class Result\n      attr_reader :decision\n\n      def initialize(decision:)\n        @decision = decision\n      end\n    end\n  end\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join("specifications/opentelemetry-zz-1.0.0.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"opentelemetry-zz\".freeze\n  s.version = \"1.0.0\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n",
+    )
+    .unwrap();
+    let ots = "require \"opentelemetry/zz\"\n\nmodule Ots\n  class Results\n    RESULT = OpenTelemetry::Zz::Result\n    DECISION = OpenTelemetry::Zz::Decision\n\n    def self.drop\n      RESULT.new(decision: DECISION::DROP).decision\n    end\n  end\nend\n";
+    let rubylib = lib.display().to_string();
+    let ots_dir = home.join("ots/lib");
+    std::fs::create_dir_all(&ots_dir).unwrap();
+    std::fs::write(ots_dir.join("ots.rb"), ots).unwrap();
+    let native = emit_and_run::ruby()
+        .args(["-W", "-I"])
+        .arg(&ots_dir)
+        .args(["-r", "ots", "-e", "p Ots::Results.drop"])
+        .env("RUBYLIB", &rubylib)
+        .output()
+        .expect("CRuby control");
+    assert!(native.status.success(), "native control failed:\n{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), ":__drop__\n", "native control");
+
+    let rbi = "# typed: true\n\nmodule OpenTelemetry; end\nmodule OpenTelemetry::Zz; end\nmodule OpenTelemetry::Zz::Decision; end\nOpenTelemetry::Zz::Decision::DROP = T.let(T.unsafe(nil), Symbol)\n\nclass OpenTelemetry::Zz::Result\n  sig { params(decision: Symbol).void }\n  def initialize(decision:); end\n\n  sig { returns(Symbol) }\n  def decision; end\nend\n";
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", &format!("gem_home: {}\ngem_sources:\n  ots: vendor/gems/ots-1.0.0\n", home.display()))
+        .write(
+            "Gemfile.lock",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    opentelemetry-zz (1.0.0)\n    ots (1.0.0)\n      opentelemetry-zz\n\nDEPENDENCIES\n  ots\n",
+        )
+        .write("sorbet/rbi/gems/opentelemetry-zz@1.0.0.rbi", rbi)
+        .write("config/application.rb", "require \"ots\"\n")
+        .write("vendor/gems/ots-1.0.0/lib/ots.rb", ots)
+        .run_ruby_env("p Ots::Results.drop\n", &[("RUBYLIB", rubylib.as_str())]);
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(run.success, "emitted tree failed in {}\n=== stderr ===\n{}", run.emitted.display(), run.stderr);
+    assert_eq!(run.stdout, ":__drop__\n");
+}

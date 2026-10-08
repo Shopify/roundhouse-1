@@ -511,6 +511,26 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// `Head::Rest` read through a constant of an enclosing scope that
+    /// names a class or module (`Head = Gem::Module`, an entry of the
+    /// scope's `ClassInfo::type_aliases` from `class_constant_aliases`):
+    /// the path Ruby reads, `Gem::Module::Rest`. The innermost lexical
+    /// scope that has the alias answers, as Ruby's lexical lookup does.
+    fn aliased_constant_path(&self, span: crate::span::Span, path: &[Symbol]) -> Option<Vec<Symbol>> {
+        let (head, rest) = path.split_first()?;
+        if rest.is_empty() || head.as_str().is_empty() {
+            return None;
+        }
+        let resolver = self.const_resolver.as_ref()?;
+        resolver.unresolved_nesting(span, path).iter().find_map(|scope| {
+            let info = self.classes().get(&ClassId(Symbol::from(scope.as_ref())))?;
+            let Ty::Class { id, .. } = info.type_aliases.get(head)? else { return None };
+            let mut target: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
+            target.extend(rest.iter().cloned());
+            Some(target)
+        })
+    }
+
     /// The nearest ancestor of the enclosing class that models `name`,
     /// in Ruby's order: each class's included modules (the last included
     /// first), then its superclass. A superclass counts by its modeled
@@ -1308,7 +1328,20 @@ impl<'a> BodyTyper<'a> {
                                 qualify_resolved_path(path, &full);
                                 exact_modeled_class(path)
                             }
-                            None => exact_modeled_class(path),
+                            None => match self.aliased_constant_path(expr_span, path) {
+                                // `DECISION::DROP`, where the enclosing
+                                // class wrote `DECISION =
+                                // OpenTelemetry::SDK::Trace::Samplers::Decision`
+                                // (opentelemetry-shopify's verbosity
+                                // sampler): Ruby reads `DROP` in the
+                                // aliased module, which only the gem's RBI
+                                // declares. The read stays as written.
+                                Some(target) => {
+                                    let ty = exact_modeled_class(&target);
+                                    if matches!(ty, Ty::Var { .. }) { exact_modeled_class(path) } else { ty }
+                                }
+                                None => exact_modeled_class(path),
+                            },
                         }
                         }
                     }

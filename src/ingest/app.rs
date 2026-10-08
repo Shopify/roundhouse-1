@@ -2505,7 +2505,7 @@ end
     // their files are registered.
     if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
         crate::timings::phase("gem sources: required gems", || {
-            super::gem_source_constants::scan_gem_source_requires(vfs, &home, &mut app)
+            super::gem_source_constants::scan_gem_source_requires(vfs, &home, dir, &mut app)
         });
     }
     drop(sources);
