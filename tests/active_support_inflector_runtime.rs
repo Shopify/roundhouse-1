@@ -174,6 +174,40 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
     // After the gems, immediately before the app's code.
     assert!(gems < replayed, "{boot}");
     assert_eq!(replayed + replay.len(), boot.find("require_relative \"app/models\"").expect("boot loads app/models"), "{boot}");
+    // A native gem's `require "active_support/inflector"` (dry-core's
+    // backend probe) answers from the loaded port without evaluating it
+    // again: the app's acronym survives every feature's require.
+    let features = [
+        "active_support/inflector",
+        "active_support/inflector/inflections",
+        "active_support/inflector/methods",
+        "active_support/inflector/transliterate",
+        "active_support/inflections",
+    ];
+    let run = dir.join("feature-run");
+    let feature_paths: Vec<String> = features.iter().map(|f| format!("runtime/features/{f}.rb")).collect();
+    for path in ["runtime/module_delegate.rb", "runtime/active_support_inflector.rb"].into_iter().chain(feature_paths.iter().map(String::as_str)) {
+        let file = run.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, source(path)).unwrap();
+    }
+    let out = Command::new("ruby")
+        .current_dir(&run)
+        .args([
+            "-e",
+            &format!(
+                "$LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+                 require_relative 'runtime/module_delegate'\n\
+                 require_relative 'runtime/active_support_inflector'\n\
+                 ActiveSupport::Inflector.inflections(:en) {{ |i| i.acronym 'API' }}\n\
+                 required = {features:?}.map {{ |f| require f }}\n\
+                 p [required, ActiveSupport::Inflector.camelize('api_key'), $LOADED_FEATURES.grep(/active_support_inflector/).size, $LOADED_FEATURES.grep(%r{{runtime/features/active_support}}).size, $LOADED_FEATURES.grep(%r{{/gems/activesupport}}).size]\n"
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[[true, true, true, true, true], \"APIKey\", 1, 5, 0]\n");
     let model = source("app/models/probe.rb");
     assert!(model.contains("ActiveSupport::Inflector.underscore(\"APIKey\")") && !model.contains("not supported"), "{model}");
     std::fs::remove_dir_all(dir).unwrap();

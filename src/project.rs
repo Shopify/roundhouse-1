@@ -3894,6 +3894,29 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
         .map_err(|e| format!("read inflector runtime: {e}"))?;
     files.push(("runtime/active_support_inflector.rb".into(), inflector));
+    // A native gem's `require "active_support/inflector"` (dry-core 1.1.0's
+    // inflector backend probe, inflector.rb:9) answers from the port, as
+    // the loaded activesupport answers it under Rails; the port is
+    // already loaded (gem_facades.rb), so the require evaluates nothing.
+    for feature in [
+        "active_support/inflector",
+        "active_support/inflector/inflections",
+        "active_support/inflector/methods",
+        "active_support/inflector/transliterate",
+        "active_support/inflections",
+    ] {
+        let up = "../".repeat(feature.matches('/').count());
+        files.push((
+            format!("runtime/features/{feature}.rb"),
+            format!(
+                "# `require {feature:?}` on this tree: activesupport's Inflector,\n\
+                 # ported (runtime/active_support_inflector.rb, which carries\n\
+                 # inflections.rb, methods.rb, transliterate.rb and the English rules).\n\
+                 # runtime/gem_facades.rb puts this directory first on the load path.\n\
+                 require_relative \"{up}../active_support_inflector\"\n"
+            ),
+        ));
+    }
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
     // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
     for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
