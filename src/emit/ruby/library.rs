@@ -10201,11 +10201,17 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
 /// The nested class's files include those that only declare it: Core's
 /// `config/test.rb` is `class Config; class Test < Config; end; end`, an
 /// empty body the owner's `config.rb` never declares. The owner's are
-/// its body's only, since such a file reopens it without adding to it.
+/// its body's, and each file declaring it that does not declare the
+/// nested class: merchant_workflows' `config.rb` is
+/// `class Config < ::Component::Config` around Sorbet calls only, an
+/// empty body once ingested, and still the owner's file. A file that
+/// declares both and adds nothing to the owner only reopens it around
+/// the nested class.
 fn written_apart(name: &str, owner: &str, app: &App) -> bool {
     let mut child = body_files(name, app);
     child.extend(declared_files(name, app));
-    let parent = body_files(owner, app);
+    let mut parent = body_files(owner, app);
+    parent.extend(declared_files(owner, app).into_iter().filter(|file| !child.contains(file)));
     !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)
 }
 
