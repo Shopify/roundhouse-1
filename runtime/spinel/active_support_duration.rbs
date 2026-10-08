@@ -7,8 +7,12 @@
 module ActiveSupport
   class Duration
     @seconds: Integer
+    @parts: Array[Integer?]
 
-    def initialize: (Integer seconds) -> void
+    PART_NAMES: Array[String]
+
+    def initialize: (Integer seconds, ?Array[Integer?]? parts) -> void
+    def self.single_part: (Integer index, Integer n) -> Array[Integer?]
     def self.seconds: (Integer n) -> Duration
     def self.second: (Integer n) -> Duration
     def self.minutes: (Integer n) -> Duration
@@ -40,6 +44,11 @@ module ActiveSupport
     def in_years: () -> Float
     def to_s: () -> String
     def seconds: () -> Integer
+    def part_slots: () -> Array[Integer?]
+    def +: (untyped other) -> Duration
+    def -: (untyped other) -> Duration
+    def -@: () -> Duration
+    def inspect: () -> String
     def ==: (untyped other) -> bool
     def <=>: (untyped other) -> Integer
     def <: (untyped other) -> bool

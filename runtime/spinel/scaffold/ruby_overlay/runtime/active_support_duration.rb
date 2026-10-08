@@ -22,26 +22,47 @@ module ActiveSupport
     SECONDS_PER_MONTH = 2629746
     SECONDS_PER_YEAR = 31556952
 
-    def initialize(seconds)
+    # activesupport 8.2 keeps the parts a duration was built from
+    # (`2.days` is `{days: 2}`), which `inspect` names ("2 days") and `+`
+    # adds up. Here one slot per PART_NAMES entry, in Rails' PARTS order,
+    # nil where the duration has no such part.
+    PART_NAMES = ["years", "months", "weeks", "days", "hours", "minutes", "seconds"].freeze
+
+    def initialize(seconds, parts = nil)
       @seconds = seconds
+      @parts = parts || [nil, nil, nil, nil, nil, nil, nil]
+      # Rails drops the zero parts, unless the whole value is zero
+      # (`1.day - 1.day` inspects as "0 days").
+      if seconds != 0
+        kept = []
+        @parts.each { |v| kept << (v == 0 ? nil : v) }
+        @parts = kept
+      end
     end
 
-    def self.seconds(n) = new(n)
-    def self.second(n) = new(n)
-    def self.minutes(n) = new(n * SECONDS_PER_MINUTE)
-    def self.minute(n) = new(n * SECONDS_PER_MINUTE)
-    def self.hours(n) = new(n * SECONDS_PER_HOUR)
-    def self.hour(n) = new(n * SECONDS_PER_HOUR)
-    def self.days(n) = new(n * SECONDS_PER_DAY)
-    def self.day(n) = new(n * SECONDS_PER_DAY)
-    def self.weeks(n) = new(n * SECONDS_PER_WEEK)
-    def self.week(n) = new(n * SECONDS_PER_WEEK)
-    def self.fortnights(n) = new(n * SECONDS_PER_WEEK * 2)
-    def self.fortnight(n) = new(n * SECONDS_PER_WEEK * 2)
-    def self.months(n) = new(n * SECONDS_PER_MONTH)
-    def self.month(n) = new(n * SECONDS_PER_MONTH)
-    def self.years(n) = new(n * SECONDS_PER_YEAR)
-    def self.year(n) = new(n * SECONDS_PER_YEAR)
+    # The parts of a duration built from one unit: `index` into PART_NAMES.
+    def self.single_part(index, n)
+      parts = [nil, nil, nil, nil, nil, nil, nil]
+      parts[index] = n
+      parts
+    end
+
+    def self.seconds(n) = new(n, single_part(6, n))
+    def self.second(n) = new(n, single_part(6, n))
+    def self.minutes(n) = new(n * SECONDS_PER_MINUTE, single_part(5, n))
+    def self.minute(n) = new(n * SECONDS_PER_MINUTE, single_part(5, n))
+    def self.hours(n) = new(n * SECONDS_PER_HOUR, single_part(4, n))
+    def self.hour(n) = new(n * SECONDS_PER_HOUR, single_part(4, n))
+    def self.days(n) = new(n * SECONDS_PER_DAY, single_part(3, n))
+    def self.day(n) = new(n * SECONDS_PER_DAY, single_part(3, n))
+    def self.weeks(n) = new(n * SECONDS_PER_WEEK, single_part(2, n))
+    def self.week(n) = new(n * SECONDS_PER_WEEK, single_part(2, n))
+    def self.fortnights(n) = new(n * SECONDS_PER_WEEK * 2, single_part(2, n * 2))
+    def self.fortnight(n) = new(n * SECONDS_PER_WEEK * 2, single_part(2, n * 2))
+    def self.months(n) = new(n * SECONDS_PER_MONTH, single_part(1, n))
+    def self.month(n) = new(n * SECONDS_PER_MONTH, single_part(1, n))
+    def self.years(n) = new(n * SECONDS_PER_YEAR, single_part(0, n))
+    def self.year(n) = new(n * SECONDS_PER_YEAR, single_part(0, n))
 
     # A Time minus seconds is a Time in Ruby, so `ago`/`from_now` (and the
     # Rails aliases `until`/`since`) stay Time-typed for callers like
@@ -70,6 +91,63 @@ module ActiveSupport
     # (lobsters embeds durations in cache keys).
     def to_s = @seconds.to_s
     def seconds = @seconds
+
+    def part_slots
+      @parts
+    end
+
+    # activesupport 8.2 `Duration#+`: a Duration adds its value and its
+    # parts unit by unit; a number adds to the value and to the seconds
+    # part. `Time + Duration` is Time's (the CRuby overlay's reopen).
+    def +(other)
+      if other.is_a?(Duration)
+        theirs = other.part_slots
+        parts = []
+        i = 0
+        while i < 7
+          mine = @parts[i]
+          other_part = theirs[i]
+          parts << (mine.nil? ? other_part : (other_part.nil? ? mine : mine + other_part))
+          i += 1
+        end
+        Duration.new(@seconds + other.seconds, parts)
+      else
+        parts = @parts.dup
+        parts[6] = (parts[6] || 0) + other
+        Duration.new(@seconds + other, parts)
+      end
+    end
+
+    # Rails: `self + (-other)`.
+    def -(other)
+      self + (-other)
+    end
+
+    def -@
+      parts = []
+      @parts.each { |v| parts << (v.nil? ? nil : -v) }
+      Duration.new(-@seconds, parts)
+    end
+
+    # activesupport 8.2 `Duration#inspect`: its parts in PARTS order, a
+    # unit of 1 singular, joined as `to_sentence(locale: false)` joins
+    # ("1 day, 2 hours, and 5 minutes"); "<value> seconds" with none.
+    def inspect
+      words = []
+      i = 0
+      while i < 7
+        v = @parts[i]
+        unless v.nil?
+          unit = PART_NAMES[i]
+          words << "#{v} #{v == 1 ? unit.chop : unit}"
+        end
+        i += 1
+      end
+      return "#{@seconds} seconds" if words.empty?
+      return words[0] if words.length == 1
+      return "#{words[0]} and #{words[1]}" if words.length == 2
+      "#{words[0, words.length - 1].join(", ")}, and #{words[words.length - 1]}"
+    end
 
     # Rails parity: a Duration IS its seconds count for equality, so
     # `1.year == 31556952` is true and `assert_equal 1.year, n` passes
