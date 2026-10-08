@@ -2277,7 +2277,7 @@ fn inline_associated_check(model: &Model, attr: &Symbol, value: &Expr, text: &Er
     };
     let block = Expr::new(
         s,
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             params: vec![record.clone()],
             rest_param: None,
             block_param: None,

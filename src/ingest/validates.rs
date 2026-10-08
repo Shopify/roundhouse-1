@@ -623,9 +623,12 @@ pub(crate) fn validations_in_source(
 /// that calls it inside the record's method: `self` is the record there
 /// as under `instance_exec`, and a one-parameter block gets the record.
 pub(crate) fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
-    let ExprNode::Lambda { params, rest_param, block_param, .. } = &*lambda.node else {
+    let ExprNode::Lambda { params, rest_param, block_param, signature, .. } = &*lambda.node else {
         return Err("a block that is not a plain block".into());
     };
+    if !signature.is_empty() {
+        return Err("a block with optional or keyword parameters".into());
+    }
     if rest_param.is_some() || block_param.is_some() || params.len() > 1 {
         return Err("a block taking more than the record".into());
     }
@@ -648,9 +651,12 @@ pub(crate) fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
 /// inside the record's method is not, so a body that reads `self` is
 /// not modeled either.
 pub(crate) fn each_callable(lambda: Expr) -> Result<(Expr, usize), String> {
-    let ExprNode::Lambda { params, rest_param, block_param, body, .. } = &*lambda.node else {
+    let ExprNode::Lambda { params, rest_param, block_param, body, signature, .. } = &*lambda.node else {
         return Err("a block that is not a plain block".into());
     };
+    if !signature.is_empty() {
+        return Err("a block with optional or keyword parameters".into());
+    }
     if rest_param.is_some() || block_param.is_some() {
         return Err("a block with a rest or block parameter".into());
     }
@@ -722,8 +728,8 @@ fn callable(expr: &Expr) -> Option<(Expr, usize)> {
         }
         _ => return None,
     };
-    let ExprNode::Lambda { params, rest_param, block_param, .. } = &*lambda.node else { return None };
-    if rest_param.is_some() || block_param.is_some() {
+    let ExprNode::Lambda { params, rest_param, block_param, signature, .. } = &*lambda.node else { return None };
+    if rest_param.is_some() || block_param.is_some() || !signature.is_empty() {
         return None;
     }
     Some((expr.clone(), params.len()))

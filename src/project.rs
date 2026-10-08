@@ -1387,6 +1387,49 @@ fn reject_unsupported_forwarded_procs(app: &App, target: BuildTarget) -> Result<
     Ok(())
 }
 
+/// Optional, keyword and named-kwrest block parameters are held in
+/// `Lambda.signature`; only the Ruby-family emitters write it (verbatim).
+/// Every other target would emit the block without those bindings, so
+/// it refuses each one by name instead.
+fn reject_block_signatures(app: &App, target: BuildTarget) -> Result<(), String> {
+    if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby
+        | BuildTarget::Spinel | BuildTarget::Roda) {
+        return Ok(());
+    }
+    fn visit(e: &crate::expr::Expr, at: crate::span::Span, target: &str, found: &mut bool) {
+        use crate::expr::ExprNode;
+        // A lowering that rebuilds a block (`map`'s) may leave it
+        // synthetic; the nearest enclosing source span names it then.
+        let at = if e.span.is_synthetic() { at } else { e.span };
+        if let ExprNode::Lambda { signature, .. } = &*e.node {
+            if !signature.is_empty() {
+                *found = true;
+                let names: Vec<String> = signature.optionals.iter().map(|(n, _)| format!("`{} = …`", n.as_str()))
+                    .chain(signature.keywords.iter().map(|(n, d)| match d {
+                        Some(_) => format!("`{}: …`", n.as_str()),
+                        None => format!("`{}:`", n.as_str()),
+                    }))
+                    .chain(signature.kwrest.iter().map(|n| format!("`**{}`", n.as_str())))
+                    .collect();
+                crate::emit::diagnostics::report_unsupported(
+                    at, target, "block_signature",
+                    &format!("block parameter{} {} {} not implemented on this target; use Ruby instead",
+                        if names.len() == 1 { "" } else { "s" }, names.join(", "),
+                        if names.len() == 1 { "is" } else { "are" }),
+                );
+            }
+        }
+        e.node.for_each_child(&mut |child| visit(child, at, target, found));
+    }
+    let mut found = false;
+    let mut f = |e: &crate::expr::Expr| visit(e, e.span, target.as_str(), &mut found);
+    crate::lower::for_each_emit_body_ref(app, &mut f);
+    if found {
+        return Err(format!("{}: optional/keyword block parameters are not supported; use Ruby instead", target.as_str()));
+    }
+    Ok(())
+}
+
 /// Targets whose emitters name, file and dispatch a module-qualified
 /// controller (`Admin::StatsController`) correctly. The others write
 /// the `::` into identifiers and paths (TypeScript, Crystal, C#,
@@ -1663,6 +1706,7 @@ pub fn target_files(
     reject_unported_load_hooks(app, target)?;
     reject_unsupported_dates(app, target)?;
     reject_unsupported_forwarded_procs(app, target)?;
+    reject_block_signatures(app, target)?;
     report_unsupported_keys(app, target);
     report_inherited_visibility_overrides(app, target);
     report_test_helper_connection(app, target);

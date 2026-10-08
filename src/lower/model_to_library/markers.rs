@@ -1499,7 +1499,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let (callback, opt_args): (&Expr, &[Expr]) = match (block.as_ref(), &args[..]) {
             (Some(b), rest) => (b, rest),
             (None, [first, rest @ ..])
-                if matches!(&*first.node, ExprNode::Lambda { params, .. } if params.is_empty()) =>
+                if matches!(&*first.node, ExprNode::Lambda { params, signature, .. } if params.is_empty() && signature.is_empty()) =>
             {
                 (first, rest)
             }
@@ -1534,9 +1534,14 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             ("before_validation" | "after_validation", Some(_)) => hook,
             _ => return,
         };
-        let ExprNode::Lambda { body: lambda_body, .. } = &*callback.node else {
+        // A block whose optional or keyword parameters bind names its
+        // body reads cannot be spliced into a parameterless hook method.
+        let ExprNode::Lambda { body: lambda_body, signature, .. } = &*callback.node else {
             return;
         };
+        if !signature.is_empty() {
+            return;
+        }
 
         // Translate Rails-API broadcast calls (`assoc.broadcast_replace_to(...)`
         // etc.) inside the block body to spinel-shape `Broadcasts.<action>(...)`

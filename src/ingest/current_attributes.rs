@@ -280,7 +280,7 @@ fn take_reset_callbacks(lc: &mut LibraryClass) -> Vec<(ResetPhase, ResetCallback
         let Some(names) = names else { return true };
         let body = match block.as_ref().map(|b| &*b.node) {
             None => None,
-            Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. }) if params.is_empty() => {
+            Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, signature, .. }) if params.is_empty() && signature.is_empty() => {
                 Some(body.clone())
             }
             Some(_) => return true,

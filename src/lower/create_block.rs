@@ -63,7 +63,7 @@ fn rewrite_create_block(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let matches = matches!(
         &*expr.node,
         ExprNode::Send { block: Some(b), .. }
-            if matches!(&*b.node, ExprNode::Lambda { params, .. } if params.len() == 1)
+            if matches!(&*b.node, ExprNode::Lambda { params, signature, .. } if params.len() == 1 && signature.is_empty())
     );
     if !matches {
         diags.push(residue(expr, "block is not a single-param lambda"));

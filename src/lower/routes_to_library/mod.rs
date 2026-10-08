@@ -1661,7 +1661,7 @@ fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
                     args: Vec::new(),
                     block: Some(Expr::new(
                         Span::synthetic(),
-                        ExprNode::Lambda { rest_param: None,
+                        ExprNode::Lambda { signature: Default::default(), rest_param: None,
                             params: vec![elem],
                             block_param: None,
                             body,

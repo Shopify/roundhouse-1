@@ -625,11 +625,15 @@ fn expand_define_methods(
                 rest_param: None,
                 block_param: None,
                 body,
+                signature,
                 ..
             } = &*block.as_ref()?.node
             else {
                 return None;
             };
+            if !signature.is_empty() {
+                return None;
+            }
             if !params.is_empty()
                 || !supported_source_statement(statement, sources, true, &bindings)
             {

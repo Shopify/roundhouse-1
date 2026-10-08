@@ -790,7 +790,7 @@ fn each_loop_with_body(
     }
     let lambda = Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param: None,
+        ExprNode::Lambda { signature: Default::default(), rest_param: None,
             params: vec![el],
             block_param: None,
             body: loop_body,

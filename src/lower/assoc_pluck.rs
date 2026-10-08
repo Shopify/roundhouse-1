@@ -242,7 +242,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &crate::det::HashSet<S
 
     let block = Expr::new(
         span,
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             params: vec![var],
             rest_param: None,
             block_param: None,

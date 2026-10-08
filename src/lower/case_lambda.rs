@@ -79,7 +79,7 @@ fn claims(expr: &Expr) -> bool {
             Pattern::Wildcard => i == arms.len() - 1,
             Pattern::Expr { expr } => matches!(
                 &*expr.node,
-                ExprNode::Lambda { params, block_param: None, .. } if params.len() == 1
+                ExprNode::Lambda { params, block_param: None, signature, .. } if params.len() == 1 && signature.is_empty()
             ),
             _ => false,
         }

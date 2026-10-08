@@ -1246,7 +1246,7 @@ impl<'a> Scope<'a> {
             .block()
             .and_then(|b| b.as_block_node())
             .ok_or_else(|| format!("`{what}(:{name})` without a literal block"))?;
-        let params = required_block_params(&block)?;
+        let params = define_method_block_params(&block)?;
         let loc = call.location();
         let send = ir_at(self.ir, loc.start_offset(), loc.end_offset())
             .ok_or_else(|| format!("the body of `{name}` was not ingested"))?;
@@ -1257,14 +1257,27 @@ impl<'a> Scope<'a> {
         else {
             return Err(format!("the body of `{name}` was not ingested"));
         };
-        let ExprNode::Lambda { body, .. } = &*lambda.node else {
+        let ExprNode::Lambda { body, signature, .. } = &*lambda.node else {
             return Err(format!("the body of `{name}` was not ingested"));
         };
+        // The block's optional, keyword and keyword-rest parameters are
+        // the method's, as define_method makes them; a default closes
+        // over the captured locals as the body does.
+        let names: Vec<Symbol> = params.iter().chain(signature.names()).cloned().collect();
         let mut captured = env.clone();
-        captured.locals.retain(|(n, _)| !params.contains(n));
-        let body = self
-            .close_over(body, &captured, &params)
-            .map_err(|e| format!("`{name}`: {e}"))?;
+        captured.locals.retain(|(n, _)| !names.contains(n));
+        let close = |e: &Expr| self.close_over(e, &captured, &names).map_err(|e| format!("`{name}`: {e}"));
+        let mut formals: Vec<Param> = params.iter().cloned().map(Param::positional).collect();
+        for (n, default) in &signature.optionals {
+            formals.push(Param::with_default(n.clone(), close(default)?));
+        }
+        for (n, default) in &signature.keywords {
+            formals.push(Param::keyword(n.clone(), default.as_ref().map(close).transpose()?));
+        }
+        if let Some(n) = &signature.kwrest {
+            formals.push(Param { rest: true, ..Param::keyword(n.clone(), None) });
+        }
+        let body = close(body)?;
         let mut def = MethodDef {
             name: name.clone(),
             receiver: if singleton {
@@ -1281,7 +1294,7 @@ impl<'a> Scope<'a> {
             } else {
                 MethodVisibility::Public
             },
-            params: params.iter().cloned().map(Param::positional).collect(),
+            params: formals,
             unsupported_formals: None,
             has_anonymous_block: false,
             block_param: None,
@@ -1677,6 +1690,39 @@ impl<'a> Scope<'a> {
     }
 }
 
+/// A `define_method` block's required positionals. Its optional,
+/// keyword and named keyword-rest parameters are allowed too: they are
+/// in the ingested block's `signature`, which `Scope::define`
+/// reads. A rest, post, block or nameless `**` parameter is refused.
+fn define_method_block_params(block: &ruby_prism::BlockNode<'_>) -> Result<Vec<Symbol>, String> {
+    let Some(list) = block
+        .parameters()
+        .and_then(|p| p.as_block_parameters_node())
+        .and_then(|p| p.parameters())
+    else {
+        return required_block_params(block);
+    };
+    let named_kwrest = list.keyword_rest().is_none_or(|k| {
+        k.as_keyword_rest_parameter_node().is_some_and(|k| k.name().is_some())
+    });
+    if list.rest().is_some() || list.posts().iter().next().is_some() || list.block().is_some() || !named_kwrest {
+        return Err("block parameters other than required, optional, keyword and named keyword-rest ones".into());
+    }
+    let required: Vec<Symbol> = list
+        .requireds()
+        .iter()
+        .map(|p| {
+            p.as_required_parameter_node()
+                .map(|r| Symbol::from(constant_id_str(&r.name())))
+                .ok_or_else(|| "a destructuring block parameter".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if block.parameters().and_then(|p| p.as_block_parameters_node()).is_some_and(|p| p.locals().iter().next().is_some()) {
+        return Err("block-local variables".into());
+    }
+    Ok(required)
+}
+
 fn required_block_params(block: &ruby_prism::BlockNode<'_>) -> Result<Vec<Symbol>, String> {
     let Some(params) = block.parameters() else {
         return Ok(Vec::new());
@@ -1749,10 +1795,12 @@ fn collect_bindings(expr: &Expr, own: &mut HashSet<Symbol>, problem: &mut Option
             params,
             rest_param,
             block_param,
+            signature,
             ..
         } => {
             own.extend(params.iter().cloned());
             own.extend(rest_param.iter().cloned());
+            own.extend(signature.names().cloned());
             own.extend(block_param.iter().cloned());
         }
         ExprNode::BeginRescue { rescues, .. } => {

@@ -465,6 +465,50 @@ pub enum BlockStyle {
     Brace,
 }
 
+/// The parameters of a block or lambda beyond its required, rest, post
+/// and block ones, in source order within each group. Ruby's order is
+/// required, optional, rest, post, keyword, keyword-rest, block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct BlockSignature {
+    /// `|a, b = 1|`: optional positionals, after the required ones and
+    /// before the rest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optionals: Vec<(Symbol, Expr)>,
+    /// `|item:, context: 1|`: keywords, required when there is no default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<(Symbol, Option<Expr>)>,
+    /// `|**opts|`: the named keyword rest, without its sigil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kwrest: Option<Symbol>,
+}
+
+impl BlockSignature {
+    pub fn is_empty(&self) -> bool {
+        self.optionals.is_empty() && self.keywords.is_empty() && self.kwrest.is_none()
+    }
+
+    /// Every name the signature binds, in order.
+    pub fn names(&self) -> impl Iterator<Item = &Symbol> {
+        self.optionals
+            .iter()
+            .map(|(n, _)| n)
+            .chain(self.keywords.iter().map(|(n, _)| n))
+            .chain(self.kwrest.iter())
+    }
+
+    /// The default expressions, in order.
+    pub fn defaults(&self) -> impl Iterator<Item = &Expr> {
+        self.optionals.iter().map(|(_, d)| d).chain(self.keywords.iter().filter_map(|(_, d)| d.as_ref()))
+    }
+
+    pub fn defaults_mut(&mut self) -> impl Iterator<Item = &mut Expr> {
+        self.optionals
+            .iter_mut()
+            .map(|(_, d)| d)
+            .chain(self.keywords.iter_mut().filter_map(|(_, d)| d.as_mut()))
+    }
+}
+
 /// Which short-circuit operator is meant.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -570,6 +614,12 @@ pub enum ExprNode {
         /// For round-trip fidelity; analyzer and typed targets ignore it.
         #[serde(default)]
         block_style: BlockStyle,
+        /// The optional, keyword and keyword-rest parameters
+        /// (`|a, b = 1, item:, context: 1, **opts|`); empty for most
+        /// blocks. Ruby-family targets write it verbatim; the others
+        /// refuse a non-empty one by name.
+        #[serde(default, skip_serializing_if = "BlockSignature::is_empty")]
+        signature: BlockSignature,
     },
     /// A bound-method value: `method(:name)` (`recv: None`, dispatches
     /// on `self`), `self.method(:name)` / `recv.method(:name)`
@@ -894,7 +944,12 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, .. } => f(body),
+            ExprNode::Lambda { body, signature, .. } => {
+                for d in signature.defaults_mut() {
+                    f(d);
+                }
+                f(body);
+            }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     f(r);
@@ -1103,7 +1158,12 @@ impl ExprNode {
                 f(value);
                 f(body);
             }
-            ExprNode::Lambda { body, .. } => f(body),
+            ExprNode::Lambda { body, signature, .. } => {
+                for d in signature.defaults() {
+                    f(d);
+                }
+                f(body);
+            }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     f(r);
