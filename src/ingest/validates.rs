@@ -486,7 +486,12 @@ fn message(value: &Node<'_>, file: &str) -> IngestResult<Result<RuleMessage, Str
         return Ok(Ok(RuleMessage::Key { key: Symbol::from(sym.as_str()) }));
     }
     let expr = ingest_expr(value, file)?;
-    if callable(&expr).is_some() {
+    if let Some((callable, _)) = callable(&expr) {
+        // ActiveModel calls it with the class body's `self`; the emitted
+        // check calls it inside the record's method.
+        if reads_self(&callable) {
+            return Ok(Err("a `message:` lambda that reads `self` (ActiveModel calls it with the class as `self`)".into()));
+        }
         return Ok(Ok(RuleMessage::Call { callable: expr }));
     }
     // A constant may hold a String or a Proc; which, the run tells. An

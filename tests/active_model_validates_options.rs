@@ -757,6 +757,74 @@ fn computed_messages_and_ranges_answer_like_activemodel() {
     );
 }
 
+/// `with_options` deep-merges its options into each `validates` in its
+/// block, the call's own options winning; the merged call takes the same
+/// path as one written out.
+const WRAPPED: &str = r##"class Wrapped
+  include ActiveModel::Validations
+
+  LIMIT = 4
+
+  attr_reader :name, :code, :note, :kind, :strict
+
+  with_options presence: true do
+    validates :name
+    validates :code, length: { maximum: LIMIT }
+  end
+  with_options allow_nil: true, length: { minimum: 2 } do
+    validates :note, length: { maximum: -> { LIMIT } }
+  end
+  with_options if: :strict do
+    validates :kind, inclusion: { in: %w[a b], message: "is not one of #{LIMIT / 2} kinds" }
+  end
+  with_options if: :strict, format: { message: "is off" } do
+    validates :code, format: { with: /\A[a-z]+\z/ }, unless: -> { code.nil? }
+  end
+  with_options on: :publish do |o|
+    o.validates :name, length: { minimum: 3 }
+  end
+
+  def initialize(name: "abc", code: "ab", note: nil, kind: "a", strict: false)
+    @name = name
+    @code = code
+    @note = note
+    @kind = kind
+    @strict = strict
+  end
+end
+"##;
+
+const WRAPPED_PROBE: &str = r##"class Probe
+  #: -> Array[String]
+  def self.lines
+    out = [Observe.line("default", Wrapped.new)]
+    [nil, "ab"].each { |v| out << Observe.line("name #{v.inspect}", Wrapped.new(name: v)) }
+    out << Observe.line("name in publish", Wrapped.new(name: "ab"), :publish)
+    [nil, "abcde", "AB"].each { |v| out << Observe.line("code #{v.inspect}", Wrapped.new(code: v)) }
+    [nil, "AB"].each { |v| out << Observe.line("strict code #{v.inspect}", Wrapped.new(code: v, strict: true)) }
+    ["a", "abcde", "abc"].each { |v| out << Observe.line("note #{v.inspect}", Wrapped.new(note: v)) }
+    out << Observe.line("kind", Wrapped.new(kind: "z"))
+    out << Observe.line("strict kind", Wrapped.new(kind: "z", strict: true))
+    out
+  end
+end
+"##;
+
+#[test]
+fn with_options_merged_validates_answer_like_activemodel() {
+    same_as_activemodel(
+        ("app/models/wrapped.rb", WRAPPED),
+        WRAPPED_PROBE,
+        &[
+            r#"name nil: false ["Name can't be blank"]"#,
+            r#"name in publish: false ["Name is too short (minimum is 3 characters)"]"#,
+            r#"strict code "AB": false ["Code is off"]"#,
+            r#"note "a": false ["Note is too short (minimum is 2 characters)"]"#,
+            r#"strict kind: false ["Kind is not one of 2 kinds"]"#,
+        ],
+    );
+}
+
 /// `on:` contexts on a tableless class: `valid?(context)` runs the rules
 /// for that context, and `valid?` (no context; ActiveModel has no
 /// `:create` / `:update` default) runs none of them.
