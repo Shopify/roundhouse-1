@@ -508,5 +508,101 @@ module ActiveRecord
         raise NotImplementedError, "roundhouse: #{@owner.class.name}#association(:#{@name}).stale_target? is not ported for a :through association"
       end
     end
+
+    # `Preloader.new(records:, associations:, scope:).call`
+    # (associations/preloader.rb, preloader/branch.rb, preloader/
+    # association.rb): loads the named associations of records a program
+    # already holds. Each name of the spec (a Symbol, an Array of specs,
+    # a Hash of a name to a nested spec) loads for the records whose
+    # association is not loaded yet; a loaded one keeps its target, and
+    # a collection keeps its unsaved records, as Rails'
+    # `associate_records_to_owner` does. A nested spec loads on the
+    # targets. The loads are the model's synthesized
+    # `preload_associations` (an `includes`' batch loaders); a kind with
+    # no batch loader loads per record through the association object,
+    # the records Rails' one query loads.
+    #
+    # `scope:` narrows what loads at every level, and the association
+    # holds just those records, as Rails': per record, the association's
+    # scope with the scope's conditions merged in (a scope of another
+    # model fails in the database, as in Rails). Only the conditions are
+    # merged, not an order or limit. `available_records:` spares Rails a
+    # query; it is accepted and not read.
+    #
+    # Differences: `call` answers nil, not Rails' loader objects. A
+    # nested name loads on every record's target, where Rails, when only
+    # some of the records had the association loaded, loads it on the
+    # rows its query returned.
+    class Preloader
+      attr_reader :records, :associations, :scope
+
+      def initialize(records:, associations:, scope: nil, available_records: [], associate_by_default: true)
+        @records = records
+        @associations = associations
+        @scope = scope
+        @associate_by_default = associate_by_default
+      end
+
+      def empty?
+        associations.nil? || records.length == 0
+      end
+
+      def call
+        unless @associate_by_default
+          raise NotImplementedError, "roundhouse: Associations::Preloader with associate_by_default: false is not ported"
+        end
+        preload(@records.to_a, @associations)
+        nil
+      end
+
+      private
+        def preload(owners, spec)
+          return if owners.empty?
+          if spec.is_a?(Hash)
+            spec.each { |name, nested| preload_name(owners, name.to_sym, nested) }
+          elsif spec.is_a?(Array)
+            spec.each { |each_spec| preload(owners, each_spec) }
+          elsif !spec.nil?
+            preload_name(owners, spec.to_sym, nil)
+          end
+        end
+
+        def preload_name(owners, name, nested)
+          pending = owners.reject { |owner| owner.association(name).loaded? }
+          unsaved = pending.map { |owner| unsaved_records(owner.association(name)) }
+          if @scope.nil?
+            pending.group_by(&:class).each { |klass, group| klass.preload_associations(group, [name]) }
+          end
+          pending.each_with_index do |owner, i|
+            association = owner.association(name)
+            if @scope.nil?
+              association.load_target
+            else
+              found = association.scope.merge(@scope).to_a
+              association.target = association.is_a?(CollectionAssociation) ? found : found.first
+            end
+            association.target = association.target + unsaved[i] unless unsaved[i].empty?
+          end
+          preload(targets(owners, name), nested) unless nested.nil?
+        end
+
+        def unsaved_records(association)
+          return [] unless association.is_a?(CollectionAssociation)
+          association.target.reject(&:persisted?)
+        end
+
+        def targets(owners, name)
+          out = []
+          owners.each do |owner|
+            target = owner.association(name).target
+            if target.is_a?(Array)
+              out.concat(target)
+            elsif !target.nil?
+              out << target
+            end
+          end
+          out.uniq(&:object_id)
+        end
+    end
   end
 end
