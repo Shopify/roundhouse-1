@@ -175,6 +175,70 @@ pub fn emit_method(m: &MethodDef) -> String {
     out
 }
 
+/// What `audit_block_signatures` found.
+#[derive(Debug, Default)]
+pub struct BlockSignatureAudit {
+    /// Lambdas the ingest built with a block signature.
+    pub ingested: usize,
+    /// Lambdas the Ruby emitter wrote whose body is one of those.
+    pub written: usize,
+    /// Each written one whose signature names other parameters than the
+    /// ingest's: a lowering rebuilt the Lambda and dropped (or changed)
+    /// what Lambda IR carries in `signature` (most `Lambda { .. }`
+    /// constructions outside ingest do not bind it).
+    pub losses: Vec<String>,
+    /// The ingested ones the emit did not write as a Lambda (a lowering
+    /// made a method of it, or dropped it), with their signatures.
+    pub unwritten: Vec<String>,
+}
+
+/// Run `run` (ingest, lower and write a Ruby-family tree), recording
+/// every block signature the ingest builds and every Lambda the Ruby
+/// emitter writes, matched by the Lambda body's source span. A Lambda a
+/// lowering dropped or turned into something else is not written and
+/// not counted; one written with fewer or other optional, keyword or
+/// keyword-rest parameters than the source had is a loss. Defaults are
+/// not compared (a lowering may qualify a constant in one).
+pub fn audit_block_signatures<T>(run: impl FnOnce() -> T) -> (T, BlockSignatureAudit) {
+    use crate::expr::BlockSignature;
+    crate::ingest::expr::INGESTED_SIGNATURES.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    expr::EMITTED_SIGNATURES.with(|r| *r.borrow_mut() = Some(Vec::new()));
+    let out = run();
+    let ingested = crate::ingest::expr::INGESTED_SIGNATURES.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    let emitted = expr::EMITTED_SIGNATURES.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    let shape = |s: &BlockSignature| -> String {
+        s.optionals
+            .iter()
+            .map(|(n, _)| format!("{n} = …"))
+            .chain(s.keywords.iter().map(|(n, d)| if d.is_some() { format!("{n}: …") } else { format!("{n}:") }))
+            .chain(s.kwrest.iter().map(|n| format!("**{n}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let by_body: crate::det::HashMap<crate::span::Span, &BlockSignature> =
+        ingested.iter().map(|(span, s)| (*span, s)).collect();
+    let mut audit = BlockSignatureAudit { ingested: by_body.len(), ..Default::default() };
+    for (span, wrote) in &emitted {
+        let Some(had) = by_body.get(span) else { continue };
+        audit.written += 1;
+        if shape(had) != shape(wrote) {
+            audit.losses.push(format!(
+                "{span:?}: the source block takes `{}`, the Ruby emit wrote `{}`",
+                shape(had),
+                shape(wrote)
+            ));
+        }
+    }
+    let mut unwritten: Vec<(crate::span::Span, String)> = by_body
+        .iter()
+        .filter(|(span, _)| !emitted.iter().any(|(e, _)| e == *span))
+        .map(|(span, s)| (*span, format!("{span:?}: `{}`", shape(s))))
+        .collect();
+    unwritten.sort_by_key(|(span, _)| (span.file.0, span.start));
+    audit.unwritten = unwritten.into_iter().map(|(_, s)| s).collect();
+    (out, audit)
+}
+
 /// Whether `def <name>` parses as a method named `name`: an identifier
 /// (a trailing `?`, `!` or `=` allowed) or an operator method. A Symbol
 /// literal that needs quotes (`:"tag:unit"`) names one only

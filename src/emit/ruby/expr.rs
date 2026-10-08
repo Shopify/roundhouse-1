@@ -402,6 +402,7 @@ fn emit_node(n: &ExprNode) -> String {
             format!("{name} = {}\n{}", emit_expr(value), emit_expr(body))
         }
         ExprNode::Lambda { params, rest_param, block_param, body, signature, .. } => {
+            note_emitted_signature(body, signature);
             let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
             if ps.is_empty() {
                 format!("-> {{ {} }}", emit_expr(body))
@@ -1749,6 +1750,7 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     // The splat has to survive to the emitted source: the body reads
     // `args`, and an emitted module answers a bare name from its own
     // functions when no local binds it.
+    note_emitted_signature(body, signature);
     let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
     let params_str = if ps.is_empty() {
         String::new()
@@ -2491,4 +2493,22 @@ mod tests {
             assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
         }
     }
+}
+
+thread_local! {
+    /// While `emit::ruby::audit_block_signatures` runs: each Lambda this
+    /// emitter writes, with the signature it writes, by its body's span.
+    pub(crate) static EMITTED_SIGNATURES: std::cell::RefCell<Option<Vec<(crate::span::Span, crate::expr::BlockSignature)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_emitted_signature(body: &Expr, signature: &crate::expr::BlockSignature) {
+    if body.span.is_synthetic() {
+        return;
+    }
+    EMITTED_SIGNATURES.with(|r| {
+        if let Some(seen) = r.borrow_mut().as_mut() {
+            seen.push((body.span, signature.clone()));
+        }
+    });
 }

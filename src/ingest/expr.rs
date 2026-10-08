@@ -1364,6 +1364,7 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
             let signature = block_signature(l.parameters(), file)?;
+            note_signature(&body, &signature);
             ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature }
         }
         n if n.as_yield_node().is_some() => {
@@ -3209,6 +3210,7 @@ fn ingest_call_block(
                 let body = desugar_post_params(&mut rest_param, block_post_params(lam.parameters()), body);
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
                 let signature = block_signature(lam.parameters(), file)?;
+                note_signature(&body, &signature);
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
                     ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
@@ -3285,6 +3287,7 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     let body = desugar_post_params(&mut rest_param, block_post_params(b.parameters()), body);
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
     let signature = block_signature(b.parameters(), file)?;
+    note_signature(&body, &signature);
     Ok(Expr::new(
         Span::synthetic(),
         ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
@@ -4071,4 +4074,22 @@ fn method_def_expr(def: &ruby_prism::DefNode<'_>, file: &str) -> IngestResult<Ex
         }
     }
     Ok(ExprNode::MethodDefExpr { def: Box::new(method) })
+}
+
+thread_local! {
+    /// While `emit::ruby::audit_block_signatures` runs: each Lambda the
+    /// ingest builds with a block signature, by its body's span.
+    pub(crate) static INGESTED_SIGNATURES: std::cell::RefCell<Option<Vec<(Span, crate::expr::BlockSignature)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_signature(body: &Expr, signature: &crate::expr::BlockSignature) {
+    if signature.is_empty() || body.span.is_synthetic() {
+        return;
+    }
+    INGESTED_SIGNATURES.with(|r| {
+        if let Some(seen) = r.borrow_mut().as_mut() {
+            seen.push((body.span, signature.clone()));
+        }
+    });
 }
