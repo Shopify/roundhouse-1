@@ -1536,8 +1536,32 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         };
         // A block whose optional or keyword parameters bind names its
         // body reads cannot be spliced into a parameterless hook method.
-        let ExprNode::Lambda { body: lambda_body, signature, .. } = &*callback.node else {
+        let ExprNode::Lambda { body: lambda_body, signature, params, rest_param, block_param, .. } =
+            &*callback.node
+        else {
             return;
+        };
+        // Rails runs a one-argument callback proc as
+        // `record.instance_exec(record, &blk)`: the record is both
+        // `self` and the argument. Any other positional shape has no
+        // Rails meaning (two parameters raise ArgumentError natively;
+        // `|*args|` receives nothing), so it is refused by name.
+        let bound_param = match (params.as_slice(), rest_param, block_param) {
+            ([], None, None) => None,
+            ([one], None, None) => Some(one.clone()),
+            _ => {
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    "block_callback_params",
+                    format!(
+                        "`{hook} {{ |…| … }}` on `{}` takes parameters other than the single \
+                         record argument Rails passes; the callback is not lowered",
+                        model.name.0.as_str(),
+                    ),
+                ));
+                return;
+            }
         };
         // Refused by name: the diagnose pass claims every block-form
         // hook, so returning quietly dropped the callback.
@@ -1560,8 +1584,27 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         // Translate Rails-API broadcast calls (`assoc.broadcast_replace_to(...)`
         // etc.) inside the block body to spinel-shape `Broadcasts.<action>(...)`
         // calls. Other content passes through unchanged.
+        let lambda_body = match bound_param {
+            // `<param> = self` ahead of the spliced body.
+            Some(name) => {
+                let bind = Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Assign {
+                        target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
+                        value: Expr::new(Span::synthetic(), ExprNode::SelfRef),
+                    },
+                );
+                let mut stmts = vec![bind];
+                match &*lambda_body.node {
+                    ExprNode::Seq { exprs } => stmts.extend(exprs.clone()),
+                    _ => stmts.push(lambda_body.clone()),
+                }
+                seq(stmts)
+            }
+            None => lambda_body.clone(),
+        };
         let mut lambda_body = super::broadcasts::rewrite_rails_broadcast_calls(
-            lambda_body.clone(),
+            lambda_body,
             model,
         );
         // `self.<col> ||= v` on a string column → blank-guarded assign.

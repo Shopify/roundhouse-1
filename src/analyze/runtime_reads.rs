@@ -61,6 +61,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
+    ("runtime/spinel/action_dispatch_http_url.rb", "runtime/action_dispatch_http_url.rb"),
     // The PostgreSQL CRuby tree only (`project::apply_postgres_bootstrap`).
     ("runtime/spinel/user_agent_version.rb", "runtime/user_agent_version.rb"),
     ("runtime/spinel/active_model_naming.rb", "runtime/active_model_naming.rb"),
@@ -839,6 +840,8 @@ mod tests {
             ("ActionDispatch::Session::SessionRestoreError", "runtime/action_dispatch_session_store.rb"),
             ("ActionDispatch::Constants", "runtime/action_dispatch_show_exceptions.rb"),
             ("ActionDispatch::ShowExceptions", "runtime/action_dispatch_show_exceptions.rb"),
+            ("ActionDispatch::Http::URL", "runtime/action_dispatch_http_url.rb"),
+            ("ActionDispatch::Journey::Router::Utils", "runtime/action_dispatch_http_url.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
             ("ActiveSupport::JSON::Encoding", "runtime/active_support_json.rb"),

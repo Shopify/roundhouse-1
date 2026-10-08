@@ -187,6 +187,24 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("<<", uncountables.clone()), ("add", uncountables.clone()), ("delete", Ty::Untyped),
         ("empty?", Ty::Bool), ("each", Ty::Untyped),
     ]);
+    // ActionDispatch::Http::URL's module functions and the Journey
+    // escapers they reach, answered by runtime/spinel/
+    // action_dispatch_http_url.rb (8.2.0.alpha actionpack), which the
+    // Ruby-family CRuby trees carry where the app names the module
+    // (`runtime_reads` refuses the read elsewhere). The module defines
+    // them in `class << self`, which the runtime index does not follow.
+    let str_arr = Ty::Array { elem: Box::new(Ty::Str) };
+    register_stdlib_class(classes, "ActionDispatch::Http::URL", &[
+        ("url_for", Ty::Str), ("full_url_for", Ty::Str), ("path_for", Ty::Str),
+        ("extract_domain", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }),
+        ("extract_subdomains", str_arr.clone()), ("extract_subdomain", Ty::Str),
+        ("secure_protocol", Ty::Bool), ("secure_protocol=", Ty::Bool),
+        ("tld_length", Ty::Int), ("tld_length=", Ty::Int),
+        ("domain_extractor", Ty::Untyped), ("domain_extractor=", Ty::Untyped),
+    ], &[]);
+    register_stdlib_class(classes, "ActionDispatch::Journey::Router::Utils", &[
+        ("escape_path", Ty::Str), ("escape_segment", Ty::Str), ("escape_fragment", Ty::Str),
+    ], &[]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");

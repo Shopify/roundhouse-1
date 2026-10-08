@@ -3584,6 +3584,19 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_model_errors.rb: {e}"))?,
         ));
     }
+    // ActionDispatch::Http::URL's module functions (`path_for`,
+    // `full_url_for`, `url_for`; 8.2.0.alpha actionpack, see the file's
+    // header; tests/action_dispatch_http_url_runtime.rs holds it to
+    // native actionpack): carried where app code names the module, as
+    // Core's WebUrlHelpersFactory does. gem_facades.rb requires it.
+    let carries_http_url = carries_named(&files, &["ActionDispatch::Http::URL"]);
+    if carries_http_url {
+        files.push((
+            "runtime/action_dispatch_http_url.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/action_dispatch_http_url.rb")
+                .map_err(|e| format!("read runtime/spinel/action_dispatch_http_url.rb: {e}"))?,
+        ));
+    }
     if carries_associations {
         files.push((
             "runtime/active_record_associations.rb".to_string(),
@@ -3749,6 +3762,11 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_associations {
         format!("{gem_facades}require_relative \"active_record_associations\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_http_url {
+        format!("{gem_facades}require_relative \"action_dispatch_http_url\"\n")
     } else {
         gem_facades
     };
@@ -9778,6 +9796,9 @@ fn spinel_files_with_assertions(
     // pushed back by the two ruby-family forks where a model dispatches
     // to it.
     files.retain(|(p, _)| p != "runtime/active_record_associations.rb" && p != "runtime/active_model_errors.rb");
+    // And for ActionDispatch::Http::URL, pushed back by the two
+    // ruby-family forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/action_dispatch_http_url.rb");
     // And for the messages port and its JSON coder (OpenSSL, Marshal),
     // pushed back by the two ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
