@@ -88,13 +88,106 @@ pub fn rewrite_assoc_create_with_models(expr: &Expr, models: &[crate::dialect::M
 
 /// In-place twin. Returns whether any node changed so the test
 /// lowerer can skip a follow-up typing pass.
+///
+/// `join_target` is for a tree whose has_many reader keeps what it
+/// loads (`emit::ruby::library::apply_collection_memoization`): the
+/// constructed record then joins the owner's target, as Rails'
+/// `add_to_target` adds it, through the runtime's
+/// `ActiveRecord::Associations::Association.created` — what the
+/// scope-chain lowering writes for the same call in an app body. Here
+/// it rides a `tap` on the constructor, so the expression keeps the
+/// constructor's type: a test body goes on to hand the record to type-
+/// directed rewrites (`comment_path(comment)` projecting `comment.id`)
+/// after this pass, which an untyped runtime call would decline.
+/// Without it a test that read the association, created through it and
+/// read it again saw the first read's rows.
 pub fn rewrite_assoc_create_with_models_in_place(
     expr: &mut Expr,
     models: &[crate::dialect::Model],
+    join_target: bool,
 ) -> bool {
     crate::lower::controller_to_library::util::map_expr_mut(expr, &|e| {
-        assoc_create_rewrite(e, models)
+        let created = assoc_create_rewrite(e, models)?;
+        Some(if join_target { join_owner_target(e, created).unwrap_or_else(|c| c) } else { created })
     })
+}
+
+/// `<ctor>` → `<ctor>.tap { |__rh_record| ActiveRecord::Associations::
+/// Association.created(<owner>, :<assoc>, __rh_record) }`, for the
+/// original `<owner>.<assoc>.<create|create!|build>(…)` site `orig`.
+/// Only for an owner the code can name again — a local, an ivar,
+/// `self`, or one zero-argument read off one of those or a constant
+/// (`ArticlesFixtures.one`, which memoizes) — as the scope-chain
+/// lowering's `renamable` test: any other owner expression is a fresh
+/// record nothing reads afterwards. Hands `ctor` back otherwise.
+fn join_owner_target(orig: &Expr, ctor: Expr) -> Result<Expr, Expr> {
+    let ExprNode::Send { recv: Some(outer_recv), .. } = &*orig.node else { return Err(ctor) };
+    let ExprNode::Send { recv: Some(owner), method: assoc, .. } = &*outer_recv.node else {
+        return Err(ctor);
+    };
+    let renamable = match &*owner.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef => true,
+        ExprNode::Send { recv, args, block: None, .. } if args.is_empty() => match recv {
+            None => true,
+            Some(root) => matches!(
+                &*root.node,
+                ExprNode::Const { .. } | ExprNode::SelfRef | ExprNode::Var { .. } | ExprNode::Ivar { .. }
+            ),
+        },
+        _ => false,
+    };
+    if !renamable {
+        return Err(ctor);
+    }
+    let span = orig.span;
+    let param = Symbol::from("__rh_record");
+    let call = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                span,
+                ExprNode::Const {
+                    path: vec![
+                        Symbol::from("ActiveRecord"),
+                        Symbol::from("Associations"),
+                        Symbol::from("Association"),
+                    ],
+                },
+            )),
+            method: Symbol::from("created"),
+            args: vec![
+                owner.clone(),
+                Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Sym { value: assoc.clone() } }),
+                Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: param.clone() }),
+            ],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let block = Expr::new(
+        span,
+        ExprNode::Lambda {
+            signature: Default::default(),
+            rest_param: None,
+            params: vec![param],
+            block_param: None,
+            body: call,
+            // Braces bind to `tap` wherever the call stands, also as
+            // an unparenthesized argument (`do … end` would bind to the
+            // outer call).
+            block_style: crate::expr::BlockStyle::Brace,
+        },
+    );
+    Ok(Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(ctor),
+            method: Symbol::from("tap"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+    ))
 }
 
 fn assoc_create_rewrite(e: &Expr, models: &[crate::dialect::Model]) -> Option<Expr> {

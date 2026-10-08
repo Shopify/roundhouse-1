@@ -1228,6 +1228,9 @@ pub fn emit_with_assertions(
             fixture_extras,
             &crate::lower::routes::helper_id_segments(app),
             assertion_mode,
+            // The CRuby / JRuby trees' has_many readers keep their
+            // target (`library::apply_collection_memoization`).
+            expr::native_keywords(),
         );
         // A test body writes the same relation chains an app body does —
         // `@room.messages.ordered`, `user.push_subscriptions.find_by(…)`,

@@ -1913,6 +1913,49 @@ pub fn mentions_assoc_lookup(expr: &Expr, assocs: &AssocRegistry) -> bool {
     found
 }
 
+/// True when `expr` asks a has_many read something Rails' CollectionProxy
+/// answers WITHOUT loading the target: `count` (always a `SELECT
+/// COUNT(*)`), and `size` / `empty?` / `any?` / `exists?` (the loaded
+/// target when there is one, a query otherwise). A third gate for
+/// `rewrite_call_site`, and only for a tree whose has_many reader KEEPS
+/// what it loads (`emit::ruby::library::apply_collection_memoization`,
+/// the caller passes it in as `track_targets`).
+///
+/// The note on [`mentions_assoc_constructor`] keeps a bare `count` on
+/// the reader's Array because there the Array is a fresh query, or the
+/// preload cache, and either answers the right number. A memoizing
+/// reader breaks that premise: `before = article.comments.count` loads
+/// and keeps the rows, a `create!` later (through the association or
+/// not) lands in the table, and the second `article.comments.count`
+/// answered the kept Array — `Expected: 2, Actual: 1`, where Rails
+/// counts again. The seed arm answers these on the association-seeded
+/// Relation with the reader's cache (`preloaded(<assoc>_target,
+/// <assoc>_loaded?)`): `count` queries, `size` / `empty?` / `any?` read
+/// a loaded target and query otherwise, and none of them loads, as
+/// Rails' do not. `length` loads in Rails too, so it stays on the
+/// reader.
+pub fn mentions_assoc_unloaded_read(expr: &Expr, assocs: &AssocRegistry) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, assocs: &AssocRegistry, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node {
+            if args.is_empty() && matches!(method.as_str(), "count" | "size" | "empty?" | "any?" | "exists?") {
+                if let ExprNode::Send { method: aname, args: aargs, block: None, .. } = &*r.node {
+                    if aargs.is_empty() && assocs.is_has_many_name(aname) {
+                        *found = true;
+                        return;
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, assocs, found));
+    }
+    walk(expr, assocs, &mut found);
+    found
+}
+
 /// True when `expr` calls an association EXTENSION method through an
 /// association read (`room.memberships.grant_to users`). Gate for
 /// `rewrite_call_site`, the same reason as its two siblings: such a body
