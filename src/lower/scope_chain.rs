@@ -2191,6 +2191,8 @@ pub struct Ctx<'a> {
     /// A record built or created through an association joins the
     /// owner's loaded target (see [`Registries::track_targets`]).
     pub track_targets: bool,
+    /// See [`Registries::plain_subclasses`].
+    pub plain_subclasses: &'a HashMap<ClassId, ClassId>,
 }
 
 impl Ctx<'_> {
@@ -2253,6 +2255,7 @@ impl Ctx<'_> {
             instance_self: self.instance_self.clone(),
             user_returns: self.user_returns,
             track_targets: self.track_targets,
+            plain_subclasses: self.plain_subclasses,
         }
     }
 }
@@ -3106,6 +3109,44 @@ fn const_model(expr: &Expr, models: &HashSet<ClassId>) -> Option<ClassId> {
     None
 }
 
+/// `(subclass, model)` when `expr` is the constant of a plain model
+/// subclass (see [`Registries::plain_subclasses`]).
+fn plain_subclass_const(expr: &Expr, subclasses: &HashMap<ClassId, ClassId>) -> Option<(ClassId, ClassId)> {
+    if subclasses.is_empty() {
+        return None;
+    }
+    let ExprNode::Const { path } = &*expr.node else { return None };
+    let joined = ClassId(Symbol::from(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")));
+    subclasses.get(&joined).map(|model| (joined, model.clone()))
+}
+
+/// [`mentions_model_chain_start`] for a plain model subclass's
+/// constant: the chain methods, the class-root terminals and the
+/// counted `first(n)` / `last(n)` the rewrite seeds for it.
+pub fn mentions_plain_subclass_chain_start(expr: &Expr, subclasses: &HashMap<ClassId, ClassId>) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, subclasses: &HashMap<ClassId, ClassId>, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*e.node {
+            if (is_relation_chain_method(method.as_str())
+                || CLASS_ROOT_TERMINALS.contains(&method.as_str())
+                || counted_terminal(method, args, block.as_ref()).is_some())
+                && plain_subclass_const(r, subclasses).is_some()
+            {
+                *found = true;
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, subclasses, found));
+    }
+    if !subclasses.is_empty() {
+        walk(expr, subclasses, &mut found);
+    }
+    found
+}
+
 /// What the names in scope stand for, accumulated as a method body's
 /// statements are processed in order.
 #[derive(Default)]
@@ -3377,6 +3418,28 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
             None
         }
         Some(r) => {
+            // The same class-level chain on a plain model subclass
+            // (`BigAsset.order(:id)`, `class BigAsset < Asset`): Rails
+            // delegates it to `all`, a relation on the SUBCLASS, so the
+            // seed names the subclass and its rows load as it. The
+            // arguments lower against the model whose table it reads;
+            // scopes (inherited class methods) and every other call
+            // stay as written.
+            if let Some((sub, m)) = plain_subclass_const(&r, ctx.plain_subclasses) {
+                if !ctx.scope_of(&m, &method)
+                    && (is_relation_chain_method(method.as_str())
+                        || CLASS_ROOT_TERMINALS.contains(&method.as_str()))
+                {
+                    let _ = lower_relation_args(&m, &method, &mut args, ctx);
+                    let seed = relation_new(span, &sub);
+                    *expr = put(span, Some(seed), method, args, block, parenthesized);
+                    return Some(m);
+                }
+                if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
+                    *expr = put(span, Some(relation_new(span, &sub)), counted, args, block, parenthesized);
+                    return None;
+                }
+            }
             // Class-level call on a model constant.
             if let Some(m) = const_model(&r, ctx.models) {
                 // `<Model>.insert_all(rows)` — Rails' bulk insert over an
@@ -4147,6 +4210,7 @@ fn rewrite_relation_taking_body(
         instance_self: None,
         track_targets: false,
         user_returns: &empty_returns,
+        plain_subclasses: no_plain_subclasses(),
     };
     let mut locals = Locals::default();
     rewrite(body, &ctx, &mut locals);
@@ -4174,6 +4238,7 @@ pub fn rewrite_call_site(
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         track_targets: regs.track_targets,
+        plain_subclasses: regs.plain_subclasses,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -4196,6 +4261,17 @@ pub struct Registries<'a> {
     /// `ActiveRecord::Associations::Association.created`, which adds it
     /// to the owner's loaded target as Rails does.
     pub track_targets: bool,
+    /// Plain (non-STI) model subclass -> its model
+    /// (`sti_scope::plain_model_subclasses`): `BigAsset.order(:id)`
+    /// seeds a relation on the subclass, as `Asset.order(:id)` does on
+    /// the model.
+    pub plain_subclasses: &'a HashMap<ClassId, ClassId>,
+}
+
+/// No plain model subclasses: the registries of a caller with no app.
+pub fn no_plain_subclasses() -> &'static HashMap<ClassId, ClassId> {
+    static EMPTY: std::sync::OnceLock<HashMap<ClassId, ClassId>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashMap::default)
 }
 
 #[cfg(test)]
@@ -4356,6 +4432,7 @@ mod tests {
             user_returns: empty_returns(),
             unique_keys: empty_unique_keys(),
             track_targets: false,
+            plain_subclasses: no_plain_subclasses(),
         }
     }
 
@@ -4375,6 +4452,7 @@ mod tests {
             class_self: None,
             instance_self: None,
             track_targets: false,
+            plain_subclasses: no_plain_subclasses(),
             user_returns: empty_returns(),
         }
     }
@@ -4644,6 +4722,7 @@ mod tests {
             user_returns: empty_returns(),
             instance_self: None,
             track_targets: false,
+            plain_subclasses: no_plain_subclasses(),
         }
     }
 

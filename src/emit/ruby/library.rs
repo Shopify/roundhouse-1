@@ -1636,6 +1636,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     drop(_span);
     let _span = crate::timings::begin("scope lowering: gates");
     let models = crate::lower::scope_chain::model_set(&app.models);
+    // `BigAsset.order(:id)` on a plain model subclass seeds the same way.
+    let plain_subclasses = crate::lower::sti_scope::plain_model_subclasses(app);
     // A model-root query needs the same Relation seed even when the app
     // declares no scopes. Otherwise `Widget.order(...)` reaches no method
     // and `Widget.where.not(...)` reaches Base.where with no argument.
@@ -1643,7 +1645,8 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     let mut wants_model_chain = false;
     crate::lower::for_each_hook_body_ref(app, &mut |body| {
         wants_model_chain = wants_model_chain
-            || crate::lower::scope_chain::mentions_model_chain_start(body, &models);
+            || crate::lower::scope_chain::mentions_model_chain_start(body, &models)
+            || crate::lower::scope_chain::mentions_plain_subclass_chain_start(body, &plain_subclasses);
     });
     // …and an association read continuing into relation surface
     // (`@user.notifications.offset(n)`) needs the seed whether or not
@@ -1687,6 +1690,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
         user_returns: &user_returns,
         unique_keys: &unique_keys,
         track_targets: super::expr::native_keywords(),
+        plain_subclasses: &plain_subclasses,
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
@@ -1867,6 +1871,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 .flatten();
             if crate::lower::scope_chain::mentions_scope(&m.body, &names)
                 || crate::lower::scope_chain::mentions_model_chain_start(&m.body, &models)
+                || crate::lower::scope_chain::mentions_plain_subclass_chain_start(&m.body, &plain_subclasses)
                 || crate::lower::scope_chain::mentions_assoc_constructor(&m.body, &assocs)
                 || crate::lower::scope_chain::mentions_assoc_lookup(&m.body, &assocs)
                 || crate::lower::scope_chain::mentions_assoc_alias(&m.body, &assocs)

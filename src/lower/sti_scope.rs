@@ -224,6 +224,38 @@ pub(crate) fn apply_plain_subclass_hydration(lcs: &mut [crate::dialect::LibraryC
     }
 }
 
+/// Plain (non-STI) model subclass -> the model its `parent` chain
+/// reaches: `class BigAsset < Asset` on a table with no inheritance
+/// column. Rails answers `BigAsset.select(:id)` / `.order(:id)` from a
+/// relation on the subclass (`Querying` delegates them to `all`), so
+/// `scope_chain` seeds `ActiveRecord::Relation.new(BigAsset)` for these
+/// as it does `Relation.new(Asset)` for the model, and the rows load as
+/// the subclass (`apply_plain_subclass_hydration`).
+pub(crate) fn plain_model_subclasses(app: &App) -> HashMap<ClassId, ClassId> {
+    let sti = sti_bases(app);
+    let models: HashSet<&ClassId> = app.models.iter().map(|m| &m.name).collect();
+    let mut lc_parent: HashMap<&ClassId, &Option<ClassId>> = HashMap::default();
+    for other in &app.library_classes {
+        lc_parent.entry(&other.name).or_insert(&other.parent);
+    }
+    let mut out = HashMap::default();
+    for lc in &app.library_classes {
+        if sti.contains_key(&lc.name) || models.contains(&lc.name) {
+            continue;
+        }
+        let mut cursor = lc.parent.clone();
+        for _ in 0..8 {
+            let Some(parent) = cursor else { break };
+            if models.contains(&parent) {
+                out.insert(lc.name.clone(), parent);
+                break;
+            }
+            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
+        }
+    }
+    out
+}
+
 /// `Owner.from_stmt(..)` / `Owner.from_row(..)` / `Owner.instantiate(..)`
 /// (and, inside a factory, `Owner.new(..)`) -> the implicit-self call.
 fn through_receiver(expr: &mut Expr, owner: &ClassId, factory: bool) {
