@@ -531,6 +531,27 @@ module Rails
       @config ||= Railtie::Configuration.new
     end
 
+    def railtie_namespace # :nodoc:
+      @railtie_namespace ||= module_parents_of(self.class).detect { |n| n.respond_to?(:railtie_namespace) }
+    end
+
+    # Module#module_parents (core_ext/module/introspection.rb), which
+    # railtie_namespace reads: the enclosing modules by name, innermost
+    # first, then Object.
+    private def module_parents_of(mod) # :nodoc:
+      parents = []
+      parent_name = mod.name =~ /::[^:]+\z/ ? -$` : nil
+      if parent_name
+        parts = parent_name.split("::")
+        until parts.empty?
+          parents << Object.const_get(parts * "::")
+          parts.pop
+        end
+      end
+      parents << Object unless parents.include? Object
+      parents
+    end
+
     def inspect
       "#<#{self.class.name}>"
     end

@@ -36,7 +36,23 @@ require "active_support/core_ext/object/blank"
 require "active_support/multibyte/unicode"
 require "active_support/core_ext/module/attribute_accessors_per_thread"
 
+require "rails/engine"
+
 module ProbeGem
+  ROUTES_RAN = []
+
+  # graphql 2.6.11's GraphQL::Dashboard shape: an engine whose routes
+  # are appended at class load and drawn only when the routes load.
+  class Dashboard < Rails::Engine
+    engine_name "probe_gem_dashboard"
+    isolate_namespace(ProbeGem::Dashboard)
+
+    routes do
+      ROUTES_RAN << :drawn
+      root "landings#show"
+    end
+  end
+
   # turbo-rails 2.x Turbo::Current's shape.
   class Current
     thread_mattr_accessor :request_id
@@ -69,7 +85,14 @@ module ProbeGem
       parameterize: "Ærøskøbing Straße".parameterize,
       per_thread: per_thread,
       app_generators: generators,
+      engine: engine,
     }
+  end
+
+  def self.engine
+    d = Dashboard
+    isolated = [:railtie_namespace, :table_name_prefix, :use_relative_model_naming?, :railtie_helpers_paths, :railtie_routes_url_helpers]
+    [d.engine_name, d.isolated?, d.instance.engine_name, isolated.map { |m| d.respond_to?(m) }, d.routes.equal?(d.instance.routes), d.instance.routes?.nil?, ROUTES_RAN]
   end
 
   def self.generators
@@ -136,6 +159,9 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // String#parameterize through the Inflector (not the ASCII overlay).
         "parameterize: \"aeroskobing-strasse\"",
         "app_generators: [\"Rails::Configuration::Generators\", {template_engine: :tailwindcss, stylesheet_engine: :sass}, {fixture: false}, {f: :fixture}, :tailwindcss]",
+        // The route block recorded, not run; isolate_namespace's methods.
+        "engine: [\"probe_gem_dashboard\", true, \"probe_gem_dashboard\", [true, false, false, false, false], true, false, []]",
+
         // Per thread, with the default seeded in each thread.
         "per_thread: [\"main\", \"main\", :info, [nil, :info, \"t\", \"t\"], \"invalid attribute name: bad-name\"]",
     ] {
@@ -153,6 +179,11 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
         let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
+    for method in ["draw", "url_helpers", "recognize_path", "url_helpers"] {
+        let line = format!("routes: NotImplementedError: roundhouse: error[engine_routes_not_drawn]: Refused::Engine.routes.{method}: an engine's route set is recorded, never drawn");
+        assert!(out.contains(&line), "missing {line:?}:\n{out}");
+    }
+    assert_eq!(out.matches("routes: ").count(), 4, "{out}");
     let features = tree.join("runtime/features");
     let read = |feature: &str| std::fs::read_to_string(features.join(format!("{feature}.rb"))).unwrap_or_else(|e| panic!("{feature}: {e}"));
     assert!(read("active_job").contains("require_relative \"../active_job\"\n"), "{}", read("active_job"));
