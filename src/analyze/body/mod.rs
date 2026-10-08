@@ -2501,8 +2501,17 @@ impl<'a> BodyTyper<'a> {
                 // Enumerable over Rails' collection (`expr::errors_enumerable`):
                 // it runs over the Errors, an Array of ActiveModel::Error on
                 // the trees that build them (`expr::ERRORS_PORT_CALL`).
+                // A view's `errors.each do |error| ... end` is the view
+                // lowering's to rewrite onto the messages on every target
+                // (`IrHint::ErrorMessagesEach`), before or after it has.
+                let view_messages_each = expr.hint == Some(crate::expr::IrHint::ErrorMessagesEach)
+                    || (ctx.in_view
+                        && method.as_str() == "each"
+                        && args.is_empty()
+                        && recv.as_ref().is_some_and(|r| matches!(&*r.node,
+                            ExprNode::Send { method: m, args: a, block: None, .. } if m.as_str() == "errors" && a.is_empty())));
                 if crate::expr::errors_enumerable(method.as_str(), args.len(), block.is_some())
-                    && expr.hint != Some(crate::expr::IrHint::ErrorMessagesEach)
+                    && !view_messages_each
                     && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
                 {
                     expr.decisions |= crate::expr::ERRORS_PORT_CALL;
