@@ -145,7 +145,7 @@ fn ingests_tables_columns_indexes_fk_and_pk() {
     assert_eq!(col(widgets, "active").col_type, ColumnType::Boolean);
     // `status` is an enum-typed column — schema.rb parity maps it to String.
     assert_eq!(col(widgets, "status").col_type, ColumnType::String { limit: None });
-    assert_eq!(col(widgets, "price").col_type, ColumnType::Decimal { precision: None, scale: None });
+    assert_eq!(col(widgets, "price").col_type, ColumnType::Decimal { precision: Some(10), scale: Some(2) });
     assert_eq!(col(widgets, "published_at").col_type, ColumnType::DateTime);
     assert_eq!(col(widgets, "metadata").col_type, ColumnType::Json);
     assert_eq!(col(widgets, "external_id").col_type, ColumnType::Uuid);
@@ -594,7 +594,7 @@ fn a_mysql_dump_ingests_tables_columns_keys_and_defaults() {
     assert!(col(gadgets, "body").nullable);
     assert_eq!(col(gadgets, "notes").col_type, ColumnType::Text);
     assert!(!col(gadgets, "notes").nullable);
-    assert_eq!(col(gadgets, "price").col_type, ColumnType::Decimal { precision: None, scale: None });
+    assert_eq!(col(gadgets, "price").col_type, ColumnType::Decimal { precision: Some(7), scale: Some(2) });
     assert_eq!(col(gadgets, "ratio").col_type, ColumnType::Float);
     assert_eq!(col(gadgets, "settings").col_type, ColumnType::Json);
     assert_eq!(col(gadgets, "blob_data").col_type, ColumnType::Binary);

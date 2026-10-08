@@ -600,12 +600,13 @@ class BaseTest < Minitest::Test
     base = ActiveRecord::Relation.new(Item).where(title: "A")
     prior = base.to_sql
     fork = base.spawn.where(title: "B")
-    assert_match(/title = 'B'/, fork.to_sql)
+    # Hash conditions quote the column as Rails does (`"title"`).
+    assert_match(/"title" = 'B'/, fork.to_sql)
     assert_equal prior, base.to_sql
     # Copy-on-write: mutating the parent after spawn must not rewrite the fork.
     base.where(title: "C")
-    assert_match(/title = 'B'/, fork.to_sql)
-    refute_match(/title = 'C'/, fork.to_sql)
+    assert_match(/"title" = 'B'/, fork.to_sql)
+    refute_match(/"title" = 'C'/, fork.to_sql)
     ordered = ActiveRecord::Relation.new(Item).where(title: "A")
     prior_order = ordered.to_sql
     fork_order = ordered.spawn
