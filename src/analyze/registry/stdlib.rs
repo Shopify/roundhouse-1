@@ -928,10 +928,11 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `clock_gettime` are typed by the send dispatcher (the unit
     // argument picks Float or Integer), so no method is declared here;
     // what this adds is the module itself and its clock ids, which are
-    // Integers in Ruby. Only the ids Spinel emits are listed, so any
-    // other `Process::` constant stays an unresolved name. `project`
-    // refuses the module value on every target whose runtime does not
-    // supply it.
+    // Integers in Ruby. Only the ids Spinel emits are listed; any other
+    // `Process::` constant (`WNOHANG`) is the one Ruby's signatures
+    // declare (`rbs/core/process.rbs`), read on the CRuby and JRuby
+    // trees. `project` refuses the module value, and such a constant,
+    // on every target whose runtime does not supply it.
     let process = classes.entry(ClassId(Symbol::from("Process"))).or_default();
     process.is_module = true;
     for clock in ["CLOCK_MONOTONIC", "CLOCK_REALTIME", "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID"] {

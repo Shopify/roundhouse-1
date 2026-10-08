@@ -68,14 +68,37 @@ fn process_clock_constant_is_refused_where_no_target_runtime_supplies_it() {
     );
 }
 
-#[test]
-fn an_unmodeled_process_clock_stays_an_error() {
-    let (_, errors) = emit_and_run::empty_app()
+/// A clock id outside the four Spinel lowers is still the Integer Ruby's
+/// signatures declare (`Process::CLOCK_BOOTTIME_ALARM: Integer` in
+/// `rbs/core/process.rbs`; 9 on the native Linux interpreter). The CRuby
+/// tree reads it natively; Spinel, whose codegen lowers only the four,
+/// refuses it by name rather than as an unknown constant.
+fn boottime_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
         .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
         .write("lib/forker.rb", "class Forker\n  def clock\n    Process::CLOCK_BOOTTIME_ALARM\n  end\nend\n")
-        .emit(BuildTarget::Ruby);
+        .write("test/forker_test.rb", r#"require "test_helper"
+require "forker"
+class ForkerTest < ActiveSupport::TestCase
+  test "a signature-declared clock id" do
+    assert_equal 9, Forker.new.clock
+  end
+end
+"#)
+}
+
+#[test]
+fn a_signature_declared_process_clock_runs_in_emitted_ruby() {
+    boottime_app().run_test("test/models/forker_test.rb").assert_passes();
+}
+
+#[test]
+fn a_clock_spinel_does_not_lower_is_refused_there_by_name() {
+    let (_, errors) = boottime_app().emit(BuildTarget::Spinel);
     assert!(
-        errors.iter().any(|e| e.contains("Process::CLOCK_BOOTTIME_ALARM")),
-        "an unmodeled clock constant is not modeled: {errors:#?}"
+        errors.iter().any(|e| e.contains("Process::CLOCK_BOOTTIME_ALARM is CRuby's own; the spinel runtime does not define it")),
+        "{errors:#?}"
     );
+    assert!(!errors.iter().any(|e| e.contains("constant not supported (all targets)")), "{errors:#?}");
 }

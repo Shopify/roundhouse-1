@@ -1347,17 +1347,17 @@ impl<'a> BodyTyper<'a> {
                     }
                     // A value only Ruby's signatures declare: a modeled
                     // constant (`Process::CLOCK_MONOTONIC`) keeps its
-                    // model, and a class modeled with a constant table
-                    // answers for its own constants; otherwise the
-                    // declared type, gradual when the signature's type
-                    // does not map.
+                    // model; otherwise the declared type, gradual when
+                    // the signature's type does not map. A class modeled
+                    // with a constant table (the four clock ids Spinel
+                    // lowers) does not close the module: Ruby's
+                    // signatures still declare the rest of it
+                    // (`Process::WNOHANG: Integer`), which the CRuby and
+                    // JRuby trees read natively and `project` refuses by
+                    // name elsewhere.
                     Some(Some(ResolvedConstant::Value { stdlib: true, runtime, .. })) => {
-                        let closed = path.split_last().is_some_and(|(_, owner)| {
-                            !owner.is_empty() && self.classes().get(&written_class_id(owner))
-                                .is_some_and(|info| !info.constants.is_empty())
-                        });
                         match exact_modeled_class(path) {
-                            Ty::Var { .. } if !closed => {
+                            Ty::Var { .. } => {
                                 expr.decisions |= crate::expr::STDLIB_CONSTANT_REF;
                                 runtime.as_ref().map_or(Ty::Untyped, |ty| (**ty).clone())
                             }
