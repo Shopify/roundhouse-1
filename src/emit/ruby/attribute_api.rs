@@ -225,7 +225,7 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
         ColumnType::String { limit } => spec("string", limit.map(i64::from)),
         ColumnType::Text => spec("text", None),
         ColumnType::Boolean => spec("boolean", None),
-        ColumnType::Binary if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Bytea"),
+        ColumnType::Binary if pg => spec("bytea", None),
         ColumnType::Binary => spec("binary", None),
         ColumnType::Float => unported("ActiveModel::Type::Float"),
         ColumnType::Decimal { .. } if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Decimal"),

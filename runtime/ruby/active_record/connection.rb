@@ -624,6 +624,30 @@ module ActiveRecord
       nil
     end
     
+    # attribute_methods/serialization.rb's `serialize(attr_name, coder:,
+    # type:, comparable:, yaml:, **options)`, for a call the class body
+    # makes at load with an app coder. The column serializer is built at
+    # the call, as Rails builds it (Type::Serialized::Decoration, in the
+    # type port), and the column's type, the one declared with
+    # `attribute` or else the schema's, is decorated with Type::Serialized
+    # when the types are first read, as Rails' `decorate_attributes`
+    # does. As for `attribute`, a column whose
+    # compiled accessors do not consult a declared type raises
+    # NotImplementedError, and so do `attribute` options (`default:`).
+    def self.serialize(attr_name, coder: nil, type: Object, comparable: false, yaml: {}, **options)
+      name = attr_name.to_s
+      decoration = ActiveRecord::Type::Serialized::Decoration.new(self.name, attr_name, coder, type, comparable)
+      unless options.empty?
+        raise NotImplementedError, "#{self.name}.serialize(#{name.inspect}, #{options.keys.inspect}): `attribute` options on a serialized column are not ported"
+      end
+      unless _retypable_attribute_names.include?(name)
+        raise NotImplementedError, "#{self.name}.serialize(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
+      end
+      @__serialized_attributes = (@__serialized_attributes || {}).merge(name => decoration)
+      _reset_attribute_types
+      nil
+    end
+
     # The attribute names whose compiled accessors consult
     # `type_for_attribute`. Emitted models override it.
     def self._retypable_attribute_names
@@ -712,7 +736,9 @@ module ActiveRecord
     private_constant :IGNORED_COLUMNS_NONE
     
     # Read on every retypable accessor and bind, so memoized; a later
-    # `attribute` here or in a superclass clears it.
+    # `attribute` or `serialize` here or in a superclass clears it. A
+    # serialized column's decoration (Type::Serialized::Decoration) wraps
+    # the type it would otherwise have.
     def self._declared_attribute_types
       @__declared_types_memo ||= begin
         inherited = superclass.respond_to?(:_declared_attribute_types) ? superclass._declared_attribute_types : {}
@@ -720,7 +746,10 @@ module ActiveRecord
         (@__declared_attribute_types || {}).each do |n, (type, options)|
           own[n] = type.is_a?(Symbol) ? ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) : type
         end
-        inherited.merge(own)
+        types = inherited.merge(own)
+        serialized = @__serialized_attributes || {} #: Hash[String, untyped]
+        serialized.each { |n, decoration| types[n] = decoration.call(types[n] || _cast_type_for_spec(n, schema_column_types[n])) }
+        types
       end
     end
     
@@ -735,9 +764,13 @@ module ActiveRecord
     # through the declared type, as attribute.rb's FromUser / FromDatabase
     # and value_for_database do. With no type declared (the macro chose
     # not to retype the column) the value passes through as it did before.
+    # A write checks the value first (attribute.rb's `with_value_from_user`
+    # calls `assert_valid_value`): a serialized column's wrong class raises.
     def self._attribute_cast(name, value)
       type = _declared_attribute_types[name]
-      type ? type.cast(value) : value
+      return value unless type
+      type.assert_valid_value(value)
+      type.cast(value)
     end
     
     def self._attribute_deserialize(name, value)
@@ -757,6 +790,14 @@ module ActiveRecord
       type ? _bind_type_cast(name, type.serialize(type.cast(value))) : value
     end
     
+    # predicate_builder.rb's `force_equality?` test for a hash condition
+    # on a column with a declared type: true where the type compares the
+    # value whole (Type::Serialized, for its `type:` class).
+    def self._attribute_force_equality?(name, value)
+      type = _declared_attribute_types[name]
+      type ? type.force_equality?(value) : false
+    end
+
     # How the adapter sends a declared type's serialized value as a bind
     # (quoting.rb's `type_cast`): as text the column's own type then reads,
     # so a boolean or number declared over a varchar column stores and
@@ -796,6 +837,7 @@ module ActiveRecord
       when :text then ActiveRecord::Type::Text.new
       when :boolean then ActiveRecord::Type::Boolean.new
       when :binary then ActiveRecord::Type::Binary.new
+      when :bytea then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Bytea.new
       when :immutable_string then ActiveRecord::Type::ImmutableString.new
       when :value then ActiveRecord::Type::Value.new
       else

@@ -1965,7 +1965,12 @@ module ActiveRecord
       # A column of this model with a declared type (`attribute`) binds
       # what the type serializes, as Rails' QueryAttribute does.
       own = col.include?(".") ? nil : col
-      if val.is_a?(Relation)
+      if !own.nil? && @model._attribute_force_equality?(own, val)
+        # A value the declared type compares whole (a serialized column's
+        # `type:` class, an Array or a Hash): predicate_builder.rb's
+        # `force_equality?` binds it as one value, not as an IN list.
+        "#{qcol} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(own, val))}"
+      elsif val.is_a?(Relation)
         # A relation value is Rails' subquery form —
         # `where(story_id: Tagging.where(...).select(:story_id))` →
         # `story_id IN (SELECT taggings.story_id FROM taggings …)`.
