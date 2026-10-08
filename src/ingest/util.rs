@@ -434,7 +434,8 @@ fn body_has_constant_receiver_call(body: Option<Node<'_>>) -> bool {
 }
 
 /// A module that declares nothing but itself: `module Segment; end`, or a
-/// Sorbet interface with no members (`extend T::Helpers; interface!`).
+/// Sorbet interface with no members (`extend T::Helpers; interface!`,
+/// `requires_ancestor { StandardError }`).
 /// It is a type other code names (`include Segment`, `is_a?(Segment)`),
 /// so it must exist when that code loads. Shopify Core's
 /// Pagination::Ast::ReferenceFilterPathSegment and
@@ -463,6 +464,16 @@ fn is_marker_module(body: Option<Node<'_>>) -> bool {
             return true;
         }
         let Some(call) = stmt.as_call_node() else { return false };
+        // `requires_ancestor { StandardError }`: a runtime no-op (see
+        // `library_class::SORBET_ANNOTATIONS`). Hedwig's
+        // `CommandTable::FailedCommandError` is only that, and its
+        // includers' rescues name it.
+        if call.receiver().is_none() && call.arguments().is_none()
+            && constant_id_str(&call.name()) == "requires_ancestor"
+            && call.block().is_some_and(|block| block.as_block_node().is_some())
+        {
+            return true;
+        }
         if call.receiver().is_some() || call.block().is_some() {
             return false;
         }

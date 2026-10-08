@@ -80,3 +80,41 @@ fn member_less_modules_are_emitted_and_their_includers_load() {
         assert!(source.contains("module "), "{source}");
     }
 }
+
+/// Hedwig's `CommandTable::FailedCommandError` is only `extend
+/// T::Helpers; requires_ancestor { StandardError }`; its error classes
+/// include it and callers rescue by it. `requires_ancestor` takes a
+/// block, which the marker rule refused, so the module was dropped and
+/// both the include and the rescue were refused.
+const FAILURES: &str = r#"module Table
+  module FailedCommandError
+    extend T::Helpers
+
+    requires_ancestor { StandardError }
+  end
+
+  class Boom < StandardError
+    include FailedCommandError
+  end
+
+  class Lock
+    def take
+      raise Boom, "x"
+    rescue FailedCommandError => e
+      "rescued #{e.message}"
+    end
+  end
+end
+"#;
+
+#[test]
+fn a_requires_ancestor_module_is_emitted_and_rescues_its_includers() {
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("lib/table.rb", FAILURES)
+        .run_ruby("puts Table::Lock.new.take\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "rescued x\n");
+    let source = std::fs::read_to_string(run.emitted.join("app/models/table/failed_command_error.rb")).expect("module emitted");
+    assert!(!source.contains("requires_ancestor"), "{source}");
+}
