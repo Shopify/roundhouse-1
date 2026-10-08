@@ -628,6 +628,16 @@ pub struct App {
     /// (`concern_accessors::carried_included_blocks`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_included_blocks: Vec<ClassId>,
+    /// The `included do` statements a plain includer runs where its
+    /// `include` runs, keyed by the includer, each with the direct include
+    /// it runs after (the root its Concern hangs off), in the order Rails
+    /// runs them: a job's ActiveJob::Callbacks registrations
+    /// (`before_perform`, `around_enqueue`, `rescue_from`, ...;
+    /// `concern_accessors::splice_into_library_includers`). The Ruby
+    /// emitter writes each after its `include` line, where it registers in
+    /// the same order against the include hooks and the class's own body.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub included_block_statements: HashMap<ClassId, Vec<(ClassId, crate::expr::Expr)>>,
     /// Renderer view → the partial views it renders (`articles/show` →
     /// [`articles/_form`]), harvested from actual render sites as views
     /// are analyzed. The other half of the render graph that
@@ -1332,6 +1342,7 @@ impl App {
             concern_prepended_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
             carried_included_blocks: Vec::new(),
+            included_block_statements: HashMap::default(),
             render_edges: HashMap::default(),
             view_feeders: HashMap::default(),
             controller_resolutions: HashMap::default(),
