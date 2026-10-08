@@ -1225,6 +1225,8 @@ pub(crate) const MODEL_STATEMENT_CLAIMS: &[fn(&Expr) -> bool] = &[
     crate::ingest::database_ownership::claims_model_statement,
     // A reproducible `normalizes`.
     crate::lower::normalizes::claims,
+    // A reproducible `default_scope` (applied by the runtime relation).
+    crate::lower::default_scope::claims,
 ];
 
 /// `delegate :a, :b, to: :t` on `model` whose every forwarder the Ruby
@@ -1360,6 +1362,9 @@ pub fn include_callbacks_in_sti_subclasses(app: &mut crate::App) {
 /// lifecycle declarations that pass folds into hooks are claimed.
 fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut out = Vec::new();
+    // An STI subclass's own default scope is emitted on it
+    // (`lower::sti_scope`, `lower::default_scope::push_subclass_methods`).
+    let sti = crate::lower::sti_scope::sti_bases(app);
     for lc in &app.library_classes {
         if !lc.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p)) {
             continue;
@@ -1370,6 +1375,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
             if kept.iter().any(|k| std::ptr::eq(*k, call))
                 || crate::analyze::is_include_refusal(call)
                 || crate::lower::sti_subclass_callbacks::folds(call)
+                || (sti.contains_key(&lc.name) && crate::lower::default_scope::claims(call))
                 || app.models.iter().any(|m| lc.parent.as_ref() == Some(&m.name) && m.claimed_body_calls.contains(&call.span))
             {
                 continue;
@@ -2355,6 +2361,7 @@ fn build_class_info_with_finder_inputs(
     let mut info = crate::analyze::ClassInfo::default();
     info.table = Some(model.table.clone());
     info.parent = model.parent.clone();
+    info.default_scoped = crate::lower::default_scope::declares(model);
 
     // Attributes row from schema columns.
     if let Some(t) = table {

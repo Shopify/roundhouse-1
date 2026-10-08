@@ -83,6 +83,7 @@ pub mod array_ordinal;
 pub mod each_with_index;
 pub mod sti_is_a;
 pub mod dead_default;
+pub mod default_scope;
 pub mod errors_add;
 pub mod errors_full_messages;
 pub mod assoc_attr_key;

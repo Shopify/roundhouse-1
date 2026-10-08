@@ -235,8 +235,8 @@ fn rewrite_arel_inner(
         }
     }
     if let ExprNode::Send { .. } = expr.node.as_ref() {
-        if let Some((mut op, owner)) =
-            build::try_build_arel_with_assocs(expr, schema, registry, assocs)
+        if let Some((mut op, owner)) = build::try_build_arel_with_assocs(expr, schema, registry, assocs)
+            .filter(|(_, owner)| !crate::lower::default_scope::scoped_owner(registry, owner))
         {
             if ruby_read_values {
                 ruby_values::normalize(&mut op, schema);

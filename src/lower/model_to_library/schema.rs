@@ -3118,6 +3118,18 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         }
     }
 
+    // A default scope's `where` equalities, for the attributes not given
+    // (`lower::default_scope`), before the after_initialize hook sees them.
+    if crate::lower::default_scope::applies(model, models) {
+        stmts.push(Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: None,
+            method: Symbol::from("_seed_default_scope_attributes"),
+            args: vec![var_ref(attrs.clone())],
+            block: None,
+            parenthesized: true,
+        }));
+    }
+
     // `after_initialize` tail — Rails fires the hook after construction
     // (and after find; the hydration factories append their own call,
     // after the columns are set). Runs LAST so the hook observes the

@@ -59,7 +59,9 @@ module ActiveRecord
     EXISTS_ANY_ROW = Object.new.freeze
     private_constant :EXISTS_ANY_ROW
 
-    def initialize(model)
+    # `default_scoped` false is `Model.unscoped`: the class's
+    # `default_scope` (Base#_apply_default_scope) is not applied.
+    def initialize(model, default_scoped = true)
       @model = model
       @table = model._table_sql
       @wheres = []
@@ -78,6 +80,49 @@ module ActiveRecord
       @from = nil
       @ctes = []
       @shared_lists = false
+      @default_scoped = default_scoped
+      model._apply_default_scope(self) if default_scoped && model._default_scope_applies?
+    end
+
+    # Rails' `Relation#unscoped`: the model's relation with nothing
+    # applied, its default scope included.
+    def unscoped
+      ActiveRecord::Relation.new(@model, false)
+    end
+
+    # `extending(Mod)`: Mod's methods answer on this relation (and its
+    # spawns: `clone` keeps the singleton class), ahead of Relation's own,
+    # so an override's `super` reaches the Relation method. A model's
+    # `default_scope { extending(Mod) }` puts it on every relation.
+    def extending(*modules)
+      modules.each { |mod| self.extend(mod) }
+      self
+    end
+
+    # Rails' `Relation#new` / `build` / `create` / `create!`: a record of
+    # the model with the relation's scope attributes, under the
+    # relation's default scoping (an unscoped relation's record gets no
+    # default-scope attributes).
+    def new(attrs = {})
+      merged = @scope_attributes.empty? ? attrs : @scope_attributes.merge(attrs)
+      return @model.new(merged) if @default_scoped
+      @model.unscoped { @model.new(merged) }
+    end
+
+    def build(attrs = {})
+      new(attrs)
+    end
+
+    def create(attrs = {})
+      record = new(attrs)
+      record.save
+      record
+    end
+
+    def create!(attrs = {})
+      record = new(attrs)
+      raise RecordInvalid, record unless record.save
+      record
     end
 
     # Rails' `Relation#spawn`: a new relation that shares this one's

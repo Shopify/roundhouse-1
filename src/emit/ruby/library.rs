@@ -1741,6 +1741,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 &models,
                 &assocs,
             );
+            crate::lower::default_scope::push_methods(&mut lc.methods, model);
         }
         // User-written class methods the registry admitted as
         // relation-taking (`def self.arrange_for_user` with bare

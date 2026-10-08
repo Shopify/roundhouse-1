@@ -258,6 +258,11 @@ pub struct ClassInfo {
     /// singleton's ancestors, where a `class << self` body looks a
     /// constant up after its lexical scopes.
     pub extends: Vec<crate::ident::ClassId>,
+    /// The model declares a `default_scope` that `lower::default_scope`
+    /// reproduces at runtime: the arel pass leaves its queries (and its
+    /// STI subclasses', found through `parent`) on the runtime relation,
+    /// which applies the scope.
+    pub default_scoped: bool,
     /// Declared by a gem's RBI rather than by the app or the catalog
     /// (`crate::gem_boundary`). Its own table is the gem's whole
     /// declared surface, so a miss on the class itself is a real miss --
