@@ -3109,10 +3109,15 @@ pub(crate) fn rewrite(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option
             m
         }
         ExprNode::Send { .. } => {
+            // `rewrite_send` writes a fresh `Expr` over the send. When the
+            // send is a keyword argument of the call around it, the slot's
+            // keyword marks have to survive that.
+            let slot = crate::lower::keyword_marks::SlotMarks::of(expr);
             let model = rewrite_send(expr, ctx, locals);
             crate::lower::relation_counted_terminal::rewrite_count_gt_when(expr, |rel| {
                 is_relation_expr(rel, ctx, locals)
             });
+            slot.restore(expr);
             model
         }
         _ => {

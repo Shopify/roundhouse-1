@@ -2180,6 +2180,62 @@ fn collect_asset_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>)
     }
 }
 
+/// One emitted Ruby file that Prism rejects: its path, the 1-based line
+/// of the first syntax error, and Prism's message for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnparsableRuby {
+    pub path: String,
+    pub line: usize,
+    pub message: String,
+}
+
+/// Every emitted Ruby source of a ruby-family tree that does not parse.
+///
+/// The emitter writes Ruby text, so a defect anywhere in a lowering can
+/// leave a file Ruby refuses to load: a keyword argument that lost its
+/// label (`f(a, path: p, g(x))`), a brace block on a call without
+/// parentheses. Nothing between the emitter and the boot looked at the
+/// text as Ruby. `--allow-unsupported` writes the output anyway, so the
+/// first sign was a `SyntaxError` when the booted app required the file.
+///
+/// Prism parses the same grammar CRuby does. Sources are `.rb`, `.ru`
+/// and `.rake` files; another target's output is not Ruby and returns
+/// nothing. Files are parsed on all cores, because a Core emit writes
+/// about 140k of them.
+pub fn unparsable_ruby_files(files: &[(String, String)], target: BuildTarget) -> Vec<UnparsableRuby> {
+    if !matches!(
+        target,
+        BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda
+    ) {
+        return Vec::new();
+    }
+    let ruby: Vec<&(String, String)> = files
+        .iter()
+        .filter(|(path, _)| [".rb", ".ru", ".rake"].iter().any(|ext| path.ends_with(ext)))
+        .collect();
+    let first_error = |(path, content): &(String, String)| -> Option<UnparsableRuby> {
+        let parsed = ruby_prism::parse(content.as_bytes());
+        let error = parsed.errors().next()?;
+        let offset = error.location().start_offset().min(content.len());
+        Some(UnparsableRuby {
+            path: path.clone(),
+            line: content.as_bytes()[..offset].iter().filter(|b| **b == b'\n').count() + 1,
+            message: error.message().to_string(),
+        })
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(32);
+    let chunk = ruby.len().div_ceil(workers).max(1);
+    let mut bad: Vec<UnparsableRuby> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ruby
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().filter_map(|f| first_error(f)).collect::<Vec<_>>()))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().expect("prism parse worker")).collect()
+    });
+    bad.sort_by(|a, b| a.path.cmp(&b.path));
+    bad
+}
+
 /// Write `files` to `dest` — each entry's path is taken relative to
 /// `dest`, parent dirs created as needed. Used by the `--target LANG`
 /// mode of the `roundhouse` binary. Identical files are left untouched
