@@ -653,7 +653,8 @@ impl<'s, 'a> Walk<'s, 'a> {
 /// The verdicts on `model`'s body statements that call app class macros,
 /// extend app modules or write `belongs_to_required_by_default`, by item.
 pub(crate) fn model_macro_verdicts<'a>(model: &'a Model, app: &'a crate::App) -> Vec<(&'a Expr, MacroVerdict)> {
-    let callbacks = super::callback_dsl_calls(model, &app.models);
+    let mut callbacks = super::callback_dsl_calls(model, &app.models);
+    callbacks.extend(super::gem_port_macro_calls(model, &app.models));
     let side = ClassSide::of_model(model, app);
     model
         .body

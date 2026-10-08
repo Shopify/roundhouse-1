@@ -594,6 +594,7 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
     // mixins as the base's include is, and keeps those calls in body
     // order beside its prepends.
     let callbacks = callback_dsl_calls(model, models);
+    let port_macros = gem_port_macro_calls(model, models);
     let mut includes = crate::analyze::model_includes(model);
     let module = ClassId(Symbol::from("ActiveSupport::Callbacks"));
     if !callbacks.is_empty() && !includes.contains(&module) {
@@ -606,7 +607,11 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
             crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
         })
-        .filter(|expr| is_constant_prepend(expr) || callbacks.iter().any(|c| std::ptr::eq(*c, *expr)))
+        .filter(|expr| {
+            is_constant_prepend(expr)
+                || callbacks.iter().any(|c| std::ptr::eq(*c, *expr))
+                || port_macros.iter().any(|c| std::ptr::eq(*c, *expr))
+        })
         .cloned()
         .collect();
     LibraryClass {
@@ -844,6 +849,7 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
 
     let (models, schema) = (&app.models, &app.schema);
     let callbacks = callback_dsl_calls(model, models);
+    let port_macros = gem_port_macro_calls(model, models);
     let macros = macro_replay::model_macro_verdicts(model, app);
     let mut out = Vec::new();
     for item in &model.body {
@@ -878,6 +884,12 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // lowered class by `model_class` and replayed through the
         // runtime port (`emit::ruby::library::model_callback_calls`).
         if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
+            continue;
+        }
+        // A class macro a gem runtime port's mixin gives the model
+        // (`database_documentation do ... end`): carried by `model_class`
+        // and replayed through the port.
+        if port_macros.iter().any(|c| std::ptr::eq(*c, expr)) {
             continue;
         }
         // A `delegate` ingest left because its names are called with
@@ -1196,6 +1208,56 @@ pub(crate) fn claimed_in_model(_model: &Model, expr: &Expr) -> bool {
 /// `reset_callbacks`, …).
 fn callbacks_port_methods() -> &'static [String] {
     crate::analyze::runtime_reads::mixed_in_class_methods("ActiveSupport::Callbacks").unwrap_or(&[])
+}
+
+/// The body calls (bare or `self.`) of a class method that a module a
+/// gem runtime port declares gives the model through its `ClassMethods`
+/// (`runtime_reads::mixed_in_class_methods`), where the model or an app
+/// model ancestor includes that module: Core's 230 `database_documentation
+/// do |dd| ... end` under `include
+/// DatabaseDocumentation::ModelMetadata::Metadata`. `model_class` carries
+/// them into the lowered class beside the include, and the Ruby family
+/// replays them through the port (`emit::ruby::library::
+/// runtime_mixin_macro_calls`) in body order; a tree without the port
+/// file refuses the include. A class method of the model's own, or an
+/// ancestor's, of the same name answers instead, so its call is not one.
+pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Vec<&'a Expr> {
+    let mut chain: Vec<&Model> = vec![model];
+    while let Some(parent) = chain.last().and_then(|m| m.parent.as_ref()) {
+        match models.iter().find(|m| &m.name == parent) {
+            Some(next) if !chain.iter().any(|seen| seen.name == next.name) => chain.push(next),
+            _ => break,
+        }
+    }
+    let app_module = |name: &ClassId| models.iter().any(|m| &m.name == name);
+    let provided: Vec<&str> = chain
+        .iter()
+        .flat_map(|m| crate::analyze::model_includes(m))
+        .filter(|module| !app_module(module) && crate::project::gem_port_declaring(module.0.as_str()).is_some())
+        .filter_map(|module| crate::analyze::runtime_reads::mixed_in_class_methods(module.0.as_str()))
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    if provided.is_empty() {
+        return Vec::new();
+    }
+    let own_class_method = |name: &str| {
+        chain.iter().any(|m| m.methods().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == name))
+    };
+    model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .filter(|expr| {
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { return false };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && provided.contains(&method.as_str())
+                && !own_class_method(method.as_str())
+        })
+        .collect()
 }
 
 /// An STI subclass (a library class whose superclass is a model) that

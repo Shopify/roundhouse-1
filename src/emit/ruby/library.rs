@@ -7992,7 +7992,22 @@ fn emit_library_class_decl_inner(
         let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
         let carried = carried_class_macro_calls(lc, app);
         let wraps_own = |e: &Expr| carried.iter().any(|c| std::ptr::eq(*c, e)) && names_own_method(lc, e);
-        let at = body_effects.iter().position(|e| own.runs(e) || wraps_own(e)).unwrap_or(body_effects.len());
+        // A gem port's class macro on a model (`database_documentation do
+        // ... end` reads `table_name`, which Active Record answers in the
+        // class body and the lowered model defines among its methods).
+        let port_macros: Vec<crate::span::Span> = app
+            .models
+            .iter()
+            .find(|m| m.name == lc.name)
+            .map(|m| {
+                crate::lower::model_to_library::gem_port_macro_calls(m, &app.models).iter().map(|c| c.span).collect()
+            })
+            .unwrap_or_default();
+        let port_macro = |e: &Expr| e.span != crate::span::Span::synthetic() && port_macros.contains(&e.span);
+        let at = body_effects
+            .iter()
+            .position(|e| own.runs(e) || wraps_own(e) || port_macro(e))
+            .unwrap_or(body_effects.len());
         body_effects.split_off(at)
     };
     // A carried railtie's body: its locals first (a statement's block
@@ -9274,18 +9289,23 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
 /// what the class then asks of itself, and the tree that carries the port
 /// loads it before any app file (runtime/gem_facades.rb).
 fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
-    let port_module = |written: &str| -> Option<&'static str> {
+    // A gated port module, or one a gem runtime port declares
+    // (database_documentation's `ModelMetadata::Metadata`).
+    let port_module = |written: &str| -> bool {
         let name = written.trim_start_matches("::");
-        if app.library_classes.iter().any(|own| own.name.0.as_str() == name) {
-            return None;
+        if app.library_classes.iter().any(|own| own.name.0.as_str() == name)
+            || app.models.iter().any(|own| own.name.0.as_str() == name)
+        {
+            return false;
         }
-        crate::analyze::runtime_reads::ruby_family_runtime_names().get_key_value(name).map(|(k, _)| k.as_str())
+        crate::analyze::runtime_reads::ruby_family_runtime_names().contains_key(name)
+            || crate::project::gem_port_declaring(name).is_some()
     };
     let provided = |c: &LibraryClass| -> Vec<&'static str> {
         c.includes
             .iter()
-            .filter_map(|inc| port_module(inc.0.as_str()))
-            .filter_map(crate::analyze::runtime_reads::mixed_in_class_methods)
+            .filter(|inc| port_module(inc.0.as_str()))
+            .filter_map(|inc| crate::analyze::runtime_reads::mixed_in_class_methods(inc.0.as_str().trim_start_matches("::")))
             .flatten()
             .map(String::as_str)
             .collect()
@@ -9300,7 +9320,10 @@ fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Exp
             && !args.is_empty()
             && args.iter().all(|a| match &*a.node {
                 ExprNode::Const { path } => {
-                    port_module(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")).is_some()
+                    let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+                    port_module(&name)
+                        && crate::analyze::runtime_reads::ruby_family_runtime_names()
+                            .contains_key(name.trim_start_matches("::"))
                 }
                 _ => false,
             })

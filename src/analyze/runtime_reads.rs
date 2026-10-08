@@ -338,7 +338,9 @@ pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> 
             }
         }
         let mut carriers = Carriers(Vec::new(), HashMap::default(), Vec::new(), HashSet::default());
-        for (source, _) in RUBY_FAMILY_RUNTIME {
+        // And the gem runtime ports' (database_documentation's
+        // `ModelMetadata::Metadata::ClassMethods`).
+        for source in RUBY_FAMILY_RUNTIME.iter().map(|(source, _)| *source).chain(crate::project::gem_port_sources()) {
             let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
             let parsed = ruby_prism::parse(text.as_bytes());
             if parsed.errors().next().is_none() {

@@ -3812,6 +3812,19 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ),
         ));
     }
+    // `require "database_documentation"` (Core's privacy initializer
+    // makes it) answers from the port, whichever gem or file makes it.
+    for (gem, stem) in BUNDLER_REQUIRED_GEM_PORTS {
+        files.push((
+            format!("runtime/features/{gem}.rb"),
+            format!(
+                "# `require {gem:?}` on this tree: the gem's runtime port\n\
+                 # (runtime/{stem}.rb). runtime/gem_facades.rb puts this directory\n\
+                 # first on the load path.\n\
+                 require_relative \"../{stem}\"\n"
+            ),
+        ));
+    }
     // Rails::Railtie (railties 8.2.0.alpha), the feature `rails/railtie`
     // answers on this tree: a gem's optional railtie (hashie 5.0.0's
     // `require 'rails/railtie' if defined?(::Rails)`) defines against
@@ -3897,6 +3910,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         ));
     }
     let port_requires = semian_port_requires(app);
+    let bundled_ports = bundler_required_gem_ports(app);
     // ActiveSupport.on_load / run_load_hooks (activesupport 8.1.4), for the
     // initializer hooks boot registers (`load_hook_registrations`) and the
     // adapter-load point `DatabaseConfiguration.configure!` fires.
@@ -4019,6 +4033,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 content.push_str(&format!(
                     "\n# `require {feature:?}`, which the app's code (or a gem source) makes at load:\n\
                      # semian's own file, ported over runtime/semian.rb, never the gem's.\n\
+                     require_relative {stem:?}\n"
+                ));
+            }
+            for (gem, stem) in &bundled_ports {
+                content.push_str(&format!(
+                    "\n# The app's Bundler.require of the {gem} gem: its runtime port\n\
+                     # (project.rs::BUNDLER_REQUIRED_GEM_PORTS), never the gem's own Ruby.\n\
                      require_relative {stem:?}\n"
                 ));
             }
@@ -10427,7 +10448,6 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("shopify-i18n", "requiring it loads 52 Rails framework files"),
     ("country_db", "requiring it loads 35 Rails framework files"),
     ("shopify_spanner", "it registers `ActiveSupport.on_load` hooks (:active_record)"),
-    ("database_documentation", "requiring it loads 57 Rails framework files"),
     ("courier", "requiring it loads 65 Rails framework files"),
     ("sequenced_column", "requiring it loads 28 Rails framework files"),
     ("paypal_ruby", "requiring it loads 168 Rails framework files"),
@@ -10464,17 +10484,47 @@ pub(crate) fn gem_requires_rails(gem: &str) -> Option<&'static str> {
 /// Not ports in this sense: concurrent.rb and web_push.rb stand in for
 /// loaded gems on Spinel only, and typed_store.rb and
 /// global_id_locator.rb back lowered DSLs, not the gems' constants.
-const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[(
-    "semian",
-    &[
-        ("runtime/spinel/semian.rb", "runtime/semian.rb"),
-        // lib/semian/adapter.rb, which both adapters share.
-        ("runtime/spinel/semian_adapter.rb", "runtime/semian_adapter.rb"),
-        ("runtime/spinel/semian_activerecord_postgresql_adapter.rb", "runtime/semian_activerecord_postgresql_adapter.rb"),
-        // `require "semian/net_http"`.
-        ("runtime/spinel/semian_net_http.rb", "runtime/semian_net_http.rb"),
-    ],
-)];
+const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "semian",
+        &[
+            ("runtime/spinel/semian.rb", "runtime/semian.rb"),
+            // lib/semian/adapter.rb, which both adapters share.
+            ("runtime/spinel/semian_adapter.rb", "runtime/semian_adapter.rb"),
+            ("runtime/spinel/semian_activerecord_postgresql_adapter.rb", "runtime/semian_activerecord_postgresql_adapter.rb"),
+            // `require "semian/net_http"`.
+            ("runtime/spinel/semian_net_http.rb", "runtime/semian_net_http.rb"),
+        ],
+    ),
+    // database_documentation 3.2.0's model metadata: the
+    // `include DatabaseDocumentation::ModelMetadata::Metadata` concern,
+    // its `database_documentation` / `annotate` / `metadata` macros (which
+    // only record an annotation), its Datatypes and its configuration.
+    // The gem loads through zeitwerk and ActiveSupport.
+    ("database_documentation", &[("runtime/spinel/database_documentation.rb", "runtime/database_documentation.rb")]),
+];
+
+/// Gems a `GEM_RUNTIME_PORTS` port stands in for that the app's
+/// Bundler.require loads (a Gemfile line without `require: false`), with
+/// the port file runtime/gem_facades.rb requires where Bundler.require
+/// would have loaded the gem, and the feature `require "<gem>"` answers
+/// from runtime/features. semian is not here: the app requires its
+/// features itself (`semian_port_requires`).
+const BUNDLER_REQUIRED_GEM_PORTS: &[(&str, &str)] = &[("database_documentation", "database_documentation")];
+
+/// The [`BUNDLER_REQUIRED_GEM_PORTS`] the app's Gemfile Bundler.requires
+/// in the test environment.
+fn bundler_required_gem_ports(app: &App) -> Vec<(&'static str, &'static str)> {
+    BUNDLER_REQUIRED_GEM_PORTS
+        .iter()
+        .copied()
+        .filter(|(gem, _)| {
+            app.bundler_gems.iter().any(|g| {
+                g.name == *gem && (g.envs.is_empty() || g.envs.iter().any(|e| e == "test"))
+            })
+        })
+        .collect()
+}
 
 /// Gem ports the CRuby overlay carries on every CRuby tree
 /// (`ruby_overlay/boot.rb` requires them), in `GEM_RUNTIME_PORTS`' shape:
@@ -10485,6 +10535,11 @@ const OVERLAY_GEM_PORTS: &[(&str, &[(&str, &str)])] =
 
 fn gem_ports() -> impl Iterator<Item = &'static (&'static str, &'static [(&'static str, &'static str)])> {
     GEM_RUNTIME_PORTS.iter().chain(OVERLAY_GEM_PORTS)
+}
+
+/// Every gem runtime port file, by source path (`runtime/spinel/...`).
+pub(crate) fn gem_port_sources() -> impl Iterator<Item = &'static str> {
+    gem_ports().flat_map(|(_, ports)| ports.iter().map(|(source, _)| *source))
 }
 
 /// The finished-tree path of `gem`'s runtime port files.
