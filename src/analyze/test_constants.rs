@@ -23,6 +23,8 @@
 //!   exactly that name reaches the hoisted class unless an app namespace
 //!   of the same name is found first from the test's modules, or is
 //!   reopened by the hoist (`Shop::Late` for `module Shop`, `Late`).
+//!   A qualified read whose first segment is such a class reaches what
+//!   that class nests (`Local::Kind`), hoisted with it.
 
 use crate::det::HashSet;
 use std::sync::OnceLock;
@@ -137,7 +139,14 @@ fn collect(expr: &Expr, scope: &Scope<'_>, app_namespace: &dyn Fn(&str) -> bool,
                 if harness && construct.as_str() == "constant" {
                     out.harness.push((expr.span, written.join("::")));
                 }
-                harness
+                // `TestClass::Subclass`, both declared in the test body:
+                // the first segment binds to the hoisted class, which
+                // carries the rest under the same path.
+                let hoisted = !rooted
+                    && written.len() > 1
+                    && scope.reaches_hoisted(written[0], app_namespace)
+                    && scope.hoisted.contains(&written.join("::").as_str());
+                harness || hoisted
             }
             _ => false,
         };

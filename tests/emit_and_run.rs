@@ -9628,3 +9628,48 @@ fn same_named_classes_in_two_test_support_classes_stay_apart() {
         }
     }
 }
+
+/// A test file's top-level helper class nesting others (Core's
+/// `discount_code_api_test.rb`: `class PriceRule; class DiscountCode <
+/// Base`). The test ingest read the helper and dropped what it nests
+/// without a word, so the test died on `PriceRule::DiscountCode`. Each
+/// nested class or module comes along under its qualified name, nested
+/// in a reopen of its outer class with that class's own parent; so does
+/// what a class in the test class's own body nests (`Local::Kind`).
+#[test]
+fn a_test_file_helper_class_carries_its_nested_classes() {
+    use roundhouse::project::BuildTarget;
+    const HELPERS: &str = "class Rule\n  def label\n    \"rule\"\n  end\nend\n\nclass PriceRule < Rule\n  def self.code(value)\n    DiscountCode.lookup(value)\n  end\n\n  class DiscountCode < Rule\n    class << self\n      def lookup(value)\n        [:code, value]\n      end\n    end\n  end\n\n  class Batch\n    module Codes\n      def self.size\n        3\n      end\n    end\n\n    def label\n      [:batch, Codes.size]\n    end\n  end\nend\n";
+    const LOCAL: &str = "  class Local\n    class Kind\n      def self.tag\n        :kind\n      end\n    end\n  end\n";
+    let script = "p [PriceRuleTest::Local::Kind.tag, PriceRule.code(7), PriceRule::DiscountCode.lookup(8), PriceRule::DiscountCode.new.label, PriceRule::Batch.new.label, PriceRule::Batch::Codes.size, PriceRule.superclass, PriceRule::DiscountCode.superclass]";
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{HELPERS}\nclass PriceRuleTest\n{LOCAL}end\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "[:kind, [:code, 7], [:code, 8], \"rule\", [:batch, 3], 3, Rule, Rule]\n"
+    );
+    let test = format!(
+        "require \"test_helper\"\n\n{HELPERS}\nclass PriceRuleTest < ActiveSupport::TestCase\n{LOCAL}\n  test \"nested helper classes come along\" do\n    assert_equal :kind, Local::Kind.tag\n    assert_equal [:code, 7], PriceRule.code(7)\n    assert_equal [:code, 8], PriceRule::DiscountCode.lookup(8)\n    assert_equal \"rule\", PriceRule::DiscountCode.new.label\n    assert_equal [:batch, 3], PriceRule::Batch.new.label\n    assert_equal 3, PriceRule::Batch::Codes.size\n    assert_equal Rule, PriceRule.superclass\n    assert_equal Rule, PriceRule::DiscountCode.superclass\n  end\nend\n"
+    );
+    let app = || {
+        emit_and_run::empty_app()
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/price_rule_test.rb", &test)
+    };
+    let (_, errors) = app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    app().run_test("test/models/price_rule_test.rb").assert_passes();
+    for target in [BuildTarget::Typescript, BuildTarget::Crystal] {
+        let (_, errors) = app().emit(target);
+        for class in ["PriceRule::DiscountCode", "PriceRule::Batch"] {
+            assert!(
+                errors.iter().any(|e| e.contains("namespaced class in a test-support class") && e.contains(class)),
+                "{target:?} {class}: {errors:?}"
+            );
+        }
+    }
+}

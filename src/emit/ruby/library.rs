@@ -8000,8 +8000,27 @@ fn emit_library_class_decl_inner(
     // `Opengraph::Fetch::RedirectDeniedError` nests inside the CLASS
     // `Opengraph::Fetch`, and looking up a bare `Fetch` finds nothing
     // ("Fetch is not a module" at load).
+    //
+    // A test file's helper class nesting another (`class PriceRule;
+    // class DiscountCode`) is no app class, but the test file splices
+    // `class PriceRule` just above `PriceRule::DiscountCode`: its outer
+    // segment reopens that class, with the parent it was written with.
+    let test_siblings: &[LibraryClass] = app
+        .test_modules
+        .iter()
+        .find(|t| t.inner_classes.iter().any(|c| c.name == lc.name))
+        .map_or(&[], |t| t.inner_classes.as_slice());
     let outer_header = |i: usize, seg: &str| {
         let qualified = segments[..=i].join("::");
+        if let Some(sibling) = test_siblings.iter().find(|c| !c.is_module && c.name.0.as_str() == qualified) {
+            return match sibling.parent.as_ref() {
+                Some(p) => format!(
+                    "class {seg} < {}",
+                    lexically_qualified(&written_parent(sibling, p, app), &segments[..i], app)
+                ),
+                None => format!("class {seg}"),
+            };
+        }
         let parent = outer_class_parent(&qualified, app);
         match (is_app_class(&qualified, app), parent) {
             (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app)),

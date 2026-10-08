@@ -189,6 +189,18 @@ fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> I
     declared_classes_in(node, file, before, &[])
 }
 
+/// Every class and module the declaration `node` makes, itself and
+/// what it nests, as library classes scoped under `outer`: a test
+/// file's helper class carries its nested classes this way
+/// (`ingest::test`).
+pub(super) fn declared_classes_under(
+    node: &ruby_prism::Node<'_>,
+    file: &str,
+    outer: &[String],
+) -> IngestResult<Vec<LibraryClass>> {
+    declared_classes_in(node, file, usize::MAX, outer)
+}
+
 /// [`declared_classes`] for `node` written inside the body of `outer`
 /// (its qualified segments): a declaration in a load-time conditional
 /// of that body (`ConditionalArm::declarations`).
