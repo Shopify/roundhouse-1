@@ -1051,8 +1051,8 @@ fn unmodeled_validates_options_are_check_errors() {
 
   validates :code, uniqueness: true
   validates :seats, numericality: { only_numeric: true }
-  validates :email, presence: true, strict: true
-  validates :kind, comparison: { greater_than: -> { minimum } }
+  validates :email, presence: true, strict: :loud
+  validates :kind, comparison: { greater_than: -> { @minimum } }
   validates :note, length: { in: SPAN.to_a }
   validates :email, format: { with: /^x/ }
   validates :seats, numericality: { greater_than: 0, message: "must exceed %{count}" }
@@ -1066,8 +1066,8 @@ end
     for expected in [
         "`validates uniqueness:` not supported (all targets): on `code`, a uniqueness check on a class outside ActiveRecord",
         "`validates numericality:` not supported (all targets): on `seats`, `only_numeric:`",
-        "`validates presence:` not supported (all targets): on `email`, `strict:`",
-        "`validates comparison:` not supported (all targets): on `kind`, `greater_than:` lambda that reads `self`",
+        "`validates presence:` not supported (all targets): on `email`, `strict:` that is not `true`, `false`, `nil` or an exception class constant",
+        "`validates comparison:` not supported (all targets): on `kind`, `greater_than:` lambda that reads an instance variable of the class",
         "`validates length:` not supported (all targets): on `note`, `in:` that is not a Range literal or a constant",
         "`validates format:` not supported (all targets): on `email`, a regexp with a `^`/`$` anchor",
         "`validates numericality:` not supported (all targets): on `seats`, a `message:` interpolating %{count}",

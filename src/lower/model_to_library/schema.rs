@@ -2868,6 +2868,41 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
         }
     }
 
+    // `attr_accessor` / `attr_writer` virtuals: `Order.new(terms: "1")`
+    // assigns through the writer in Rails (`assign_attributes` sends
+    // `terms=` for every key), as the synthesized `update` does; the
+    // column loop above only knows the table. A name that is also a
+    // column or a `belongs_to` was assigned there.
+    let mut declared_virtuals: Vec<Symbol> = Vec::new();
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { continue };
+        if !matches!(method.as_str(), "attr_accessor" | "attr_writer") {
+            continue;
+        }
+        for arg in args {
+            let ExprNode::Lit { value: Literal::Sym { value } } = &*arg.node else { continue };
+            let assigned = table.columns.iter().any(|c| &c.name == value)
+                || model.associations().any(|a| matches!(a, Association::BelongsTo { name, .. } if name == value));
+            if !assigned && !declared_virtuals.contains(value) {
+                declared_virtuals.push(value.clone());
+            }
+        }
+    }
+    for field in declared_virtuals {
+        let lookup = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(var_ref(attrs.clone())),
+                method: Symbol::from("[]"),
+                args: vec![lit_sym(field.clone())],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        stmts.push(assign_via_writer_unless_nil(Symbol::from(format!("{}=", field.as_str())), lookup));
+    }
+
     // has_secure_password virtual attrs: `User.new(password: "...",
     // password_confirmation: "...")` is the factory/signup shape —
     // Rails routes them through the macro's plaintext writers (where

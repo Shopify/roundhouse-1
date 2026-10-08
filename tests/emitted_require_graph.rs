@@ -251,7 +251,7 @@ fn ruby_family_runtime_constants_are_ledgered_on_other_targets() {
   def show
     begin
       head :ok
-    rescue ActionController::UnpermittedParameters, ActionView::MissingTemplate
+    rescue ActionController::UnpermittedParameters, ActionView::MissingTemplate, ActiveModel::StrictValidationFailed
       head :not_found
     end
   end

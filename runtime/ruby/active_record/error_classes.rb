@@ -330,3 +330,12 @@ module ActiveRecord
     end
   end
 end
+
+# activemodel 8.2.0.alpha errors.rb: what a strict validation
+# (`validates ..., strict: true`, `validates!`) raises with the error's
+# full message, from `Errors#add`. The validations lowering writes the
+# raise (`lower::model_to_library::validations`).
+module ActiveModel
+  class StrictValidationFailed < StandardError
+  end
+end

@@ -663,6 +663,13 @@ pub enum ValidationRule {
     /// `comparison:`: each check in the order the options were written,
     /// its bound resolved per run (a value, a Symbol method, a Proc).
     Comparison { checks: Vec<NumericCheck> },
+    /// `acceptance:`: the value must be one of `accept` (Rails'
+    /// `Array(options[:accept]).include?(value)`, `["1", true]` unless
+    /// given). ActiveModel's defaults make a nil value exempt
+    /// (`allow_nil: true`), which ingest folds into the rule's options.
+    /// An attribute the class does not otherwise read or write is a
+    /// virtual one ActiveModel defines on the declaring class.
+    Acceptance { accept: Expr },
     /// A rule under the options every `validates` validator takes:
     /// `allow_nil:` / `allow_blank:` skip it for such a value, `message:`
     /// replaces its error text, and Symbol `if:` / `unless:` guard it.
@@ -755,6 +762,12 @@ pub enum RuleValue {
     /// A lambda / proc literal, called with the record when it takes a
     /// parameter, with nothing otherwise.
     Call { callable: Expr, with_record: bool },
+    /// An `Expr` or `Call` that reads `self`, which is the DECLARING
+    /// CLASS where ActiveModel evaluates it: a class-body expression
+    /// (`in: statuses.keys`) or a lambda `resolve_value` calls
+    /// (`-> { minimum }`). The validations lowering binds it to that
+    /// class (its `Declarer`) before resolving it.
+    ClassScoped { value: Box<RuleValue> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -833,6 +846,11 @@ pub struct RuleOptions {
     /// to the front of the chain, ahead of the ones declared before it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prepend: bool,
+    /// `strict:` (or `validates!`): the exception class a failing check
+    /// raises with the error's full message instead of adding the error
+    /// (`ActiveModel::StrictValidationFailed` for `strict: true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<Expr>,
 }
 
 /// ActiveModel's and ActiveRecord's English error messages (their
