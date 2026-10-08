@@ -257,6 +257,28 @@ impl World {
         Some(out)
     }
 
+    /// The runtime declares instance method `method` on namespace `name`:
+    /// in its own body, or in a module it prepends or includes there
+    /// (followed through the runtime's own modules). A name the runtime
+    /// writes but that does not resolve may declare anything; a core or
+    /// stdlib module mixed in declares only core methods, whose ABI is
+    /// native.
+    fn runtime_declares_method<'w>(&'w self, name: &'w str, method: &str, seen: &mut HashSet<&'w str>) -> bool {
+        if !seen.insert(name) {
+            return false;
+        }
+        if let Some(target) = self.aliases.get(name) {
+            return target.as_deref().is_none_or(|target| self.runtime_declares_method(target, method, seen));
+        }
+        let Some(namespace) = self.runtime.get(name) else { return false };
+        namespace.methods.contains(method)
+            || namespace
+                .prepends
+                .iter()
+                .chain(&namespace.includes)
+                .any(|module| module.as_deref().is_none_or(|module| self.runtime_declares_method(module, method, seen)))
+    }
+
     /// The lookup of instance method `method` through `name`, entered as a
     /// superclass (`as_superclass`) or as a mixed-in module.
     /// `app_reopens(namespace, method)` answers whether the app declares
@@ -323,13 +345,15 @@ impl World {
             };
         }
         if self.stdlib.contains(name) {
-            // The runtime reopens no namespace on the way (it would be in
-            // `runtime`, and refused); the app may.
+            // A namespace on the way that the runtime or the app reopens
+            // with `method` (declared there, or in a module it mixes in)
+            // is refused; a reopening that does not touch `method`
+            // (runtime/spinel/active_support_tryable.rb's `class Object;
+            // include ActiveSupport::Tryable`) leaves the core lookup as is.
             let Some(ancestry) = self.core_ancestry(name) else { return Step::Refuse };
-            if ancestry
-                .iter()
-                .any(|ancestor| self.runtime.contains_key(ancestor) || app_reopens(ancestor, method))
-            {
+            if ancestry.iter().any(|ancestor| {
+                self.runtime_declares_method(ancestor, method, &mut HashSet::default()) || app_reopens(ancestor, method)
+            }) {
                 return Step::Refuse;
             }
             // A core class's ancestry is core; a core module may or may not
@@ -566,6 +590,11 @@ mod tests {
         assert_eq!(world.through("StandardError", "initialize", true, &none), Step::Bound);
         assert_eq!(world.through("StandardError", "initialize", true, &initialize_reopened), Step::Refuse);
         assert_eq!(world.through("Comparable", "initialize", false, &none), Step::Continue);
+        // runtime/spinel/active_support_tryable.rb reopens Object to
+        // include ActiveSupport::Tryable: `try` is the runtime's there,
+        // and every other core method stays the interpreter's.
+        assert_eq!(world.through("StandardError", "try", true, &none), Step::Refuse);
+        assert_eq!(world.through("StandardError", "method_missing", true, &none), Step::Bound);
         // A port's constant alias of its own class.
         assert_eq!(world.through("ActiveRecord::Type::Value", "deserialize", true, &none), Step::Bound);
         // Neither the runtime nor Ruby declares it.
