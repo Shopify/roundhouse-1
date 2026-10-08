@@ -47,6 +47,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_deprecation.rb", "runtime/active_support_deprecation.rb"),
     ("runtime/spinel/active_job_errors.rb", "runtime/active_job_errors.rb"),
     ("runtime/spinel/active_support_tryable.rb", "runtime/active_support_tryable.rb"),
+    ("runtime/spinel/action_dispatch_session_store.rb", "runtime/action_dispatch_session_store.rb"),
+    ("runtime/spinel/action_dispatch_show_exceptions.rb", "runtime/action_dispatch_show_exceptions.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
@@ -57,9 +59,12 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
 /// Shared runtime every target carries: `active_support_ext.rb` stands
 /// `ActiveSupport::MessageVerifier::InvalidSignature` in for a signed-id
 /// rescue, and `security_utils.rb` answers
-/// `ActiveSupport::SecurityUtils.secure_compare`. A name either declares
-/// stays ungated though a gated port declares it too.
-const SHARED_RUNTIME: &[&str] = &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb", "runtime/ruby/logger.rb"];
+/// `ActiveSupport::SecurityUtils.secure_compare`, and
+/// `action_dispatch/session.rb` declares the `ActionDispatch::Session`
+/// object the session-store port reopens. A name either declares stays
+/// ungated though a gated port declares it too.
+const SHARED_RUNTIME: &[&str] =
+    &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb", "runtime/ruby/logger.rb", "runtime/ruby/action_dispatch/session.rb"];
 
 /// Runtime files whose VALUES are gated though their namespaces are not:
 /// railties' Rails::Railtie and Rails::Engine are a lowering's concern
@@ -678,6 +683,12 @@ mod tests {
             ("ActiveJob::DeserializationError::RecordNotFound", "runtime/active_job_errors.rb"),
             ("ActiveJob::SerializationError", "runtime/active_job_errors.rb"),
             ("ActiveSupport::Tryable", "runtime/active_support_tryable.rb"),
+            ("ActionDispatch::Session::AbstractStore", "runtime/action_dispatch_session_store.rb"),
+            ("ActionDispatch::Session::AbstractSecureStore", "runtime/action_dispatch_session_store.rb"),
+            ("ActionDispatch::Session::Compatibility", "runtime/action_dispatch_session_store.rb"),
+            ("ActionDispatch::Session::SessionRestoreError", "runtime/action_dispatch_session_store.rb"),
+            ("ActionDispatch::Constants", "runtime/action_dispatch_show_exceptions.rb"),
+            ("ActionDispatch::ShowExceptions", "runtime/action_dispatch_show_exceptions.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
         ] {
@@ -687,6 +698,8 @@ mod tests {
         assert!(!names.contains_key("Rails"), "{names:?}");
         assert!(!names.contains_key("Rails::Application"), "{names:?}");
         assert!(!names.contains_key("ActiveJob::Base"), "{names:?}");
+        // runtime/ruby/action_dispatch/session.rb declares it for every target.
+        assert!(!names.contains_key("ActionDispatch::Session"), "{names:?}");
         // active_support_ext.rb and security_utils.rb declare these for
         // every target.
         assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");

@@ -3861,6 +3861,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let tryable = crate::runtime_files::read_to_string("runtime/spinel/active_support_tryable.rb")
         .map_err(|e| format!("read tryable runtime: {e}"))?;
     files.push(("runtime/active_support_tryable.rb".into(), tryable));
+    // ActionDispatch::Session::AbstractStore over rack's Persisted, and
+    // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
+    for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
+        let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+            .map_err(|e| format!("read {port} runtime: {e}"))?;
+        files.push((format!("runtime/{port}.rb"), text));
+    }
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
@@ -3931,6 +3938,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # `require \"active_support/core_ext\"` mixes ActiveSupport::Tryable\n\
                  # into Object before any app code: `Object#try`, ported.\n\
                  require_relative \"runtime/active_support_tryable\"\n\
+                 # `require \"action_dispatch\"` defines its session stores, constants\n\
+                 # and ShowExceptions before any app code.\n\
+                 require_relative \"runtime/action_dispatch_session_store\"\n\
+                 require_relative \"runtime/action_dispatch_show_exceptions\"\n\
                  # `require \"active_job\"` defines its error classes before app code.\n\
                  require_relative \"runtime/active_job_errors\"\n\
                  # `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
@@ -8565,6 +8576,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_deprecation.rb"
         && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_support_tryable.rb"
+        && p != "runtime/action_dispatch_session_store.rb"
+        && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the
