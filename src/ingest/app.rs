@@ -2974,6 +2974,12 @@ end
     for (model, spans) in app.models.iter_mut().zip(claimed) {
         model.claimed_body_calls = spans;
     }
+    // The associations class macros declare (`accelerated_belongs_to`),
+    // their targets qualified as they are added, and the polymorphic
+    // ones resolved with the rest.
+    if super::macro_associations::declare(&mut app) {
+        resolve_polymorphic_targets(&mut app);
+    }
     // The models whose subclasses (STI or not, through library-class
     // parents) declare a default scope of their own.
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
@@ -6274,35 +6280,47 @@ fn qualify_association_targets(app: &mut App) {
         | Association::HasAndBelongsToMany { target, .. }) = assoc;
         Some(target)
     }
-    /// Drops a rooted target's `::`; answers whether it was rooted.
-    fn unroot(target: &mut ClassId) -> bool {
-        let Some(rooted) = target.0.as_str().strip_prefix("::") else { return false };
-        *target = ClassId(Symbol::from(rooted));
-        true
-    }
 
     for items in app.concern_model_items.values_mut() {
         for target in items.iter_mut().filter_map(target_of) {
-            unroot(target);
+            unroot_target(target);
         }
     }
     let models: crate::det::HashSet<String> =
         app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
     for model in &mut app.models {
-        let scope: Vec<String> = model.name.0.as_str().split("::").map(str::to_string).collect();
+        let owner = model.name.clone();
         for target in model.body.iter_mut().filter_map(target_of) {
-            if unroot(target) {
-                continue;
-            }
-            let written = target.0.as_str();
-            let found = (1..=scope.len())
-                .rev()
-                .map(|depth| format!("{}::{written}", scope[..depth].join("::")))
-                .find(|candidate| models.contains(candidate));
-            if let Some(qualified) = found {
-                *target = ClassId(Symbol::from(qualified));
-            }
+            qualify_target(&owner, target, &models);
         }
+    }
+}
+
+/// Drops a rooted target's `::`; answers whether it was rooted.
+fn unroot_target(target: &mut crate::ident::ClassId) -> bool {
+    let Some(rooted) = target.0.as_str().strip_prefix("::") else { return false };
+    *target = crate::ident::ClassId(crate::ident::Symbol::from(rooted));
+    true
+}
+
+/// An association target as `owner`'s `compute_type` reads it: rooted
+/// names as written, else the nearest enclosing namespace's model.
+pub(super) fn qualify_target(
+    owner: &crate::ident::ClassId,
+    target: &mut crate::ident::ClassId,
+    models: &crate::det::HashSet<String>,
+) {
+    if unroot_target(target) {
+        return;
+    }
+    let scope: Vec<&str> = owner.0.as_str().split("::").collect();
+    let written = target.0.as_str();
+    let found = (1..=scope.len())
+        .rev()
+        .map(|depth| format!("{}::{written}", scope[..depth].join("::")))
+        .find(|candidate| models.contains(candidate));
+    if let Some(qualified) = found {
+        *target = crate::ident::ClassId(crate::ident::Symbol::from(qualified));
     }
 }
 

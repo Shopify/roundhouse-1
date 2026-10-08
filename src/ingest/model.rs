@@ -2792,7 +2792,7 @@ fn spelled_lambda_parts<'a>(
     Some((block.parameters(), block.body()))
 }
 
-fn parse_association(
+pub(super) fn parse_association(
     call: &ruby_prism::CallNode<'_>,
     owner: &ClassId,
     method: &str,

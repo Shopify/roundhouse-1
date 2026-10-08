@@ -25,6 +25,26 @@ module ActiveRecord
     def each: () { (Hash[String, untyped]) -> void } -> Array[Hash[String, untyped]]
   end
 
+  module Reflection
+    class BelongsToReflection
+      @name: Symbol
+      @foreign_key: String
+      @class_name: String?
+      @foreign_type: String?
+      @primary_key: String?
+
+      def initialize: (Symbol name, String foreign_key, String? class_name, String? foreign_type, String? primary_key) -> void
+      def name: () -> Symbol
+      def macro: () -> Symbol
+      def foreign_key: () -> String
+      def foreign_type: () -> String?
+      def polymorphic?: () -> bool
+      def class_name: () -> String?
+      def klass: () -> singleton(ActiveRecord::Base)
+      def association_primary_key: () -> String
+    end
+  end
+
   class Connection
     def adapter_name: () -> String
     def quote: (String | Symbol | Integer | Float | bool | nil value) -> String

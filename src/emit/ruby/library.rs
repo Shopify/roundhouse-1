@@ -9070,7 +9070,10 @@ fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryC
     }
     let model = app.models.iter().find(|m| m.name == lc.name)?;
     let table = app.schema.tables.get(&model.table.0)?;
-    let names = crate::lower::model_to_library::generated_attribute_method_names(model, &app.models, table);
+    let mut names = crate::lower::model_to_library::generated_attribute_method_names(model, &app.models, table);
+    // The reader of an association a class macro declares, which the
+    // reader its `class_eval` writes supers into.
+    names.extend(crate::lower::model_to_library::macro_associations::declared_readers(model));
     let generated = |m: &MethodDef| {
         m.receiver == MethodReceiver::Instance
             && m.name_span.is_synthetic()

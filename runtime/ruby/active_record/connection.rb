@@ -155,6 +155,59 @@ module ActiveRecord
     end
   end
 
+  module Reflection
+    # A `belongs_to` association's reflection, the slice of Rails'
+    # `BelongsToReflection` app code reads: its name, foreign key (and
+    # type), the target class and primary key. The compiler writes a
+    # class's `reflect_on_association` from the associations a class
+    # macro declares (`model_to_library::macro_associations`).
+    class BelongsToReflection
+      def initialize(name, foreign_key, class_name, foreign_type, primary_key)
+        @name = name
+        @foreign_key = foreign_key
+        @class_name = class_name
+        @foreign_type = foreign_type
+        @primary_key = primary_key
+      end
+
+      def name
+        @name
+      end
+
+      def macro
+        :belongs_to
+      end
+
+      def foreign_key
+        @foreign_key
+      end
+
+      def foreign_type
+        @foreign_type
+      end
+
+      def polymorphic?
+        !@foreign_type.nil?
+      end
+
+      def class_name
+        @class_name
+      end
+
+      # Rails raises the same for a polymorphic association, whose class
+      # is per record.
+      def klass
+        name = @class_name
+        raise ArgumentError, "Polymorphic associations do not support computing the class." if name.nil?
+        Object.const_get(name) #: singleton(ActiveRecord::Base)
+      end
+
+      def association_primary_key
+        @primary_key || klass.primary_key.to_s
+      end
+    end
+  end
+
   class Connection
     # This runtime's only backend. Lobsters branches on this to pick
     # its upsert dialect; the SQLite arm is the one we execute.

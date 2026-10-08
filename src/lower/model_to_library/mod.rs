@@ -34,6 +34,7 @@ mod composite_key;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub(crate) mod macro_replay;
+pub(crate) mod macro_associations;
 pub(crate) mod transaction_callbacks;
 pub(crate) mod private_constant;
 pub use macro_replay::replay_model_macros;
@@ -1940,6 +1941,7 @@ fn build_methods_for_dialect(
 
     push_validate_method(&mut methods, model);
     push_association_methods(&mut methods, model, models);
+    self::macro_associations::push_reflection_methods(&mut methods, model, models);
     push_dependent_destroy(&mut methods, model);
     push_unknown_marker_methods(&mut methods, model);
     push_attr_accessor_methods(&mut methods, model);
