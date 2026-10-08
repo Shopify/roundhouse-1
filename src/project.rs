@@ -6055,11 +6055,31 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     };
     // Native boot's own requires, in load order, each with the
     // environments it loads in.
+    //
+    // A required file with no program declares only classes and
+    // modules: requiring it loads each of their files, in its order, as
+    // a program's `require` of it does (`declarations_by_source`). A gem
+    // file's constants have no autoload (below), so nothing else would
+    // define them: config/application.rb's `require "gqlc/plain"` left
+    // `Gqlc::Plain` undefined.
+    let declarations_by_source = emit::ruby::declarations_by_source(app);
+    let emitted_file = |anchor: &str| {
+        let path = format!("app/{anchor}.rb");
+        files.iter().any(|(p, _)| *p == path)
+    };
     let mut boot_programs: Vec<(String, &crate::app::BootLoad)> = Vec::new();
     for load in &app.boot_loads {
         let anchor = program_anchor_of_source(&load.source);
-        if program_anchors.contains(&anchor) && !boot_programs.iter().any(|(a, _)| *a == anchor) {
-            boot_programs.push((anchor, load));
+        let loads: Vec<String> = if program_anchors.contains(&anchor) {
+            vec![anchor]
+        } else {
+            let rel = load.source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&load.source);
+            declarations_by_source.get(rel).into_iter().flatten().filter(|a| emitted_file(a)).cloned().collect()
+        };
+        for anchor in loads {
+            if !boot_programs.iter().any(|(a, _)| *a == anchor) {
+                boot_programs.push((anchor, load));
+            }
         }
     }
     let conditional_programs: Vec<(String, &crate::app::BootLoad)> = app
@@ -6466,6 +6486,30 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         writeln!(body, "    {anchor:?} => {:?},", load.site).unwrap();
     }
     body.push_str("  }.freeze\n");
+    // Each gem file an initializer requires (`RoundhouseAutoload.require_source`,
+    // `ingest::initializer_programs::require_of_support`): the files of
+    // the classes and modules it declares, in its order, which requiring
+    // it loads. Empty when the tree carries none of them.
+    {
+        const CALL: &str = "RoundhouseAutoload.require_source(\"";
+        let mut required: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, content) in files.iter() {
+            let mut rest = content.as_str();
+            while let Some(at) = rest.find(CALL) {
+                let tail = &rest[at + CALL.len()..];
+                let Some(end) = tail.find('"') else { break };
+                required.insert(tail[..end].to_string());
+                rest = &tail[end..];
+            }
+        }
+        body.push_str("  # gem file an initializer requires => the files of its declarations\n  SOURCE_FILES = {\n");
+        for source in &required {
+            let loads: Vec<&String> =
+                declarations_by_source.get(source).into_iter().flatten().filter(|a| emitted_file(a)).collect();
+            writeln!(body, "    {source:?} => {loads:?},").unwrap();
+        }
+        body.push_str("  }.freeze\n");
+    }
     // The constants whose autoload is each program (`entering_program`),
     // and each declarations file that requires other files before its
     // own definitions: a program (shopify-money's lib/money.rb) may load
@@ -6612,10 +6656,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     if !boot_programs.is_empty() {
         body.push_str(
-            "# The support files' file-level programs (app/models/roundhouse_files) that\n\
-             # native boot requires from its own boot files (`App::boot_loads`), in its\n\
-             # order, with the environments each loads in (nil: every one). Every\n\
-             # other program loads where a file requires it, or with its constant.\n[\n",
+            "# The support files' file-level programs (app/models/roundhouse_files), or\n\
+             # for a file with none the files of the classes it declares, that native\n\
+             # boot requires from its own boot files (`App::boot_loads`), in its order,\n\
+             # with the environments each loads in (nil: every one). Every other\n\
+             # program loads where a file requires it, or with its constant.\n[\n",
         );
         for (program, load) in &boot_programs {
             let envs = if load.envs.is_empty() { "nil".to_string() } else { format!("{:?}", load.envs) };
@@ -6930,6 +6975,19 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   def self.path(file)
     File.expand_path("#{file}.rb", ROOT)
+  end
+
+  # An initializer's `require` of a gem file (SOURCE_FILES): the files of
+  # the classes and modules it declares, here, as Ruby running the file
+  # defines them. One whose declarations the tree does not carry is named.
+  def self.require_source(source)
+    files = SOURCE_FILES.fetch(source, [])
+    if files.empty?
+      $stderr.puts "roundhouse: error[file_require_not_carried]: #{source} is required by an initializer, but the tree carries none of its declarations; it was not loaded"
+      return false
+    end
+    files.each { |file| require path(file) }
+    true
   end
 
   # A program loading by a plain `require` (a boot file's, another

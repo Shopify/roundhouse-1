@@ -532,8 +532,39 @@ pub(super) fn guard_block_body(expr: &mut Expr, refused: &[u32], labels: &BTreeM
     Ok(())
 }
 
-/// `require "x"` → a runtime port, a no-op for a lib file boot already
-/// loads, or the standard library feature itself; anything else refuses.
+/// A carried `require` of `target`, a support file of declarations only
+/// (`loaded_support`). Under the app's `lib/` its constants autoload as
+/// Zeitwerk loads them: a no-op. Under a gem's `lib/` nothing else loads
+/// them, as the emitted tree gives a plain gem's constants no autoload
+/// (`project::apply_models_autoload`):
+/// `RoundhouseAutoload.require_source("<path from the root>")`, which
+/// loads the emitted files of the classes and modules it declares, here,
+/// in its order, as Ruby requiring it does. Ascribed `untyped`, as the
+/// generated loader is runtime the analyzer has no model of.
+pub(super) fn require_of_support<V: Vfs + ?Sized>(inputs: &Inputs<'_, V>, target: &Path) -> ExprNode {
+    if target.starts_with(inputs.dir.join("lib")) && !inputs.load_path.iter().skip(1).any(|lib| target.starts_with(lib)) {
+        return ExprNode::Lit { value: Literal::Nil };
+    }
+    let span = crate::span::Span::synthetic();
+    let recv = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] });
+    let source = Expr::new(span, ExprNode::Lit { value: Literal::Str { value: relative(inputs.dir, target) } });
+    let call = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from("require_source"),
+            args: vec![source],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    ExprNode::Cast { value: call, target_ty: crate::ty::Ty::Untyped }
+}
+
+/// `require "x"` → a runtime port, a no-op for an app lib file boot
+/// already loads, the files of a gem file's declarations
+/// ([`require_of_support`]), or the standard library feature itself;
+/// anything else refuses.
 pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs<'_, V>) -> Result<(), String> {
     let mut failure: Option<String> = None;
     walk(expr, &mut |e| {
@@ -567,8 +598,8 @@ pub(super) fn rewrite_requires<V: Vfs + ?Sized>(expr: &mut Expr, inputs: &Inputs
         }
         let file = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
         let target: Option<PathBuf> = inputs.load_path.iter().map(|lib| lib.join(&file)).find(|p| inputs.vfs.exists(p));
-        if target.as_ref().is_some_and(|t| inputs.loaded_support.contains(t)) {
-            *e.node = ExprNode::Lit { value: Literal::Nil };
+        if let Some(t) = target.as_ref().filter(|t| inputs.loaded_support.contains(*t)) {
+            *e.node = require_of_support(inputs, t);
             return;
         }
         if target.is_none() && STDLIB.contains(&feature.as_str()) {

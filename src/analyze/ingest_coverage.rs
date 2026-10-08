@@ -40,7 +40,59 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         .chain(required_left_out_files(app))
         .chain(validation_gaps(app))
         .chain(cross_file_redefinitions(app))
+        .chain(conditional_declarations_reopened(app))
         .collect()
+}
+
+/// A class or module declared in a load-time conditional
+/// (`ConditionalArm::declarations`) that another support file also
+/// declares, unconditionally. The IR holds one class per name, so the
+/// two bodies are merged and the emitted tree writes the merged class
+/// inside the conditional's branch: when the branch does not run, what
+/// the other file defines is missing too, where Ruby still defines it.
+/// Reported at the conditional declaration, naming the other file. A
+/// reopening in the same file is not detected here.
+fn conditional_declarations_reopened(app: &App) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let source_of = |file: crate::span::FileId| -> Option<&str> {
+        app.sources.get((file.0 as usize).checked_sub(1)?).map(|s| s.path.as_str())
+    };
+    let relative = |path: &str| -> String {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    for lc in &app.library_classes {
+        for conditional in &lc.conditional_definitions {
+            let Some(own) = source_of(conditional.span.file) else { continue };
+            for declaration in conditional.arms.iter().flat_map(|arm| arm.declarations.iter()) {
+                let others: Vec<String> = app
+                    .library_class_files
+                    .iter()
+                    .filter(|(source, names)| source != own && names.contains(&declaration.name))
+                    .map(|(source, _)| relative(source))
+                    .collect();
+                if others.is_empty() {
+                    continue;
+                }
+                let span = crate::span::Span {
+                    file: conditional.span.file,
+                    start: declaration.start,
+                    end: declaration.start + 1,
+                };
+                out.push(Diagnostic::unsupported(
+                    span,
+                    None,
+                    "conditional declaration reopened elsewhere",
+                    format!(
+                        "`{}` is declared in a load-time conditional here and unconditionally in {}; the emitted tree writes the merged class inside the conditional's branch, so when the branch does not run what {} defines is missing as well, which is not modeled",
+                        declaration.name.0.as_str(),
+                        others.join(", "),
+                        if others.len() == 1 { "that file" } else { "those files" },
+                    ),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// A file program's `require` / `require_relative` of an app file whose

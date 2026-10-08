@@ -49,6 +49,13 @@ pub(crate) fn file_program_anchor(app: &App, program: &crate::app::FileProgram) 
     library::file_program_anchor(app, program)
 }
 
+/// Each app source with no file program => the `models/<stem>` files of
+/// the classes and modules it declares, in the order requiring it
+/// defines them.
+pub(crate) fn declarations_by_source(app: &App) -> std::collections::BTreeMap<String, Vec<String>> {
+    library::declarations_by_source(app)
+}
+
 /// Each support file's file program (`App::file_programs`) as
 /// `(app/models/roundhouse_files/<source>.rb, content)`. `emitted` is
 /// every app/models.rb anchor (`models/<stem>`) the tree has.

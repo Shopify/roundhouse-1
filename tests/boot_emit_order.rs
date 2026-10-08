@@ -233,3 +233,54 @@ fn an_alias_no_ancestor_defines_still_refuses_its_file() {
     let row = text.lines().find(|l| l.contains("node.rb:5:5:")).unwrap_or_else(|| panic!("{text}"));
     assert!(row.contains("alias names a method this body has not defined"), "{row}");
 }
+
+/// A gem file of declarations only, required by config/application.rb.
+/// The boot list held file programs only, so a file with none loaded
+/// nothing, and a plain gem's constants have no autoload: `Gqlc::Plain`
+/// was undefined (NameError). Each class it declares now loads at that
+/// boot require, in the file's order (`Shapes` before `Plain`, whose
+/// body reads it).
+const PLAIN_DECLARATIONS: &[(&str, &str)] = &[(
+    "gqlc/plain.rb",
+    "module Gqlc\n  module Shapes\n    ALL = %i[a b c].freeze\n  end\n\n  class Plain\n    SIZE = Shapes::ALL.size\n\n    def self.x = SIZE\n  end\nend\n",
+)];
+
+#[test]
+fn a_gem_file_of_declarations_only_required_by_boot_is_loaded() {
+    let run = gem_same_as_native(
+        "gqlc",
+        PLAIN_DECLARATIONS,
+        "gqlc/plain",
+        "p Gqlc::Plain.x, Gqlc::Shapes::ALL.last\n",
+        "3\n:c\n",
+    );
+    let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).unwrap();
+    let shapes = models.find("  [\"models/gqlc/shapes\", nil], # config/application.rb:1\n");
+    let plain = models.find("  [\"models/gqlc/plain\", nil], # config/application.rb:1\n");
+    assert!(shapes.is_some() && plain.is_some() && shapes < plain, "{models}");
+}
+
+/// A class declared inside `class << self` of a gem module, once with no
+/// method of the module's own and once beside a `def self.x`. Ruby puts
+/// it on the singleton class, where the singleton's methods read it bare;
+/// the ingest hoists it into the module (`util::hoisted_singleton_body`),
+/// as for Core's ConnectionSerializer. Its file was emitted, but nothing
+/// loaded it: a gem file of declarations only that boot requires
+/// (above). Divergence kept: the hoisted `Singleton::Inner` also resolves
+/// from outside, where native Ruby raises NameError, and
+/// `singleton_class.constants` is empty.
+const SINGLETON_ONLY: &[(&str, &str)] = &[(
+    "gqlc/singleton.rb",
+    "module Gqlc\n  module Singleton\n    class << self\n      class Inner\n        def visit = :visitor\n      end\n\n      def make = Inner.new.visit\n    end\n  end\nend\n",
+)];
+
+const SINGLETON_BESIDE_DEF: &[(&str, &str)] = &[(
+    "gqlc/singleton.rb",
+    "module Gqlc\n  module Singleton\n    def self.x = 1\n\n    class << self\n      class Inner\n        def visit = :visitor\n      end\n\n      def make = [Inner.new.visit, x]\n    end\n  end\nend\n",
+)];
+
+#[test]
+fn a_class_declared_in_class_less_less_self_of_a_gem_module_is_loaded() {
+    gem_same_as_native("gqlc", SINGLETON_ONLY, "gqlc/singleton", "p Gqlc::Singleton.make\n", ":visitor\n");
+    gem_same_as_native("gqlc", SINGLETON_BESIDE_DEF, "gqlc/singleton", "p Gqlc::Singleton.make, Gqlc::Singleton.x\n", "[:visitor, 1]\n1\n");
+}

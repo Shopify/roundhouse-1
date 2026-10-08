@@ -245,3 +245,93 @@ fn boot_runs_initializer_statements_in_rails_order() {
         named[0]
     );
 }
+
+/// A vendored gem's file of declarations only (two modules, the second
+/// reading the first as its body runs). Nothing in the emitted tree
+/// autoloads a plain gem's constants.
+const GEM_SHAPES: &str = "module Gqlc\n  module Shapes\n    ALL = %i[a b c].freeze\n  end\n\n  class Plain\n    SIZE = Shapes::ALL.size\n\n    def self.x = SIZE\n  end\nend\n";
+
+/// An initializer that requires it, recording what it sees before and
+/// after the require.
+const REQUIRES_GEM_FILE: &str = "BootLog.record(defined?(Gqlc::Plain).inspect)\nrequire \"gqlc/plain\"\nBootLog.record(Gqlc::Plain.x)\nBootLog.record(Gqlc::Shapes::ALL.last)\n";
+
+const SIMPLE_BOOT_LOG: &str = "module BootLog\n  def self.entries\n    @entries ||= []\n  end\n\n  def self.record(entry)\n    entries << entry\n  end\nend\n";
+
+fn gem_file_fixture_app() -> TempDir {
+    let app = temp_dir("gemfile");
+    copy_tree(&Path::new(MANIFEST_DIR).join("fixtures/tiny-blog"), &app.0);
+    let write = |rel: &str, text: &str| {
+        let path = app.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n");
+    write("app/models/boot_log.rb", SIMPLE_BOOT_LOG);
+    write("config/initializers/plain.rb", REQUIRES_GEM_FILE);
+    write("vendor/gems/gqlc-1.0.0/lib/gqlc/plain.rb", GEM_SHAPES);
+    write("roundhouse.yml", "database_adapter: postgresql\ngem_sources:\n  gqlc: vendor/gems/gqlc-1.0.0\n");
+    write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    gqlc (1.0.0)\n\nDEPENDENCIES\n  gqlc\n");
+    write("config/database.yml", DATABASE_YML);
+    app
+}
+
+/// An initializer's `require` of a gem file of declarations only was
+/// applied as a no-op, as for a lib file whose constants autoload: the
+/// gem's constants have none, so the file never loaded and the next
+/// statement raised NameError at boot. It is carried as
+/// `RoundhouseAutoload.require_source`, which loads the files of the
+/// classes the gem file declares (SOURCE_FILES), at that statement.
+#[test]
+fn an_initializer_requiring_a_gem_file_of_declarations_carries_the_require() {
+    let dir = gem_file_fixture_app();
+    let app = roundhouse::ingest::ingest_app(&dir.0).expect("ingest fixture");
+    let gaps = gaps_in(&app, "config/initializers/plain.rb");
+    assert!(gaps.is_empty(), "{gaps:?}");
+    let programs: Vec<(&str, usize)> =
+        app.initializer_programs.iter().map(|p| (p.file.as_str(), p.statements)).collect();
+    assert_eq!(programs, [("config/initializers/plain.rb", 4)]);
+    let (_out, files) = emit(&app);
+    let holder = &files
+        .iter()
+        .find(|(p, _)| p == "app/models/roundhouse_initializer_config_initializers_plain.rb")
+        .expect("holder")
+        .1;
+    assert!(holder.contains("RoundhouseAutoload.require_source(\"vendor/gems/gqlc-1.0.0/lib/gqlc/plain.rb\")"), "{holder}");
+    let models = &files.iter().find(|(p, _)| p == "app/models.rb").expect("app/models.rb").1;
+    assert!(
+        models.contains("  SOURCE_FILES = {\n    \"vendor/gems/gqlc-1.0.0/lib/gqlc/plain.rb\" => [\"models/gqlc/shapes\", \"models/gqlc/plain\"],\n  }.freeze\n"),
+        "{models}"
+    );
+}
+
+/// The boot runs it as native Ruby does: the constants are undefined
+/// before the require and defined after it. Boot loads the `pg` gem:
+/// run with `--ignored` and a `GEM_PATH` that has it.
+#[test]
+#[ignore = "requires ruby with the pg gem"]
+fn boot_loads_a_gem_file_an_initializer_requires_where_it_requires_it() {
+    let dir = gem_file_fixture_app();
+    let native = Command::new("ruby")
+        .arg("-I")
+        .arg(dir.0.join("vendor/gems/gqlc-1.0.0/lib"))
+        .args(["-e", &format!("{SIMPLE_BOOT_LOG}{REQUIRES_GEM_FILE}p BootLog.entries\n")])
+        .output()
+        .expect("ruby");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "[\"nil\", 3, :c]\n", "native control");
+
+    let app = roundhouse::ingest::ingest_app(&dir.0).expect("ingest fixture");
+    let (out, _files) = emit(&app);
+    let output = Command::new("ruby")
+        .args(["-e", "require \"./boot\"\np BootLog.entries\n"])
+        .current_dir(&out.0)
+        .env_remove("DATABASE_URL")
+        .env_remove("ROUNDHOUSE_DATABASE_URL")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(!stderr.contains("initializer_statement_not_run"), "{stderr}");
+    assert_eq!(stdout, "[\"nil\", 3, :c]\n", "stderr={stderr}");
+}
