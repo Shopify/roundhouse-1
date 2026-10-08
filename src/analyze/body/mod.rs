@@ -317,6 +317,64 @@ pub(crate) fn lexical_class(
     classes.contains_key(written).then(|| written.clone())
 }
 
+/// Ruby's whole constant lookup for a class name written in `scope`: the
+/// lexical scopes, then `scope`'s ancestors (its includes, the last one
+/// first, then its superclass chain), then the top level. Core's
+/// `Counters::LiveAggregatedCounter` includes `AggregatedCounter` and
+/// annotates `@aggregated_counts = {} #: Hash[String, AggregatedData]`,
+/// naming `AggregatedCounter::AggregatedData`. `lexical_class` alone left it
+/// unresolved, so the annotation was refused as a declared type with no
+/// declaration.
+pub(crate) fn cref_class(written: &ClassId, scope: &str, classes: Classes<'_>) -> Option<ClassId> {
+    let name = written.0.as_str();
+    let mut parts: Vec<&str> = scope.split("::").filter(|s| !s.is_empty()).collect();
+    while !parts.is_empty() {
+        let candidate = ClassId(Symbol::from(format!("{}::{name}", parts.join("::")).as_str()));
+        if classes.contains_key(&candidate) {
+            return Some(candidate);
+        }
+        parts.pop();
+    }
+    fn ancestors(id: &ClassId, classes: Classes<'_>, out: &mut Vec<ClassId>) {
+        if out.contains(id) || out.len() > 64 {
+            return;
+        }
+        out.push(id.clone());
+        let Some(info) = classes.get(id) else { return };
+        // A mixin is recorded as written (`include AggregatedCounter`),
+        // so it is found from inside the class body that wrote it; a
+        // superclass from the namespace around the class. A module that
+        // only nests classes is no registry entry of its own: each of its
+        // lexical spellings stands in as an owner.
+        for module in info.includes().iter().rev() {
+            match lexical_class(module, id.0.as_str(), classes) {
+                Some(module) => ancestors(&module, classes, out),
+                None => {
+                    let mut parts: Vec<&str> = id.0.as_str().split("::").collect();
+                    while !parts.is_empty() {
+                        out.push(ClassId(Symbol::from(format!("{}::{}", parts.join("::"), module.0).as_str())));
+                        parts.pop();
+                    }
+                    out.push(module.clone());
+                }
+            }
+        }
+        if let Some(parent) = info.parent() {
+            let outer = id.0.as_str().rsplit_once("::").map_or("", |(outer, _)| outer);
+            let parent = lexical_class(parent, outer, classes).unwrap_or_else(|| parent.clone());
+            ancestors(&parent, classes, out);
+        }
+    }
+    let mut chain = Vec::new();
+    ancestors(&ClassId(Symbol::from(scope)), classes, &mut chain);
+    chain
+        .iter()
+        .skip(1)
+        .map(|ancestor| ClassId(Symbol::from(format!("{}::{name}", ancestor.0.as_str()).as_str())))
+        .find(|candidate| classes.contains_key(candidate))
+        .or_else(|| classes.contains_key(written).then(|| written.clone()))
+}
+
 /// `ty` with every sorbet type alias it names (`Name = T.type_alias { X }`,
 /// in `ClassInfo::type_aliases`) replaced by the type the alias names.
 /// An alias is found the way `lexical_class` finds a class, innermost
@@ -3063,7 +3121,7 @@ impl<'a> BodyTyper<'a> {
                         target_ty,
                         scope.0.as_str(),
                         &|_, _| None,
-                        &|id, scope| lexical_class(id, scope, self.classes()).unwrap_or_else(|| id.clone()),
+                        &|id, scope| cref_class(id, scope, self.classes()).unwrap_or_else(|| id.clone()),
                         false,
                     ),
                 _ => target_ty.clone(),
