@@ -110,6 +110,7 @@ pub mod job_test_only;
 pub mod test_cookie_jar;
 pub mod sti_scope;
 mod sti_subclass_callbacks;
+pub(crate) mod sti_subclass_validations;
 pub mod sum_symbol;
 pub mod values_at_splat;
 pub mod request_index;
@@ -828,6 +829,7 @@ pub fn apply_post_analyze_lowerings(
     defined_ivar_memo::apply_defined_ivar_memo_lowering(app);
     ran!("defined_ivar_memo");
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
+    sti_subclass_validations::apply_sti_subclass_validations(app);
     model_to_library::include_callbacks_in_sti_subclasses(app);
     ran!("sti_subclass_callbacks");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
@@ -1176,6 +1178,15 @@ pub(crate) fn for_each_owned_hook_body(
                         f(&mut m.body);
                     }
                 }
+                // `validate do ... end`: the block body runs as a
+                // record method once the model lowering inlines it.
+                crate::dialect::ModelBodyItem::Validation { validation, .. } => {
+                    for rule in validation.rules.iter_mut() {
+                        if let Some(body) = rule.block_body_mut() {
+                            f(body);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1314,6 +1325,13 @@ pub(crate) fn for_each_hook_body_ref(
                     for m in extension {
                         visit_param_defaults(&m.params, f);
                         f(&m.body);
+                    }
+                }
+                crate::dialect::ModelBodyItem::Validation { validation, .. } => {
+                    for rule in &validation.rules {
+                        if let Some(body) = rule.block_body() {
+                            f(body);
+                        }
                     }
                 }
                 _ => {}

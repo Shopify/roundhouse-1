@@ -604,6 +604,23 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unless_method: Option<Symbol>,
     },
+    /// `validate do ... end` / `validate ->(record) { ... }`: a block
+    /// ActiveSupport::Callbacks runs with the record as `self` (and as
+    /// its argument when it takes one).
+    Block {
+        callable: Expr,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        with_record: bool,
+    },
+    /// `validate SomeValidations.new`: an object ActiveSupport::Callbacks
+    /// calls as `object.validate(record)`. Rails evaluates the argument
+    /// once, in the class body; the lowered `validate` evaluates it on
+    /// each run, so ingest admits only an expression that does not read
+    /// `self` (a constant, `Const.new(...)`).
+    Object { object: Expr },
+    /// `comparison:`: each check in the order the options were written,
+    /// its bound resolved per run (a value, a Symbol method, a Proc).
+    Comparison { checks: Vec<NumericCheck> },
     /// A rule under the options every `validates` validator takes:
     /// `allow_nil:` / `allow_blank:` skip it for such a value, `message:`
     /// replaces its error text, and Symbol `if:` / `unless:` guard it.
@@ -615,6 +632,29 @@ pub enum ValidationRule {
     /// check: `roundhouse check` reports it as an error at the
     /// `validates` call.
     Unsupported { construct: String, detail: String },
+}
+
+impl ValidationRule {
+    /// The app-authored body a `validate do ... end` block (or lambda)
+    /// carries, under any guard: the record-side code every
+    /// post-analyze hook pass (`errors.add` grounding and friends)
+    /// has to reach before the model lowering inlines it.
+    pub fn block_body_mut(&mut self) -> Option<&mut Expr> {
+        match self {
+            ValidationRule::Block { callable, .. } => Some(callable),
+            ValidationRule::Guarded { rule, .. } => rule.block_body_mut(),
+            _ => None,
+        }
+    }
+
+    /// [`Self::block_body_mut`], shared.
+    pub fn block_body(&self) -> Option<&Expr> {
+        match self {
+            ValidationRule::Block { callable, .. } => Some(callable),
+            ValidationRule::Guarded { rule, .. } => rule.block_body(),
+            _ => None,
+        }
+    }
 }
 
 /// One `numericality:` comparison, parity or range option.
@@ -743,6 +783,14 @@ pub struct RuleOptions {
     /// validation context is one of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on: Vec<Symbol>,
+    /// `except_on:` validation contexts; the rule does not run when the
+    /// validation context is one of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_on: Vec<Symbol>,
+    /// `prepend: true` (`validate` / `validates_with`): the callback goes
+    /// to the front of the chain, ahead of the ones declared before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepend: bool,
 }
 
 /// ActiveModel's and ActiveRecord's English error messages (their

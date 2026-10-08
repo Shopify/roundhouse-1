@@ -11,6 +11,11 @@
 //! and a `message:` interpolating `%{model}`. The emitted model writes
 //! that query through the runtime's Relation.
 //!
+//! In STI, a uniqueness rule asks the class that declared it: the base's
+//! asks the whole table, a subclass's keeps its type condition (the
+//! subclass and every class below it), as `find_finder_class_for` and
+//! `unscoped` do.
+//!
 //! The same model files run natively (Core's pinned Rails, over
 //! `establish_connection`) and on the emitted program, each on a freshly
 //! created `rh_e2e_validates_uniq`, and every line `UniqProbe.lines`
@@ -31,6 +36,11 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
     t.bigint "shop_id"
     t.boolean "is_deleted", default: false, null: false
     t.integer "rank"
+  end
+  create_table "badges", force: :cascade do |t|
+    t.string "name"
+    t.string "code"
+    t.string "type"
   end
 end
 "#;
@@ -56,6 +66,11 @@ const HANDLE: &str = r##"class Handle < ApplicationRecord
   validates :code, presence: true, on: :update
 end
 "##;
+
+const BADGE: &str = "class Badge < ApplicationRecord\n  validates :code, uniqueness: true\nend\n";
+const GOLD_BADGE: &str = "class GoldBadge < Badge\n  validates :name, uniqueness: { case_sensitive: false }\nend\n";
+const PLATINUM_BADGE: &str = "class PlatinumBadge < GoldBadge\nend\n";
+const SILVER_BADGE: &str = "class SilverBadge < Badge\nend\n";
 
 const PROBE: &str = r##"class UniqProbe
   def self.observe(label, record)
@@ -103,6 +118,16 @@ const PROBE: &str = r##"class UniqProbe
     second.shop_id = shop.id
     out << observe("second renamed onto first, same shop", second)
     out << "rows: #{Handle.count}"
+    Badge.create!(name: "Star", code: "b1")
+    GoldBadge.create!(name: "Sun", code: "g1")
+    PlatinumBadge.create!(name: "Moon", code: "p1")
+    out << observe("gold named like a plain badge", GoldBadge.new(name: "star", code: "g2"))
+    out << observe("gold named like gold", GoldBadge.new(name: "SUN", code: "g3"))
+    out << observe("gold named like platinum", GoldBadge.new(name: "moon", code: "g4"))
+    out << observe("platinum named like gold", PlatinumBadge.new(name: "sun", code: "p2"))
+    out << observe("silver named like gold", SilverBadge.new(name: "Sun", code: "s1"))
+    out << observe("silver with gold's code", SilverBadge.new(name: "x", code: "g1"))
+    out << observe("gold with a plain badge's code", GoldBadge.new(name: "y", code: "b1"))
     out
   end
 end
@@ -110,7 +135,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 25] = [
+const EXPECTED: [&str; 32] = [
     "first new: true []",
     "first saved: true",
     "first persisted: true []",
@@ -136,9 +161,16 @@ const EXPECTED: [&str; 25] = [
     "second renamed onto first, other shop: true []",
     r#"second renamed onto first, same shop: false ["Handle has already been taken"]"#,
     "rows: 4",
+    "gold named like a plain badge: true []",
+    r#"gold named like gold: false ["Name has already been taken"]"#,
+    r#"gold named like platinum: false ["Name has already been taken"]"#,
+    r#"platinum named like gold: false ["Name has already been taken"]"#,
+    "silver named like gold: true []",
+    r#"silver with gold's code: false ["Code has already been taken"]"#,
+    r#"gold with a plain badge's code: false ["Code has already been taken"]"#,
 ];
 
-const FILES: [(&str, &str); 8] = [
+const FILES: [(&str, &str); 12] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -146,6 +178,10 @@ const FILES: [(&str, &str); 8] = [
     ("app/models/application_record.rb", APPLICATION_RECORD),
     ("app/models/shop.rb", SHOP),
     ("app/models/handle.rb", HANDLE),
+    ("app/models/badge.rb", BADGE),
+    ("app/models/gold_badge.rb", GOLD_BADGE),
+    ("app/models/platinum_badge.rb", PLATINUM_BADGE),
+    ("app/models/silver_badge.rb", SILVER_BADGE),
     ("app/models/uniq_probe.rb", PROBE),
 ];
 
@@ -167,7 +203,7 @@ fn uniqueness_and_validation_context_compile() {
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
     let model = std::fs::read_to_string(emitted.join("app/models/handle.rb")).unwrap();
     for expected in [
-        r#"ActiveRecord::Relation.new(self.class).where("LOWER(handle) = LOWER(?)", @handle)"#,
+        r#"ActiveRecord::Relation.new(Handle).where("LOWER(handle) = LOWER(?)", @handle)"#,
         "handle_relation = handle_relation.not({ id: [self.id] }) if self.persisted?",
         "code_relation = code_relation.where(is_deleted: false)",
         "rank_relation = rank_relation.where({ shop_id: @shop_id })",
@@ -175,6 +211,9 @@ fn uniqueness_and_validation_context_compile() {
     ] {
         assert!(model.contains(expected), "missing {expected:?} in:\n{model}");
     }
+    let gold = std::fs::read_to_string(emitted.join("app/models/gold_badge.rb")).unwrap();
+    let expected = r#"ActiveRecord::Relation.new(GoldBadge).where({ type: ["GoldBadge", "PlatinumBadge"] })"#;
+    assert!(gold.contains(expected) && gold.contains("super()"), "missing {expected:?} in:\n{gold}");
 }
 
 /// The model files natively and emitted, same PostgreSQL.

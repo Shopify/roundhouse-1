@@ -68,6 +68,8 @@ fn validation_gaps(app: &App) -> Vec<Diagnostic> {
             ));
         }
     }
+    // An STI subclass's own declarations (a library class to ingest).
+    out.extend(crate::lower::sti_subclass_validations::diagnose(app));
     // `uniqueness:` queries the model's table: a class outside the
     // ActiveRecord hierarchy has none (ActiveModel has no
     // UniquenessValidator, and Rails raises at load).
