@@ -6149,6 +6149,7 @@ impl Analyzer {
             return Some((**ret).clone());
         }
         self.class_object_return_ty(&method.body)
+            .or_else(|| self.shared_base_return_ty(&method.body))
             .or_else(|| tuple_return_ty(&method.body))
             .or_else(|| effective_return_ty(&method.body))
     }
@@ -6168,39 +6169,7 @@ impl Analyzer {
     /// All or nothing: a tail mixing a class with any other value, or a
     /// `return` off the tail, keeps the ordinary harvest.
     fn class_object_return_ty(&self, body: &Expr) -> Option<Ty> {
-        fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>, returns: &mut usize) {
-            match &*e.node {
-                ExprNode::If { then_branch, else_branch, .. } => {
-                    tails(then_branch, out, returns);
-                    tails(else_branch, out, returns);
-                }
-                ExprNode::Case { arms, .. } => {
-                    arms.iter().for_each(|a| tails(&a.body, out, returns))
-                }
-                ExprNode::Seq { exprs } if !exprs.is_empty() => {
-                    tails(exprs.last().unwrap(), out, returns)
-                }
-                ExprNode::Return { value } => {
-                    *returns += 1;
-                    tails(value, out, returns);
-                }
-                // A raising arm returns nothing.
-                ExprNode::Raise { .. } => {}
-                _ => out.push(e),
-            }
-        }
-        fn count_returns(e: &Expr) -> usize {
-            let mut n = usize::from(matches!(&*e.node, ExprNode::Return { .. }));
-            e.node.for_each_child(&mut |c| n += count_returns(c));
-            n
-        }
-        let mut out = Vec::new();
-        let mut tail_returns = 0;
-        tails(body, &mut out, &mut tail_returns);
-        // A `return` off the tail is a value this walk did not see.
-        if out.is_empty() || count_returns(body) != tail_returns {
-            return None;
-        }
+        let out = tail_values(body)?;
         let mut classes: Vec<Ty> = Vec::new();
         for t in out {
             let ExprNode::Const { path } = &*t.node else { return None };
@@ -6225,6 +6194,37 @@ impl Analyzer {
         Some(match classes.len() {
             1 => classes.pop().unwrap(),
             _ => Ty::Union { variants: classes },
+        })
+    }
+
+    /// A method whose every return value is `record.reload`,
+    /// `record.destroy` or `record.destroy!` on a model returns
+    /// `ActiveRecord::Base`. The call itself evaluates to the record
+    /// (Rails returns `self`), so its site types as the receiver's
+    /// model and `record.reload.title` dispatches there. But the
+    /// function behind it is the one compiled `Base` method,
+    /// `() -> Base` in `runtime/ruby/active_record/base.rbs`, which no
+    /// target monomorphizes per model: harvesting the site's type
+    /// declared `def run: (Integer id) -> Widget` on a function spinel
+    /// compiled to return the Base pointer, and the C did not build
+    /// (roundhouse#296). As with `class_object_return_ty`, the
+    /// boundary is where the two answers separate. All or nothing: a
+    /// tail mixing such a call with any other value keeps the
+    /// ordinary harvest.
+    fn shared_base_return_ty(&self, body: &Expr) -> Option<Ty> {
+        let out = tail_values(body)?;
+        let shared = |t: &&Expr| {
+            let ExprNode::Send { method, args, block: None, .. } = &*t.node else {
+                return false;
+            };
+            let Some(Ty::Class { id, .. }) = &t.ty else { return false };
+            matches!(method.as_str(), "reload" | "destroy" | "destroy!")
+                && args.is_empty()
+                && self.classes.get(id).is_some_and(|cls| cls.table.is_some())
+        };
+        out.iter().all(shared).then(|| Ty::Class {
+            id: ClassId(Symbol::from("ActiveRecord::Base")),
+            args: vec![],
         })
     }
 
@@ -7657,6 +7657,45 @@ fn scope_tail_materializing_sibling(
             || body_tail_yields_relation(r, model_id, scope_names),
     };
     rooted_here.then(|| seed.clone())
+}
+
+/// Every value `body` returns from its tail: the leaves of its
+/// `if`/`case`/sequence tail and the values of tail `return`s. A
+/// raising arm returns nothing. `None` when nothing is returned or a
+/// `return` off the tail returns a value this walk does not see.
+fn tail_values(body: &Expr) -> Option<Vec<&Expr>> {
+    fn tails<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>, returns: &mut usize) {
+        match &*e.node {
+            ExprNode::If { then_branch, else_branch, .. } => {
+                tails(then_branch, out, returns);
+                tails(else_branch, out, returns);
+            }
+            ExprNode::Case { arms, .. } => arms.iter().for_each(|a| tails(&a.body, out, returns)),
+            ExprNode::Seq { exprs } if !exprs.is_empty() => {
+                tails(exprs.last().unwrap(), out, returns)
+            }
+            ExprNode::Return { value } => {
+                *returns += 1;
+                tails(value, out, returns);
+            }
+            // A raising arm returns nothing.
+            ExprNode::Raise { .. } => {}
+            _ => out.push(e),
+        }
+    }
+    fn count_returns(e: &Expr) -> usize {
+        let mut n = usize::from(matches!(&*e.node, ExprNode::Return { .. }));
+        e.node.for_each_child(&mut |c| n += count_returns(c));
+        n
+    }
+    let mut out = Vec::new();
+    let mut tail_returns = 0;
+    tails(body, &mut out, &mut tail_returns);
+    // A `return` off the tail is a value this walk did not see.
+    if out.is_empty() || count_returns(body) != tail_returns {
+        return None;
+    }
+    Some(out)
 }
 
 /// Does `start` descend from `ActiveRecord::Base`?

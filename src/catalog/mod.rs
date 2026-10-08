@@ -767,10 +767,12 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     },
     // ---- Instance-method writes ----
     // Mutations on a loaded record. Rails bangs-vs-non-bangs
-    // convention: non-bang returns Bool (success/failure); bangs that
-    // share the compiled `Base` method (`save!`/`destroy`/`destroy!`)
-    // return `ActiveRecord::Base` per the sidecar (not Self — see
-    // `save!` below); monomorphized constructors stay SelfType.
+    // convention: non-bang returns Bool (success/failure); `save!`
+    // answers the shared compiled `Base` method's `ActiveRecord::Base`
+    // per the sidecar (see below); `destroy`/`destroy!`/`reload`
+    // evaluate to the record itself (Self), and a method returning one
+    // of those calls still declares `ActiveRecord::Base`
+    // (`Analyzer::shared_base_return_ty`).
     CatalogedMethod {
         name: "save",
         receiver: ReceiverContext::Instance,
@@ -811,21 +813,26 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::NotApplicable,
         return_kind: Some(ReturnKind::SelfType),
     },
-    // `destroy`/`destroy!` are `() -> Base` in the same sidecar, for
-    // the same reason `save!` is — see the comment there.
+    // `destroy`/`destroy!` are `() -> Base` in the same sidecar, but
+    // unlike `save!` (Rails: `true`) they evaluate to the record
+    // itself, so the call answers the receiver's class:
+    // `record.destroy.destroyed?` dispatches on the model. Only the
+    // signature of a method returning such a call is `Base`, where the
+    // shared compiled function is the value
+    // (`Analyzer::shared_base_return_ty`, roundhouse#296).
     CatalogedMethod {
         name: "destroy",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+        return_kind: Some(ReturnKind::SelfType),
     },
     CatalogedMethod {
         name: "destroy!",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+        return_kind: Some(ReturnKind::SelfType),
     },
     CatalogedMethod {
         name: "delete",
@@ -858,13 +865,15 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
     // ---- Instance-method reads ----
     // `#reload` refreshes from the DB — writes-vs-reads-wise it's
     // a read, but carries the DbRead effect because it issues a
-    // SELECT. Also `() -> Base` in the sidecar — see `save!` above.
+    // SELECT. Rails returns the record, so `record.reload.title`
+    // dispatches on the model; a method returning the call declares
+    // the sidecar's `() -> Base` — see `destroy` above.
     CatalogedMethod {
         name: "reload",
         receiver: ReceiverContext::Instance,
         effect: EffectClass::DbRead,
         chain: ChainKind::NotApplicable,
-        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+        return_kind: Some(ReturnKind::SelfType),
     },
     // ---- Instance-method state predicates ----
     // Pure — query in-memory flags the record already carries.
