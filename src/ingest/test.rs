@@ -274,6 +274,9 @@ fn ingest_test_class(
         message: "test class name must be a simple constant or path".into(),
     })?);
     let name = ClassId(Symbol::from(name_path.join("::")));
+    // The file's first top-level class taken as its module although it
+    // is not test-shaped: a test-support class (`ingest_test_files`).
+    let support_class = !is_test_class_node(class);
 
     let parent = class.superclass().and_then(|n| {
         constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
@@ -351,7 +354,16 @@ fn ingest_test_class(
                 if is_nested_test_class_node(&inner) {
                     continue;
                 }
-                let lc = library_class_from_node(&inner, file)?;
+                // In a test-support class (`MockGCSInterface`, no test
+                // shape of its own) a nested class is the namespaced
+                // constant `MockGCSInterface::Bucket`, as in Ruby: a
+                // second support file's `MockS3Interface::Bucket` is a
+                // different class, not a reopen of a shared `Bucket`.
+                let lc = if support_class {
+                    library_class_from_node_with_scope(&inner, &name_path, file)?
+                } else {
+                    library_class_from_node(&inner, file)?
+                };
                 inner_classes.push(lc);
                 continue;
             }
@@ -1174,6 +1186,22 @@ end
         let src = "module Support\n  class Thing\n    def x\n      1\n    end\n  end\nend\n";
         let tms = ingest_test_files(src.as_bytes(), "thing.rb").expect("ingest");
         assert!(tms.is_empty());
+    }
+
+    // A class nested in a top-level support class is that class's
+    // constant (`MockStore::Bucket`), so two support files' `Bucket`s
+    // stay two classes. A test class's own inner classes keep the bare
+    // name every target's hoist expects.
+    #[test]
+    fn a_support_class_namespaces_its_nested_classes() {
+        let src = "class MockStore\n  class Bucket\n    def x\n      1\n    end\n  end\nend\n";
+        let tms = ingest_test_files(src.as_bytes(), "mock_store.rb").expect("ingest");
+        let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+        assert_eq!(names, ["MockStore::Bucket"]);
+        let src = "class StoreTest < ActiveSupport::TestCase\n  class Bucket\n  end\n\n  test \"t\" do\n    assert true\n  end\nend\n";
+        let tms = ingest_test_files(src.as_bytes(), "store_test.rb").expect("ingest");
+        let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+        assert_eq!(names, ["Bucket"]);
     }
 
     // When no class looks like a test, the first top-level class is
