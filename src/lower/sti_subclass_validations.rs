@@ -222,7 +222,7 @@ fn type_names(sub: &ClassId, app: &App) -> Vec<String> {
 
 pub fn apply_sti_subclass_validations(app: &mut App) {
     define_acceptance_attributes(app);
-    let sti = crate::lower::sti_bases(app);
+    let sti = crate::lower::sti_scope::sti_columns(app);
     let mut plans: Vec<(usize, Vec<usize>, Vec<crate::dialect::MethodDef>)> = Vec::new();
     for (index, lc) in app.library_classes.iter().enumerate() {
         let Some((model, chain)) = model_ancestry(lc, app) else { continue };
@@ -236,6 +236,7 @@ pub fn apply_sti_subclass_validations(app: &mut App) {
             finder: Finder::Declaring {
                 class: lc.name.clone(),
                 type_names: if sti.contains_key(&lc.name) { type_names(&lc.name, app) } else { Vec::new() },
+                type_column: sti.get(&lc.name).map(|c| c.as_str().to_string()).unwrap_or_default(),
             },
         };
         let spanned = read.declared.iter().flat_map(|(_, span, vs, _)| vs.iter().map(move |v| (*span, v)));

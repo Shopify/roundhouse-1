@@ -50,8 +50,6 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol};
 use crate::ty::Ty;
 
-/// The column Rails writes an STI row's class name into.
-const INHERITANCE_COLUMN: &str = "type";
 
 #[allow(dead_code)]
 pub fn apply_sti_is_a_lowering(app: &mut App) {
@@ -65,11 +63,13 @@ pub fn apply_sti_is_a_lowering(app: &mut App) {
     }
 }
 
-/// Subclass → every name a row of that class can carry in `type`:
-/// itself plus anything descending from it.
-pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, Vec<String>> {
+/// Subclass → its inheritance column (`sti_scope::sti_columns`) and
+/// every name a row of that class can carry there: itself plus anything
+/// descending from it.
+pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, (Symbol, Vec<String>)> {
     let bases = crate::lower::sti_scope::sti_bases(app);
-    let mut names: HashMap<ClassId, Vec<String>> = HashMap::default();
+    let cols = crate::lower::sti_scope::sti_columns(app);
+    let mut names: HashMap<ClassId, (Symbol, Vec<String>)> = HashMap::default();
     for sub in bases.keys() {
         let mut set: Vec<String> = vec![sub.0.as_str().to_string()];
         for other in bases.keys() {
@@ -78,7 +78,8 @@ pub(crate) fn subclass_type_names(app: &App) -> HashMap<ClassId, Vec<String>> {
             }
         }
         set.sort();
-        names.insert(sub.clone(), set);
+        let col = cols.get(sub).cloned().unwrap_or_else(|| Symbol::from("type"));
+        names.insert(sub.clone(), (col, set));
     }
     names
 }
@@ -108,12 +109,12 @@ fn descends_from(app: &App, class_id: &ClassId, ancestor: &ClassId) -> bool {
     false
 }
 
-fn rewrite(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>>) {
+fn rewrite(expr: &mut Expr, names: &HashMap<ClassId, (Symbol, Vec<String>)>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, names));
     rewrite_node(expr, names);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>>) {
+pub(crate) fn rewrite_node(expr: &mut Expr, names: &HashMap<ClassId, (Symbol, Vec<String>)>) {
     let ExprNode::Send { recv, method, args, .. } = &*expr.node else { return };
     if method.as_str() != "is_a?" && method.as_str() != "kind_of?" {
         return;
@@ -125,7 +126,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>
     let named = ClassId(Symbol::from(
         path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"),
     ));
-    let Some(type_names) = names.get(&named) else { return };
+    let Some((column, type_names)) = names.get(&named) else { return };
     let span = expr.span;
     // `type` on the receiver — bare when the test was receiverless,
     // which is the implicit self it already stood for.
@@ -133,7 +134,7 @@ pub(crate) fn rewrite_node(expr: &mut Expr, names: &HashMap<ClassId, Vec<String>
         span,
         ExprNode::Send {
             recv: recv.clone(),
-            method: Symbol::from(INHERITANCE_COLUMN),
+            method: column.clone(),
             args: vec![],
             block: None,
             parenthesized: false,

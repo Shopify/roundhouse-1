@@ -1742,6 +1742,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 &assocs,
             );
             crate::lower::default_scope::push_methods(&mut lc.methods, model);
+            crate::lower::sti_scope::push_inheritance_column_method(&mut lc.methods, model);
         }
         // User-written class methods the registry admitted as
         // relation-taking (`def self.arrange_for_user` with bare
@@ -2665,6 +2666,7 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
     if bases.is_empty() {
         return;
     }
+    let cols = crate::lower::sti_scope::sti_columns(app);
     let mut subs_of: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
     for (sub, base) in &bases {
         subs_of.entry(base.clone()).or_default().push(sub.clone());
@@ -2676,6 +2678,8 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
     for lc in lcs.iter_mut() {
         let Some(subs) = subs_of.get(&lc.name) else { continue };
         let base = lc.name.clone();
+        let column = cols.get(&base).map(|c| c.as_str().to_string()).unwrap_or_else(|| "type".to_string());
+        let writer = format!("{column}=");
         for m in lc.methods.iter_mut() {
             if !matches!(m.name.as_str(), "from_stmt" | "from_row") {
                 continue;
@@ -2692,12 +2696,12 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
             // reader goes stale.
             let Some(type_read) = exprs.iter().find_map(|e| match &*e.node {
                 ExprNode::Send { recv: Some(_), method, args, .. }
-                    if method.as_str() == "type=" && args.len() == 1 =>
+                    if method.as_str() == writer && args.len() == 1 =>
                 {
                     Some(args[0].clone())
                 }
                 ExprNode::Assign { target: LValue::Attr { name, .. }, value }
-                    if name.as_str() == "type" =>
+                    if name.as_str() == column =>
                 {
                     Some(value.clone())
                 }
