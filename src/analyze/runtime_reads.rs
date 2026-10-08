@@ -43,6 +43,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
+    ("runtime/spinel/active_support_json.rb", "runtime/active_support_json.rb"),
     ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
@@ -471,6 +472,9 @@ const UNTYPED_SINGLETONS: &[(&str, &str, &str)] = &[
     ("ActiveSupport", "filter_parameters", "ActiveSupport::ParameterFilter"),
     ("ActiveSupport", "filter_parameters=", "ActiveSupport::ParameterFilter"),
     ("Rails", "configuration", "Rails::Configuration"),
+    // `lower::as_json_residue`'s route for an `as_json` no static method
+    // answers (`expr::OBJECT_AS_JSON`): active_support_json.rb's table.
+    ("ActiveSupport::JSON::Encoding", "as_json", "ActiveSupport::JSON::Encoding"),
 ];
 
 /// Instance methods only a gated port answers, though the registry types
@@ -790,6 +794,8 @@ mod tests {
             ("ActionDispatch::ShowExceptions", "runtime/action_dispatch_show_exceptions.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
+            ("ActiveSupport::JSON::Encoding", "runtime/active_support_json.rb"),
+            ("ActiveSupport::JSON::Encoding::JSONGemEncoder", "runtime/active_support_json.rb"),
         ] {
             assert_eq!(names.get(name).copied(), Some(file), "{name}: {names:?}");
         }
@@ -807,6 +813,9 @@ mod tests {
         assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");
         assert!(!names.contains_key("ActiveSupport::MessageVerifier::InvalidSignature"), "{names:?}");
         assert!(!names.contains_key("ActiveSupport::SecurityUtils"), "{names:?}");
+        // active_support_ext.rb declares ActiveSupport::JSON (`encode`) for
+        // every target; only the JSON port's Encoding is gated.
+        assert!(!names.contains_key("ActiveSupport::JSON"), "{names:?}");
         // runtime/ruby/logger.rb declares these for every target.
         assert!(!names.contains_key("ActiveSupport::Logger"), "{names:?}");
         assert!(!names.contains_key("ActiveSupport::TaggedLogging"), "{names:?}");

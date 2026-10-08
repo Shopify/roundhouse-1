@@ -642,6 +642,7 @@ fn walk(
         } else if !enclosing.params.iter().any(|p| p.forwarding) {
             Some("forwarding call has no preserved forwarding declaration")
         } else if native_core_destination(app, e)
+            || foreign_destination(contracts, e)
             || super_leaves_source(contracts, Some((owner, enclosing)), e, in_block)
         {
             // The packet reaches code the app does not define, which the
@@ -692,6 +693,39 @@ fn native_core_destination(app: &App, e: &Expr) -> bool {
         .iter()
         .filter(|c| c.name.0.as_str() == class)
         .any(|c| c.methods.iter().any(|m| &m.name == method))
+}
+
+/// `recv.m(...)` where `recv` is typed as a class the app declares no
+/// fragment of (a stdlib, gem or runtime class: `Set`, `Thread`,
+/// `ActiveModel::Type::BigInteger`), mixes nothing into, reopens with no
+/// `m` and derives nothing from: whether the value is an instance or the
+/// class object (`Ty::Class` does not say), the method it reaches is that
+/// library's, which the Ruby family binds natively against `...` as
+/// written, as `native_core_destination` admits for the core values. A
+/// `nil` arm raises NoMethodError natively as it would in the source.
+fn foreign_destination(contracts: &SourceContractIndex<'_>, e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node else { return false };
+    let id = match recv.ty.as_ref() {
+        Some(Ty::Class { id, .. }) => id,
+        Some(Ty::Union { variants }) => {
+            let mut classes = variants.iter().filter(|v| !matches!(v, Ty::Nil));
+            match (classes.next(), classes.next()) {
+                (Some(Ty::Class { id, .. }), None) => id,
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let last = last_segment(id.0.as_str());
+    let named = |c: &ClassId| last_segment(c.0.as_str()) == last;
+    !contracts.fragments.contains_key(id)
+        && !contracts.synthesized.contains(id)
+        && !contracts.mixed_into(id)
+        && !contracts.app_reopens(id.0.as_str(), method.as_str())
+        // An app class written `< Set` (or including a module named
+        // so) may be the value; its override is the app's.
+        && !contracts.parents.values().any(|parent| named(parent))
+        && !contracts.includes.values().flatten().any(named)
 }
 
 fn accepts_keywords(method: &MethodDef) -> bool {
@@ -750,9 +784,17 @@ fn destination<'a>(
     }
     match &*e.node {
         ExprNode::Send { recv, method, .. } => {
+            // A value the typer proved a class object (`expr::
+            // CLASS_OBJECT_VALUE`: a reader declared `singleton(C)`)
+            // dispatches on the class side.
+            let class_object = recv.as_ref().is_some_and(|r| {
+                !matches!(&*r.node, ExprNode::Const { .. } | ExprNode::SelfRef)
+                    && r.decisions & crate::expr::CLASS_OBJECT_VALUE != 0
+            });
             let receiver = match recv.as_ref().map(|r| &*r.node) {
                 None | Some(ExprNode::SelfRef) => context?.1.receiver,
                 Some(ExprNode::Const { .. }) => MethodReceiver::Class,
+                _ if class_object => MethodReceiver::Class,
                 _ => MethodReceiver::Instance,
             };
             let class = match recv {
@@ -783,6 +825,8 @@ fn destination<'a>(
                         recv.as_ref().unwrap(),
                         c,
                     )
+                    && !constructed_by_reader(contracts, context, recv.as_ref().unwrap(), c)
+                    && !(class_object && exact_class_object(contracts, c, method))
                 {
                     return None;
                 }
@@ -1228,6 +1272,128 @@ fn constructed_instance(
     let mut closure = false;
     writes(&method.body, name, &mut count, &mut closure);
     binding && count == 1 && !closure
+}
+
+/// A class-object value of `class` whose `method` no app subclass
+/// overrides on the class side: the value may be a subclass's class
+/// object (the proof is of class-object-ness, not of the exact class),
+/// and every one of them answers `class`'s declaration.
+fn exact_class_object(contracts: &SourceContractIndex<'_>, class: &ClassId, method: &Symbol) -> bool {
+    !contracts.modules.contains(class)
+        && matches!(contracts.virtual_calls(class, method, MethodReceiver::Class), Ok(c) if c.is_empty())
+}
+
+/// `reader.m(...)` (`delegate :m, to: :reader`) where `reader` is a
+/// no-argument self-send to the enclosing class's own source method on
+/// the same side, no subclass overrides it, and every value it answers
+/// is a construction of `class`: `C.new(...)` with no source `C.new`, or
+/// on a class's own side a bare `new` when no app class descends from
+/// it. Directly, as `@x ||= value` or `@x = value`, a sequence's last
+/// value, or both arms of an `if`; with no `return`. Every write of each
+/// such ivar in the class's methods on that side is nil or such a
+/// construction. (Core's `@announcer ||= Podding::Locking::
+/// RedisAnnouncer.new`, `def default = @default ||= new`, api_versioning's
+/// `current`.) The receiver is then an instance of exactly `class`.
+fn constructed_by_reader(
+    contracts: &SourceContractIndex<'_>,
+    context: Option<(&ClassId, &MethodDef)>,
+    recv: &Expr,
+    class: &ClassId,
+) -> bool {
+    let Some((owner, enclosing)) = context else { return false };
+    let ExprNode::Send { recv: reader_recv, method: reader, args, block: None, .. } = &*recv.node else {
+        return false;
+    };
+    if !args.is_empty() || reader_recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+        return false;
+    }
+    let side = enclosing.receiver;
+    let declarations = match side {
+        MethodReceiver::Instance => &contracts.instance,
+        MethodReceiver::Class => &contracts.class,
+    };
+    let Some(&(def, false)) = declarations.get(&(owner.clone(), reader.clone())) else { return false };
+    if !contracts.verified(owner)
+        || !matches!(contracts.virtual_calls(owner, reader, side), Ok(c) if c.is_empty())
+        || def.params.iter().any(|p| !p.keyword && p.default.is_none())
+    {
+        return false;
+    }
+    let source_new = |c: &ClassId| {
+        contracts.declaration(c, &Symbol::from("new"), MethodReceiver::Class, &mut HashSet::default()).is_some()
+    };
+    // `new` on the class's own side builds an instance of `self`, which is
+    // `class` itself only when nothing in the app descends from it.
+    let self_new = side == MethodReceiver::Class
+        && owner == class
+        && !contracts.modules.contains(owner)
+        && contracts.children.get(owner).is_none_or(|c| c.is_empty())
+        && contracts.descendant_positions(owner).is_empty()
+        && !source_new(owner);
+    let construction = |value: &Expr| -> bool {
+        let ExprNode::Send { recv: r, method, .. } = &*value.node else { return false };
+        if method.as_str() != "new" {
+            return false;
+        }
+        match r {
+            Some(r) if matches!(&*r.node, ExprNode::Const { .. }) => {
+                constant_names_class(r, class)
+                    && matches!(r.ty.as_ref(), Some(Ty::Class { id, .. }) if id == class)
+                    && !source_new(class)
+            }
+            Some(r) => matches!(&*r.node, ExprNode::SelfRef) && self_new,
+            None => self_new,
+        }
+    };
+    fn always<'e>(e: &'e Expr, ivars: &mut Vec<&'e Symbol>, construction: &dyn Fn(&Expr) -> bool) -> bool {
+        match &*e.node {
+            ExprNode::OpAssign { target: LValue::Ivar { name }, op: crate::expr::OpAssignOp::OrOr, value }
+            | ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+                ivars.push(name);
+                construction(value)
+            }
+            ExprNode::Seq { exprs } => exprs.last().is_some_and(|last| always(last, ivars, construction)),
+            ExprNode::If { then_branch, else_branch, .. } => {
+                always(then_branch, ivars, construction) && always(else_branch, ivars, construction)
+            }
+            _ => construction(e),
+        }
+    }
+    let mut ivars = Vec::new();
+    if has_return(&def.body) || !always(&def.body, &mut ivars, &construction) {
+        return false;
+    }
+    // Every write of those ivars, in any of the class's methods on that side.
+    fn writes_ok(e: &Expr, ivars: &[&Symbol], construction: &dyn Fn(&Expr) -> bool) -> bool {
+        let own = match &*e.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, value } if ivars.contains(&name) => {
+                matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) || construction(value)
+            }
+            ExprNode::OpAssign { target: LValue::Ivar { name }, op, value } if ivars.contains(&name) => {
+                *op == crate::expr::OpAssignOp::OrOr && construction(value)
+            }
+            ExprNode::MultiAssign { targets, .. } => {
+                !targets.iter().any(|t| matches!(t, LValue::Ivar { name } if ivars.contains(&name)))
+            }
+            ExprNode::Send { method, .. } => method.as_str() != "instance_variable_set",
+            _ => true,
+        };
+        let mut children = true;
+        e.node.for_each_child(&mut |c| children &= writes_ok(c, ivars, construction));
+        own && children
+    }
+    methods(contracts.app)
+        .filter(|(o, m)| *o == owner && m.receiver == side)
+        .all(|(_, m)| writes_ok(&m.body, &ivars, &construction))
+}
+
+fn has_return(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Return { .. }) {
+        return true;
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| found |= has_return(c));
+    found
 }
 
 /// Source declarations, not inferred arity: inference does not retain the

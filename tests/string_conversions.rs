@@ -46,9 +46,11 @@ fn missing_string_conversion_runtimes_are_refused() {
     let f = failures(
         "  def index\n    a = \"2020-01-01\".to_date\n    b = \"12:00\".to_time\n    c = \"1.5\".to_d / 100\n    d = \"now\".in_time_zone\n    e = \"x\".to_json\n    f = \"x\".as_json\n    render plain: \"x\"\n  end",
     );
-    for name in ["to_date", "to_time", "to_d", "in_time_zone", "as_json"] {
+    for name in ["to_date", "to_time", "to_d", "in_time_zone"] {
         assert!(f.iter().any(|d| d.contains(name)), "missing {name}: {f:?}");
     }
+    // `as_json` has one: the JSON port (`lower::as_json_residue`).
+    assert!(!f.iter().any(|d| d.contains("as_json")), "{f:?}");
 }
 
 #[test]

@@ -18,6 +18,78 @@ use crate::ty::Ty;
 use super::{BodyTyper, Ctx, union_many, union_of, unknown};
 
 impl<'a> BodyTyper<'a> {
+    /// Whether an `as_json` send no static method answers can go to the
+    /// port's `ActiveSupport::JSON::Encoding.as_json(value, options)`
+    /// (`expr::OBJECT_AS_JSON`). That function is ActiveSupport's
+    /// dispatch written out: a value with an `as_json` of its own is
+    /// asked, so the route never answers for a method the tree defines.
+    /// What it cannot be is a stand-in for the framework objects whose
+    /// emitted shape is not Rails': an `errors` collection (the runtime's
+    /// accumulator is an Array of full messages, where
+    /// `ActiveModel::Errors#as_json` is the attribute-keyed Hash), and a
+    /// record serializing itself with options (`serializable_hash`'s
+    /// `except:` / `methods:` / `include:`; the runtime's
+    /// `ActiveRecord::Base#as_json` honors `only:`).
+    pub(super) fn as_json_residue(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        args: &[Expr],
+        has_block: bool,
+        class_object: bool,
+        ctx: &Ctx,
+    ) -> AsJsonResidue {
+        if has_block
+            || args.len() > 1
+            || args.iter().any(|a| matches!(&*a.node,
+                ExprNode::Splat { .. } | ExprNode::ForwardArgs | ExprNode::ForwardKeywords))
+        {
+            return AsJsonResidue::Gap;
+        }
+        let errors_typed = matches!(recv_ty, Some(Ty::Class { id, .. })
+            if matches!(id.0.as_str(), "ActiveModel::Errors" | "ActiveModel::Error"));
+        let errors_read = recv.is_some_and(|r| matches!(&*r.node,
+            ExprNode::Send { method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty()));
+        if errors_typed || errors_read {
+            return AsJsonResidue::Refuse(
+                "ActiveModel::Errors",
+                "as_json: the emitted `errors` is the runtime's Array of full messages, not ActiveModel::Errors' attribute-keyed collection",
+            );
+        }
+        let on_self = recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+        if on_self && !class_object && !args.is_empty() && self.self_may_be_record(ctx)
+            && !args.first().is_some_and(only_option_literal)
+        {
+            return AsJsonResidue::Refuse(
+                "ActiveModel::Serializers::JSON",
+                "self may be a record (a module, an ActiveModel ancestor or a superclass outside the app); a record's as_json(options) is serializable_hash, and the runtime's ActiveRecord::Base#as_json honors only:",
+            );
+        }
+        AsJsonResidue::Route
+    }
+
+    /// `self` may be a record, or an ActiveModel object: a module (its
+    /// includer is not known here), a class whose superclass chain reaches
+    /// ActiveRecord / ActiveModel or a class the registry does not model,
+    /// or one including an ActiveModel module.
+    fn self_may_be_record(&self, ctx: &Ctx) -> bool {
+        let Some(Ty::Class { id, .. }) = ctx.self_ty.as_ref() else { return false };
+        let mut current = Some(id.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return false };
+            let name = id.0.as_str();
+            if name == "ApplicationRecord" || name.starts_with("ActiveRecord::") || name.starts_with("ActiveModel::") {
+                return true;
+            }
+            let Some(class) = self.classes().get(&id) else { return true };
+            if class.is_module || class.includes.iter().any(|m| m.0.as_str().starts_with("ActiveModel::")) {
+                return true;
+            }
+            current = class.parent_id().cloned();
+        }
+        true
+    }
+
     /// `record[:column]` / `read_attribute(:column)` (and their writer
     /// twins) are schema-indexed APIs.  The generic ActiveRecord catalog
     /// can only describe their fallback shape, but a literal key and a
@@ -3371,6 +3443,63 @@ pub(super) fn is_module_query(method: &Symbol) -> bool {
         | "class_variable_get" | "class_variable_defined?")
 }
 
+/// The value ActiveSupport's core_ext/object/json.rb `as_json` answers
+/// for a receiver of `recv_ty` that no static method answers (the
+/// analyzer flags the send `expr::OBJECT_AS_JSON` and
+/// `lower::as_json_residue` routes it to the port's
+/// `ActiveSupport::JSON::Encoding.as_json`): String and Symbol are a
+/// String, Numeric itself, Float `nil` where not finite, true / false /
+/// nil themselves, a Hash String-keyed, an Array mapped, Time / Date /
+/// DateTime their (standard or legacy) String, BigDecimal its String or
+/// `nil`, a class or module its name. Anything else (an object's own
+/// `as_json`, `to_hash`, `instance_values`) is not known statically.
+/// A receiver whose `as_json` the core method tables answer (String,
+/// Array, Hash; `nil` arms included), which the port answers the same.
+pub(super) fn as_json_core_receiver(recv_ty: Option<&Ty>) -> bool {
+    fn core(ty: &Ty) -> bool {
+        matches!(ty, Ty::Str | Ty::Array { .. } | Ty::Tuple { .. } | Ty::Hash { .. })
+    }
+    match recv_ty {
+        Some(Ty::Union { variants }) => {
+            variants.iter().any(core) && variants.iter().all(|v| core(v) || matches!(v, Ty::Nil))
+        }
+        Some(ty) => core(ty),
+        None => false,
+    }
+}
+
+pub(super) fn object_as_json_ty(recv_ty: Option<&Ty>, class_object: bool) -> Ty {
+    if class_object {
+        // Module#as_json is `name`, which is nil for an anonymous one;
+        // a class's own singleton `as_json` answers what it answers.
+        return Ty::Untyped;
+    }
+    match recv_ty {
+        Some(Ty::Str | Ty::Sym | Ty::Time | Ty::Date) => Ty::Str,
+        Some(Ty::Int) => Ty::Int,
+        Some(Ty::Float) => union_of(Ty::Float, Ty::Nil),
+        Some(Ty::Bool) => Ty::Bool,
+        Some(Ty::Nil) => Ty::Nil,
+        Some(Ty::Hash { .. }) => Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Untyped) },
+        Some(Ty::Array { .. } | Ty::Tuple { .. }) => Ty::Array { elem: Box::new(Ty::Untyped) },
+        Some(Ty::Class { id, .. }) => match id.0.as_str() {
+            "String" | "Symbol" | "Time" | "Date" | "DateTime" => Ty::Str,
+            "Integer" => Ty::Int,
+            "BigDecimal" => union_of(Ty::Str, Ty::Nil),
+            _ => Ty::Untyped,
+        },
+        Some(Ty::Union { variants }) => {
+            let arms: Vec<Ty> = variants.iter().map(|v| object_as_json_ty(Some(v), false)).collect();
+            if arms.iter().any(|t| matches!(t, Ty::Untyped)) {
+                Ty::Untyped
+            } else {
+                union_many(arms)
+            }
+        }
+        _ => Ty::Untyped,
+    }
+}
+
 pub(super) fn object_protocol_method(
     recv_ty: Option<&Ty>,
     method: &Symbol,
@@ -3463,3 +3592,22 @@ fn param_value_method(method: &Symbol, block_ret: Option<&Ty>) -> Option<Ty> {
         _ => return None,
     })
 }
+
+/// [`BodyTyper::as_json_residue`]'s answer.
+pub(super) enum AsJsonResidue {
+    /// Flag it `expr::OBJECT_AS_JSON`; the port answers it.
+    Route,
+    /// Not a core_ext `as_json`: refused by name.
+    Refuse(&'static str, &'static str),
+    /// A shape the port's function does not take; the generic gap.
+    Gap,
+}
+
+/// A literal `only: [...]` options Hash, the one `serializable_hash`
+/// option the runtime's `ActiveRecord::Base#as_json` honors.
+fn only_option_literal(arg: &Expr) -> bool {
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return false };
+    !entries.is_empty()
+        && entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "only"))
+}
+
