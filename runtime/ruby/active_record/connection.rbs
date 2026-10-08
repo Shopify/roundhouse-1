@@ -87,6 +87,10 @@ module ActiveRecord
     def self.take: () -> Base?
     def self._hydrate_all: (String sql) -> Array[Base]
     def update_attribute: (Symbol name, untyped value) -> bool
+    def valid?: (?Symbol? context) -> bool
+    def validation_context: () -> Symbol?
+    def save: (?context: Symbol?) -> bool
+    def save!: (?context: Symbol?) -> Base
     # Ruby-family overrides of base.rb's dirty-tracking stubs.
     def __track_saved_changes: (bool was_new) -> void
     def saved_changes: () -> Hash[String, untyped]

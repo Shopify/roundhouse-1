@@ -498,7 +498,19 @@ pub struct Validation {
 pub enum ValidationRule {
     Presence,
     Absence,
-    Uniqueness { scope: Vec<Symbol>, case_sensitive: bool },
+    /// `uniqueness:`: no other row of the model's table holds the value
+    /// (within `scope`'s columns, under `conditions`), excluding the
+    /// record itself once persisted. `case_sensitive: false` compares
+    /// `LOWER()`s.
+    Uniqueness {
+        scope: Vec<Symbol>,
+        case_sensitive: bool,
+        /// `conditions: -> { where(...) }`, the lambda Rails
+        /// `instance_exec`s on the relation (with the record as the
+        /// argument when it takes one).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conditions: Option<Expr>,
+    },
     Length {
         min: Option<u32>,
         max: Option<u32>,
@@ -509,6 +521,26 @@ pub enum ValidationRule {
         /// the Rails default text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+    },
+    /// `length:` in Rails' general form, each check against a bound
+    /// resolved on every run (an Integer, a constant, a method, a
+    /// lambda). `Length` above is the literal `minimum`/`maximum` form
+    /// the Sequel front end shares; Rails declarations with `is:`, a
+    /// non-literal bound or a per-check message come here.
+    LengthOf {
+        /// In LengthValidator's `CHECKS` order: is, minimum, maximum.
+        checks: Vec<LengthCheck>,
+        /// `allow_nil:` / `allow_blank:` was given (even `false`), so a
+        /// nil value is not exempt from `maximum:` (`skip_nil_check?`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nil_fails_maximum: bool,
+    },
+    /// `format: { with: REGEXP }` with a regexp resolved on each run (a
+    /// constant, a method, a lambda).
+    FormatOf {
+        regexp: RuleValue,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        without: bool,
     },
     /// `format: { with: /re/ }` (`without: true` for `without: /re/`):
     /// Rails matches `value.to_s`, so nil reads as "".
@@ -531,9 +563,13 @@ pub enum ValidationRule {
     /// `inclusion: { in: list }` / `exclusion: { in: list }`. `list` is
     /// the expression as written (an Array or Range literal, a
     /// constant, ...), asked `include?` per value; `cover` marks a Range
-    /// literal over numbers, which Rails asks `cover?`.
+    /// literal over numbers, which Rails asks `cover?`. `list_of` is a
+    /// list resolved on each run instead (a method, a lambda), in which
+    /// case `list` is unused `nil`.
     Inclusion {
         list: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        list_of: Option<RuleValue>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         exclusion: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -573,14 +609,62 @@ pub enum ValidationRule {
     Unsupported { construct: String, detail: String },
 }
 
-/// One `numericality:` comparison or parity option.
+/// One `numericality:` comparison, parity or range option.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NumericCheck {
     pub op: NumericOp,
-    /// The bound as written (an Integer or Float literal); `None` for
-    /// `odd` / `even`.
+    /// The bound: an Integer or Float literal, or a value resolved on
+    /// each run (a constant, a method, a lambda; a Range for `in`).
+    /// `None` for `odd` / `even`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bound: Option<Literal>,
+    pub bound: Option<RuleValue>,
+}
+
+impl NumericCheck {
+    /// The bound when it is a numeric literal.
+    pub fn literal_bound(&self) -> Option<&Literal> {
+        match &self.bound {
+            Some(RuleValue::Literal { value }) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// One `length:` check.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LengthCheck {
+    pub op: LengthOp,
+    pub bound: RuleValue,
+    /// `too_short:` / `too_long:` / `wrong_length:`, which a
+    /// validator-wide `message:` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<RuleMessage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LengthOp {
+    Is,
+    Minimum,
+    Maximum,
+}
+
+/// A validator option resolved on each validation run: ActiveModel's
+/// `resolve_value` for bounds, lists and regexps, and the callback call
+/// templates for `if:` / `unless:`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuleValue {
+    /// A literal, the same on every run.
+    Literal { value: Literal },
+    /// An expression evaluated as written on each run (a constant, a
+    /// Range or Array literal, ...).
+    Expr { expr: Expr },
+    /// `:name`: `record.send(name)`.
+    Method { name: Symbol },
+    /// A lambda / proc literal, called with the record when it takes a
+    /// parameter, with nothing otherwise.
+    Call { callable: Expr, with_record: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +678,7 @@ pub enum NumericOp {
     OtherThan,
     Odd,
     Even,
+    In,
 }
 
 impl NumericOp {
@@ -608,11 +693,12 @@ impl NumericOp {
             NumericOp::OtherThan => "other_than",
             NumericOp::Odd => "odd",
             NumericOp::Even => "even",
+            NumericOp::In => "in",
         }
     }
 
     /// ActiveModel's option order (`RESERVED_OPTIONS`).
-    pub const ORDER: [NumericOp; 8] = [
+    pub const ORDER: [NumericOp; 9] = [
         NumericOp::GreaterThan,
         NumericOp::GreaterThanOrEqualTo,
         NumericOp::EqualTo,
@@ -621,6 +707,7 @@ impl NumericOp {
         NumericOp::OtherThan,
         NumericOp::Odd,
         NumericOp::Even,
+        NumericOp::In,
     ];
 
     pub fn from_key(key: &str) -> Option<NumericOp> {
@@ -637,10 +724,56 @@ pub struct RuleOptions {
     pub allow_blank: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<RuleMessage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub if_method: Option<Symbol>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unless_method: Option<Symbol>,
+    /// `if:` conditions, every one of which must hold (a method, a
+    /// lambda run with the record as `self`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub if_conds: Vec<RuleValue>,
+    /// `unless:` conditions, none of which may hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unless_conds: Vec<RuleValue>,
+    /// `on:` validation contexts; the rule runs only when the
+    /// validation context is one of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on: Vec<Symbol>,
+}
+
+/// ActiveModel's and ActiveRecord's English error messages (their
+/// `en.yml`) by error type: the `one` form where the entry is
+/// pluralized, and the `other` (or only) form. `None` for a type neither
+/// defines (`model_invalid` / `record_invalid`, which interpolate
+/// `%{errors}`, are not error messages and are left out).
+pub fn active_model_en_message(kind: &str) -> Option<(Option<&'static str>, &'static str)> {
+    Some(match kind {
+        "inclusion" => (None, "is not included in the list"),
+        "exclusion" => (None, "is reserved"),
+        "invalid" => (None, "is invalid"),
+        "confirmation" => (None, "doesn't match %{attribute}"),
+        "accepted" => (None, "must be accepted"),
+        "empty" => (None, "can't be empty"),
+        "blank" => (None, "can't be blank"),
+        "present" => (None, "must be blank"),
+        "too_long" => (Some("is too long (maximum is 1 character)"), "is too long (maximum is %{count} characters)"),
+        "password_too_long" => (None, "is too long"),
+        "too_short" => (Some("is too short (minimum is 1 character)"), "is too short (minimum is %{count} characters)"),
+        "wrong_length" => (
+            Some("is the wrong length (should be 1 character)"),
+            "is the wrong length (should be %{count} characters)",
+        ),
+        "not_a_number" => (None, "is not a number"),
+        "not_an_integer" => (None, "must be an integer"),
+        "greater_than" => (None, "must be greater than %{count}"),
+        "greater_than_or_equal_to" => (None, "must be greater than or equal to %{count}"),
+        "equal_to" => (None, "must be equal to %{count}"),
+        "less_than" => (None, "must be less than %{count}"),
+        "less_than_or_equal_to" => (None, "must be less than or equal to %{count}"),
+        "other_than" => (None, "must be other than %{count}"),
+        "in" => (None, "must be in %{count}"),
+        "odd" => (None, "must be odd"),
+        "even" => (None, "must be even"),
+        "required" => (None, "must exist"),
+        "taken" => (None, "has already been taken"),
+        _ => return None,
+    })
 }
 
 /// A validator's `message:`: a String (I18n-interpolated with
@@ -652,6 +785,13 @@ pub struct RuleOptions {
 pub enum RuleMessage {
     Text { text: String },
     Call { callable: Expr },
+    /// `message: :taken`: an error type looked up as I18n does with
+    /// only ActiveModel's and ActiveRecord's English messages loaded.
+    Key { key: Symbol },
+    /// A message evaluated where it is written: a constant (a String,
+    /// or a Proc, called as a lambda message is) or an interpolated
+    /// String. The result is interpolated per run.
+    Value { expr: Expr },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

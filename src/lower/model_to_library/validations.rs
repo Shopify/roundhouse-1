@@ -13,8 +13,8 @@
 //! append their own stmt block to the body.
 
 use crate::dialect::{
-    AccessorKind, Association, MethodDef, MethodReceiver, Model, NumericCheck, NumericOp, RuleMessage,
-    RuleOptions, ValidationRule,
+    AccessorKind, Association, LengthCheck, LengthOp, MethodDef, MethodReceiver, Model, NumericCheck, NumericOp,
+    RuleMessage, RuleOptions, RuleValue, ValidationRule,
 };
 use crate::effect::EffectSet;
 use crate::expr::{ArrayStyle, BoolOpKind, BoolOpSurface, Expr, ExprNode, InterpPart, Literal};
@@ -28,6 +28,10 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
     let mut stmts: Vec<Expr> = Vec::new();
     // `model_name.human`, which a `message:` reads as `%{model}`.
     let model_human = humanize(&crate::naming::underscore(crate::naming::demodulize(model.name.0.as_str())));
+    // `model_name.i18n_key` and the I18n scope, which a Symbol
+    // `message:` with no English translation names.
+    let i18n_key = crate::naming::underscore(model.name.0.as_str());
+    let i18n_scope = if model.parent.is_some() { "activerecord" } else { "activemodel" };
 
     for (span, v) in model.spanned_validations() {
         // Column type from the model's attributes row (when present).
@@ -48,6 +52,9 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             matches!(a, Association::BelongsTo { name, .. } | Association::HasOne { name, .. }
                 if name == &v.attribute)
         });
+        // Any association (a `has_many` too) is read through its reader,
+        // as `read_attribute_for_validation` reads it.
+        let any_assoc = model.associations().any(|a| a.name() == &v.attribute);
         for rule in &v.rules {
             // `allow_nil:` / `allow_blank:` / `message:` / `if:` /
             // `unless:` wrap the rule they apply to.
@@ -63,6 +70,8 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             let text = ErrorText {
                 attr: &v.attribute,
                 model_human: &model_human,
+                i18n_key: &i18n_key,
+                i18n_scope,
                 message: options.and_then(|o| o.message.as_ref()).or(own_message.as_ref()),
             };
             let reader = Expr::new(
@@ -78,11 +87,12 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             let (checks, value) = if is_assoc && matches!(rule, ValidationRule::Presence) {
                 let check = if_with_nil_else(
                     send(reader.clone(), "nil?", vec![]),
-                    text.push("can't be blank", None, || reader.clone()),
+                    text.push("blank", None, || reader.clone()),
                 );
                 (vec![check], reader)
             } else {
-                (validation_rule_to_calls(&v.attribute, rule, attr_ty, &text), ivar(&v.attribute))
+                let value = if any_assoc { reader } else { ivar(&v.attribute) };
+                (validation_rule_to_calls(model, &v.attribute, rule, attr_ty, &value, &text), value)
             };
             let checks = match options {
                 Some(o) => guard_rule(value, checks, o),
@@ -366,7 +376,57 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
                 },
             ),
         ]);
+        // A rule's `on:` reads `validation_context`: ActiveModel's
+        // `valid?(context = nil)` sets it for the run (no default — the
+        // `:create` / `:update` default is ActiveRecord's) and restores
+        // the previous one after.
+        let contexts = uses_validation_context(model);
+        let mut params = Vec::new();
+        if contexts {
+            let context = Symbol::from("validation_context");
+            let previous = Symbol::from("previous_validation_context");
+            let ctx_ivar = || Expr::new(span, ExprNode::Ivar { name: context.clone() });
+            let ok = Symbol::from("validation_ok");
+            let check = body_stmts.pop().expect("the empty? check");
+            body_stmts.insert(0, assign_local(&previous, ctx_ivar()));
+            body_stmts.insert(
+                1,
+                Expr::new(
+                    span,
+                    ExprNode::Assign {
+                        target: crate::expr::LValue::Ivar { name: context.clone() },
+                        value: local_read(&Symbol::from("context")),
+                    },
+                ),
+            );
+            body_stmts.push(assign_local(&ok, check));
+            body_stmts.push(Expr::new(
+                span,
+                ExprNode::Assign {
+                    target: crate::expr::LValue::Ivar { name: context.clone() },
+                    value: local_read(&previous),
+                },
+            ));
+            body_stmts.push(local_read(&ok));
+            params.push(crate::dialect::Param {
+                name: Symbol::from("context"),
+                default: Some(Expr::new(span, ExprNode::Lit { value: Literal::Nil })),
+                keyword: false,
+                rest: false,
+                forwarding: false,
+                from_keyword: false,
+                from_kwrest: false,
+            });
+        }
         let body = seq(body_stmts);
+        let mut signature = fn_sig(vec![], Ty::Bool);
+        if let (true, Ty::Fn { params, .. }) = (contexts, &mut signature) {
+            params.push(crate::ty::Param {
+                name: Symbol::from("context"),
+                ty: Ty::Union { variants: vec![Ty::Sym, Ty::Nil] },
+                kind: crate::ty::ParamKind::Optional,
+            });
+        }
         methods.push(MethodDef {
             visibility: crate::dialect::MethodVisibility::Public,
             unsupported_formals: None,
@@ -374,14 +434,33 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
             name_span: crate::span::Span::synthetic(),
             name: Symbol::from("valid?"),
             receiver: MethodReceiver::Instance,
-            params: Vec::new(),
+            params,
             body,
-            signature: Some(fn_sig(vec![], Ty::Bool)),
+            signature: Some(signature),
             effects: EffectSet::default(),
             enclosing_class: Some(model.name.0.clone()),
             kind: AccessorKind::Method,
             is_async: false,
             mutates_self: true,
+            block_param: None,
+        });
+    }
+    if uses_validation_context(model) && !defines("validation_context") {
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: crate::span::Span::synthetic(),
+            name: Symbol::from("validation_context"),
+            receiver: MethodReceiver::Instance,
+            params: Vec::new(),
+            body: Expr::new(span, ExprNode::Ivar { name: Symbol::from("validation_context") }),
+            signature: Some(fn_sig(vec![], Ty::Union { variants: vec![Ty::Sym, Ty::Nil] })),
+            effects: EffectSet::default(),
+            enclosing_class: Some(model.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
             block_param: None,
         });
     }
@@ -406,14 +485,23 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
     }
 }
 
+/// Whether any rule runs `on:` a validation context.
+fn uses_validation_context(model: &Model) -> bool {
+    model.validations().any(|v| {
+        v.rules.iter().any(|r| matches!(r, ValidationRule::Guarded { options, .. } if !options.on.is_empty()))
+    })
+}
+
 /// Produce the list of helper-call expressions for one `ValidationRule` on
 /// `attr`. Each helper is `<helper>(:attr, @attr [, kwargs])` — the value
 /// is passed positionally so the runtime helper sees a concretely-typed
 /// `value` parameter (no block-yield, no `instance_variable_get`).
 fn validation_rule_to_calls(
+    model: &Model,
     attr: &Symbol,
     rule: &ValidationRule,
     attr_ty: Option<&Ty>,
+    value: &Expr,
     text: &ErrorText<'_>,
 ) -> Vec<Expr> {
     match rule {
@@ -432,14 +520,25 @@ fn validation_rule_to_calls(
         ValidationRule::Numericality { only_integer, checks } => {
             inline_numericality_check(attr, *only_integer, checks, text)
         }
-        ValidationRule::Inclusion { list, exclusion, cover } => {
+        ValidationRule::Inclusion { list_of: Some(members), exclusion, .. } => {
+            vec![inline_inclusion_check(attr, &resolve(members), *exclusion, false, text)]
+        }
+        ValidationRule::Inclusion { list, exclusion, cover, list_of: None } => {
             vec![inline_inclusion_check(attr, list, *exclusion, *cover, text)]
+        }
+        ValidationRule::LengthOf { checks, nil_fails_maximum } => {
+            inline_length_of_check(attr, value, attr_ty, checks, *nil_fails_maximum, text)
+        }
+        ValidationRule::FormatOf { regexp, without } => {
+            let matched = send(resolve(regexp), "match?", vec![send(ivar(attr), "to_s", vec![])]);
+            let invalid = if *without { matched } else { not(matched) };
+            vec![if_with_nil_else(invalid, text.push("invalid", None, || ivar(attr)))]
         }
         // Reported by `roundhouse check` (`analyze::ingest_coverage`);
         // a weaker check here would pass records Rails rejects.
         ValidationRule::Unsupported { .. } => Vec::new(),
         // `push_validate_method` unwraps the options before asking.
-        ValidationRule::Guarded { rule, .. } => validation_rule_to_calls(attr, rule, attr_ty, text),
+        ValidationRule::Guarded { rule, .. } => validation_rule_to_calls(model, attr, rule, attr_ty, value, text),
         // `validate :validate_url` — a method the model defines, which
         // adds to `errors` itself. The synthesized `validate` just
         // calls it; everything else about the shape (when it runs, what
@@ -527,9 +626,10 @@ fn validation_rule_to_calls(
             };
             vec![guarded]
         }
-        ValidationRule::Uniqueness { .. } => {
-            // Not yet exercised by real-blog; lands when a fixture forces the issue.
-            Vec::new()
+        // Reported by `roundhouse check`: there is no table to ask.
+        ValidationRule::Uniqueness { .. } if model.parent.is_none() => Vec::new(),
+        ValidationRule::Uniqueness { scope, case_sensitive, conditions } => {
+            inline_uniqueness_check(model, attr, attr_ty, scope, *case_sensitive, conditions.as_ref(), text)
         }
     }
 }
@@ -636,7 +736,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, text: &ErrorText<'
             send(raw_ivar.clone(), "nil?", vec![]),
             send(raw_ivar, "empty?", vec![]),
         );
-        let push_err = text.push("can't be blank", None, || ivar(attr));
+        let push_err = text.push("blank", None, || ivar(attr));
         return if_with_nil_else(cond, push_err);
     }
     let attr_ivar = ivar(attr);
@@ -692,7 +792,7 @@ fn inline_presence_check(attr: &Symbol, attr_ty: Option<&Ty>, text: &ErrorText<'
         }
     };
     // `errors << "attr can't be blank"`
-    let push_err = text.push("can't be blank", None, || ivar(attr));
+    let push_err = text.push("blank", None, || ivar(attr));
     // The wrapping `if cond then push_err end` (Nil else).
     if_with_nil_else(cond, push_err)
 }
@@ -731,7 +831,7 @@ fn inline_absence_check(attr: &Symbol, text: &ErrorText<'_>) -> Expr {
             parenthesized: false,
         },
     );
-    let push_err = text.push("must be blank", None, || ivar(attr));
+    let push_err = text.push("present", None, || ivar(attr));
     if_with_nil_else(not_blank, push_err)
 }
 
@@ -751,9 +851,9 @@ fn inline_inclusion_check(
 ) -> Expr {
     let member = send(list.clone(), if cover { "cover?" } else { "include?" }, vec![ivar(attr)]);
     if exclusion {
-        return if_with_nil_else(member, text.push("is reserved", None, || ivar(attr)));
+        return if_with_nil_else(member, text.push("exclusion", None, || ivar(attr)));
     }
-    if_with_nil_else(not(member), text.push("is not included in the list", None, || ivar(attr)))
+    if_with_nil_else(not(member), text.push("inclusion", None, || ivar(attr)))
 }
 
 /// Inline `validates :attr, format: { with: /re/ }` (`without:` with
@@ -766,7 +866,7 @@ fn inline_format_check(attr: &Symbol, pattern: &str, flags: &str, without: bool,
     );
     let matched = send(regex_lit, "match?", vec![send(ivar(attr), "to_s", vec![])]);
     let invalid = if without { matched } else { not(matched) };
-    if_with_nil_else(invalid, text.push("is invalid", None, || ivar(attr)))
+    if_with_nil_else(invalid, text.push("invalid", None, || ivar(attr)))
 }
 
 /// Inline `validates :attr, length: { minimum: M, maximum: N, is: K }`.
@@ -803,16 +903,14 @@ fn inline_length_check(
     let len_expr = match attr_ty {
         Some(Ty::Str) | Some(Ty::Array { .. }) => length_send,
         _ => {
-            let zero_lit = Expr::new(
-                Span::synthetic(),
-                ExprNode::Lit { value: Literal::Int { value: 0 } },
-            );
+            // Rails reads anything else's `to_s.length`.
+            let to_s_length = send(send(attr_ivar.clone(), "to_s", vec![]), "length", vec![]);
             let inner_else = Expr::new(
                 Span::synthetic(),
                 ExprNode::If {
                     cond: is_a_check(&attr_ivar, "Array"),
                     then_branch: length_send.clone(),
-                    else_branch: zero_lit,
+                    else_branch: to_s_length,
                 },
             );
             Expr::new(
@@ -851,8 +949,8 @@ fn inline_length_check(
                 ExprNode::Lit { value: Literal::Int { value: n as i64 } },
             )],
         );
-        let count = Literal::Int { value: n as i64 };
-        let msg = text.push("is too short (minimum is %{count} characters)", Some(&count), || ivar(attr));
+        let count = Count::Static(Literal::Int { value: n as i64 });
+        let msg = text.push("too_short", Some(&count), || ivar(attr));
         inner_stmts.push(if_with_nil_else(lt, msg));
     }
     if let Some(n) = max {
@@ -864,8 +962,8 @@ fn inline_length_check(
                 ExprNode::Lit { value: Literal::Int { value: n as i64 } },
             )],
         );
-        let count = Literal::Int { value: n as i64 };
-        let msg = text.push("is too long (maximum is %{count} characters)", Some(&count), || ivar(attr));
+        let count = Count::Static(Literal::Int { value: n as i64 });
+        let msg = text.push("too_long", Some(&count), || ivar(attr));
         inner_stmts.push(if_with_nil_else(gt, msg));
     }
     let body_seq = seq(inner_stmts);
@@ -879,8 +977,8 @@ fn inline_length_check(
     let nil_check = send(ivar(attr), "nil?", vec![]);
     let nil_branch = match min {
         Some(n) => {
-            let count = Literal::Int { value: n as i64 };
-            text.push("is too short (minimum is %{count} characters)", Some(&count), || ivar(attr))
+            let count = Count::Static(Literal::Int { value: n as i64 });
+            text.push("too_short", Some(&count), || ivar(attr))
         }
         None => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
     };
@@ -888,6 +986,270 @@ fn inline_length_check(
         Span::synthetic(),
         ExprNode::If { cond: nil_check, then_branch: nil_branch, else_branch: body_seq },
     )]
+}
+
+/// `validates :attr, length: { ... }` in LengthValidator's general form
+/// — `is:` / `minimum:` / `maximum:` in that order, each bound resolved
+/// per run, each error with its own default message:
+///   <attr>_minimum = <bound>               # for a non-literal bound
+///   if value.nil?
+///     errors << "Attr is too short (...)"  # is / minimum always fail nil
+///   else
+///     len = value.respond_to?(:length) ? value.length : value.to_s.length
+///     errors << "Attr is too short (minimum is 3 characters)" unless len >= <attr>_minimum
+///   end
+/// A nil value fails `maximum:` too when `allow_nil:` / `allow_blank:`
+/// is given (`skip_nil_check?`); otherwise nil's length, 0, passes it.
+fn inline_length_of_check(
+    attr: &Symbol,
+    value: &Expr,
+    attr_ty: Option<&Ty>,
+    checks: &[LengthCheck],
+    nil_fails_maximum: bool,
+    text: &ErrorText<'_>,
+) -> Vec<Expr> {
+    let s = Span::synthetic();
+    let mut out = Vec::new();
+    let mut bounds: Vec<(Expr, Count)> = Vec::new();
+    for check in checks {
+        let key = match check.op {
+            LengthOp::Is => "is",
+            LengthOp::Minimum => "minimum",
+            LengthOp::Maximum => "maximum",
+        };
+        bounds.push(match &check.bound {
+            RuleValue::Literal { value } => {
+                (Expr::new(s, ExprNode::Lit { value: value.clone() }), Count::Static(value.clone()))
+            }
+            other => {
+                let local = Symbol::from(format!("{}_length_{key}", attr.as_str()));
+                out.push(assign_local(&local, resolve(other)));
+                (local_read(&local), Count::Dynamic(local_read(&local)))
+            }
+        });
+    }
+    let error = |check: &LengthCheck, count: &Count| {
+        let kind = match check.op {
+            LengthOp::Is => "wrong_length",
+            LengthOp::Minimum => "too_short",
+            LengthOp::Maximum => "too_long",
+        };
+        // A rule-level `message:` wins over `too_short:` and the like.
+        let own = ErrorText { message: text.message.or(check.message.as_ref()), ..*text };
+        own.push(kind, Some(count), || value.clone())
+    };
+    let (inner, _) = peel_nilable(attr_ty);
+    let length = match inner {
+        Some(Ty::Str) | Some(Ty::Array { .. }) => send(value.clone(), "length", vec![]),
+        _ => Expr::new(
+            s,
+            ExprNode::If {
+                cond: send(
+                    value.clone(),
+                    "respond_to?",
+                    vec![Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from("length") } })],
+                ),
+                then_branch: send(value.clone(), "length", vec![]),
+                else_branch: send(send(value.clone(), "to_s", vec![]), "length", vec![]),
+            },
+        ),
+    };
+    let len = Symbol::from(format!("{}_length", attr.as_str()));
+    let mut present = vec![assign_local(&len, length)];
+    let mut absent = Vec::new();
+    for (check, (bound, count)) in checks.iter().zip(&bounds) {
+        let op = match check.op {
+            LengthOp::Is => "==",
+            LengthOp::Minimum => ">=",
+            LengthOp::Maximum => "<=",
+        };
+        present.push(if_with_nil_else(not(send(local_read(&len), op, vec![bound.clone()])), error(check, count)));
+        match check.op {
+            LengthOp::Maximum if !nil_fails_maximum => {
+                // nil's length is 0.
+                let zero = Expr::new(s, ExprNode::Lit { value: Literal::Int { value: 0 } });
+                absent.push(if_with_nil_else(not(send(zero, "<=", vec![bound.clone()])), error(check, count)));
+            }
+            _ => absent.push(error(check, count)),
+        }
+    }
+    out.push(Expr::new(
+        s,
+        ExprNode::If { cond: send(value.clone(), "nil?", vec![]), then_branch: seq(absent), else_branch: seq(present) },
+    ));
+    out
+}
+
+/// `validates :attr, uniqueness: { ... }` — UniquenessValidator's query
+/// against the record's own class, unscoped:
+///   <attr>_relation = ActiveRecord::Relation.new(self.class).where({ attr: @attr })
+///   <attr>_relation = <attr>_relation.not({ id: [id] }) if persisted?
+///   <attr>_relation = <attr>_relation.where({ scope: @scope })   # each `scope:`
+///   <attr>_relation = <attr>_relation.where(...)                 # `conditions:`
+///   errors << "Attr has already been taken" if <attr>_relation.exists?
+/// `case_sensitive: false` on a string column compares `LOWER(col) =
+/// LOWER(?)`, as PostgreSQL's case-insensitive comparison does; a nil
+/// value is `IS NULL` either way. A `belongs_to` names its foreign key.
+fn inline_uniqueness_check(
+    model: &Model,
+    attr: &Symbol,
+    attr_ty: Option<&Ty>,
+    scope: &[Symbol],
+    case_sensitive: bool,
+    conditions: Option<&Expr>,
+    text: &ErrorText<'_>,
+) -> Vec<Expr> {
+    let s = Span::synthetic();
+    let sym = |n: &str| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n) } });
+    let hash = |entries: Vec<(Expr, Expr)>| Expr::new(s, ExprNode::Hash { entries, kwargs: false });
+    // A `belongs_to` reads as its foreign key column; a polymorphic one
+    // as its type column too, as `where(assoc => record)` writes it.
+    let columns = |name: &Symbol| -> Vec<Symbol> {
+        for a in model.associations() {
+            if let Association::BelongsTo { name: n, foreign_key, polymorphic, .. } = a {
+                if n == name {
+                    let mut cols = vec![foreign_key.clone()];
+                    if *polymorphic {
+                        cols.push(Symbol::from(format!("{}_type", name.as_str())));
+                    }
+                    return cols;
+                }
+            }
+        }
+        vec![name.clone()]
+    };
+    let rel = Symbol::from(format!("{}_relation", attr.as_str()));
+    let model_class = send(Expr::new(s, ExprNode::SelfRef), "class", vec![]);
+    let base = Expr::new(
+        s,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                s,
+                ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("Relation")] },
+            )),
+            method: Symbol::from("new"),
+            args: vec![model_class],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    // The attribute itself: a belongs_to binds its foreign key only.
+    let own_col = columns(attr).into_iter().next().expect("one column");
+    let own_value = ivar(&own_col);
+    let (inner, _) = peel_nilable(attr_ty);
+    let lower = !case_sensitive && own_col == *attr && matches!(inner, Some(Ty::Str));
+    let eq = send(base.clone(), "where", vec![hash(vec![(sym(own_col.as_str()), own_value.clone())])]);
+    let first = if lower {
+        let sql = Expr::new(
+            s,
+            ExprNode::Lit { value: Literal::Str { value: format!("LOWER({0}) = LOWER(?)", own_col.as_str()) } },
+        );
+        Expr::new(
+            s,
+            ExprNode::If {
+                cond: send(own_value.clone(), "nil?", vec![]),
+                then_branch: eq,
+                else_branch: send(base, "where", vec![sql, own_value.clone()]),
+            },
+        )
+    } else {
+        eq
+    };
+    let mut out = vec![assign_local(&rel, first)];
+    let pk = model.primary_key.clone().unwrap_or_else(|| Symbol::from("id"));
+    let id = Expr::new(
+        s,
+        ExprNode::Send { recv: None, method: Symbol::from("id"), args: Vec::new(), block: None, parenthesized: false },
+    );
+    let not_self = send(
+        local_read(&rel),
+        "not",
+        vec![hash(vec![(
+            sym(pk.as_str()),
+            Expr::new(s, ExprNode::Array { elements: vec![id], style: ArrayStyle::Brackets }),
+        )])],
+    );
+    let persisted = Expr::new(
+        s,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("persisted?"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    );
+    out.push(if_with_nil_else(persisted, assign_local(&rel, not_self)));
+    let scope_entries: Vec<(Expr, Expr)> =
+        scope.iter().flat_map(columns).map(|c| (sym(c.as_str()), ivar(&c))).collect();
+    if !scope_entries.is_empty() {
+        out.push(assign_local(&rel, send(local_read(&rel), "where", vec![hash(scope_entries)])));
+    }
+    if let Some(conditions) = conditions {
+        if let Some(chain) = uniqueness_conditions_chain(conditions, &local_read(&rel)) {
+            out.push(assign_local(&rel, chain));
+        }
+    }
+    let taken = send(local_read(&rel), "exists?", vec![]);
+    out.push(if_with_nil_else(taken, text.push("taken", None, || own_value.clone())));
+    out
+}
+
+/// A `conditions:` lambda — a `where(...)` / `where.not(...)` chain,
+/// which Rails `instance_exec`s on the relation — written onto `rel`.
+/// The lambda's parameter, when it takes one, is the record. Ingest
+/// admits no other shape.
+fn uniqueness_conditions_chain(conditions: &Expr, rel: &Expr) -> Option<Expr> {
+    let lambda = match &*conditions.node {
+        ExprNode::Lambda { .. } => conditions,
+        ExprNode::Send { block: Some(block), .. } => block,
+        _ => return None,
+    };
+    let ExprNode::Lambda { params, body, .. } = &*lambda.node else { return None };
+    let record = params.first().cloned();
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    fn args_on(args: &[Expr], record: &Option<Symbol>) -> Vec<Expr> {
+        args.iter()
+            .map(|a| {
+                let mut a = a.clone();
+                replace_var_with_self(&mut a, record);
+                a
+            })
+            .collect()
+    }
+    fn chain(e: &Expr, rel: &Expr, record: &Option<Symbol>) -> Option<Expr> {
+        let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else { return None };
+        let on = |r: &Option<Expr>| match r {
+            None => Some(rel.clone()),
+            Some(r) => chain(r, rel, record),
+        };
+        match method.as_str() {
+            "where" if !args.is_empty() => Some(send(on(recv)?, "where", args_on(args, record))),
+            "not" if !args.is_empty() => {
+                let inner = recv.as_ref()?;
+                let ExprNode::Send { recv: root, method: w, args: none, block: None, .. } = &*inner.node else {
+                    return None;
+                };
+                (w.as_str() == "where" && none.is_empty()).then_some(())?;
+                Some(send(on(root)?, "not", args_on(args, record)))
+            }
+            _ => None,
+        }
+    }
+    chain(body, rel, &record)
+}
+
+fn replace_var_with_self(e: &mut Expr, record: &Option<Symbol>) {
+    if let (ExprNode::Var { name, .. }, Some(r)) = (&*e.node, record) {
+        if name == r {
+            *e.node = ExprNode::SelfRef;
+            return;
+        }
+    }
+    e.node.for_each_child_mut(&mut |c| replace_var_with_self(c, record));
 }
 
 /// Inline `validates :attr, numericality: { ... }`, NumericalityValidator's
@@ -987,22 +1349,32 @@ fn inline_numericality_check(
             NumericOp::Odd | NumericOp::Even => {
                 let parity = if check.op == NumericOp::Odd { "odd?" } else { "even?" };
                 let holds = send(send(number(), "to_i", vec![]), parity, vec![]);
-                let default = if check.op == NumericOp::Odd { "must be odd" } else { "must be even" };
-                compares.push(if_with_nil_else(not(holds), text.push(default, None, number)));
+                compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), None, number)));
                 continue;
             }
+            // `value.in?(range)`: Range#include?, which for numbers is
+            // `cover?`.
+            NumericOp::In => "include?",
         };
         let Some(bound) = &check.bound else { continue };
-        let holds = send(number(), op, vec![Expr::new(s, ExprNode::Lit { value: bound.clone() })]);
-        let default = match check.op {
-            NumericOp::GreaterThan => "must be greater than %{count}",
-            NumericOp::GreaterThanOrEqualTo => "must be greater than or equal to %{count}",
-            NumericOp::EqualTo => "must be equal to %{count}",
-            NumericOp::LessThan => "must be less than %{count}",
-            NumericOp::LessThanOrEqualTo => "must be less than or equal to %{count}",
-            _ => "must be other than %{count}",
+        // A literal is written in place; anything else is resolved once,
+        // into a local the comparison and the message's %{count} share.
+        let (bound_expr, count) = match bound {
+            RuleValue::Literal { value } => {
+                (Expr::new(s, ExprNode::Lit { value: value.clone() }), Count::Static(value.clone()))
+            }
+            other => {
+                let local = Symbol::from(format!("{}_{}", attr.as_str(), check.op.key()));
+                compares.push(assign_local(&local, resolve(other)));
+                (local_read(&local), Count::Dynamic(local_read(&local)))
+            }
         };
-        compares.push(if_with_nil_else(not(holds), text.push(default, Some(bound), number)));
+        let holds = if check.op == NumericOp::In {
+            send(bound_expr, op, vec![number()])
+        } else {
+            send(number(), op, vec![bound_expr])
+        };
+        compares.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), number)));
     }
     let tail = if compares.is_empty() { nil() } else { seq(compares) };
     let tail = if only_integer {
@@ -1010,7 +1382,7 @@ fn inline_numericality_check(
             s,
             ExprNode::If {
                 cond: not(send(regex(integer_re), "match?", vec![send(raw(), "to_s", vec![])])),
-                then_branch: text.push("must be an integer", None, raw),
+                then_branch: text.push("not_an_integer", None, raw),
                 else_branch: tail,
             },
         )
@@ -1021,7 +1393,7 @@ fn inline_numericality_check(
         s,
         ExprNode::If {
             cond: send(number(), "nil?", vec![]),
-            then_branch: text.push("is not a number", None, raw),
+            then_branch: text.push("not_a_number", None, raw),
             else_branch: tail,
         },
     );
@@ -1060,51 +1432,85 @@ fn bigdecimal_to_s(f: f64) -> String {
     format!("{}0.{digits}e{}", if f < 0.0 { "-" } else { "" }, exp + 1)
 }
 
+/// What a message's `%{count}` reads: a bound known when lowering, or
+/// one resolved on the run.
+pub(super) enum Count {
+    Static(Literal),
+    Dynamic(Expr),
+}
+
 /// How a rule's errors read: ActiveModel's default text, or the
 /// validator's `message:`. Either way the full message is the humanized
 /// attribute, a space, and the message (`"%{attribute} %{message}"`).
+#[derive(Clone, Copy)]
 pub(super) struct ErrorText<'a> {
     attr: &'a Symbol,
     model_human: &'a str,
+    i18n_key: &'a str,
+    i18n_scope: &'a str,
     message: Option<&'a RuleMessage>,
 }
 
 impl ErrorText<'_> {
-    /// `errors << "<Attr> <message>"` for an error whose default text is
-    /// `default` (its `%{count}` the formatted `count`) and whose value
-    /// (what `%{value}` and a callable message see) is `value`.
-    fn push(&self, default: &str, count: Option<&Literal>, value: impl Fn() -> Expr) -> Expr {
+    /// `errors << "<Attr> <message>"` for an error of type `kind`
+    /// (`blank`, `too_long`, ...), its `%{count}` `count`, and the value
+    /// `%{value}` and a callable message see.
+    fn push(&self, kind: &str, count: Option<&Count>, value: impl Fn() -> Expr) -> Expr {
         let human = humanize(self.attr.as_str());
-        let count_text = count.map(format_count).unwrap_or_default();
         match self.message {
-            None => errors_push(format!("{human} {}", default.replace("%{count}", &count_text))),
-            Some(RuleMessage::Text { text }) => {
-                // I18n interpolation of the keys ActiveModel supplies;
-                // ingest admits no others.
-                let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("{human} ") }];
-                let mut rest = text.as_str();
-                let push_text = |parts: &mut Vec<InterpPart>, t: &str| match parts.last_mut() {
-                    Some(InterpPart::Text { value }) => value.push_str(t),
-                    _ => parts.push(InterpPart::Text { value: t.to_string() }),
+            None => self.push_type(kind, count, &value),
+            Some(RuleMessage::Key { key }) => self.push_type(key.as_str(), count, &value),
+            Some(RuleMessage::Text { text }) => errors_push_expr(self.interpolate(text, count, &value)),
+            Some(RuleMessage::Value { expr }) => {
+                // `m = <expr>`, then a Proc's call or the String with
+                // the keys ActiveModel supplies interpolated.
+                let s = Span::synthetic();
+                let local = Symbol::from(format!("{}_message", self.attr.as_str()));
+                let str_lit = |t: &str| Expr::new(s, ExprNode::Lit { value: Literal::Str { value: t.to_string() } });
+                let sym = |n: &str| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n) } });
+                let count_expr = match count {
+                    Some(Count::Static(c)) => Some(Expr::new(s, ExprNode::Lit { value: c.clone() })),
+                    Some(Count::Dynamic(e)) => Some(e.clone()),
+                    None => None,
                 };
-                while let Some(start) = rest.find("%{") {
-                    let tail = &rest[start + 2..];
-                    let Some(end) = tail.find('}') else { break };
-                    push_text(&mut parts, &rest[..start]);
-                    match &tail[..end] {
-                        "attribute" => push_text(&mut parts, &human),
-                        "model" => push_text(&mut parts, self.model_human),
-                        "count" => push_text(&mut parts, &count_text),
-                        "value" => parts.push(InterpPart::Expr { expr: value() }),
-                        other => push_text(&mut parts, &format!("%{{{other}}}")),
-                    }
-                    rest = &tail[end + 1..];
+                let mut entries = vec![
+                    (sym("model"), str_lit(self.model_human)),
+                    (sym("attribute"), str_lit(&human)),
+                    (sym("value"), value()),
+                ];
+                if let Some(c) = &count_expr {
+                    entries.push((sym("count"), c.clone()));
                 }
-                push_text(&mut parts, rest);
-                match parts.as_slice() {
-                    [InterpPart::Text { value }] => errors_push(value.clone()),
-                    _ => errors_push_expr(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts })),
+                let call = Expr::new(
+                    s,
+                    ExprNode::Send {
+                        recv: Some(local_read(&local)),
+                        method: Symbol::from("call"),
+                        args: vec![Expr::new(s, ExprNode::SelfRef), Expr::new(s, ExprNode::Hash { entries, kwargs: true })],
+                        block: None,
+                        parenthesized: true,
+                    },
+                );
+                let mut text = send(local_read(&local), "to_s", vec![]);
+                let mut keys = vec![("%{attribute}", str_lit(&human)), ("%{model}", str_lit(self.model_human))];
+                keys.push(("%{value}", send(value(), "to_s", vec![])));
+                if let Some(c) = count_expr {
+                    keys.push(("%{count}", send(c, "to_s", vec![])));
                 }
+                for (key, with) in keys {
+                    text = send(text, "gsub", vec![str_lit(key), with]);
+                }
+                let callable = send(local_read(&local), "respond_to?", vec![sym("call")]);
+                let message = Expr::new(s, ExprNode::If { cond: callable, then_branch: call, else_branch: text });
+                seq(vec![
+                    assign_local(&local, expr.clone()),
+                    errors_push_expr(Expr::new(
+                        s,
+                        ExprNode::StringInterp {
+                            parts: vec![InterpPart::Text { value: format!("{human} ") }, InterpPart::Expr { expr: message }],
+                        },
+                    )),
+                ])
             }
             Some(RuleMessage::Call { callable }) => {
                 // `message.call(record, model:, attribute:, value:[, count:])`.
@@ -1116,8 +1522,10 @@ impl ErrorText<'_> {
                     (sym("attribute"), str_lit(&human)),
                     (sym("value"), value()),
                 ];
-                if let Some(c) = count {
-                    entries.push((sym("count"), Expr::new(s, ExprNode::Lit { value: c.clone() })));
+                match count {
+                    Some(Count::Static(c)) => entries.push((sym("count"), Expr::new(s, ExprNode::Lit { value: c.clone() }))),
+                    Some(Count::Dynamic(e)) => entries.push((sym("count"), e.clone())),
+                    None => {}
                 }
                 let call = Expr::new(
                     s,
@@ -1138,11 +1546,120 @@ impl ErrorText<'_> {
             }
         }
     }
+
+    /// The English message for error type `kind`, pluralized by `count`
+    /// (`one` for 1), or — for a type nothing translates — the text I18n
+    /// answers for a missing translation, naming the keys it tried.
+    fn push_type(&self, kind: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
+        let Some((one, other)) = crate::dialect::active_model_en_message(kind) else {
+            let attr = self.attr.as_str();
+            let (scope, model) = (self.i18n_scope, self.i18n_key);
+            let missing = format!(
+                "Translation missing. Options considered were:\n\
+                 - en.{scope}.errors.models.{model}.attributes.{attr}.{kind}\n\
+                 - en.{scope}.errors.models.{model}.{kind}\n\
+                 - en.{scope}.errors.messages.{kind}\n\
+                 - en.errors.attributes.{attr}.{kind}\n\
+                 - en.errors.messages.{kind}"
+            );
+            return errors_push(format!("{} {missing}", humanize(attr)));
+        };
+        match (one, count) {
+            (Some(one), Some(Count::Static(c))) => {
+                let is_one = matches!(c, Literal::Int { value: 1 }) || matches!(c, Literal::Float { value } if *value == 1.0);
+                errors_push_expr(self.interpolate(if is_one { one } else { other }, count, value))
+            }
+            (Some(one), Some(Count::Dynamic(e))) => {
+                let s = Span::synthetic();
+                let is_one = send(e.clone(), "==", vec![Expr::new(s, ExprNode::Lit { value: Literal::Int { value: 1 } })]);
+                errors_push_expr(Expr::new(
+                    s,
+                    ExprNode::If {
+                        cond: is_one,
+                        then_branch: self.interpolate(one, count, value),
+                        else_branch: self.interpolate(other, count, value),
+                    },
+                ))
+            }
+            _ => errors_push_expr(self.interpolate(other, count, value)),
+        }
+    }
+
+    /// `"<Attr> <template>"` with I18n's interpolation of the keys
+    /// ActiveModel supplies (ingest admits no others).
+    fn interpolate(&self, template: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
+        let human = humanize(self.attr.as_str());
+        let mut parts: Vec<InterpPart> = vec![InterpPart::Text { value: format!("{human} ") }];
+        let push_text = |parts: &mut Vec<InterpPart>, t: &str| match parts.last_mut() {
+            Some(InterpPart::Text { value }) => value.push_str(t),
+            _ => parts.push(InterpPart::Text { value: t.to_string() }),
+        };
+        let mut rest = template;
+        while let Some(start) = rest.find("%{") {
+            let tail = &rest[start + 2..];
+            let Some(end) = tail.find('}') else { break };
+            push_text(&mut parts, &rest[..start]);
+            match (&tail[..end], count) {
+                ("attribute", _) => push_text(&mut parts, &human),
+                ("model", _) => push_text(&mut parts, self.model_human),
+                ("count", Some(Count::Static(c))) => push_text(&mut parts, &format_count(c)),
+                ("count", Some(Count::Dynamic(e))) => parts.push(InterpPart::Expr { expr: e.clone() }),
+                ("value", _) => parts.push(InterpPart::Expr { expr: value() }),
+                (other, _) => push_text(&mut parts, &format!("%{{{other}}}")),
+            }
+            rest = &tail[end + 1..];
+        }
+        push_text(&mut parts, rest);
+        match parts.as_slice() {
+            [InterpPart::Text { value }] => Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: value.clone() } }),
+            _ => Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }),
+        }
+    }
+}
+
+/// A value ActiveModel resolves per run (`resolve_value`), and a
+/// callback condition's call: a literal or expression as written, a
+/// method on the record, a lambda called with the record or with
+/// nothing. A lambda written inline runs with the record as `self`,
+/// which is what a condition's `instance_exec` sees; ingest admits a
+/// resolved lambda only when it does not read `self`.
+fn resolve(value: &RuleValue) -> Expr {
+    let s = Span::synthetic();
+    match value {
+        RuleValue::Literal { value } => Expr::new(s, ExprNode::Lit { value: value.clone() }),
+        RuleValue::Expr { expr } => expr.clone(),
+        RuleValue::Method { name } => Expr::new(
+            s,
+            ExprNode::Send { recv: None, method: name.clone(), args: Vec::new(), block: None, parenthesized: false },
+        ),
+        RuleValue::Call { callable, with_record } => Expr::new(
+            s,
+            ExprNode::Send {
+                recv: Some(callable.clone()),
+                method: Symbol::from("call"),
+                args: if *with_record { vec![Expr::new(s, ExprNode::SelfRef)] } else { Vec::new() },
+                block: None,
+                parenthesized: true,
+            },
+        ),
+    }
+}
+
+fn assign_local(name: &Symbol, value: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name: name.clone() }, value },
+    )
+}
+
+fn local_read(name: &Symbol) -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(0), name: name.clone() })
 }
 
 /// A rule's checks under its `allow_nil:` / `allow_blank:` (EachValidator
-/// skips such a value) and Symbol `if:` / `unless:` (both given: `if`
-/// holds and `unless` does not).
+/// skips such a value), its `on:` contexts, and its `if:` / `unless:`
+/// conditions (every `if` holds and no `unless` does, as callback
+/// conditions combine).
 fn guard_rule(value: Expr, checks: Vec<Expr>, o: &RuleOptions) -> Vec<Expr> {
     if checks.is_empty() {
         return checks;
@@ -1161,16 +1678,48 @@ fn guard_rule(value: Expr, checks: Vec<Expr>, o: &RuleOptions) -> Vec<Expr> {
     if let Some(cond) = skip {
         body = Expr::new(s, ExprNode::If { cond, then_branch: nil(), else_branch: body });
     }
-    let bare = |m: &Symbol| {
-        Expr::new(s, ExprNode::Send { recv: None, method: m.clone(), args: Vec::new(), block: None, parenthesized: false })
-    };
-    if let Some(c) = &o.unless_method {
-        body = Expr::new(s, ExprNode::If { cond: bare(c), then_branch: nil(), else_branch: body });
+    let mut holds: Vec<Expr> = Vec::new();
+    if !o.on.is_empty() {
+        holds.push(on_context_check(&o.on));
     }
-    if let Some(c) = &o.if_method {
-        body = Expr::new(s, ExprNode::If { cond: bare(c), then_branch: body, else_branch: nil() });
+    holds.extend(o.if_conds.iter().map(resolve));
+    holds.extend(o.unless_conds.iter().map(|c| not(resolve(c))));
+    if let Some(cond) = holds.into_iter().reduce(|a, b| bool_op(BoolOpKind::And, a, b)) {
+        body = if_with_nil_else(cond, body);
     }
     vec![body]
+}
+
+/// `on: [:create, ...]`: Rails' `!(on & Array(validation_context)).empty?`.
+fn on_context_check(on: &[Symbol]) -> Expr {
+    let s = Span::synthetic();
+    let contexts = Expr::new(
+        s,
+        ExprNode::Array {
+            elements: on.iter().map(|c| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: c.clone() } })).collect(),
+            style: ArrayStyle::Brackets,
+        },
+    );
+    let current = Expr::new(
+        s,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("Array"),
+            args: vec![Expr::new(
+                s,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("validation_context"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            )],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    send(contexts, "intersect?", vec![current])
 }
 
 fn not(e: Expr) -> Expr {
@@ -1337,7 +1886,7 @@ mod tests {
     }
 
     fn plain(attr: &Symbol) -> ErrorText<'_> {
-        ErrorText { attr, model_human: "Post", message: None }
+        ErrorText { attr, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: None }
     }
 
     #[test]
@@ -1376,7 +1925,7 @@ mod tests {
     fn presence_message_replaces_the_default_text() {
         let a = attr();
         let message = RuleMessage::Text { text: "must be given".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: Some(&message) };
         let expr = inline_presence_check(&a, None, &text);
         assert_eq!(collect_error_messages(&expr), vec!["Title must be given"]);
     }
@@ -1428,7 +1977,7 @@ mod tests {
     fn length_message_interpolates_count() {
         let a = attr();
         let message = RuleMessage::Text { text: "needs %{count} for %{model}".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: Some(&message) };
         let exprs = inline_length_check(&a, None, Some(4), &text, None);
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(msgs, vec!["Title needs 4 for Post"]);
@@ -1473,8 +2022,8 @@ mod tests {
         let a = attr();
         let check = |op, bound| NumericCheck { op, bound };
         let checks = [
-            check(NumericOp::GreaterThan, Some(Literal::Int { value: 0 })),
-            check(NumericOp::LessThanOrEqualTo, Some(Literal::Int { value: 100 })),
+            check(NumericOp::GreaterThan, Some(crate::dialect::RuleValue::Literal { value: Literal::Int { value: 0 } })),
+            check(NumericOp::LessThanOrEqualTo, Some(crate::dialect::RuleValue::Literal { value: Literal::Int { value: 100 } })),
             check(NumericOp::Odd, None),
         ];
         let exprs = inline_numericality_check(&a, true, &checks, &plain(&a));
@@ -1496,7 +2045,7 @@ mod tests {
         // ActiveModel parses a Float option through BigDecimal(f,
         // Float::DIG) and interpolates its `to_s`.
         let a = attr();
-        let checks = [NumericCheck { op: NumericOp::GreaterThan, bound: Some(Literal::Float { value: 0.5 }) }];
+        let checks = [NumericCheck { op: NumericOp::GreaterThan, bound: Some(RuleValue::Literal { value: Literal::Float { value: 0.5 } }) }];
         let exprs = inline_numericality_check(&a, false, &checks, &plain(&a));
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert!(msgs.iter().any(|m| m == "Title must be greater than 0.5e0"), "got {msgs:?}");

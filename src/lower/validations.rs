@@ -172,12 +172,14 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
             out.push(Check::Format { pattern: pattern.clone() });
         }
         ValidationRule::Format { .. } => {}
+        // Resolved per run; no table shape.
+        ValidationRule::LengthOf { .. } | ValidationRule::FormatOf { .. } => {}
         ValidationRule::Numericality { only_integer, checks } => {
             if *only_integer {
                 out.push(Check::OnlyInteger);
             }
             for check in checks {
-                let threshold = match &check.bound {
+                let threshold = match check.literal_bound() {
                     Some(crate::expr::Literal::Int { value }) => *value as f64,
                     Some(crate::expr::Literal::Float { value }) => *value,
                     _ => continue,
@@ -189,7 +191,7 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
                 }
             }
         }
-        ValidationRule::Inclusion { list, exclusion: false, .. } => {
+        ValidationRule::Inclusion { list, exclusion: false, list_of: None, .. } => {
             if let crate::expr::ExprNode::Array { elements, .. } = &*list.node {
                 let vs: Vec<InclusionValue> = elements
                     .iter()
@@ -206,7 +208,7 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
         ValidationRule::Inclusion { .. } => {}
         ValidationRule::Guarded { rule, .. } => expand_rule(rule, out),
         ValidationRule::Unsupported { .. } => {}
-        ValidationRule::Uniqueness { scope, case_sensitive } => {
+        ValidationRule::Uniqueness { scope, case_sensitive, .. } => {
             out.push(Check::Uniqueness {
                 scope: scope.clone(),
                 case_sensitive: *case_sensitive,
