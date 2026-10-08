@@ -1343,6 +1343,13 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         }
         n if n.as_lambda_node().is_some() => {
             let l = n.as_lambda_node().unwrap();
+            if let Some(stub) = refused_block_signature(
+                l.parameters(),
+                block_style_from_opening(l.opening_loc().as_slice()),
+                file,
+            ) {
+                return Ok(stub);
+            }
             let block_param = block_capture(l.parameters(), file)?;
             let (params, destructures) = block_param_names(l.parameters(), file)?;
             let mut rest_param = block_rest_param(l.parameters());
@@ -3144,6 +3151,13 @@ fn ingest_call_block(
             // standalone-lambda-vs-attached-block distinction is lost,
             // which is immaterial once it sits in block-argument position.
             if let Some(lam) = expr.as_lambda_node() {
+                if let Some(stub) = refused_block_signature(
+                    lam.parameters(),
+                    block_style_from_opening(lam.opening_loc().as_slice()),
+                    file,
+                ) {
+                    return Ok(Some(stub));
+                }
                 let block_param = block_capture(lam.parameters(), file)?;
                 let (params, destructures) = block_param_names(lam.parameters(), file)?;
                 let mut rest_param = block_rest_param(lam.parameters());
@@ -3212,6 +3226,13 @@ fn ingest_call_block(
 /// hands this the same `BlockNode` shape one level deeper (inside the
 /// `proc`/`lambda` call's own block).
 fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> IngestResult<Expr> {
+    if let Some(stub) = refused_block_signature(
+        b.parameters(),
+        block_style_from_opening(b.opening_loc().as_slice()),
+        file,
+    ) {
+        return Ok(stub);
+    }
     let block_param = block_capture(b.parameters(), file)?;
     let (params, destructures) = block_param_names(b.parameters(), file)?;
     let mut rest_param = block_rest_param(b.parameters());
@@ -3387,6 +3408,81 @@ fn block_param_names(params_node: Option<Node<'_>>, file: &str) -> IngestResult<
         names.extend(positional_param(&req, &mut destructures, file)?);
     }
     Ok((names, destructures))
+}
+
+/// A block or lambda whose signature Lambda IR cannot hold, refused at
+/// the block: the block stays where it was (so `define_method "x" do
+/// |host: nil, **args| … end` still defines `x`, and the statement
+/// around it still runs), and its body is a refusal naming the
+/// parameters, which the Ruby emitter renders as a `NotImplementedError`
+/// raise and `check` reports. The stub takes any arguments (`*`), so a
+/// call reaches the raise rather than an arity error.
+fn refused_block_signature(
+    params_node: Option<Node<'_>>,
+    block_style: crate::expr::BlockStyle,
+    file: &str,
+) -> Option<Expr> {
+    let params_node = params_node?;
+    let pn = params_node.as_block_parameters_node()?.parameters()?;
+    let unrepresented = unrepresented_block_params(&pn);
+    if unrepresented.is_empty() {
+        return None;
+    }
+    let loc = params_node.location();
+    let span = Span {
+        file: super::sources::file_id(file),
+        start: loc.start_offset() as u32,
+        end: loc.end_offset() as u32,
+    };
+    let mut body = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    body.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused {
+        detail: format!(
+            "block/lambda parameter{} {} not represented in block IR (only required, rest, post and block parameters are); the block was refused rather than run without {}",
+            if unrepresented.len() == 1 { "" } else { "s" },
+            unrepresented.join(", "),
+            if unrepresented.len() == 1 { "it" } else { "them" },
+        ),
+    });
+    Some(Expr::new(
+        span,
+        ExprNode::Lambda {
+            rest_param: Some(Symbol::from("__refused_args")),
+            params: vec![],
+            block_param: None,
+            body,
+            block_style,
+        },
+    ))
+}
+
+/// The block or lambda parameters Lambda IR has no slot for, spelled as
+/// in the source: optional (`b = 1`), keyword (`item:`, `context: 1`)
+/// and named keyword-rest (`**opts`). Ingest used to drop them, so the
+/// emitted `lambda do |item:, context: 1|` was `lambda do` with a body
+/// reading names nothing bound. A nameless `**` binds nothing the body
+/// can read and stays accepted, as does `**nil`.
+fn unrepresented_block_params(pn: &ruby_prism::ParametersNode<'_>) -> Vec<String> {
+    let mut out = Vec::new();
+    for opt in pn.optionals().iter() {
+        if let Some(op) = opt.as_optional_parameter_node() {
+            out.push(format!("`{} = …`", constant_id_str(&op.name())));
+        }
+    }
+    for kw in pn.keywords().iter() {
+        if let Some(okw) = kw.as_optional_keyword_parameter_node() {
+            out.push(format!("`{}: …`", constant_id_str(&okw.name())));
+        } else if let Some(rkw) = kw.as_required_keyword_parameter_node() {
+            out.push(format!("`{}:`", constant_id_str(&rkw.name())));
+        }
+    }
+    if let Some(name) = pn
+        .keyword_rest()
+        .and_then(|k| k.as_keyword_rest_parameter_node())
+        .and_then(|k| k.name())
+    {
+        out.push(format!("`**{}`", constant_id_str(&name)));
+    }
+    out
 }
 
 /// A positional block parameter's name. A destructuring one (`|(k, v),
