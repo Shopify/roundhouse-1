@@ -1212,6 +1212,53 @@ module Db
     bind_bool(handle, index, value)
   end
 
+  # ── Request lifecycle hooks ──
+  #
+  # The Ruby-family dispatcher (main.rb `dispatch_core`), the Rack boot
+  # (config.ru) and the test harness's request dispatch (test_helper.rb)
+  # call these on every Db driver, so this one must define them.
+  #
+  # `read_snapshot_begin` / `read_snapshot_end` bracket a GET/HEAD. The
+  # SQLite drivers open a deferred BEGIN there, so the request's reads
+  # share one WAL snapshot and skip per-statement snapshot setup
+  # (db_cruby.rb). On PostgreSQL a GET reads as it does under Rails 8.2,
+  # which opens no transaction for a request: the executor hooks only
+  # enable the query cache and release the connection
+  # (activerecord railtie.rb `active_record.set_executor_hooks`), and
+  # the PostgreSQLAdapter sends each statement outside an application
+  # transaction in autocommit. So, inside the bracket:
+  #
+  # - a read runs alone, at the session's isolation level (READ
+  #   COMMITTED unless configured), and sees every transaction committed
+  #   before it started, including one committed since the request's
+  #   previous read;
+  # - a failed statement fails alone; the next one runs;
+  # - a write commits as it runs;
+  # - a transaction the application or the test holds (the pinned
+  #   fixture transaction) is neither joined nor ended;
+  # - no connection is leased until a statement needs one.
+  #
+  # A BEGIN here would not give the reads one snapshot under READ
+  # COMMITTED, and under REPEATABLE READ it would hide commits Rails'
+  # reads see, abort every later statement of the request after one
+  # failed read (25P02), and add two round trips to every GET. The
+  # bracket therefore sends nothing and holds no state. Brackets nest
+  # trivially.
+  def self.read_snapshot_begin
+    nil
+  end
+
+  def self.read_snapshot_end
+    nil
+  end
+
+  # config.ru starts the SQLite drivers' WAL checkpointer at boot. The
+  # PostgreSQL server checkpoints its own WAL (the checkpointer process);
+  # a client has nothing to start.
+  def self.checkpoint_in_background!
+    nil
+  end
+
   def self.query_cache_begin
     context[:cache] = {}
   end

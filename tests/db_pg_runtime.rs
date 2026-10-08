@@ -46,6 +46,28 @@ fn postgres_driver_preserves_values_database_identity_and_leases() {
         String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
 }
 
+/// The dispatcher's and test harness's GET/HEAD bracket
+/// (`Db.read_snapshot_begin` / `read_snapshot_end`) and the Rack boot's
+/// `Db.checkpoint_in_background!`, on the driver a PostgreSQL CRuby
+/// project runs. Every GET of a PostgreSQL controller test once raised
+/// NoMethodError here. The reads must stay Rails' autocommit reads:
+/// a concurrent commit visible to the next read, a failed read failing
+/// alone, a write committed at once, the caller's transaction untouched.
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn postgres_driver_serves_the_get_request_bracket_in_autocommit() {
+    assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
+    let result = std::process::Command::new("ruby")
+        .args(["tests/db_pg_runtime.rb", "--name", "/test_get_request_bracket_/"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(result.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&result.stderr));
+    // A filter matching nothing also succeeds.
+    assert!(stdout.lines().any(|line| line.starts_with("2 runs, ")), "stdout={stdout}");
+}
+
 #[test]
 #[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn shared_lowering_executes_postgresql_sql_in_emitted_ruby() {

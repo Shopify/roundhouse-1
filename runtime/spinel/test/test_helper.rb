@@ -1809,8 +1809,9 @@ module RequestDispatch
     # once for every site (matz/spinel#4495), and campfire's web-push
     # handler already wraps with a block of another type.
     #
-    # A GET/HEAD reads through one snapshot, as the dispatcher serves it,
-    # so the suite exercises the same transaction shape production does.
+    # A GET/HEAD is bracketed as the dispatcher brackets it (one read
+    # snapshot on SQLite, autocommit reads on PostgreSQL), so the suite
+    # exercises the same transaction shape production does.
     snapshot = method == "GET" || method == "HEAD"
     if Db.in_lease?
       Db.read_snapshot_begin if snapshot

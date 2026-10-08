@@ -103,6 +103,19 @@ const SHIMS: &[Shim] = &[
         map_entry: false,
         type_before_name: false,
     },
+    // The pg-gem driver `project.rs::ruby_overlay` puts over db.rb for a
+    // PostgreSQL CRuby project. It runs under the same dispatcher and
+    // test harness; it once lacked the request-lifecycle hooks, and every
+    // GET of a PostgreSQL controller test raised NoMethodError
+    // `read_snapshot_begin`.
+    Shim {
+        path: "runtime/spinel/db_pg_cruby.rb",
+        naming: Naming::Snake,
+        step_pred: "step?",
+        def_forms: &["def self."],
+        map_entry: false,
+        type_before_name: false,
+    },
     // TypeScript ships FOUR backends behind one export shape. Missing
     // three of them is the exact mistake this test exists to catch.
     // Two def forms: the plain `function name(...)` the libsql and
@@ -402,7 +415,9 @@ fn the_rbs_contract_declares_the_nullable_seam() {
 /// The request-lifecycle hooks the Ruby-family dispatcher and test
 /// harness call unconditionally (runtime/spinel/scaffold/ruby_overlay/
 /// main.rb, config.ru, test/test_helper.rb, tep/app.rb). The CRuby and
-/// Spinel shims implement them (tests/db_sqlite_concurrency.rs); a shim
+/// Spinel SQLite shims implement them (tests/db_sqlite_concurrency.rs);
+/// PostgreSQL reads in autocommit, as Rails does, and its server
+/// checkpoints itself (db_pg_cruby.rb, tests/db_pg_runtime.rb); a shim
 /// that has not yet (JDBC) must still define them as no-ops, or every
 /// request on that lane raises
 /// NoMethodError. Strict targets have no such dispatcher, so only the
@@ -423,6 +438,7 @@ fn ruby_family_shims_declare_optional_binds() {
             "runtime/spinel/db_cruby.rb",
             "runtime/spinel/db_jruby.rb",
             "runtime/spinel/db_pg.rb",
+            "runtime/spinel/db_pg_cruby.rb",
         ] {
             assert!(defines_with(&read_shim(path), method, &["def self."], false, false), "{path}: {method}");
         }
