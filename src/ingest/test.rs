@@ -13,9 +13,7 @@ use crate::span::Span;
 use crate::{ClassId, Symbol};
 
 use super::expr::ingest_expr;
-use super::library_class::{
-    ingest_library_method, library_class_from_node, library_class_from_node_with_scope,
-};
+use super::library_class::{declared_classes_under, ingest_library_method};
 use super::util::{
     class_name_path, constant_id_str, constant_path_is_rooted, constant_path_of, flatten_statements,
     module_name_path,
@@ -242,6 +240,20 @@ fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     find.0
 }
 
+/// A helper class of a test file (one beside the test class, or in its
+/// body) with every class and module it nests, each under its qualified
+/// name (`PriceRule::DiscountCode`), outer before inner. The nested ones
+/// used to be dropped without a word: only the helper itself was read.
+/// A nested class that declares tests never gets here: the file is
+/// refused by name (`refuse_unreached_test_classes`).
+fn carried_classes(
+    class: &ruby_prism::ClassNode<'_>,
+    scope: &[String],
+    file: &str,
+) -> IngestResult<Vec<crate::dialect::LibraryClass>> {
+    declared_classes_under(&class.as_node(), file, scope)
+}
+
 /// `def self.use_transactional_tests; <value>; end` on the test class.
 fn use_transactional_tests_reader(class: &ClassId, value: bool) -> MethodDef {
     MethodDef {
@@ -359,12 +371,9 @@ fn ingest_test_class(
                 // constant `MockGCSInterface::Bucket`, as in Ruby: a
                 // second support file's `MockS3Interface::Bucket` is a
                 // different class, not a reopen of a shared `Bucket`.
-                let lc = if support_class {
-                    library_class_from_node_with_scope(&inner, &name_path, file)?
-                } else {
-                    library_class_from_node(&inner, file)?
-                };
-                inner_classes.push(lc);
+                // What the class nests comes with it (`carried_classes`).
+                let scope: &[String] = if support_class { &name_path } else { &[] };
+                inner_classes.extend(carried_classes(&inner, scope, file)?);
                 continue;
             }
             // Other non-test `def` — instance helper method
@@ -530,8 +539,7 @@ fn ingest_test_class(
     // would have Minitest find it under CRuby and run it against the
     // wrong assertion surface.)
     for (helper_scope, helper_node) in top_level_helper_nodes {
-        let lc = library_class_from_node_with_scope(helper_node, helper_scope, file)?;
-        inner_classes.push(lc);
+        inner_classes.extend(carried_classes(helper_node, helper_scope, file)?);
     }
 
     Ok(TestModule {
@@ -1202,6 +1210,49 @@ end
         let tms = ingest_test_files(src.as_bytes(), "store_test.rb").expect("ingest");
         let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
         assert_eq!(names, ["Bucket"]);
+    }
+
+    // A helper class, beside the test class or in its body, carries
+    // what it nests under qualified names.
+    #[test]
+    fn a_helper_class_carries_its_nested_classes() {
+        let src = r#"
+module Api
+  class PriceRule
+    class DiscountCode < Base
+    end
+  end
+end
+
+class PriceRuleTest < ActiveSupport::TestCase
+  class TestClass
+    class Subclass < TestClass
+      module Marks
+        def self.mark
+          1
+        end
+      end
+    end
+  end
+
+  test "t" do
+    assert true
+  end
+end
+"#;
+        let tms = ingest_test_files(src.as_bytes(), "price_rule_test.rb").expect("ingest");
+        let test = tms.iter().find(|tm| tm.name.0.as_str() == "PriceRuleTest").expect("test class");
+        let names: Vec<&str> = test.inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "TestClass",
+                "TestClass::Subclass",
+                "TestClass::Subclass::Marks",
+                "Api::PriceRule",
+                "Api::PriceRule::DiscountCode",
+            ]
+        );
     }
 
     // When no class looks like a test, the first top-level class is

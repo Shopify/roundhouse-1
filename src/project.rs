@@ -8474,8 +8474,14 @@ fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
         return;
     }
     for module in &app.test_modules {
-        let prefix = format!("{}::", module.name.0.as_str());
-        for inner in module.inner_classes.iter().filter(|c| c.name.0.as_str().starts_with(&prefix)) {
+        // Nested in the test-support class itself, or in a helper class
+        // of the same file (`PriceRule::DiscountCode`).
+        let nested = |name: &str| {
+            let outers = std::iter::once(module.name.0.as_str())
+                .chain(module.inner_classes.iter().map(|c| c.name.0.as_str()));
+            outers.into_iter().any(|outer| name.strip_prefix(outer).is_some_and(|rest| rest.starts_with("::")))
+        };
+        for inner in module.inner_classes.iter().filter(|c| nested(c.name.0.as_str())) {
             let span = inner
                 .methods
                 .iter()
@@ -8488,9 +8494,8 @@ fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
                 "namespaced class in a test-support class",
                 format!(
                     "`{}`: this target hoists a test file's inner classes under a flat name; \
-                     the Ruby family writes it nested in `{}`",
-                    inner.name.0.as_str(),
-                    module.name.0.as_str()
+                     the Ruby family writes it nested in its outer class",
+                    inner.name.0.as_str()
                 ),
             );
         }
