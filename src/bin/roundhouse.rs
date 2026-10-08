@@ -486,6 +486,28 @@ fn run_transpile(
         out.display(),
         target.as_str()
     );
+    // Emitted Ruby that Ruby cannot parse is a compiler defect, not an
+    // unsupported construct, so `--allow-unsupported` does not excuse
+    // it. The tree is already written, so it can still be inspected.
+    let unparsable = project::unparsable_ruby_files(&files, target);
+    if !unparsable.is_empty() {
+        for u in &unparsable {
+            eprintln!(
+                "roundhouse: error[emitted_ruby_syntax]: {}:{}: {}",
+                out.join(&u.path).display(),
+                u.line,
+                u.message
+            );
+        }
+        // Same early exit as below: do not free the trees node by node.
+        std::mem::forget(app);
+        std::mem::forget(files);
+        return Err(format!(
+            "{} emitted Ruby file(s) do not parse; the output in {} is left for inspection",
+            unparsable.len(),
+            out.display()
+        ));
+    }
     // The process exits next. Freeing the App's trees node by node took
     // seconds on a large app (tens on the full Core closure) and frees
     // nothing the exit would not.
