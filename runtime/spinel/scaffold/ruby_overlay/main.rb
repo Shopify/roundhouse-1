@@ -68,8 +68,10 @@ module Main
     # invalidates. The CRuby Db shim implements the same discipline
     # (fiber-local, so Puma threads don't share entries).
     Db.query_cache_begin
-    # A GET/HEAD reads through one SQLite snapshot (Db.read_snapshot_begin).
-    # Any write still works: the shim ends the snapshot before it.
+    # A GET/HEAD is bracketed for the driver's read discipline
+    # (Db.read_snapshot_begin): SQLite reads through one snapshot, which
+    # the shim ends before any write; PostgreSQL reads in autocommit, as
+    # Rails' adapter does.
     method = env["REQUEST_METHOD"]
     snapshot = method == "GET" || method == "HEAD"
     Db.read_snapshot_begin if snapshot

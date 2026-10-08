@@ -6,7 +6,9 @@ require_relative "../runtime/spinel/db_pg_cruby"
 
 admin_url = ENV.fetch("ROUNDHOUSE_PG_TEST_URL")
 ADMIN = PG.connect(admin_url)
-DATABASE_NAMES = ["roundhouse_pg_runtime_#{Process.pid}", "roundhouse_pg_runtime_archive_#{Process.pid}"].freeze
+# A shared server's naming policy can supply the prefix (e.g. rh_e2e_<lane>).
+DATABASE_PREFIX = ENV.fetch("ROUNDHOUSE_PG_TEST_DB_PREFIX", "roundhouse_pg_runtime")
+DATABASE_NAMES = ["#{DATABASE_PREFIX}_#{Process.pid}", "#{DATABASE_PREFIX}_archive_#{Process.pid}"].freeze
 DATABASE_NAMES.each { |name| ADMIN.exec("CREATE DATABASE #{ADMIN.quote_ident(name)}").clear }
 DB_OPTIONS = ADMIN.conninfo_hash.slice(:host, :port, :user, :password).freeze
 Minitest.after_run do
@@ -310,6 +312,72 @@ class PostgreSQLRuntimeTest < Minitest::Test
       assert_equal 0, scalar("SELECT COUNT(*) FROM items")
       Db.exec("COMMIT")
       assert_equal 1, scalar("SELECT COUNT(*) FROM items")
+    end
+  end
+
+  # The GET/HEAD bracket of the dispatcher and the test harness (main.rb
+  # `dispatch_core`, test_helper.rb), as Rails 8.2 serves a GET on
+  # PostgreSQL: no transaction, every statement in autocommit.
+  def test_get_request_bracket_reads_in_autocommit_as_rails_does
+    Db.with_connection do
+      Db.read_snapshot_begin
+      begin
+        log = Db.capture_sql do
+          assert_equal 0, scalar("SELECT COUNT(*) FROM items")
+          assert_equal PG::PQTRANS_IDLE, Db.current_dbh.transaction_status
+          # Another session commits after the request's first read; the
+          # next read sees it (READ COMMITTED, no snapshot held).
+          Thread.new { Db.with_connection { Db.exec("INSERT INTO items(label) VALUES ('committed meanwhile')") } }.value
+          assert_equal 1, scalar("SELECT COUNT(*) FROM items")
+          # A failed read fails alone: no aborted transaction (25P02).
+          assert_raises(PG::UndefinedTable) { scalar("SELECT * FROM absent") }
+          assert_equal 1, scalar("SELECT COUNT(*) FROM items")
+          # A write commits as it runs: another session sees it before
+          # the request ends.
+          Db.exec("INSERT INTO items(label) VALUES ('written by the GET')")
+          assert_equal 2, Thread.new { Db.with_connection { scalar("SELECT COUNT(*) FROM items") } }.value
+          assert_equal PG::PQTRANS_IDLE, Db.current_dbh.transaction_status
+        end
+        assert_equal ["SELECT COUNT(*) FROM items", "SELECT COUNT(*) FROM items", "SELECT * FROM absent",
+          "SELECT COUNT(*) FROM items", "INSERT INTO items(label) VALUES ('written by the GET')"], log
+      ensure
+        Db.read_snapshot_end
+      end
+      assert_equal PG::PQTRANS_IDLE, Db.current_dbh.transaction_status
+    end
+  end
+
+  # Brackets nest (a test dispatching inside a lease, a job drained in a
+  # request) and take no lease of their own. A transaction the caller
+  # holds (the test's pinned fixture transaction) is neither joined nor
+  # ended. The Rack boot's checkpointer hook starts nothing: the server
+  # checkpoints its own WAL.
+  def test_get_request_bracket_nests_and_leaves_the_callers_transaction_open
+    log = Db.capture_sql do
+      Db.read_snapshot_begin
+      Db.read_snapshot_begin
+      Db.read_snapshot_end
+      Db.read_snapshot_end
+      assert_nil Db.checkpoint_in_background!
+    end
+    assert_equal [], log
+    refute Db.in_lease?, "the bracket leased a connection without a statement"
+    Db.with_connection do
+      Db.exec("BEGIN")
+      Db.exec("INSERT INTO items(label) VALUES ('fixture row')")
+      Db.read_snapshot_begin
+      begin
+        Db.read_snapshot_begin
+        assert_equal 1, scalar("SELECT COUNT(*) FROM items")
+        Db.read_snapshot_end
+        assert_equal PG::PQTRANS_INTRANS, Db.current_dbh.transaction_status
+      ensure
+        Db.read_snapshot_end
+      end
+      assert_equal PG::PQTRANS_INTRANS, Db.current_dbh.transaction_status
+      assert_equal 0, Thread.new { Db.with_connection { scalar("SELECT COUNT(*) FROM items") } }.value
+      Db.exec("ROLLBACK")
+      assert_equal 0, scalar("SELECT COUNT(*) FROM items")
     end
   end
 end
