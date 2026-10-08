@@ -672,9 +672,12 @@ module ActiveRecord
     # model_schema.rb's `ignored_columns`: the model's own list, else its
     # superclass's. The compiled table already leaves out the columns the
     # class body ignores (`_compiled_ignored_columns`, emitted per model),
-    # so a list naming any other column raises rather than being recorded
-    # while the compiled SQL still reads and writes it. Not detected: a
-    # later write that un-ignores a column the compiled table left out.
+    # so a write raises, naming the columns, rather than being recorded
+    # while the compiled SQL disagrees: one naming any other column (the
+    # compiled SQL would still read and write it), and one un-ignoring a
+    # column the list in effect ignores and the compiled table leaves out
+    # (the compiled SQL would still skip it). The class body's own writes
+    # only build up to the compiled list, so they pass.
     def self.ignored_columns
       return @ignored_columns if @ignored_columns
       parent = superclass
@@ -686,6 +689,10 @@ module ActiveRecord
       unknown = list - _compiled_ignored_columns
       unless unknown.empty?
         raise NotImplementedError, "#{name}.ignored_columns = #{list.inspect}: the compiled table leaves out only #{_compiled_ignored_columns.inspect}"
+      end
+      restored = (ignored_columns & _compiled_ignored_columns) - list
+      unless restored.empty?
+        raise NotImplementedError, "#{name}.ignored_columns = #{list.inspect}: un-ignores #{restored.inspect}, which the compiled table leaves out"
       end
       @ignored_columns = list
     end

@@ -144,3 +144,48 @@ fn ignored_columns_match_native_rails_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted, native, "emitted");
 }
+
+/// A later write that disagrees with the compiled table raises, naming
+/// the columns, in either direction: un-ignoring a column the compiled
+/// table leaves out, or ignoring one it keeps. Rewriting the same list
+/// passes.
+#[test]
+fn an_ignored_columns_write_the_compiled_table_disagrees_with_raises() {
+    // Class-level, so no adapter: require the emitted app and run.
+    let (emitted, errors) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let output = emit_and_run::ruby()
+        .arg("-e")
+        .arg(
+            r#"require File.expand_path("main", Dir.pwd)
+def attempt
+  yield
+  puts "ok"
+rescue NotImplementedError => e
+  puts e.message
+end
+attempt { Widget.ignored_columns = %w[legacy] }
+attempt { Widget.ignored_columns = [] }
+attempt { Widget.ignored_columns += ["name"] }
+attempt { Widget.ignored_columns = Widget.ignored_columns.dup }
+puts Widget.ignored_columns.inspect
+"#,
+        )
+        .current_dir(&*emitted)
+        .output()
+        .expect("spawn ruby");
+    let (stdout, stderr) = (String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            r#"Widget.ignored_columns = ["legacy"]: un-ignores ["gone", "old_count"], which the compiled table leaves out"#,
+            r#"Widget.ignored_columns = []: un-ignores ["legacy", "gone", "old_count"], which the compiled table leaves out"#,
+            r#"Widget.ignored_columns = ["legacy", "gone", "old_count", "name"]: the compiled table leaves out only ["legacy", "gone", "old_count"]"#,
+            "ok",
+            r#"["legacy", "gone", "old_count"]"#,
+        ],
+        "{stderr}"
+    );
+}
