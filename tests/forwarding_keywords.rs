@@ -373,3 +373,65 @@ fn ordinary_super_binds_natively_only_into_core_or_a_signature_port() {
         assert!(!errors.iter().any(|e| e.contains("full forwarding")), "{errors:?}");
     }
 }
+
+/// The output of `source` and then `script` under native activesupport
+/// (tests/support/rails_oracle.rb's copy) with its cache loaded.
+fn native_cache_result(source: &str, script: &str) -> String {
+    let oracle = std::env::temp_dir().join(format!("rh-cache-oracle-{}-{}.rb", std::process::id(), source.len()));
+    std::fs::write(&oracle, format!(
+        "require_relative {:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\nrequire \"active_support/cache\"\nrequire \"active_support/cache/memory_store\"\nrequire \"active_support/notifications\"\n{source}\n{script}\n",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle"),
+    )).unwrap();
+    let native = Command::new("ruby").arg(&oracle).output().unwrap();
+    let _ = std::fs::remove_file(&oracle);
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    String::from_utf8_lossy(&native.stdout).into_owned()
+}
+
+#[test]
+fn ordinary_super_binds_natively_from_a_reopened_runtime_module_and_a_yielding_block() {
+    // The app reopens the runtime's LocalCache, which MemoryStore,
+    // NullStore and MemCacheStore prepend: its `super` goes on in each
+    // from just after it, into the store's own method, a native ABI.
+    // A subclass's `super` reaches the reopening's declaration first,
+    // which the Ruby tree writes with its source keywords.
+    let local_cache = "module ActiveSupport; module Cache; module Strategy; module LocalCache; def write_entry(key, entry, **options); (@probe_log ||= []) << [:local, key, options.key?(:unless_exist)]; super(key, entry, **options); end; end; end; end; end\n";
+    let source = format!("{local_cache}class ProbeStore < ActiveSupport::Cache::MemoryStore; attr_reader :probe_log; def write_entry(key, entry, **options); (@probe_log ||= []) << [:store, key]; options = options.merge(unless_exist: false); super(key, entry, **options); end; end");
+    let script = "s = ProbeStore.new; s.write('k', 7); p s.read('k'); s.with_local_cache { s.write('j', 3); p s.read('j') }; p s.probe_log; m = ActiveSupport::Cache::MemoryStore.new; m.write('x', 1); p m.read('x')";
+    let expected = native_cache_result(&source, script);
+    assert!(expected.contains(":local"), "{expected}");
+    let run = emit_and_run::real_blog().write("app/lib/probe_store.rb", &source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    // A literal block passed to an app method that only yields stays
+    // the method's block, so its `super` is the method's.
+    let source = "class ProbeStore < ActiveSupport::Cache::MemoryStore; def read_entry(key, **options); guarded { super(key, **options) }; end; private; def guarded; yield; rescue ArgumentError; nil; end; end";
+    let script = "s = ProbeStore.new; s.write('k', 7); p s.read('k'); p s.read('missing'); p s.fetch('j') { 3 }";
+    let expected = native_cache_result(source, script);
+    assert_eq!(expected, "7\nnil\n3\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe_store.rb", source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    let (_, errors) = emit_and_run::real_blog()
+        .write("app/lib/probe_store.rb", source)
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.iter().any(|e| e.contains("keyword splat in ordinary super")), "{errors:?}");
+    // Not shown: a block the callee can capture (its own `&blk`, a
+    // runtime method's, or an override's), and a reopened module an
+    // app class also mixes in.
+    for source in [
+        "class ProbeStore < ActiveSupport::Cache::MemoryStore; def read_entry(key, **options); guarded { super(key, **options) }; end; private; def guarded(&blk); blk.call; end; end",
+        "class ProbeStore < ActiveSupport::Cache::MemoryStore; def write_entry(key, entry, **options); synchronize { super(key, entry, **options) }; end; end",
+        "class ProbeStore < ActiveSupport::Cache::MemoryStore; def read_entry(key, **options); guarded { super(key, **options) }; end; private; def guarded; yield; end; end; class ProbeChild < ProbeStore; private; def guarded(&blk); blk.call; end; end",
+        &format!("{local_cache}class ProbeStore; include ActiveSupport::Cache::Strategy::LocalCache; end"),
+        &format!("{local_cache}ActiveSupport::Cache::Strategy::LocalCache.module_eval {{ def probe; end }}"),
+    ] {
+        let (_, errors) = emit_and_run::real_blog()
+            .write("app/lib/probe_store.rb", source)
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(
+            errors.iter().any(|e| e.contains("ordinary super") && e.contains("argument ABI")),
+            "{source}: {errors:?}"
+        );
+    }
+}

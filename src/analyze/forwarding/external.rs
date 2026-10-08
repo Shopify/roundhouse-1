@@ -38,6 +38,20 @@ pub(super) const SIGNATURE_PORTS: &[&str] = &[
     "runtime/spinel/active_model_type.rb",
 ];
 
+/// What the app declares of an instance method on a namespace outside
+/// it: by reopening it, or through a module it mixes in there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Reopened {
+    /// Nothing: the namespace's own lookup decides.
+    No,
+    /// A source declaration in the reopening the Ruby family writes with
+    /// its source argument contract: the lookup ends there.
+    Native,
+    /// A mixin, an unverified reopening, or a declaration whose contract
+    /// the tree does not keep as written: the ABI is unknown.
+    Unknown,
+}
+
 /// One step of the lookup through a name outside the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
@@ -77,6 +91,9 @@ pub(super) struct World {
     core: HashMap<String, CoreNamespace>,
     /// Every proper `::`-suffix of a runtime or stdlib name.
     suffixes: HashSet<String>,
+    /// The last names of the mixins the runtime writes that do not
+    /// resolve.
+    unresolved_mixins: HashSet<String>,
 }
 
 pub(super) fn world() -> &'static World {
@@ -174,6 +191,17 @@ impl World {
                 rest = tail;
             }
         }
+        let unresolved_mixins: HashSet<String> = scans
+            .iter()
+            .flat_map(|scan| {
+                scan.bodies
+                    .iter()
+                    .flat_map(|body| body.prepends.iter().chain(&body.includes))
+                    .chain(scan.mixins.iter().map(|(_, module, _)| module))
+            })
+            .filter(|written| resolve(written, &declared, &suffixes).is_none())
+            .map(|written| written.text.rsplit("::").next().unwrap_or(&written.text).to_string())
+            .collect();
         let resolve = |written: &Written| resolve(written, &declared, &suffixes);
         let mut runtime: HashMap<String, Namespace> = HashMap::default();
         for scan in &scans {
@@ -211,7 +239,7 @@ impl World {
                 aliases.insert(name.clone(), target);
             }
         }
-        World { runtime, aliases, stdlib, core, suffixes }
+        World { runtime, aliases, stdlib, core, suffixes, unresolved_mixins }
     }
 
     /// The written name could resolve lexically to a nested declaration.
@@ -226,6 +254,98 @@ impl World {
 
     pub(super) fn stdlib_declares(&self, name: &str) -> bool {
         self.stdlib.contains(name)
+    }
+
+    /// The runtime namespaces that mix `module` in, each with whether it
+    /// prepends it. `None` when a mixin the runtime writes that does not
+    /// resolve ends in `module`'s last name (it may mean `module`), or
+    /// `module` is aliased.
+    pub(super) fn includers(&self, module: &str) -> Option<Vec<(&str, bool)>> {
+        let last = module.rsplit("::").next().unwrap_or(module);
+        if self.aliases.values().flatten().any(|target| target == module) || self.unresolved_mixins.contains(last) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (name, namespace) in &self.runtime {
+            for (list, prepend) in [(&namespace.prepends, true), (&namespace.includes, false)] {
+                for entry in list {
+                    if entry.as_deref() == Some(module) {
+                        out.push((name.as_str(), prepend));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        Some(out)
+    }
+
+    /// The lookup of instance method `method` in runtime class `target`
+    /// from just after the module it mixes in as `module` (`prepend`
+    /// says which list): the module's own includes, the earlier mixins
+    /// of that list, then (after a prepend) the class's own methods and
+    /// includes, then its superclass. The app's own reopening of `target` or mixin into it
+    /// is answered as [`World::through`] answers it.
+    pub(super) fn after(
+        &self,
+        target: &str,
+        module: &str,
+        prepend: bool,
+        method: &str,
+        app_reopens: &dyn Fn(&str, &str) -> Reopened,
+    ) -> Step {
+        let Some(namespace) = self.runtime.get(target) else { return Step::Refuse };
+        if namespace.lowered || namespace.is_module {
+            return Step::Refuse;
+        }
+        let reopened = app_reopens(target, method);
+        if reopened == Reopened::Unknown {
+            return Step::Refuse;
+        }
+        let list = if prepend { &namespace.prepends } else { &namespace.includes };
+        let mut positions = list.iter().enumerate().filter(|(_, m)| m.as_deref() == Some(module)).map(|(i, _)| i);
+        let (Some(position), None) = (positions.next(), positions.next()) else { return Step::Refuse };
+        let other = if prepend { &namespace.includes } else { &namespace.prepends };
+        if other.iter().any(|m| m.as_deref() == Some(module)) {
+            return Step::Refuse;
+        }
+        let walk = |modules: &[Option<String>]| -> Step {
+            for module in modules.iter().rev() {
+                match module.as_deref() {
+                    None => return Step::Refuse,
+                    Some(module) => match self.step(module, method, false, app_reopens, &mut HashSet::default()) {
+                        Step::Continue => {}
+                        other => return other,
+                    },
+                }
+            }
+            Step::Continue
+        };
+        // The module's own includes follow it, then the mixins the
+        // target wrote before it.
+        let own = self.runtime.get(module).map_or(&[][..], |m| m.includes.as_slice());
+        for modules in [own, &list[..position]] {
+            match walk(modules) {
+                Step::Continue => {}
+                other => return other,
+            }
+        }
+        if prepend {
+            if reopened == Reopened::Native {
+                return Step::Bound;
+            }
+            if namespace.methods.contains(method) {
+                return Step::Bound;
+            }
+            match walk(&namespace.includes) {
+                Step::Continue => {}
+                other => return other,
+            }
+        }
+        match &namespace.superclass {
+            None => self.through("Object", method, true, app_reopens),
+            Some(None) => Step::Refuse,
+            Some(Some(parent)) => self.through(parent, method, true, app_reopens),
+        }
     }
 
     /// The core namespaces a lookup through core `name` may visit: its
@@ -288,7 +408,7 @@ impl World {
         name: &str,
         method: &str,
         as_superclass: bool,
-        app_reopens: &dyn Fn(&str, &str) -> bool,
+        app_reopens: &dyn Fn(&str, &str) -> Reopened,
     ) -> Step {
         self.step(name, method, as_superclass, app_reopens, &mut HashSet::default())
     }
@@ -298,7 +418,7 @@ impl World {
         name: &'w str,
         method: &str,
         as_superclass: bool,
-        app_reopens: &dyn Fn(&str, &str) -> bool,
+        app_reopens: &dyn Fn(&str, &str) -> Reopened,
         seen: &mut HashSet<&'w str>,
     ) -> Step {
         if !seen.insert(name) {
@@ -314,6 +434,13 @@ impl World {
             if namespace.lowered {
                 return Step::Refuse;
             }
+            // The app reopening the namespace, or mixing a module into
+            // it, with `method`: that declaration is what the lookup may
+            // reach first, not the runtime's.
+            let reopened = app_reopens(name, method);
+            if reopened == Reopened::Unknown {
+                return Step::Refuse;
+            }
             for module in namespace.prepends.iter().rev() {
                 match module.as_deref() {
                     None => return Step::Refuse,
@@ -323,7 +450,7 @@ impl World {
                     },
                 }
             }
-            if namespace.methods.contains(method) {
+            if reopened == Reopened::Native || namespace.methods.contains(method) {
                 return Step::Bound;
             }
             for module in namespace.includes.iter().rev() {
@@ -352,7 +479,8 @@ impl World {
             // include ActiveSupport::Tryable`) leaves the core lookup as is.
             let Some(ancestry) = self.core_ancestry(name) else { return Step::Refuse };
             if ancestry.iter().any(|ancestor| {
-                self.runtime_declares_method(ancestor, method, &mut HashSet::default()) || app_reopens(ancestor, method)
+                self.runtime_declares_method(ancestor, method, &mut HashSet::default())
+                    || app_reopens(ancestor, method) != Reopened::No
             }) {
                 return Step::Refuse;
             }
@@ -576,8 +704,10 @@ mod tests {
     #[test]
     fn a_port_method_binds_and_a_lowered_runtime_method_does_not() {
         let world = world();
-        let none = |_: &str, _: &str| false;
-        let initialize_reopened = |namespace: &str, method: &str| namespace == "Object" && method == "initialize";
+        let none = |_: &str, _: &str| Reopened::No;
+        let initialize_reopened = |namespace: &str, method: &str| {
+            if namespace == "Object" && method == "initialize" { Reopened::Native } else { Reopened::No }
+        };
         // MemoryStore < Store, prepending Strategy::LocalCache.
         assert_eq!(world.through("ActiveSupport::Cache::MemoryStore", "read_entry", true, &none), Step::Bound);
         assert_eq!(world.through("ActiveSupport::Cache::MemoryStore", "fetch_multi", true, &none), Step::Bound);
