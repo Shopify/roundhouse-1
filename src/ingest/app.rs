@@ -3108,6 +3108,11 @@ fn keep_carried_body_statements(app: &mut App) {
         .library_classes
         .iter()
         .map(|lc| {
+            // Only its own literal-list calls can answer: skip the
+            // (name-scanning) drop verdict for a class with none.
+            if !lc.unknown_calls.iter().any(is_literal_list_call) {
+                return Vec::new();
+            }
             crate::emit::ruby::dropped_class_body_calls(lc, app)
                 .into_iter()
                 .filter(|c| is_literal_list_call(c))
