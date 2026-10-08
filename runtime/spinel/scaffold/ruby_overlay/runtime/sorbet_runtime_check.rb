@@ -448,6 +448,29 @@ module SorbetRuntimeCheck
     end
   end
 
+  # `T::Types::Intersection`: nested intersections flatten, members
+  # dedupe by name, a value passes when every member passes, and the
+  # name lists the members' names sorted.
+  class Intersection
+    include Described
+    attr_reader :types
+
+    def initialize(types)
+      @types = types.flat_map do |type|
+        type = SorbetRuntimeCheck.coerce(type)
+        type.is_a?(Intersection) ? type.types : [type]
+      end.uniq(&:name)
+    end
+
+    def valid?(obj)
+      @types.all? { |type| type.valid?(obj) }
+    end
+
+    def name
+      "T.all(#{@types.map(&:name).compact.sort.join(', ')})"
+    end
+  end
+
   # `T::Private::Types::TypeAlias`. The block runs at the first check
   # (`aliased_type`), so it may name a constant defined after the alias.
   # `coerce` unwraps it wherever a type is read, as sorbet's does, so
@@ -519,6 +542,10 @@ module SorbetRuntimeCheck
 
   def self.any(*types)
     Union.new(types)
+  end
+
+  def self.all(type_a, type_b, *types)
+    Intersection.new([type_a, type_b] + types)
   end
 
   def self.generic(label, outer, *args)

@@ -498,7 +498,10 @@ fn an_uncheckable_type_is_refused_by_name() {
         ("T.cast(@values.first, T.attached_class)", "T.attached_class"),
         ("T.let(@values.first, [Integer, *[String]])", "splats an array into a tuple shape"),
         ("T.let(@values.first, { 1 => Integer })", "key that is not a symbol or string literal"),
-        ("T.let(@values.first, T.all(Comparable, Integer))", "intersection"),
+        // `T.all` checks every member (tests/sorbet_intersection_run.rs);
+        // one with a member this check cannot rebuild stays refused.
+        ("T.let(@values.first, T.all(Comparable, T.self_type))", "T.self_type"),
+        ("T.let(@values.first, T.noreturn)", "T.noreturn"),
         ("T.let(@values.first, T::Sig::WithoutRuntime)", "T::Sig::WithoutRuntime"),
         ("T.let(@values.first, Integer, checked: flag)", "checked: true"),
     ] {

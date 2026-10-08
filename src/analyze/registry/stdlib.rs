@@ -228,7 +228,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // (`sorbet_check::alias_value`). The call's value is the source
     // `Cast`'s to type.
     let mut sorbet_check = ClassInfo::default();
-    for method in ["cast", "nilable", "any", "generic", "class_of", "fixed_hash", "fixed_array", "untyped", "anything", "boolean", "type_alias", "mixes_in_class_methods"] {
+    for method in ["cast", "nilable", "any", "all", "proc_type", "void", "generic", "class_of", "fixed_hash", "fixed_array", "untyped", "anything", "boolean", "type_alias", "mixes_in_class_methods"] {
         sorbet_check.class_methods.insert(Symbol::from(method), Ty::Untyped);
     }
     classes.insert(ClassId(Symbol::from(crate::ingest::sorbet_check::HELPER)), sorbet_check);

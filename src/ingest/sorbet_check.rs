@@ -23,6 +23,7 @@
 //! - a user generic `Foo[X]` is `Foo`: `T::Generic#[]` answers `self`;
 //! - `T.class_of(C)` is `C.singleton_class`; `T.untyped` / `T.anything`
 //!   accept everything;
+//! - `T.all(A, B, ...)` is sorbet's `Intersection`: every member passes;
 //! - a hash shape `{a: X, "b" => Y}` is sorbet's `FixedHash`: a Hash
 //!   whose every declared key's value passes its type (an absent key
 //!   reads nil) and which has no other key;
@@ -31,7 +32,7 @@
 //!
 //! A form sorbet checks some other way, or that names sorbet-runtime's
 //! own constants (`T.proc` outside a generic's arguments, `T.self_type`, `T.attached_class`,
-//! `T.type_parameter`, `T.all`, a splat in a tuple shape, ...), is refused
+//! `T.type_parameter`, a splat in a tuple shape, ...), is refused
 //! at the site by name ("sorbet type check"), never skipped. A check that
 //! provably passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
 //! `T::Array[...]`, ...) is the value alone, as is `checked: false`.
@@ -71,6 +72,9 @@ enum SorbetType {
     Boolean,
     Nilable(Box<SorbetType>),
     Any(Vec<SorbetType>),
+    /// `T.all(A, B, ...)`: sorbet's `T::Types::Intersection`, which
+    /// passes a value every member passes.
+    All(Vec<SorbetType>),
     Generic { label: &'static str, outer: &'static [&'static str], args: Vec<SorbetType> },
     ClassOf(Expr),
     /// `{a: Integer, "b" => String}`: sorbet's `T::Types::FixedHash`,
@@ -97,6 +101,7 @@ impl SorbetType {
             SorbetType::Untyped | SorbetType::Anything => true,
             SorbetType::Nilable(inner) => inner.always_valid(),
             SorbetType::Any(members) => members.iter().any(SorbetType::always_valid),
+            SorbetType::All(members) => members.iter().all(SorbetType::always_valid),
             _ => false,
         }
     }
@@ -114,6 +119,7 @@ impl SorbetType {
         match self {
             SorbetType::Nilable(_) => true,
             SorbetType::Any(members) => members.iter().any(SorbetType::admits_nil),
+            SorbetType::All(members) => members.iter().all(SorbetType::admits_nil),
             SorbetType::Module(_, Some(name)) => name == "NilClass",
             _ => false,
         }
@@ -316,7 +322,16 @@ fn read_type_at(node: &Node<'_>, file: &str, named: bool) -> IngestResult<Result
             ("self_type", _) => Err(format!("`{}` is `T.self_type`, which depends on the receiver", text())),
             ("attached_class", _) => Err(format!("`{}` is `T.attached_class`, which depends on the receiver", text())),
             ("type_parameter", _) => Err(format!("`{}` is a method type parameter, which sorbet-runtime does not erase the same way", text())),
-            ("all", _) => Err(format!("`{}` is an intersection", text())),
+            ("all", members) if members.len() >= 2 => {
+                let mut out = Vec::with_capacity(members.len());
+                for member in members {
+                    match read_type_at(member, file, named)? {
+                        Ok(member) => out.push(member),
+                        Err(reason) => return Ok(Err(reason)),
+                    }
+                }
+                Ok(SorbetType::All(out))
+            }
             ("noreturn", _) => Err(format!("`{}` is `T.noreturn`", text())),
             ("enum" | "deprecated_enum", _) => Err(format!("`{}` is a value enumeration", text())),
             _ => Err(format!("`{}` is not a type expression this check reads", text())),
@@ -592,6 +607,10 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
         ("boolean", []) => Some(Ty::Bool),
         ("nilable", [inner]) => Some(Ty::Union { variants: vec![type_object_ty(inner)?, Ty::Nil] }),
         ("any", members) => Some(Ty::Union { variants: members.iter().map(type_object_ty).collect::<Option<_>>()? }),
+        // The intersection `sorbet_sig` reads `T.all(A, B)` as.
+        ("all", members) if members.len() >= 2 => {
+            Some(crate::rbs::intersection_ty(members.iter().map(type_object_ty).collect::<Option<_>>()?))
+        }
         ("class_of", [class]) => Some(Ty::Class { id: crate::ident::ClassId(Symbol::from(const_name(class)?.as_str())), args: Vec::new() }),
         // A symbol-keyed shape is the record `sorbet_sig` reads `{a: X}`
         // as; one with a string key is the `T::Hash` sorbet widens a
@@ -672,6 +691,7 @@ fn type_expr(ty: &SorbetType) -> Expr {
         SorbetType::Boolean => send(helper(), "boolean", Vec::new()),
         SorbetType::Nilable(inner) => send(helper(), "nilable", vec![type_expr(inner)]),
         SorbetType::Any(members) => send(helper(), "any", members.iter().map(type_expr).collect()),
+        SorbetType::All(members) => send(helper(), "all", members.iter().map(type_expr).collect()),
         SorbetType::Generic { label, outer, args } => {
             let mut path = vec![Symbol::from("")];
             path.extend(outer.iter().map(|s| Symbol::from(*s)));
