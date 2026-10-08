@@ -16,9 +16,10 @@
 # `T.untyped`, `T.anything`, `T.class_of`, hash and tuple shapes and the
 # stdlib generics
 # (`T::Array[X]` and friends, which check the outer class only, as
-# sorbet's `valid?` does). A user generic `Foo[X]` is `Foo` itself:
+# sorbet's `valid?` does, so an argument may be a proc type, read for its
+# name). A user generic `Foo[X]` is `Foo` itself:
 # `T::Generic#[]` answers `self`. Type forms the ingest cannot build here
-# (`T.proc`, `T.self_type`, `T.attached_class`, type parameters, ...)
+# (`T.proc` outside a generic's arguments, `T.self_type`, `T.attached_class`, type parameters, ...)
 # are refused at the site and never reach this file.
 #
 # `Name = T.type_alias { X }` is carried as
@@ -478,6 +479,39 @@ module SorbetRuntimeCheck
 
   BOOLEAN = Union.new([::TrueClass, ::FalseClass])
   NORETURN = Named.new("T.noreturn")
+  # `T::Private::Types::Void#name`, a proc type's `void`.
+  VOID = Named.new("<VOID>")
+
+  # `T::Types::Proc` (types/proc.rb): `valid?` is `obj.is_a?(::Proc)`;
+  # the name spells each parameter and the return, the bind left out.
+  class ProcType
+    include Described
+
+    def initialize(arg_types, returns)
+      @arg_types = arg_types
+      @returns = returns
+    end
+
+    def valid?(obj)
+      obj.is_a?(::Proc)
+    end
+
+    def name
+      args = []
+      @arg_types.each do |k, v|
+        args << "#{k}: #{SorbetRuntimeCheck.coerce(v).name}"
+      end
+      "T.proc.params(#{args.join(', ')}).returns(#{SorbetRuntimeCheck.coerce(@returns).name})"
+    end
+  end
+
+  def self.proc_type(arg_types, returns)
+    ProcType.new(arg_types, returns)
+  end
+
+  def self.void
+    VOID
+  end
 
   def self.nilable(type)
     Union.new([type, ::NilClass])

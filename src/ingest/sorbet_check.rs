@@ -17,7 +17,9 @@
 //! - `T::Array[X]`, `T::Hash[K, V]`, `T::Set`, `T::Range`,
 //!   `T::Enumerable`, `T::Enumerator` (and its `Lazy` / `Chain`),
 //!   `T::Class`, `T::Module` check the outer class only, as sorbet does;
-//!   their arguments only spell the message;
+//!   their arguments only spell the message, so an argument may be a
+//!   proc type (`T::Hash[Symbol, T.proc.returns(T.untyped)]`), which
+//!   sorbet names `T.proc.params().returns(T.untyped)`;
 //! - a user generic `Foo[X]` is `Foo`: `T::Generic#[]` answers `self`;
 //! - `T.class_of(C)` is `C.singleton_class`; `T.untyped` / `T.anything`
 //!   accept everything;
@@ -28,7 +30,7 @@
 //!   that length whose every element passes the type at its position.
 //!
 //! A form sorbet checks some other way, or that names sorbet-runtime's
-//! own constants (`T.proc`, `T.self_type`, `T.attached_class`,
+//! own constants (`T.proc` outside a generic's arguments, `T.self_type`, `T.attached_class`,
 //! `T.type_parameter`, `T.all`, a splat in a tuple shape, ...), is refused
 //! at the site by name ("sorbet type check"), never skipped. A check that
 //! provably passes (`T.untyped`, `nil` into a nilable type, a literal `[]` into
@@ -77,6 +79,9 @@ enum SorbetType {
     /// `[Integer, String]`: sorbet's `T::Types::FixedArray`, an Array
     /// of that length whose each element passes its position's type.
     FixedArray(Vec<SorbetType>),
+    /// `T.proc.params(a: X).returns(Y)` (`None` for `.void`), as a
+    /// generic's argument: sorbet's `T::Types::Proc`, read for its name.
+    Proc { params: Vec<(String, SorbetType)>, returns: Option<Box<SorbetType>> },
 }
 
 /// A shape's key, as written: sorbet keys the hash by the literal.
@@ -233,6 +238,14 @@ fn under_t(node: &Node<'_>) -> Option<Vec<String>> {
 
 /// The type expression `node`, or why the check cannot be built here.
 fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+    read_type_at(node, file, false)
+}
+
+/// `read_type`; `named` inside a stdlib generic's arguments, which
+/// sorbet's `valid?` never checks (`TypedHash#valid?` is
+/// `obj.is_a?(Hash)`), so there a type is read for its name alone and
+/// may be a proc type.
+fn read_type_at(node: &Node<'_>, file: &str, named: bool) -> IngestResult<Result<SorbetType, String>> {
     let text = || String::from_utf8_lossy(node.location().as_slice()).into_owned();
     if node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some() {
         if is_t(node) {
@@ -252,10 +265,10 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
         return Ok(Ok(SorbetType::Module(super::expr::ingest_expr(node, file)?, name)));
     }
     if let Some(hash) = node.as_hash_node() {
-        return read_shape(&hash, file);
+        return read_shape(&hash, file, named);
     }
     if let Some(array) = node.as_array_node() {
-        return read_tuple(&array, file);
+        return read_tuple(&array, file, named);
     }
     let Some(call) = node.as_call_node() else {
         return Ok(Err(format!("`{}` is not a type expression this check reads", text())));
@@ -266,6 +279,9 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
         return Ok(Err(format!("`{}` is not a type expression this check reads", text())));
     };
     if rooted_at_t_proc(&call) {
+        if named {
+            return read_proc(&call, file);
+        }
         return Ok(Err(format!("`{}` is a proc type, which sorbet checks by arity and signature", text())));
     }
     if call.block().is_some() {
@@ -275,14 +291,14 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
         return Ok(match (method, args.as_slice()) {
             ("untyped", []) => Ok(SorbetType::Untyped),
             ("anything", []) => Ok(SorbetType::Anything),
-            ("nilable", [inner]) => match read_type(inner, file)? {
+            ("nilable", [inner]) => match read_type_at(inner, file, named)? {
                 Ok(inner) => Ok(SorbetType::Nilable(Box::new(inner))),
                 Err(reason) => Err(reason),
             },
             ("any", members) if members.len() >= 2 => {
                 let mut out = Vec::with_capacity(members.len());
                 for member in members {
-                    match read_type(member, file)? {
+                    match read_type_at(member, file, named)? {
                         Ok(member) => out.push(member),
                         Err(reason) => return Ok(Err(reason)),
                     }
@@ -318,7 +334,7 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
         }
         let mut read = Vec::with_capacity(args.len());
         for arg in &args {
-            match read_type(arg, file)? {
+            match read_type_at(arg, file, true)? {
                 Ok(arg) => read.push(arg),
                 Err(reason) => return Ok(Err(reason)),
             }
@@ -339,7 +355,7 @@ fn read_type(node: &Node<'_>, file: &str) -> IngestResult<Result<SorbetType, Str
 
 /// A hash shape: each key a plain symbol or string literal (what sorbet
 /// keys `FixedHash#types` by), each value a type this check reads.
-fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str, named: bool) -> IngestResult<Result<SorbetType, String>> {
     let text = || String::from_utf8_lossy(hash.location().as_slice()).into_owned();
     let mut fields = Vec::new();
     for element in hash.elements().iter() {
@@ -354,7 +370,7 @@ fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str) -> IngestResult<Resul
         } else {
             return Ok(Err(format!("`{}` has a key that is not a symbol or string literal", text())));
         };
-        match read_type(&assoc.value(), file)? {
+        match read_type_at(&assoc.value(), file, named)? {
             Ok(ty) => fields.push((key, ty)),
             Err(reason) => return Ok(Err(reason)),
         }
@@ -364,19 +380,85 @@ fn read_shape(hash: &ruby_prism::HashNode<'_>, file: &str) -> IngestResult<Resul
 
 /// A tuple shape: each element a type this check reads, in place (a
 /// splat would make the length the check fixes a runtime value).
-fn read_tuple(array: &ruby_prism::ArrayNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+fn read_tuple(array: &ruby_prism::ArrayNode<'_>, file: &str, named: bool) -> IngestResult<Result<SorbetType, String>> {
     let mut types = Vec::new();
     for element in array.elements().iter() {
         if element.as_splat_node().is_some() {
             let text = String::from_utf8_lossy(array.location().as_slice()).into_owned();
             return Ok(Err(format!("`{text}` splats an array into a tuple shape")));
         }
-        match read_type(&element, file)? {
+        match read_type_at(&element, file, named)? {
             Ok(ty) => types.push(ty),
             Err(reason) => return Ok(Err(reason)),
         }
     }
     Ok(Ok(SorbetType::FixedArray(types)))
+}
+
+/// A proc type as a generic's argument, for its name: sorbet-runtime's
+/// `T.proc` builder (`private/methods/decl_builder.rb`) takes `bind`,
+/// `params` (keywords only) and then `returns(X)` or `void`, and
+/// `T::Types::Proc#name` spells `T.proc.params(a: X).returns(Y)`
+/// (`<VOID>` for `void`; the bind is not in the name).
+fn read_proc(call: &ruby_prism::CallNode<'_>, file: &str) -> IngestResult<Result<SorbetType, String>> {
+    /// Each builder step, innermost (`proc`) first: its name, its
+    /// arguments and whether it takes a block; `false` when the chain is
+    /// not rooted at `T`.
+    fn steps<'pr>(call: &ruby_prism::CallNode<'pr>, out: &mut Vec<(String, Vec<Node<'pr>>, bool)>) -> bool {
+        let Some(receiver) = call.receiver() else { return false };
+        if !is_t(&receiver) {
+            let Some(inner) = receiver.as_call_node() else { return false };
+            if !steps(&inner, out) {
+                return false;
+            }
+        }
+        let args = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        out.push((constant_id_str(&call.name()).to_string(), args, call.block().is_some()));
+        true
+    }
+    let text = String::from_utf8_lossy(call.location().as_slice()).into_owned();
+    let unread = || Ok(Err(format!("`{text}` is a proc type this check does not read")));
+    let mut chain = Vec::new();
+    if !steps(call, &mut chain) {
+        return unread();
+    }
+    let mut params: Option<Vec<(String, SorbetType)>> = None;
+    let mut returns: Option<Option<Box<SorbetType>>> = None;
+    let mut bound = false;
+    for (i, (name, args, block)) in chain.iter().enumerate() {
+        if *block || returns.is_some() {
+            return unread();
+        }
+        match (name.as_str(), args.as_slice()) {
+            ("proc", []) if i == 0 => {}
+            ("bind", [_]) if i > 0 && !bound && params.is_none() => bound = true,
+            ("params", [keywords]) if i > 0 && params.is_none() => {
+                let Some(hash) = keywords.as_keyword_hash_node() else { return unread() };
+                let mut read = Vec::new();
+                for element in hash.elements().iter() {
+                    let Some(assoc) = element.as_assoc_node() else { return unread() };
+                    let Some(key) = assoc.key().as_symbol_node().map(|k| String::from_utf8_lossy(k.unescaped()).into_owned()) else {
+                        return unread();
+                    };
+                    match read_type_at(&assoc.value(), file, true)? {
+                        Ok(ty) => read.push((key, ty)),
+                        Err(reason) => return Ok(Err(reason)),
+                    }
+                }
+                params = Some(read);
+            }
+            ("returns", [ty]) if i > 0 => match read_type_at(ty, file, true)? {
+                Ok(ty) => returns = Some(Some(Box::new(ty))),
+                Err(reason) => return Ok(Err(reason)),
+            },
+            ("void", []) if i > 0 => returns = Some(None),
+            _ => return unread(),
+        }
+    }
+    let Some(returns) = returns else {
+        return Ok(Err(format!("`{text}` is a proc type without `returns` or `void`, which sorbet rejects")));
+    };
+    Ok(Ok(SorbetType::Proc { params: params.unwrap_or_default(), returns }))
 }
 
 /// `T.proc`, or a builder chain on it (`T.proc.params(...).returns(...)`).
@@ -552,6 +634,19 @@ fn type_object_ty(expr: &Expr) -> Option<crate::ty::Ty> {
             let ExprNode::Array { elements, .. } = &*array.node else { return None };
             Some(Ty::Tuple { elems: elements.iter().map(type_object_ty).collect::<Option<_>>()? })
         }
+        // A proc type is the `Ty::Fn` `sorbet_sig` reads `T.proc...` as.
+        ("proc_type", [hash, ret]) => {
+            let ExprNode::Hash { entries, .. } = &*hash.node else { return None };
+            let mut params = Vec::new();
+            for (key, value) in entries {
+                let ExprNode::Lit { value: Literal::Sym { value: name } } = &*key.node else { return None };
+                params.push(crate::ty::Param { name: name.clone(), ty: type_object_ty(value)?, kind: crate::ty::ParamKind::Required });
+            }
+            let void = matches!(&*ret.node, ExprNode::Send { recv: Some(recv), method, args, .. }
+                if method.as_str() == "void" && args.is_empty() && const_name(recv).as_deref() == Some(HELPER));
+            let ret = if void { Ty::Nil } else { type_object_ty(ret)? };
+            Some(Ty::Fn { params, block: None, ret: Box::new(ret), effects: crate::effect::EffectSet::default() })
+        }
         ("generic", [label, _outer, rest @ ..]) => {
             let ExprNode::Lit { value: Literal::Str { value: label } } = &*label.node else { return None };
             let args: Vec<Ty> = rest.iter().map(type_object_ty).collect::<Option<_>>()?;
@@ -604,6 +699,21 @@ fn type_expr(ty: &SorbetType) -> Expr {
             let elements = types.iter().map(type_expr).collect();
             let array = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: Default::default() });
             send(helper(), "fixed_array", vec![array])
+        }
+        SorbetType::Proc { params, returns } => {
+            let entries = params
+                .iter()
+                .map(|(key, ty)| {
+                    let key = Literal::Sym { value: Symbol::from(key.as_str()) };
+                    (Expr::new(Span::synthetic(), ExprNode::Lit { value: key }), type_expr(ty))
+                })
+                .collect();
+            let hash = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
+            let returns = match returns {
+                Some(ty) => type_expr(ty),
+                None => send(helper(), "void", Vec::new()),
+            };
+            send(helper(), "proc_type", vec![hash, returns])
         }
     }
 }
