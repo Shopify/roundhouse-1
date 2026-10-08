@@ -2164,11 +2164,32 @@ fn native_classvar_initialization_uses_owned_initializer_ir() {
     assert!(classes[0].unknown_calls.is_empty());
     assert!(matches!(&*classes[0].class_ivar_initializers[0].node,
         ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
-    for declaration in ["arbitrary_dsl", "INITIAL = @@count", "include Other", "class << self; LATER = 1; end"] {
+    for declaration in [
+        "arbitrary_dsl",
+        "INITIAL = @@count",
+        "include Other",
+        "class << self; LATER = @@count; end",
+        // A constant written above the initializers is seen by one that
+        // asked before it existed, or reads what an initializer set up.
+        "@@seen = defined?(LATER); LATER = 1",
+        "@@names = constants; LATER = 1",
+        "LATER = Other::THING",
+        "LATER = [build]",
+    ] {
         let source = format!("class Probe; @@count = nil; {declaration}; end");
         let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
             .expect_err("separate class-body buckets cannot preserve interleaving");
-        assert!(err.to_string().contains("requires source ordering"), "{err}");
+        assert!(err.to_string().contains("requires source ordering"), "{source}: {err}");
+    }
+    // An inert constant no initializer reads (activemerchant's
+    // cyber_source.rb: `@@credit_card_codes = {...}` then
+    // `NT_PAYMENT_SOLUTION = {...}`) moves above them unobserved.
+    for declaration in ["LATER = 1", "LATER = { 'a' => [1, 2..3, nil, :x] }.freeze", "class << self; LATER = 1; end"] {
+        let source = format!("class Probe; @@count = nil; {declaration}; @@table = {{}}; end");
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(classes[0].class_ivar_initializers.len(), 2, "{source}");
+        assert!(classes[0].constants.iter().any(|(name, _)| name.as_str() == "LATER"), "{source}");
     }
     // Declarations BEFORE every initializer emit before them too.
     for declaration in ["arbitrary_dsl", "INITIAL = 1", "include Other"] {

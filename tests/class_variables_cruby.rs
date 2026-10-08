@@ -178,6 +178,49 @@ fn class_variables_behave_as_in_cruby_after_emission() {
     assert_eq!(actual, expected, "emitted Ruby diverges from CRuby line for line");
 }
 
+/// activemerchant's cyber_source.rb: class-variable initializers, then
+/// literal constants. The emitted body writes the constants above the
+/// initializers, which nothing here can tell from the source order.
+const LATE_CONSTANTS: &str = r#"class CvarGateway
+  @@codes = { visa: "001", master: "002" }
+  @@seen = defined?(EARLY) ? :early : :none
+
+  @@wallets = { apple_pay: "001" }
+
+  NT_SOLUTION = { "master" => "014", "visa" => "015" }.freeze
+  LIMITS = [1, 2..3, :x, nil, 1.5]
+
+  def self.codes = @@codes
+  def self.seen = @@seen
+  def code(brand) = @@codes[brand]
+  def solution(brand) = NT_SOLUTION[brand]
+end
+"#;
+const LATE_CONSTANTS_SCRIPT: &str = r#"p [CvarGateway.codes, CvarGateway.seen, CvarGateway.new.code(:visa), CvarGateway.new.solution("visa")]
+p [CvarGateway::LIMITS, CvarGateway::NT_SOLUTION.frozen?, CvarGateway.class_variables.sort, CvarGateway.constants.sort]
+"#;
+
+#[test]
+fn literal_constants_after_class_variable_initializers_run_as_in_cruby() {
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{LATE_CONSTANTS}\n{LATE_CONSTANTS_SCRIPT}"))
+        .output()
+        .expect("CRuby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        expected,
+        "[{visa: \"001\", master: \"002\"}, :none, \"001\", \"015\"]\n\
+         [[1, 2..3, :x, nil, 1.5], true, [:@@codes, :@@seen, :@@wallets], [:LIMITS, :NT_SOLUTION]]\n",
+        "native control"
+    );
+    let run = emit_and_run::real_blog().write("app/services/cvar_gateway.rb", LATE_CONSTANTS).run_ruby(LATE_CONSTANTS_SCRIPT);
+    run.assert_passes();
+    assert!(!run.stderr.contains("requires source ordering"), "{}", run.stderr);
+    assert_eq!(run.stdout, expected);
+}
+
 /// A class variable stays native Ruby: a target that cannot express the
 /// shared storage refuses each read and write by name.
 #[test]
