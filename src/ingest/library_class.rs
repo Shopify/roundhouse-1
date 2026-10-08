@@ -4781,6 +4781,10 @@ pub struct ConcernClassMethodSpans {
     /// Finite configuration uses these; factory bridge splicing is unchanged.
     pub concern_extensions: Vec<Span>,
     pub concern_calls: Vec<Span>,
+    /// Per `concern_calls` entry, the constant paths an `include` /
+    /// `prepend` names as written; `None` for `class_methods` or an
+    /// argument that is not a literal constant.
+    pub concern_call_modules: Vec<Option<Vec<Vec<String>>>>,
     pub has_other_extensions: bool,
 }
 
@@ -4853,6 +4857,7 @@ pub fn ingest_concern_class_method_spans(
         let in_concerning = concerning.is_some();
         let mut concern_extensions: Vec<Span> = concerning.into_iter().collect();
         let mut concern_calls = Vec::new();
+        let mut concern_call_modules = Vec::new();
         let mut has_other_extensions = false;
         for stmt in flatten_statements(body) {
             if let Some(m) = stmt.as_module_node() {
@@ -4896,15 +4901,26 @@ pub fn ingest_concern_class_method_spans(
                                 has_other_extensions = true;
                             }
                         }
-                        // `T::Helpers` declarations that do change what an
-                        // include does: `mixes_in_class_methods` extends the
-                        // includer, `sealed!` checks the including file,
-                        // `final!` freezes the module's methods. `abstract!`
-                        // and `interface!` only record the includer (their
-                        // `append_features` calls `super`) and
-                        // `requires_ancestor` is a no-op at runtime.
-                        "mixes_in_class_methods" | "sealed!" | "final!" => has_other_extensions = true,
-                        "class_methods" | "include" | "prepend" => concern_calls.push(span),
+                        // `T::Helpers` declarations that change what an
+                        // include does in a way not modeled: `sealed!`
+                        // checks the including file, `final!` freezes the
+                        // module's methods. `abstract!` and `interface!`
+                        // only record the includer (their `append_features`
+                        // calls `super`), `requires_ancestor` is a no-op at
+                        // runtime, and `mixes_in_class_methods` adds an
+                        // `included` that extends the includer and calls
+                        // `super`, which the emitted module still runs
+                        // (`sorbet_check::mixes_in_class_methods`).
+                        "sealed!" | "final!" => has_other_extensions = true,
+                        name @ ("class_methods" | "include" | "prepend") => {
+                            concern_calls.push(span);
+                            concern_call_modules.push(
+                                (name != "class_methods" && call.block().is_none())
+                                    .then(|| call.arguments())
+                                    .flatten()
+                                    .and_then(|args| args.arguments().iter().map(|arg| constant_path_of(&arg)).collect()),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -4960,6 +4976,7 @@ pub fn ingest_concern_class_method_spans(
                 has_nested_carrier,
                 concern_extensions,
                 concern_calls,
+                concern_call_modules,
                 has_other_extensions,
             });
         }

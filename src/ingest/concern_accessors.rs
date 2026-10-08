@@ -909,6 +909,68 @@ pub(super) fn splice_into_library_includers(
     Ok(settled)
 }
 
+/// The Concerns with an `included do` block that ingest supplies to every
+/// class it runs on, or reports there: each such class is a model or a
+/// plain library class or module, and there is at least one. A block on
+/// a controller, a test's class or no static includer at all (an include
+/// this cannot see) is not, and its emitted module still warns.
+///
+/// Who a block runs on follows `ActiveSupport::Concern`: a Concern's own
+/// includes are deferred to its includers, a plain module's are not.
+pub(super) fn carried_included_blocks(
+    app: &App,
+    carriers: &[super::library_class::ConcernClassMethodSpans],
+) -> Vec<ClassId> {
+    let concerns: HashSet<&ClassId> =
+        carriers.iter().filter(|c| !c.concern_extensions.is_empty()).map(|c| &c.owner).collect();
+    let mut defined: HashSet<String> = HashSet::default();
+    defined.extend(app.library_classes.iter().map(|lc| lc.name.0.as_str().to_string()));
+    let top = |id: &ClassId| ClassId(Symbol::from(id.0.as_str().trim_start_matches("::")));
+    let mut deferred: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for lc in app.library_classes.iter().filter(|lc| concerns.contains(&lc.name)) {
+        let entry = deferred.entry(lc.name.clone()).or_default();
+        entry.extend(lc.includes.iter().map(top));
+        for item in app.concern_model_items.get(&lc.name).into_iter().flatten() {
+            entry.extend(included_modules(item, &lc.name, &defined));
+        }
+    }
+    // Host kind: true when ingest carries a block onto it.
+    let mut hosts: Vec<(Vec<ClassId>, bool)> = Vec::new();
+    hosts.extend(app.models.iter().map(|m| (crate::analyze::model_includes(m), true)));
+    hosts.extend(app.controllers.iter().map(|c| (crate::analyze::controller_includes(c), false)));
+    hosts.extend(
+        app.library_classes
+            .iter()
+            .filter(|lc| !concerns.contains(&lc.name))
+            .map(|lc| (lc.includes.clone(), true)),
+    );
+    hosts.extend(
+        app.test_modules
+            .iter()
+            .flat_map(|t| t.inner_classes.iter())
+            .map(|lc| (lc.includes.clone(), false)),
+    );
+    let mut covered: HashMap<ClassId, bool> = HashMap::default();
+    for (includes, carries) in hosts {
+        let mut stack: Vec<ClassId> = includes.iter().map(top).collect();
+        let mut seen = HashSet::default();
+        while let Some(id) = stack.pop() {
+            if !concerns.contains(&id) || !seen.insert(id.clone()) {
+                continue;
+            }
+            *covered.entry(id.clone()).or_insert(true) &= carries;
+            stack.extend(deferred.get(&id).into_iter().flatten().cloned());
+        }
+    }
+    let mut out: Vec<ClassId> = covered
+        .into_iter()
+        .filter(|(id, carries)| *carries && app.concern_model_items.get(id).is_some_and(|items| !items.is_empty()))
+        .map(|(id, _)| id)
+        .collect();
+    out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out
+}
+
 /// The `included do … end` call of a Concern's body.
 fn included_call(app: &App, concern: &ClassId) -> Span {
     app.library_classes

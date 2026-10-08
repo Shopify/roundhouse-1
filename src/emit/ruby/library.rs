@@ -7476,8 +7476,18 @@ fn emit_library_class_decl_inner(
         lc.unknown_calls.iter().filter(|c| !crate::analyze::is_include_refusal(c)).collect()
     } else {
         let own = modelled_class_body_calls(lc, app);
+        // A Concern's `included do` that ingest gave every class it runs
+        // on (or reported there) is not missing from any of them.
+        let carried_block = |call: &Expr| {
+            app.carried_included_blocks.contains(&lc.name)
+                && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
+                    if method.as_str() == "included")
+        };
         for call in &lc.unknown_calls {
-            if !own.iter().any(|c| std::ptr::eq(*c, call)) && !crate::analyze::is_include_refusal(call) {
+            if !own.iter().any(|c| std::ptr::eq(*c, call))
+                && !crate::analyze::is_include_refusal(call)
+                && !carried_block(call)
+            {
                 report_dropped_class_body_call(lc, call);
             }
         }
