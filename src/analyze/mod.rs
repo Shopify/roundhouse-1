@@ -1466,6 +1466,26 @@ impl Analyzer {
         app.library_classes.truncate(carried);
     }
 
+    /// Whether `include <written>` in `scope` names a source module that
+    /// only nests other declarations, at least one of them modeled. Like
+    /// `body::lexical_class`, the innermost scope that has it wins.
+    fn includes_source_namespace(&self, written: &str, scope: &str, rooted: bool) -> bool {
+        let nests_modeled = |name: &str| {
+            self.const_resolver
+                .nested_source_namespaces(name)
+                .iter()
+                .any(|nested| self.classes.contains_key(&ClassId(Symbol::from(nested.as_ref()))))
+        };
+        let mut parts: Vec<&str> = if rooted { Vec::new() } else { scope.split("::").filter(|s| !s.is_empty()).collect() };
+        while !parts.is_empty() {
+            if nests_modeled(&format!("{}::{written}", parts.join("::"))) {
+                return true;
+            }
+            parts.pop();
+        }
+        nests_modeled(written)
+    }
+
     fn analyze_carried(&mut self, app: &mut App) {
         self.param_tables = None;
         self.constant_rounds = 0;
@@ -1515,7 +1535,13 @@ impl Analyzer {
                     || matches!(
                         self.gem_sources.provider(included.0.as_str(), if rooted { "" } else { class.name.0.as_str() }),
                         Some(crate::gem_boundary::SourceProvider::Declared { .. })
-                    );
+                    )
+                    // A source module that only nests modeled classes
+                    // (Zeitwerk's implicit `Kyc::BusinessPlatform`, a
+                    // directory with no file of its own), included so the
+                    // class reads its constants bare; emitted, its nested
+                    // classes open it.
+                    || (self.source_indexed && self.includes_source_namespace(included.0.as_str(), class.name.0.as_str(), rooted));
                 if known { continue; }
                 let detail = format!("{} includes unresolved {}", class.name.0, written.0);
                 if class.unknown_calls.iter().any(|call| matches!(&call.diagnostic,
