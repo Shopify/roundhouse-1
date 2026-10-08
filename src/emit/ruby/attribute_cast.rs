@@ -28,11 +28,13 @@
 //!
 //! The cast type is the one the model's `schema_column_types` names
 //! (`emit::ruby::attribute_api`): a column whose type the port does not
-//! carry (`[:unported, ...]`, an enum, JSON), the primary key, a
-//! retypable column (`Model::retypable_attributes`, which casts through
-//! its declared type already) and a JSON `serialize`d one (its coder's
-//! type, not the column's, casts: `lower::serialize`) keep the shared
-//! lowering's writer.
+//! carry (`[:unported, ...]`, an enum, JSON), a retypable column
+//! (`Model::retypable_attributes`, which casts through its declared type
+//! already) and a JSON `serialize`d one (its coder's type, not the
+//! column's, casts: `lower::serialize`) keep the shared lowering's
+//! writer. A single integer or text primary key's writer casts too, but
+//! no other access to its slot changes: the slot keeps the unsaved
+//! sentinel.
 //!
 //! A new record's `id` reader answers nil, as Rails' does, and its
 //! `to_param` nil with it; the slot keeps the unsaved sentinel.
@@ -95,6 +97,7 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         if !cols.is_empty() {
             cast_writes(lc, &cols);
         }
+        cast_key_writer(lc, model, table, &specs);
         public_attributes(lc, model, table);
         nil_unsaved_id(lc, model, table);
         let row_class = format!("{}Row", model.name.0.as_str());
@@ -104,6 +107,29 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
     }
     for lc in lcs.iter_mut().filter(|lc| app.models.iter().any(|m| m.name == lc.name)) {
         nil_unsaved_param(lc);
+    }
+}
+
+/// The single primary key's writer (`id=`, and `<key>=` for a key not
+/// named `id`) casts as a column's does: Rails' `Owner.new(id: "6").id`
+/// is 6, and `assign_attributes` hands the key to the writer as given.
+/// Only the writer: the key's slot keeps the unsaved sentinel every
+/// other synthesized read and write tests.
+fn cast_key_writer(lc: &mut LibraryClass, model: &Model, table: &Table, specs: &[(String, Option<Kind>)]) {
+    let mut keys = table.columns.iter().filter(|c| c.primary_key);
+    let (Some(col), None) = (keys.next(), keys.next()) else { return };
+    if is_retypable(model, col) {
+        return;
+    }
+    let Some(kind) = specs.iter().find(|(n, _)| n == col.name.as_str()).and_then(|(_, k)| *k) else { return };
+    if !matches!(kind, Kind::Integer | Kind::Text) || is_temporal(col) {
+        return;
+    }
+    let own = format!("{}=", col.name.as_str());
+    for m in lc.methods.iter_mut().filter(|m| m.name_span.is_synthetic() && m.receiver == MethodReceiver::Instance) {
+        if m.name.as_str() == "id=" || m.name.as_str() == own {
+            cast_writer(m, col, kind);
+        }
     }
 }
 

@@ -39,7 +39,7 @@ thread_local! {
 }
 
 /// Whether the tree being emitted binds keywords natively (ruby family).
-pub(super) fn native_keywords() -> bool {
+pub(crate) fn native_keywords() -> bool {
     NATIVE_KEYWORD_SPLATS.with(Cell::get)
 }
 

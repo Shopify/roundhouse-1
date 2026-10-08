@@ -625,10 +625,6 @@ fn collect_remove_method(node: &ruby_prism::Node<'_>, out: &mut crate::det::Hash
 /// with what an override misses.
 const PARTIAL_BASE_HOOKS: &[(&str, &str)] = &[
     (
-        "_assign_attributes",
-        "only `assign_attributes`/`attributes=` run it; the compiled `new`, `create` and `update` write each column directly, in column order",
-    ),
-    (
         "initialize",
         "records loaded from the database are built through `new`, so the override runs for them where Rails' `instantiate` skips it",
     ),

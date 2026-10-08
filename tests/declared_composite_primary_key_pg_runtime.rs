@@ -132,7 +132,8 @@ fn declared_composite_primary_key_compiles_to_the_tuple() {
         assert!(pin.contains(expected), "missing {expected:?} in:\n{pin}");
     }
     let invoice = std::fs::read_to_string(emitted.join("app/models/invoice.rb")).unwrap();
-    assert!(invoice.contains("  def id\n    [self.shop_id, self.id_value]\n  end\n"), "invoice:\n{invoice}");
+    // In the model's GeneratedAttributeMethods module.
+    assert!(invoice.contains("    def id\n      [self.shop_id, self.id_value]\n    end\n"), "invoice:\n{invoice}");
 }
 
 /// The model files natively and emitted, same PostgreSQL.

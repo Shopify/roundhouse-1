@@ -19,13 +19,14 @@
 #   private `_runtime_internals`), not Rails' @readonly/@strict_loading
 #   flags.
 # - Core#initialize ignores its attributes: the model's compiled
-#   `initialize` calls `super()` and then writes its columns, so
-#   `init_internals` runs before any attribute write, as in Rails. Those
-#   writes go column by column rather than through `_assign_attributes`,
-#   and records loaded from the database are built through `new`, so an
-#   override of `initialize` runs for them where Rails' `instantiate`
-#   skips it. lower::model_to_library::macro_replay refuses a Base
-#   include's override of either (`PARTIAL_BASE_HOOKS`).
+#   `initialize` calls `super()`, writes its column defaults and then
+#   calls `assign_attributes` with them
+#   (lower::model_to_library::assign_attributes), so `init_internals`
+#   runs before any attribute write, as in Rails. Records loaded from the
+#   database are built through `new`, so an override of `initialize` runs
+#   for them where Rails' `instantiate` skips it;
+#   lower::model_to_library::macro_replay refuses a Base include's
+#   override of it (`PARTIAL_BASE_HOOKS`).
 # - `reload` takes no options (Rails' `lock:`); it re-reads the row
 #   through the runtime's `_adapter_reload`.
 # - Multiparameter keys (`"written_on(1i)"`) raise NotImplementedError.

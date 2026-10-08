@@ -112,7 +112,8 @@ fn composite_primary_key_compiles_to_the_tuple() {
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
     let order = std::fs::read_to_string(emitted.join("app/models/order.rb")).unwrap();
     for expected in [
-        "  def id\n    [self.shop_id, self.id_value, self.island]\n  end\n",
+        // `id` in the model's GeneratedAttributeMethods module.
+        "    def id\n      [self.shop_id, self.id_value, self.island]\n    end\n",
         "  def id_value\n    @id\n  end\n",
         "  def self.primary_key\n    [\"shop_id\", \"id\", \"island\"]\n  end\n",
         r#"WHERE \"shop_id\" = " + Db.escape_int(@shop_id) + " AND \"id\" = " + Db.escape_int(@id) + " AND \"island\" = "#,

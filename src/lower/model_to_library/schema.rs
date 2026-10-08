@@ -4247,3 +4247,23 @@ fn synth_update_hash(
             block_param: None,
     }
 }
+
+/// The instance methods [`push_schema_methods`] synthesizes because the
+/// table has columns: the per-column readers, writers, predicates and
+/// dirty readers Rails defines in the model's `GeneratedAttributeMethods`
+/// module (activerecord 8.2.0.alpha core.rb `initialize_generated_modules`),
+/// so a method the class itself defines overrides them and its `super`
+/// reaches them. A post-pass over this module's own output: what it
+/// synthesizes for `table`, less what it synthesizes for the same table
+/// without columns. The Ruby family writes these into the module
+/// (`emit::ruby::library`); the IR keeps them on the model.
+pub(crate) fn generated_attribute_method_names(model: &Model, models: &[Model], table: &Table) -> crate::det::HashSet<Symbol> {
+    let instance_names = |t: &Table| -> crate::det::HashSet<Symbol> {
+        let mut methods = Vec::new();
+        push_schema_methods(&mut methods, model, models, t);
+        methods.into_iter().filter(|m| m.receiver == MethodReceiver::Instance).map(|m| m.name).collect()
+    };
+    let bare = Table { columns: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), ..table.clone() };
+    let without = instance_names(&bare);
+    instance_names(table).into_iter().filter(|name| !without.contains(name)).collect()
+}

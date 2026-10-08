@@ -37,10 +37,17 @@ use crate::ty::Ty;
 /// Inline kwargs-form `update`/`update!` sends across every hook body.
 /// Returns the residue ledger: update-shaped calls left in source
 /// shape, with the reason.
+///
+/// A PostgreSQL app keeps its `update`/`update!` calls: the CRuby tree,
+/// the one target that emits it (`project::target_files`), assigns them
+/// through `assign_attributes` (`model_to_library::assign_attributes`),
+/// every key through its writer in the hash's order as Rails does, and
+/// has `update!`.
 pub fn apply_update_kwargs_inline(app: &mut App) -> Vec<Diagnostic> {
     let models: HashSet<ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    let keep_update = app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
     let mut diags = Vec::new();
-    super::for_each_hook_body(app, &mut |body| rewrite(body, &models, &mut diags));
+    super::for_each_hook_body(app, &mut |body| rewrite(body, &models, keep_update, &mut diags));
     diags
 }
 
@@ -67,20 +74,20 @@ fn residue(expr: &Expr, reason: &str) -> Diagnostic {
 /// strict emitter cannot compile). lobsters stamps its read markers
 /// this way on /newest and /comments (`@user&.touch(:last_read_newest_
 /// story)`).
-fn recognized_update(e: &Expr) -> bool {
-    inline_parts(e).is_some()
+fn recognized_update(e: &Expr, keep_update: bool) -> bool {
+    inline_parts(e, keep_update).is_some()
 }
 
 /// `(column writes, finishing call)` for a recognized send: the
 /// kwargs of an `update`, or each `touch` column paired with the
 /// current time.
-fn inline_parts(e: &Expr) -> Option<(Vec<(Symbol, Expr)>, &'static str)> {
+fn inline_parts(e: &Expr, keep_update: bool) -> Option<(Vec<(Symbol, Expr)>, &'static str)> {
     let ExprNode::Send { recv: Some(_), method, args, block: None, .. } = &*e.node else {
         return None;
     };
     match method.as_str() {
         "update" | "update!" => {
-            if args.len() != 1 {
+            if args.len() != 1 || keep_update {
                 return None;
             }
             let ExprNode::Hash { entries, .. } = &*args[0].node else { return None };
@@ -131,7 +138,7 @@ fn now(span: crate::span::Span) -> Expr {
     now
 }
 
-fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnostic>) {
+fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, keep_update: bool, diags: &mut Vec<Diagnostic>) {
     // The `try(:update!, …)`-desugared guarded form — `recv &&
     // recv.update!(…)` — rewrites as a UNIT, before child recursion
     // would turn the right operand into a Seq: a BoolOp operand is a
@@ -146,7 +153,7 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnosti
     // nil-receiver value IS nil, so the If is the closer model.
     let guarded = matches!(
         &*expr.node,
-        ExprNode::BoolOp { op: BoolOpKind::And, right, .. } if recognized_update(right)
+        ExprNode::BoolOp { op: BoolOpKind::And, right, .. } if recognized_update(right, keep_update)
     );
     if guarded {
         let (is_model, _, pure) = {
@@ -159,7 +166,7 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnosti
             let span = expr.span;
             let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
             let ExprNode::BoolOp { left, right, .. } = node else { unreachable!() };
-            let (entries, finish) = inline_parts(&right).expect("recognized above");
+            let (entries, finish) = inline_parts(&right, keep_update).expect("recognized above");
             let ExprNode::Send { recv: Some(r), .. } = *right.node else { unreachable!() };
             let local = Symbol::from("__update_rcv");
             let bind = Expr::new(
@@ -208,8 +215,8 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnosti
             expr.ty = Some(Ty::Union { variants: vec![Ty::Bool, Ty::Nil] });
         }
     }
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, models, diags));
-    if !recognized_update(expr) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, models, keep_update, diags));
+    if !recognized_update(expr, keep_update) {
         return;
     }
     let (is_model, ty_unknown, pure) = send_gates(expr, models);
@@ -222,7 +229,7 @@ fn rewrite(expr: &mut Expr, models: &HashSet<ClassId>, diags: &mut Vec<Diagnosti
         return;
     }
     let span = expr.span;
-    let (entries, finish) = inline_parts(expr).expect("recognized above");
+    let (entries, finish) = inline_parts(expr, keep_update).expect("recognized above");
     let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
     let ExprNode::Send { recv: Some(r), .. } = node else { unreachable!() };
     let mut exprs: Vec<Expr> = Vec::new();

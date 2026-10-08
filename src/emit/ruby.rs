@@ -39,6 +39,7 @@ pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
 pub use expr::{emit_expr, with_error_attributes, with_native_keyword_splats};
+pub(crate) use expr::native_keywords;
 
 /// The `app/models/<stem>` file a library class is emitted into (a
 /// nested class goes in its outermost owner's file), as `<stem>`.
