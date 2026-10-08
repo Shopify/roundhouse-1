@@ -147,6 +147,12 @@ pub struct Ctx {
     /// `ActiveRecord::Base … lacks a shared runtime` on the template
     /// itself is noise that hides the real ledger.
     pub claimed_macro_template: bool,
+    /// The `def` whose body is being typed, by name and side
+    /// (`true` for a class-side method). `super` re-sends it to the
+    /// parent, so a block inherits it, even one that rebinds `self`:
+    /// a block's `super` is its method's. `None` outside a method body
+    /// and wherever the caller does not say.
+    pub enclosing_def: Option<(Symbol, bool)>,
 }
 
 /// User-class dispatch data: table name (if any), instance shape,
@@ -1654,15 +1660,21 @@ impl<'a> BodyTyper<'a> {
                         ctx, Some(&Ty::Untyped), &method, args.as_deref().unwrap_or(&[]), b);
                     self.analyze_expr(b, &block_ctx);
                 }
-                // `super` invokes the parent's same-name method;
-                // tracking which method we're inside (and looking up
-                // its parent in the registry) is future work. Until
-                // then, type as `Untyped` — `super` is an
-                // intentional jump out of the typed envelope, similar
-                // in spirit to RBS's `untyped` declaration. Distinct
-                // from `Var` (analyzer gap) so the gradual diagnostic
-                // shape is right.
-                Ty::Untyped
+                // `super` invokes the parent's same-name method. In an
+                // instance-side `initialize` that method is an
+                // `initialize`, whose value `new` discards: RBS declares
+                // every one `-> void` (core's Object and Exception
+                // family, and each runtime signature), and a declared
+                // `void` reads as `Nil` (`rbs::ty_from_node`). Any other
+                // method's parent is not looked up in the registry yet,
+                // so its `super` stays `Untyped`: an intentional jump
+                // out of the typed envelope, distinct from `Var`
+                // (analyzer gap) so the gradual diagnostic shape is
+                // right.
+                match &ctx.enclosing_def {
+                    Some((name, false)) if name.as_str() == "initialize" => Ty::Nil,
+                    _ => Ty::Untyped,
+                }
             }
 
             ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
@@ -3919,6 +3931,44 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn super_in_an_instance_initialize_is_its_void_parent_initialize() {
+        // `super(message)` re-sends `initialize`, which RBS declares
+        // `-> void` (read as Nil). A class-side `initialize`, any other
+        // method, and a body typed with no enclosing def keep `Untyped`:
+        // their parent method is not looked up.
+        let classes = empty_classes();
+        let typer = BodyTyper::new(&classes);
+        let super_call = || synth(ExprNode::Super { args: Some(vec![var("message")]), block: None });
+        for (def, want) in [
+            (Some(("initialize", false)), Ty::Nil),
+            (Some(("initialize", true)), Ty::Untyped),
+            (Some(("save", false)), Ty::Untyped),
+            (None, Ty::Untyped),
+        ] {
+            let mut ctx = ctx_with_local("message", Ty::Str);
+            ctx.enclosing_def = def.map(|(name, class_side)| (Symbol::from(name), class_side));
+            let mut expr = super_call();
+            assert_eq!(typer.analyze_expr(&mut expr, &ctx), want, "{def:?}");
+            let ExprNode::Super { args: Some(args), .. } = &*expr.node else { unreachable!() };
+            assert_eq!(args[0].ty, Some(Ty::Str), "arguments are typed either way");
+        }
+        // A block inside `initialize` inherits the def: its `super` is
+        // the method's.
+        let mut ctx = Ctx::default();
+        ctx.enclosing_def = Some((Symbol::from("initialize"), false));
+        let mut block = synth(ExprNode::Lambda {
+            rest_param: None,
+            params: vec![],
+            block_param: None,
+            body: synth(ExprNode::Super { args: None, block: None }),
+            block_style: crate::expr::BlockStyle::Brace,
+        });
+        typer.analyze_expr(&mut block, &ctx);
+        let ExprNode::Lambda { body, .. } = &*block.node else { unreachable!() };
+        assert_eq!(body.ty, Some(Ty::Nil));
+    }
 
     #[test]
     fn kernel_array_does_not_capture_inherited_or_included_app_methods() {

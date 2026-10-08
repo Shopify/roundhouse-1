@@ -11,8 +11,8 @@ module ActiveSupport
 
     @mask: untyped
     @no_filters: bool
-    @regexps: Array[Regexp]
-    @deep_regexps: Array[Regexp]
+    @regexps: Array[::Regexp]
+    @deep_regexps: Array[::Regexp]
     @blocks: Array[untyped]
 
     def initialize: (?Array[untyped] filters, ?mask: untyped) -> void

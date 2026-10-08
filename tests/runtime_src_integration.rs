@@ -139,14 +139,20 @@ fn walk_ruby_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// emission (Rust). Non-recursive in itself; calls
 /// `count_gradual_recurse` to descend.
 fn count_gradual(e: &Expr) -> usize {
-    let mut total = 0usize;
+    gradual_sites(e).len()
+}
+
+/// The source offset of every `Ty::Untyped` site under `e`, in walk
+/// order: what `count_gradual` counts, for RUNTIME_PROBE_DUMP=1.
+fn gradual_sites(e: &Expr) -> Vec<u32> {
+    let mut total = Vec::new();
     count_gradual_recurse(e, &mut total);
     total
 }
 
-fn count_gradual_recurse(e: &Expr, total: &mut usize) {
+fn count_gradual_recurse(e: &Expr, total: &mut Vec<u32>) {
     if matches!(&e.ty, Some(Ty::Untyped)) {
-        *total += 1;
+        total.push(e.span.start);
     }
     use ExprNode as N;
     match &*e.node {
@@ -778,6 +784,17 @@ fn every_runtime_method_body_concretely_typed() {
             if n > 0 {
                 *by_file.entry(stem.clone()).or_insert(0) += n;
                 total_gradual += n;
+            }
+            // Every site as `file:line method`, for diffing two trees'
+            // site sets (the inference probes read the same variable).
+            if std::env::var_os("RUNTIME_PROBE_DUMP").is_some() {
+                for start in gradual_sites(&m.body) {
+                    let line = 1 + ruby.as_bytes()[..(start as usize).min(ruby.len())]
+                        .iter()
+                        .filter(|b| **b == b'\n')
+                        .count();
+                    eprintln!("BAR_B {stem}.rb:{line} {}", m.name);
+                }
             }
         }
     }
