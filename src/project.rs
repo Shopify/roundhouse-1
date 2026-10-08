@@ -7685,17 +7685,28 @@ fn compiled_gem_features(
 /// The `require` of a compiled gem's feature (`COMPILED_GEM_FEATURES`,
 /// [`compiled_gem_features`]), installed once app/models.rb has defined
 /// RoundhouseAutoload: it loads the compiled files, as the gem's own
-/// file would define them. Every other require is RubyGems' own.
+/// file would define them. Every other require goes on to Kernel's own
+/// `require` as it stood (RubyGems', or Zeitwerk's decoration of it).
+///
+/// That previous method is Kernel's own, not whatever a lookup from
+/// Kernel finds first: `alias_method` would take a module prepended to
+/// Kernel (a require hook such as the boot survey's), and calling the
+/// alias re-enters that hook under another name, which skips Zeitwerk's
+/// decoration; dry-schema's `Dry::Schema::Macros`, a directory Zeitwerk
+/// autoloads, was then a plain LoadError.
 const COMPILED_GEM_REQUIRE: &str = r##"
 # A gem the tree compiles from source answers its own features for a
 # native gem that requires one (`project::compiled_gem_features`).
 module Kernel
-  alias_method :roundhouse_require_before_compiled_gems, :require
+  previous = instance_method(:require)
+  # A module prepended to Kernel stays in front of this method.
+  previous = previous.super_method while previous.owner != Kernel && previous.super_method
+  RoundhouseAutoload.const_set(:REQUIRE_BEFORE_COMPILED_GEMS, previous)
 
   private def require(feature)
     files = feature.is_a?(String) && RoundhouseAutoload::COMPILED_GEM_FEATURES[feature.delete_suffix(".rb")]
-    return roundhouse_require_before_compiled_gems(feature) unless files
-    files.map { |file| roundhouse_require_before_compiled_gems(RoundhouseAutoload.path(file)) }.any?
+    return RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, feature) unless files
+    files.map { |file| RoundhouseAutoload::REQUIRE_BEFORE_COMPILED_GEMS.bind_call(self, RoundhouseAutoload.path(file)) }.any?
   end
 end
 "##;

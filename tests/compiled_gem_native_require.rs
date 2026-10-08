@@ -39,6 +39,12 @@ fn gem_home() -> PathBuf {
         ("gems/paqlike-1.0.2/lib/paqlike/codec.rb".into(), "module Paqlike\n  class Codec\n    NATIVE = true\n  end\nend\n".into()),
         ("specifications/sessionish-7.40.0.gemspec".into(), spec("sessionish", "7.40.0")),
         ("gems/sessionish-7.40.0/lib/sessionish.rb".into(), "module Sessionish\nend\n".into()),
+        // dry-schema's shape: a Zeitwerk-managed gem whose `Macros` is a
+        // directory with no macros.rb (an implicit namespace).
+        ("specifications/zwish-1.14.1.gemspec".into(), spec("zwish", "1.14.1")),
+        ("gems/zwish-1.14.1/lib/zwish.rb".into(), "require \"zeitwerk\"\n\nmodule Zwish\nend\n\nloader = Zeitwerk::Loader.for_gem\nloader.setup\n".into()),
+        ("gems/zwish-1.14.1/lib/zwish/version.rb".into(), "module Zwish\n  VERSION = \"1.14.1\"\nend\n".into()),
+        ("gems/zwish-1.14.1/lib/zwish/macros/core.rb".into(), "module Zwish\n  module Macros\n    class Core\n      def self.label\n        \"core macro\"\n      end\n    end\n  end\nend\n".into()),
         (
             "gems/sessionish-7.40.0/lib/sessionish/rack.rb".into(),
             "require \"paqlike\"\nrequire \"paqlike/codec\"\n\nmodule Sessionish\n  class Middleware\n    CODER = [Paqlike::ORIGIN, Paqlike::Codec.label]\n  end\nend\n".into(),
@@ -52,9 +58,7 @@ fn gem_home() -> PathBuf {
     home
 }
 
-#[test]
-fn a_native_gems_require_of_a_compiled_gem_loads_the_compiled_files() {
-    let home = gem_home();
+fn emit_app(home: &std::path::Path) -> emit_and_run::Emitted {
     let (dir, errors) = emit_and_run::empty_app()
         .write(
             "roundhouse.yml",
@@ -74,6 +78,24 @@ fn a_native_gems_require_of_a_compiled_gem_loads_the_compiled_files() {
         .emit(BuildTarget::Ruby);
     let own: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
     assert!(own.is_empty(), "{own:?}");
+    dir
+}
+
+const BOOT: &str = "Gem.paths = { 'GEM_PATH' => [ENV['RH_TEST_GEMS'], *Gem.path].join(File::PATH_SEPARATOR) }\n\
+     require_relative 'runtime/active_support_lazy_load_hooks'\n\
+     $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+     require_relative 'runtime/module_delegate'\n\
+     require_relative 'runtime/active_support_inflector'\n\
+     require_relative 'runtime/rails'\n\
+     Rails.env_name = 'test'\n\
+     require_relative 'runtime/rails_railtie'\n\
+     require_relative 'runtime/rails_engine'\n\
+     require_relative 'runtime/active_support_deprecation'\n";
+
+#[test]
+fn a_native_gems_require_of_a_compiled_gem_loads_the_compiled_files() {
+    let home = gem_home();
+    let dir = emit_app(&home);
     let models = std::fs::read_to_string(dir.join("app/models.rb")).expect("app/models.rb");
     let table = &models[models.find("COMPILED_GEM_FEATURES = {").unwrap_or_else(|| panic!("{models}"))..];
     let table = &table[..table.find("}.freeze").expect("table end")];
@@ -112,4 +134,43 @@ fn a_native_gems_require_of_a_compiled_gem_loads_the_compiled_files() {
     // ORIGIN and label, the gem home's copy never loaded, and a second
     // require of the feature a no-op.
     assert_eq!(stdout, "true\n[:compiled, \"compiled codec\"]\n[nil, nil]\nfalse\n[]\n", "{stderr}");
+}
+
+/// Kernel#require with a module prepended to Kernel (a require hook such
+/// as bin/run-target-boot-survey.rb's, which sends a call made under any
+/// other name than `require` to RubyGems' own): the compiled-gem require
+/// goes on to Kernel's own method, so Zeitwerk's decoration of it still
+/// autovivifies an implicit namespace. With an `alias_method` it took the
+/// hook instead, and dry-schema's `Dry::Schema::Macros` (r17-pre4 boot
+/// survey) was `cannot load such file -- .../dry/schema/macros`.
+#[test]
+fn a_require_hook_prepended_to_kernel_still_reaches_zeitwerks_implicit_namespaces() {
+    let home = gem_home();
+    let dir = emit_app(&home);
+    let hook = "GEM_REQUIRE = Kernel.instance_method(:require)\n\
+         module Hook\n  private def require(path)\n    return GEM_REQUIRE.bind_call(self, path) unless __callee__ == :require\n    (Kernel.instance_method(:require).super_method || GEM_REQUIRE).bind_call(self, path)\n  end\nend\n\
+         Kernel.prepend(Hook) if ENV['RH_HOOK']\n";
+    let observe = "require 'zwish'\np Zwish::Macros::Core.label\np require('sessionish/rack')\np Sessionish::Middleware::CODER\n";
+    let mut outs = Vec::new();
+    // Not (hooked, Zeitwerk after app/models): Zeitwerk's own `def
+    // require` then replaces Kernel's, and its alias takes the hook,
+    // whose renamed call skips to RubyGems'. That is the hook's chain, and
+    // Core's boot loads Zeitwerk with the gems, before app/models.
+    for (hooked, zeitwerk_first) in [(true, true), (false, true), (false, false)] {
+        let early = if zeitwerk_first { "require 'zeitwerk'\n" } else { "" };
+        let script = format!("{BOOT}{hook}{early}require_relative 'app/models'\nrequire 'sessionish'\n{observe}");
+        let mut cmd = emit_and_run::ruby();
+        cmd.current_dir(&*dir).env("RH_TEST_GEMS", &home).args(["-e", &script]);
+        if hooked {
+            cmd.env("RH_HOOK", "1");
+        }
+        let out = cmd.output().expect("ruby");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "hooked={hooked} zeitwerk_first={zeitwerk_first}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        outs.push(stdout);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+    for out in &outs {
+        assert_eq!(out, "\"core macro\"\ntrue\n[:compiled, \"compiled codec\"]\n");
+    }
 }
