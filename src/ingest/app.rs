@@ -2620,6 +2620,67 @@ end
         let span = crate::span::Span { file, start: dropped.start as u32, end: dropped.end as u32 };
         app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone(), construct: None });
     }
+    // Rails' `ignored_columns`: a column every model on its table ignores
+    // leaves the table, so attribute rows, the analyzer and the compiled
+    // SQL agree with Rails (`analyze::ignored_columns`). The writes of a
+    // model none of whose ignored names is still a column run at class
+    // load as written; the runtime's `ignored_columns=` accepts a list
+    // within the compiled one (`Model::ignored_columns`).
+    let ignored: Vec<Option<(Vec<String>, Vec<crate::span::Span>)>> =
+        app.models.iter().map(|m| crate::analyze::ignored_columns::ignored_columns(m, &app)).collect();
+    let mut dropped: indexmap::IndexMap<crate::ident::Symbol, Vec<crate::ident::Symbol>> = indexmap::IndexMap::new();
+    for model in &app.models {
+        if dropped.contains_key(&model.table.0) {
+            continue;
+        }
+        let Some(table) = app.schema.tables.get(&model.table.0) else { continue };
+        let on_table: Vec<usize> = (0..app.models.len()).filter(|&j| app.models[j].table.0 == model.table.0).collect();
+        let lists: Option<Vec<&Vec<String>>> = on_table.iter().map(|&j| ignored[j].as_ref().map(|(l, _)| l)).collect();
+        let columns = match lists {
+            Some(lists) => table
+                .columns
+                .iter()
+                .filter(|c| !c.primary_key && !table.primary_key_columns.contains(&c.name))
+                .filter(|c| on_table.iter().all(|&j| app.models[j].primary_key.as_ref() != Some(&c.name)))
+                .filter(|c| lists.iter().all(|l| l.iter().any(|n| n == c.name.as_str())))
+                .map(|c| c.name.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        dropped.insert(model.table.0.clone(), columns);
+    }
+    for (table_name, columns) in &dropped {
+        if let Some(table) = app.schema.tables.get_mut(table_name) {
+            table.columns.retain(|c| !columns.contains(&c.name));
+        }
+    }
+    for (model, found) in app.models.iter_mut().zip(ignored) {
+        let Some((list, spans)) = found else { continue };
+        for col in dropped.get(&model.table.0).into_iter().flatten() {
+            model.attributes.fields.shift_remove(col);
+        }
+        let left = app
+            .schema
+            .tables
+            .get(&model.table.0)
+            .is_some_and(|t| t.columns.iter().any(|c| list.iter().any(|n| n == c.name.as_str())));
+        if left {
+            continue;
+        }
+        for item in model.body.iter_mut() {
+            let crate::dialect::ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
+                continue;
+            };
+            if spans.contains(&expr.span) {
+                *item = crate::dialect::ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+        }
+        model.ignored_columns = list;
+    }
     // Columns an app class macro can retype at load through `attribute`;
     // their accessors and binds consult the declared type, and the
     // attribute row types them gradually (`attribute_type_unevaluated`):

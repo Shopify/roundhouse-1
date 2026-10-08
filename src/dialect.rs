@@ -134,6 +134,13 @@ pub struct Model {
     /// The unclaimed-DSL checks skip them. Empty for nearly every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claimed_body_calls: Vec<crate::span::Span>,
+    /// Rails' `ignored_columns`, as the class-body writes of the model and
+    /// its model ancestors leave it, when none of them is still a column
+    /// of the table (`analyze::ignored_columns`). Those writes run at class
+    /// load as written; the runtime's `ignored_columns=` accepts a list
+    /// within this one. Empty for nearly every model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_columns: Vec<String>,
     /// Named visibility for methods the body does not define as a local
     /// `MethodDef`: inherited ones, schema/association readers, and
     /// accessors the lowering synthesizes. See [`VisibilityOverride`].

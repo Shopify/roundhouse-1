@@ -274,6 +274,7 @@ mod tests {
             retypable_attributes: Vec::new(),
             query_constraints: Vec::new(),
             claimed_body_calls: Vec::new(),
+            ignored_columns: Vec::new(),
             span: crate::span::Span::synthetic(),
             visibility_overrides: Vec::new(),
         }

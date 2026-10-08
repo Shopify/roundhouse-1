@@ -643,6 +643,36 @@ module ActiveRecord
     def self._compiled_query_constraints
       nil
     end
+
+    # model_schema.rb's `ignored_columns`: the model's own list, else its
+    # superclass's. The compiled table already leaves out the columns the
+    # class body ignores (`_compiled_ignored_columns`, emitted per model),
+    # so a list naming any other column raises rather than being recorded
+    # while the compiled SQL still reads and writes it. Not detected: a
+    # later write that un-ignores a column the compiled table left out.
+    def self.ignored_columns
+      return @ignored_columns if @ignored_columns
+      parent = superclass
+      parent.respond_to?(:ignored_columns) ? parent.ignored_columns : IGNORED_COLUMNS_NONE
+    end
+
+    def self.ignored_columns=(columns)
+      list = columns.map(&:to_s).freeze
+      unknown = list - _compiled_ignored_columns
+      unless unknown.empty?
+        raise NotImplementedError, "#{name}.ignored_columns = #{list.inspect}: the compiled table leaves out only #{_compiled_ignored_columns.inspect}"
+      end
+      @ignored_columns = list
+    end
+
+    # The ignored columns the compiled table leaves out. Emitted models
+    # override it.
+    def self._compiled_ignored_columns
+      IGNORED_COLUMNS_NONE
+    end
+
+    IGNORED_COLUMNS_NONE = [].freeze
+    private_constant :IGNORED_COLUMNS_NONE
     
     # Read on every retypable accessor and bind, so memoized; a later
     # `attribute` here or in a superclass clears it.

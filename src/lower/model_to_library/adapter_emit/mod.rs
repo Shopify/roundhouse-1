@@ -77,6 +77,9 @@ pub(super) fn push_adapter_methods(
     if !model.query_constraints.is_empty() {
         methods.push(synth_compiled_query_constraints(model));
     }
+    if !model.ignored_columns.is_empty() {
+        methods.push(synth_compiled_ignored_columns(model));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +817,22 @@ fn reload_lookup(
 /// (`Model::query_constraints`). The runtime's `query_constraints`
 /// accepts this list and raises for any other.
 fn synth_compiled_query_constraints(model: &Model) -> MethodDef {
+    let names = model.query_constraints.iter().map(|c| c.as_str().to_string()).collect();
+    synth_class_string_list(model, "_compiled_query_constraints", names)
+}
+
+/// `def self._compiled_ignored_columns; ["legacy_flag"]; end` — the
+/// `ignored_columns` the compiled table already leaves out
+/// (`Model::ignored_columns`). The runtime's `ignored_columns=` accepts a
+/// list within it and raises for any other.
+fn synth_compiled_ignored_columns(model: &Model) -> MethodDef {
+    synth_class_string_list(model, "_compiled_ignored_columns", model.ignored_columns.clone())
+}
+
+/// `def self.<name>; [<names>]; end`.
+fn synth_class_string_list(model: &Model, name: &str, names: Vec<String>) -> MethodDef {
     let owner = &model.name;
-    let elements = model.query_constraints.iter().map(|c| arel_lit_str(c.as_str().to_string())).collect();
+    let elements = names.into_iter().map(arel_lit_str).collect();
     let mut body = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets });
     body.ty = Some(Ty::Array { elem: Box::new(Ty::Str) });
     MethodDef {
@@ -823,7 +840,7 @@ fn synth_compiled_query_constraints(model: &Model) -> MethodDef {
         unsupported_formals: None,
         has_anonymous_block: false,
         name_span: Span::synthetic(),
-        name: Symbol::from("_compiled_query_constraints"),
+        name: Symbol::from(name),
         receiver: MethodReceiver::Class,
         params: vec![],
         body,

@@ -66,6 +66,7 @@ fn tiny_blog_round_trips() {
         retypable_attributes: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
+        ignored_columns: Vec::new(),
         span: Span::synthetic(),
         visibility_overrides: Vec::new(),
     };

@@ -72,6 +72,9 @@ module ActiveRecord
     def self.query_constraints_list: () -> Array[String]?
     def self.composite_query_constraints_list: () -> Array[String]
     def self._compiled_query_constraints: () -> Array[String]?
+    def self.ignored_columns: () -> Array[String]
+    def self.ignored_columns=: (Array[String | Symbol] columns) -> Array[String]
+    def self._compiled_ignored_columns: () -> Array[String]
     def self._declared_attribute_types: () -> Hash[String, untyped]
     def self._reset_attribute_types: () -> untyped
     def self._attribute_cast: (String name, untyped value) -> untyped
