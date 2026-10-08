@@ -50,6 +50,32 @@ fn an_included_implicit_namespace_resolves_and_runs() {
     assert!(!builder.contains("include not supported"), "{builder}");
 }
 
+// `ShopifyPayments::Kyc` holds only the implicit `Kyc::BusinessPlatform`,
+// so the modeled class sits two namespaces down.
+const OUTER_BUILDER: &str = r#"module Pay
+  module Tax
+    class Outer
+      include Kyc
+
+      def label = Platform::BusinessType.label
+    end
+  end
+end
+"#;
+
+#[test]
+fn an_included_namespace_of_namespaces_resolves_and_runs() {
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("app/models/pay/kyc/platform/business_type.rb", BUSINESS_TYPE)
+        .write("app/models/pay/tax/outer.rb", OUTER_BUILDER)
+        .run_ruby("puts Pay::Tax::Outer.new.label\nputs Pay::Tax::Outer.include?(Pay::Kyc)\n");
+    run.assert_passes();
+    assert_eq!(run.stdout, "corp\ntrue\n");
+    let outer = std::fs::read_to_string(run.emitted.join("app/models/pay/tax/outer.rb")).expect("outer.rb");
+    assert!(!outer.contains("include not supported"), "{outer}");
+}
+
 #[test]
 fn an_include_naming_no_namespace_stays_refused() {
     use roundhouse::det::HashMap;

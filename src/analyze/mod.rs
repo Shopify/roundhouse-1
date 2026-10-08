@@ -1470,20 +1470,24 @@ impl Analyzer {
     /// only nests other declarations, at least one of them modeled. Like
     /// `body::lexical_class`, the innermost scope that has it wins.
     fn includes_source_namespace(&self, written: &str, scope: &str, rooted: bool) -> bool {
-        let nests_modeled = |name: &str| {
-            self.const_resolver
-                .nested_source_namespaces(name)
-                .iter()
-                .any(|nested| self.classes.contains_key(&ClassId(Symbol::from(nested.as_ref()))))
-        };
         let mut parts: Vec<&str> = if rooted { Vec::new() } else { scope.split("::").filter(|s| !s.is_empty()).collect() };
         while !parts.is_empty() {
-            if nests_modeled(&format!("{}::{written}", parts.join("::"))) {
+            if self.nests_modeled(&format!("{}::{written}", parts.join("::")), 0) {
                 return true;
             }
             parts.pop();
         }
-        nests_modeled(written)
+        self.nests_modeled(written, 0)
+    }
+
+    /// A modeled class is nested in `name`, directly or through namespaces
+    /// that only nest (Zeitwerk's `ShopifyPayments::Kyc` holds only the
+    /// implicit `Kyc::BusinessPlatform`).
+    fn nests_modeled(&self, name: &str, depth: u8) -> bool {
+        depth < 8
+            && self.const_resolver.nested_source_namespaces(name).iter().any(|nested| {
+                self.classes.contains_key(&ClassId(Symbol::from(nested.as_ref()))) || self.nests_modeled(nested, depth + 1)
+            })
     }
 
     fn analyze_carried(&mut self, app: &mut App) {
