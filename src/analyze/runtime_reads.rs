@@ -517,12 +517,26 @@ pub(crate) const GATED_METHODS: &[(&str, Typed, &str)] = &[
 
 /// The namespace a gated method read needs, if `expr` is one.
 fn gated_method(expr: &Expr) -> Option<(&'static str, String)> {
-    let ExprNode::Send { recv, method, .. } = &*expr.node else { return None };
+    let ExprNode::Send { method, .. } = &*expr.node else { return None };
     // A call the analyzer routed to the port (`expr::ERRORS_PORT_CALL`):
     // Enumerable over the Errors, and the reads listed below.
     if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
         return Some(("ActiveModel::ErrorAttributes", format!("ActiveModel::Errors#{}", method.as_str())));
     }
+    gated_listed(expr)
+}
+
+/// A routed call the accumulator answered before the port did (an
+/// iteration or question its Array answers over the messages): a tree
+/// without the port keeps that answer rather than refuse it, as it did.
+fn accumulator_answers(expr: &Expr) -> bool {
+    expr.decisions & crate::expr::ERRORS_PORT_CALL != 0
+        && matches!(&*expr.node, ExprNode::Send { method, .. }
+            if matches!(method.as_str(), "each" | "any?" | "none?" | "count" | "include?" | "messages_for"))
+}
+
+fn gated_listed(expr: &Expr) -> Option<(&'static str, String)> {
+    let ExprNode::Send { recv, method, .. } = &*expr.node else { return None };
     GATED_METHODS.iter().find_map(|(name, typed, needs)| {
         if *name != method.as_str() {
             return None;
@@ -582,7 +596,7 @@ fn class_name(ty: &Option<Ty>) -> Option<&str> {
 const RECORD_SERIALIZATION_PORT: &str = "ActiveModel::Serializers::JSON";
 
 fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut Vec<RuntimeRead>) {
-    if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs)) {
+    if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs) && !accumulator_answers(expr)) {
         out.push(RuntimeRead { span: expr.span, name: needs.to_string(), shown, in_test, declaration: false });
     }
     if expr.decisions & crate::expr::RECORD_SERIALIZATION != 0 && gated(RECORD_SERIALIZATION_PORT) {

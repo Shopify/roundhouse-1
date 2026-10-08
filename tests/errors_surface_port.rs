@@ -483,3 +483,21 @@ fn errors_surface_matches_native_rails_on_postgresql() {
     assert_eq!(native, PORT_EXPECTED, "native, port");
     assert_eq!(emitted_lines, native, "emitted, port");
 }
+
+/// The blog's form iterates `article.errors.each do |error|` over the
+/// messages (the view lowering reads `error.full_message` as the
+/// message), on every target: no tree is refused the port for it, and
+/// the CRuby tree's form does not route it over the Errors.
+#[test]
+fn the_blogs_errors_each_needs_no_port() {
+    for target in [BuildTarget::Rust, BuildTarget::Spinel, BuildTarget::Ruby] {
+        let (emitted, errors) = emit_and_run::real_blog().emit(target);
+        let refused: Vec<_> = errors.iter().filter(|e| e.contains("ErrorAttributes")).collect();
+        assert!(refused.is_empty(), "{target:?}: {refused:#?}");
+        if target == BuildTarget::Ruby {
+            let form = std::fs::read_to_string(emitted.join("app/views/articles/_form.rb")).unwrap();
+            assert!(form.contains("article.errors.each do |error|"), "{form}");
+            assert!(!form.contains("ErrorAttributes"), "{form}");
+        }
+    }
+}
