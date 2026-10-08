@@ -51,7 +51,7 @@ const BUILT_IN: &[&str] = &[
 ];
 
 /// The `validates`-level keys that are defaults for every validator.
-const DEFAULT_KEYS: &[&str] = &["if", "unless", "on", "allow_blank", "allow_nil", "strict"];
+const DEFAULT_KEYS: &[&str] = &["if", "unless", "on", "allow_blank", "allow_nil", "strict", "except_on"];
 
 /// `validates ...` / `validates_<key>_of ...`: the Validations it
 /// declares, or `None` for any other call. A declaration whose shape is
@@ -237,6 +237,9 @@ fn own_keys(key: &str) -> &'static [&'static str] {
         ],
         "format" => &["with", "without", "multiline"],
         "uniqueness" => &["scope", "case_sensitive", "conditions", "class"],
+        "comparison" => &[
+            "greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than",
+        ],
         _ => &[],
     }
 }
@@ -286,6 +289,10 @@ fn validator_rule(
                 Some(on) => options.on = on,
                 None => return Ok(Some(unsupported(key, "`on:` that is not a Symbol or an Array of Symbols"))),
             },
+            "except_on" => match contexts(v) {
+                Some(on) => options.except_on = on,
+                None => return Ok(Some(unsupported(key, "`except_on:` that is not a Symbol or an Array of Symbols"))),
+            },
             "strict" => return Ok(Some(unsupported(key, "`strict:` (raising validations)"))),
             "message" => match message(v, file)? {
                 Ok(m) => options.message = Some(m),
@@ -310,6 +317,7 @@ fn validator_rule(
         "numericality" => numericality_rule(&own, file)?,
         "format" => format_rule(&own, file)?,
         "uniqueness" => uniqueness_rule(&own, file)?,
+        "comparison" => comparison_rule(&own, file)?,
         other => Err(format!("the `{other}` validator is not modeled")),
     };
     let rule = match rule {
@@ -325,7 +333,7 @@ fn validator_rule(
     if needs_count {
         let counted = matches!(
             rule,
-            ValidationRule::Length { .. } | ValidationRule::LengthOf { .. }
+            ValidationRule::Length { .. } | ValidationRule::LengthOf { .. } | ValidationRule::Comparison { .. }
         );
         if !counted {
             return Ok(Some(unsupported(
@@ -345,6 +353,181 @@ fn validator_rule(
         return Ok(Some(rule));
     }
     Ok(Some(ValidationRule::Guarded { rule: Box::new(rule), options }))
+}
+
+/// `validate :a, :b, on:, if:, unless:, except_on:` / `validate do ...
+/// end` / `validate ->(record) { ... }` / `validates_with K[, L], opts`:
+/// the `validate` callbacks ActiveModel registers, as one Validation
+/// whose rules run in order. The options become the callback's
+/// conditions, as `validate` turns them into them: `on:` the first
+/// `if:`, `except_on:` the first `unless:`. `None` for any other call.
+pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -> IngestResult<Option<Validation>> {
+    if call.receiver().is_some() {
+        return Ok(None);
+    }
+    let name = constant_id_str(&call.name()).to_string();
+    if name != "validate" && name != "validates_with" {
+        return Ok(None);
+    }
+    let mut args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let options_node = match args.last() {
+        Some(last) if last.as_keyword_hash_node().is_some() => args.pop(),
+        _ => None,
+    };
+    let construct = format!("`{name}`");
+    let first_name = args.first().and_then(|a| symbol_value(a)).map(|s| Symbol::from(s.as_str()));
+    let gap = |detail: String| {
+        Ok(Some(Validation {
+            attribute: first_name.clone().unwrap_or_else(|| Symbol::from("base")),
+            rules: vec![ValidationRule::Unsupported { construct: construct.clone(), detail }],
+        }))
+    };
+    let mut entries: Vec<(String, Node<'_>)> = Vec::new();
+    if let Some(kh) = options_node.as_ref().and_then(|n| n.as_keyword_hash_node()) {
+        for el in kh.elements().iter() {
+            match el.as_assoc_node().and_then(|a| symbol_value(&a.key()).map(|k| (k, a.value()))) {
+                Some(pair) => entries.push(pair),
+                None => return gap("an option that is not a `key: value` pair with a Symbol key".into()),
+            }
+        }
+    }
+    let block = call.block();
+    if block.as_ref().is_some_and(|b| b.as_block_node().is_none()) {
+        return gap("a block argument (`&block`)".into());
+    }
+    let all_symbols = args.iter().all(|a| symbol_value(a).is_some());
+    let mut guard = RuleOptions::default();
+    for (k, v) in &entries {
+        match k.as_str() {
+            "on" => match contexts(v) {
+                Some(on) => guard.on = on,
+                None => return gap("`on:` that is not a Symbol or an Array of Symbols".into()),
+            },
+            "except_on" => match contexts(v) {
+                Some(on) => guard.except_on = on,
+                None => return gap("`except_on:` that is not a Symbol or an Array of Symbols".into()),
+            },
+            "if" | "unless" => match conditions(v, file)? {
+                Ok(conds) if k == "if" => guard.if_conds = conds,
+                Ok(conds) => guard.unless_conds = conds,
+                Err(detail) => return gap(format!("`{k}:` {detail}")),
+            },
+            "prepend" => match super::util::bool_value(v) {
+                Some(false) => {}
+                _ => return gap("`prepend:` (the callback runs before the validations declared earlier)".into()),
+            },
+            // `validates_with` hands every option to the validator.
+            _ if name == "validates_with" => {}
+            // `validate :m, allow_nil: true` raises at load.
+            other if all_symbols => {
+                return gap(format!("`{other}:` (ActiveModel raises \"Unknown key\" for `validate`)"));
+            }
+            // Callbacks ignore other options given beside a callable.
+            _ => {}
+        }
+    }
+    let mut attribute = first_name.clone().unwrap_or_else(|| Symbol::from("base"));
+    let rules: Vec<ValidationRule> = if name == "validates_with" {
+        if block.is_some() {
+            return gap("a block (passed to the validator's `new`)".into());
+        }
+        let constant = |a: &Node<'_>| a.as_constant_read_node().is_some() || a.as_constant_path_node().is_some();
+        if args.is_empty() || !args.iter().all(constant) {
+            return gap("an argument that is not a validator class constant".into());
+        }
+        if let Some((_, v)) = entries.iter().find(|(k, _)| k == "attributes") {
+            let first = v
+                .as_array_node()
+                .and_then(|a| a.elements().iter().next())
+                .and_then(|e| symbol_value(&e))
+                .or_else(|| symbol_value(v));
+            if let Some(first) = first {
+                attribute = Symbol::from(first.as_str());
+            }
+        }
+        let options = match &options_node {
+            Some(o) => Some(ingest_expr(o, file)?),
+            None => None,
+        };
+        let mut rules = Vec::new();
+        for class in &args {
+            rules.push(ValidationRule::With {
+                validator: ingest_expr(class, file)?,
+                options: options.clone(),
+                if_method: None,
+                unless_method: None,
+            });
+        }
+        rules
+    } else if let Some(block) = &block {
+        if !args.is_empty() {
+            return gap("method names beside a block".into());
+        }
+        let _ = block;
+        let whole = ingest_expr(&call.as_node(), file)?;
+        let ExprNode::Send { block: Some(lambda), .. } = &*whole.node else {
+            return gap("a block that is not read as one".into());
+        };
+        match block_callable(lambda.clone()) {
+            Ok(rule) => vec![rule],
+            Err(detail) => return gap(detail),
+        }
+    } else if args.is_empty() {
+        return gap("no method, lambda or block named".into());
+    } else if all_symbols {
+        args.iter()
+            .filter_map(|a| symbol_value(a))
+            .map(|m| ValidationRule::Custom { method: Symbol::from(m.as_str()), if_method: None, unless_method: None })
+            .collect()
+    } else {
+        let mut rules = Vec::new();
+        for a in &args {
+            if let Some(m) = symbol_value(a) {
+                rules.push(ValidationRule::Custom { method: Symbol::from(m.as_str()), if_method: None, unless_method: None });
+                continue;
+            }
+            let expr = ingest_expr(a, file)?;
+            let Some((lambda, _)) = callable(&expr) else {
+                return gap("an argument that is not a Symbol, a lambda/proc literal or a block".into());
+            };
+            let lambda = match &*lambda.node {
+                ExprNode::Send { block: Some(b), .. } => b.clone(),
+                _ => lambda,
+            };
+            match block_callable(lambda) {
+                Ok(rule) => rules.push(rule),
+                Err(detail) => return gap(detail),
+            }
+        }
+        rules
+    };
+    let rules = if guard == RuleOptions::default() {
+        rules
+    } else {
+        rules.into_iter().map(|rule| ValidationRule::Guarded { rule: Box::new(rule), options: guard.clone() }).collect()
+    };
+    Ok(Some(Validation { attribute, rules }))
+}
+
+/// A `validate` block or lambda (an `ExprNode::Lambda`) as the rule
+/// that calls it inside the record's method: `self` is the record there
+/// as under `instance_exec`, and a one-parameter block gets the record.
+fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
+    let ExprNode::Lambda { params, rest_param, block_param, .. } = &*lambda.node else {
+        return Err("a block that is not a plain block".into());
+    };
+    if rest_param.is_some() || block_param.is_some() || params.len() > 1 {
+        return Err("a block taking more than the record".into());
+    }
+    let with_record = params.len() == 1;
+    let s = Span::synthetic();
+    // `lambda do |record| ... end`, so `next` leaves the block as it does
+    // under `instance_exec`.
+    let callable = Expr::new(
+        s,
+        ExprNode::Send { recv: None, method: Symbol::from("lambda"), args: Vec::new(), block: Some(lambda), parenthesized: false },
+    );
+    Ok(ValidationRule::Block { callable, with_record })
 }
 
 /// `on: :create` / `on: [:create, :publish]`.
@@ -757,6 +940,23 @@ fn numericality_rule(own: &[(&str, &Node<'_>)], file: &str) -> IngestResult<Resu
     Ok(Ok(ValidationRule::Numericality { only_integer, checks }))
 }
 
+/// `comparison:`: ComparisonValidator runs the checks in the order the
+/// options were written, each bound through `resolve_value`.
+fn comparison_rule(own: &[(&str, &Node<'_>)], file: &str) -> IngestResult<Result<ValidationRule, String>> {
+    let mut checks: Vec<NumericCheck> = Vec::new();
+    for (k, v) in own {
+        let Some(op) = NumericOp::from_key(k) else { continue };
+        match rule_value(v, k, file)? {
+            Ok(bound) => checks.push(NumericCheck { op, bound: Some(bound) }),
+            Err(detail) => return Ok(Err(detail)),
+        }
+    }
+    if checks.is_empty() {
+        return Ok(Err("no comparison option (ActiveModel raises at load)".into()));
+    }
+    Ok(Ok(ValidationRule::Comparison { checks }))
+}
+
 fn format_rule(own: &[(&str, &Node<'_>)], file: &str) -> IngestResult<Result<ValidationRule, String>> {
     let multiline = own.iter().any(|(k, v)| *k == "multiline" && v.as_true_node().is_some());
     let mut found: Option<ValidationRule> = None;
@@ -909,6 +1109,10 @@ fn custom_validator(
             "on" => match contexts(v) {
                 Some(on) => guard.on = on,
                 None => return Ok(unsupported(key, "`on:` that is not a Symbol or an Array of Symbols")),
+            },
+            "except_on" => match contexts(v) {
+                Some(on) => guard.except_on = on,
+                None => return Ok(unsupported(key, "`except_on:` that is not a Symbol or an Array of Symbols")),
             },
             "if" | "unless" => match conditions(v, file)? {
                 Ok(conds) if k == "if" => guard.if_conds = conds,

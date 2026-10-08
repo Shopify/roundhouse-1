@@ -337,7 +337,14 @@ end
 "##;
 
 fn same_as_activemodel(model: (&str, &str), probe: &str, expect: &[&str]) {
-    let files = [("app/models/observe.rb", OBSERVE), model, ("app/models/probe.rb", probe)];
+    same_as_activemodel_with(&[model], probe, expect)
+}
+
+/// [`same_as_activemodel`] over several app files (one class each).
+fn same_as_activemodel_with(models: &[(&str, &str)], probe: &str, expect: &[&str]) {
+    let mut files = vec![("app/models/observe.rb", OBSERVE)];
+    files.extend_from_slice(models);
+    files.push(("app/models/probe.rb", probe));
     let script = "puts Probe.lines\n";
     let native = native(&files, script);
     for seen in expect {
@@ -825,6 +832,162 @@ fn with_options_merged_validates_answer_like_activemodel() {
     );
 }
 
+/// `validate` callbacks under conditions: a method with `on:` / `if:` /
+/// `unless:` / `except_on:` (Symbols, lambdas, Arrays), a block with and
+/// without the record, a lambda, and `validates_with` under `on:`, run in
+/// declaration order with the `validates` rules.
+const EVEN_VALIDATOR: &str = r##"class EvenValidator < ActiveModel::Validator
+  def validate(record)
+    record.errors.add(:base, "#{options[:label]} is odd") if record.n.odd?
+  end
+end
+"##;
+
+const CHECKER: &str = r##"class Checker
+  include ActiveModel::Validations
+
+  attr_reader :n, :name, :strict
+
+  validate :big, on: :publish
+  validate :named, if: -> { strict }, unless: [:skip?, ->(c) { c.n == 99 }]
+  validates :name, presence: true, except_on: :draft
+  validate do
+    errors.add(:n, "is negative") if n.negative?
+  end
+  validate do |record|
+    record.errors.add(:n, "is thirteen") if record.n == 13
+  end
+  validate ->(record) { record.errors.add(:name, "is shouted") if record.name.to_s.upcase == record.name.to_s && !record.name.to_s.empty? }
+  validates_with EvenValidator, on: [:publish, :review], label: "N"
+  validate :tiny, :huge, except_on: [:draft, :review]
+
+  def initialize(n: 2, name: "a", strict: false)
+    @n = n
+    @name = name
+    @strict = strict
+  end
+
+  def skip?
+    name == "skip"
+  end
+
+  private
+
+  def big
+    errors.add(:n, "is too small to publish") if n < 10
+  end
+
+  def named
+    errors.add(:name, "is too short when strict") if name.to_s.length < 3
+  end
+
+  def tiny
+    errors.add(:n, "is zero") if n.zero?
+  end
+
+  def huge
+    errors.add(:n, "is huge") if n > 1000
+  end
+end
+"##;
+
+const CHECKER_PROBE: &str = r##"class Probe
+  #: -> Array[String]
+  def self.lines
+    out = []
+    [nil, :publish, :review, :draft].each do |context|
+      out << Observe.line("default #{context.inspect}", Checker.new, context)
+      out << Observe.line("odd #{context.inspect}", Checker.new(n: 11), context)
+      out << Observe.line("zero #{context.inspect}", Checker.new(n: 0, name: nil), context)
+      out << Observe.line("huge #{context.inspect}", Checker.new(n: 1002), context)
+    end
+    [-4, 13].each { |n| out << Observe.line("n #{n}", Checker.new(n: n)) }
+    ["ab", "skip", "abc", "AB"].each { |v| out << Observe.line("strict #{v.inspect}", Checker.new(name: v, strict: true)) }
+    out << Observe.line("strict 99", Checker.new(n: 99, name: "a", strict: true))
+    out
+  end
+end
+"##;
+
+#[test]
+fn validate_callbacks_under_conditions_answer_like_activemodel() {
+    same_as_activemodel_with(
+        &[("app/models/even_validator.rb", EVEN_VALIDATOR), ("app/models/checker.rb", CHECKER)],
+        CHECKER_PROBE,
+        &[
+            r#"default nil: true []"#,
+            r#"default :publish: false ["N is too small to publish"]"#,
+            r#"odd :review: false ["N is odd"]"#,
+            r#"zero :draft: true []"#,
+            r#"zero nil: false ["Name can't be blank", "N is zero"]"#,
+            r#"huge :review: true []"#,
+            r#"n 13: false ["N is thirteen"]"#,
+            r#"strict "ab": false ["Name is too short when strict"]"#,
+            r#"strict "skip": true []"#,
+            r#"strict "AB": false ["Name is too short when strict", "Name is shouted"]"#,
+            r#"strict 99: true []"#,
+        ],
+    );
+}
+
+/// `comparison:` with a literal, a Symbol (another attribute), and Procs
+/// with and without the record; a nil or blank value; a bound the value
+/// cannot be compared with (the ArgumentError's text is the error); the
+/// option order as written; `allow_nil:` and a `%{count}` message.
+const COMPARER: &str = r##"class Comparer
+  include ActiveModel::Validations
+
+  attr_reader :from, :to, :n, :at, :code
+
+  validates :to, comparison: { greater_than_or_equal_to: :from }
+  validates :n, comparison: { less_than: 10, greater_than: ->(r) { r.from.to_i } }, allow_nil: true
+  validates :at, comparison: { greater_than: -> { Time.utc(2020, 1, 1) } }
+  validates :code, comparison: { other_than: "x", message: "cannot be %{count}" }
+
+  def initialize(from: 1, to: 2, n: nil, at: Time.utc(2021, 1, 1), code: "y")
+    @from = from
+    @to = to
+    @n = n
+    @at = at
+    @code = code
+  end
+end
+"##;
+
+const COMPARER_PROBE: &str = r##"class Probe
+  #: -> Array[String]
+  def self.lines
+    out = [Observe.line("default", Comparer.new)]
+    [0, 1, nil, ""].each { |v| out << Observe.line("to #{v.inspect}", Comparer.new(to: v)) }
+    out << Observe.line("to over a nil from", Comparer.new(from: nil, to: 3))
+    [12, 1, 0, 5].each { |v| out << Observe.line("n #{v.inspect}", Comparer.new(n: v)) }
+    out << Observe.line("n over a from of 5", Comparer.new(n: 5, from: 5, to: 6))
+    [Time.utc(2019, 1, 1), nil].each { |v| out << Observe.line("at #{v.inspect}", Comparer.new(at: v)) }
+    ["x", " "].each { |v| out << Observe.line("code #{v.inspect}", Comparer.new(code: v)) }
+    out
+  end
+end
+"##;
+
+#[test]
+fn comparison_answers_like_activemodel() {
+    same_as_activemodel(
+        ("app/models/comparer.rb", COMPARER),
+        COMPARER_PROBE,
+        &[
+            r#"default: true []"#,
+            r#"to 0: false ["To must be greater than or equal to 1"]"#,
+            r#"to nil: false ["To can't be blank"]"#,
+            r#"to over a nil from: false ["To comparison of Integer with nil failed"]"#,
+            r#"n 12: false ["N must be less than 10"]"#,
+            r#"n 0: false ["N must be greater than 1"]"#,
+            r#"at nil: false ["At can't be blank"]"#,
+            r#"code "x": false ["Code cannot be x"]"#,
+            r#"code " ": false ["Code cannot be x"]"#,
+        ],
+    );
+}
+
 /// `on:` contexts on a tableless class: `valid?(context)` runs the rules
 /// for that context, and `valid?` (no context; ActiveModel has no
 /// `:create` / `:update` default) runs none of them.
@@ -889,7 +1052,7 @@ fn unmodeled_validates_options_are_check_errors() {
   validates :code, uniqueness: true
   validates :seats, numericality: { only_numeric: true }
   validates :email, presence: true, strict: true
-  validates :kind, comparison: { greater_than: 1 }
+  validates :kind, comparison: { greater_than: -> { minimum } }
   validates :note, length: { in: SPAN.to_a }
   validates :email, format: { with: /^x/ }
   validates :seats, numericality: { greater_than: 0, message: "must exceed %{count}" }
@@ -904,7 +1067,7 @@ end
         "`validates uniqueness:` not supported (all targets): on `code`, a uniqueness check on a class outside ActiveRecord",
         "`validates numericality:` not supported (all targets): on `seats`, `only_numeric:`",
         "`validates presence:` not supported (all targets): on `email`, `strict:`",
-        "`validates comparison:` not supported (all targets): on `kind`",
+        "`validates comparison:` not supported (all targets): on `kind`, `greater_than:` lambda that reads `self`",
         "`validates length:` not supported (all targets): on `note`, `in:` that is not a Range literal or a constant",
         "`validates format:` not supported (all targets): on `email`, a regexp with a `^`/`$` anchor",
         "`validates numericality:` not supported (all targets): on `seats`, a `message:` interpolating %{count}",

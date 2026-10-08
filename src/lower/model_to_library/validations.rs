@@ -488,7 +488,9 @@ fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Mo
 /// Whether any rule runs `on:` a validation context.
 fn uses_validation_context(model: &Model) -> bool {
     model.validations().any(|v| {
-        v.rules.iter().any(|r| matches!(r, ValidationRule::Guarded { options, .. } if !options.on.is_empty()))
+        v.rules.iter().any(|r| {
+            matches!(r, ValidationRule::Guarded { options, .. } if !options.on.is_empty() || !options.except_on.is_empty())
+        })
     })
 }
 
@@ -519,6 +521,22 @@ fn validation_rule_to_calls(
         }
         ValidationRule::Numericality { only_integer, checks } => {
             inline_numericality_check(attr, *only_integer, checks, text)
+        }
+        ValidationRule::Comparison { checks } => inline_comparison_check(attr, value, checks, text),
+        // `validate do ... end`: the block, called inside the record's
+        // method (its `self`, as under `instance_exec`).
+        ValidationRule::Block { callable, with_record } => {
+            let args = if *with_record { vec![Expr::new(Span::synthetic(), ExprNode::SelfRef)] } else { Vec::new() };
+            vec![Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(callable.clone()),
+                    method: Symbol::from("call"),
+                    args,
+                    block: None,
+                    parenthesized: *with_record,
+                },
+            )]
         }
         ValidationRule::Inclusion { list_of: Some(members), exclusion, .. } => {
             vec![inline_inclusion_check(attr, &resolve(members), *exclusion, false, text)]
@@ -1266,6 +1284,82 @@ fn replace_var_with_self(e: &mut Expr, record: &Option<Symbol>) {
 ///     ...                                      # each option, in order
 ///   end
 /// Every failing comparison adds its own error, as natively.
+/// ComparisonValidator: a nil or blank value is one `:blank` error;
+/// otherwise each check, in the order written, compares the value with
+/// its resolved bound (`value.public_send(op, bound)`) and adds the
+/// option's error with the bound as `%{count}`. An ArgumentError from
+/// the comparison (`comparison of Time with nil failed`) becomes the
+/// error's text, as Rails rescues it per check.
+fn inline_comparison_check(attr: &Symbol, value: &Expr, checks: &[NumericCheck], text: &ErrorText<'_>) -> Vec<Expr> {
+    let s = Span::synthetic();
+    let human = humanize(attr.as_str());
+    let err = Symbol::from(format!("{}_comparison_error", attr.as_str()));
+    let rescued = |body: Expr| {
+        Expr::new(
+            s,
+            ExprNode::BeginRescue {
+                body,
+                rescues: vec![crate::expr::RescueClause {
+                    classes: vec![Expr::new(s, ExprNode::Const { path: vec![Symbol::from("ArgumentError")] })],
+                    binding: Some(err.clone()),
+                    body: errors_push_expr(Expr::new(
+                        s,
+                        ExprNode::StringInterp {
+                            parts: vec![
+                                InterpPart::Text { value: format!("{human} ") },
+                                InterpPart::Expr { expr: send(local_read(&err), "message", vec![]) },
+                            ],
+                        },
+                    )),
+                }],
+                else_branch: None,
+                ensure: None,
+                implicit: false,
+            },
+        )
+    };
+    // The bound: a literal in place, anything else resolved into a local
+    // the comparison and %{count} share.
+    let bound = |check: &NumericCheck| -> (Vec<Expr>, Expr, Count) {
+        match check.bound.as_ref() {
+            Some(RuleValue::Literal { value }) => {
+                (Vec::new(), Expr::new(s, ExprNode::Lit { value: value.clone() }), Count::Static(value.clone()))
+            }
+            Some(other) => {
+                let local = Symbol::from(format!("{}_{}", attr.as_str(), check.op.key()));
+                (vec![assign_local(&local, resolve(other))], local_read(&local), Count::Dynamic(local_read(&local)))
+            }
+            None => (Vec::new(), Expr::new(s, ExprNode::Lit { value: Literal::Nil }), Count::Static(Literal::Nil)),
+        }
+    };
+    let Some(first) = checks.first() else { return Vec::new() };
+    let blank = bool_op(
+        BoolOpKind::Or,
+        send(value.clone(), "nil?", vec![]),
+        send(Expr::new(s, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] }), "blank?", vec![value.clone()]),
+    );
+    let (mut pre, _, count) = bound(first);
+    pre.push(text.push("blank", Some(&count), || value.clone()));
+    let blank_branch = rescued(seq(pre));
+    let mut each: Vec<Expr> = Vec::new();
+    for check in checks {
+        let op = match check.op {
+            NumericOp::GreaterThan => ">",
+            NumericOp::GreaterThanOrEqualTo => ">=",
+            NumericOp::EqualTo => "==",
+            NumericOp::LessThan => "<",
+            NumericOp::LessThanOrEqualTo => "<=",
+            NumericOp::OtherThan => "!=",
+            NumericOp::Odd | NumericOp::Even | NumericOp::In => continue,
+        };
+        let (mut pre, bound_expr, count) = bound(check);
+        let holds = send(value.clone(), op, vec![bound_expr]);
+        pre.push(if_with_nil_else(not(holds), text.push(check.op.key(), Some(&count), || value.clone())));
+        each.push(rescued(seq(pre)));
+    }
+    vec![Expr::new(s, ExprNode::If { cond: blank, then_branch: blank_branch, else_branch: seq(each) })]
+}
+
 fn inline_numericality_check(
     attr: &Symbol,
     only_integer: bool,
@@ -1683,6 +1777,10 @@ fn guard_rule(value: Expr, checks: Vec<Expr>, o: &RuleOptions) -> Vec<Expr> {
         holds.push(on_context_check(&o.on));
     }
     holds.extend(o.if_conds.iter().map(resolve));
+    // `except_on:` is the first `unless:` condition Rails adds.
+    if !o.except_on.is_empty() {
+        holds.push(not(on_context_check(&o.except_on)));
+    }
     holds.extend(o.unless_conds.iter().map(|c| not(resolve(c))));
     if let Some(cond) = holds.into_iter().reduce(|a, b| bool_op(BoolOpKind::And, a, b)) {
         body = if_with_nil_else(cond, body);
