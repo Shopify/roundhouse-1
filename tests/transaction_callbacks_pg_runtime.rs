@@ -6,7 +6,8 @@
 //! rules (`lower::model_to_library::transaction_callbacks`): duplicates
 //! of a symbol callback removed, `prepend:`, the after chains run last
 //! to first, `on:` first among the conditions, `if:`/`unless:` arrays,
-//! one-parameter lambdas, callback objects, block forms, a parent
+//! one-parameter lambdas, callback objects, block forms (a block's own
+//! `next` ends the callback; a nested block's ends that block), a parent
 //! model's callbacks ahead of its subclass's, and Core's ignored
 //! `only:`. The runtime enrolls a saved, destroyed or touched record in
 //! its transaction (runtime/spinel/cruby/active_record_transactions.rb)
@@ -150,6 +151,8 @@ end
 const GADGET: &str = r#"class Gadget < TrackedRecord
   after_create_commit { CallbackLog.add("g-create:#{name}") }
   after_commit(on: [:update, :destroy]) do |record|
+    %w[n1 n2].each { |n| next if n == "n1"; CallbackLog.add(n) }
+    next CallbackLog.add("g-next") if record.name.blank?
     CallbackLog.add("g-ud:#{record.name}")
     CallbackLog.add("g-destroyed:#{record.destroyed?}")
   end
@@ -293,10 +296,10 @@ const EXPECTED: [&str; 25] = [
     "destroy state: destroyed=false persisted=true exists=true",
     "update_attribute: s bc ba h g f obj:x:z d c b a e",
     "gadget create: g-before g-lambda g-create:p track",
-    "gadget update: g-before g-multi g-multi-end g-ud: g-destroyed:false track",
-    "gadget touch: g-before g-multi g-multi-end g-ud: g-destroyed:false track",
+    "gadget update: g-before g-multi g-multi-end n2 g-next track",
+    "gadget touch: g-before g-multi g-multi-end n2 g-next track",
     "gadget rollback: g-rollback:false untrack",
-    "gadget destroy: g-before g-self:Gadget:Gadget g-ud: g-destroyed:true track",
+    "gadget destroy: g-before g-self:Gadget:Gadget n2 g-next track",
     "count: 5 0",
 ];
 

@@ -279,11 +279,13 @@ fn block_form(model: &Model, index: usize, expr: &Expr) -> Option<BlockForm> {
         [record] => rebind_to_self(&mut body, record),
         _ => return None,
     }
-    // The block's `next`/`break` (and a proc's `return`) would mean
-    // something else in the method it becomes.
+    // The block's own `next` ends the callback, as `return` ends the
+    // method it becomes (the chain ignores the value). Its `break` (and
+    // a proc's `return`) would mean something else there.
     if escapes(&body, is_block) {
         return None;
     }
+    next_to_return(&mut body);
     let body = super::broadcasts::rewrite_rails_broadcast_calls(body, model);
     let mut body = body;
     super::markers::rewrite_column_or_assign(&mut body, model);
@@ -461,16 +463,39 @@ fn statement(entry: Entry) -> Expr {
 /// Rails raises LocalJumpError)? A nested block or lambda has its own.
 fn escapes(body: &Expr, proc_return: bool) -> bool {
     let mut found = false;
-    fn walk(e: &Expr, proc_return: bool, found: &mut bool) {
+    fn walk(e: &Expr, proc_return: bool, in_loop: bool, found: &mut bool) {
         match &*e.node {
+            // The body's own `next` becomes `return` (`next_to_return`).
+            ExprNode::Next { .. } if !in_loop => {
+                if let ExprNode::Next { value: Some(v) } = &*e.node {
+                    walk(v, proc_return, in_loop, found);
+                }
+            }
             ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo | ExprNode::Retry => *found = true,
             ExprNode::Return { .. } if proc_return => *found = true,
             ExprNode::Lambda { .. } => {}
-            _ => e.node.for_each_child(&mut |c| walk(c, proc_return, found)),
+            ExprNode::While { .. } => e.node.for_each_child(&mut |c| walk(c, proc_return, true, found)),
+            _ => e.node.for_each_child(&mut |c| walk(c, proc_return, in_loop, found)),
         }
     }
-    walk(body, proc_return, &mut found);
+    walk(body, proc_return, false, &mut found);
     found
+}
+
+/// The callback body's own `next` (not one inside a nested block or a
+/// loop, which ends that) becomes `return` with the same value.
+fn next_to_return(expr: &mut Expr) {
+    match &mut *expr.node {
+        ExprNode::Next { value } => {
+            let value = value
+                .take()
+                .unwrap_or_else(|| Expr::new(expr.span, ExprNode::Lit { value: Literal::Nil }));
+            let span = expr.span;
+            *expr = Expr::new(span, ExprNode::Return { value });
+        }
+        ExprNode::Lambda { .. } | ExprNode::While { .. } => {}
+        _ => expr.node.for_each_child_mut(&mut next_to_return),
+    }
 }
 
 /// The record parameter's reads become `self` (`instance_exec(record)`).
