@@ -1388,9 +1388,10 @@ fn reject_unsupported_forwarded_procs(app: &App, target: BuildTarget) -> Result<
 }
 
 /// Optional, keyword and named-kwrest block parameters are held in
-/// `Lambda.signature`; only the Ruby-family emitters write it (verbatim).
-/// Every other target would emit the block without those bindings, so
-/// it refuses each one by name instead.
+/// `Lambda.signature`, and a `def` inside a block in `MethodDefExpr`;
+/// only the Ruby-family emitters write them (verbatim). Every other
+/// target would emit the block without them, so it refuses each one by
+/// name instead.
 fn reject_block_signatures(app: &App, target: BuildTarget) -> Result<(), String> {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby
         | BuildTarget::Spinel | BuildTarget::Roda) {
@@ -1401,6 +1402,13 @@ fn reject_block_signatures(app: &App, target: BuildTarget) -> Result<(), String>
         // A lowering that rebuilds a block (`map`'s) may leave it
         // synthetic; the nearest enclosing source span names it then.
         let at = if e.span.is_synthetic() { at } else { e.span };
+        if let ExprNode::MethodDefExpr { def } = &*e.node {
+            *found = true;
+            crate::emit::diagnostics::report_unsupported(
+                at, target, "block_method_def",
+                &format!("`def {}` inside a block (`Class.new do … end`, `class_eval do … end`) is not implemented on this target; use Ruby instead", def.name),
+            );
+        }
         if let ExprNode::Lambda { signature, .. } = &*e.node {
             if !signature.is_empty() {
                 *found = true;
@@ -1425,7 +1433,7 @@ fn reject_block_signatures(app: &App, target: BuildTarget) -> Result<(), String>
     let mut f = |e: &crate::expr::Expr| visit(e, e.span, target.as_str(), &mut found);
     crate::lower::for_each_emit_body_ref(app, &mut f);
     if found {
-        return Err(format!("{}: optional/keyword block parameters are not supported; use Ruby instead", target.as_str()));
+        return Err(format!("{}: optional/keyword block parameters or a `def` inside a block are not supported; use Ruby instead", target.as_str()));
     }
     Ok(())
 }

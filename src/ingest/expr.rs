@@ -2510,15 +2510,13 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             return ingest_expr(&implicit.value(), file);
         }
         // `def`/`def self.X` at expression position — appears inside
-        // `Class.new(Parent) do ... end` blocks (anonymous-class
-        // idiom). Roundhouse's IR has no first-class "method def as
-        // expression" node; lift it to a no-op so the surrounding
-        // statement sequence still ingests. The behavioral fidelity
-        // gap (the resulting anonymous class won't carry the
-        // overridden methods) surfaces at runtime, not at ingest.
-        n if n.as_def_node().is_some() => {
-            ExprNode::Lit { value: Literal::Nil }
-        }
+        // `Class.new(Parent) do ... end` and `class_eval do … end`
+        // blocks (the anonymous-class idiom), where no class-body walk
+        // classifies it. Ruby defines it on the block's default definee
+        // when the statement runs; the IR keeps it as a `MethodDefExpr`,
+        // which the Ruby family writes verbatim and every other target
+        // refuses by name.
+        n if n.as_def_node().is_some() => method_def_expr(&n.as_def_node().unwrap(), file)?,
         // Backticks / `%x{…}` — a shell-out (`Kernel#\``). Not a
         // construct any target can run, and not worth pretending to
         // model; ledgered by name so it stops reading as the generic
@@ -2564,7 +2562,17 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_singleton_class_node().is_some() => {
             let sc = n.as_singleton_class_node().unwrap();
             match sc.body() {
-                Some(body) => return ingest_expr(&body, file),
+                Some(body) => {
+                    // Its body is ingested inline, so a `def` in it is
+                    // written `def self.x` (the same singleton method
+                    // when `self` is the class, as in `Class.new do`).
+                    // One this mapping cannot reach is refused.
+                    let marks = singleton_def_marks(&body, file);
+                    let saved = SINGLETON_DEFS.with(|m| std::mem::replace(&mut *m.borrow_mut(), marks));
+                    let out = ingest_expr(&body, file);
+                    SINGLETON_DEFS.with(|m| *m.borrow_mut() = saved);
+                    return out;
+                }
                 None => ExprNode::Lit { value: Literal::Nil },
             }
         }
@@ -3973,4 +3981,94 @@ fn merge_call(recv: Expr, arg: Expr, span: Span) -> Expr {
             parenthesized: true,
         },
     )
+}
+
+thread_local! {
+    /// The `def`s of the `class << self` body being ingested at
+    /// expression position, by (file, start offset): `true` for one that
+    /// is a direct statement of the body (written `def self.x`), `false`
+    /// for one nested in other statements (refused).
+    static SINGLETON_DEFS: std::cell::RefCell<Vec<(String, usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The marks [`SINGLETON_DEFS`] holds for a `class << self` body.
+fn singleton_def_marks(body: &Node<'_>, file: &str) -> Vec<(String, usize, bool)> {
+    use ruby_prism::Visit;
+    struct Nested<'a>(&'a mut Vec<(String, usize, bool)>, &'a str);
+    impl<'pr> Visit<'pr> for Nested<'_> {
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.0.push((self.1.to_string(), node.location().start_offset(), false));
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut marks = Vec::new();
+    let direct: Vec<Node<'_>> = match body.as_statements_node() {
+        Some(stmts) => stmts.body().iter().collect(),
+        None => Vec::new(),
+    };
+    for stmt in &direct {
+        match stmt.as_def_node() {
+            Some(def) => marks.push((file.to_string(), def.location().start_offset(), true)),
+            None => Nested(&mut marks, file).visit(stmt),
+        }
+    }
+    if direct.is_empty() {
+        Nested(&mut marks, file).visit(body);
+    }
+    marks
+}
+
+/// A `def` at expression position as a [`ExprNode::MethodDefExpr`]: its
+/// formals exactly as written (no keyword flattening: nothing rewrites
+/// the calls into an anonymous class to match), `def self.x` a class
+/// method. A formal the method IR cannot carry, or a `def` on another
+/// receiver, is refused by name.
+fn method_def_expr(def: &ruby_prism::DefNode<'_>, file: &str) -> IngestResult<ExprNode> {
+    let name = constant_id_str(&def.name()).to_string();
+    let start = def.location().start_offset();
+    let singleton = SINGLETON_DEFS.with(|m| {
+        m.borrow().iter().find(|(f, at, _)| f == file && *at == start).map(|(_, _, direct)| *direct)
+    });
+    let refuse = |why: &str| IngestError::Unsupported {
+        file: file.into(),
+        message: format!("`def {name}` inside a block {why}"),
+    };
+    if singleton == Some(false) {
+        return Err(refuse("nested in a `class << self` body's other statements is not modeled"));
+    }
+    if def.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+        return Err(refuse("on a receiver other than `self` is not modeled"));
+    }
+    if singleton == Some(true) && def.receiver().is_some() {
+        return Err(refuse("as `def self.x` within `class << self` is not modeled"));
+    }
+    // The body is its own scope: no enclosing `class << self` reaches it.
+    let saved = SINGLETON_DEFS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let ingested = super::library_class::ingest_library_method(def, &crate::ident::ClassId(Symbol::from("")), file);
+    SINGLETON_DEFS.with(|m| *m.borrow_mut() = saved);
+    let mut method = ingested?;
+    if let Some(formals) = &method.unsupported_formals {
+        return Err(refuse(&format!("with formals the method IR does not carry ({formals:?})")));
+    }
+    if singleton == Some(true) {
+        method.receiver = crate::dialect::MethodReceiver::Class;
+    }
+    method.enclosing_class = None;
+    for p in method.params.iter_mut() {
+        if p.from_keyword {
+            p.keyword = true;
+            p.from_keyword = false;
+        }
+        if p.from_kwrest {
+            p.keyword = true;
+            p.rest = true;
+            p.default = None;
+            p.from_kwrest = false;
+        }
+    }
+    Ok(ExprNode::MethodDefExpr { def: Box::new(method) })
 }

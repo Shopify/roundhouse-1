@@ -1435,6 +1435,10 @@ fn collect_class_refs(e: &Expr, out: &mut BTreeSet<String>) {
             collect_class_refs(body, out);
         }
         ExprNode::Lambda { body, .. } => collect_class_refs(body, out),
+        ExprNode::MethodDefExpr { def } => {
+            def.params.iter().filter_map(|p| p.default.as_ref()).for_each(|d| collect_class_refs(d, out));
+            collect_class_refs(&def.body, out);
+        }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 collect_class_refs(r, out);
@@ -1673,6 +1677,7 @@ fn rewrite_free(e: &Expr) -> Expr {
                 InterpPart::Expr { expr } => InterpPart::Expr { expr: rewrite_free(expr) },
             }).collect(),
         },
+        ExprNode::MethodDefExpr { def } => ExprNode::MethodDefExpr { def: def.clone() },
         ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
             params: params.clone(),
             block_param: block_param.clone(),
@@ -1937,6 +1942,7 @@ fn rewrite(e: &Expr, super_method: Option<&str>) -> Expr {
                 })
                 .collect(),
         },
+        ExprNode::MethodDefExpr { def } => ExprNode::MethodDefExpr { def: def.clone() },
         ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
             params: params.clone(),
             block_param: block_param.clone(),

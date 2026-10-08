@@ -7246,6 +7246,9 @@ impl Analyzer {
                 self.collect_send_sites(body, self_class, side, helpers, out);
             }
             ExprNode::Lambda { body, .. } => self.collect_send_sites(body, self_class, side, helpers, out),
+            // A `def` in a block defines on another class (`Class.new`'s):
+            // its implicit-self calls are not this class's sites.
+            ExprNode::MethodDefExpr { .. } => {}
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     self.collect_send_sites(r, self_class, side, helpers, out);

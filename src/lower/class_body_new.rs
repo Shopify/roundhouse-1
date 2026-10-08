@@ -316,6 +316,11 @@ fn plan_copies(
 
 /// Does this body construct with a bare `new`?
 fn constructs(expr: &Expr) -> bool {
+    // A `def` in a block (`Class.new do def self.build = new end`) has
+    // the other class as its `self`.
+    if matches!(&*expr.node, ExprNode::MethodDefExpr { .. }) {
+        return false;
+    }
     if let ExprNode::Send { recv: None, method, .. } = &*expr.node {
         if method.as_str() == "new" {
             return true;
@@ -358,6 +363,9 @@ fn subclassed_names(app: &App) -> crate::det::HashSet<String> {
 }
 
 fn rewrite(expr: &mut Expr, owner: &str) {
+    if matches!(&*expr.node, ExprNode::MethodDefExpr { .. }) {
+        return;
+    }
     expr.node.for_each_child_mut(&mut |c| rewrite(c, owner));
     let ExprNode::Send { recv: recv @ None, method, .. } = &mut *expr.node else { return };
     if method.as_str() != "new" {

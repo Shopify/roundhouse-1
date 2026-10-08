@@ -575,6 +575,7 @@ fn visit_subexprs(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             f(body); visit_subexprs(body, f);
         }
         ExprNode::Lambda { body, .. } => { f(body); visit_subexprs(body, f); }
+        ExprNode::MethodDefExpr { def } => { f(&def.body); visit_subexprs(&def.body, f); }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 f(r);

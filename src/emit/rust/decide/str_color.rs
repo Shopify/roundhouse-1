@@ -801,6 +801,9 @@ fn walk_children(e: &mut Expr, tail_expect: ParentExpect, ctx: &mut WalkCtx<'_>)
                 count += walk(en, ParentExpect::None, ctx);
             }
         }
+        ExprNode::MethodDefExpr { def } => {
+            count += walk(&mut def.body, ParentExpect::None, ctx);
+        }
         ExprNode::Lambda { body, .. } => {
             // Lambda body's color is the lambda's RESULT, not the
             // surrounding expression's value — block-return color

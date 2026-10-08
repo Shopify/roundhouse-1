@@ -2050,6 +2050,38 @@ impl<'a> BodyTyper<'a> {
                 }
             }
 
+            // `def` at expression position (inside `Class.new do … end`):
+            // a scope gate, so none of the enclosing locals or ivar facts
+            // reach in, and `self` is the anonymous class's instance,
+            // which nothing types. Params are Untyped except where a
+            // non-nil literal default types one. Its value is the name.
+            ExprNode::MethodDefExpr { def } => {
+                let mut inner = ctx.clone();
+                inner.local_bindings.clear();
+                inner.class_objects.clear();
+                inner.ivar_bindings.clear();
+                inner.self_ty = Some(Ty::Untyped);
+                inner.lexical_self = None;
+                inner.annotate_self_dispatch = false;
+                for p in def.params.iter_mut() {
+                    let ty = match p.default.as_mut() {
+                        Some(d) => {
+                            let ty = self.analyze_expr(d, &inner);
+                            block_default_ty(d, ty)
+                        }
+                        None => Ty::Untyped,
+                    };
+                    if !p.name.as_str().is_empty() {
+                        inner.local_bindings.insert(p.name.clone(), ty);
+                    }
+                }
+                if let Some(bp) = &def.block_param {
+                    inner.local_bindings.insert(bp.name.clone(), Ty::Untyped);
+                }
+                self.analyze_expr(&mut def.body, &inner);
+                Ty::Sym
+            }
+
             // `method(:name)` / `recv.method(:name)`. Unlike `&:sym`
             // (desugared to a real `Lambda` calling through
             // `block_ctx_for`'s elem-type binding), there is no body

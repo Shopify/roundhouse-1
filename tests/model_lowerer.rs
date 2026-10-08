@@ -1316,6 +1316,9 @@ fn collect_untyped_lowered(
         ExprNode::Lambda { body, .. } => {
             collect_untyped_lowered(body, &format!("{path}/lambda.body"), out)
         }
+        ExprNode::MethodDefExpr { def } => {
+            collect_untyped_lowered(&def.body, &format!("{path}/lambda.body"), out)
+        }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 collect_untyped_lowered(r, &format!("{path}/method_ref.recv"), out);

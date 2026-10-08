@@ -603,6 +603,7 @@ fn action_aggregate_equals_subtree_fold() {
                 fold(body, acc);
             }
             ExprNode::Lambda { body, .. } => fold(body, acc),
+            ExprNode::MethodDefExpr { def } => fold(&def.body, acc),
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
                     fold(r, acc);
@@ -993,6 +994,9 @@ fn collect_ivar_reads(expr: &roundhouse::expr::Expr, out: &mut Vec<(Symbol, Opti
         ExprNode::Lambda { body, .. } => {
             collect_ivar_reads(body, out);
         }
+        ExprNode::MethodDefExpr { def } => {
+            collect_ivar_reads(&def.body, out);
+        }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 collect_ivar_reads(r, out);
@@ -1197,6 +1201,9 @@ fn collect_bare_name_sends(
         }
         ExprNode::Lambda { body, .. } => {
             collect_bare_name_sends(body, out);
+        }
+        ExprNode::MethodDefExpr { def } => {
+            collect_bare_name_sends(&def.body, out);
         }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {

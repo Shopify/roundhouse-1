@@ -633,6 +633,15 @@ pub enum ExprNode {
         #[serde(default, skip_serializing_if = "BlockSignature::is_empty")]
         signature: BlockSignature,
     },
+    /// A `def` at expression position: inside a `Class.new do … end`,
+    /// `class_eval do … end` or other block a class-body walk does not
+    /// classify. Ruby defines the method on whatever `self`'s default
+    /// definee is when the statement runs (the anonymous class, for
+    /// `Class.new`); the value is the method's name as a Symbol. The
+    /// Ruby family writes it verbatim; every other target refuses it by
+    /// name. The params are exactly the source's (no keyword
+    /// flattening): nothing normalizes calls into an anonymous class.
+    MethodDefExpr { def: Box<crate::dialect::MethodDef> },
     /// A bound-method value: `method(:name)` (`recv: None`, dispatches
     /// on `self`), `self.method(:name)` / `recv.method(:name)`
     /// (`recv: Some(...)`). Surfaces almost exclusively in block-
@@ -854,6 +863,7 @@ impl ExprNode {
             ExprNode::BoolOp { .. } => "BoolOp",
             ExprNode::Let { .. } => "Let",
             ExprNode::Lambda { .. } => "Lambda",
+            ExprNode::MethodDefExpr { .. } => "MethodDefExpr",
             ExprNode::MethodRef { .. } => "MethodRef",
             ExprNode::Apply { .. } => "Apply",
             ExprNode::Send { .. } => "Send",
@@ -961,6 +971,14 @@ impl ExprNode {
                     f(d);
                 }
                 f(body);
+            }
+            ExprNode::MethodDefExpr { def } => {
+                for p in def.params.iter_mut() {
+                    if let Some(d) = p.default.as_mut() {
+                        f(d);
+                    }
+                }
+                f(&mut def.body);
             }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {
@@ -1175,6 +1193,14 @@ impl ExprNode {
                     f(d);
                 }
                 f(body);
+            }
+            ExprNode::MethodDefExpr { def } => {
+                for p in def.params.iter() {
+                    if let Some(d) = p.default.as_ref() {
+                        f(d);
+                    }
+                }
+                f(&def.body);
             }
             ExprNode::MethodRef { recv, .. } => {
                 if let Some(r) = recv {

@@ -385,6 +385,9 @@ fn contains_assign(e: &Expr) -> bool {
 fn emit_node(n: &ExprNode) -> String {
     match n {
         ExprNode::Lit { value } => emit_literal(value),
+        // Written as the source wrote it, inside its block; the
+        // surrounding statements (`protected`, …) carry its visibility.
+        ExprNode::MethodDefExpr { def } => crate::emit::ruby::emit_method(def).trim_end().to_string(),
         ExprNode::Var { name, .. } => emit_local_read(name.as_str()),
         ExprNode::Ivar { name } => format!("@{name}"),
         ExprNode::SelfRef => "self".to_string(),
