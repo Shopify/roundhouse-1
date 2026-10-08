@@ -561,11 +561,9 @@ fn model_alias_method_copy(call: &ruby_prism::CallNode<'_>, body: &[ModelBodyIte
 ///
 /// The `validates_*_of` family is the same declaration in Rails' older
 /// spelling — `validates_presence_of :a` IS `validates :a, presence:
-/// true` — so it lands here rather than growing a second rule table.
-/// BARE SYMBOLS ONLY: an options hash (`allow_nil:`, `if:`, `on:`)
-/// narrows or reshapes the check, and the call falls through to the
-/// unsupported-DSL ledger rather than being flattened into an
-/// unconditional one.
+/// true` — so both are read by `ingest::validates`, which answers an
+/// explicit `ValidationRule::Unsupported` for any validator or option it
+/// does not model rather than dropping it.
 pub(super) fn ingest_model_body_items(
     stmt: &Node<'_>,
     owner: &ClassId,
@@ -573,7 +571,6 @@ pub(super) fn ingest_model_body_items(
     leading_comments: Vec<Comment>,
     class_attr_defaults: Option<&mut IndexMap<Symbol, Expr>>,
 ) -> IngestResult<Vec<ModelBodyItem>> {
-    use crate::dialect::{Validation, ValidationRule};
     let span = Span {
         file: super::sources::file_id(file),
         start: stmt.location().start_offset() as u32,
@@ -582,34 +579,7 @@ pub(super) fn ingest_model_body_items(
     if let Some(call) = stmt.as_call_node() {
         if call.receiver().is_none() {
             let name = constant_id_str(&call.name()).to_string();
-            let rule = match name.as_str() {
-                "validates_presence_of" => Some(ValidationRule::Presence),
-                "validates_absence_of" => Some(ValidationRule::Absence),
-                _ => None,
-            };
-            let parsed: Vec<Validation> = if name == "validates" {
-                parse_validates(&call)
-            } else if let Some(rule) = rule.clone() {
-                let args: Vec<Node<'_>> = call
-                    .arguments()
-                    .map(|a| a.arguments().iter().collect())
-                    .unwrap_or_default();
-                let attrs: Vec<Symbol> = args
-                    .iter()
-                    .filter_map(|a| symbol_value(a).map(|s| Symbol::from(s.as_str())))
-                    .collect();
-                if attrs.len() == args.len() && !attrs.is_empty() {
-                    attrs
-                        .into_iter()
-                        .map(|attribute| Validation { attribute, rules: vec![rule.clone()] })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-            if parsed.len() > 1 || (rule.is_some() && !parsed.is_empty()) {
+            if let Some(parsed) = super::validates::parse_validation_call(&call, file)? {
                 return Ok(parsed
                     .into_iter()
                     .enumerate()
@@ -1065,42 +1035,17 @@ pub(super) fn ingest_model_body_item(
                 });
             }
         }
-        if method == "validates" {
-            let mut parsed = parse_validates(&call);
-            if let Some(first) = parsed.first().cloned() {
-                // `validates :attr` with multiple rules is one call; we
-                // only see one Validation per call today. If the call
-                // expanded to multiple (the multi-attribute form), they
-                // share leading comments only on the first.
-                let mut items = Vec::with_capacity(parsed.len());
-                items.push(ModelBodyItem::Validation {
+        if let Some(parsed) = super::validates::parse_validation_call(&call, file)? {
+            // The caller expects ONE item; `ingest_model_body_items`
+            // answers every one of them and is the model walk's entry.
+            if let Some(first) = parsed.into_iter().next() {
+                return Ok(ModelBodyItem::Validation {
                     validation: first,
                     leading_comments,
                     leading_blank_line: false,
                     span,
                 });
-                for v in parsed.drain(1..) {
-                    items.push(ModelBodyItem::Validation {
-                        validation: v,
-                        leading_comments: Vec::new(),
-                        leading_blank_line: false,
-                        span,
-                    });
-                }
-                // Degenerate: the caller expects ONE item. If parse_validates
-                // returned multiple, merge-ingest is a bit lossy — return
-                // the first and drop the tail (no real fixture triggers
-                // this yet; multi-attr validates is usually
-                // `validates :a, :b, rule: ...` and our current shape is
-                // one-Validation-per-attribute).
-                return Ok(items.into_iter().next().unwrap());
             }
-            // No validation extracted — treat as Unknown so we don't lose it.
-            return Ok(ModelBodyItem::Unknown {
-                expr: ingest_expr(stmt, file)?,
-                leading_comments,
-                leading_blank_line: false,
-            });
         }
         if method == "scope" {
             if let Some(scope) = parse_scope(&call, file)? {
@@ -2525,114 +2470,6 @@ fn spelled_lambda_parts<'a>(
     }
     let block = call.block()?.as_block_node()?;
     Some((block.parameters(), block.body()))
-}
-
-fn parse_validates(call: &ruby_prism::CallNode<'_>) -> Vec<crate::dialect::Validation> {
-    use crate::dialect::{Validation, ValidationRule};
-    let Some(args) = call.arguments() else { return vec![] };
-    let all_args = args.arguments();
-
-    let mut attrs: Vec<Symbol> = Vec::new();
-    let mut rules: Vec<ValidationRule> = Vec::new();
-    let mut allow_blank = false;
-
-    for arg in all_args.iter() {
-        if let Some(sym) = symbol_value(&arg) {
-            attrs.push(Symbol::from(sym.as_str()));
-        } else if let Some(kh) = arg.as_keyword_hash_node() {
-            for el in kh.elements().iter() {
-                let Some(assoc) = el.as_assoc_node() else { continue };
-                let Some(key) = symbol_value(&assoc.key()) else { continue };
-                let value = assoc.value();
-                if key.as_str() == "allow_blank" {
-                    allow_blank = super::util::bool_value(&value).unwrap_or(false);
-                } else if let Some(rule) = validation_rule_from_kv(&key, &value) {
-                    rules.push(rule);
-                }
-            }
-        }
-    }
-
-    // `presence: true, allow_blank: true` is a dead check: presence
-    // fails only when the value is blank, and allow_blank skips every
-    // validator on blank values — so it can never fire (Rails runs
-    // validations BEFORE before_save, so e.g. lobsters' `validates
-    // :session_token, allow_blank: true, presence: true` relies on
-    // this: the token is generated in a before_save). Dropping it here
-    // fixes both lowering paths at once. The remaining parsed rule
-    // kinds are blank-safe as emitted (MaxLength trivially passes on
-    // blank; Absence wants blank); when MinLength/Format/Uniqueness
-    // gain allow_blank fixtures they'll need a skip-when-blank guard
-    // on the check instead of a drop.
-    if allow_blank {
-        rules.retain(|r| !matches!(r, ValidationRule::Presence));
-    }
-
-    let mut out = Vec::new();
-    for attr in attrs {
-        out.push(Validation { attribute: attr, rules: rules.clone() });
-    }
-    out
-}
-
-fn validation_rule_from_kv(
-    key: &str,
-    value: &ruby_prism::Node<'_>,
-) -> Option<crate::dialect::ValidationRule> {
-    use super::util::bool_value;
-    use crate::dialect::ValidationRule;
-    match key {
-        "presence" => bool_value(value).filter(|b| *b).map(|_| ValidationRule::Presence),
-        "absence" => bool_value(value).filter(|b| *b).map(|_| ValidationRule::Absence),
-        "length" => parse_length_rule(value),
-        _ => None,
-    }
-}
-
-/// `length: { minimum: N, maximum: M }`. Either bound may be absent;
-/// the hash-value shape is the only one we accept today. The shorthand
-/// `length: 5` (exact length) isn't in any fixture yet and drops.
-fn parse_length_rule(value: &ruby_prism::Node<'_>) -> Option<crate::dialect::ValidationRule> {
-    use super::util::integer_value;
-    use crate::dialect::ValidationRule;
-    let hash = value.as_hash_node().or_else(|| {
-        // Rails idiomatically uses `{ ... }`, but a bare keyword-args
-        // shape (`length: { … }` parses as HashNode inside the kwargs,
-        // not KeywordHashNode). Keep KeywordHashNode as a fallback for
-        // defensive parsing.
-        None
-    });
-    let elements = if let Some(h) = hash {
-        h.elements()
-    } else if let Some(kh) = value.as_keyword_hash_node() {
-        kh.elements()
-    } else {
-        return None;
-    };
-
-    let mut min: Option<u32> = None;
-    let mut max: Option<u32> = None;
-    for el in elements.iter() {
-        let Some(assoc) = el.as_assoc_node() else { continue };
-        let Some(key) = symbol_value(&assoc.key()) else { continue };
-        let Some(n) = integer_value(&assoc.value()) else { continue };
-        if n < 0 {
-            continue;
-        }
-        match key.as_str() {
-            "minimum" => min = Some(n as u32),
-            "maximum" => max = Some(n as u32),
-            // `is:` (exact), `in:` (range), `within:` land when a
-            // fixture demands them.
-            _ => {}
-        }
-    }
-
-    if min.is_none() && max.is_none() {
-        None
-    } else {
-        Some(ValidationRule::Length { min, max, message: None })
-    }
 }
 
 fn parse_association(

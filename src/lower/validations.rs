@@ -165,29 +165,47 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
                 out.push(Check::MaxLength { n: *n, message: message.clone() });
             }
         }
-        ValidationRule::Format { pattern } => {
+        // The table has one shape per check, so only the plain forms
+        // map; the inline lowering (`model_to_library::validations`)
+        // carries every rule.
+        ValidationRule::Format { pattern, flags, without: false } if flags.is_empty() => {
             out.push(Check::Format { pattern: pattern.clone() });
         }
-        ValidationRule::Numericality { only_integer, gt, lt } => {
+        ValidationRule::Format { .. } => {}
+        ValidationRule::Numericality { only_integer, checks } => {
             if *only_integer {
                 out.push(Check::OnlyInteger);
             }
-            if let Some(n) = gt {
-                out.push(Check::GreaterThan { threshold: *n });
-            }
-            if let Some(n) = lt {
-                out.push(Check::LessThan { threshold: *n });
-            }
-        }
-        ValidationRule::Inclusion { values } => {
-            let vs: Vec<InclusionValue> = values
-                .iter()
-                .filter_map(lit_to_inclusion_value)
-                .collect();
-            if !vs.is_empty() {
-                out.push(Check::Inclusion { values: vs });
+            for check in checks {
+                let threshold = match &check.bound {
+                    Some(crate::expr::Literal::Int { value }) => *value as f64,
+                    Some(crate::expr::Literal::Float { value }) => *value,
+                    _ => continue,
+                };
+                match check.op {
+                    crate::dialect::NumericOp::GreaterThan => out.push(Check::GreaterThan { threshold }),
+                    crate::dialect::NumericOp::LessThan => out.push(Check::LessThan { threshold }),
+                    _ => {}
+                }
             }
         }
+        ValidationRule::Inclusion { list, exclusion: false, .. } => {
+            if let crate::expr::ExprNode::Array { elements, .. } = &*list.node {
+                let vs: Vec<InclusionValue> = elements
+                    .iter()
+                    .filter_map(|e| match &*e.node {
+                        crate::expr::ExprNode::Lit { value } => lit_to_inclusion_value(value),
+                        _ => None,
+                    })
+                    .collect();
+                if !vs.is_empty() {
+                    out.push(Check::Inclusion { values: vs });
+                }
+            }
+        }
+        ValidationRule::Inclusion { .. } => {}
+        ValidationRule::Guarded { rule, .. } => expand_rule(rule, out),
+        ValidationRule::Unsupported { .. } => {}
         ValidationRule::Uniqueness { scope, case_sensitive } => {
             out.push(Check::Uniqueness {
                 scope: scope.clone(),

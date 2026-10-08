@@ -510,9 +510,35 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
-    Format { pattern: String },
-    Numericality { only_integer: bool, gt: Option<f64>, lt: Option<f64> },
-    Inclusion { values: Vec<Literal> },
+    /// `format: { with: /re/ }` (`without: true` for `without: /re/`):
+    /// Rails matches `value.to_s`, so nil reads as "".
+    Format {
+        pattern: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        flags: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        without: bool,
+    },
+    /// `numericality: { ... }`. `checks` are in ActiveModel's
+    /// evaluation order (`NumericalityValidator::RESERVED_OPTIONS`), not
+    /// source order: every failing check adds its own error.
+    Numericality {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        only_integer: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<NumericCheck>,
+    },
+    /// `inclusion: { in: list }` / `exclusion: { in: list }`. `list` is
+    /// the expression as written (an Array or Range literal, a
+    /// constant, ...), asked `include?` per value; `cover` marks a Range
+    /// literal over numbers, which Rails asks `cover?`.
+    Inclusion {
+        list: Expr,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exclusion: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cover: bool,
+    },
     Custom {
         method: Symbol,
         /// `validate :m, if: :pred` / `unless: :pred` — the instance
@@ -534,6 +560,98 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unless_method: Option<Symbol>,
     },
+    /// A rule under the options every `validates` validator takes:
+    /// `allow_nil:` / `allow_blank:` skip it for such a value, `message:`
+    /// replaces its error text, and Symbol `if:` / `unless:` guard it.
+    /// The `validates`-level options merge under each validator's own,
+    /// as Rails merges them.
+    Guarded { rule: Box<ValidationRule>, options: RuleOptions },
+    /// A validator or option ingest does not model (`uniqueness:`,
+    /// `on:`, a lambda condition, ...). It is never lowered as a weaker
+    /// check: `roundhouse check` reports it as an error at the
+    /// `validates` call.
+    Unsupported { construct: String, detail: String },
+}
+
+/// One `numericality:` comparison or parity option.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NumericCheck {
+    pub op: NumericOp,
+    /// The bound as written (an Integer or Float literal); `None` for
+    /// `odd` / `even`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<Literal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NumericOp {
+    GreaterThan,
+    GreaterThanOrEqualTo,
+    EqualTo,
+    LessThan,
+    LessThanOrEqualTo,
+    OtherThan,
+    Odd,
+    Even,
+}
+
+impl NumericOp {
+    /// The option key, which is also the error type.
+    pub fn key(self) -> &'static str {
+        match self {
+            NumericOp::GreaterThan => "greater_than",
+            NumericOp::GreaterThanOrEqualTo => "greater_than_or_equal_to",
+            NumericOp::EqualTo => "equal_to",
+            NumericOp::LessThan => "less_than",
+            NumericOp::LessThanOrEqualTo => "less_than_or_equal_to",
+            NumericOp::OtherThan => "other_than",
+            NumericOp::Odd => "odd",
+            NumericOp::Even => "even",
+        }
+    }
+
+    /// ActiveModel's option order (`RESERVED_OPTIONS`).
+    pub const ORDER: [NumericOp; 8] = [
+        NumericOp::GreaterThan,
+        NumericOp::GreaterThanOrEqualTo,
+        NumericOp::EqualTo,
+        NumericOp::LessThan,
+        NumericOp::LessThanOrEqualTo,
+        NumericOp::OtherThan,
+        NumericOp::Odd,
+        NumericOp::Even,
+    ];
+
+    pub fn from_key(key: &str) -> Option<NumericOp> {
+        NumericOp::ORDER.into_iter().find(|op| op.key() == key)
+    }
+}
+
+/// The per-validator options of [`ValidationRule::Guarded`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RuleOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_nil: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_blank: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<RuleMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_method: Option<Symbol>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_method: Option<Symbol>,
+}
+
+/// A validator's `message:`: a String (I18n-interpolated with
+/// `%{attribute}`, `%{model}`, `%{value}` and, for a numeric bound,
+/// `%{count}`), or a callable (a lambda constant or literal) Rails calls
+/// as `message.call(record, model:, attribute:, value:[, count:])`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuleMessage {
+    Text { text: String },
+    Call { callable: Expr },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

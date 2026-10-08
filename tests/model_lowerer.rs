@@ -1199,10 +1199,19 @@ end
     let validations: Vec<&roundhouse::Validation> = model.validations().collect();
 
     // presence + allow_blank can never fire (presence fails only on
-    // blank; allow_blank skips blank) — dropped. Length survives.
+    // blank; allow_blank skips blank) — dropped. Length survives, still
+    // guarded by allow_blank (a 100-space value is blank and skips the
+    // maximum check, as in Rails).
     let st = validations.iter().find(|v| v.attribute.as_str() == "session_token").unwrap();
     assert!(!st.rules.iter().any(|r| matches!(r, ValidationRule::Presence)), "{st:?}");
-    assert!(st.rules.iter().any(|r| matches!(r, ValidationRule::Length { .. })), "{st:?}");
+    assert!(
+        st.rules.iter().any(|r| matches!(
+            r,
+            ValidationRule::Guarded { rule, options }
+                if matches!(**rule, ValidationRule::Length { max: Some(75), .. }) && options.allow_blank
+        )),
+        "{st:?}"
+    );
 
     // presence without allow_blank is untouched.
     let email = validations.iter().find(|v| v.attribute.as_str() == "email").unwrap();
