@@ -125,9 +125,106 @@ fn indexed_text(source: &SourceFile) -> std::borrow::Cow<'_, str> {
         crate::erb::stdlib_code_projection(&source.text)
             .map(std::borrow::Cow::Owned)
             .unwrap_or_else(|| std::borrow::Cow::Owned(" ".repeat(source.text.len())))
+    } else if let Some(projected) = dynamic_mixin_projection(&source.text) {
+        std::borrow::Cow::Owned(projected)
     } else {
         std::borrow::Cow::Borrowed(&source.text)
     }
+}
+
+/// The mixin methods Rubydex records as ancestors (`ruby_indexer.rs`
+/// `handle_mixin`), each with a same-length name it does not treat
+/// specially.
+const MIXIN_RENAMES: [(&str, &str); 3] = [("include", "includ_"), ("extend", "exten_"), ("prepend", "prepen_")];
+
+/// `text` with each receiverless `include`/`extend`/`prepend` whose
+/// arguments are all dynamic (`include(Module.new do … end)`, `extend
+/// Builder.module_for(X)`) renamed to a plain call of the same length,
+/// or `None` when the file has none.
+///
+/// Rubydex's `handle_mixin` keeps the constant arguments of a mixin call
+/// and skips every other argument (a `DynamicAncestor` diagnostic), its
+/// subtree and a `do` block bound to the call unvisited, so no constant
+/// written inside had a source answer: Core's StoreLocalization::
+/// TranslatableContent reads `Verdict::Flag`, `LocalizableContentTypes`
+/// and `NoMethodError` in the `define_method` bodies of an `include(
+/// Module.new do … end)`. Renamed, Rubydex indexes the call as any other,
+/// and each constant inside resolves from the lexical scope around it, as
+/// Ruby's does (a block keeps its cref). A dynamic mixin records no
+/// ancestor either way. A call with a constant argument keeps its name,
+/// and with it the ancestor that argument records.
+fn dynamic_mixin_projection(text: &str) -> Option<String> {
+    if !may_have_dynamic_mixin(text) {
+        return None;
+    }
+    struct Renames {
+        at: Vec<(usize, &'static str)>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Renames {
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            let receiverless = call.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
+            let name = call.name();
+            let renamed = MIXIN_RENAMES.iter().find(|(from, _)| name.as_slice() == from.as_bytes()).map(|(_, to)| *to);
+            if let (true, Some(to), Some(arguments), Some(message)) =
+                (receiverless, renamed, call.arguments(), call.message_loc())
+            {
+                let dynamic = arguments.arguments().iter().all(|arg| {
+                    arg.as_constant_read_node().is_none()
+                        && arg.as_constant_path_node().is_none()
+                        && arg.as_self_node().is_none()
+                });
+                if dynamic && message.as_slice() == name.as_slice() {
+                    self.at.push((message.start_offset(), to));
+                }
+            }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let result = ruby_prism::parse(text.as_bytes());
+    let mut renames = Renames { at: Vec::new() };
+    ruby_prism::Visit::visit(&mut renames, &result.node());
+    if renames.at.is_empty() {
+        return None;
+    }
+    let mut projected = text.to_string();
+    for (start, to) in renames.at {
+        projected.replace_range(start..start + to.len(), to);
+    }
+    Some(projected)
+}
+
+/// Whether some `include`/`extend`/`prepend` in `text` is followed by an
+/// argument that is not a bare constant path or `self`: the cheap filter
+/// before [`dynamic_mixin_projection`] parses the file.
+fn may_have_dynamic_mixin(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    MIXIN_RENAMES.iter().any(|(word, _)| {
+        text.match_indices(word).any(|(at, _)| {
+            let before = at.checked_sub(1).map(|i| bytes[i]);
+            if before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'@' || b == b'$') {
+                return false;
+            }
+            let rest = &text[at + word.len()..];
+            // `include(` may break the line before its argument.
+            let argument = if let Some(inner) = rest.strip_prefix('(') {
+                inner.trim_start()
+            } else if rest.starts_with(' ') {
+                rest.trim_start_matches(' ')
+            } else {
+                return false;
+            };
+            let Some(c) = argument.chars().next() else { return false };
+            if c == '\n' || c == '#' || argument.starts_with("self") && !argument[4..].starts_with(['.', '_']) {
+                return false;
+            }
+            if !(c.is_ascii_uppercase() || argument.starts_with("::")) {
+                return true;
+            }
+            // A constant path, then a call on it (`Module.new`).
+            let after = argument.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+            after.starts_with(['.', '(', '{', '['])
+        })
+    })
 }
 
 fn source_fingerprint(sources: &[SourceFile]) -> u64 {
@@ -1375,6 +1472,22 @@ fn delegator_const_missing(graph: &Graph, name_id: NameId, depth: u8) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dynamic_mixin_call_is_indexed_as_a_plain_call() {
+        let text = "class Probe\n  include Comparable\n  def self.multi\n    include(\n      Module.new { V }\n    )\n  end\n  extend self\n  def self.build(fields)\n    include(Module.new do\n      def z = Probe.name\n    end)\n    include Module.new do\n      X\n    end\n    extend(Kernel.then { Widgetable })\n    prepend Mixins.for(Y)\n    include Comparable, Module.new { Z }\n    other.include(Module.new { W })\n    [1].include?(1)\n  end\nend\n";
+        let projected = dynamic_mixin_projection(text).expect("projected");
+        assert_eq!(projected.len(), text.len());
+        assert_eq!(
+            projected,
+            text.replace("    include(Module", "    includ_(Module")
+                .replace("    include(\n", "    includ_(\n")
+                .replace("include Module.new do", "includ_ Module.new do")
+                .replace("extend(Kernel", "exten_(Kernel")
+                .replace("prepend Mixins", "prepen_ Mixins")
+        );
+        assert!(dynamic_mixin_projection("class A\n  include B\n  extend C::D\n  extend self\nend\n").is_none());
+    }
 
     #[test]
     fn prepared_answers_require_the_same_paths_text_and_file_order() {
