@@ -127,6 +127,13 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // The analyzer resolves model include identities against the registry.
     // Collect that edge's refusal; declaration-marker arguments are metadata
     // handled by the shared model lowerer, rather than executable reads.
+    //
+    // A Concern's `included do include M end` is spliced into every
+    // includer, and each copy refuses `M` naming its includer at the
+    // Concern's one site (Core's MainShardTable, 44 models): one row per
+    // site, naming the first includer and counting the rest, as the
+    // model-DSL rows do (`diagnose_unclaimed_model_dsl`).
+    let mut include_rows: Vec<IncludeRefusalRow> = Vec::new();
     for model in &app.models {
         for item in &model.body {
             if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
@@ -145,8 +152,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
                 }
                 refusals(expr, &mut out);
                 if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
-                    if matches!(construct.as_str(), "include" | "gem_requires_rails")
-                        || construct.as_str() == crate::view_helpers::REFUSAL_CONSTRUCT
+                    if matches!(construct.as_str(), "include" | "gem_requires_rails") {
+                        include_rows.push(IncludeRefusalRow::new(expr.span, construct, detail, &model.name));
+                    } else if construct.as_str() == crate::view_helpers::REFUSAL_CONSTRUCT
                         || construct.as_str() == crate::ingest::DEFINE_METHOD_REFUSAL
                     {
                         out.push(Diagnostic::unsupported(expr.span, None, construct.as_str(), detail.clone()));
@@ -155,6 +163,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
             }
         }
     }
+    out.extend(IncludeRefusalRow::collapse(include_rows));
     // A filter's return value is Rails' to discard (`around_action
     // :switch_locale` → `I18n.with_locale(locale, &action)`): nothing
     // escapes from its tail, so an `untyped` there is not a gradual
@@ -218,6 +227,64 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     let mut seen = crate::det::HashSet::default();
     out.retain(|d| seen.insert((d.span.file, d.span.start, d.code(), d.message.clone())));
     (out, coverage)
+}
+
+/// A model's refused `include` (`include` unresolved, or
+/// `gem_requires_rails`), before the rows at one site are collapsed.
+struct IncludeRefusalRow {
+    span: crate::span::Span,
+    construct: Symbol,
+    detail: String,
+    /// The detail past `"{includer} includes "`, the same for every
+    /// includer of the statement; the whole detail when it does not name
+    /// the includer first.
+    shared: Option<(String, String)>,
+}
+
+impl IncludeRefusalRow {
+    fn new(span: crate::span::Span, construct: &Symbol, detail: &str, includer: &ClassId) -> Self {
+        let prefix = format!("{} includes ", includer.0);
+        let shared = detail
+            .strip_prefix(prefix.as_str())
+            .map(|rest| (includer.0.as_str().to_string(), rest.to_string()));
+        IncludeRefusalRow { span, construct: construct.clone(), detail: detail.to_string(), shared }
+    }
+
+    /// One row per (site, construct, refusal), in first-seen order, the
+    /// first includer's, with `(and N more includers)` after its name.
+    /// A row without a source position stays one per includer.
+    fn collapse(rows: Vec<IncludeRefusalRow>) -> Vec<Diagnostic> {
+        let mut first: std::collections::BTreeMap<(u32, u32, u32, Symbol, String), usize> = Default::default();
+        let mut kept: Vec<(IncludeRefusalRow, usize)> = Vec::new();
+        for row in rows {
+            let key = (
+                row.span.file.0,
+                row.span.start,
+                row.span.end,
+                row.construct.clone(),
+                row.shared.as_ref().map_or_else(|| row.detail.clone(), |(_, rest)| rest.clone()),
+            );
+            match first.get(&key) {
+                Some(&at) if !row.span.is_synthetic() => kept[at].1 += 1,
+                _ => {
+                    first.insert(key, kept.len());
+                    kept.push((row, 0));
+                }
+            }
+        }
+        kept.into_iter()
+            .map(|(row, others)| {
+                let detail = match (&row.shared, others) {
+                    (Some((includer, rest)), n) if n > 0 => {
+                        let more = if n == 1 { "1 more includer".to_string() } else { format!("{n} more includers") };
+                        format!("{includer} (and {more}) includes {rest}")
+                    }
+                    _ => row.detail,
+                };
+                Diagnostic::unsupported(row.span, None, row.construct.as_str(), detail)
+            })
+            .collect()
+    }
 }
 
 /// Whether a diagnostic stamped on a send already accounts for its
