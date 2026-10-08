@@ -108,7 +108,7 @@ fn a_gem_source_body_runs_in_source_order_like_the_gem() {
     }
     let run = app.run_ruby(OBSERVE);
     let currencies = std::fs::read_to_string(run.emitted.join("app/models/orbis/currencies.rb")).expect("emitted currencies.rb");
-    let def = currencies.find("def self.numeric_code_for").expect("numeric_code_for emitted");
+    let def = currencies.find("def numeric_code_for").expect("numeric_code_for emitted (an `extend self` def, written as in the source)");
     let all = currencies.find("ALL = ").expect("ALL emitted");
     let sort = currencies.find("ALL.sort_by!").expect("ALL.sort_by! emitted");
     let freeze = currencies.find("ALL.freeze").expect("ALL.freeze emitted");
