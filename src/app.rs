@@ -44,6 +44,17 @@ pub struct HelperConnection {
 /// call sites typed the other's params.
 pub type ParamKey = (ClassId, Symbol, crate::dialect::MethodReceiver);
 
+/// One include's carried `class_attribute`s (`App::included_class_attributes`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IncludedClassAttributes {
+    /// The includer's own include the Concern hangs off.
+    pub after: ClassId,
+    /// The generated defs, by receiver and name.
+    pub methods: Vec<(crate::dialect::MethodReceiver, Symbol)>,
+    /// The seeds (`@__class_attr_x = default`, `self.x = []`), by span.
+    pub seeds: Vec<crate::span::Span>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct App {
     pub schema_version: u32,
@@ -650,6 +661,18 @@ pub struct App {
     /// the same order against the include hooks and the class's own body.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub included_block_statements: HashMap<ClassId, Vec<(ClassId, crate::expr::Expr)>>,
+    /// The `class_attribute`s a Concern's `included do` gives a plain
+    /// includer, keyed by the includer, each group with the direct include
+    /// it runs after, as `included_block_statements` has it
+    /// (`concern_accessors::splice_into_library_includers`). The generated
+    /// defs stay in `LibraryClass::methods` and the seeds in
+    /// `class_ivar_initializers`, where every pass reads them; this names
+    /// them, so the Ruby emitter writes them right after that `include`,
+    /// where Ruby runs the block. A class-body macro below the include
+    /// then writes over the seeded default, as Core's `retries 3` writes
+    /// BackgroundQueue::Retry's `retry_limit`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub included_class_attributes: HashMap<ClassId, Vec<IncludedClassAttributes>>,
     /// Renderer view → the partial views it renders (`articles/show` →
     /// [`articles/_form`]), harvested from actual render sites as views
     /// are analyzed. The other half of the render graph that
@@ -1369,6 +1392,7 @@ impl App {
             current_attribute_classes: Vec::new(),
             carried_included_blocks: Vec::new(),
             included_block_statements: HashMap::default(),
+            included_class_attributes: HashMap::default(),
             render_edges: HashMap::default(),
             view_feeders: HashMap::default(),
             controller_resolutions: HashMap::default(),
