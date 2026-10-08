@@ -3968,6 +3968,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ("runtime/spinel/active_support_i18n.rb", "runtime/active_support_i18n.rb"),
             ("runtime/spinel/active_support/locale/en.yml", "runtime/active_support/locale/en.yml"),
             ("runtime/spinel/active_support/locale/en.rb", "runtime/active_support/locale/en.rb"),
+            // I18n::Railtie (active_support/i18n_railtie.rb): `config.i18n`,
+            // the engines' and the app's config/locales and a gem railtie's
+            // load path applied to I18n at boot.
+            ("runtime/spinel/active_support_i18n_railtie.rb", "runtime/active_support_i18n_railtie.rb"),
+            // Active Model's, Active Record's and Action View's `:i18n` hooks
+            // with their English locales, verbatim.
+            ("runtime/spinel/rails_framework_locales.rb", "runtime/rails_framework_locales.rb"),
+            ("runtime/spinel/active_model/locale/en.yml", "runtime/active_model/locale/en.yml"),
+            ("runtime/spinel/active_record/locale/en.yml", "runtime/active_record/locale/en.yml"),
+            ("runtime/spinel/action_view/locale/en.yml", "runtime/action_view/locale/en.yml"),
         ] {
             let text = crate::runtime_files::read_to_string(from).map_err(|e| format!("read {from}: {e}"))?;
             files.push((to.into(), text));
@@ -3978,6 +3988,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
              # ported (runtime/active_support_i18n.rb). runtime/gem_facades.rb puts\n\
              # this directory first on the load path.\n\
              require_relative \"../../active_support_i18n\"\n"
+                .into(),
+        ));
+        files.push((
+            "runtime/features/active_support/i18n_railtie.rb".into(),
+            "# `require \"active_support/i18n_railtie\"` on this tree: I18n::Railtie,\n\
+             # ported (runtime/active_support_i18n_railtie.rb). runtime/gem_facades.rb\n\
+             # puts this directory first on the load path.\n\
+             require_relative \"../../active_support_i18n_railtie\"\n"
                 .into(),
         ));
     }
@@ -4003,6 +4021,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read active_support_json runtime: {e}"))?;
         files.push(("runtime/active_support_json.rb".into(), text));
     }
+    let i18n_config = i18n_config_block(app, carries_i18n);
     // A native gem's `require "active_support/inflector"` (dry-core 1.1.0's
     // inflector backend probe, inflector.rb:9) answers from the port, as
     // the loaded activesupport answers it under Rails; the port is
@@ -4106,6 +4125,30 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 )
                 .collect();
             content.insert_str(at, &ports);
+            // `require "rails"` defines Rails::Railtie and Rails::Engine, and
+            // with active_support/railtie I18n::Railtie, before
+            // Bundler.require; the framework railties (active_record/railtie,
+            // action_controller/railtie) register Active Model's, Active
+            // Record's and Action View's locales. So a gem's `require
+            // "x/railtie" if defined?(Rails::Railtie)` (phonelib 0.10.27,
+            // statsd-instrument 3.11.1) defines its railtie as it loads.
+            let configuration = "require_relative \"rails_configuration\"\n";
+            let at = content.find(configuration).ok_or("PostgreSQL bootstrap: missing rails_configuration require in gem_facades.rb")? + configuration.len();
+            let mut railties = String::from(
+                "# Rails::Railtie and Rails::Engine, which `require \"rails\"` defines\n\
+                 # before Bundler.require: for the gems' railties and the app's own\n\
+                 # railties and engines, which app/models.rb loads.\n\
+                 require_relative \"rails_railtie\"\n\
+                 require_relative \"rails_engine\"\n",
+            );
+            if carries_i18n {
+                railties.push_str(
+                    "# I18n::Railtie (`require \"rails\"`) and the framework railties' locales.\n\
+                     require_relative \"active_support_i18n_railtie\"\n\
+                     require_relative \"rails_framework_locales\"\n",
+                );
+            }
+            content.insert_str(at, &railties);
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -4147,11 +4190,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # Active Record's railtie: LogSubscriber.backtrace_cleaner and its\n\
                  # `active_record.backtrace_cleaner` load hook, registered ahead of\n\
                  # every config/initializers file.\n\
-                 require_relative \"runtime/active_record_log_subscriber\"\n\
-                 # Rails::Railtie and Rails::Engine, for the gems' railties and the\n\
-                 # app's own railties and engines, which app/models.rb loads.\n\
-                 require_relative \"runtime/rails_railtie\"\n\
-                 require_relative \"runtime/rails_engine\"\n",
+                 require_relative \"runtime/active_record_log_subscriber\"\n",
             );
             // The app's `inflect.*` declarations (config/initializers), which
             // Rails runs after the gems load and before the app's code, in
@@ -4185,6 +4224,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = at + environment.len();
             content.insert_str(at, &deprecation_behavior);
             let at = at + deprecation_behavior.len();
+            content.insert_str(at, &i18n_config);
+            let at = at + i18n_config.len();
             content.insert_str(
                 at,
                 "# Application#initialize!: the railties' and engines' initializers, in\n\
@@ -4863,6 +4904,64 @@ fn deprecation_behavior_block(app: &App) -> String {
          Rails::Application.apply_deprecation_behavior({})\n",
         args.join(", ")
     )
+}
+
+/// The `config.i18n` keys the app may write that I18n::Railtie's
+/// `initialize_i18n` applies (activesupport 8.2.0.alpha i18n_railtie.rb:
+/// `fallbacks`, `enforce_available_locales`, `load_path`,
+/// `raise_on_missing_translations`, any other as `I18n.<key>=`),
+/// lifted onto the Application reopen as `i18n_<key>`
+/// (`ingest::app::APPLIED_FRAMEWORK_CONFIG_KEYS`).
+pub(crate) const I18N_CONFIG_KEYS: &[&str] = &[
+    "available_locales",
+    "default_locale",
+    "enforce_available_locales",
+    "fallbacks",
+    "load_path",
+    "locale",
+    "raise_on_missing_translations",
+];
+
+/// The app's `config.i18n.<key> = v` writes (application.rb, its
+/// initializers), into I18n::Railtie's `config.i18n`
+/// (runtime/active_support_i18n_railtie.rb) in source order, as Rails'
+/// OrderedOptions holds them, before the railties' initializers run: a
+/// gem railtie's initializer reads them (phonelib 0.10.27's
+/// `app.config.i18n.load_path`), and `initialize_i18n` applies them on
+/// `before_eager_load` or `after_initialize`. The value is the reader
+/// ingest lifted, evaluated once. Without I18n::Railtie (no i18n in the
+/// lockfile) each write is named, error[i18n_config_not_applied].
+fn i18n_config_block(app: &App, carries_i18n: bool) -> String {
+    let Some(lc) = app.rails_application.as_ref() else { return String::new() };
+    let mut writes: Vec<(&str, crate::span::Span)> = Vec::new();
+    for m in &lc.methods {
+        let Some(key) = m.name.as_str().strip_prefix("i18n_") else { continue };
+        if I18N_CONFIG_KEYS.contains(&key) && !writes.iter().any(|(k, _)| *k == key) {
+            writes.push((key, m.name_span));
+        }
+    }
+    if writes.is_empty() {
+        return String::new();
+    }
+    if !carries_i18n {
+        for (key, span) in &writes {
+            emit::diagnostics::report_unsupported(
+                *span,
+                "ruby",
+                "config.i18n",
+                format!("error[i18n_config_not_applied]: `config.i18n.{key}` is not applied: the tree carries no I18n::Railtie (the lockfile has no i18n gem)"),
+            );
+        }
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's config.i18n writes, in source order, into I18n::Railtie's\n\
+         # config.i18n (runtime/active_support_i18n_railtie.rb).\n",
+    );
+    for (key, _) in &writes {
+        out.push_str(&format!("Rails.application.config.i18n.{key} = Rails.application.i18n_{key}\n"));
+    }
+    out
 }
 
 /// End each emitted class file with the `ActiveSupport.run_load_hooks`
@@ -6998,6 +7097,18 @@ fn relative_path(from_dir: &str, to: &str) -> String {
 /// program is loading now (`require_through`): secure_headers.rb requires
 /// headers/content_security_policy, whose policy_management depends on
 /// SecureHeaders; natively nothing there requires secure_headers.rb back.
+///
+/// A declarations file other programs declare too (a class several
+/// source files reopen) is no file only its program loads: another
+/// program loads it first (Core's gems/ci minitest_ext.rb reopening
+/// Minitest::Test), and its dependency on this program's constant
+/// (test_wrapper.rb's `include TestWrapper::Plugin`, merged into
+/// Minitest::Test's declarations) goes through the program too, naming
+/// the requiring file. The program requires that file among its
+/// declarations, which is loading now: `require_declaration` leaves it
+/// to finish, where Ruby's require of it would be a circular one (and
+/// required directly, the declarations file's `class TestWrapper` fired
+/// its autoload into the program, which required it back).
 fn load_declarations_through_their_program(
     files: &mut [(String, String)],
     app: &App,
@@ -7016,6 +7127,16 @@ fn load_declarations_through_their_program(
                 for name in names {
                     own.insert(format!("models/{}", crate::emit::ruby::library_file_stem(name.0.as_str(), app)));
                 }
+            }
+        }
+    }
+    // Declarations files more than one program declares.
+    let mut seen: BTreeSet<&String> = BTreeSet::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    for declared in declarations_of.values() {
+        for file in declared {
+            if !seen.insert(file) {
+                shared.insert(file.clone());
             }
         }
     }
@@ -7050,13 +7171,27 @@ fn load_declarations_through_their_program(
         // The program a dependency loads through, unless this file is
         // that program or one of its declarations, or a program loading
         // its own declarations there (a file reopening the constant).
-        let through = |anchor: &str| -> Option<&String> {
+        // A file another program declares too names itself (`from`).
+        let reopened = shared.contains(own);
+        let through = |anchor: &str| -> Option<(&String, bool)> {
             let program = program_of_file.get(anchor)?;
+            let declares_own = declarations_of.get(program).is_some_and(|d| d.contains(own));
             let theirs = program == own
-                || declarations_of.get(program).is_some_and(|d| d.contains(own))
+                || (declares_own && !reopened)
                 || declarations_of.get(own).is_some_and(|d| d.contains(anchor));
-            (!theirs).then_some(program)
+            (!theirs).then_some((program, declares_own))
         };
+        let through_call = |program: &String, anchor: &str, from: bool| -> String {
+            if from {
+                format!("RoundhouseAutoload.require_through({program:?}, {anchor:?}, {own:?})")
+            } else {
+                format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})")
+            }
+        };
+        // This program's require of a declarations file another program
+        // declares too.
+        let shared_declaration =
+            |anchor: &str| shared.contains(anchor) && declarations_of.get(own).is_some_and(|d| d.contains(anchor));
         let mut changed = false;
         let mut out = String::with_capacity(content.len());
         for line in content.split_inclusive('\n') {
@@ -7069,9 +7204,10 @@ fn load_declarations_through_their_program(
                 // A file loading before app/models.rb (an initializer's
                 // constant, boot.rb) keeps its direct require.
                 target.strip_prefix("app/").and_then(|anchor| {
-                    through(anchor).map(|program| {
+                    through(anchor).map(|(program, from)| {
                         format!(
-                            "defined?(RoundhouseAutoload) ? RoundhouseAutoload.require_through({program:?}, {anchor:?}) : require_relative({:?})",
+                            "defined?(RoundhouseAutoload) ? {} : require_relative({:?})",
+                            through_call(program, anchor, from),
                             relative(dir, &format!("app/{program}"))
                         )
                     })
@@ -7079,7 +7215,11 @@ fn load_declarations_through_their_program(
             } else if let Some(anchor) =
                 text.strip_prefix("require RoundhouseAutoload.path(\"").and_then(|r| r.strip_suffix("\")"))
             {
-                through(anchor).map(|program| format!("RoundhouseAutoload.require_through({program:?}, {anchor:?})"))
+                match through(anchor) {
+                    Some((program, from)) => Some(through_call(program, anchor, from)),
+                    None if shared_declaration(anchor) => Some(format!("RoundhouseAutoload.require_declaration({anchor:?})")),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -7150,16 +7290,38 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # being required on its way: then the declarations file, as the program
   # itself loads it. Requiring the in-flight program is a circular
   # require natively absent, which Core's StrictWarning raises.
-  def self.require_through(program, declarations)
+  #
+  # `from`: the requiring file, when the program declares it too and
+  # another program loads it first (load_declarations_through_their_program).
+  # It is loading now, and the program's require of it
+  # (`require_declaration`) leaves it to finish.
+  def self.require_through(program, declarations, from = nil)
     @loaded_programs ||= {}
     if @loaded_programs.key?(program) || !@entered&.key?(program)
-      require path(program)
+      return require path(program) unless from
+      @waiting ||= {}
+      waiting = @waiting.key?(from)
+      @waiting[from] = true
+      begin
+        require path(program)
+      ensure
+        @waiting.delete(from) unless waiting
+      end
     elsif $LOADED_FEATURES.include?(path(program))
       @loaded_programs[program] = true
       require path(program)
     else
       require path(declarations)
     end
+  end
+
+  # A program's require of a declarations file other programs declare
+  # too: not the one waiting on this program (`require_through`'s
+  # `from`), which is loading now and finishes after it; requiring it
+  # again would be a circular require, which Core's StrictWarning raises.
+  def self.require_declaration(file)
+    return false if @waiting&.key?(file)
+    require path(file)
   end
 
   # A file-level statement of a support file's program: runs it, and
@@ -8951,6 +9113,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_inflector.rb"
         && p != "runtime/active_support_ractors.rb"
         && p != "runtime/active_support_i18n.rb"
+        && p != "runtime/active_support_i18n_railtie.rb"
+        && p != "runtime/rails_framework_locales.rb"
         && p != "runtime/action_dispatch_session_store.rb"
         && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb");

@@ -125,9 +125,8 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
     let boot = std::fs::read_to_string(dir.join("boot.rb")).expect("boot.rb");
     let finish = boot.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)").unwrap_or_else(|| panic!("{boot}"));
     let gems = boot.find("require_relative \"runtime/gem_facades\"").expect("gem facades");
-    let railtie = boot.find("require_relative \"runtime/rails_railtie\"").unwrap_or_else(|| panic!("{boot}"));
     let models = boot.find("require_relative \"app/models\"").expect("app/models");
-    assert!(gems < railtie && railtie < models && models < finish, "{boot}");
+    assert!(gems < models && models < finish, "{boot}");
     // The :boot phase runs once app/models has loaded the boot files and
     // the carried engines, before eager loading, as Rails runs it before
     // `eager_load!`.
@@ -138,7 +137,10 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
     let features = facades.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))").unwrap_or_else(|| panic!("{facades}"));
     let dependency = facades.find("[\"hashlike\"].each do |feature|").unwrap_or_else(|| panic!("{facades}"));
-    assert!(features < dependency, "{facades}");
+    // `require "rails"` defines Rails::Railtie before Bundler.require: a
+    // gem's `if defined?(Rails::Railtie)` sees it as it loads.
+    let railtie = facades.find("require_relative \"rails_railtie\"\n").unwrap_or_else(|| panic!("{facades}"));
+    assert!(features < railtie && railtie < dependency, "{facades}");
 
     let home = gem_home(&dir);
     let out = emit_and_run::ruby()

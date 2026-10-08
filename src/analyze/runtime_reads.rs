@@ -52,6 +52,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_tryable.rb", "runtime/active_support_tryable.rb"),
     ("runtime/spinel/active_support_inflector.rb", "runtime/active_support_inflector.rb"),
     ("runtime/spinel/active_support_ractors.rb", "runtime/active_support_ractors.rb"),
+    // The PostgreSQL CRuby tree with i18n in its lockfile.
+    ("runtime/spinel/active_support_i18n_railtie.rb", "runtime/active_support_i18n_railtie.rb"),
     ("runtime/spinel/action_dispatch_session_store.rb", "runtime/action_dispatch_session_store.rb"),
     ("runtime/spinel/action_dispatch_show_exceptions.rb", "runtime/action_dispatch_show_exceptions.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
@@ -129,7 +131,7 @@ pub(crate) fn declared_constants(text: &str) -> HashSet<String> {
 /// path). The trees chain their runtime by `require_relative`; a carried
 /// file nothing reaches defines nothing. The SQLite CRuby tree carries
 /// runtime/rails_railtie.rb with the rest of runtime/spinel/, but only
-/// the PostgreSQL tree's boot.rb requires it.
+/// the PostgreSQL tree's runtime/gem_facades.rb requires it.
 pub(crate) fn loaded_files(files: &[(String, String)]) -> HashSet<String> {
     struct Requires(Vec<(bool, String)>);
     impl<'pr> ruby_prism::Visit<'pr> for Requires {

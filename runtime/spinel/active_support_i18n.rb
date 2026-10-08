@@ -14,7 +14,7 @@
 # depends on concurrent-ruby alone, nothing of Rails.
 #
 # Not here: the I18n railtie (active_support/i18n_railtie.rb), which
-# applies `config.i18n` at boot; this tree does not run it.
+# applies `config.i18n` at boot (runtime/active_support_i18n_railtie.rb).
 #
 # The PostgreSQL CRuby tree whose lockfile has i18n only
 # (`project::apply_postgres_bootstrap`).

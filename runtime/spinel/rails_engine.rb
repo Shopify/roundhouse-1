@@ -25,9 +25,11 @@
 # autoload covers every carried file), `load_config_initializers` (each
 # engine's config/initializers are compiled into the boot, in engine
 # order), `add_routing_paths` and `make_routes_lazy` (config/routes.rb is
-# compiled). The rest are refused when the engine has what they would
-# apply (error[engine_initializer_not_applied]): `add_locales`,
-# `add_view_paths`, `add_mailer_preview_paths`, `add_fixture_paths`,
+# compiled). `add_locales` adds the engine's config/locales to
+# `config.i18n.railties_load_path`, as Rails' does, where the tree carries
+# I18n::Railtie. The rest are refused when the engine has what they would
+# apply (error[engine_initializer_not_applied]): `add_locales` without
+# I18n::Railtie, `add_view_paths`, `add_mailer_preview_paths`, `add_fixture_paths`,
 # `prepend_helpers_path`. Not ported: the engine as a Rack endpoint
 # (`app`, `call`, `routes`, `helpers`, `load_seed`), and generators,
 # console, runner and tasks loading.
@@ -264,6 +266,33 @@ module Rails
         super
       end
 
+      # The application's own Engine initializers, run after every
+      # engine's: Rails::Application is an engine, the last in
+      # Engine::Railties order (Application#ordered_railties), with the
+      # app's root as its root. Of them this tree has work for
+      # `add_locales` (the app's config/locales, carried at the tree's
+      # root); the rest are done by the emitted boot, as the engines'
+      # are. The root is the tree's (app/models.rb's RoundhouseAutoload
+      # sits in app/), as Rails' is the app's.
+      def application_initializers(app) # :nodoc:
+        return [] unless app.is_a?(::Rails::Application)
+
+        root = defined?(::RoundhouseAutoload::ROOT) ? File.expand_path("..", ::RoundhouseAutoload::ROOT) : File.expand_path(Rails.root.to_s)
+        locales = Engine::Configuration.new(Pathname.new(root)).paths["config/locales"]
+        add_locales = Initializable::Initializer.new(:add_locales, app, before: nil, after: nil) do
+          # `config` is runtime/rails_configuration.rb's, which the tree
+          # loads with the gems.
+          if respond_to?(:config) && config.respond_to?(:i18n)
+            config.i18n.railties_load_path << locales
+          elsif !locales.existent.empty?
+            Railtie.not_run_unless_it_runs("#{self.class.name} initializer :add_locales") do
+              raise NotImplementedError, "error[engine_initializer_not_applied]: the tree has no locales to add #{locales.existent.map { |f| f.to_s.delete_prefix("#{root}/") }.join(", ")} to"
+            end
+          end
+        end
+        [add_locales]
+      end
+
       def find_root(from)
         return Pathname.new(File.expand_path(from)) if source_roots.value?(from)
 
@@ -408,8 +437,16 @@ module Rails
     initializer :add_routing_paths do |app|
     end
 
+    # As Rails', where I18n::Railtie owns `config.i18n`
+    # (runtime/active_support_i18n_railtie.rb, carried with i18n in the
+    # lockfile): the engine's config/locales, carried in its directory in
+    # this tree, joins I18n.load_path when the railtie initializes I18n.
     initializer :add_locales do
-      not_applied(:add_locales, paths["config/locales"].existent)
+      if config.respond_to?(:i18n)
+        config.i18n.railties_load_path << paths["config/locales"]
+      else
+        not_applied(:add_locales, paths["config/locales"].existent)
+      end
     end
 
     initializer :add_view_paths do
