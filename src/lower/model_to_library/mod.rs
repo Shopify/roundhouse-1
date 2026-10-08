@@ -1202,10 +1202,14 @@ fn unlowered_dsl_reason(name: &str) -> &'static str {
         // Rails defines the attribute methods under the new name
         // (`title`, `title=`, `title_changed?`, ...) and translates the
         // name to the column in `new`, `where`, `order`, `pluck`. The
-        // lowered model has neither the methods nor the key translation.
+        // lowered model compiles that for literal names over a column
+        // (`analyze::retypable_attributes::alias_attribute_decl`); any
+        // other alias (of an association, another alias, a computed
+        // name) gets neither the methods nor the key translation.
         "alias_attribute" => {
-            "Rails answers the alias's attribute methods and translates the alias to its column in \
-             `new`, `where`, `order` and `pluck`, and the lowered model and relations do not"
+            "Rails answers the alias's attribute methods and translates the alias to its target in \
+             `new`, `where`, `order` and `pluck`, and the lowered model compiles that only for a literal \
+             new name over a literal column"
         }
         _ => "the class does not run it",
     }

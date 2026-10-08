@@ -1,6 +1,8 @@
-//! `default_scope` (Core: 71 statements) and `alias_attribute` (69) are
-//! refused with the Rails behavior the lowered model lacks, not the
-//! generic "the class does not run it".
+//! `default_scope` (Core: 71 statements), and an `alias_attribute` the
+//! lowered model does not compile (anything but literal names over a
+//! column, which `alias_attribute_pg_runtime` covers), are refused with
+//! the Rails behavior the lowered model lacks, not the generic "the
+//! class does not run it".
 //!
 //! Rails merges a default_scope into every relation of the class and
 //! seeds new records with its `where` values, and translates an
@@ -93,6 +95,7 @@ fn default_scope_and_alias_attribute_are_refused_with_the_reason() {
         .iter()
         .fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
         .write("db/schema.rb", SCHEMA)
+        .write("app/models/gizmo.rb", "class Gizmo < ApplicationRecord\n  self.table_name = \"widgets\"\n  alias_attribute :label, :headline\nend\n")
         .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: \":memory:\"\n");
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     let scope = "Rails applies a default_scope to every query of the class";
@@ -106,9 +109,10 @@ fn default_scope_and_alias_attribute_are_refused_with_the_reason() {
     );
     assert!(
         errors.iter().any(|e| e.contains("alias_attribute not supported")
-            && e.contains("on `Widget`")
-            && e.contains("translates the alias to its column")),
+            && e.contains("on `Gizmo`")
+            && e.contains("only for a literal new name over a literal column")),
         "{errors:#?}"
     );
+    assert!(!errors.iter().any(|e| e.contains("on `Widget`") && e.contains("alias_attribute")), "{errors:#?}");
     assert!(!errors.iter().any(|e| e.contains("the class does not run it")), "{errors:#?}");
 }

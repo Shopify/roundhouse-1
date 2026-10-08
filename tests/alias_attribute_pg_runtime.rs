@@ -1,6 +1,8 @@
 //! `alias_attribute :new, :old` over a column (Core's
 //! `alias_attribute :subdomain, :name`, 77 calls), against native Rails
-//! 8.2 on the same local PostgreSQL database.
+//! 8.2 on the same local PostgreSQL database; and the same declared
+//! through an app class macro whose body calls `alias_attribute` with its
+//! parameters (`Store`), which replays at class load.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -25,6 +27,38 @@ test:
 
 const APPLICATION_RECORD: &str = r#"class ApplicationRecord < ActiveRecord::Base
   self.abstract_class = true
+
+  def self.aliases_column(new_name, column)
+    alias_attribute new_name, column
+  end
+
+  def self.renames(new_name, column)
+    CallLog.add("renames #{new_name}")
+    alias_attribute(new_name, column)
+  end
+end
+"#;
+
+const CALL_LOG: &str = r#"class CallLog
+  def self.lines
+    @lines ||= []
+  end
+
+  def self.add(line)
+    lines << line
+  end
+end
+"#;
+
+/// The aliases a replayed macro declares.
+const STORE: &str = r#"class Store < ApplicationRecord
+  self.table_name = "shops"
+  aliases_column :handle, :name
+  renames "count", "number"
+
+  def handle_renamed?
+    handle_changed?
+  end
 end
 "#;
 
@@ -58,6 +92,10 @@ const PROBE: &str = r##"class AliasAttributeProbe
     out << "update: #{s.reload.name.inspect} #{Shop.where(name: "d").count}"
     out << "read: #{s.read_attribute(:subdomain).inspect} #{s[:subdomain].inspect}"
     out << "class: #{Shop.attribute_aliases.inspect} #{Shop.attribute_alias?(:subdomain)} #{Shop.attribute_alias(:subdomain).inspect}"
+    st = Store.create!(handle: "m", count: 5)
+    st.handle = "n"
+    out << "macro: #{st.name.inspect} #{st.handle_renamed?} #{Store.where(handle: "m").count} #{Store.find_by(count: 5).handle.inspect} #{Store.order(handle: :desc).pluck(:handle).first.inspect}"
+    out << "macro class: #{Store.attribute_aliases.inspect} #{CallLog.lines.inspect}"
     out
   end
 end
@@ -68,7 +106,7 @@ end
 /// here: a String given for the integer column (`tracking_number: "7"`,
 /// as `number: "7"`) stays a String in `new`, and `attributes` omits
 /// `id`.
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 10] = [
     r#"new: "a" "a" true 7 7"#,
     r#"write: "b" true nil"#,
     r#"saved: true true nil ["b"]"#,
@@ -77,22 +115,28 @@ const EXPECTED: [&str; 8] = [
     r#"update: "d" 1"#,
     r#"read: "d" "d""#,
     r#"class: {"subdomain" => "name", "tracking_number" => "number", "id_value" => "id"} true "name""#,
+    r#"macro: "n" true 1 "m" "m""#,
+    r#"macro class: {"handle" => "name", "count" => "number", "id_value" => "id"} ["renames count"]"#,
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 3] = [
+const LOADS: [&str; 5] = [
     "app/models/application_record",
+    "app/models/call_log",
     "app/models/shop",
+    "app/models/store",
     "app/models/alias_attribute_probe",
 ];
 
-const FILES: [(&str, &str); 7] = [
+const FILES: [(&str, &str); 9] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
     ("db/structure.sql", STRUCTURE),
     ("app/models/application_record.rb", APPLICATION_RECORD),
+    ("app/models/call_log.rb", CALL_LOG),
     ("app/models/shop.rb", SHOP),
+    ("app/models/store.rb", STORE),
     ("app/models/alias_attribute_probe.rb", PROBE),
 ];
 
@@ -122,4 +166,20 @@ fn alias_attribute_matches_native_rails_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
     assert_eq!(emitted_lines, native, "emitted");
+}
+
+/// A macro that reaches `alias_attribute` under a branch declares
+/// nothing statically, and its call stays refused.
+#[test]
+fn a_macro_alias_under_a_branch_stays_refused() {
+    let app = overlay().write(
+        "app/models/store.rb",
+        "class Store < ApplicationRecord\n  self.table_name = \"shops\"\n  def self.maybe(n, c)\n    alias_attribute(n, c) if n\n  end\n  maybe :handle, :name\nend\n",
+    );
+    let (_dir, errors) = app.emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("maybe not supported") && e.contains("alias_attribute")),
+        "{}",
+        errors.join("\n")
+    );
 }

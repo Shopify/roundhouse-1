@@ -154,14 +154,79 @@ pub(crate) fn attribute_aliases(model: &Model, app: &App) -> Vec<(Symbol, Symbol
     }
     let mut out: Vec<(Symbol, Symbol)> = Vec::new();
     for m in chain.into_iter().rev() {
-        for (new, old) in body_statements(m).filter_map(|e| alias_attribute_decl(e, table)) {
-            match out.iter_mut().find(|(n, _)| *n == new) {
-                Some(slot) => slot.1 = old,
-                None => out.push((new, old)),
+        let side = ClassSide::of(m, app);
+        for expr in body_statements(m) {
+            let pairs = match alias_attribute_decl(expr, table) {
+                Some(pair) => vec![pair],
+                None => macro_alias_pairs(&side, expr, table).unwrap_or_default(),
+            };
+            for (new, old) in pairs {
+                match out.iter_mut().find(|(n, _)| *n == new) {
+                    Some(slot) => slot.1 = old,
+                    None => out.push((new, old)),
+                }
             }
         }
     }
     out
+}
+
+/// A body call of an app class macro (`aliases_column :subdomain, :name`)
+/// whose own body declares its aliases by top-level `alias_attribute`
+/// statements, each argument one of the macro's positional parameters or
+/// a literal: the `(new, old)` pairs the call declares, read with the
+/// call's literal arguments bound to the parameters, in body order, each
+/// over a column as [`alias_attribute_decl`] requires. None when the
+/// macro reaches `alias_attribute` any other way (a nested branch or
+/// block, another macro, a computed name), or reaches none. The call is
+/// replayed as written at class load, so the runtime's `alias_attribute`
+/// checks every pair it declares against the compiled aliases.
+fn macro_alias_pairs(side: &ClassSide<'_>, call: &Expr, table: &crate::schema::Table) -> Option<Vec<(Symbol, Symbol)>> {
+    let ExprNode::Send { recv, method, args, .. } = &*call.node else { return None };
+    if !on_self(recv) || method.as_str() == "alias_attribute" {
+        return None;
+    }
+    let def = side.class_method(method.as_str())?;
+    if def.params.len() != args.len() || def.params.iter().any(|p| p.keyword || p.rest || p.forwarding || p.name.as_str().is_empty()) {
+        return None;
+    }
+    let literal = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let bound: Vec<(&Symbol, String)> =
+        def.params.iter().zip(args).map(|(p, a)| literal(a).map(|v| (&p.name, v))).collect::<Option<_>>()?;
+    let aliases = self_aliases(&def.body);
+    let statements: Vec<&Expr> = match &*def.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&def.body],
+    };
+    let mut pairs = Vec::new();
+    for statement in statements {
+        if let ExprNode::Send { recv, method, args, block: None, .. } = &*statement.node
+            && method.as_str() == "alias_attribute"
+            && on_class(recv, &aliases)
+        {
+            let name = |e: &Expr| match &*e.node {
+                ExprNode::Var { name, .. } => bound.iter().find(|(p, _)| *p == name).map(|(_, v)| v.clone()),
+                _ => literal(e),
+            };
+            let [new, old] = args.as_slice() else { return None };
+            let (new, old) = (name(new)?, name(old)?);
+            if new == old || table.columns.iter().any(|c| c.name.as_str() == new) {
+                return None;
+            }
+            let old = table.columns.iter().find(|c| c.name.as_str() == old)?;
+            pairs.push((Symbol::from(new.as_str()), old.name.clone()));
+            continue;
+        }
+        let mut seen = vec![def.name.as_str().to_string()];
+        if side.reaches(statement, "alias_attribute", &aliases, &mut seen) {
+            return None;
+        }
+    }
+    (!pairs.is_empty()).then_some(pairs)
 }
 
 /// A direct `alias_attribute :new, :old` body statement, both names
@@ -408,6 +473,8 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
         out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| alias_attribute_decl(e, table).is_some()).map(|e| e.span));
+        let side = ClassSide::of(model, app);
+        out.extend(body_statements(model).filter(|e| macro_alias_pairs(&side, e, table).is_some()).map(|e| e.span));
         for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
             out.extend(lc.unknown_calls.iter().filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
         }
