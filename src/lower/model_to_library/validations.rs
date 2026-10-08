@@ -195,9 +195,13 @@ pub(crate) fn validation_statements_split<'v>(
         // as `read_attribute_for_validation` reads it.
         let any_assoc = model.associations().any(|a| a.name() == &v.attribute);
         for rule in &v.rules {
+            // A value read with the class as `self` reads the declaring
+            // class's.
+            let mut bound = rule.clone();
+            bind_class_scope(&mut bound, &declarer.name);
             // `allow_nil:` / `allow_blank:` / `message:` / `if:` /
             // `unless:` wrap the rule they apply to.
-            let (rule, options) = match rule {
+            let (rule, options) = match &bound {
                 ValidationRule::Guarded { rule, options } => (&**rule, Some(options)),
                 other => (other, None),
             };
@@ -230,10 +234,14 @@ pub(crate) fn validation_statements_split<'v>(
                 );
                 (vec![check], reader)
             } else {
-                let value = if any_assoc { reader } else { ivar(&v.attribute) };
+                // `validates_associated` / `validates_each` read the value
+                // as `read_attribute_for_validation` does, through the reader.
+                let read_by_send = any_assoc || matches!(rule, ValidationRule::Associated | ValidationRule::Each { .. });
+                let value = if read_by_send { reader } else { ivar(&v.attribute) };
                 (validation_rule_to_calls(model, &declarer.finder, &v.attribute, rule, attr_ty, &value, &text), value)
             };
             let prepend = options.is_some_and(|o| o.prepend);
+            let strict = options.and_then(|o| o.strict.as_ref());
             let checks = match options {
                 Some(o) => guard_rule(value, checks, o),
                 None => checks,
@@ -242,9 +250,13 @@ pub(crate) fn validation_statements_split<'v>(
                 .into_iter()
                 .map(|mut check| {
                     // Each expanded check attributes to its `validates` line,
-                    // and each message it adds to the validated attribute.
+                    // and each message it adds to the validated attribute;
+                    // a strict one raises the message instead.
                     check.inherit_span(span);
-                    tag_error_attribute(&mut check, &v.attribute);
+                    match strict {
+                        Some(exception) => raise_instead_of_adding(&mut check, exception),
+                        None => tag_error_attribute(&mut check, &v.attribute),
+                    }
                     check
                 })
                 .collect();
@@ -318,18 +330,93 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
     out
 }
 
+/// `errors << msg` as ActiveModel's `errors.add(..., strict: exception)`
+/// runs it: `raise exception, error.full_message`, the error not added.
+/// The accumulator's messages are full messages already.
+fn raise_instead_of_adding(check: &mut Expr, exception: &Expr) {
+    if is_errors_push(check) {
+        let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
+        let message = args[0].clone();
+        check.hint = None;
+        *check.node = ExprNode::Send {
+            recv: None,
+            method: Symbol::from("raise"),
+            args: vec![exception.clone(), message],
+            block: None,
+            parenthesized: false,
+        };
+        return;
+    }
+    check.node.for_each_child_mut(&mut |c| raise_instead_of_adding(c, exception));
+}
+
+/// `errors << msg`, the accumulator push every check lowers its error to.
+fn is_errors_push(check: &Expr) -> bool {
+    matches!(
+        &*check.node,
+        ExprNode::Send { recv: Some(r), method, args, .. }
+            if method.as_str() == "<<" && args.len() == 1
+                && matches!(&*r.node, ExprNode::Send { recv: None, method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty())
+    )
+}
+
+/// Bind every [`RuleValue::ClassScoped`] in `rule` to `class`, the
+/// class whose body declared it: `self` reads the class, and a method
+/// call without a receiver is the class's (`-> { minimum }` →
+/// `-> { Post.minimum }`). Ingest admits such a value only when it reads
+/// no instance variable of the class.
+pub(crate) fn bind_class_scope(rule: &mut ValidationRule, class: &ClassId) {
+    fn bind(value: &mut RuleValue, class: &ClassId) {
+        let RuleValue::ClassScoped { value: inner } = value else { return };
+        let mut inner = (**inner).clone();
+        match &mut inner {
+            RuleValue::Expr { expr } => class_self(expr, class),
+            RuleValue::Call { callable, .. } => class_self(callable, class),
+            _ => {}
+        }
+        *value = inner;
+    }
+    fn class_self(e: &mut Expr, class: &ClassId) {
+        let konst = || {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: class.0.as_str().split("::").map(Symbol::from).collect() })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = konst(),
+            ExprNode::Send { recv: recv @ None, method, .. }
+                if !crate::ingest::validates::SELFLESS_KERNEL.contains(&method.as_str()) =>
+            {
+                *recv = Some(konst())
+            }
+            _ => {}
+        }
+        e.node.for_each_child_mut(&mut |c| class_self(c, class));
+    }
+    match rule {
+        ValidationRule::Guarded { rule, .. } => bind_class_scope(rule, class),
+        ValidationRule::Inclusion { list_of: Some(v), .. } => bind(v, class),
+        ValidationRule::Numericality { checks, .. } | ValidationRule::Comparison { checks } => {
+            for check in checks {
+                if let Some(bound) = &mut check.bound {
+                    bind(bound, class);
+                }
+            }
+        }
+        ValidationRule::LengthOf { checks, .. } => {
+            for check in checks {
+                bind(&mut check.bound, class);
+            }
+        }
+        ValidationRule::FormatOf { regexp, .. } => bind(regexp, class),
+        _ => {}
+    }
+}
+
 /// Tag each `errors << msg` push in `check` that carries no attribute yet
 /// with the one it is for (`IrHint::ErrorAttribute`): the accumulator
 /// keeps only the message, and `errors.attribute_names` needs the
 /// attribute on the trees that record it.
 pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
-    let is_push = matches!(
-        &*check.node,
-        ExprNode::Send { recv: Some(r), method, args, .. }
-            if method.as_str() == "<<" && args.len() == 1
-                && matches!(&*r.node, ExprNode::Send { recv: None, method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty())
-    );
-    if is_push && check.hint.is_none() {
+    if is_errors_push(check) && check.hint.is_none() {
         check.hint = Some(crate::expr::IrHint::ErrorAttribute(attr.clone()));
     }
     check.node.for_each_child_mut(&mut |c| tag_error_attribute(c, attr));
@@ -651,6 +738,38 @@ fn validation_rule_to_calls(
             inline_numericality_check(attr, *only_integer, checks, text)
         }
         ValidationRule::Comparison { checks } => inline_comparison_check(attr, value, checks, text),
+        // `acceptance:`: `errors.add(attr, :accepted) unless
+        // Array(accept).include?(value)`.
+        ValidationRule::Acceptance { accept } => vec![if_with_nil_else(
+            not(send(accept.clone(), "include?", vec![value.clone()])),
+            text.push("accepted", None, || value.clone()),
+        )],
+        // Reported by `roundhouse check`: ActiveModel has no
+        // AssociatedValidator.
+        ValidationRule::Associated if model.parent.is_none() => Vec::new(),
+        ValidationRule::Associated => vec![inline_associated_check(model, attr, value, text)],
+        // `validates_each :a do |record, attr, value| ... end`:
+        // BlockValidator's `@block.call(record, attribute, value)`, as
+        // a proc takes it (a parameter past the three reads nil).
+        ValidationRule::Each { callable, arity } => {
+            let s = Span::synthetic();
+            let mut args = vec![
+                Expr::new(s, ExprNode::SelfRef),
+                Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: attr.clone() } }),
+                value.clone(),
+            ];
+            args.resize_with((*arity).max(3), || Expr::new(s, ExprNode::Lit { value: Literal::Nil }));
+            vec![Expr::new(
+                s,
+                ExprNode::Send {
+                    recv: Some(callable.clone()),
+                    method: Symbol::from("call"),
+                    args: args.into_iter().take(*arity).collect(),
+                    block: None,
+                    parenthesized: true,
+                },
+            )]
+        }
         // `validate do ... end`: the block, called inside the record's
         // method (its `self`, as under `instance_exec`).
         // `validate SomeValidations.new` → `<object>.validate(self)`.
@@ -1896,6 +2015,8 @@ fn resolve(value: &RuleValue) -> Expr {
                 parenthesized: true,
             },
         ),
+        // `validation_statements_split` binds these first.
+        RuleValue::ClassScoped { value } => resolve(value),
     }
 }
 
@@ -2003,6 +2124,75 @@ pub(crate) fn humanize(attr: &str) -> String {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
     }
+}
+
+/// `validates_associated :attr` (ActiveRecord's AssociatedValidator):
+///
+///   errors << "Attr is invalid" if Array(value).reject { |r|
+///     (r.respond_to?(:marked_for_destruction?) && r.marked_for_destruction?) ||
+///       r.valid?([:create, :update].include?(validation_context) ? nil : validation_context)
+///   }.any?
+///
+/// Each record validates in the record's own context when that is a
+/// custom one (`record_validation_context_for_association`), else in
+/// its own default; `reject` asks every record, so each one's errors
+/// are filled as in Rails. A collection association reads `to_a`, a
+/// singular one is `[]` when nil, and any other attribute is `Array()`.
+fn inline_associated_check(model: &Model, attr: &Symbol, value: &Expr, text: &ErrorText<'_>) -> Expr {
+    let s = Span::synthetic();
+    let sym = |name: &str| Expr::new(s, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+    let nil = || Expr::new(s, ExprNode::Lit { value: Literal::Nil });
+    let context = || {
+        Expr::new(
+            s,
+            ExprNode::Send { recv: None, method: Symbol::from("validation_context"), args: vec![], block: None, parenthesized: false },
+        )
+    };
+    let record = Symbol::from("associated_record");
+    let r = || local_read(&record);
+    let default_context = send(
+        Expr::new(s, ExprNode::Array { elements: vec![sym("create"), sym("update")], style: ArrayStyle::default() }),
+        "include?",
+        vec![context()],
+    );
+    let own_context = Expr::new(s, ExprNode::If { cond: default_context, then_branch: nil(), else_branch: context() });
+    let marked = bool_op(
+        BoolOpKind::And,
+        send(r(), "respond_to?", vec![sym("marked_for_destruction?")]),
+        send(r(), "marked_for_destruction?", vec![]),
+    );
+    let valid_object = bool_op(BoolOpKind::Or, marked, send(r(), "valid?", vec![own_context]));
+    let association = model.associations().find(|a| a.name() == attr);
+    let records = match association {
+        Some(Association::HasMany { .. } | Association::HasAndBelongsToMany { .. }) => send(value.clone(), "to_a", vec![]),
+        Some(Association::BelongsTo { .. } | Association::HasOne { .. }) => Expr::new(
+            s,
+            ExprNode::If {
+                cond: send(value.clone(), "nil?", vec![]),
+                then_branch: Expr::new(s, ExprNode::Array { elements: vec![], style: ArrayStyle::default() }),
+                else_branch: Expr::new(s, ExprNode::Array { elements: vec![value.clone()], style: ArrayStyle::default() }),
+            },
+        ),
+        None => Expr::new(
+            s,
+            ExprNode::Send { recv: None, method: Symbol::from("Array"), args: vec![value.clone()], block: None, parenthesized: true },
+        ),
+    };
+    let block = Expr::new(
+        s,
+        ExprNode::Lambda {
+            params: vec![record.clone()],
+            rest_param: None,
+            block_param: None,
+            body: valid_object,
+            block_style: crate::expr::BlockStyle::default(),
+        },
+    );
+    let invalid = Expr::new(
+        s,
+        ExprNode::Send { recv: Some(records), method: Symbol::from("reject"), args: vec![], block: Some(block), parenthesized: false },
+    );
+    if_with_nil_else(send(invalid, "any?", vec![]), text.push("invalid", None, || value.clone()))
 }
 
 // ── IR helpers ────────────────────────────────────────────────

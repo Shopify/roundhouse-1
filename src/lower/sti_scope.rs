@@ -110,6 +110,7 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
     // dead weight on every target, and on the strict ones it is dead
     // weight that still has to type-check.
     let mut recast: HashSet<ClassId> = HashSet::default();
+    let types = type_names(app, &bases);
     // Inside a subclass's OWN class method the receiver is implicit:
     // campfire's `Rooms::Direct.find_for` writes `all.joins(:users)
     // .detect { … }`, and Rails scopes that `all` to the subclass. Left
@@ -137,19 +138,19 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
             (sub.clone(), root.clone())
         })
         .collect();
-    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &mut recast));
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &mut recast));
     for view in &mut app.views {
-        rewrite(&mut view.body, &roots, &mut recast);
+        rewrite(&mut view.body, &roots, &types, &mut recast);
     }
     for tm in &mut app.test_modules {
         if let Some(setup) = &mut tm.setup {
-            rewrite(setup, &roots, &mut recast);
+            rewrite(setup, &roots, &types, &mut recast);
         }
         for t in &mut tm.tests {
-            rewrite(&mut t.body, &roots, &mut recast);
+            rewrite(&mut t.body, &roots, &types, &mut recast);
         }
         for m in &mut tm.helpers {
-            rewrite(&mut m.body, &roots, &mut recast);
+            rewrite(&mut m.body, &roots, &types, &mut recast);
         }
     }
     push_becomes_from(app, &bases, &recast);
@@ -442,15 +443,53 @@ pub(crate) fn sti_bases(app: &App) -> HashMap<ClassId, ClassId> {
     out
 }
 
+/// Each STI subclass's `type` values: its own name, then every STI
+/// class below it (`GoldBadge` -> `GoldBadge`, `PlatinumBadge`), the
+/// `type IN (...)` Rails' `type_condition` writes from `descendants`.
+fn type_names(app: &App, bases: &HashMap<ClassId, ClassId>) -> HashMap<ClassId, Vec<String>> {
+    let parent_of: HashMap<&ClassId, &ClassId> = app
+        .library_classes
+        .iter()
+        .filter_map(|lc| lc.parent.as_ref().map(|p| (&lc.name, p)))
+        .collect();
+    let mut out: HashMap<ClassId, Vec<String>> = HashMap::default();
+    for lc in &app.library_classes {
+        if !bases.contains_key(&lc.name) || out.contains_key(&lc.name) {
+            continue;
+        }
+        let mut names = vec![lc.name.0.as_str().to_string()];
+        for other in &app.library_classes {
+            if other.name == lc.name || !bases.contains_key(&other.name) {
+                continue;
+            }
+            let mut cursor = parent_of.get(&other.name).copied();
+            for _ in 0..8 {
+                let Some(parent) = cursor else { break };
+                if parent == &lc.name {
+                    let name = other.name.0.as_str().to_string();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    break;
+                }
+                cursor = parent_of.get(parent).copied();
+            }
+        }
+        out.insert(lc.name.clone(), names);
+    }
+    out
+}
+
 /// `bases` maps each STI subclass to the class its scoped relation roots
 /// on: its base model, or itself when it declares attribute types of its
 /// own (`apply_sti_scope_lowering`).
 fn rewrite(
     expr: &mut Expr,
     bases: &HashMap<ClassId, ClassId>,
+    types: &HashMap<ClassId, Vec<String>>,
     recast: &mut HashSet<ClassId>,
 ) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, recast));
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, bases, types, recast));
     if rewrite_becomes(expr, bases, recast) {
         return;
     }
@@ -493,12 +532,7 @@ fn rewrite(
                                 value: Literal::Sym { value: Symbol::from(INHERITANCE_COLUMN) },
                             },
                         ),
-                        Expr::new(
-                            span,
-                            ExprNode::Lit {
-                                value: Literal::Str { value: named.0.as_str().to_string() },
-                            },
-                        ),
+                        type_value(span, &named, types),
                     )],
                     kwargs: true,
                 },
@@ -519,6 +553,19 @@ fn rewrite(
         span,
         ExprNode::Send { recv: Some(scoped), method, args, block, parenthesized },
     );
+}
+
+/// `"Rooms::Open"`, or `["GoldBadge", "PlatinumBadge"]` when STI
+/// classes sit below the subclass.
+fn type_value(span: Span, named: &ClassId, types: &HashMap<ClassId, Vec<String>>) -> Expr {
+    let str_lit = |value: &str| Expr::new(span, ExprNode::Lit { value: Literal::Str { value: value.to_string() } });
+    match types.get(named) {
+        Some(names) if names.len() > 1 => Expr::new(
+            span,
+            ExprNode::Array { elements: names.iter().map(|n| str_lit(n)).collect(), style: Default::default() },
+        ),
+        _ => str_lit(named.0.as_str()),
+    }
 }
 
 /// `room.becomes!(Rooms::Open)` -> `Rooms::Open.becomes_from(room)`.

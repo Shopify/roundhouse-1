@@ -14,7 +14,10 @@
 //! In STI, a uniqueness rule asks the class that declared it: the base's
 //! asks the whole table, a subclass's keeps its type condition (the
 //! subclass and every class below it), as `find_finder_class_for` and
-//! `unscoped` do.
+//! `unscoped` do. A grandchild record (`PlatinumBadge < GoldBadge <
+//! Badge`) is stored with its own type, meets the base's rule across
+//! the whole table and its parent's within the parent's type set, new
+//! and persisted.
 //!
 //! The same model files run natively (Core's pinned Rails, over
 //! `establish_connection`) and on the emitted program, each on a freshly
@@ -128,6 +131,23 @@ const PROBE: &str = r##"class UniqProbe
     out << observe("silver named like gold", SilverBadge.new(name: "Sun", code: "s1"))
     out << observe("silver with gold's code", SilverBadge.new(name: "x", code: "g1"))
     out << observe("gold with a plain badge's code", GoldBadge.new(name: "y", code: "b1"))
+    SilverBadge.create!(name: "Rain", code: "s0")
+    out << observe("platinum with a plain badge's code", PlatinumBadge.new(name: "z", code: "b1"))
+    out << observe("platinum with silver's code", PlatinumBadge.new(name: "z", code: "s0"))
+    out << observe("plain badge with platinum's code", Badge.new(name: "z", code: "p1"))
+    out << observe("silver with platinum's code", SilverBadge.new(name: "z", code: "p1"))
+    out << observe("platinum named like platinum", PlatinumBadge.new(name: "MOON", code: "p4"))
+    out << observe("platinum named like a plain badge", PlatinumBadge.new(name: "star", code: "p5"))
+    out << observe("silver named like platinum", SilverBadge.new(name: "Moon", code: "s2"))
+    platinum = PlatinumBadge.where(code: "p1").first
+    out << "platinum row: #{platinum.class.name} #{platinum.type}"
+    out << observe("platinum keeps its own name and code", platinum)
+    platinum.code = "g1"
+    out << observe("platinum takes gold's code", platinum)
+    platinum.code = "p1"
+    platinum.name = "sun"
+    out << observe("platinum renamed onto gold", platinum)
+    out << "platinum rows: #{PlatinumBadge.count} gold rows: #{GoldBadge.count} badge rows: #{Badge.count}"
     out
   end
 end
@@ -135,7 +155,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 32] = [
+const EXPECTED: [&str; 44] = [
     "first new: true []",
     "first saved: true",
     "first persisted: true []",
@@ -168,6 +188,18 @@ const EXPECTED: [&str; 32] = [
     "silver named like gold: true []",
     r#"silver with gold's code: false ["Code has already been taken"]"#,
     r#"gold with a plain badge's code: false ["Code has already been taken"]"#,
+    r#"platinum with a plain badge's code: false ["Code has already been taken"]"#,
+    r#"platinum with silver's code: false ["Code has already been taken"]"#,
+    r#"plain badge with platinum's code: false ["Code has already been taken"]"#,
+    r#"silver with platinum's code: false ["Code has already been taken"]"#,
+    r#"platinum named like platinum: false ["Name has already been taken"]"#,
+    "platinum named like a plain badge: true []",
+    "silver named like platinum: true []",
+    "platinum row: PlatinumBadge PlatinumBadge",
+    "platinum keeps its own name and code: true []",
+    r#"platinum takes gold's code: false ["Code has already been taken"]"#,
+    r#"platinum renamed onto gold: false ["Name has already been taken"]"#,
+    "platinum rows: 1 gold rows: 2 badge rows: 4",
 ];
 
 const FILES: [(&str, &str); 12] = [

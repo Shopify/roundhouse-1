@@ -35,6 +35,16 @@
 //! A declaration with a validator or option those readers do not model
 //! is reported by `roundhouse check` ([`diagnose`]) and stays in
 //! `unknown_calls`; one that cannot be re-read is reported the same way.
+//!
+//! `acceptance:` on an attribute the class neither stores nor reads
+//! (`validates :terms, acceptance: true`, a form's checkbox) has
+//! ActiveModel define it: AcceptanceValidator includes a module that
+//! defines `attr_reader` / `attr_writer` for each half that is not an
+//! attribute method of the declaring class. [`define_acceptance_attributes`]
+//! does the same before the model lowering runs: a model gets the
+//! `attr_*` declaration (which its constructor and `update` then assign
+//! like any virtual), an STI subclass its reader and writer and the
+//! assignment in its constructor and `update` / `update!`.
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
@@ -47,15 +57,19 @@ use crate::lower::model_to_library::validations::{
 };
 use crate::span::Span;
 
-/// Is `call` a validation declaration (`validates`, `validate`,
-/// `validates_with`, `validates_<key>_of`) this pass answers for? `check`
+/// Is `call` a validation declaration (`validates`, `validates!`, `validate`,
+/// `validates_with`, `validates_<key>_of`, `validates_associated`,
+/// `validates_each`) this pass answers for? `check`
 /// asks before the pass runs; what it cannot lower, [`diagnose`] reports.
 pub(crate) fn claims(call: &Expr) -> bool {
     let ExprNode::Send { recv: None, method, .. } = &*call.node else { return false };
     let m = method.as_str();
     m == "validates"
+        || m == "validates!"
         || m == "validate"
         || m == "validates_with"
+        || m == "validates_associated"
+        || m == "validates_each"
         || (m.starts_with("validates_") && m.ends_with("_of"))
 }
 
@@ -111,7 +125,10 @@ fn read(lc: &LibraryClass, app: &App) -> Read {
             out.gaps.push((
                 call.span,
                 construct_of(call),
-                format!("`{}` defines its own `validate`, which the declaration would extend", lc.name.0.as_str()),
+                format!(
+                    "`{}` defines its own `validate`: in Rails that replaces only the `valid?` alias, and the emitted record runs its validations through `validate`",
+                    lc.name.0.as_str()
+                ),
             ));
             continue;
         }
@@ -139,12 +156,33 @@ fn read(lc: &LibraryClass, app: &App) -> Read {
                 continue;
             }
         };
-        // `validate do ... end`: the block ingest built (and the passes
-        // before this one rewrote), not the re-read copy.
+        // The re-read runs outside ingest's source registry, so its spans
+        // name no file; the strict exception class's is the one a
+        // target without it reports at.
+        for v in &mut validations {
+            for rule in &mut v.rules {
+                if let ValidationRule::Guarded { options, .. } = rule {
+                    if let Some(exception) = &mut options.strict {
+                        if exception.span.file.0 == 0 && !exception.span.is_synthetic() {
+                            exception.span.file = call.span.file;
+                        }
+                    }
+                }
+            }
+        }
+        // `validate do ... end` / `validates_each ... do`: the block
+        // ingest built (and the passes before this one rewrote), not the
+        // re-read copy.
         if let ExprNode::Send { block: Some(block), .. } = &*call.node {
-            if let Ok(ValidationRule::Block { callable, .. }) =
-                crate::ingest::validates::block_callable(block.clone())
-            {
+            let callable = if construct_of(call) == "`validates_each`" {
+                crate::ingest::validates::each_callable(block.clone()).ok().map(|(c, _)| c)
+            } else {
+                match crate::ingest::validates::block_callable(block.clone()) {
+                    Ok(ValidationRule::Block { callable, .. }) => Some(callable),
+                    _ => None,
+                }
+            };
+            if let Some(callable) = callable {
                 for v in &mut validations {
                     for rule in &mut v.rules {
                         if let Some(body) = rule.block_body_mut() {
@@ -183,6 +221,7 @@ fn type_names(sub: &ClassId, app: &App) -> Vec<String> {
 }
 
 pub fn apply_sti_subclass_validations(app: &mut App) {
+    define_acceptance_attributes(app);
     let sti = crate::lower::sti_bases(app);
     let mut plans: Vec<(usize, Vec<usize>, Vec<crate::dialect::MethodDef>)> = Vec::new();
     for (index, lc) in app.library_classes.iter().enumerate() {
@@ -242,6 +281,251 @@ pub fn apply_sti_subclass_validations(app: &mut App) {
             keep
         });
         lc.methods.extend(methods);
+    }
+}
+
+/// The attributes `validations` run `acceptance:` on.
+fn accepted_attributes<'v>(validations: impl Iterator<Item = &'v Validation>) -> Vec<Symbol> {
+    fn accepts(rule: &ValidationRule) -> bool {
+        match rule {
+            ValidationRule::Acceptance { .. } => true,
+            ValidationRule::Guarded { rule, .. } => accepts(rule),
+            _ => false,
+        }
+    }
+    let mut out: Vec<Symbol> = Vec::new();
+    for v in validations {
+        if v.rules.iter().any(accepts) && !out.contains(&v.attribute) {
+            out.push(v.attribute.clone());
+        }
+    }
+    out
+}
+
+/// The names `attr_accessor` / `attr_reader` / `attr_writer` declare
+/// in a model body, as (name, reader, writer).
+fn declared_attrs(model: &Model) -> Vec<(Symbol, bool, bool)> {
+    let mut out = Vec::new();
+    for item in &model.body {
+        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else { continue };
+        let (reader, writer) = match method.as_str() {
+            "attr_accessor" => (true, true),
+            "attr_reader" => (true, false),
+            "attr_writer" => (false, true),
+            _ => continue,
+        };
+        for arg in args {
+            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*arg.node {
+                out.push((value.clone(), reader, writer));
+            }
+        }
+    }
+    out
+}
+
+/// Is `name` an attribute method of `model` (a column, an Attributes
+/// API attribute) or an association, which ActiveModel's acceptance
+/// leaves alone?
+fn stored(model: &Model, name: &Symbol) -> bool {
+    model.attributes.fields.contains_key(name)
+        || model.associations().any(|a| a.name() == name)
+        || crate::lower::model_to_library::attribute_api_decls(&model.body).iter().any(|(n, _)| n == name)
+}
+
+/// [`ValidationRule::Acceptance`]'s virtual attributes (see the module
+/// header).
+fn define_acceptance_attributes(app: &mut App) {
+    // Models: the `attr_*` halves the model does not define.
+    for model in &mut app.models {
+        let names = accepted_attributes(model.validations());
+        if names.is_empty() {
+            continue;
+        }
+        let declared = declared_attrs(model);
+        let mut additions = Vec::new();
+        for name in names {
+            if stored(model, &name) {
+                continue;
+            }
+            let writer = Symbol::from(format!("{}=", name.as_str()));
+            let defines = |n: &Symbol| crate::lower::model_to_library::model_defines_instance_method(model, n);
+            let reader_missing = !defines(&name) && !declared.iter().any(|(n, r, _)| n == &name && *r);
+            let writer_missing = !defines(&writer) && !declared.iter().any(|(n, _, w)| n == &name && *w);
+            let macro_name = match (reader_missing, writer_missing) {
+                (true, true) => "attr_accessor",
+                (true, false) => "attr_reader",
+                (false, true) => "attr_writer",
+                (false, false) => continue,
+            };
+            let s = Span::synthetic();
+            additions.push(crate::dialect::ModelBodyItem::Unknown {
+                expr: Expr::new(
+                    s,
+                    ExprNode::Send {
+                        recv: None,
+                        method: Symbol::from(macro_name),
+                        args: vec![Expr::new(s, ExprNode::Lit { value: crate::expr::Literal::Sym { value: name } })],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+                leading_comments: Vec::new(),
+                leading_blank_line: false,
+            });
+        }
+        model.body.extend(additions);
+    }
+    // STI subclasses: the reader and writer, and the constructor's and
+    // `update`'s assignment the base's attrs loop does not know.
+    let mut plans: Vec<(usize, Vec<Symbol>)> = Vec::new();
+    for (index, lc) in app.library_classes.iter().enumerate() {
+        let Some((model, _)) = model_ancestry(lc, app) else { continue };
+        let read = read(lc, app);
+        let names: Vec<Symbol> = accepted_attributes(read.declared.iter().flat_map(|(_, _, vs, _)| vs.iter()))
+            .into_iter()
+            .filter(|n| !stored(model, n))
+            .collect();
+        if !names.is_empty() {
+            plans.push((index, names));
+        }
+    }
+    for (index, names) in plans {
+        let lc = &mut app.library_classes[index];
+        for name in names {
+            define_virtual_on_subclass(lc, &name);
+        }
+    }
+}
+
+fn instance_method(owner: &ClassId, name: &str, params: Vec<crate::dialect::Param>, body: Expr) -> crate::dialect::MethodDef {
+    crate::dialect::MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Instance,
+        params,
+        body,
+        signature: None,
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
+        block_param: None,
+    }
+}
+
+fn param(name: &str, default: Option<Expr>) -> crate::dialect::Param {
+    crate::dialect::Param {
+        name: Symbol::from(name),
+        default,
+        keyword: false,
+        rest: false,
+        forwarding: false,
+        from_keyword: false,
+        from_kwrest: false,
+    }
+}
+
+/// `name` / `name=` on an STI subclass, unless it defines them, and
+/// `self.name = attrs[:name] unless attrs[:name].nil?` (the base's
+/// virtual-attribute assignment) in its synthesized constructor and in
+/// an `update` / `update!` that then hands `attrs` to the base's.
+fn define_virtual_on_subclass(lc: &mut LibraryClass, name: &Symbol) {
+    let s = Span::synthetic();
+    let node = |n| Expr::new(s, n);
+    let var = |n: &str| node(ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::from(n) });
+    let defines = |lc: &LibraryClass, n: &str| {
+        lc.methods.iter().any(|m| m.name.as_str() == n && m.receiver == MethodReceiver::Instance)
+    };
+    let writer = format!("{}=", name.as_str());
+    if !defines(lc, name.as_str()) {
+        let body = node(ExprNode::Ivar { name: name.clone() });
+        lc.methods.push(instance_method(&lc.name, name.as_str(), Vec::new(), body));
+    }
+    if !defines(lc, &writer) {
+        let body = node(ExprNode::Assign { target: crate::expr::LValue::Ivar { name: name.clone() }, value: var("value") });
+        lc.methods.push(instance_method(&lc.name, &writer, vec![param("value", None)], body));
+    }
+    let lookup = || {
+        node(ExprNode::Send {
+            recv: Some(var("attrs")),
+            method: Symbol::from("[]"),
+            args: vec![node(ExprNode::Lit { value: crate::expr::Literal::Sym { value: name.clone() } })],
+            block: None,
+            parenthesized: false,
+        })
+    };
+    let assign = || {
+        let given = node(ExprNode::Send {
+            recv: Some(node(ExprNode::Send {
+                recv: Some(lookup()),
+                method: Symbol::from("nil?"),
+                args: Vec::new(),
+                block: None,
+                parenthesized: false,
+            })),
+            method: Symbol::from("!"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        });
+        node(ExprNode::If {
+            cond: given,
+            then_branch: node(ExprNode::Send {
+                recv: Some(node(ExprNode::SelfRef)),
+                method: Symbol::from(writer.as_str()),
+                args: vec![lookup()],
+                block: None,
+                parenthesized: false,
+            }),
+            else_branch: node(ExprNode::Lit { value: crate::expr::Literal::Nil }),
+        })
+    };
+    let stmts_of = |body: &Expr| match &*body.node {
+        ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![body.clone()],
+    };
+    let super_attrs = || node(ExprNode::Super { args: Some(vec![var("attrs")]), block: None });
+    // The constructor: the one `sti_subclass_callbacks` stamped (or a new
+    // one), never a hand-written one (`diagnose` reports that).
+    match lc.methods.iter_mut().find(|m| m.name.as_str() == "initialize" && m.receiver == MethodReceiver::Instance) {
+        Some(init) if init.name_span.is_synthetic() => {
+            let mut stmts = stmts_of(&init.body);
+            stmts.push(assign());
+            init.body = node(ExprNode::Seq { exprs: stmts });
+        }
+        Some(_) => {}
+        None => {
+            let empty = node(ExprNode::Hash { entries: Vec::new(), kwargs: false });
+            let mut init = instance_method(
+                &lc.name,
+                "initialize",
+                vec![param("attrs", Some(empty))],
+                node(ExprNode::Seq { exprs: vec![super_attrs(), assign()] }),
+            );
+            init.visibility = crate::dialect::MethodVisibility::Private;
+            lc.methods.insert(0, init);
+        }
+    }
+    for update in ["update", "update!"] {
+        match lc.methods.iter_mut().find(|m| m.name.as_str() == update && m.receiver == MethodReceiver::Instance) {
+            Some(existing) if existing.name_span.is_synthetic() => {
+                let mut stmts = stmts_of(&existing.body);
+                stmts.insert(0, assign());
+                existing.body = node(ExprNode::Seq { exprs: stmts });
+            }
+            Some(_) => {}
+            None => lc.methods.push(instance_method(
+                &lc.name,
+                update,
+                vec![param("attrs", None)],
+                node(ExprNode::Seq { exprs: vec![assign(), super_attrs()] }),
+            )),
+        }
     }
 }
 

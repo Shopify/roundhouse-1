@@ -699,6 +699,8 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("ActionController::UnpermittedParameters", None),
         ("ActionController::UnknownFormat", None),
         ("ActionController::RoutingError", Some(("failures", Ty::Array { elem: Box::new(Ty::Str) }))),
+        // What a strict validation raises (runtime/ruby/active_record/error_classes.rb).
+        ("ActiveModel::StrictValidationFailed", None),
     ] {
         let mut methods = exception_surface.to_vec();
         methods.extend(extra);

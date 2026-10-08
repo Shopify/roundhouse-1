@@ -87,6 +87,12 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
     for lc in &mut app.library_classes {
         // An STI subclass is a library class whose parent IS a model.
         if !lc.parent.as_ref().is_some_and(|p| models.contains(p)) {
+            // A class further down (`Gold < Premium < Account`) inherits
+            // its parent's stamp, which names the parent; its own runs
+            // after it (see `stamp_inheritance_column`).
+            if sti.contains(&lc.name) {
+                stamp_inheritance_column(lc, false);
+            }
             continue;
         }
         let mut folds: Vec<(&'static str, Vec<Symbol>)> = Vec::new();
@@ -103,7 +109,7 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
             }
         }
         if sti.contains(&lc.name) {
-            stamp_inheritance_column(lc);
+            stamp_inheritance_column(lc, true);
         }
     }
 }
@@ -140,9 +146,15 @@ fn fold_targets(call: &Expr) -> Option<(&'static str, Vec<Symbol>)> {
 /// has already assigned them by the time this line runs, and the guard
 /// is what recovers that order.
 ///
+/// Below a direct subclass (`direct` false) the parent's constructor
+/// has stamped ITS name by then, so the guard asks `attrs` instead
+/// (`self.type = "Gold" if attrs[:type].nil? || attrs[:type] == ""`):
+/// an explicit `type:` still wins, and otherwise the deepest class's
+/// stamp, which runs last, names the class Rails' `sti_name` would.
+///
 /// Declines when the subclass writes its own `initialize` — a
 /// hand-written constructor is somebody else's contract.
-fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass) {
+fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass, direct: bool) {
     if lc.methods.iter().any(|m| m.name.as_str() == "initialize") {
         return;
     }
@@ -150,13 +162,23 @@ fn stamp_inheritance_column(lc: &mut crate::dialect::LibraryClass) {
     let attrs = Symbol::from("attrs");
     let syn = |n| Expr::new(span, n);
     let read_type = || {
-        syn(ExprNode::Send {
-            recv: Some(syn(ExprNode::SelfRef)),
-            method: Symbol::from("type"),
-            args: vec![],
-            block: None,
-            parenthesized: true,
-        })
+        if direct {
+            syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::SelfRef)),
+                method: Symbol::from("type"),
+                args: vec![],
+                block: None,
+                parenthesized: true,
+            })
+        } else {
+            syn(ExprNode::Send {
+                recv: Some(syn(ExprNode::Var { id: crate::ident::VarId(0), name: attrs.clone() })),
+                method: Symbol::from("[]"),
+                args: vec![syn(ExprNode::Lit { value: Literal::Sym { value: Symbol::from("type") } })],
+                block: None,
+                parenthesized: false,
+            })
+        }
     };
     let unset = syn(ExprNode::BoolOp {
         op: crate::expr::BoolOpKind::Or,
