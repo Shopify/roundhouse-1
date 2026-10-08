@@ -1382,6 +1382,28 @@ impl<'a> BodyTyper<'a> {
                             args: vec![],
                         }),
                     },
+                    // `C.subclasses` / `C.descendants` (Class#subclasses,
+                    // ActiveSupport's descendants): every element IS a
+                    // subclass of C, and a class-object read types as the
+                    // class itself with dispatch consulting both sides, so
+                    // each element is `C` — `subclasses.each(&:_reset)`
+                    // reaches C's own class method. `superclass` and
+                    // `ancestors` stay `Class`: they climb, and nothing
+                    // says what they climb to.
+                    "subclasses" | "descendants" if call_args.is_empty() => return Ty::Array {
+                        elem: Box::new(Ty::Class { id: id.clone(), args: vec![] }),
+                    },
+                    // Module#< / #<= / #> / #>= on a class object of unknown
+                    // class (what `superclass` answers): true or false when
+                    // the two are related, nil when they aren't. Keyed on the
+                    // `Class` / `Module` receiver: an instance of a user class
+                    // with Comparable reads as `Ty::Class` too, and its `<`
+                    // answers a plain Bool.
+                    "<" | "<=" | ">" | ">="
+                        if call_args.len() == 1 && matches!(id.0.as_str(), "Class" | "Module") =>
+                    {
+                        return Ty::Union { variants: vec![Ty::Bool, Ty::Nil] };
+                    }
                     _ => {}
                 }
                 // Time stdlib subset — `Time.now.utc.iso8601` is the

@@ -1,0 +1,29 @@
+# Signatures for the public surface of active_model_type.rb that other
+# runtime files call: the fallback cast type and the two type registries
+# (ActiveModel::Type's and ActiveRecord::Type's adapter-specific one).
+# A registry answers whatever its registration builds — a built-in Value
+# subclass or an app's own type (Core's Shopify::ModelUuidAsInteger) — so
+# a lookup is a Value, and its cast/serialize/deserialize take and answer
+# untyped values, as ActiveModel::Type::Value's do.
+module ActiveModel
+  module Type
+    def self.default_value: () -> ActiveModel::Type::Value
+    def self.register: (Symbol type_name, ?untyped klass) ?{ (*untyped) -> ActiveModel::Type::Value } -> untyped
+    def self.lookup: (Symbol symbol, *untyped args, **untyped kwargs) -> ActiveModel::Type::Value
+
+    class Value
+      def type: () -> Symbol?
+      def cast: (untyped value) -> untyped
+      def deserialize: (untyped value) -> untyped
+      def serialize: (untyped value) -> untyped
+    end
+  end
+end
+
+module ActiveRecord
+  module Type
+    def self.register: (Symbol type_name, ?untyped klass, **untyped options) ?{ (*untyped) -> ActiveModel::Type::Value } -> untyped
+    def self.lookup: (Symbol symbol, *untyped args, ?adapter: Symbol?, **untyped kwargs) -> ActiveModel::Type::Value
+    def self.adapter_name_from: (untyped model) -> Symbol
+  end
+end

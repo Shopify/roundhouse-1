@@ -2443,8 +2443,8 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 /// Two edits per non-polymorphic belongs_to:
 ///
 ///   1. the writer stashes an UNSAVED value in the reader's cache —
-///      a record with no id yet cannot be found again from the foreign
-///      key, so something has to hold it until the save;
+///      a record that is not in the table yet cannot be found again from
+///      the foreign key, so something has to hold it until the save;
 ///   2. `_autosave_<name>` saves it and takes the id, folded into
 ///      `before_validation`.
 ///
@@ -2454,7 +2454,7 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 ///     @creator_id = 0
 ///   else
 ///     @creator_id = value.id
-///     if value.id == 0
+///     if value.new_record?
 ///       @creator_cache = value
 ///       @creator_loaded = true
 ///     end
@@ -2462,16 +2462,29 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
 /// end
 ///
 /// def _autosave_creator
-///   if @creator_loaded && @creator_id == 0 && !@creator_cache.nil?
+///   if @creator_loaded && !@creator_cache.nil? && @creator_cache.new_record?
 ///     @creator_cache.save
 ///     @creator_id = @creator_cache.id
 ///   end
 /// end
 /// ```
 ///
+/// "Unsaved" is Rails' rule (`save_belongs_to_association`: save when
+/// `association.new_record?`), read off the record, not off the key it
+/// carries. The key misreads both ways: a retyped key (Core's
+/// `model_uuid_attributes`) is nil, not 0, while its target is unsaved,
+/// and a target given its id before its save (`Shop.new(id: …)`) has a
+/// key and is still not in the table. The old `== 0` test saved
+/// neither (tests/belongs_to_autosave_pg_runtime.rs). The cache is read
+/// at save time, so a target assigned new and saved by hand before its
+/// owner is not saved twice, and the owner still takes its id.
+///
 /// A SAVED value deliberately does not populate the cache, so the
 /// reader keeps re-querying by foreign key for those and a later direct
-/// write to the key cannot be answered from a stale object.
+/// write to the key cannot be answered from a stale object. (The CRuby
+/// and JRuby trees' writer also loads every assigned value into the
+/// cache, `load_on_assign`; the `new_record?` test is what keeps a saved
+/// one from being saved again.)
 ///
 /// WHY RUBY-FAMILY AND NOT THE SHARED LOWERING. This started shared and
 /// the strict targets refused it, each in its own way — the two of them
@@ -2539,26 +2552,84 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
             );
             lc.methods.push(autosave_method(&lc.name, &name, &fk));
             fold_before_validation(&mut lc.methods, &lc.name, &name);
+            for m in lc.methods.iter_mut().filter(|m| {
+                m.receiver == MethodReceiver::Instance
+                    && matches!(m.name.as_str(), "initialize" | "update" | "update!")
+            }) {
+                route_object_key_through_writer(&mut m.body, &name, &fk);
+            }
         }
     }
 }
 
-/// `if value.id == 0 then @<name>_cache = value; @<name>_loaded = true end`
+/// `Product.new(shop: s)` / `update(shop: s)` call Rails' `shop=` writer.
+/// The shared constructor and `update` write the key instead,
+/// `self.shop_id = attrs[:shop].id unless attrs[:shop].nil?` (one shape
+/// every target compiles), so an unsaved target given as a keyword never
+/// reached the writer's stash and was never autosaved: on a retyped key
+/// its nil id failed `belongs_to`'s presence check, and an assigned id
+/// was written with no row behind it. Here, beside the patched writer,
+/// that statement calls the writer: `self.shop = attrs[:shop] unless
+/// attrs[:shop].nil?`. Only that exact synthesized shape (a `Cast` of
+/// `<attrs>[:<name>]` read for `.id` into `self.<fk>=`) is rewritten.
+fn route_object_key_through_writer(e: &mut Expr, name: &Symbol, fk: &Symbol) {
+    let fk_writer = format!("{}=", fk.as_str());
+    let lookup = match &*e.node {
+        ExprNode::Send { recv: Some(recv), method, args, .. }
+            if matches!(&*recv.node, ExprNode::SelfRef) && method.as_str() == fk_writer && args.len() == 1 =>
+        {
+            match &*args[0].node {
+                ExprNode::Send { recv: Some(obj), method, args: id_args, .. }
+                    if method.as_str() == "id" && id_args.is_empty() =>
+                {
+                    match &*obj.node {
+                        ExprNode::Cast { value, .. } => match &*value.node {
+                            ExprNode::Send { recv: Some(_), method, args: key, .. }
+                                if method.as_str() == "[]"
+                                    && matches!(key.as_slice(), [k] if matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value == name)) =>
+                            {
+                                Some(value.clone())
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(lookup) = lookup {
+        let span = e.span;
+        let recv = match &*e.node {
+            ExprNode::Send { recv: Some(recv), .. } => recv.clone(),
+            _ => unreachable!("matched a Send with a receiver above"),
+        };
+        *e = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(format!("{}=", name.as_str())),
+                args: vec![lookup],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        return;
+    }
+    e.node.for_each_child_mut(&mut |c| route_object_key_through_writer(c, name, fk));
+}
+
+/// `if value.new_record? then @<name>_cache = value; @<name>_loaded = true end`
 fn stash_unsaved(name: &Symbol, span: Span) -> Expr {
     let syn = |n| Expr::new(span, n);
     let value = || syn(ExprNode::Var { id: VarId(0), name: Symbol::from("value") });
-    let id_read = syn(ExprNode::Send {
-        recv: Some(value()),
-        method: Symbol::from("id"),
-        args: vec![],
-        block: None,
-        parenthesized: false,
-    });
     syn(ExprNode::If {
         cond: syn(ExprNode::Send {
-            recv: Some(id_read),
-            method: Symbol::from("=="),
-            args: vec![syn(ExprNode::Lit { value: Literal::Int { value: 0 } })],
+            recv: Some(value()),
+            method: Symbol::from("new_record?"),
+            args: vec![],
             block: None,
             parenthesized: false,
         }),
@@ -2607,19 +2678,12 @@ fn autosave_method(
             right: r,
         })
     };
-    let fk_zero = syn(ExprNode::Send {
-        recv: Some(syn(ExprNode::Ivar { name: fk.clone() })),
-        method: Symbol::from("=="),
-        args: vec![syn(ExprNode::Lit { value: Literal::Int { value: 0 } })],
-        block: None,
-        parenthesized: false,
-    });
     let cond = and(
         and(
             syn(ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) }),
-            fk_zero,
+            send(send(cache(), "nil?"), "!"),
         ),
-        send(send(cache(), "nil?"), "!"),
+        send(cache(), "new_record?"),
     );
     let body = syn(ExprNode::If {
         cond,

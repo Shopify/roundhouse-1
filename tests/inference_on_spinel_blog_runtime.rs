@@ -22,6 +22,21 @@
 //! contract) and is `#[ignore]`'d while the framework-typing residual
 //! closes. This test runs by default and tracks the inference-only
 //! number — same fixture surface, different machinery.
+//!
+//! Inline RBS method signatures (`#: (String) -> Integer` above a `def`)
+//! are NOT read here, by decision: they are declarations, which this
+//! probe excludes, not code. Ingest puts them in `App::rbs_signatures`,
+//! the same table the `sig/` sidecars fill, and only `ingest_app` reads
+//! them, for application source; `runtime_src`, which types these runtime
+//! files in production, reads only the `.rbs` sidecars. Counting them here
+//! would score typing no production path performs, and would let a
+//! comment above an entry point stand in for the inference this probe
+//! measures. A runtime method's declared type belongs in its `.rbs`
+//! sidecar, where the companion probe
+//! (`inference_on_spinel_blog_runtime_with_rbs`) and production both
+//! read it. An inline `#:` ascription on a local (`values = [] #:
+//! Array[untyped]`) is different in kind: ingest folds it into the
+//! method body, so it is code inference follows, here and in production.
 
 use std::fs;
 use std::path::Path;
@@ -260,6 +275,13 @@ fn untyped_subexpressions_baseline() {
         all_untyped.len(),
         app.library_classes.len()
     );
+    // Every site, one per line, for diffing two runtimes' site sets
+    // (the companion RBS probe reads the same variable).
+    if std::env::var_os("RUNTIME_PROBE_DUMP").is_some() {
+        for site in &all_untyped {
+            eprintln!("{site}");
+        }
+    }
 
     // Loose ceiling — current measurement plus headroom. Tighten as
     // inference improves; failing low is a good thing (un-pin and
@@ -313,6 +335,27 @@ fn untyped_subexpressions_baseline() {
     // RBS probe is NOT at zero here: 6 type_for_attribute /
     // attribute_types sites, the unbound `&block` and the sig-less
     // `ActiveModel::Type.default_value`.)
+    // Ceiling 546, held: the count comes back under it rather than the
+    // bound rising to meet it. Over ffbaf0de7..c9d39872e the count rose
+    // to 649 (entry-point params of the attribute / query_constraints /
+    // ignored_columns / composite-key surface) and 7dccef02f's runtime
+    // restructures brought it to 600. MEASURED with this collector, site
+    // sets diffed at each step (RUNTIME_PROBE_DUMP=1 dumps them):
+    // - `C.subclasses` types as `Array[C]`, and `x < C` narrows a Class
+    //   binding to C: 600 -> 595 (_reset_attribute_types).
+    // - a rest parameter binds as `Array[_]` and a keyword rest as
+    //   `Hash[Symbol, _]`: 595 -> 491. Relation's `*parts` / `*names` /
+    //   `*records` / `*specs` / `*args` methods, and everything downstream
+    //   of them (order_column 32, sort_in_place! 13 and order_descending?
+    //   9 through the now-typed `parts.map { order_term(p) }`), and
+    //   query_constraints' `*columns_list`.
+    // - a local a default assigns (attribute's `no_default`) binds as
+    //   `T | nil`: 491 -> 490.
+    // Untypable by inference alone, as before: the params of entry points
+    // with no caller under runtime/ruby/active_record (attribute,
+    // ignored_columns=, the _attribute_* / _cast_primary_key /
+    // _primary_key_from_database helpers, the error_classes.rb
+    // constructors), and what only they feed.
     const CEILING: usize = 546;
     assert!(
         all_untyped.len() <= CEILING,

@@ -51,6 +51,17 @@ pub(super) enum NarrowPred {
     IsNotNil(VarKey),
     /// `x.is_a?(T)` — narrow to T in then, remove T from union in else.
     IsA(VarKey, Ty),
+    /// `x < C` / `x <= C` with `C` a constant: Module#< / #<= — `x` is a
+    /// class that is C (for `<=`) or inherits from it. A class-object
+    /// read types as the class itself (`Ty::Class { C }`, dispatch
+    /// consulting both sides), so the then side narrows a class object
+    /// of unknown class (`superclass` answers `Class`) to `C`. Applied
+    /// only to that class-object type: the same spelling compares
+    /// numbers and strings (`count < LIMIT`), and those keep their type.
+    /// The false side proves nothing about what `x` is.
+    SubclassOf(VarKey, Ty),
+    /// Negated [`NarrowPred::SubclassOf`] — the inverse.
+    NotSubclassOf(VarKey, Ty),
     /// `!x.is_a?(T)` — inverse.
     IsNotA(VarKey, Ty),
     /// Bare variable as truthiness guard (`if x` / `x && x.foo`).
@@ -126,6 +137,13 @@ pub(super) fn extract_narrowing_with(
                     let ty = const_to_ty(arg)?;
                     Some(NarrowPred::IsA(key, ty))
                 }
+                ("<" | "<=", [arg]) => {
+                    let key = var_key(target)?;
+                    match const_to_ty(arg)? {
+                        ty @ Ty::Class { .. } => Some(NarrowPred::SubclassOf(key, ty)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
@@ -195,6 +213,8 @@ fn negate_pred(p: NarrowPred) -> NarrowPred {
         NarrowPred::IsNotNil(k) => NarrowPred::IsNil(k),
         NarrowPred::IsA(k, t) => NarrowPred::IsNotA(k, t),
         NarrowPred::IsNotA(k, t) => NarrowPred::IsA(k, t),
+        NarrowPred::SubclassOf(k, t) => NarrowPred::NotSubclassOf(k, t),
+        NarrowPred::NotSubclassOf(k, t) => NarrowPred::SubclassOf(k, t),
         NarrowPred::IsTruthy(k) => NarrowPred::IsFalsy(k),
         NarrowPred::IsFalsy(k) => NarrowPred::IsTruthy(k),
         NarrowPred::IsPresent(k) => NarrowPred::IsBlank(k),
@@ -333,6 +353,12 @@ pub(super) fn apply_narrowing(ctx: &Ctx, pred: &NarrowPred, then_branch: bool) -
                 }
             });
         }
+        NarrowPred::SubclassOf(k, ty) | NarrowPred::NotSubclassOf(k, ty) => {
+            let holds = matches!(pred, NarrowPred::SubclassOf(_, _)) == then_branch;
+            if holds {
+                narrow_binding(&mut new_ctx, k, |current| narrow_class_object(current, ty));
+            }
+        }
         NarrowPred::IsPresent(k) | NarrowPred::IsBlank(k) => {
             let is_present = matches!(pred, NarrowPred::IsPresent(_));
             if is_present == then_branch {
@@ -399,6 +425,24 @@ pub(crate) fn remove_nil(ty: &Ty) -> Ty {
         // Not a union — if the type is bare Nil, the "non-nil" branch
         // is unreachable in Ruby; we keep Nil here (the analyzer doesn't
         // flag contradictions). For non-Nil concrete types, no change.
+        other => other.clone(),
+    }
+}
+
+/// The then side of `x < C`: a class object of unknown class (`Class` or
+/// `Module`, alone or with nil, which `<` would have raised on) is `C`.
+/// Any other type is left as it was.
+fn narrow_class_object(current: &Ty, class: &Ty) -> Ty {
+    let is_class_object =
+        |t: &Ty| matches!(t, Ty::Class { id, args } if args.is_empty() && matches!(id.0.as_str(), "Class" | "Module"));
+    match current {
+        t if is_class_object(t) => class.clone(),
+        Ty::Union { variants }
+            if variants.iter().any(|v| is_class_object(v))
+                && variants.iter().all(|v| is_class_object(v) || matches!(v, Ty::Nil)) =>
+        {
+            class.clone()
+        }
         other => other.clone(),
     }
 }

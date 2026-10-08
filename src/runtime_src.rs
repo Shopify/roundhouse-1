@@ -664,7 +664,8 @@ pub fn parse_library_with_rbs(
         let empty_ivars: crate::det::HashMap<Symbol, Ty> =
             crate::det::HashMap::default();
         for m in &mut lc.methods {
-            let ctx = build_ctx(m, &empty_ivars);
+            let mut ctx = build_ctx(m, &empty_ivars);
+            typer.seed_param_default_locals(&mut m.params, &mut ctx);
             typer.analyze_expr(&mut m.body, &ctx);
         }
 
@@ -705,7 +706,8 @@ pub fn parse_library_with_rbs(
                 .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil] }))
                 .collect();
             for m in &mut lc.methods {
-                let ctx = build_ctx(m, &reseeded);
+                let mut ctx = build_ctx(m, &reseeded);
+                typer.seed_param_default_locals(&mut m.params, &mut ctx);
                 typer.analyze_expr(&mut m.body, &ctx);
             }
         }
@@ -986,7 +988,8 @@ pub fn parse_methods_with_rbs_in_ctx(
     let empty_ivars: crate::det::HashMap<Symbol, Ty> =
         crate::det::HashMap::default();
     for m in &mut methods {
-        let ctx = build_ctx(m, &empty_ivars);
+        let mut ctx = build_ctx(m, &empty_ivars);
+        typer.seed_param_default_locals(&mut m.params, &mut ctx);
         typer.analyze_expr(&mut m.body, &ctx);
     }
 
@@ -1002,7 +1005,8 @@ pub fn parse_methods_with_rbs_in_ctx(
             .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil] }))
             .collect();
         for m in &mut methods {
-            let ctx = build_ctx(m, &reseeded);
+            let mut ctx = build_ctx(m, &reseeded);
+            typer.seed_param_default_locals(&mut m.params, &mut ctx);
             typer.analyze_expr(&mut m.body, &ctx);
         }
     }
