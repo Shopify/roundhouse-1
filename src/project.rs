@@ -8785,6 +8785,12 @@ fn unavailable_class_module_construct(name: &str, target: &str) -> Option<&'stat
             Some("ruby_family_runtime_constant")
         };
     }
+    // The CRuby and JRuby trees' ActiveSupport core_ext overlay
+    // (ruby_overlay active_support_core_ext.rb) defines it: what Rails'
+    // `delegate_missing_to` raises on a nil target.
+    if name == "ActiveSupport::DelegationError" {
+        return (target != "jruby").then_some("bundled_constant");
+    }
     // Only the CRuby tree's SQLite3 adapter (and the `sqlite3` gem under
     // it) supplies these, on every other target Spinel included.
     if matches!(name,

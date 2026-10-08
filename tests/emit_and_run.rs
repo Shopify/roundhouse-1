@@ -9160,8 +9160,9 @@ fn a_nameless_rest_is_refused_off_cruby() {
 /// (the class side, a test helper), split across reopened
 /// fragments, or declared beside `**nil`, the emitted program is not
 /// shown to keep it, so the declaration stays refused. So do `...` into
-/// it and a `delegate` to it that writes no `(...)` forwarder (a string
-/// name, a test class, `delegate_missing_to`). Other parameters beside the rest, reified
+/// it, a `delegate` to it that writes no `(...)` forwarder (a string
+/// name, a test class), and a `delegate_missing_to` that writes no
+/// `method_missing` (a target expression). Other parameters beside the rest, reified
 /// methods and keyword splats into it run on the CRuby tree
 /// (`tests/ruby_anonymous_rest_dispatch.rs`), as do a module's own
 /// instance methods and an implicit `super` from it and from an override
@@ -9181,7 +9182,7 @@ fn a_nameless_rest_outside_an_own_instance_method_is_refused_by_name() {
         ("forwarded_into", "class Probe\n  def m(*)\n    :m\n  end\n\n  def g(...)\n    m(...)\n  end\nend\n", "forwarding destination has an unrepresented parameter declaration"),
         ("block_default_passes_on", "class Probe\n  def m(*)\n    [1].map { |x = [*]| x }\n  end\nend\n", "anonymous positional rest is not retained"),
         ("delegate_string", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate \"m\", to: :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
-        ("delegate_missing_to", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate_missing_to :probe\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
+        ("delegate_missing_to_expression", "class Probe\n  def m(*)\n    :m\n  end\nend\n\nclass Wrapper\n  delegate_missing_to \"probe.itself\"\n\n  def probe\n    Probe.new\n  end\nend\n", "delegate to an anonymous positional rest"),
         ("default_passes_on", "class Probe\n  def m(*, k: [*])\n    k\n  end\nend\n", "anonymous positional rest is not retained"),
     ];
     let test = "require \"test_helper\"\n\nclass ProbeTest < ActiveSupport::TestCase\n  test \"t\" do\n    assert Probe\n  end\nend\n";
@@ -9216,6 +9217,86 @@ fn a_library_delegate_to_a_nameless_rest_forwards_on_cruby() {
     for target in [BuildTarget::Jruby, BuildTarget::Spinel] {
         let (_, errors) = nameless_rest_app(probe, test).emit(target);
         assert!(errors.iter().any(|e| e.contains("argument-forwarding delegate to an anonymous positional rest")), "{target:?}: {errors:?}");
+    }
+}
+
+/// A library class's `delegate_missing_to` is written on the CRuby tree
+/// as the `respond_to_missing?` and `method_missing(method, ...)` pair
+/// activesupport 8.2.0.alpha generates (active_support/delegation.rb),
+/// so a call reaching an admitted `def m(*)` hands it what the caller
+/// passed. The target may be a method or an instance variable; a nil
+/// target raises `ActiveSupport::DelegationError` unless `allow_nil:
+/// true`, where a method nil answers runs on nil. The same test passes
+/// natively (9 assertions). Core declares four (`ElasticSearch::ShopEntity`'s
+/// `delegate_missing_to :@shop`, a `delegate_missing_to :data, allow_nil:
+/// true`). The strict targets still refuse it by name.
+#[test]
+fn a_library_delegate_missing_to_forwards_on_cruby() {
+    use roundhouse::project::BuildTarget;
+    let probe = r#"class Probe
+  def m(*)
+    :m
+  end
+
+  def k(a, b: 1)
+    [a, b]
+  end
+
+  def blk
+    yield
+  end
+end
+
+class Wrapper
+  delegate_missing_to :probe
+
+  def probe
+    Probe.new
+  end
+end
+
+class IvarWrapper
+  delegate_missing_to :@inner
+
+  def initialize(inner)
+    @inner = inner
+  end
+end
+
+class NilWrapper
+  delegate_missing_to :inner, allow_nil: true
+
+  def inner
+    nil
+  end
+end
+"#;
+    let test = r#"require "test_helper"
+
+class ProbeTest < ActiveSupport::TestCase
+  test "t" do
+    w = Wrapper.new
+    assert_equal [:m, :m, :m], [w.m, w.m(1, 2), w.m(1, k: 2) { 3 }]
+    assert_equal [[1, 2], 5], [w.k(1, b: 2), w.blk { 5 }]
+    assert_equal [true, false, false], [w.respond_to?(:m), w.respond_to?(:nope), w.respond_to?(:marshal_dump)]
+    assert_raises(NoMethodError) { w.nope }
+    assert_equal :m, IvarWrapper.new(Probe.new).m(1)
+    e = assert_raises(ActiveSupport::DelegationError) { IvarWrapper.new(nil).foo }
+    assert_equal "foo delegated to @inner, but @inner is nil", e.message
+    assert_kind_of NoMethodError, e
+    assert_equal [nil, []], [NilWrapper.new.foo(1), NilWrapper.new.to_a]
+  end
+end
+"#;
+    let (_, errors) = nameless_rest_app(probe, test).emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("delegate_missing_to") || e.contains("delegate to an anonymous positional rest")), "{errors:?}");
+    nameless_rest_app(probe, test).run_test("test/models/probe_test.rb").assert_passes();
+    for target in [BuildTarget::Jruby, BuildTarget::Spinel] {
+        let (_, errors) = nameless_rest_app(probe, test).emit(target);
+        assert!(
+            errors.iter().any(|e| e.contains("argument-forwarding delegate_missing_to to an anonymous positional rest")),
+            "{target:?}: {errors:?}"
+        );
     }
 }
 

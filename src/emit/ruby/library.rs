@@ -8197,11 +8197,21 @@ fn emit_library_class_decl_inner(
                 && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
                     if method.as_str() == "included")
         };
+        // A `delegate_missing_to` is written as the `method_missing` pair
+        // placed at it (`ingest::delegate::missing_delegators`), added
+        // to the methods above.
+        let written_pair = |call: &Expr| {
+            app.ruby_declined_delegate_forwarders.contains_key(&lc.name)
+                && lc.methods.iter().any(|m| {
+                    m.receiver == MethodReceiver::Instance && m.name.as_str() == "method_missing" && m.name_span == call.span
+                })
+        };
         for call in &lc.unknown_calls {
             if !own.iter().any(|c| std::ptr::eq(*c, call))
                 && !crate::analyze::is_include_refusal(call)
                 && !carried_block(call)
                 && !modelled_elsewhere(lc, call)
+                && !written_pair(call)
             {
                 report_dropped_class_body_call(lc, call);
             }
