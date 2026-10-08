@@ -149,13 +149,17 @@ const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "a
 /// Rails gem (the boot refuses its feature), a ported gem (its runtime
 /// port answers, `project::gem_port_files`), a gem the app carries, and
 /// a gem already read. Runs after the sources are registered, which the
-/// feature walk reads.
+/// feature walk reads. A gem owning a feature required for certain (not
+/// only under an `if`) joins `GemBoundary::loaded`.
 pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
     let Some(lock) = app.gem_lock.as_ref() else { return };
     let (features, _, _) = crate::project::gem_source_dependencies_with(app, true);
     if features.is_empty() {
         return;
     }
+    // What the gem sources require for certain, which the boot's gem
+    // facades require in the CRuby tree (`project::gem_source_dependencies`).
+    let (certain, _, _) = crate::project::gem_source_dependencies(app);
     fn deps<'a>(lock: &'a Lockfile, gem: &str) -> impl Iterator<Item = &'a str> {
         lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
     }
@@ -185,6 +189,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     let sources = &app.gem_boundary.source_constants;
     let mut installed = None;
     let mut found = BTreeSet::new();
+    let mut loads = BTreeSet::new();
     for gem in candidates {
         if sources.scans.contains_key(gem)
             || lock.is_in_repo(gem)
@@ -204,7 +209,15 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
         if features.iter().any(|f| owns(f)) {
             found.insert(gem.to_string());
         }
+        if certain.iter().any(|f| owns(f)) {
+            loads.insert(gem.to_string());
+        }
     }
+    // Such a gem loads natively in the CRuby tree as surely as a
+    // Bundler.require entry does: a constant its RBI declares
+    // (elastic-transport's `Elastic::Transport::Transport::Errors::Gone`,
+    // read by elasticsearch-shopify's errors.rb at load) runs as the gem's.
+    app.gem_boundary.loaded.extend(loads);
     if found.is_empty() {
         return;
     }

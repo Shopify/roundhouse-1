@@ -421,3 +421,43 @@ fn a_gem_source_reads_its_own_data_files() {
     ];
     let _ = same_as_native("data", &[("sp", SP)], "sp", "p [Sp::QUERY, Sp::SUBTAGS]\n", "[\"SELECT 1\\n\", {\"en\" => \"en-Latn-US\"}]\n");
 }
+
+/// elasticsearch-shopify 6.0.1's errors.rb lists
+/// `Elastic::Transport::Transport::Errors::BadGateway` and seven more in
+/// CONNECTION_EXCEPTIONS at load; its shopify.rb requires
+/// "elastic/transport", which the boot loads from the gem home (the gem
+/// source's dependency, not a Bundler.require entry). The elastic-transport
+/// RBI declares each class, so the read was decided by the RBI's gem
+/// against the Bundler.require closure alone, which does not hold it:
+/// "declared by the elastic-transport gem, which no emitted tree loads".
+/// optimist 3.2.1 (installed beside the test Ruby) has the same shape.
+#[test]
+fn a_constant_of_a_gem_a_gem_source_requires_runs_as_that_gems() {
+    const ES: &[(&str, &str)] = &[(
+        "es.rb",
+        "require \"optimist\"\n\nmodule Es\n  ERRORS = [Optimist::CommandlineError, Optimist::HelpNeeded].freeze\nend\n",
+    )];
+    let ruby = emit_and_run::ruby()
+        .args(["-e", "s = Gem::Specification.find_by_name('optimist'); print s.version, ' ', s.base_dir"])
+        .output()
+        .expect("ruby");
+    let found = String::from_utf8_lossy(&ruby.stdout).to_string();
+    let (version, home) = found.split_once(' ').expect("the optimist gem is installed");
+    let config = format!("gem_home: {home}\ngem_sources:\n  es: vendor/gems/es-1.0.0\n");
+    let lock = format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    es (1.0.0)\n      optimist\n    optimist ({version})\n\nDEPENDENCIES\n  es\n"
+    );
+    let rbi = "# typed: true\n\nmodule Optimist; end\nclass Optimist::CommandlineError < ::StandardError; end\nclass Optimist::HelpNeeded < ::StandardError; end\n";
+    let rbi_path = format!("sorbet/rbi/gems/optimist@{version}.rbi");
+    let extra = [("roundhouse.yml", config.as_str()), ("Gemfile.lock", lock.as_str()), (rbi_path.as_str(), rbi)];
+    let run = same_as_native_from(
+        "gem-dep",
+        &[("es", ES)],
+        "es",
+        "p Es::ERRORS\n",
+        "[Optimist::CommandlineError, Optimist::HelpNeeded]\n",
+        false,
+        &extra,
+    );
+    assert!(!run.stderr.contains("no emitted tree loads"), "{}", run.stderr);
+}
