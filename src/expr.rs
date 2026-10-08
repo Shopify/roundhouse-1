@@ -72,6 +72,16 @@ pub const RUNTIME_VALUE_REF: u64 = 1 << 20;
 /// (`analyze::runtime_reads`).
 pub const OBJECT_AS_JSON: u64 = 1 << 21;
 
+/// A record's `as_json(options)` with options beyond `only:`, or its
+/// `serializable_hash`: ActiveRecord::Serialization over
+/// ActiveModel::Serialization, which ActiveRecord::Base includes only on
+/// the PostgreSQL CRuby tree (runtime/spinel/cruby/
+/// active_record_active_model.rb, over the ActiveModel serialization
+/// port). `project` refuses it where the finished tree lacks the port
+/// (`analyze::runtime_reads`); the other trees' Base#as_json honors only
+/// `only:`.
+pub const RECORD_SERIALIZATION: u64 = 1 << 22;
+
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
 /// keyword arguments, or a `yield(**value)` argument, which ingest takes
@@ -1686,7 +1696,7 @@ mod tests {
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
-            RUNTIME_VALUE_REF, OBJECT_AS_JSON,
+            RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION,
         ];
         let mut seen = 0u64;
         for bit in bits {

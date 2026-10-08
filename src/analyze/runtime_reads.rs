@@ -559,9 +559,32 @@ fn class_name(ty: &Option<Ty>) -> Option<&str> {
     }
 }
 
+/// The namespace a record's serialization beyond `only:`
+/// (`expr::RECORD_SERIALIZATION`) needs: the ActiveModel serialization
+/// port, which ActiveRecord::Base includes on the one tree that carries
+/// it (runtime/spinel/cruby/active_record_active_model.rb, beside it on
+/// the PostgreSQL CRuby tree).
+const RECORD_SERIALIZATION_PORT: &str = "ActiveModel::Serializers::JSON";
+
 fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut Vec<RuntimeRead>) {
     if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs)) {
         out.push(RuntimeRead { span: expr.span, name: needs.to_string(), shown, in_test, declaration: false });
+    }
+    if expr.decisions & crate::expr::RECORD_SERIALIZATION != 0 && gated(RECORD_SERIALIZATION_PORT) {
+        // `lower::as_json_residue` may have made the record an argument
+        // of `ActiveSupport::JSON::Encoding.as_json`; the method is still
+        // the record's.
+        let method = match &*expr.node {
+            ExprNode::Send { method, .. } if method.as_str() == "serializable_hash" => "serializable_hash",
+            _ => "as_json",
+        };
+        out.push(RuntimeRead {
+            span: expr.span,
+            name: RECORD_SERIALIZATION_PORT.to_string(),
+            shown: format!("ActiveRecord::Base#{method}(options)"),
+            in_test,
+            declaration: false,
+        });
     }
     match &*expr.node {
         ExprNode::Const { path } => {
