@@ -57,6 +57,9 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
     // The PostgreSQL CRuby tree only (`project::apply_postgres_bootstrap`).
     ("runtime/spinel/user_agent_version.rb", "runtime/user_agent_version.rb"),
+    ("runtime/spinel/active_model_naming.rb", "runtime/active_model_naming.rb"),
+    ("runtime/spinel/active_model_attribute_methods.rb", "runtime/active_model_attribute_methods.rb"),
+    ("runtime/spinel/active_model_serialization.rb", "runtime/active_model_serialization.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands
