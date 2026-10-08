@@ -1944,10 +1944,11 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 || (class_self.is_some()
                     && crate::lower::scope_chain::mentions_bare_chain_start(&m.body))
             {
-                crate::lower::scope_chain::rewrite_call_site(
+                crate::lower::scope_chain::rewrite_call_site_in(
                     &mut m.body,
                     &regs,
                     class_self.as_ref(),
+                    is_model || plain_subclasses.contains_key(&lc.name),
                     instance_self.as_ref(),
                 );
             }

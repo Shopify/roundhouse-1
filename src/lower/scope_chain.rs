@@ -2184,6 +2184,12 @@ pub struct Ctx<'a> {
     /// key).limit(1)`), so it seeds `Relation.new(Model)` — like a scope
     /// body, but with no `__rel` parameter to thread.
     pub class_self: Option<ClassId>,
+    /// `class_self` is the class whose body this is (a model or a plain
+    /// model subclass, not a concern's owner), so `self` there is the
+    /// receiving class and implicit roots seed `Relation.new(self)`:
+    /// `Asset.recent` reached as `BigAsset.recent` loads BigAssets, as
+    /// Rails' `Querying` does.
+    pub class_self_is_self: bool,
     /// Name-keyed relation return types of user instance methods (see
     /// `build_user_method_returns`).
     pub user_returns: &'a UserMethodReturns,
@@ -2263,6 +2269,7 @@ impl Ctx<'_> {
             scope_body: self.scope_body.clone(),
             self_const_is_implicit: self.self_const_is_implicit,
             class_self: self.class_self.clone(),
+            class_self_is_self: self.class_self_is_self,
             instance_self: self.instance_self.clone(),
             user_returns: self.user_returns,
             track_targets: self.track_targets,
@@ -3341,6 +3348,25 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
         {
             None
         }
+        // …and in a model's own class method, the `Asset.where(…)` /
+        // `Asset.all` that `qualify_model_class_method_ar_calls` wrote
+        // (the author wrote bare `where(…)`) is the implicit self too,
+        // so it seeds on `self` like the bare form. That receiver was
+        // synthetic, and span filling gives it the whole call's span —
+        // which an author-written `Asset.where` constant, a strict
+        // sub-range of its call, never has; that one keeps its constant.
+        Some(r)
+            if ctx.class_self_is_self
+                && ctx.scope_body.is_none()
+                && (r.span.is_synthetic() || r.span == span)
+                && (method.as_str() == "all" || method.as_str() == "where")
+                && ctx
+                    .class_self
+                    .as_ref()
+                    .is_some_and(|c| const_model(&r, ctx.models).as_ref() == Some(c)) =>
+        {
+            None
+        }
         other => other,
     };
 
@@ -3411,15 +3437,15 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                 // `all` IS a fresh relation; a bare scope call is the
                 // class-level form; a bare chain method seeds a new
                 // relation (there's no `__rel` param here to thread).
-                // In a plain subclass's own class method (`BigAsset <
-                // Asset; def self.recent; order(:id); end`) the relation
-                // is on the receiving class — `self`, so `HugeAsset <
-                // BigAsset` inheriting `recent` loads HugeAssets, as
-                // Rails' `Querying` does — while scopes, columns and the
-                // returned chain model stay the parent model's.
-                let subclass_model = ctx.plain_subclasses.get(&self_class).cloned();
-                let on_self = subclass_model.is_some();
-                let self_model = subclass_model.unwrap_or(self_class.clone());
+                // In a model's or a plain subclass's own class method
+                // (`BigAsset < Asset; def self.recent; order(:id); end`)
+                // the relation is on the receiving class — `self`, so a
+                // subclass reaching `recent` by inheritance loads its own
+                // rows, as Rails' `Querying` does — while scopes, columns
+                // and the returned chain model stay the model's.
+                let on_self = ctx.class_self_is_self;
+                let self_model =
+                    ctx.plain_subclasses.get(&self_class).cloned().unwrap_or(self_class.clone());
                 let seed = || {
                     if on_self {
                         relation_new_of(span, syn(span, ExprNode::SelfRef))
@@ -4246,6 +4272,7 @@ fn rewrite_relation_taking_body(
         scope_body: Some((self_model.clone(), rel_param.clone())),
         self_const_is_implicit,
         class_self: None,
+        class_self_is_self: false,
         instance_self: None,
         track_targets: false,
         user_returns: &empty_returns,
@@ -4265,6 +4292,18 @@ pub fn rewrite_call_site(
     class_self: Option<&ClassId>,
     instance_self: Option<&ClassId>,
 ) {
+    rewrite_call_site_in(expr, regs, class_self, false, instance_self);
+}
+
+/// [`rewrite_call_site`], saying whether `class_self` is the body's own
+/// class (see [`Ctx::class_self_is_self`]).
+pub fn rewrite_call_site_in(
+    expr: &mut Expr,
+    regs: &Registries<'_>,
+    class_self: Option<&ClassId>,
+    class_self_is_self: bool,
+    instance_self: Option<&ClassId>,
+) {
     let ctx = Ctx {
         scopes: regs.scopes,
         models: regs.models,
@@ -4274,6 +4313,7 @@ pub fn rewrite_call_site(
         scope_body: None,
         self_const_is_implicit: false,
         class_self: class_self.cloned(),
+        class_self_is_self,
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
         track_targets: regs.track_targets,
@@ -4489,6 +4529,7 @@ mod tests {
             scope_body: None,
             self_const_is_implicit: false,
             class_self: None,
+            class_self_is_self: false,
             instance_self: None,
             track_targets: false,
             plain_subclasses: no_plain_subclasses(),
@@ -4758,6 +4799,7 @@ mod tests {
             scope_body: None,
             self_const_is_implicit: false,
             class_self: None,
+            class_self_is_self: false,
             user_returns: empty_returns(),
             instance_self: None,
             track_targets: false,
