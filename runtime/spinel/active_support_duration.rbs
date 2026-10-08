@@ -8,10 +8,12 @@ module ActiveSupport
   class Duration
     @seconds: Integer
     @parts: Array[Integer?]
+    @order: Array[Integer]
 
     PART_NAMES: Array[String]
 
-    def initialize: (Integer seconds, ?Array[Integer?]? parts) -> void
+    def initialize: (Integer seconds, ?Array[Integer?]? parts, ?Array[Integer]? order) -> void
+    def self.present_slots: (Array[Integer?] parts) -> Array[Integer]
     def self.single_part: (Integer index, Integer n) -> Array[Integer?]
     def self.seconds: (Integer n) -> Duration
     def self.second: (Integer n) -> Duration
@@ -29,10 +31,20 @@ module ActiveSupport
     def self.month: (Integer n) -> Duration
     def self.years: (Integer n) -> Duration
     def self.year: (Integer n) -> Duration
-    def ago: () -> Time
-    def until: () -> Time
-    def from_now: () -> Time
-    def since: () -> Time
+    def ago: (?Time time) -> Time
+    def until: (?Time time) -> Time
+    def before: (?Time time) -> Time
+    def from_now: (?Time time) -> Time
+    def since: (?Time time) -> Time
+    def after: (?Time time) -> Time
+    def sum: (Integer sign, untyped time) -> untyped
+    def self.move_seconds: (untyped time, untyped seconds, bool date) -> untyped
+    def self.advance_date: (untyped date, Integer index, untyped n) -> untyped
+    def self.advance_time: (Time time, Integer index, untyped n) -> Time
+    def self.change_date: (Time time, Integer year, Integer month, Integer day) -> Time
+    def self.days_in_month: (Integer year, Integer month) -> Integer
+    def self.civil_to_jd: (Integer year, Integer month, Integer day) -> Integer
+    def self.jd_to_civil: (Integer jd) -> Array[Integer]
     def to_i: () -> Integer
     def to_f: () -> Float
     def in_seconds: () -> Integer
@@ -45,12 +57,17 @@ module ActiveSupport
     def to_s: () -> String
     def seconds: () -> Integer
     def part_slots: () -> Array[Integer?]
+    def part_order: () -> Array[Integer]
     def +: (untyped other) -> Duration
     def -: (untyped other) -> Duration
     def -@: () -> Duration
     def inspect: () -> String
     def ==: (untyped other) -> bool
-    def <=>: (untyped other) -> Integer
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+    def <=>: (untyped other) -> Integer?
+    def self.value_of: (untyped other) -> untyped
+    def coerce: (untyped other) -> [untyped, Integer]
     def <: (untyped other) -> bool
     def <=: (untyped other) -> bool
     def >: (untyped other) -> bool
