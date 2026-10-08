@@ -268,6 +268,22 @@ pub(super) fn ingest_model_with_enum_constants(
             let leading_blank = prev_end
                 .map(|pe| source_has_blank_line(source, pe, leading_area_start))
                 .unwrap_or(false);
+            // `concerning :Topic do … end` (`util::ConcerningCall`): the
+            // block's constants are the model's, written where the call
+            // stands, then `include Topic`, the module the library-class
+            // pass over this file builds from the block.
+            if let Some(concerning) = super::util::concerning_call(&stmt) {
+                let mut items = Vec::new();
+                concerning_model_items(&concerning, &owner, file, true, &mut items)?;
+                let (mut leading, mut blank) = (leading, leading_blank);
+                for mut item in items {
+                    *item.leading_comments_mut() = std::mem::take(&mut leading);
+                    item.set_leading_blank_line(std::mem::take(&mut blank));
+                    body.push(item);
+                }
+                prev_end = Some(stmt.location().end_offset());
+                continue;
+            }
             // `enum :status, %i[…]` — one statement standing for a
             // scope + predicate + bang writer per label, so it expands
             // in the walk loop for the same reason `class << self` does.
@@ -1140,6 +1156,79 @@ pub(super) fn ingest_model_body_item(
         leading_comments,
         leading_blank_line: false,
     })
+}
+
+/// A model body's `concerning` block (`util::ConcerningCall`) as body
+/// items: its constants, which bind in the model (the block's cref), a
+/// nested block's included; then, when `mixes_in` (the model's own
+/// block), the `include` / `prepend` of `Model::Topic`. The module's
+/// methods and hooks are the library-class pass's (`concerning_modules`),
+/// and its class-side carriers the concern splice's. An `included` or
+/// `prepended` block holding DSL is refused by name: the model concern
+/// splice reads authored concern modules, so the DSL would be lost.
+fn concerning_model_items(
+    concerning: &super::util::ConcerningCall<'_>,
+    owner: &ClassId,
+    file: &str,
+    mixes_in: bool,
+    out: &mut Vec<ModelBodyItem>,
+) -> IngestResult<()> {
+    let topic = ClassId(Symbol::from(format!("{}::{}", owner.0.as_str(), concerning.topic)));
+    let stmts = concerning.block.body().map(flatten_statements).unwrap_or_default();
+    for stmt in &stmts {
+        if stmt.as_constant_write_node().is_some() || stmt.as_constant_path_write_node().is_some() {
+            out.push(ModelBodyItem::Unknown {
+                expr: ingest_expr(stmt, file)?,
+                leading_comments: Vec::new(),
+                leading_blank_line: false,
+            });
+            continue;
+        }
+        if let Some(inner) = super::util::concerning_call(stmt) {
+            concerning_model_items(&inner, &topic, file, false, out)?;
+            continue;
+        }
+        let Some(call) = stmt.as_call_node() else { continue };
+        let hook = constant_id_str(&call.name());
+        if call.receiver().is_none() && matches!(hook, "included" | "prepended") {
+            let dsl = call
+                .block()
+                .and_then(|b| b.as_block_node())
+                .and_then(|b| b.body())
+                .map(flatten_statements)
+                .unwrap_or_default()
+                .iter()
+                .any(|inner| visibility::definition(inner).is_none());
+            if dsl {
+                return Err(super::error_site::at(
+                    IngestError::Unsupported {
+                        file: file.into(),
+                        message: format!("an `{hook}` block with class-body statements in a model's `concerning` block is not modeled"),
+                    },
+                    stmt,
+                ));
+            }
+        }
+    }
+    if mixes_in && concerning.mixes_in {
+        let span = super::util::node_span(&concerning.call.as_node(), file);
+        let path = topic.0.as_str().split("::").map(Symbol::from).collect();
+        out.push(ModelBodyItem::Unknown {
+            expr: Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from(if concerning.prepend { "prepend" } else { "include" }),
+                    args: vec![Expr::new(span, ExprNode::Const { path })],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            leading_comments: Vec::new(),
+            leading_blank_line: false,
+        });
+    }
+    Ok(())
 }
 
 /// Expand `enum :status, %i[active deactivated banned]` into the DSL it

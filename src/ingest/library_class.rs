@@ -180,7 +180,9 @@ fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> I
         if let Some(base) = struct_base {
             out.push(base);
         }
+        let concerns = concerning_modules(class.body(), &lc.name, file)?;
         out.push(lc);
+        out.extend(concerns);
     }
     for (scope, module) in find_all_modules_with_scope(node) {
         if module.location().start_offset() >= before {
@@ -192,10 +194,11 @@ fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> I
         // INSTANCE methods; they reach an includer only through an
         // `extend` (the authored `included` hook, or Concern's
         // `append_features`), never the owner's own singleton.
-        out.push(
-            library_class_from_module_node_with_scope(&module, &scope, file)
-                .map_err(|err| super::error_site::at(err, &module.as_node()))?,
-        );
+        let lc = library_class_from_module_node_with_scope(&module, &scope, file)
+            .map_err(|err| super::error_site::at(err, &module.as_node()))?;
+        let concerns = concerning_modules(module.body(), &lc.name, file)?;
+        out.push(lc);
+        out.extend(concerns);
     }
     Ok(out)
 }
@@ -1984,6 +1987,103 @@ pub(super) fn library_class_from_module_node_with_scope(
     })
 }
 
+/// `Owner::Topic`, the module a `concerning :Topic` / `concern :Topic`
+/// block in `owner`'s body defines (`const_set` on the body's self).
+fn concerning_topic_id(owner: &ClassId, topic: &str) -> ClassId {
+    ClassId(Symbol::from(format!("{}::{topic}", owner.0.as_str())))
+}
+
+/// The modules the `concerning` / `concern` blocks of `owner`'s body
+/// define (`util::ConcerningCall`), each as the explicit module it is:
+///
+/// ```ruby
+/// module Behaviour
+///   extend ActiveSupport::Concern
+///   def action = ACTION
+/// end
+/// ```
+///
+/// Its methods, includes, hooks (`included do`, `class_methods do`) and
+/// captured calls are the block's, walked as a module body, since
+/// `module_eval` makes the new module the default definee and self. The
+/// block's constants are NOT its: the block keeps the enclosing body's
+/// cref, so they are `owner`'s, carried where `walk_decl_body` meets the
+/// call. The module extends ActiveSupport::Concern, as `concern` makes
+/// it, so the concern machinery (class-method splices, hooks) treats it
+/// as any authored concern. A block's own `concerning` nests under it.
+fn concerning_modules(
+    body: Option<ruby_prism::Node<'_>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<Vec<LibraryClass>> {
+    let mut out = Vec::new();
+    for concerning in super::util::concerning_calls(body) {
+        let at = |err| super::error_site::at(err, &concerning.call.as_node());
+        let name = concerning_topic_id(owner, &concerning.topic);
+        let visibility = Visibility::resolve_library(concerning.block.body().as_ref(), file, Some(&name)).map_err(at)?;
+        let DeclBody {
+            includes,
+            mut methods,
+            unknown_calls,
+            class_initializers,
+            method_aliases,
+            conditional_definitions,
+            class_attribute_effects,
+            ..
+        } = walk_decl_body_with_visibility(concerning.block.body(), &name, file, false, &visibility).map_err(at)?;
+        admit_nameless_rest(&mut methods);
+        if !class_attribute_effects.is_empty() {
+            return Err(at(IngestError::Unsupported {
+                file: file.into(),
+                message: "`class_attribute` in a `concerning` block (outside `included do`) is not modeled".into(),
+            }));
+        }
+        // `@@x = v` in the block resolves through the block's cref, the
+        // enclosing body, not the new module.
+        if !class_initializers.is_empty() {
+            return Err(at(IngestError::Unsupported {
+                file: file.into(),
+                message: "class-variable initialization in a `concerning` block is not modeled".into(),
+            }));
+        }
+        // `@x = v` in the block runs with the new module as self.
+        let class_ivar_initializers = with_class_body_ivar_writes(Vec::new(), concerning.block.body(), file).map_err(at)?;
+        let span = super::util::node_span(&concerning.call.as_node(), file);
+        let concern = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("extend"),
+                args: vec![Expr::new(
+                    span,
+                    ExprNode::Const { path: vec![Symbol::from("ActiveSupport"), Symbol::from("Concern")] },
+                )],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        out.push(LibraryClass {
+            conditional_definitions,
+            method_aliases,
+            top_level_constants: Vec::new(),
+            name: name.clone(),
+            is_module: true,
+            parent: None,
+            parent_span: Span::synthetic(),
+            includes,
+            methods,
+            nullable_columns: Vec::new(),
+            origin: None,
+            constants: Vec::new(),
+            unknown_calls: std::iter::once(concern).chain(unknown_calls).collect(),
+            class_ivar_initializers,
+            visibility_overrides: Vec::new(),
+        });
+        out.extend(concerning_modules(concerning.block.body(), &name, file)?);
+    }
+    Ok(out)
+}
+
 /// A class or module body's own instance-variable writes (`@registry =
 /// {} #: Hash[String, bool]`, Core's ModelUuidColumns), appended to the
 /// body's class-side initializers. They set the ivar on the class or
@@ -3044,6 +3144,36 @@ fn walk_decl_body_with_visibility<'pr>(
             // and it means the body's own self, exactly as the bare form.
             if call.receiver().is_none_or(|r| r.as_self_node().is_some()) {
                 let kw = constant_id_str(&call.name());
+                // `concerning :Topic do … end` (`util::ConcerningCall`):
+                // the block's constants are this body's, written where
+                // the call stands, and the module it defines
+                // (`concerning_modules`) is included or prepended here.
+                // `concern :Topic do … end` defines it only.
+                if !force_class_receiver && let Some(concerning) = super::util::concerning_call(&stmt) {
+                    let inner = walk_decl_body(concerning.block.body(), owner, file, false)?;
+                    out.constants.extend(inner.constants);
+                    if concerning.mixes_in {
+                        let topic = concerning_topic_id(owner, &concerning.topic);
+                        if concerning.prepend {
+                            // As an authored `prepend Topic` is carried.
+                            let span = super::util::node_span(&stmt, file);
+                            let path = topic.0.as_str().split("::").map(Symbol::from).collect();
+                            out.unknown_calls.push(Expr::new(
+                                span,
+                                ExprNode::Send {
+                                    recv: None,
+                                    method: Symbol::from("prepend"),
+                                    args: vec![Expr::new(span, ExprNode::Const { path })],
+                                    block: None,
+                                    parenthesized: false,
+                                },
+                            ));
+                        } else {
+                            out.includes.push(topic);
+                        }
+                    }
+                    continue;
+                }
                 // `class_methods do … end` — ActiveSupport::Concern's
                 // class-side block: its defs become class methods of
                 // every includer (`Account.find_local!`). Capture them
@@ -4531,30 +4661,64 @@ pub fn ingest_concern_class_method_spans(
         }
     }
 
+    /// The `concerning` / `concern` blocks of a body, each the body of
+    /// the Concern module `Owner::Topic` it defines (`concerning_modules`),
+    /// with the call that makes it one, nested blocks included.
+    fn concerning_bodies<'pr>(
+        body: Option<ruby_prism::Node<'pr>>,
+        owner: &ClassId,
+        file: &str,
+        out: &mut Vec<(ClassId, ruby_prism::Node<'pr>, Option<Span>)>,
+    ) {
+        for concerning in super::util::concerning_calls(body) {
+            let id = concerning_topic_id(owner, &concerning.topic);
+            if let Some(block_body) = concerning.block.body() {
+                out.push((id.clone(), block_body, Some(super::util::node_span(&concerning.call.as_node(), file))));
+            }
+            concerning_bodies(concerning.block.body(), &id, file, out);
+        }
+    }
+
     let result = parse(source);
     let root = result.node();
     let mut out = Vec::new();
+    // Each module body, then each `concerning` block's: the module it
+    // defines extends ActiveSupport::Concern without a statement saying so.
+    let mut subjects: Vec<(ClassId, ruby_prism::Node<'_>, Option<Span>)> = Vec::new();
+    let mut concerning: Vec<(ClassId, ruby_prism::Node<'_>, Option<Span>)> = Vec::new();
     for (scope, module) in find_all_module_declarations_with_scope(&root) {
         let Some(name_path) = module_name_path(&module) else { continue };
+        let mut full_path: Vec<String> = scope.clone();
+        full_path.extend(name_path.iter().cloned());
+        let id = ClassId(Symbol::from(full_path.join("::")));
+        concerning_bodies(module.body(), &id, file, &mut concerning);
         // A nested `ClassMethods` is reported under its PARENT, which is
         // the module an app actually includes.
         if name_path.as_slice() == ["ClassMethods".to_string()] && !scope.is_empty() {
             continue;
         }
-        let mut full_path: Vec<String> = scope.clone();
-        full_path.extend(name_path);
-        let id = ClassId(Symbol::from(full_path.join("::")));
-
         let Some(body) = module.body() else { continue };
+        subjects.push((id, body, None));
+    }
+    for (scope, class) in find_all_classes_with_scope(&root) {
+        let Some(name_path) = class_name_path(&class) else { continue };
+        let id = ClassId(Symbol::from(scope.into_iter().chain(name_path).collect::<Vec<_>>().join("::")));
+        concerning_bodies(class.body(), &id, file, &mut concerning);
+    }
+    subjects.extend(concerning);
+    for (id, body, concerning) in subjects {
         let mut spans: Vec<Span> = Vec::new();
         let mut bridges: Vec<Span> = Vec::new();
         let mut has_nested_carrier = false;
-        let mut concern_extensions = Vec::new();
+        let in_concerning = concerning.is_some();
+        let mut concern_extensions: Vec<Span> = concerning.into_iter().collect();
         let mut concern_calls = Vec::new();
         let mut has_other_extensions = false;
         for stmt in flatten_statements(body) {
             if let Some(m) = stmt.as_module_node() {
-                if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) {
+                // In a `concerning` block, `module ClassMethods` binds in
+                // the enclosing body (the block's cref), not the concern.
+                if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()]) && !in_concerning {
                     has_nested_carrier = true;
                     defs_in(m.body(), file, &mut spans);
                 }
