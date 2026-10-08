@@ -101,3 +101,50 @@ fn a_class_declared_in_a_file_body_conditional_exists_only_in_its_branch() {
         &[(&[("GQLC_TOP", "1")], ":top\n"), (&[], "nil\n")],
     );
 }
+
+/// A class declared in a conditional and reopened unconditionally by
+/// another file. Natively the reopening defines it whether or not the
+/// branch runs; the IR merges both bodies into one class, which the
+/// emitted tree writes inside the branch. Not modeled: named at the
+/// conditional declaration, with the reopening file.
+const REOPENED: &[(&str, &str)] = &[
+    (
+        "gqlc/q.rb",
+        "module Gqlc\n  module Q\n    if ENV[\"GQLC_LEGACY\"].nil?\n      class V\n        def a = 1\n      end\n    end\n\n    def self.f = 1\n  end\nend\n",
+    ),
+    ("gqlc/q_ext.rb", "require \"gqlc/q\"\n\nmodule Gqlc\n  module Q\n    class V\n      def b = 2\n    end\n  end\nend\n"),
+];
+
+#[test]
+fn a_conditional_declaration_reopened_in_another_file_is_named() {
+    let script = "p Gqlc::Q::V.instance_methods(false).sort\n";
+    assert_eq!(native(REOPENED, &format!("require \"gqlc/q_ext\"\n{script}"), &[]), "[:a, :b]\n");
+    assert_eq!(native(REOPENED, &format!("require \"gqlc/q_ext\"\n{script}"), &[("GQLC_LEGACY", "1")]), "[:b]\n");
+
+    let root = std::env::temp_dir().join(format!("rh_conditional_reopened_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let gem: Vec<(String, &str)> = REOPENED.iter().map(|(path, text)| (format!("vendor/gems/gqlc-1.0.0/lib/{path}"), *text)).collect();
+    for (path, text) in [
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("config/application.rb", "require \"gqlc/q_ext\"\n"),
+        ("roundhouse.yml", "gem_sources:\n  gqlc: vendor/gems/gqlc-1.0.0\n"),
+        ("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    gqlc (1.0.0)\n\nDEPENDENCIES\n  gqlc\n"),
+    ]
+    .into_iter()
+    .chain(gem.iter().map(|(path, text)| (path.as_str(), *text)))
+    {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_roundhouse")).arg("check").arg(&root).output().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let row = text.lines().find(|l| l.contains("q.rb:4:7:")).unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains("error[unsupported]"), "{row}");
+    assert!(
+        row.contains("`Gqlc::Q::V` is declared in a load-time conditional here and unconditionally in vendor/gems/gqlc-1.0.0/lib/gqlc/q_ext.rb"),
+        "{row}"
+    );
+}
