@@ -39,7 +39,8 @@
 //! takes the same compiled path and the call runs at class load.
 //!
 //! So does a direct `attribute :col[, :type], default: value`
-//! (`defaulted_attribute`) over a column other than the primary key: the
+//! (`defaulted_attribute`), the primary key included (Core's `attribute
+//! :id, :suid, default: -> { Shopify::Uuid.generate_new }`): the
 //! compiled `initialize` starts a new record's attribute from the class's
 //! declared default (`Model::defaulted_attributes`).
 
@@ -104,13 +105,15 @@ pub(crate) fn defaulted_attributes(model: &Model, app: &App) -> Vec<Symbol> {
 }
 
 /// A direct `attribute :col[, :type], default: value` body statement
-/// over a column of `table` other than its primary key, the type (if
+/// over a column of `table`, the type (if
 /// any) a Symbol: Rails records the type (the column's own when none is
 /// named) and the value a new record's attribute starts from, a Proc
 /// called for each record. The column takes the retypable path and the
 /// call runs at class load as written (`ModelBodyItem::ClassBody`, or
 /// carried by an STI subclass) for the runtime's `attribute`. Other
-/// options, a non-Symbol type and the primary key stay unclaimed.
+/// options and a non-Symbol type stay unclaimed. A retyped primary key
+/// keys finds, binds and the INSERT through the declared type
+/// (`adapter_emit::key_ty`).
 pub(crate) fn defaulted_attribute(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
     if method.as_str() != "attribute" || !on_self(recv) {
@@ -131,10 +134,7 @@ pub(crate) fn defaulted_attribute(expr: &Expr, table: &crate::schema::Table) -> 
     if !matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "default") {
         return None;
     }
-    if name == "id" || table.primary_key_columns.iter().any(|c| c.as_str() == name) {
-        return None;
-    }
-    table.columns.iter().find(|c| c.name.as_str() == name && !c.primary_key).map(|c| c.name.clone())
+    table.columns.iter().find(|c| c.name.as_str() == name).map(|c| c.name.clone())
 }
 
 /// The body calls of the model's STI subclasses (library classes whose
