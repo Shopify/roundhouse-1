@@ -68,6 +68,7 @@ mod filter_targets;
 pub mod graphql;
 mod harvest_return;
 mod dirty_retype;
+mod superclass_binding;
 mod typing_mode;
 mod inferred_types;
 pub mod inquiry;
@@ -1356,6 +1357,10 @@ impl Analyzer {
             !app.source_index_required || !app.sources.is_empty(),
             "source_index_missing: ingested source app cannot use IR-only analysis"
         );
+
+        // After every registration: the lookup reads the whole registry,
+        // gem RBI classes included.
+        superclass_binding::bind(app, &const_resolver, &mut classes);
 
         let data_factories = data::register(app, &const_resolver, &mut classes);
 
@@ -6546,9 +6551,13 @@ impl Analyzer {
 
     /// Parents are recorded as written, so `module Api; class
     /// AuthsController < BaseController` records `BaseController` for
-    /// the class the registry keys `Api::BaseController`. Qualify a
-    /// single-segment parent against the child's enclosing namespaces,
-    /// innermost first — Ruby's lexical rule.
+    /// the class the registry keys `Api::BaseController`. A parent the
+    /// registry knows is taken as it is: the record drops a leading `::`
+    /// (`< ::Operation` and `< Operation` both read `Operation`), and a
+    /// source library class's parent is already bound by Ruby's lookup
+    /// (rubydex at ingest, `superclass_binding` for a gem's class). Only a
+    /// single-segment parent no class is gets qualified against the
+    /// child's enclosing namespaces, innermost first.
     fn lexical_parent(&self, child: &ClassId, parent: &ClassId) -> ClassId {
         if self.classes.contains_key(parent) || parent.0.as_str().contains("::") {
             return parent.clone();
