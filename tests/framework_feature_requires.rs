@@ -45,6 +45,7 @@ require "active_support/notifications"
 require "active_support/logger"
 require "action_controller/metal/exceptions"
 require "action_view"
+require "active_support/core_ext/string/strip"
 
 require "rails/engine"
 
@@ -160,6 +161,20 @@ module ProbeGem
      h.deep_transform_keys(&:to_s), { a: 1 }.assert_valid_keys(:a, :b), invalid]
   end
 
+  # typed_parameters' deprecation warning shape.
+  def self.strip
+    usage = <<-EOM
+      This command does such and such.
+
+      Supported options are:
+        -h         This message
+    EOM
+    frozen = "  a\n    b\n".freeze
+    [usage.strip_heredoc, "x\n  y".strip_heredoc, "".strip_heredoc, "  a\n\n  b\r\n".strip_heredoc,
+     frozen.strip_heredoc, frozen.strip_heredoc.frozen?, "  a".dup.strip_heredoc.frozen?, "\t\tq\n\t r".strip_heredoc,
+     "  \n    z".strip_heredoc]
+  end
+
   def self.notifications
     events = []
     subscriber = ActiveSupport::Notifications.subscribe("probe_gem.ran") { |event| events << [event.name, event.payload] }
@@ -215,6 +230,7 @@ module ProbeGem
       concern: concern,
       try: try,
       hash_keys: hash_keys,
+      strip: strip,
       load_hooks: (ActiveSupport.run_load_hooks(:probe_gem_hook, :base); HOOKS),
       notifications: notifications,
       logger: logger,
@@ -299,6 +315,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // `included`/`prepended` blocks, a second `included` refused.
         "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
         "try: [nil, 3, nil, \"ABC\", nil, :nope]",
+        "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
         "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",
         "Unknown key: :z. Valid keys are: :a, :b",
         "load_hooks: [[:ran, :base]]",
