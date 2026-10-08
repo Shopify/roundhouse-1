@@ -4011,6 +4011,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
         .map_err(|e| format!("read inflector runtime: {e}"))?;
     files.push(("runtime/active_support_inflector.rb".into(), inflector));
+    // ActiveSupport::Multibyte::Unicode (8.2.0.alpha multibyte/unicode.rb),
+    // which the Inflector's `transliterate` calls.
+    let unicode = crate::runtime_files::read_to_string("runtime/spinel/active_support_multibyte_unicode.rb")
+        .map_err(|e| format!("read Multibyte::Unicode runtime: {e}"))?;
+    files.push(("runtime/active_support_multibyte_unicode.rb".into(), unicode));
     // ActiveSupport::Ractors (8.2.0.alpha ractors.rb), and, where the
     // lockfile has the i18n gem, active_support/i18n.rb with Active
     // Support's English locale: I18n's load path as `require "rails"`
@@ -4101,6 +4106,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ),
         ));
     }
+    framework_feature_files(files);
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
     // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
     for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
@@ -4164,14 +4170,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // which Inflections::Uncountables uses.
             let delegate = "require_relative \"module_delegate\"\n";
             let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
-            content.insert_str(at, "require_relative \"active_support_inflector\"\n");
+            content.insert_str(at, "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n");
             // active_support/i18n.rb, which active_support/railtie loads
             // with `require "rails"`: after the Inflector, whose
             // `ordinal` reads the locale it adds. Then ActiveModel's
             // naming, conversion, attribute methods and serialization,
             // which `require "active_model"` autoloads, over the
             // Inflector: before any app file or gem source names them.
-            let at = at + "require_relative \"active_support_inflector\"\n".len();
+            let at = at + "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n".len();
             let i18n = if carries_i18n { "require_relative \"active_support_i18n\"\n" } else { "" };
             let ports: String = std::iter::once(i18n.to_string())
                 .chain(
@@ -4725,6 +4731,85 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
 
 /// A Rails feature (`rails`, `active_support/...`, `action_...`): this
 /// tree's runtime ports answer it, so nothing requires it.
+/// A Rails feature a native gem requires as it loads, with the runtime
+/// ports that answer it on the PostgreSQL CRuby tree (runtime/features,
+/// first on the load path). Each is one Rails has loaded before any gem
+/// or app file natively (`require "rails"` and the framework railties
+/// Core's config/application.rb requires: active_record, action_controller,
+/// action_view, action_mailer, active_job), so the gem's require is a no-op
+/// there; here it requires the tree's port of that framework, which boot
+/// has loaded or loads now. A feature whose ports the tree does not carry
+/// gets no file. Collected from Core's boot (`file_statement_not_run`
+/// LoadErrors: job-iteration's `require "active_job"`, responders' and
+/// typed_parameters' `require "action_controller"`, identifications'
+/// `require "active_support/multibyte/unicode"`).
+const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
+    ("active_support", &["active_support_lazy_load_hooks", "active_support_core_ext", "active_support_inflector"]),
+    ("active_support/core_ext/object/blank", &["active_support_core_ext"]),
+    ("active_support/multibyte", &["active_support_multibyte_unicode"]),
+    ("active_support/multibyte/unicode", &["active_support_multibyte_unicode"]),
+    ("active_model", &["active_model_errors", "active_model_type", "active_model_validator"]),
+    ("active_record", &["active_record"]),
+    ("action_controller", &["action_controller"]),
+    ("action_mailer", &["action_mailer"]),
+    ("active_job", &["active_job", "active_job_errors"]),
+];
+
+/// Rails features a native gem requires that Rails has not loaded by
+/// then natively and the tree ports only in part (Active Support's every
+/// core extension, the whole Hash extension set, the per-thread module
+/// accessors). Each answers with a named LoadError, never the gem home's
+/// activesupport (Rails' own code over the ports).
+const FRAMEWORK_FEATURES_NOT_PORTED: &[(&str, &str)] = &[
+    ("active_support/all", "loads every Active Support extension (core_ext, time, json, ...), which this tree ports only in part"),
+    ("active_support/core_ext/hash", "loads every Hash extension (conversions' to_xml/from_xml, deep_merge, indifferent access, ...), which this tree ports only in part"),
+    (
+        "active_support/core_ext/module/attribute_accessors_per_thread",
+        "defines Module#thread_mattr_accessor and its kin, which this tree does not port",
+    ),
+];
+
+/// runtime/features/<feature>.rb for [`FRAMEWORK_FEATURE_PORTS`] and
+/// [`FRAMEWORK_FEATURES_NOT_PORTED`]; a feature that already has a file
+/// (the Inflector's, i18n's) keeps it.
+fn framework_feature_files(files: &mut Vec<(String, String)>) {
+    let carried = |files: &[(String, String)], port: &str| files.iter().any(|(p, _)| *p == format!("runtime/{port}.rb"));
+    let exists = |files: &[(String, String)], feature: &str| files.iter().any(|(p, _)| *p == format!("runtime/features/{feature}.rb"));
+    for (feature, ports) in FRAMEWORK_FEATURE_PORTS {
+        let ports: Vec<&str> = ports.iter().copied().filter(|port| carried(files, port)).collect();
+        if ports.is_empty() || exists(files, feature) {
+            continue;
+        }
+        let up = "../".repeat(feature.matches('/').count() + 1);
+        let mut text = format!(
+            "# `require {feature:?}` on this tree, from a gem's own code: Rails\n\
+             # loaded it before any gem natively, and here the tree's ports are\n\
+             # that framework (project.rs::FRAMEWORK_FEATURE_PORTS).\n\
+             # runtime/gem_facades.rb puts this directory first on the load path.\n"
+        );
+        for port in ports {
+            text.push_str(&format!("require_relative \"{up}{port}\"\n"));
+        }
+        files.push((format!("runtime/features/{feature}.rb"), text));
+    }
+    for (feature, why) in FRAMEWORK_FEATURES_NOT_PORTED {
+        if exists(files, feature) {
+            continue;
+        }
+        let message = format!("roundhouse: error[framework_feature_not_ported]: `require {feature:?}` {why}; not loaded");
+        files.push((
+            format!("runtime/features/{feature}.rb"),
+            format!(
+                "# `require {feature:?}` on this tree: not ported\n\
+                 # (project.rs::FRAMEWORK_FEATURES_NOT_PORTED), and never the gem home's\n\
+                 # activesupport. runtime/gem_facades.rb puts this directory first on\n\
+                 # the load path.\n\
+                 raise LoadError, {message:?}\n"
+            ),
+        ));
+    }
+}
+
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     feature == "rails"
         || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
@@ -9246,6 +9331,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_support_tryable.rb"
         && p != "runtime/active_support_inflector.rb"
+        && p != "runtime/active_support_multibyte_unicode.rb"
         && p != "runtime/active_support_ractors.rb"
         && p != "runtime/active_support_i18n.rb"
         && p != "runtime/active_support_i18n_railtie.rb"

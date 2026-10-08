@@ -11,9 +11,12 @@
 # native one, and replaces the CRuby overlay's rule-subset `pluralize` and
 # `singularize` (runtime/active_support_core_ext.rb) with the Inflector's.
 #
-# Not carried: `parameterize`. The Inflector's transliterates a non-ASCII
-# string through I18n, which this tree does not carry; the overlay's
-# ASCII form stays.
+# `parameterize` is carried where the tree carries I18n (the lockfile has
+# i18n; runtime/active_support_i18n.rb loads before this file): the
+# Inflector's transliterates a non-ASCII string through I18n and
+# ActiveSupport::Multibyte::Unicode (runtime/
+# active_support_multibyte_unicode.rb), "Ærøskøbing" => "aeroskobing".
+# Without I18n the overlay's ASCII form stays.
 
 class String
   def pluralize(count = nil, locale = :en)
@@ -92,5 +95,13 @@ class String
 
   def foreign_key(separate_class_name_and_id_with_underscore = true)
     ActiveSupport::Inflector.foreign_key(self, separate_class_name_and_id_with_underscore)
+  end
+end
+
+if defined?(::I18n)
+  class String
+    def parameterize(separator: "-", preserve_case: false, locale: nil)
+      ActiveSupport::Inflector.parameterize(self, separator: separator, preserve_case: preserve_case, locale: locale)
+    end
   end
 end
