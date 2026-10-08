@@ -418,6 +418,11 @@ fn emitted_substituted_has_one_and_class_eval_predicate_run() {
 a = Article.create!(title: "Hello world", body: "abcdefghij")
 raise "empty has_one" unless a.spotlight_present? == false
 Comment.create!(article: a, body: "hi", commenter: "x")
+# Rails' has_one reader keeps the target it loaded, nil included
+# (activerecord 8.1.4: `a.spotlight_present?` stays false here), until
+# `reload` resets the association.
+raise "has_one reader cache" unless a.spotlight_present? == false
+a.reload
 raise "has_one reader" unless a.spotlight_present?
 raise "wrong child" unless a.spotlight.body == "hi"
 puts "substituted has_one passed"
