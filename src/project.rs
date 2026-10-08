@@ -6701,6 +6701,15 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         body.push_str("    }.freeze,\n");
     }
     body.push_str("  }.freeze\n");
+    let compiled_features = compiled_gem_features(app, &program_anchors, &declarations_by_source, &emitted_file);
+    body.push_str(
+        "  # feature of a gem compiled into this tree (a gem source) => the files\n  \
+         # requiring it loads (`project::compiled_gem_features`)\n  COMPILED_GEM_FEATURES = {\n",
+    );
+    for (feature, loads) in &compiled_features {
+        writeln!(body, "    {feature:?} => {loads:?},").unwrap();
+    }
+    body.push_str("  }.freeze\n");
     body.push_str(AUTOLOAD_RUNTIME);
 
     // The environment's `config.eager_load`, as the app wrote it. Rails'
@@ -6727,6 +6736,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     if !app.eager_load.is_empty() {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
+    }
+    if !compiled_features.is_empty() {
+        body.push_str(COMPILED_GEM_REQUIRE);
     }
     if boot_programs.is_empty() {
         body.push_str("RoundhouseAutoload.register(Object)\n");
@@ -7068,6 +7080,73 @@ fn load_declarations_through_their_program(
         }
     }
 }
+
+/// Each feature of a gem this tree compiles from source (`gem_sources:`,
+/// `App::gem_source_dirs`): a file under the gem's `lib/`, by the path a
+/// `require` names it with, and the emitted files requiring it loads (its
+/// file program, else the files of the classes and modules it declares,
+/// as a file program's `require` of it loads them). A native gem
+/// requiring one gets the compiled gem: shopify_session 7.40.0's
+/// `shopify_session/rack` requires `utils/coder.rb`, whose `require
+/// "paquito"` names paquito, which Core compiles. The gem home's copy of
+/// such a gem is registered as loaded and kept off `$LOAD_PATH`
+/// (`compiled_gem_native_copies_block`), so that require raised
+/// LoadError and `ShopifySession::Rack::SessionMiddleware` was never
+/// defined.
+fn compiled_gem_features(
+    app: &App,
+    program_anchors: &std::collections::BTreeSet<String>,
+    declarations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+    emitted_file: &dyn Fn(&str) -> bool,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    if app.gem_source_dirs.is_empty() {
+        return out;
+    }
+    let sources = app
+        .sources
+        .iter()
+        .map(|f| f.path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&f.path))
+        .filter(|rel| rel.ends_with(".rb"));
+    for rel in sources {
+        let Some(feature) = app
+            .gem_source_dirs
+            .iter()
+            .find_map(|dir| rel.strip_prefix(dir.as_str()).and_then(|rest| rest.strip_prefix("lib/")))
+            .and_then(|rest| rest.strip_suffix(".rb"))
+        else {
+            continue;
+        };
+        let program = format!("models/roundhouse_files/{}", rel.strip_suffix(".rb").unwrap_or(rel));
+        let loads: Vec<String> = if program_anchors.contains(&program) {
+            vec![program]
+        } else {
+            declarations_by_source.get(rel).into_iter().flatten().filter(|a| emitted_file(a)).cloned().collect()
+        };
+        if !loads.is_empty() {
+            out.entry(feature.to_string()).or_insert(loads);
+        }
+    }
+    out
+}
+
+/// The `require` of a compiled gem's feature (`COMPILED_GEM_FEATURES`,
+/// [`compiled_gem_features`]), installed once app/models.rb has defined
+/// RoundhouseAutoload: it loads the compiled files, as the gem's own
+/// file would define them. Every other require is RubyGems' own.
+const COMPILED_GEM_REQUIRE: &str = r##"
+# A gem the tree compiles from source answers its own features for a
+# native gem that requires one (`project::compiled_gem_features`).
+module Kernel
+  alias_method :roundhouse_require_before_compiled_gems, :require
+
+  private def require(feature)
+    files = feature.is_a?(String) && RoundhouseAutoload::COMPILED_GEM_FEATURES[feature.delete_suffix(".rb")]
+    return roundhouse_require_before_compiled_gems(feature) unless files
+    files.map { |file| roundhouse_require_before_compiled_gems(RoundhouseAutoload.path(file)) }.any?
+  end
+end
+"##;
 
 /// The registration half of the generated `app/models.rb`
 /// ([`apply_models_autoload`]).
