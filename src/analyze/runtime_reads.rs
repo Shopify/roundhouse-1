@@ -34,6 +34,10 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
+    ("runtime/spinel/active_support_isolated_execution_state.rb", "runtime/active_support_isolated_execution_state.rb"),
+    ("runtime/spinel/active_support_logger.rb", "runtime/active_support_logger.rb"),
+    ("runtime/spinel/active_support_callbacks.rb", "runtime/active_support_callbacks.rb"),
+    ("runtime/spinel/active_support_descendants_tracker.rb", "runtime/active_support_descendants_tracker.rb"),
     ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
@@ -50,7 +54,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
 /// rescue, and `security_utils.rb` answers
 /// `ActiveSupport::SecurityUtils.secure_compare`. A name either declares
 /// stays ungated though a gated port declares it too.
-const SHARED_RUNTIME: &[&str] = &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb"];
+const SHARED_RUNTIME: &[&str] = &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb", "runtime/ruby/logger.rb"];
 
 /// Runtime files whose VALUES are gated though their namespaces are not:
 /// railties' Rails::Railtie and Rails::Engine are a lowering's concern
@@ -234,6 +238,57 @@ pub(crate) fn is_runtime_declared_namespace(name: &str) -> bool {
             })
             .collect()
     }).contains(name)
+}
+
+/// The class methods a gated port module gives the class that includes it:
+/// the instance methods of its `ClassMethods` module, which the module's
+/// `append_features` (ActiveSupport::Concern's, written out in the port)
+/// extends the includer with. `ActiveSupport::Callbacks` gives
+/// `define_callbacks`, `set_callback`, `skip_callback` and the rest, which
+/// an includer's body calls (Core's Plus::Plan::Change).
+pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> {
+    static METHODS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    METHODS.get_or_init(|| {
+        struct Carriers(Vec<String>, HashMap<String, Vec<String>>);
+        impl Carriers {
+            fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+                self.0.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
+                if let Some(body) = body {
+                    ruby_prism::Visit::visit(self, &body);
+                }
+                self.0.pop();
+            }
+        }
+        impl<'pr> ruby_prism::Visit<'pr> for Carriers {
+            fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+                self.enter(node.constant_path().location().as_slice(), node.body());
+            }
+            fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+            fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if node.receiver().is_some() || self.0.last().map(String::as_str) != Some("ClassMethods") {
+                    return;
+                }
+                let owner = self.0[..self.0.len() - 1].join("::");
+                if owner.is_empty() {
+                    return;
+                }
+                let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+                self.1.entry(owner).or_default().push(name);
+            }
+        }
+        let mut carriers = Carriers(Vec::new(), HashMap::default());
+        for (source, _) in RUBY_FAMILY_RUNTIME {
+            let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+            let parsed = ruby_prism::parse(text.as_bytes());
+            if parsed.errors().next().is_none() {
+                ruby_prism::Visit::visit(&mut carriers, &parsed.node());
+            }
+        }
+        carriers.1
+    }).get(module).map(Vec::as_slice)
 }
 
 /// A gated port's constant aliases of its own classes, by the alias's
@@ -439,28 +494,50 @@ pub(crate) fn ruby_family_runtime_reads(app: &App) -> Vec<RuntimeRead> {
 /// class or model, as (span, including class, module). A library class
 /// keeps its includes as names, so its span is synthetic, as the
 /// analyzer's own include refusal is.
-pub(crate) fn ruby_family_runtime_includes(app: &App) -> Vec<(Span, String, String)> {
+pub(crate) fn ruby_family_runtime_includes(app: &App) -> Vec<(Span, String, &'static str, String)> {
     let resolver = app.const_resolver.for_sources(&app.sources);
     let names = ruby_family_runtime_names();
     let gated = |name: &str| names.contains_key(name) && !resolver.has_source_namespace(name);
     let mut out = Vec::new();
     for class in &app.library_classes {
         for included in class.includes.iter().filter(|m| gated(m.0.as_str())) {
-            out.push((Span::synthetic(), class.name.0.to_string(), included.0.to_string()));
+            out.push((Span::synthetic(), class.name.0.to_string(), "includes", included.0.to_string()));
+        }
+        // A body `extend M` of a port module (Core's `extend
+        // ActiveSupport::DescendantsTracker`), which the Ruby family replays
+        // (`emit::ruby::library::runtime_mixin_macro_calls`).
+        for call in &class.unknown_calls {
+            let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { continue };
+            let verb = match method.as_str() {
+                "extend" => "extends",
+                "prepend" => "prepends",
+                _ => continue,
+            };
+            for arg in args {
+                if let ExprNode::Const { path } = &*arg.node {
+                    let name = written(path);
+                    if gated(&name) {
+                        out.push((call.span, class.name.0.to_string(), verb, name));
+                    }
+                }
+            }
         }
     }
     for model in &app.models {
         for item in &model.body {
             let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
             let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-            if !matches!(method.as_str(), "include" | "extend" | "prepend") {
-                continue;
-            }
+            let verb = match method.as_str() {
+                "include" => "includes",
+                "extend" => "extends",
+                "prepend" => "prepends",
+                _ => continue,
+            };
             for arg in args {
                 if let ExprNode::Const { path } = &*arg.node {
                     let name = written(path);
                     if gated(&name) {
-                        out.push((expr.span, model.name.0.to_string(), name));
+                        out.push((expr.span, model.name.0.to_string(), verb, name));
                     }
                 }
             }
@@ -486,7 +563,13 @@ mod tests {
             ("Rails::Configuration", "runtime/rails_configuration.rb"),
             ("ActiveSupport::Cache::MemoryStore", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::Strategy::LocalCache", "runtime/active_support_cache.rb"),
-            ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_isolated_execution_state.rb"),
+            ("ActiveSupport::LoggerSilence", "runtime/active_support_logger.rb"),
+            ("ActiveSupport::LoggerThreadSafeLevel", "runtime/active_support_logger.rb"),
+            ("ActiveSupport::Logger::SimpleFormatter", "runtime/active_support_logger.rb"),
+            ("ActiveSupport::Callbacks", "runtime/active_support_callbacks.rb"),
+            ("ActiveSupport::Callbacks::CallbackChain", "runtime/active_support_callbacks.rb"),
+            ("ActiveSupport::DescendantsTracker", "runtime/active_support_descendants_tracker.rb"),
             ("ActiveSupport::Cache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
             ("ActiveSupport::Testing::TimeHelpers", "runtime/active_support_testing_time_helpers.rb"),
@@ -521,6 +604,9 @@ mod tests {
         assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");
         assert!(!names.contains_key("ActiveSupport::MessageVerifier::InvalidSignature"), "{names:?}");
         assert!(!names.contains_key("ActiveSupport::SecurityUtils"), "{names:?}");
+        // runtime/ruby/logger.rb declares these for every target.
+        assert!(!names.contains_key("ActiveSupport::Logger"), "{names:?}");
+        assert!(!names.contains_key("ActiveSupport::TaggedLogging"), "{names:?}");
         for name in ["ActiveSupport::MessageVerifier", "ActiveSupport::MessageEncryptor", "ActiveSupport::Cache::MemoryStore"] {
             assert!(is_runtime_declared_namespace(name), "{name}");
         }

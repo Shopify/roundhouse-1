@@ -2341,6 +2341,34 @@ module WebPush
 end
 "##;
 
+/// The ruby family's `runtime/logger.rb`: Ruby's own Logger (the logger
+/// gem both trees load), activesupport's `ActiveSupport::Logger <
+/// ::Logger` over it (runtime/spinel/active_support_logger.rb), and the
+/// shared port's `ActiveSupport::TaggedLogging` wrapper, cut from
+/// `shared` (runtime/ruby/logger.rb). The shared port's own `Logger`
+/// and `ActiveSupport::Logger` exist for the targets with no stdlib; on
+/// these trees a second `Logger::Formatter` would reopen Ruby's, and an
+/// `ActiveSupport::Logger` that is no `::Logger` loses the severities,
+/// `add` and `level` a subclass reaches (Core's StructuredLogger).
+fn ruby_family_logger(shared: &str) -> Result<String, String> {
+    const TAGGED: &str = "  # `ActiveSupport::TaggedLogging.new(logger)`";
+    let at = shared.find(TAGGED).ok_or("runtime/ruby/logger.rb: no ActiveSupport::TaggedLogging section")?;
+    let tagged = &shared[at..];
+    if !tagged.trim_end().ends_with("end\nend") {
+        return Err("runtime/ruby/logger.rb: TaggedLogging is not the file's last definition".into());
+    }
+    Ok(format!(
+        "# Ruby's own logger with activesupport's ActiveSupport::Logger over it\n\
+         # (runtime/active_support_logger.rb) — see `project::ruby_family_logger`.\n\
+         # The port at runtime/ruby/logger.rb exists for the targets that have\n\
+         # no stdlib; its TaggedLogging wrapper follows.\n\
+         require \"logger\"\n\
+         require \"stringio\"\n\
+         require_relative \"active_support_logger\"\n\n\
+         module ActiveSupport\n{tagged}"
+    ))
+}
+
 /// The ruby family's `runtime/ipaddr.rb`: Ruby's own, plus the ONE
 /// method the port has and the stdlib does not. `runtime/ruby/ipaddr.rb`
 /// keeps the address as an `Array[Integer]` of octets because the strict
@@ -2918,6 +2946,11 @@ fn ruby_family_files(
                         require \"tempfile\"\n"
                 .to_string();
         }
+        // `Logger`: Ruby's own, with activesupport's ActiveSupport::Logger
+        // over it (`ruby_family_logger`).
+        if path == "runtime/logger.rb" {
+            *content = ruby_family_logger(content)?;
+        }
         // `Timeout`: default gem on CRuby/JRuby; the port is for Spinel.
         if path == "runtime/timeout.rb" {
             *content = "# Ruby's own timeout — see `project::ruby_runtime_files`.\n\
@@ -3106,6 +3139,16 @@ fn ruby_family_files(
         crate::runtime_files::read_to_string("runtime/spinel/module_delegate.rb")
             .map_err(|e| format!("read runtime/spinel/module_delegate.rb: {e}"))?,
     ));
+    // ActiveSupport::Logger over Ruby's Logger (runtime/logger.rb above
+    // requires it) and the execution-scoped state its thread-local level
+    // and the cache port keep, ported from activesupport 8.2.0.alpha.
+    for name in ["active_support_isolated_execution_state", "active_support_logger"] {
+        files.push((
+            format!("runtime/{name}.rb"),
+            crate::runtime_files::read_to_string(&format!("runtime/spinel/{name}.rb"))
+                .map_err(|e| format!("read runtime/spinel/{name}.rb: {e}"))?,
+        ));
+    }
     // `Rails.configuration` / `Rails.application.config` answering the
     // lifted config keys (see the file's header): computed-name dispatch,
     // so ruby-family only, and required beside module_delegate below.
@@ -3207,6 +3250,32 @@ fn ruby_family_files(
             "runtime/active_model_validator.rb".to_string(),
             crate::runtime_files::read_to_string("runtime/spinel/active_model_validator.rb")
                 .map_err(|e| format!("read runtime/spinel/active_model_validator.rb: {e}"))?,
+        ));
+    }
+    // ActiveSupport::Callbacks (define_callbacks / set_callback /
+    // skip_callback / run_callbacks), ported from activesupport 8.2.0.alpha
+    // (see the file's header; tests/active_support_callbacks_port.rs holds
+    // it to native ActiveSupport). Methods defined from computed names,
+    // `instance_exec` and `send`, so ruby-family only, and carried where
+    // the app's own code names the module: Core's Plus::Plan::Change and
+    // the Payments::Vault concerns include it. gem_facades.rb requires it,
+    // before any app file loads.
+    // Its DescendantsTracker rides with it, and on its own where the app
+    // names the tracker (Core extends classes with it).
+    let carries_callbacks = carries_named(&files, &["ActiveSupport::Callbacks"]);
+    let carries_descendants_tracker = carries_callbacks || carries_named(&files, &["ActiveSupport::DescendantsTracker"]);
+    if carries_callbacks {
+        files.push((
+            "runtime/active_support_callbacks.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_callbacks.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_callbacks.rb: {e}"))?,
+        ));
+    }
+    if carries_descendants_tracker {
+        files.push((
+            "runtime/active_support_descendants_tracker.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_descendants_tracker.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_descendants_tracker.rb: {e}"))?,
         ));
     }
 
@@ -3335,6 +3404,16 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_validators {
         format!("{gem_facades}require_relative \"active_model_validator\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_descendants_tracker {
+        format!("{gem_facades}require_relative \"active_support_descendants_tracker\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_callbacks {
+        format!("{gem_facades}require_relative \"active_support_callbacks\"\n")
     } else {
         gem_facades
     };
@@ -7244,13 +7323,13 @@ fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(St
     let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
     // `include M` of a runtime module: the analyzer resolved it, and the
     // class body raises at load wherever the finished tree lacks M.
-    for (span, owner, name) in includes {
+    for (span, owner, verb, name) in includes {
         if runtime.contains(&name) {
             continue;
         }
         let file = names.get(&name).copied().unwrap_or("the Ruby-family runtime");
         emit::diagnostics::report_unsupported(span, target.as_str(), "include", format!(
-            "{owner} includes {name}, declared by the Ruby-family runtime ({file}), which {} does not emit",
+            "{owner} {verb} {name}, declared by the Ruby-family runtime ({file}), which {} does not emit",
             target.as_str()));
     }
     let harness = files.iter().find(|(p, _)| p == "test/test_helper.rb")
@@ -8172,8 +8251,15 @@ fn spinel_files_with_assertions(
     // Monitor and computed-name dispatch, pushed back by the two
     // ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_cache.rb");
+    // And for ActiveSupport::Logger over Ruby's Logger and the state it
+    // and the cache keep: the ruby-family forks push both back, and
+    // runtime/logger.rb is the shared port here.
+    files.retain(|(p, _)| p != "runtime/active_support_logger.rb" && p != "runtime/active_support_isolated_execution_state.rb");
     files.retain(|(p, _)| p != "runtime/active_support_mem_cache_store.rb");
     files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");
+    // And for ActiveSupport::Callbacks, pushed back by the two ruby-family
+    // forks where the app names it.
+    files.retain(|(p, _)| p != "runtime/active_support_callbacks.rb" && p != "runtime/active_support_descendants_tracker.rb");
     // And for the messages port and its JSON coder (OpenSSL, Marshal),
     // pushed back by the two ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");
