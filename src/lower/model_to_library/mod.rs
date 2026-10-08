@@ -651,9 +651,9 @@ pub(crate) fn is_constant_prepend(expr: &Expr) -> bool {
         && args.iter().all(|a| matches!(&*a.node, ExprNode::Const { .. }))
 }
 
-/// `mattr_accessor` / `cattr_accessor` `default:` / block seeds → class
-/// ivar writes emitted once on the model class object, then the body's
-/// `ModelBodyItem::ClassBody` statements in source order (class_attribute
+/// `Model::class_attr_defaults` → class ivar writes emitted once on the
+/// model class object, then the body's `ModelBodyItem::ClassBody`
+/// statements in source order (class_attribute and `cattr_*`/`mattr_*`
 /// seeds, class-side writes, carried `included do` statements).
 fn collect_class_attr_initializers(model: &Model) -> Vec<Expr> {
     model
@@ -2033,10 +2033,12 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
             let existing_is_attr_half = existing.signature.is_none()
                 && match existing.kind {
                     AccessorKind::AttributeReader => {
-                        matches!(
-                            &*existing.body.node,
-                            ExprNode::Ivar { name } if name == &existing.name
-                        )
+                        // `@name`, or the `@@name` of a `cattr_*`.
+                        match &*existing.body.node {
+                            ExprNode::Ivar { name } => name == &existing.name,
+                            ExprNode::Var { name, .. } => name.as_str().strip_prefix("@@") == Some(existing.name.as_str()),
+                            _ => false,
+                        }
                     }
                     AccessorKind::AttributeWriter => {
                         let base = existing
@@ -2044,13 +2046,13 @@ fn push_user_methods(methods: &mut Vec<MethodDef>, model: &Model) {
                             .as_str()
                             .strip_suffix('=')
                             .unwrap_or(existing.name.as_str());
-                        matches!(
-                            &*existing.body.node,
-                            ExprNode::Assign {
-                                target: LValue::Ivar { name },
-                                ..
-                            } if name.as_str() == base
-                        )
+                        match &*existing.body.node {
+                            ExprNode::Assign { target: LValue::Ivar { name }, .. } => name.as_str() == base,
+                            ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+                                name.as_str().strip_prefix("@@") == Some(base)
+                            }
+                            _ => false,
+                        }
                     }
                     AccessorKind::Method => false,
                 };

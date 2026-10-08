@@ -1490,13 +1490,15 @@ fn survey_mode_keeps_the_class_when_one_body_item_is_unsupported() {
 }
 
 #[test]
-fn cattr_classvar_bodies_normalize_to_class_ivars() {
+fn cattr_classvar_bodies_share_the_class_variable() {
+    use roundhouse::expr::LValue;
     use roundhouse::ingest::ingest_library_classes;
     use roundhouse::{Expr, ExprNode};
 
     // The extras/keybase.rb shape: cattr_accessor storage and verbatim
-    // `@@X` reads must agree (class-level ivar), and the `@@X = nil`
-    // body initializer drops as semantically exact.
+    // `@@X` reads are one class variable (`ingest::cattr`), and the
+    // `@@X = nil` body initializer runs after the declaration's seed, in
+    // source order.
     let src = br#"class Keybase
   cattr_accessor :DOMAIN
 
@@ -1510,49 +1512,19 @@ end
     let classes = ingest_library_classes(src, "extras/keybase.rb").expect("ingest");
     let kb = &classes[0];
 
-    fn has_classvar(e: &Expr) -> bool {
-        let mut found = false;
-        fn walk(e: &Expr, found: &mut bool) {
-            if let ExprNode::Var { name, .. } = &*e.node {
-                if name.as_str().starts_with("@@") {
-                    *found = true;
-                }
-            }
-            e.node.for_each_child(&mut |c| walk(c, found));
-        }
-        walk(e, &mut found);
+    fn reads_classvar(e: &Expr, var: &str) -> bool {
+        let mut found = matches!(&*e.node, ExprNode::Var { name, .. } if name.as_str() == var);
+        e.node.for_each_child(&mut |c| found |= reads_classvar(c, var));
         found
     }
-    fn reads_ivar(e: &Expr, ivar: &str) -> bool {
-        let mut found = false;
-        fn walk(e: &Expr, ivar: &str, found: &mut bool) {
-            if let ExprNode::Ivar { name } = &*e.node {
-                if name.as_str() == ivar {
-                    *found = true;
-                }
-            }
-            e.node.for_each_child(&mut |c| walk(c, ivar, found));
-        }
-        walk(e, ivar, &mut found);
-        found
-    }
-
-    let enabled = kb
-        .methods
-        .iter()
-        .find(|m| m.name.as_str() == "enabled?")
-        .expect("enabled? ingested");
-    assert!(
-        !has_classvar(&enabled.body) && reads_ivar(&enabled.body, "DOMAIN"),
-        "class-method @@DOMAIN read should normalize to the @DOMAIN class ivar"
-    );
-    // The cattr_accessor reader uses the same storage.
-    let reader = kb
-        .methods
-        .iter()
-        .find(|m| m.name.as_str() == "DOMAIN")
-        .expect("cattr reader synthesized");
-    assert!(reads_ivar(&reader.body, "DOMAIN"), "accessor reads @DOMAIN");
+    let method = |name: &str| kb.methods.iter().find(|m| m.name.as_str() == name).unwrap_or_else(|| panic!("{name}"));
+    assert!(reads_classvar(&method("enabled?").body, "@@DOMAIN"), "authored read stays @@DOMAIN");
+    assert!(reads_classvar(&method("DOMAIN").body, "@@DOMAIN"), "the accessor reads @@DOMAIN");
+    let [seed, authored] = kb.class_ivar_initializers.as_slice() else {
+        panic!("seed then authored write: {:?}", kb.class_ivar_initializers)
+    };
+    assert!(matches!(&*seed.node, ExprNode::If { .. }), "`@@DOMAIN = nil unless defined?(@@DOMAIN)`: {seed:?}");
+    assert!(matches!(&*authored.node, ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@DOMAIN"));
 }
 
 #[test]
@@ -2100,39 +2072,56 @@ fn richer_defined_call_shapes_remain_explicitly_unsupported() {
 }
 
 #[test]
-fn native_classvar_writes_cannot_split_modeled_cattr_storage() {
+fn native_classvar_writes_are_the_modeled_cattr_storage() {
+    use roundhouse::expr::LValue;
+    use roundhouse::ExprNode;
     for declaration in ["cattr_accessor", "mattr_accessor"] {
         let source = format!("class Probe; {declaration} :count; def bump; @@count = 11; end; def self.current; @@count; end; end");
-        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-            .expect_err("native and modeled storage cannot silently diverge");
-        assert!(err.to_string().contains("alongside cattr/mattr storage"), "{err}");
+        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").expect("one storage");
+        let method = |name: &str, receiver| {
+            classes[0].methods.iter().find(|m| m.name.as_str() == name && m.receiver == receiver).unwrap_or_else(|| panic!("{name}"))
+        };
+        use roundhouse::dialect::MethodReceiver::{Class, Instance};
+        assert!(matches!(&*method("bump", Instance).body.node,
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
+        for (name, receiver) in [("count", Class), ("count", Instance)] {
+            assert!(matches!(&*method(name, receiver).body.node, ExprNode::Var { name, .. } if name.as_str() == "@@count"));
+        }
+        for (name, receiver) in [("count=", Class), ("count=", Instance)] {
+            assert!(matches!(&*method(name, receiver).body.node,
+                ExprNode::Assign { target: LValue::Var { name, .. }, .. } if name.as_str() == "@@count"));
+        }
     }
 }
 
 #[test]
-fn cattr_defaults_cannot_be_silently_dropped_with_native_initializers() {
+fn cattr_defaults_keep_source_order_with_native_initializers() {
+    use roundhouse::ExprNode;
     for declaration in ["cattr_reader", "cattr_writer", "cattr_accessor", "mattr_reader", "mattr_writer", "mattr_accessor"] {
-        for default in ["default: 41", "default: nil", "**{default: 41}", "**options", ""] {
+        for default in ["default: 41", "default: nil", ""] {
             let call = if default.is_empty() {
                 format!("{declaration}(:count) {{ 41 }}")
             } else {
                 format!("{declaration} :count, {default}")
             };
-            for body in [format!("@@count = nil; {call}"), format!("{call}; @@count = nil")] {
+            for (body, authored_first) in [(format!("@@count = nil; {call}"), true), (format!("{call}; @@count = nil"), false)] {
                 let source = format!("class Probe; {body}; def self.current; @@count; end; end");
-                let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                    .expect_err("an unmodeled default must not become an unset class ivar");
-                assert!(err.to_string().contains("cattr/mattr defaults require source-order initialization"), "{err}");
+                let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").expect("ordered");
+                let inits = &classes[0].class_ivar_initializers;
+                assert_eq!(inits.len(), 2, "{source}: {inits:?}");
+                let authored = if authored_first { &inits[0] } else { &inits[1] };
+                assert!(matches!(&*authored.node, ExprNode::Assign { value, .. }
+                    if matches!(&*value.node, ExprNode::Lit { value: roundhouse::expr::Literal::Nil })),
+                    "{source}: the authored write keeps its place: {inits:?}");
+                assert!(inits[0].span.start < inits[1].span.start, "{source}: {inits:?}");
             }
-            // Standalone cattr/mattr modeling predates this native-initializer
-            // slice; don't widen its existing approximation in this PR.
-            let source = format!("class Probe; {call}; end");
-            roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-                .expect("standalone class-attribute ingest remains unchanged");
         }
-        let source = format!("class Probe; @@count = nil; {declaration} :count; end");
-        let classes = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").unwrap();
-        assert!(classes[0].class_ivar_initializers.is_empty(), "default-free nil storage remains modeled");
+        // A splatted option hash may carry anything: refused, not guessed.
+        for default in ["**{default: 41}", "**options"] {
+            let source = format!("class Probe; {declaration} :count, {default}; end");
+            let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb").expect_err("splat");
+            assert!(err.to_string().contains("keyword splat"), "{err}");
+        }
     }
 }
 
@@ -2342,13 +2331,15 @@ fn nested_class_methods_cannot_relocate_native_initializers() {
     assert_eq!(carrier.class_ivar_initializers.len(), 1, "{carrier:?}");
     assert!(carrier.methods.iter().any(|m| m.name.as_str() == "flag" && m.receiver == roundhouse::dialect::MethodReceiver::Instance));
 
-    // A cattr in the same body keeps its pre-existing storage approximation.
+    // A cattr in the same body is that module's `@@flag` too: the
+    // authored write, then the declaration's seed, both its own.
     let classes = ingest_library_classes(
         b"module Probe; module ClassMethods; @@flag = nil; cattr_accessor :flag; def read; @@flag; end; end; end",
         "probe.rb",
     ).unwrap();
     let carrier = classes.iter().find(|class| class.name.0.as_str() == "Probe::ClassMethods").unwrap();
-    assert!(carrier.class_ivar_initializers.is_empty());
+    assert_eq!(carrier.class_ivar_initializers.len(), 2, "{carrier:?}");
+    assert!(classes.iter().find(|class| class.name.0.as_str() == "Probe").unwrap().class_ivar_initializers.is_empty());
     assert!(carrier.methods.iter().any(|method| method.name.as_str() == "read"));
 
     // An initializer actually owned by Probe must not be rejected.

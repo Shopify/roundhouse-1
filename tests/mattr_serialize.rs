@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use roundhouse::dialect::{MethodReceiver, ModelBodyItem};
 use roundhouse::expr::ExprNode;
 use roundhouse::ingest::ingest_app_from_tree;
-use roundhouse::Symbol;
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -50,6 +49,22 @@ fn class_method_names(app: &roundhouse::App, model: &str) -> Vec<String> {
         .collect()
 }
 
+/// The class-body seed `@@name = …` a `cattr_*`/`mattr_*` runs where it
+/// stands (`ingest::cattr`), and whether its value is a literal nil
+/// (`@@name = nil unless defined?(@@name)` is an `If`).
+fn seeded(model: &roundhouse::dialect::Model, name: &str) -> bool {
+    let storage = format!("@@{name}");
+    model.body.iter().any(|item| match item {
+        ModelBodyItem::ClassBody { expr, .. } => match &*expr.node {
+            ExprNode::Assign { target: roundhouse::expr::LValue::Var { name, .. }, .. } => name.as_str() == storage,
+            ExprNode::If { else_branch, .. } => matches!(&*else_branch.node,
+                ExprNode::Assign { target: roundhouse::expr::LValue::Var { name, .. }, .. } if name.as_str() == storage),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 #[test]
 fn mattr_default_keyword_literal_shapes_expand() {
     let body = r#"
@@ -67,10 +82,7 @@ fn mattr_default_keyword_literal_shapes_expand() {
         .find(|m| m.name.0.as_str() == "Article")
         .unwrap();
     for name in ["label", "count", "flag", "empty", "tags", "meta"] {
-        assert!(
-            article.class_attr_defaults.contains_key(&Symbol::from(name)),
-            "missing default for {name}"
-        );
+        assert!(seeded(article, name), "missing seed for {name}");
         assert!(
             class_method_names(&app, "Article").contains(&name.to_string()),
             "missing class reader {name}: {:?}",
@@ -96,10 +108,9 @@ fn cattr_block_default_and_mattr_const_default_expand() {
         .iter()
         .find(|m| m.name.0.as_str() == "Article")
         .unwrap();
-    assert!(article.class_attr_defaults.contains_key(&Symbol::from("factory")));
-    assert!(article.class_attr_defaults.contains_key(&Symbol::from("banner")));
-    assert!(article.class_attr_defaults.contains_key(&Symbol::from("only_read")));
-    assert!(article.class_attr_defaults.contains_key(&Symbol::from("only_write")));
+    for name in ["factory", "banner", "only_read", "only_write"] {
+        assert!(seeded(article, name), "missing seed for {name}");
+    }
     let names = class_method_names(&app, "Article");
     assert!(names.contains(&"factory".to_string()), "{names:?}");
     assert!(names.contains(&"banner".to_string()), "{names:?}");
@@ -111,8 +122,10 @@ fn cattr_block_default_and_mattr_const_default_expand() {
     );
 }
 
+/// `instance_reader: false` is ActiveSupport's own option: the class
+/// pair and the instance writer, no instance reader.
 #[test]
-fn instance_reader_kwarg_stays_unexpanded() {
+fn instance_reader_kwarg_omits_the_instance_reader() {
     let body = "  mattr_accessor :hidden, instance_reader: false, default: 1\n";
     let app = ingest_app_from_tree(article_app(body, "")).expect("ingest");
     let article = app
@@ -120,8 +133,16 @@ fn instance_reader_kwarg_stays_unexpanded() {
         .iter()
         .find(|m| m.name.0.as_str() == "Article")
         .unwrap();
-    assert!(article.class_attr_defaults.is_empty());
-    assert!(article.body.iter().any(|item| matches!(
+    assert!(seeded(article, "hidden"));
+    let names = class_method_names(&app, "Article");
+    assert!(names.contains(&"hidden".to_string()) && names.contains(&"hidden=".to_string()), "{names:?}");
+    let instance: Vec<String> = article
+        .methods()
+        .filter(|m| m.receiver == MethodReceiver::Instance)
+        .map(|m| m.name.as_str().to_string())
+        .collect();
+    assert!(instance.contains(&"hidden=".to_string()) && !instance.contains(&"hidden".to_string()), "{instance:?}");
+    assert!(!article.body.iter().any(|item| matches!(
         item,
         ModelBodyItem::Unknown { expr, .. }
             if matches!(&*expr.node, ExprNode::Send { method, .. } if method.as_str() == "mattr_accessor")

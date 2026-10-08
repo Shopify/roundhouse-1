@@ -240,7 +240,7 @@ fn an_unmodeled_included_statement_is_an_error_not_a_drop() {
     ]);
     assert_eq!(gaps.len(), 2, "{gaps:#?}");
     assert!(
-        gaps[0].contains("the generated method `count` (and any others its macro defines) in `included do` of Counted")
+        gaps[0].contains("`cattr_accessor` in `included do` of Counted")
             && gaps[0].contains("Counter, Tally would run without it"),
         "{}",
         gaps[0]

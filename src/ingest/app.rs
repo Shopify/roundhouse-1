@@ -3382,11 +3382,10 @@ pub(super) fn rehome_carried(
 }
 
 /// The attribute a `cattr_*`/`mattr_*` expansion's class-side writer
-/// (`def self.x=(value) = @x = value`) is for. With no `default:` the
-/// expansion seeds nothing, so a model's `self.x = []` beside the
-/// declaration (its own, or a concern's `included do`) is known by this.
+/// (`def self.x=(value) = @@x = value`) is for, so a model's `self.x = []`
+/// beside the declaration (its own, or a concern's `included do`) is
+/// known by this.
 fn cattr_class_writer(method: &crate::dialect::MethodDef) -> Option<Symbol> {
-    use crate::expr::{ExprNode, LValue};
     // Generated, not authored: an app's own `def self.x=` beside a
     // class-body `self.x += 1` stays the reported drop it was.
     if method.receiver != crate::dialect::MethodReceiver::Class
@@ -3395,11 +3394,7 @@ fn cattr_class_writer(method: &crate::dialect::MethodDef) -> Option<Symbol> {
     {
         return None;
     }
-    let base = method.name.as_str().strip_suffix('=')?;
-    let [param] = method.params.as_slice() else { return None };
-    let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*method.body.node else { return None };
-    let reads_param = matches!(&*value.node, ExprNode::Var { name, .. } if *name == param.name);
-    (name.as_str() == base && reads_param).then(|| Symbol::from(base))
+    super::cattr::written_storage(method).map(Symbol::from)
 }
 
 /// `self.x = v` (or `self.x += v`, …) in a class body whose `x` a
