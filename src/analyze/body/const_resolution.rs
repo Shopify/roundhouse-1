@@ -1224,7 +1224,198 @@ fn answer_file(
     }
     answers.constants.sort_unstable_by_key(|(end, ..)| *end);
     reresolve_own_value_reads(graph, &text, UriId::from(source.path.as_str()), &bare_values, &mut answers, class_cache);
+    answer_multi_write_targets(graph, &text, document, &mut answers, class_cache);
     answers
+}
+
+/// Rubydex's `visit_multi_write_node` indexes a multiple assignment's
+/// constant, variable and `recv.attr` targets and its value, and skips the
+/// rest: an index target (`old, ENV["VERBOSE"] = ENV["VERBOSE"], "false"`
+/// in Core's lib/development_support/local_datastores.rb), a nested `(a,
+/// b)` target, the `*rest` and every target after it. A constant written
+/// there had no reference, so no source answer. Each is looked up here as
+/// Ruby looks it up from the lexical scope it is written in (Rubydex's own
+/// nesting: the innermost class, module or `class << self` around it; a
+/// block keeps its scope), with the same chains `lookup_without` walks for
+/// a reference Rubydex did index. A scope or ancestor Rubydex left
+/// unresolved leaves the constant without an answer, as before.
+fn answer_multi_write_targets(
+    graph: &Graph,
+    text: &str,
+    document: &RubydexDocument,
+    answers: &mut FileAnswers,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool, bool)>,
+) {
+    if !may_have_skipped_multi_write_target(text) {
+        return;
+    }
+    let constants = skipped_multi_write_constants(text);
+    if constants.is_empty() {
+        return;
+    }
+    // Each lexical scope this file opens, by byte range.
+    let scopes: Vec<(u32, u32, NameId)> = document
+        .definitions()
+        .iter()
+        .filter_map(|id| match graph.definitions().get(id)? {
+            Definition::Class(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            Definition::Module(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            Definition::SingletonClass(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            _ => None,
+        })
+        .collect();
+    let no_skip = DeclarationId::from("<no declaration>");
+    for (start, path) in constants {
+        if answers.references.contains_key(&start) {
+            continue;
+        }
+        let (rooted, names) = path;
+        let nesting = scopes
+            .iter()
+            .filter(|(from, to, _)| *from <= start && start < *to)
+            .min_by_key(|(from, to, _)| to - from)
+            .map(|(.., name)| *name);
+        let Some((first, rest)) = names.split_first() else { continue };
+        let first_id = StringId::from(first.as_str());
+        let mut found = match if rooted { lookup_without(graph, &first_id, None, no_skip) } else { lookup_without(graph, &first_id, nesting, no_skip) } {
+            Lookup::Found(id) => Some(id),
+            Lookup::Missing => None,
+            Lookup::Unknown => continue,
+        };
+        for name in rest {
+            let Some(owner) = found else { break };
+            let owner = graph.resolve_alias(&owner).unwrap_or(owner);
+            found = graph
+                .declarations()
+                .get(&owner)
+                .and_then(Declaration::as_namespace)
+                .and_then(|namespace| namespace.member(&StringId::from(name.as_str())))
+                .copied();
+        }
+        answers.references.insert(start, found.and_then(|id| resolved_constant(graph, id, class_cache)));
+    }
+}
+
+/// Whether a line of `text` assigns to several targets, one of them of a
+/// kind Rubydex's multi-write skips (`x[i]`, `*rest`, `(a, b)`): the cheap
+/// filter before [`skipped_multi_write_constants`] parses the file.
+fn may_have_skipped_multi_write_target(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Some(at) = line.find(" = ") else { return false };
+        let left = &line[..at];
+        left.contains(',') && (left.contains('[') || left.contains('*') || left.contains('('))
+    })
+}
+
+/// The constants written inside the multi-write targets Rubydex skips, as
+/// (offset of the final name, (rooted, names)), outermost paths only.
+fn skipped_multi_write_constants(text: &str) -> Vec<(u32, (bool, Vec<String>))> {
+    #[derive(Default)]
+    struct Constants {
+        found: Vec<(u32, (bool, Vec<String>))>,
+    }
+    impl Constants {
+        fn path(node: &ruby_prism::Node<'_>) -> Option<(bool, Vec<String>, u32)> {
+            if let Some(read) = node.as_constant_read_node() {
+                let name = String::from_utf8_lossy(read.name().as_slice()).into_owned();
+                return Some((false, vec![name], read.location().start_offset() as u32));
+            }
+            let path = node.as_constant_path_node()?;
+            let name = String::from_utf8_lossy(path.name()?.as_slice()).into_owned();
+            let start = path.name_loc().start_offset() as u32;
+            match path.parent() {
+                None => Some((true, vec![name], start)),
+                Some(parent) => {
+                    let (rooted, mut names, _) = Self::path(&parent)?;
+                    names.push(name);
+                    Some((rooted, names, start))
+                }
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Constants {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            if let Some((rooted, names, start)) = Self::path(&node.as_node()) {
+                self.found.push((start, (rooted, names)));
+            }
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if let Some((rooted, names, start)) = Self::path(&node.as_node()) {
+                self.found.push((start, (rooted, names)));
+            } else {
+                ruby_prism::visit_constant_path_node(self, node);
+            }
+        }
+        // A scope opened inside a target is not the target's.
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    struct Writes {
+        skipped: Constants,
+    }
+    impl Writes {
+        fn target(&mut self, node: &ruby_prism::Node<'_>) {
+            if let Some(index) = node.as_index_target_node() {
+                ruby_prism::Visit::visit(&mut self.skipped, &index.receiver());
+                if let Some(arguments) = index.arguments() {
+                    ruby_prism::Visit::visit_arguments_node(&mut self.skipped, &arguments);
+                }
+                if let Some(block) = index.block() {
+                    ruby_prism::Visit::visit_block_argument_node(&mut self.skipped, &block);
+                }
+            } else if let Some(nested) = node.as_multi_target_node() {
+                // Rubydex indexes none of a nested target's parts.
+                for left in &nested.lefts() {
+                    self.skipped_target(&left);
+                }
+                if let Some(rest) = nested.rest() {
+                    self.skipped_target(&rest);
+                }
+                for right in &nested.rights() {
+                    self.skipped_target(&right);
+                }
+            }
+        }
+        /// A target in a position Rubydex skips entirely: every constant
+        /// it reads (a constant target is a definition, not a read).
+        fn skipped_target(&mut self, node: &ruby_prism::Node<'_>) {
+            if let Some(splat) = node.as_splat_node() {
+                if let Some(expression) = splat.expression() {
+                    self.skipped_target(&expression);
+                }
+            } else if let Some(call) = node.as_call_target_node() {
+                ruby_prism::Visit::visit(&mut self.skipped, &call.receiver());
+            } else if let Some(path) = node.as_constant_path_target_node() {
+                if let Some(parent) = path.parent() {
+                    ruby_prism::Visit::visit(&mut self.skipped, &parent);
+                }
+            } else if node.as_index_target_node().is_some() || node.as_multi_target_node().is_some() {
+                self.target(node);
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes {
+        fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+            for left in &node.lefts() {
+                self.target(&left);
+            }
+            if let Some(rest) = node.rest() {
+                self.skipped_target(&rest);
+            }
+            for right in &node.rights() {
+                self.skipped_target(&right);
+            }
+            ruby_prism::visit_multi_write_node(self, node);
+        }
+    }
+    let result = ruby_prism::parse(text.as_bytes());
+    let mut writes = Writes { skipped: Constants::default() };
+    ruby_prism::Visit::visit(&mut writes, &result.node());
+    let mut found = writes.skipped.found;
+    found.sort_by_key(|(start, _)| *start);
+    found.dedup_by_key(|(start, _)| *start);
+    found
 }
 
 /// Ruby evaluates a constant write's value before it binds the name, so
