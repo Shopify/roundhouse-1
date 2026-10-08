@@ -18,7 +18,9 @@
 //! the private names, which Ruby leaves out.
 //!
 //! A marker naming a constant the body does not define raises NameError
-//! when the class loads, so it stays refused with that reason.
+//! when the class loads, so it stays refused with that reason. A sorbet
+//! type alias (`Name = T.type_alias { ... }`) is defined in Ruby though
+//! the ingest drops it, and counts.
 
 use crate::dialect::Model;
 use crate::expr::{Expr, ExprNode, Literal};
@@ -61,10 +63,32 @@ fn defined_names(model: &Model, app: &crate::App) -> Vec<String> {
 }
 
 /// The marker's names `model` does not define, or empty when it claims
-/// the statement.
-pub(crate) fn undefined(model: &Model, app: &crate::App, names: &[String]) -> Vec<String> {
+/// the statement. `marker` is the statement, whose file is the body's.
+pub(crate) fn undefined(model: &Model, app: &crate::App, marker: &Expr, names: &[String]) -> Vec<String> {
     let defined = defined_names(model, app);
-    names.iter().filter(|n| !defined.contains(n)).cloned().collect()
+    let source = source_text(&app.sources, marker.span);
+    names.iter().filter(|n| !defined.contains(n) && !type_alias_written(source, n)).cloned().collect()
+}
+
+/// `Name = T.type_alias { ... }`: Ruby defines the constant (a sorbet
+/// type alias object), which the ingest drops unless the sorbet check
+/// reads it (`ingest::library_class::is_sorbet_type_alias`), so it is
+/// looked for in the class's source.
+fn type_alias_written(source: &str, name: &str) -> bool {
+    source.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(name)
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .is_some_and(|value| value.trim_start().starts_with("T.type_alias"))
+    })
+}
+
+fn source_text(sources: &[crate::span::SourceFile], span: crate::span::Span) -> &str {
+    (span.file.0 as usize)
+        .checked_sub(1)
+        .and_then(|i| sources.get(i))
+        .map(|source| source.text.as_str())
+        .unwrap_or("")
 }
 
 /// Every scoped read in the app's source of a constant a model makes

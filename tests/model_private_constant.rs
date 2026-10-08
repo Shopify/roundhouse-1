@@ -115,14 +115,15 @@ fn the_emitted_model_answers_the_lexical_reads() {
     assert_eq!(run.stdout, EXPECTED);
 }
 
-/// A scoped read Ruby refuses, and a marker naming nothing, are errors.
+/// A scoped read Ruby refuses, and a marker naming nothing, are errors;
+/// a sorbet type alias the ingest drops is still defined.
 #[test]
 fn a_scoped_read_and_an_undefined_marker_are_check_errors() {
     let app = app()
         .write("app/models/reader.rb", "class Reader\n  def self.read = Widget::LIMIT\n  def self.ok = Widget.helped\nend\n")
         .write(
             "app/models/gadget.rb",
-            "class Gadget < ApplicationRecord\n  self.table_name = \"widgets\"\n  private_constant :MISSING\nend\n",
+            "class Gadget < ApplicationRecord\n  self.table_name = \"widgets\"\n  Kinds = T.type_alias { T.any(String, Symbol) }\n  private_constant :Kinds\n  private_constant :MISSING\nend\n",
         );
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     assert_eq!(errors.len(), 2, "{errors:#?}");

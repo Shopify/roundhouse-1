@@ -894,7 +894,7 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // (`private_constant::scoped_reads`). One naming a constant the
         // body lacks raises NameError at load.
         if let Some(names) = private_constant::marked_names(expr) {
-            let missing = private_constant::undefined(model, app, &names);
+            let missing = private_constant::undefined(model, app, expr, &names);
             if missing.is_empty() {
                 continue;
             }
