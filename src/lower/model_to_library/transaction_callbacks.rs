@@ -51,6 +51,7 @@ use crate::dialect::{
 use crate::effect::EffectSet;
 use crate::expr::{BoolOpKind, BoolOpSurface, Expr, ExprNode, LValue, Literal, OpAssignOp};
 use crate::ident::Symbol;
+use crate::lower::lifted_block::{self, Form};
 use crate::span::Span;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -280,12 +281,14 @@ fn block_form(model: &Model, index: usize, expr: &Expr) -> Option<BlockForm> {
         _ => return None,
     }
     // The block's own `next` ends the callback, as `return` ends the
-    // method it becomes (the chain ignores the value). Its `break` (and
-    // a proc's `return`) would mean something else there.
-    if escapes(&body, is_block) {
+    // method it becomes (the chain ignores the value). A block's own
+    // `break` and `return` (LocalJumpError in Rails) and `redo` have no
+    // such reading (`lower::lifted_block`).
+    let form = if is_block { Form::Block } else { Form::Lambda };
+    if lifted_block::jumps(&body).unliftable(form).is_some() {
         return None;
     }
-    next_to_return(&mut body);
+    lifted_block::to_method_body(&mut body, form);
     let body = super::broadcasts::rewrite_rails_broadcast_calls(body, model);
     let mut body = body;
     super::markers::rewrite_column_or_assign(&mut body, model);
@@ -383,7 +386,9 @@ fn condition(value: &Expr) -> Option<Expr> {
     match &*value.node {
         ExprNode::Lit { value: Literal::Sym { value } } => Some(self_send(value.as_str(), Vec::new(), Span::synthetic())),
         ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. } => {
-            if matches!(&*body.node, ExprNode::Seq { .. }) || escapes(body, true) {
+            // One expression, evaluated as a condition: no jump of its
+            // own can sit in one.
+            if matches!(&*body.node, ExprNode::Seq { .. }) || lifted_block::jumps(body) != Default::default() {
                 return None;
             }
             let mut body = body.clone();
@@ -455,46 +460,6 @@ fn statement(entry: Entry) -> Expr {
                 else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
             },
         ),
-    }
-}
-
-/// Does `body` leave its block other than by finishing: `next`,
-/// `break`, `redo`, `retry` (and `return`, for a proc block, where
-/// Rails raises LocalJumpError)? A nested block or lambda has its own.
-fn escapes(body: &Expr, proc_return: bool) -> bool {
-    let mut found = false;
-    fn walk(e: &Expr, proc_return: bool, in_loop: bool, found: &mut bool) {
-        match &*e.node {
-            // The body's own `next` becomes `return` (`next_to_return`).
-            ExprNode::Next { .. } if !in_loop => {
-                if let ExprNode::Next { value: Some(v) } = &*e.node {
-                    walk(v, proc_return, in_loop, found);
-                }
-            }
-            ExprNode::Next { .. } | ExprNode::Break { .. } | ExprNode::Redo | ExprNode::Retry => *found = true,
-            ExprNode::Return { .. } if proc_return => *found = true,
-            ExprNode::Lambda { .. } => {}
-            ExprNode::While { .. } => e.node.for_each_child(&mut |c| walk(c, proc_return, true, found)),
-            _ => e.node.for_each_child(&mut |c| walk(c, proc_return, in_loop, found)),
-        }
-    }
-    walk(body, proc_return, false, &mut found);
-    found
-}
-
-/// The callback body's own `next` (not one inside a nested block or a
-/// loop, which ends that) becomes `return` with the same value.
-fn next_to_return(expr: &mut Expr) {
-    match &mut *expr.node {
-        ExprNode::Next { value } => {
-            let value = value
-                .take()
-                .unwrap_or_else(|| Expr::new(expr.span, ExprNode::Lit { value: Literal::Nil }));
-            let span = expr.span;
-            *expr = Expr::new(span, ExprNode::Return { value });
-        }
-        ExprNode::Lambda { .. } | ExprNode::While { .. } => {}
-        _ => expr.node.for_each_child_mut(&mut next_to_return),
     }
 }
 

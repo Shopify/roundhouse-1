@@ -139,7 +139,7 @@ fn method(
         Some(b) => ingest_expr(&b, file).ok()?,
         None => Expr::new(crate::span::Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
-    next_to_return(&mut body);
+    crate::lower::lifted_block::to_method_body(&mut body, crate::lower::lifted_block::Form::Block);
     Some(MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
         unsupported_formals: None,
@@ -159,31 +159,3 @@ fn method(
     })
 }
 
-/// `next` leaves the block; in the method it becomes, `return` does.
-/// Not inside a nested block or a loop, where `next` still means that
-/// block's or that loop's.
-pub(crate) fn next_to_return(e: &mut Expr) {
-    if let ExprNode::Next { value } = &mut *e.node {
-        let value = value.take().unwrap_or_else(|| {
-            Expr::new(e.span, ExprNode::Lit { value: crate::expr::Literal::Nil })
-        });
-        *e.node = ExprNode::Return { value };
-        return;
-    }
-    if matches!(&*e.node, ExprNode::Lambda { .. } | ExprNode::While { .. }) {
-        return;
-    }
-    if let ExprNode::Send { block: Some(_), .. } = &*e.node {
-        // Recurse into receiver and args, not the block.
-        if let ExprNode::Send { recv, args, .. } = &mut *e.node {
-            if let Some(r) = recv {
-                next_to_return(r);
-            }
-            for a in args {
-                next_to_return(a);
-            }
-        }
-        return;
-    }
-    e.node.for_each_child_mut(&mut |c| next_to_return(c));
-}

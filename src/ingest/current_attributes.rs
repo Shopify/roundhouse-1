@@ -281,7 +281,16 @@ fn take_reset_callbacks(lc: &mut LibraryClass) -> Vec<(ResetPhase, ResetCallback
         let body = match block.as_ref().map(|b| &*b.node) {
             None => None,
             Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, signature, .. }) if params.is_empty() && signature.is_empty() => {
-                Some(body.clone())
+                // The body becomes a method: its own `next` is `return`
+                // there; its own `break`/`return` (LocalJumpError in
+                // Rails) leave the call unknown, visible.
+                use crate::lower::lifted_block::{self, Form};
+                if lifted_block::jumps(body).unliftable(Form::Block).is_some() {
+                    return true;
+                }
+                let mut body = body.clone();
+                lifted_block::to_method_body(&mut body, Form::Block);
+                Some(body)
             }
             Some(_) => return true,
         };

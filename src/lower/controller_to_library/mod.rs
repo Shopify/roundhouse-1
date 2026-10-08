@@ -1785,11 +1785,35 @@ fn build_filter_preamble(
                     else {
                         continue;
                     };
+                    // The body runs inline in the dispatcher, where its own
+                    // `next` (which ends only this filter) cannot be a
+                    // `return`: guard clauses become the branch that skips
+                    // the rest of the filter (`lower::lifted_block::splice`).
+                    let body = match crate::lower::lifted_block::splice(&target.body) {
+                        Ok(body) => body,
+                        Err(jump) => {
+                            if is_own {
+                                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                                    expr.span,
+                                    None,
+                                    "filter_block_jump",
+                                    format!(
+                                        "`{}` block on `{}`: its own `{jump}` is not a guard clause at the \
+                                         block's top level, which the inline dispatcher cannot end the filter \
+                                         with; the filter is not lowered",
+                                        target.method.as_str(),
+                                        controller.name.0.as_str(),
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
+                    };
                     let is_after = target.is_after();
                     let is_prepend = target.is_prepend();
-                    let halt_check = can_respond(&target.body);
+                    let halt_check = can_respond(&body);
                     let stmt = PreambleStmt::Block {
-                        body: target.body,
+                        body,
                         only: target.only,
                         except: target.except,
                         if_cond: target.if_cond,
@@ -2416,10 +2440,18 @@ fn collect_rescue_handlers(
                         // the reads to the rescue binding rather than
                         // renaming the binding, which would collide with
                         // a sibling handler's own parameter name.
-                        match params.first() {
+                        let mut body = match params.first() {
                             Some(p) => rename_local(body, p, &exc),
                             None => body.clone(),
-                        }
+                        };
+                        // The handler is the dispatcher's last statement
+                        // (`rescue_from` wraps all of it), so its own
+                        // `next` is the dispatcher's `return`.
+                        crate::lower::lifted_block::to_method_body(
+                            &mut body,
+                            crate::lower::lifted_block::Form::Block,
+                        );
+                        body
                     }
                     _ => continue,
                 },

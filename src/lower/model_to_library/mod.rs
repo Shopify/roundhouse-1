@@ -2029,7 +2029,9 @@ fn build_methods_for_dialect(
     // runtime. After the user methods, so a model's own
     // `generate_token_for` wins.
     crate::lower::generates_token_for::push_token_for_methods(&mut methods, model);
-    push_callback_methods(&mut methods, model);
+    let mut lifted_callbacks = Vec::new();
+    push_callback_methods(&mut methods, &mut lifted_callbacks, model);
+    methods.extend(lifted_callbacks);
     self::transaction_callbacks::push_transaction_callback_methods(&mut methods, model, models);
 
     // File-grain catch-all (mirrors view_to_library's
@@ -2150,8 +2152,9 @@ pub(crate) fn push_subclass_model_methods(methods: &mut Vec<MethodDef>, view: &M
     let mut synthesized = Vec::new();
     associations::push_association_methods(&mut synthesized, view, models);
     let mut hooks = Vec::new();
+    let mut lifted_callbacks = Vec::new();
     push_dependent_destroy(&mut hooks, view);
-    push_callback_methods(&mut hooks, view);
+    push_callback_methods(&mut hooks, &mut lifted_callbacks, view);
     for hook in &mut hooks {
         if hook.receiver != MethodReceiver::Instance || !hook.params.is_empty() {
             continue;
@@ -2165,6 +2168,7 @@ pub(crate) fn push_subclass_model_methods(methods: &mut Vec<MethodDef>, view: &M
         hook.body = seq(stmts);
     }
     synthesized.extend(hooks);
+    synthesized.extend(lifted_callbacks);
     for m in synthesized {
         if !methods.iter().any(|o| o.name == m.name && o.receiver == m.receiver) {
             methods.push(m);

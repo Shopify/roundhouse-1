@@ -1285,7 +1285,12 @@ pub(crate) const BLOCK_CALLBACK_HOOKS: &[&str] = &[
 /// Unknown items — into `def <hook>` overrides of the runtime Base's
 /// no-op hooks. One body walk so declaration order is preserved
 /// across both forms when they target the same hook.
-pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model) {
+///
+/// `lifted` receives the methods a block callback's body becomes when
+/// it cannot be folded into its hook (`push_block_callback`): they are
+/// not hook overrides, so a subclass's hooks do not start them with
+/// `super`.
+pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, lifted: &mut Vec<MethodDef>, model: &Model) {
     // AHEAD of the declared callbacks: Rails registers the
     // `belongs_to … default:` callback when the association is
     // declared, and campfire declares its associations above its
@@ -1293,7 +1298,7 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
     // the default already applied, which is the order that matters.
     push_belongs_to_defaults(methods, model);
     push_belongs_to_touches(methods, model);
-    for item in &model.body {
+    for (index, item) in model.body.iter().enumerate() {
         match item {
             ModelBodyItem::Callback { callback, .. } => {
                 push_symbol_callback(methods, model, callback, item.span());
@@ -1301,7 +1306,7 @@ pub(super) fn push_callback_methods(methods: &mut Vec<MethodDef>, model: &Model)
             ModelBodyItem::Unknown { expr, .. } => {
                 match symbol_after_initialize(expr).filter(|_| !defines_after_initialize(model)) {
                     Some(body) => fold_into_or_push(methods, model, "after_initialize", body),
-                    None => push_block_callback(methods, model, expr),
+                    None => push_block_callback(methods, lifted, model, index, expr),
                 }
             }
             _ => {}
@@ -1567,7 +1572,19 @@ fn block_callback_on(arg: &Expr) -> Option<crate::dialect::CallbackOn> {
 /// passes the record as an ARGUMENT to the other and leaves `self` as
 /// the declaring context. Two different bindings, and only one of them
 /// is the shape this splices into a hook method body.
-fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr) {
+///
+/// The body's own `next` ends the callback, as `return` ends a method
+/// (`lower::lifted_block`). A body that returns early cannot share its
+/// hook with the declarations folded beside it (a `return` would skip
+/// theirs), so it becomes a method of its own, which the hook calls.
+fn push_block_callback(
+    methods: &mut Vec<MethodDef>,
+    lifted: &mut Vec<MethodDef>,
+    model: &Model,
+    index: usize,
+    expr: &Expr,
+) {
+    use crate::lower::lifted_block::{self, Form};
     {
         let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else {
             return;
@@ -1642,6 +1659,23 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
                 return;
             }
         };
+        // A block runs as a proc: its own `break`/`return` raise
+        // LocalJumpError in Rails, which no hook method reproduces.
+        let form = if block.is_some() { Form::Block } else { Form::Lambda };
+        let jumps = lifted_block::jumps(lambda_body);
+        if let Some(jump) = jumps.unliftable(form) {
+            crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span,
+                None,
+                "block_callback_jump",
+                format!(
+                    "`{hook}` on `{}`: the callback's own `{jump}` has no hook-method equivalent \
+                     (Rails raises LocalJumpError for a block's `break`/`return`); the callback is not lowered",
+                    model.name.0.as_str(),
+                ),
+            ));
+            return;
+        }
         // Refused by name: the diagnose pass claims every block-form
         // hook, so returning quietly dropped the callback.
         if !signature.is_empty() {
@@ -1682,6 +1716,8 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             }
             None => lambda_body.clone(),
         };
+        let mut lambda_body = lambda_body;
+        lifted_block::to_method_body(&mut lambda_body, form);
         let mut lambda_body = super::broadcasts::rewrite_rails_broadcast_calls(
             lambda_body,
             model,
@@ -1709,6 +1745,22 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             }
         }
 
+        // Its own method, called where the body would have been folded.
+        if jumps.returns_early() {
+            let name = lifted_callback_name(model, hook_name, index);
+            lifted.push(hook_like_method(model, Symbol::from(name.as_str()), lambda_body));
+            lambda_body = Expr::new(
+                expr.span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from(name.as_str()),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+        }
+
         let hook_sym = Symbol::from(hook_name);
         if let Some(existing) = methods.iter_mut().find(|m| m.name == hook_sym) {
             // Fold this block's body into the existing method, preserving
@@ -1723,23 +1775,40 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             }
             existing.body = seq(stmts);
         } else {
-            methods.push(MethodDef {
-                visibility: crate::dialect::MethodVisibility::Public,
-                unsupported_formals: None,
-                has_anonymous_block: false,
-                name_span: crate::span::Span::synthetic(),
-                name: hook_sym,
-                receiver: MethodReceiver::Instance,
-                params: Vec::new(),
-                body: lambda_body,
-                signature: None,
-                effects: EffectSet::default(),
-                enclosing_class: Some(model.name.0.clone()),
-                kind: AccessorKind::Method,
-                is_async: false,
-            mutates_self: false,
-            block_param: None,
-            });
+            methods.push(hook_like_method(model, hook_sym, lambda_body));
         }
+    }
+}
+
+/// The method a block callback's body becomes when it returns early:
+/// `_<model>_<hook>_callback_<body index>`, unique in the model and
+/// distinct from an ancestor's (the model's name is in it).
+fn lifted_callback_name(model: &Model, hook: &str, index: usize) -> String {
+    let slug: String = crate::naming::snake_case(model.name.0.as_str())
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("_{slug}_{hook}_callback_{index}")
+}
+
+/// A parameterless public instance method of `model`, typed from its
+/// body, as the block-callback hooks are.
+fn hook_like_method(model: &Model, name: Symbol, body: Expr) -> MethodDef {
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name,
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
     }
 }
