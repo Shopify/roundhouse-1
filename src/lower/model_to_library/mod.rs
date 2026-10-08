@@ -1177,11 +1177,38 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
             expr.span,
             None,
             name,
-            format!("model DSL call on `{}` not lowered; the class does not run it", model.name.0.as_str()),
+            format!("model DSL call on `{}` not lowered; {}", model.name.0.as_str(), unlowered_dsl_reason(name)),
         );
         out.push(d);
     }
     out
+}
+
+/// Why the lowered class cannot run a framework DSL call nothing claims,
+/// where the call's Rails behavior is known to reach past the class body
+/// (tests/model_dsl_refusal_reasons.rs pins it natively); the generic
+/// reason otherwise.
+fn unlowered_dsl_reason(name: &str) -> &'static str {
+    match name {
+        // Rails merges the scope into every relation of the class
+        // (`all`, `find`, `count`, associations) and seeds new records
+        // with its `where` values; `unscoped` drops it. The compiled
+        // finders and the runtime relation build their SQL without it,
+        // so every read would return rows Rails filters out.
+        "default_scope" => {
+            "Rails applies a default_scope to every query of the class and to new records' \
+             attributes, and the lowered finders and relations do not apply it"
+        }
+        // Rails defines the attribute methods under the new name
+        // (`title`, `title=`, `title_changed?`, ...) and translates the
+        // name to the column in `new`, `where`, `order`, `pluck`. The
+        // lowered model has neither the methods nor the key translation.
+        "alias_attribute" => {
+            "Rails answers the alias's attribute methods and translates the alias to its column in \
+             `new`, `where`, `order` and `pluck`, and the lowered model and relations do not"
+        }
+        _ => "the class does not run it",
+    }
 }
 
 /// The passes other than model lowering that consume a model-body
@@ -1348,7 +1375,11 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
                     format!("model macro call on `{}` not lowered; {reason}", lc.name.0.as_str())
                 }
                 Some((_, macro_replay::MacroVerdict::BelongsToRequiredByDefault(_))) => continue,
-                _ => format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
+                _ => format!(
+                    "STI subclass body call on `{}` not lowered; {}",
+                    lc.name.0.as_str(),
+                    unlowered_dsl_reason(dropped_statement_name(call).as_str())
+                ),
             };
             out.push(crate::diagnostic::Diagnostic::unsupported(call.span, None, dropped_statement_name(call).as_str(), detail));
         }
