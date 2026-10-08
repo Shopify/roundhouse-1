@@ -109,6 +109,35 @@ fn gem_same_as_native(name: &str, files: &[(&str, &str)], entry: &str, script: &
     run
 }
 
+/// graphql-client 0.25.0: collocated_enforcement.rb reopens `Client`,
+/// writes `WHITELISTED_GEM_NAMES` and then `module CollocatedEnforcement`;
+/// client.rb requires it and then runs `extend CollocatedEnforcement` in
+/// `Client`'s body. The module goes into Client's file below that
+/// constant, and it was written after all of Client's constants, so after
+/// client.rb's `extend`, which raised NameError at boot.
+const COLLOCATED: &[(&str, &str)] = &[
+    ("gqlc/error.rb", "module Gqlc\n  class Client\n    class Error < StandardError; end\n  end\nend\n"),
+    (
+        "gqlc/collocated.rb",
+        "require \"gqlc/error\"\n\nmodule Gqlc\n  class Client\n    NAMES = %w{pry byebug}\n\n    class CallerError < Error; end\n\n    module Collocated\n      def collocated = [:collocated, NAMES.size]\n    end\n  end\nend\n",
+    ),
+    (
+        "gqlc/client.rb",
+        "require \"gqlc/collocated\"\n\nmodule Gqlc\n  class Client\n    class DynamicError < Error; end\n\n    extend Collocated\n\n    DOC = collocated\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn a_nested_module_from_another_file_loads_before_the_body_that_extends_it() {
+    gem_same_as_native(
+        "gqlc",
+        COLLOCATED,
+        "gqlc/client",
+        "c = Gqlc::Client\np c::DOC, c.collocated, c::CallerError.superclass, c::DynamicError.superclass, c.constants.sort\n",
+        "[:collocated, 2]\n[:collocated, 2]\nGqlc::Client::Error\nGqlc::Client::Error\n[:CallerError, :Collocated, :DOC, :DynamicError, :Error, :NAMES]\n",
+    );
+}
+
 /// graphql-client 0.25.0's operation_definition.rb:
 /// `alias operation_name definition_name` in `OperationDefinition <
 /// Definition` names the superclass's method. The ingest refused the

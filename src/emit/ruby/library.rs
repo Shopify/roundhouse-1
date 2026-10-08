@@ -7729,12 +7729,29 @@ fn emit_library_class_decl_inner(
             leading.insert(call.span);
         }
     }
+    // The eager constants written so far, by index.
+    let written: std::cell::RefCell<BTreeSet<usize>> = std::cell::RefCell::new(BTreeSet::new());
     let render_constants = |s: &mut String, which: &[usize]| {
         // A nested class the source has above this point, below an
-        // earlier constant (`NestedPlacement`).
+        // earlier constant (`NestedPlacement`). One another file of the
+        // class declares goes in once that file's constants above it
+        // are written, before anything from another file: Ruby loads
+        // the whole file where it is required. graphql-client's
+        // collocated_enforcement.rb writes `WHITELISTED_GEM_NAMES` and
+        // then `module CollocatedEnforcement`, which client.rb's
+        // `extend CollocatedEnforcement` (after its require) reads.
         let place_above = |s: &mut String, at: crate::span::Span| {
             if at != crate::span::Span::synthetic() {
-                NestedPlacement::place(&lc.name, s, |kid| kid.file == at.file && kid.start < at.start);
+                let written = written.borrow();
+                NestedPlacement::place(&lc.name, s, |kid| {
+                    if kid.file == at.file {
+                        return kid.start < at.start;
+                    }
+                    eager.iter().all(|&i| {
+                        let value = lc.constants[i].1.span;
+                        value.file != kid.file || value.start >= kid.start || written.contains(&i)
+                    })
+                });
             }
         };
         for &i in which {
@@ -7749,6 +7766,7 @@ fn emit_library_class_decl_inner(
                 }
             }
             place_above(s, lc.constants[i].1.span);
+            written.borrow_mut().insert(i);
             let (cname, value) = &lc.constants[i];
             let mut rendered = super::emit_expr(value);
             if rendered.trim().is_empty() {
