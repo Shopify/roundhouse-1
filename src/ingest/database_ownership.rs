@@ -144,6 +144,18 @@ fn connects_to(model: &Model, args: &[Expr], block: &Option<Expr>, span: Span) -
     Own::Named { writing, reading, span }
 }
 
+/// Whether a model-body statement is one this path decides on rather
+/// than model lowering: a class-body `connects_to` or
+/// `establish_connection` (the model's database, replayed at boot or a
+/// [`App::database_refusals`] entry, either way decided by [`resolve`]).
+/// `model_to_library::unclaimed_unknowns` skips these. A class-body role
+/// or shard switch is not one: the multiple-database runtime runs the
+/// switches a method makes, and nothing replays a class-body one.
+pub(crate) fn claims_model_statement(expr: &Expr) -> bool {
+    let ExprNode::Send { recv, method, .. } = &*expr.node else { return false };
+    on_self(recv) && matches!(method.as_str(), "connects_to" | "establish_connection")
+}
+
 /// Every call to one of `names` under `expr` (receiver ignored).
 fn calls_named(expr: &Expr, names: &[&str], out: &mut Vec<(Span, String)>) {
     if let ExprNode::Send { method, .. } = &*expr.node {
