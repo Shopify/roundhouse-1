@@ -108,6 +108,11 @@ fn a_gem_source_program_requires_a_gem_home_feature_in_place() {
     let (tree, errors) = emit_and_run::empty_app()
         .write("roundhouse.yml", &format!("gem_home: {}\ngem_sources:\n  kafkakit: vendor/gems/kafkakit-1.0.0\n", home.display()))
         .write("Gemfile.lock", LOCK)
+        // The app's Bundler.require loads the gem, as `-rkafkakit` does
+        // natively: a plain gem's constants are defined where its files
+        // are required, never autoloaded.
+        .write("Gemfile", "source \"https://rubygems.org\"\n\ngem \"kafkakit\"\n")
+        .write("config/application.rb", "Bundler.require(*Rails.groups)\n")
         .write("vendor/gems/kafkakit-1.0.0/lib/kafkakit.rb", KAFKAKIT)
         .write("vendor/gems/kafkakit-1.0.0/lib/kafkakit/patch.rb", PATCH)
         .emit(BuildTarget::Ruby);
