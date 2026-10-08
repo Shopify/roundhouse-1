@@ -224,6 +224,23 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
 /// `authenticate_user` on every signed-in request. Dropping it made
 /// each of those requests a NameError.
 ///
+/// A module the initializer itself mixes in, anywhere in the file, is
+/// kept as well: Shopify Core's
+/// `active_record_composite_ids_methods_patch.rb` defines `module
+/// ActiveRecordCompositeIdsMethodsPatch` and prepends it inside
+/// `ActiveSupport.on_load(:active_record) { if … }`, which the
+/// statement-level mixin reader does not see; dropping the module made
+/// the carried prepend a NameError. Being an argument of `prepend`,
+/// `include` or `extend` is what marks it as the file's own definition
+/// rather than a reopen: a module the tree does not otherwise carry, of
+/// a gem or of an app namespace no file declares, is left out the same
+/// as before (`PublicSuffix`, `GraphQL`, a namespace an app class sits
+/// under), because the tree could only define it fresh.
+///
+/// Each kept definition is recorded at its statement
+/// (`initializers::define`), where the initializer's program loads it
+/// (`initializer_programs`), as Rails runs it there.
+///
 /// The reference test keeps what an initializer defines for the
 /// framework's own use (lobsters' `SneakWrapperIntoPath`, prepended
 /// into `rails dbconsole`) out of the tree. Core classes and framework
@@ -261,7 +278,13 @@ fn keep_initializer_defined(
                 })
         })
     };
-    for InitializerDefined { file, ranges, lc } in candidates {
+    let namespace_of_app = |app: &App, name: &str| {
+        let prefix = format!("{name}::");
+        app.library_classes.iter().any(|c| c.name.0.as_str().starts_with(&prefix))
+            || app.models.iter().any(|m| m.name.0.as_str().starts_with(&prefix))
+            || app.controllers.iter().any(|c| c.name.0.as_str().starts_with(&prefix))
+    };
+    for InitializerDefined { file, ranges, decls, mixed_in, lc } in candidates {
         let name = lc.name.0.as_str().to_string();
         if name.contains("::")
             || FRAMEWORK_ROOTS.contains(&name.as_str())
@@ -269,15 +292,50 @@ fn keep_initializer_defined(
             || app.library_classes.iter().any(|c| c.name == lc.name)
             || app.models.iter().any(|m| m.name == lc.name)
             || app.controllers.iter().any(|c| c.name == lc.name)
-            || !referenced(&name)
         {
+            continue;
+        }
+        let own_mixin = mixed_in
+            && lc.is_module
+            && !namespace_of_app(app, &name)
+            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(&name);
+        if !referenced(&name) && !own_mixin {
             continue;
         }
         for (start, end) in ranges {
             super::initializers::consume(&file, start, end);
         }
+        for start in decls {
+            super::initializers::define(&file, start, &name);
+        }
         app.library_classes.push(lc);
     }
+}
+
+/// The constants `file` passes to `prepend`, `include` or `extend`
+/// anywhere in it (any receiver, any depth), as written without a
+/// leading `::`.
+fn mixed_in_constants(source: &[u8]) -> Vec<String> {
+    struct Mixins(Vec<String>);
+    impl<'pr> ruby_prism::Visit<'pr> for Mixins {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if matches!(super::util::constant_id_str(&node.name()), "prepend" | "include" | "extend") {
+                if let Some(args) = node.arguments() {
+                    for arg in args.arguments().iter() {
+                        if let Some(path) = super::util::constant_path_segments_strs(&arg) {
+                            let joined = path.iter().map(String::as_str).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+                            self.0.push(joined.join("::"));
+                        }
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let result = ruby_prism::parse(source);
+    let mut found = Mixins(Vec::new());
+    ruby_prism::Visit::visit(&mut found, &result.node());
+    found.0
 }
 
 /// A library class an initializer defines, with what keeping it applies
@@ -286,6 +344,10 @@ fn keep_initializer_defined(
 struct InitializerDefined {
     file: String,
     ranges: Vec<(usize, usize)>,
+    /// Where its top-level declarations start.
+    decls: Vec<usize>,
+    /// The file passes it to `prepend`/`include`/`extend`.
+    mixed_in: bool,
     lc: LibraryClass,
 }
 
@@ -295,6 +357,7 @@ impl InitializerDefined {
         decls: &[(String, usize, usize)],
         constants: &[(usize, usize)],
         first: bool,
+        mixed_in: &[String],
         lc: LibraryClass,
     ) -> Self {
         let mut ranges: Vec<(usize, usize)> = decls
@@ -302,10 +365,12 @@ impl InitializerDefined {
             .filter(|(name, _, _)| name == lc.name.0.as_str())
             .map(|&(_, start, end)| (start, end))
             .collect();
+        let decls = ranges.iter().map(|&(start, _)| start).collect();
         if first {
             ranges.extend_from_slice(constants);
         }
-        InitializerDefined { file: file.to_string(), ranges, lc }
+        let mixed_in = mixed_in.iter().any(|m| m == lc.name.0.as_str());
+        InitializerDefined { file: file.to_string(), ranges, decls, mixed_in, lc }
     }
 }
 
@@ -1816,6 +1881,7 @@ end
                 // are kept here; the rest wait in `initializer_defined`
                 // for the referenced-by-app test below.
                 let decls = super::initializers::declaration_ranges(&bytes);
+                let mixed_in = mixed_in_constants(&bytes);
                 // A file-level constant `initializer_constants` took is
                 // its own, not the first class's to hoist.
                 let taken = super::initializer_constants::taken_in(&initializer_constants, &path_str);
@@ -1830,7 +1896,8 @@ end
                             !(hoisted(name) && lc.top_level_constants.iter().any(|c| &c.name == name))
                         });
                         lc.top_level_constants.retain(|c| !hoisted(&c.name));
-                        let defined = InitializerDefined::new(&path_str, &decls, &file_constants, i == 0, lc);
+                        let defined =
+                            InitializerDefined::new(&path_str, &decls, &file_constants, i == 0, &mixed_in, lc);
                         if mixins.iter().any(|m| m.module.as_str() == defined.lc.name.0.as_str()) {
                             for &(start, end) in &defined.ranges {
                                 super::initializers::consume(&path_str, start, end);
@@ -1845,6 +1912,34 @@ end
                 app.initializer_filters.extend(extract_initializer_filters(&bytes, &path_str));
                 app.sql_functions
                     .extend(super::sql_functions::extract_sql_functions(&bytes, &path_str));
+            }
+        }
+        // The engines' initializers run at boot too: a module one of them
+        // defines and mixes in waits for the same test.
+        for entry in boot_initializers.iter().filter(|e| !e.starts_with(&init_dir)) {
+            let Ok(bytes) = vfs.read(entry) else { continue };
+            let mixed_in = mixed_in_constants(&bytes);
+            if mixed_in.is_empty() {
+                continue;
+            }
+            let path_str = entry.display().to_string();
+            let decls = super::initializers::declaration_ranges(&bytes);
+            let taken = super::initializer_constants::taken_in(&initializer_constants, &path_str);
+            let file_constants: Vec<(usize, usize)> = super::initializers::top_level_constant_ranges(&bytes)
+                .into_iter()
+                .filter(|&(start, _)| !taken.iter().any(|&(_, s)| s == start))
+                .collect();
+            let Ok(classes) = ingest_library_classes(&bytes, &path_str) else { continue };
+            for (i, mut lc) in classes.into_iter().enumerate() {
+                if !mixed_in.iter().any(|m| m == lc.name.0.as_str()) {
+                    continue;
+                }
+                let hoisted = |name: &crate::ident::Symbol| taken.iter().any(|&(n, _)| n == name.as_str());
+                lc.constants
+                    .retain(|(name, _)| !(hoisted(name) && lc.top_level_constants.iter().any(|c| &c.name == name)));
+                lc.top_level_constants.retain(|c| !hoisted(&c.name));
+                initializer_defined
+                    .push(InitializerDefined::new(&path_str, &decls, &file_constants, i == 0, &mixed_in, lc));
             }
         }
     }

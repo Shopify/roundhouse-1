@@ -39,7 +39,13 @@
 //! Inside the block `self` is the hook's base (`class_eval`); the
 //! analyzer types it so.
 //!
-//! WHAT IS REFUSED, BY NAME. `def`, `class`, `module`; `self`, instance
+//! DEFINITIONS. A top-level `module`/`class` the tree carries as a
+//! library class (`app::keep_initializer_defined`: one the app names,
+//! or one the file mixes in) is a read of its constant at its place in
+//! the program, which autoloads its emitted file: it is defined where
+//! Rails runs the definition.
+//!
+//! WHAT IS REFUSED, BY NAME. `def`, any other `class` or `module`; `self`, instance
 //! and class variables of `main`; constant assignment below the top
 //! level; `__FILE__`, `__dir__`, `require_relative` and `load` (the
 //! initializer's own path); `return`/`yield`; calls with an implicit
@@ -319,6 +325,21 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
         for stmt in program.statements().body().iter() {
             let loc = stmt.location();
             let (start, end) = (loc.start_offset(), loc.end_offset());
+            // A module or class the file defines that the tree carries
+            // (`app::keep_initializer_defined`): reading its constant
+            // here autoloads its emitted file, so it is defined where
+            // Rails runs the definition, before the file's later
+            // statements (a prepend of it in an `on_load` block).
+            if let Some(name) = super::initializers::defined_at(&file, start) {
+                let span = crate::span::Span { file: super::sources::file_id(&file), start: start as u32, end: end as u32 };
+                let path = name.split("::").map(Symbol::from).collect();
+                // The span is the definition's, not a written read.
+                let mut read = Expr::new(span, ExprNode::Const { path });
+                read.decisions |= crate::expr::GENERATED_CONST_REF;
+                kept.push(guard(read, &label(&rel, &text, &stmt)));
+                carried += 1;
+                continue;
+            }
             // A reader applied it, or part of it, or named why not.
             if consumed.iter().any(|&(a, b)| (a <= start && end <= b) || (start <= a && b <= end))
                 || refused.iter().any(|&(a, b)| start <= a && b <= end)
