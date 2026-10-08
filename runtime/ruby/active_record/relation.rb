@@ -55,6 +55,10 @@ module ActiveRecord
   # returns this same object, mutated), and a stale cache there would
   # serve the pre-refinement rows.
   class Relation
+    # `exists?`'s no-argument default (any row), told apart from nil.
+    EXISTS_ANY_ROW = Object.new.freeze
+    private_constant :EXISTS_ANY_ROW
+
     def initialize(model)
       @model = model
       @table = model._table_sql
@@ -1387,9 +1391,13 @@ module ActiveRecord
     # `exists?` / `exists?(id)`. Hash/String forms are unsupported.
     # Integer? narrows by early return — rust2 does not narrow Option
     # across `unless x.nil?`. Unloaded: exists_sql (SELECT 1 LIMIT 1).
-    def exists?(id = nil)
+    # No argument asks for any row; `exists?(nil)` is false, as Rails'
+    # `return false if !conditions`. The default is a private sentinel so
+    # the typed signature stays `Integer?`.
+    def exists?(id = EXISTS_ANY_ROW)
       return false if @limit == 0
-      if id.nil?
+      return false if id.nil?
+      if EXISTS_ANY_ROW.equal?(id)
         r = @records
         return r.length > 0 unless r.nil?
         return probe_existence(1) > 0

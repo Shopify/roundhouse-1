@@ -385,6 +385,9 @@ class PostgreSQLRuntimeTest
     assert_equal 1, Entry.named("l'été \\ hi")
     assert_equal 0, Entry.named("absent")
     assert Entry.exists?(first.id)
+    assert Entry.exists?
+    refute Entry.exists?(nil)
+    refute Entry.all.exists?(nil)
     loaded = Entry.find(first.id)
     assert_equal "l'été \\ hi", loaded.Title
     assert_equal true, loaded.enabled
@@ -408,6 +411,7 @@ class PostgreSQLRuntimeTest
     refute Entry.exists?(loaded.id)
     Entry.delete_all
     assert_equal 0, Entry.count
+    refute Entry.exists?
     assert_equal 3, Entry.create!(Title: "no reset", enabled: true).id
     Entry._adapter_truncate
     assert_equal 1, Entry.create!(Title: "reset", enabled: true).id

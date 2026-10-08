@@ -82,7 +82,7 @@ module ActiveRecord
     def update_column: (String | Symbol name, untyped value) -> bool
     def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
     # Nil and uncastable request keys reject before the scalar adapter.
-    def self.exists?: (Integer | Float | String | nil id) -> bool
+    def self.exists?: (?(Integer | Float | String | nil) id) -> bool
     def self._exists_primary_key_input: (Integer | Float | String | nil id) -> bool
     # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
     def self.where: (Hash[Symbol, untyped] conditions) -> Relation
