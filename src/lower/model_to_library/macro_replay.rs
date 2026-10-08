@@ -130,16 +130,20 @@ fn is_lifecycle_callback(name: &str) -> bool {
 }
 
 /// Model DSL the Ruby-family runtime base answers on the class side at
-/// class-body time, so a macro that reaches it can be replayed. None yet.
+/// class-body time, so a macro that reaches it can be replayed.
 ///
-/// `attribute` is the switch for the class-side `Base.attribute` port:
-/// once each lowered model carries its retypable columns
-/// (`ingest::retypable_attributes`), a call whose column is in the
-/// model's set goes through here, and the runtime raises with the
-/// column's name for any other.
-fn runtime_answers_at_class_body(name: &str, _owner: &ClassId) -> bool {
+/// `attribute` and `query_constraints`: the runtime's class-side
+/// `Base.attribute` retypes a column the model compiled with the path
+/// that consults a declared type (`Model::retypable_attributes`), and
+/// raises with the name for any other; `Base.query_constraints` takes
+/// the model's compiled list (`Model::query_constraints`). Ingest records
+/// the macro calls whose literal columns those answer
+/// (`Model::claimed_body_calls`, `analyze::retypable_attributes`); for
+/// such a call (`answered`, decided per call in [`ClassSide::verdict`])
+/// the walk lets both through and judges the rest of what the macro does.
+fn runtime_answers_at_class_body(name: &str, answered: bool) -> bool {
     match name {
-        "attribute" => false,
+        "attribute" | "query_constraints" => answered,
         _ => false,
     }
 }
@@ -190,6 +194,9 @@ pub(crate) struct ClassSide<'a> {
     own: Vec<&'a MethodDef>,
     chain: Vec<&'a Model>,
     extended: Vec<&'a LibraryClass>,
+    /// The body calls whose `attribute`/`query_constraints` the model's
+    /// compiled columns answer (`Model::claimed_body_calls`).
+    claimed: &'a [crate::span::Span],
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -241,7 +248,9 @@ impl<'a> ClassSide<'a> {
     /// The class side of `model`.
     pub(crate) fn of_model(model: &'a Model, app: &'a crate::App) -> Self {
         let own: Vec<&MethodDef> = model.methods().filter(|d| d.receiver == MethodReceiver::Class).collect();
-        Self::new(&model.name, own, body_statements(model).collect(), model.parent.as_ref(), app)
+        let mut side = Self::new(&model.name, own, body_statements(model).collect(), model.parent.as_ref(), app);
+        side.claimed = &model.claimed_body_calls;
+        side
     }
 
     /// The class side of a class whose own class methods are `own`, whose
@@ -265,7 +274,7 @@ impl<'a> ClassSide<'a> {
                 _ => break,
             }
         }
-        let mut side = Self { owner, app, own, chain, extended: Vec::new() };
+        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[] };
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
         for call in body.into_iter().chain(ancestor_bodies) {
@@ -363,6 +372,7 @@ impl<'a> ClassSide<'a> {
         }
         let (def, module) = self.class_method(method.as_str())?;
         let mut walk = Walk::new(self, method.as_str());
+        walk.answered = self.claimed.contains(&call.span);
         let result = (|| {
             if let Some(m) = module {
                 walk.module_extended(m, method.as_str())?;
@@ -425,6 +435,9 @@ struct Walk<'s, 'a> {
     statics: Vec<bool>,
     /// Modules whose `extended` hook is being walked.
     in_progress: Vec<&'a ClassId>,
+    /// The macro call is one whose `attribute`/`query_constraints` the
+    /// model's compiled columns answer.
+    answered: bool,
 }
 
 impl<'s, 'a> Walk<'s, 'a> {
@@ -436,6 +449,7 @@ impl<'s, 'a> Walk<'s, 'a> {
             allow_static: false,
             statics: Vec::new(),
             in_progress: Vec::new(),
+            answered: false,
         }
     }
 
@@ -461,7 +475,10 @@ impl<'s, 'a> Walk<'s, 'a> {
 
     /// The class-side call `name` a macro makes on `self`.
     fn self_call(&mut self, name: &str) -> Result<(), String> {
-        if (is_model_dsl(name) && !runtime_answers_at_class_body(name, self.side.owner)) || name == REQUIRED_BY_DEFAULT_WRITER {
+        if runtime_answers_at_class_body(name, self.answered) {
+            return Ok(());
+        }
+        if is_model_dsl(name) || name == REQUIRED_BY_DEFAULT_WRITER {
             return Err(format!(
                 "{} reaches `{name}`, which the lowered model declares statically from its body, not at class-body run time",
                 self.via()
@@ -736,9 +753,15 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
     let own: Vec<&MethodDef> = lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).collect();
     let callbacks = super::callback_calls(lc.unknown_calls.iter(), &own, lc.parent.as_ref(), &app.models);
     let side = ClassSide::new(&lc.name, own, lc.unknown_calls.iter().collect(), lc.parent.as_ref(), app);
+    // The parent model's claims cover its STI subclasses' `query_constraints`
+    // macro calls naming its list, which the Ruby emit drops (Rails' list
+    // falls back to the base class's): neither replayed nor refused.
+    let parent_claims = app.models.iter().find(|m| lc.parent.as_ref() == Some(&m.name)).map(|m| m.claimed_body_calls.as_slice()).unwrap_or_default();
     lc.unknown_calls
         .iter()
-        .filter(|expr| !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_elsewhere(expr))
+        .filter(|expr| {
+            !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_elsewhere(expr) && !parent_claims.contains(&expr.span)
+        })
         .filter_map(|expr| {
             side.verdict(expr).map(|v| match v {
                 MacroVerdict::BelongsToRequiredByDefault(value) if !declares_belongs_to_after(lc, expr, app) => {
