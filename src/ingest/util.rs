@@ -370,7 +370,10 @@ fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
 /// dropped, every model including it raised at load.
 /// sorbet's `mixes_in_class_methods M` (graphql-shopify's
 /// `Metrics::AuthorizedType`) makes one too: each includer is extended
-/// with `M`.
+/// with `M`. So does a module extended with one: Core's
+/// `Metafields::Namespaces` is only `extend ShopifyMetafields::Namespaces`,
+/// and callers send it the gem module's methods. Marker extends
+/// (`T::Sig`, `ActiveSupport::Concern`) give a namespace no methods.
 fn body_has_mixin_include(body: Option<Node<'_>>) -> bool {
     let Some(body) = body else { return false };
     let stmts = flatten_statements(body);
@@ -385,8 +388,18 @@ fn body_has_mixin_include(body: Option<Node<'_>>) -> bool {
             !args.is_empty() && args.iter().all(|arg| constant_path_segments_strs(arg).is_some())
         })
     };
+    let method_extend = |call: &ruby_prism::CallNode<'_>| {
+        constant_args(call)
+            && call.arguments().is_some_and(|a| {
+                a.arguments().iter().all(|arg| {
+                    let path = constant_path_segments_strs(&arg).unwrap_or_default().join("::");
+                    !matches!(path.as_str(), "T::Sig" | "T::Helpers" | "T::Generic" | "ActiveSupport::Concern")
+                })
+            })
+    };
     stmts.iter().any(|stmt| {
         call_named(stmt, "include").is_some_and(|call| constant_args(&call))
+            || call_named(stmt, "extend").is_some_and(|call| method_extend(&call))
             || call_named(stmt, "mixes_in_class_methods").is_some_and(|call| call.arguments().is_some())
     })
 }
