@@ -151,6 +151,11 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             continue;
         }
         for (j, call) in lc.unknown_calls.iter().enumerate() {
+            // A statement the body keeps whole runs as written where it
+            // stands (`crate::expr::BODY_STATEMENT`), or stays reported.
+            if call.decisions & crate::expr::BODY_STATEMENT != 0 {
+                continue;
+            }
             if let Some((outcome, reach)) =
                 plan(app, sources, &constants, Owner::Library(i), call)
             {

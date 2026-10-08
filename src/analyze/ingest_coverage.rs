@@ -23,7 +23,12 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         Some(construct) => Diagnostic::unsupported(drop.span, None, construct.as_str(), drop.message.clone()),
         None => Diagnostic::ingest_unsupported(drop.span, drop.message.clone()),
     });
-    let calls = app.file_statement_gaps.iter().map(|gap| {
+    // A class or module body statement its class writes back in place
+    // on the Ruby family (`emit::ruby::carries_body_statement`) is run
+    // as Ruby runs it; every other target refuses it by name at build
+    // (`project::report_body_statements`).
+    let carried = crate::emit::ruby::carried_body_statement_spans(app);
+    let calls = app.file_statement_gaps.iter().filter(|gap| !carried.contains(&gap.span)).map(|gap| {
         let kind = DiagnosticKind::FileStatementUnsupported {
             construct: gap.construct.as_str().into(),
             detail: gap.detail.clone(),

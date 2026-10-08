@@ -617,6 +617,15 @@ fn program_items(
                 }
                 fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
                 fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+                // A `Const.class_eval do … end` the branch carries as a
+                // `ProgramItem::ClassEval`.
+                fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                    if is_class_eval_item(node) {
+                        self.0 = true;
+                    } else {
+                        ruby_prism::visit_call_node(self, node);
+                    }
+                }
             }
             let mut finds = Finds::default();
             finds.visit(stmt);
@@ -695,7 +704,7 @@ fn class_eval_item(
         return None;
     }
     let receiver = call.receiver()?;
-    if receiver.as_constant_read_node().is_none() && receiver.as_constant_path_node().is_none() {
+    if !class_eval_receiver(&receiver) {
         return None;
     }
     let block = call.block()?.as_block_node()?;
@@ -718,6 +727,28 @@ fn class_eval_item(
         method: method.to_string(),
         parts,
     }))
+}
+
+/// A receiver [`class_eval_item`] carries: a constant, or its singleton
+/// class (`Shopify::Types::Configuration.singleton_class.class_eval do
+/// def run_all_sig_blocks! … end`, where a `def` defines a class method).
+fn class_eval_receiver(receiver: &ruby_prism::Node<'_>) -> bool {
+    let constant = |node: &ruby_prism::Node<'_>| node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some();
+    constant(receiver)
+        || receiver.as_call_node().is_some_and(|call| {
+            constant_id_str(&call.name()) == "singleton_class"
+                && call.arguments().is_none()
+                && call.block().is_none()
+                && call.receiver().is_some_and(|r| constant(&r))
+        })
+}
+
+/// Whether `node` is a call [`class_eval_item`] takes up.
+fn is_class_eval_item(call: &ruby_prism::CallNode<'_>) -> bool {
+    matches!(constant_id_str(&call.name()), "class_eval" | "module_eval" | "class_exec" | "module_exec")
+        && call.arguments().is_none()
+        && call.block().is_some_and(|b| b.as_block_node().is_some_and(|b| b.parameters().is_none()))
+        && call.receiver().is_some_and(|r| class_eval_receiver(&r))
 }
 
 /// A `class_eval` body's statements as parts: each run of statements a
@@ -806,8 +837,23 @@ fn class_eval_body(source: &[u8], start: usize, end: usize, file: &str, method: 
     let root = result.node();
     let classes =
         declared_classes(&root, file, usize::MAX).map_err(|err| format!("the ingest cannot carry this `{method}` body: {err}"))?;
+    if classes.iter().any(|c| c.name.0.as_str() != CLASS_EVAL_BODY) {
+        return Err(format!("a class or module declared in this `{method}` body is not carried"));
+    }
     match <[LibraryClass; 1]>::try_from(classes) {
         Ok([class]) => Ok(class),
+        // A body of calls alone (`ActiveSupport::TestCase.class_eval do
+        // setup do … end end`) declares no library module of its own;
+        // it is still the body.
+        Err(classes) if classes.is_empty() => {
+            let module = root
+                .as_program_node()
+                .and_then(|p| p.statements().body().iter().next())
+                .and_then(|n| n.as_module_node())
+                .ok_or_else(|| format!("this `{method}` body has no room for its carry"))?;
+            library_class_from_module_node_with_scope(&module, &[], file)
+                .map_err(|err| format!("the ingest cannot carry this `{method}` body: {err}"))
+        }
         Err(_) => Err(format!("a class or module declared in this `{method}` body is not carried")),
     }
 }
@@ -2534,6 +2580,67 @@ fn discarded_kind(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
     })
 }
 
+/// Whether a [`discarded_kind`] statement is one Ruby runs on its own
+/// where it stands, which the Ruby family can write back in place: a
+/// loop, `begin`, `case` or global variable write. Not a multiple or
+/// operator assignment to a body local, class or instance variable (the
+/// body's locals, class variables and ivar initializers have carriers of
+/// their own the statement would bypass), nor a `yield` or `super`.
+fn statement_kind_carried(node: &ruby_prism::Node<'_>) -> bool {
+    use ruby_prism::Node as N;
+    matches!(
+        node,
+        N::WhileNode { .. }
+            | N::UntilNode { .. }
+            | N::ForNode { .. }
+            | N::BeginNode { .. }
+            | N::CaseNode { .. }
+            | N::CaseMatchNode { .. }
+            | N::GlobalVariableWriteNode { .. }
+            | N::GlobalVariableOrWriteNode { .. }
+            | N::GlobalVariableOperatorWriteNode { .. }
+            | N::GlobalVariableAndWriteNode { .. }
+    )
+}
+
+/// A class or module body statement the walk has no carrier for, whole,
+/// as Ruby runs it where it stands (`expr::BODY_STATEMENT`): a call on a
+/// computed receiver (`Foo.values.each do |d| value d.serialize end`),
+/// `x if cond`, `begin`, `case`, a loop. Its discard is noted as well;
+/// whether the emitted body writes it back is decided once the app is
+/// in (`emit::ruby::carries_body_statement`), the discard reporting it
+/// otherwise. `None` when its expression cannot stand for it: it
+/// declares (a `def`, `class`, `module` or `class << self` in it, which
+/// a statement does not define as a body does) or the expression ingest
+/// refuses it.
+fn body_statement(node: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> {
+    use ruby_prism::Visit;
+    #[derive(Default)]
+    struct Declares(bool);
+    impl<'pr> Visit<'pr> for Declares {
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {
+            self.0 = true;
+        }
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut declares = Declares::default();
+    declares.visit(node);
+    if declares.0 {
+        return None;
+    }
+    let mut expr = ingest_expr(node, file).ok()?;
+    expr.decisions |= crate::expr::BODY_STATEMENT;
+    Some(expr)
+}
+
 impl DeclBody {
     fn extend(&mut self, other: Self) {
         self.includes.extend(other.includes);
@@ -2554,7 +2661,10 @@ impl DeclBody {
 
     /// The class-body declarations an initializer must not precede.
     fn ordered_declaration_count(&self) -> usize {
-        self.includes.len() + self.constants.len() + self.unknown_calls.len()
+        // A body statement (`expr::BODY_STATEMENT`) is not one: one in a
+        // body with class-variable initializers is not carried.
+        let statements = self.unknown_calls.iter().filter(|c| c.decisions & crate::expr::BODY_STATEMENT != 0).count();
+        self.includes.len() + self.constants.len() + self.unknown_calls.len() - statements
     }
 
     fn finalize_classvars(&mut self, owner: &ClassId, file: &str) -> IngestResult<()> {
@@ -3289,6 +3399,15 @@ fn walk_decl_body_in<'pr>(
     // `extend self` exposes methods with their instance visibility; unlike
     // module_function, it neither makes a public copy nor ends at `private`.
     let mut extend_self_active = false;
+    // A bare `private` / `protected` above: a `define_method` a body
+    // statement runs takes that visibility in Ruby, which the emitted
+    // body (named directives after each def) does not give it, so such a
+    // statement is not captured (`body_statement`).
+    let mut default_visibility_nonpublic = false;
+    // Body statements are captured (`expr::BODY_STATEMENT`) in a
+    // declaration's own body only: in `class << self` they run on the
+    // singleton class.
+    let captures_statements = declaration_body && !force_class_receiver;
     // Names from the `module_function :a, :b` form, plus the positions
     // of the direct `def`s in this body they may promote. Tracking
     // positions (rather than searching `methods` by name at the end)
@@ -3353,6 +3472,9 @@ fn walk_decl_body_in<'pr>(
             Visibility::reject_conditional_declaration(&statement, file)?;
             reject_conditional_accessor(&statement, file)?;
             out.discarded.push(Discarded::of(&statement, "a conditional statement"));
+            if captures_statements && !default_visibility_nonpublic && !module_function_active {
+                out.unknown_calls.extend(body_statement(&statement, file));
+            }
             continue;
         }
         // A call on a literal list (`%w(month year).each do |m| … end`)
@@ -3393,6 +3515,7 @@ fn walk_decl_body_in<'pr>(
                 && matches!(constant_id_str(&call.name()), "public" | "protected" | "private")
             {
                 module_function_active = false;
+                default_visibility_nonpublic = constant_id_str(&call.name()) != "public";
             }
             continue;
         }
@@ -3683,6 +3806,7 @@ fn walk_decl_body_in<'pr>(
                         receiver,
                         original: Symbol::from(from.as_str()),
                         inherited: false,
+                        span: Span { file: super::sources::file_id(file), start: stmt.location().start_offset() as u32, end: stmt.location().end_offset() as u32 },
                     });
                     out.methods.push(copy);
                     continue;
@@ -4041,6 +4165,7 @@ fn walk_decl_body_in<'pr>(
                             receiver: copy.receiver,
                             original: out.methods[source].name.clone(),
                             inherited: false,
+                            span: Span { file: super::sources::file_id(file), start: call.location().start_offset() as u32, end: call.location().end_offset() as u32 },
                         });
                         out.methods.push(copy);
                     }
@@ -4187,13 +4312,24 @@ fn walk_decl_body_in<'pr>(
                 }
             } else if !glob_autoload_loops.contains(&statement.location().start_offset()) {
                 // A call on a computed receiver (`Dir[...].each do … end`)
-                // is not carried; it is named in the file's program
-                // (`DeclBody::discarded`). A glob loop registering
-                // autoloads is the autoloader's (`ingest::autoload_glob`).
+                // is named in the file's program (`DeclBody::discarded`)
+                // unless the emitted body writes it back in place
+                // (`body_statement`). A glob loop registering autoloads is
+                // the autoloader's (`ingest::autoload_glob`).
                 out.discarded.push(Discarded::of(&statement, "a call on a computed receiver"));
+                if captures_statements && !default_visibility_nonpublic && !module_function_active {
+                    out.unknown_calls.extend(body_statement(&statement, file));
+                }
             }
         } else if let Some(why) = discarded_kind(&statement) {
             out.discarded.push(Discarded::of(&statement, why));
+            if statement_kind_carried(&statement)
+                && captures_statements
+                && !default_visibility_nonpublic
+                && !module_function_active
+            {
+                out.unknown_calls.extend(body_statement(&statement, file));
+            }
         }
         // Nested class/module declarations also fall through here; they
         // surface as separate entries via the plural API.
@@ -4260,8 +4396,15 @@ fn walk_decl_body_in<'pr>(
             substitute_body_locals(value, &body_locals, file)?;
         }
         for call in &mut out.unknown_calls {
-            substitute_body_locals(call, &body_locals, file)?;
+            if call.decisions & crate::expr::BODY_STATEMENT == 0 {
+                substitute_body_locals(call, &body_locals, file)?;
+            }
         }
+        // A body statement reading a local whose scope its readers cannot
+        // keep is not carried: it stays the gap its discard names.
+        out.unknown_calls.retain_mut(|call| {
+            call.decisions & crate::expr::BODY_STATEMENT == 0 || substitute_body_locals(call, &body_locals, file).is_ok()
+        });
         for init in out.class_initializers.iter_mut().chain(out.class_attr_seeds.iter_mut()) {
             substitute_body_locals(init, &body_locals, file)?;
         }
@@ -4276,6 +4419,13 @@ fn walk_decl_body_in<'pr>(
     }
 
     order_mark.observe(&mut out);
+    // Native class-variable initializers run before every replayed call
+    // in the emitted body (`finalize_classvars`), so a body statement in
+    // such a body could not keep its place: it stays the gap its discard
+    // names.
+    if !out.class_initializers.is_empty() {
+        out.unknown_calls.retain(|call| call.decisions & crate::expr::BODY_STATEMENT == 0);
+    }
     out.finalize_classvars(owner, file)?;
     Ok(out)
 }

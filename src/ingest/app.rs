@@ -2992,6 +2992,7 @@ end
     for model in &mut app.models {
         model.subclass_default_scope = scoped.contains(&model.name);
     }
+    keep_carried_body_statements(&mut app);
     Ok(app)
 }
 
@@ -3090,6 +3091,71 @@ fn collect_subclass_declarations(app: &mut App) {
     for model in &mut app.models {
         model.subclass_declarations = declared.remove(&model.name).unwrap_or_default();
     }
+}
+
+/// The class and module body statements the walk captured whole
+/// (`expr::BODY_STATEMENT`) stay only in the classes that write them back
+/// where the source has them (`emit::ruby::carries_body_statement`), now
+/// that every class, gem and base is known. The rest leave the class:
+/// each stays the `file_statement_unsupported` gap its discard names.
+fn keep_carried_body_statements(app: &mut App) {
+    let verdicts: Vec<Vec<bool>> = app
+        .library_classes
+        .iter()
+        .map(|lc| {
+            lc.unknown_calls
+                .iter()
+                .map(|c| {
+                    c.decisions & crate::expr::BODY_STATEMENT == 0 || crate::emit::ruby::carries_body_statement(lc, c, app)
+                })
+                .collect()
+        })
+        .collect();
+    for (lc, keep) in app.library_classes.iter_mut().zip(verdicts) {
+        let mut keep = keep.into_iter();
+        lc.unknown_calls.retain(|_| keep.next().unwrap_or(true));
+    }
+    // Likewise the declarations a file program carries inline (in a
+    // file-level branch or behind a `return`), and `class_eval` bodies
+    // (`carries_body_statement` carries none of theirs).
+    fn walk(items: &mut [crate::app::ProgramItem], app: &App) {
+        fn prune(lc: &mut crate::dialect::LibraryClass, app: &App) {
+            let keep: Vec<bool> = lc
+                .unknown_calls
+                .iter()
+                .map(|c| c.decisions & crate::expr::BODY_STATEMENT == 0 || crate::emit::ruby::carries_body_statement(lc, c, app))
+                .collect();
+            let mut keep = keep.into_iter();
+            lc.unknown_calls.retain(|_| keep.next().unwrap_or(true));
+        }
+        fn parts(ps: &mut [crate::app::ClassEvalPart], app: &App) {
+            for p in ps {
+                match p {
+                    crate::app::ClassEvalPart::Body(lc) => prune(lc, app),
+                    crate::app::ClassEvalPart::Branch { then_parts, else_parts, .. } => {
+                        parts(then_parts, app);
+                        parts(else_parts, app);
+                    }
+                }
+            }
+        }
+        for item in items {
+            match item {
+                crate::app::ProgramItem::Inline(classes) => classes.iter_mut().for_each(|lc| prune(lc, app)),
+                crate::app::ProgramItem::ClassEval { parts: ps, .. } => parts(ps, app),
+                crate::app::ProgramItem::Branch { then_items, else_items, .. } => {
+                    walk(then_items, app);
+                    walk(else_items, app);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut programs = std::mem::take(&mut app.file_programs);
+    for program in &mut programs {
+        walk(&mut program.items, app);
+    }
+    app.file_programs = programs;
 }
 
 /// A support file the walk holds back for `inherited_alias::decide`:

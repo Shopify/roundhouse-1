@@ -171,6 +171,16 @@ pub const SINGLETON_CONSTANT_WRITE: u64 = 1 << 24;
 /// Ruby family reads it as `X.singleton_class::NAME`, where it lives.
 pub const SINGLETON_CONSTANT_REF: u64 = 1 << 25;
 
+/// On a class or module body statement the walk has no carrier for (a
+/// call on a computed receiver, `x if cond`, `begin`, `case`, a loop),
+/// captured whole into `LibraryClass::unknown_calls`: GraphQL enum bodies'
+/// `Foo.values.each do |d| value d.serialize end`. Ruby runs it where it
+/// stands when the body loads. The ingest keeps it only where the Ruby
+/// family writes it back in place (`emit::ruby::carries_body_statement`);
+/// elsewhere it is a `file_statement_unsupported` gap, and targets other
+/// than CRuby/JRuby refuse a kept one by name.
+pub const BODY_STATEMENT: u64 = 1 << 26;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
@@ -1921,7 +1931,7 @@ mod tests {
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
-            SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF,
+            SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT,
         ];
         let mut seen = 0u64;
         for bit in bits {
