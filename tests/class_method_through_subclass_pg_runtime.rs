@@ -78,6 +78,18 @@ const ASSET: &str = r#"class Asset < ApplicationRecord
   def self.found(n)
     where(name: n).first
   end
+
+  def self.x_list
+    where(kind: "x").to_a
+  end
+
+  def self.by_name(n)
+    find_by(name: n)
+  end
+
+  def self.how_many
+    count
+  end
 end
 "#;
 
@@ -147,6 +159,8 @@ const PROBE: &str = r##"class ClassMethodThroughSubclassProbe
     out << "model via subclass: #{BigAsset.recent.map(&:label).join(",")} #{BigAsset.newest.label} #{BigAsset.first_two.map(&:label).join(",")}"
     out << "model via subclass scope: #{BigAsset.named_b.map(&:label).join(",")} #{BigAsset.of_kind("x").map(&:label).join(",")} #{BigAsset.recent.where(kind: "y").first.label}"
     out << "model via subclass where: #{BigAsset.xs.map(&:label).join(",")} #{BigAsset.found("b").label}"
+    out << "model via subclass folded: #{BigAsset.everything.map { |a| a.class.name }.join(",")} #{BigAsset.x_list.map(&:label).join(",")} #{BigAsset.by_name("c").label} #{BigAsset.how_many}"
+    out << "model itself folded: #{Asset.everything.map { |a| a.class.name }.join(",")} #{Asset.x_list.map { |a| a.class.name }.join(",")} #{Asset.by_name("c").class.name} #{Asset.how_many}"
     out << "model itself: #{Asset.recent.map { |a| a.class.name }.join(",")} #{Asset.newest.class.name} #{Asset.first_two.map(&:name).join(",")} #{Asset.of_kind("y").map { |a| a.class.name }.join(",")} #{Asset.found("c").class.name}"
     out
   end
@@ -157,8 +171,6 @@ end
 const GAP_PROBE: &str = r##"class StiClassMethodProbe
   def self.lines
     out = []
-    Asset.create!(name: "a", kind: "x")
-    out << "model via subclass all: #{BigAsset.everything.map { |a| a.class.name }.join(",")}"
     Dog.create!(name: "rex", sound: "woof")
     Cat.create!(name: "tom", sound: "meow")
     Dog.create!(name: "fido", sound: "growl")
@@ -175,16 +187,17 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 4] = [
+const EXPECTED: [&str; 6] = [
     "model via subclass: big a,big b,big c big c big a,big b",
     "model via subclass scope: big b big a,big c big b",
     "model via subclass where: big a,big c big b",
+    "model via subclass folded: BigAsset,BigAsset,BigAsset big a,big c big c 3",
+    "model itself folded: Asset,Asset,Asset Asset,Asset Asset 3",
     "model itself: Asset,Asset,Asset Asset a,b Asset Asset",
 ];
 
 /// Native Rails 8.2 on the same PostgreSQL for [`GAP_PROBE`].
-const GAP_EXPECTED: [&str; 5] = [
-    "model via subclass all: BigAsset",
+const GAP_EXPECTED: [&str; 4] = [
     "sti base via subclass: rex,fido,bit tom,rex Dog,Dog,Puppy bit",
     "sti base itself: Dog,Cat,Dog,Puppy,Cat rex,tom",
     "sti own: rex,bit bit rex,fido,bit Dog rex",
@@ -257,6 +270,11 @@ fn model_class_methods_seed_a_relation_on_self() {
         !asset.contains("ActiveRecord::Relation.new(Asset)"),
         "{asset}"
     );
+    // The arel-folded `all.to_a` / `where(kind: "x").to_a` hydrate
+    // through `self`, and the bare `find_by` stays on `self`.
+    assert!(asset.contains("results << from_stmt(stmt)"), "{asset}");
+    assert!(!asset.contains("Asset.from_stmt"), "{asset}");
+    assert!(!asset.contains("Asset.find_by"), "{asset}");
 }
 
 /// The model files natively and emitted, same PostgreSQL.
@@ -277,16 +295,14 @@ fn model_class_methods_through_a_subclass_match_native_rails_on_postgresql() {
     assert_eq!(emitted_lines, native, "emitted");
 }
 
-/// Still differs from native. An arel-folded `all.to_a` in a model class
-/// method hydrates through the model constant (`Asset.from_stmt`), so
-/// `BigAsset.everything` answers Assets. And an STI relation carries its
-/// type condition only where `sti_scope` writes it at a constant call
-/// site: `Relation.new(Dog)` has none at runtime, so a base class method
+/// Still differs from native (the STI lane's): an STI relation carries
+/// its type condition only where `sti_scope` writes it at a constant call
+/// site. `Relation.new(Dog)` has none at runtime, so a base class method
 /// reached through `Dog` answers every animal; a subclass's own bare
 /// scope call (`named("rex")`) roots on the base; and `Puppy` inheriting
 /// `Dog.loud` keeps Dog's static type list.
 #[test]
-#[ignore = "known gap (arel-folded model class method hydration; STI type condition on a runtime relation); also requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL"]
+#[ignore = "known gap (STI type condition on a runtime relation); also requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL"]
 fn sti_class_methods_match_native_rails_on_postgresql() {
     let (emitted, errors) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
     let (native, emitted_lines) = pg_probe::native_and_emitted(

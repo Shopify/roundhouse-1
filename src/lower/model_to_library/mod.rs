@@ -428,8 +428,9 @@ pub(crate) fn lower_models_inner_for_dialect(
             let unfold = method.receiver == crate::dialect::MethodReceiver::Class
                 && unfolded.contains(&(model.name.clone(), method.name.clone()));
             if !unfold {
-                crate::lower::arel::rewrite_arel_in_expr_with_ruby_values(
+                crate::lower::arel::rewrite_arel_in_method_with_ruby_values(
                     &mut method.body, schema, &classes, &[], ruby_read_values, dialect,
+                    (method.receiver == crate::dialect::MethodReceiver::Class).then_some(&model.name),
                 );
             }
             type_method_body(method, &classes, table, Some(model));

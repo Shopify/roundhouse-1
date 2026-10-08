@@ -1945,6 +1945,10 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
                 )
                 || (class_self.is_some()
                     && crate::lower::scope_chain::mentions_bare_chain_start(&m.body))
+                || (is_model
+                    && class_self.is_some()
+                    && super::expr::native_keywords()
+                    && crate::lower::scope_chain::mentions_implicit_self_query(&m.body, &lc.name))
             {
                 crate::lower::scope_chain::rewrite_call_site_in(
                     &mut m.body,
