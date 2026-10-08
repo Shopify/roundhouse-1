@@ -3025,6 +3025,7 @@ fn collect_subclass_declarations(app: &mut App) {
         "after_save_commit",
         "after_rollback",
         "before_commit",
+        "after_initialize",
     ];
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
     let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
@@ -3082,6 +3083,15 @@ fn collect_subclass_declarations(app: &mut App) {
                 item
             {
                 items.push(item);
+            } else if let Some(item @ crate::dialect::ModelBodyItem::Unknown { .. }) = item {
+                // `after_initialize :m` / `after_initialize do … end`,
+                // which the model's hook override folds as a body item.
+                let crate::dialect::ModelBodyItem::Unknown { expr, .. } = &item else { unreachable!() };
+                let block_form = matches!(&*expr.node, crate::expr::ExprNode::Send { method, block: Some(_), .. }
+                    if method.as_str() == "after_initialize");
+                if block_form || crate::lower::model_to_library::symbol_after_initialize(expr).is_some() {
+                    items.push(item);
+                }
             }
         }
         if !items.is_empty() {

@@ -52,6 +52,7 @@ use self::associations::{push_association_methods, push_dependent_destroy};
 pub(crate) use self::associations::model_defines_instance_method;
 pub(crate) use self::markers::attribute_api_decls;
 pub(crate) use self::markers::BLOCK_CALLBACK_HOOKS;
+pub(crate) use self::markers::symbol_after_initialize;
 
 /// Push a synthesized instance method unless the model body defines the
 /// name (custom methods win — `push_user_methods` runs after the
@@ -1137,6 +1138,13 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
             }
         } else if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
             if block.is_some() {
+                continue;
+            }
+            // `after_initialize :set_defaults, if: :new_record?` —
+            // folded by markers::push_callback_methods.
+            if self::markers::symbol_after_initialize(expr).is_some()
+                && !self::markers::defines_after_initialize(model)
+            {
                 continue;
             }
             if let ExprNode::Send { args, .. } = &*expr.node {
