@@ -3671,6 +3671,34 @@ fn ruby_family_files(
     Ok(files)
 }
 
+/// The app's applied `inflect.*` declarations as the Ruby Rails runs,
+/// against the runtime's ActiveSupport::Inflector; empty when there are
+/// none. A regex rule is not read at ingest (it is reported there as a
+/// gap) and so is not replayed.
+fn inflection_replay(inflections: &crate::naming::AppInflections) -> String {
+    use crate::emit::ruby::expr::ruby_str_literal;
+    if inflections.calls.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's config/initializers inflections, which Rails runs at boot.\n\
+         ActiveSupport::Inflector.inflections(:en) do |inflect|\n",
+    );
+    for (method, words) in &inflections.calls {
+        let words: Vec<String> = words.iter().map(|w| ruby_str_literal(w)).collect();
+        if method == "acronym" {
+            // `acronym` takes one word; ingest flattens a literal list.
+            for word in &words {
+                out.push_str(&format!("  inflect.acronym({word})\n"));
+            }
+        } else {
+            out.push_str(&format!("  inflect.{method}({})\n", words.join(", ")));
+        }
+    }
+    out.push_str("end\n");
+    out
+}
+
 /// Define the constants boot initializers assign at their top level
 /// (`ingest::initializer_constants`) where Rails does: each engine's,
 /// then the app's `config/initializers` run in `load_config_initializers`
@@ -3846,6 +3874,56 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let programs = initializer_program_block(app);
     let environment = environment_program_block(app);
     apply_class_load_hooks(files, app);
+    // ActiveSupport::Deprecation, Rails.deprecator and
+    // Rails.application.deprecators (8.2.0.alpha).
+    let deprecation = crate::runtime_files::read_to_string("runtime/spinel/active_support_deprecation.rb")
+        .map_err(|e| format!("read deprecation runtime: {e}"))?;
+    files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
+    let deprecation_behavior = deprecation_behavior_block(app);
+    // Active Job's error classes (8.2.0.alpha enqueuing.rb, core.rb,
+    // arguments.rb), which `require "active_job"` defines before app code.
+    let job_errors = crate::runtime_files::read_to_string("runtime/spinel/active_job_errors.rb")
+        .map_err(|e| format!("read active job errors runtime: {e}"))?;
+    files.push(("runtime/active_job_errors.rb".into(), job_errors));
+    // ActiveSupport::Tryable and Object#try (8.2.0.alpha core_ext/object/try.rb).
+    let tryable = crate::runtime_files::read_to_string("runtime/spinel/active_support_tryable.rb")
+        .map_err(|e| format!("read tryable runtime: {e}"))?;
+    files.push(("runtime/active_support_tryable.rb".into(), tryable));
+    // ActiveSupport::Inflector (8.2.0.alpha inflector/inflections.rb,
+    // transliterate.rb, methods.rb and the default English rules).
+    let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
+        .map_err(|e| format!("read inflector runtime: {e}"))?;
+    files.push(("runtime/active_support_inflector.rb".into(), inflector));
+    // A native gem's `require "active_support/inflector"` (dry-core 1.1.0's
+    // inflector backend probe, inflector.rb:9) answers from the port, as
+    // the loaded activesupport answers it under Rails; the port is
+    // already loaded (gem_facades.rb), so the require evaluates nothing.
+    for feature in [
+        "active_support/inflector",
+        "active_support/inflector/inflections",
+        "active_support/inflector/methods",
+        "active_support/inflector/transliterate",
+        "active_support/inflections",
+    ] {
+        let up = "../".repeat(feature.matches('/').count());
+        files.push((
+            format!("runtime/features/{feature}.rb"),
+            format!(
+                "# `require {feature:?}` on this tree: activesupport's Inflector,\n\
+                 # ported (runtime/active_support_inflector.rb, which carries\n\
+                 # inflections.rb, methods.rb, transliterate.rb and the English rules).\n\
+                 # runtime/gem_facades.rb puts this directory first on the load path.\n\
+                 require_relative \"{up}../active_support_inflector\"\n"
+            ),
+        ));
+    }
+    // ActionDispatch::Session::AbstractStore over rack's Persisted, and
+    // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
+    for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
+        let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+            .map_err(|e| format!("read {port} runtime: {e}"))?;
+        files.push((format!("runtime/{port}.rb"), text));
+    }
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
@@ -3894,6 +3972,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
+            // `require "active_support"` (config/boot's `require "rails"`)
+            // loads active_support/inflector and its default English rules
+            // before Bundler.require: a gem's railtie or engine names
+            // itself through it (`generate_railtie_name`,
+            // `isolate_namespace`) as it loads. After Module#delegate,
+            // which Inflections::Uncountables uses.
+            let delegate = "require_relative \"module_delegate\"\n";
+            let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
+            content.insert_str(at, "require_relative \"active_support_inflector\"\n");
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -3910,7 +3997,19 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
             content.insert_str(
                 at,
-                "# `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
+                "# `require \"active_support\"` loads active_support/deprecation and\n\
+                 # deprecator before any app code: ActiveSupport::Deprecation, ported.\n\
+                 require_relative \"runtime/active_support_deprecation\"\n\
+                 # `require \"active_support/core_ext\"` mixes ActiveSupport::Tryable\n\
+                 # into Object before any app code: `Object#try`, ported.\n\
+                 require_relative \"runtime/active_support_tryable\"\n\
+                 # `require \"action_dispatch\"` defines its session stores, constants\n\
+                 # and ShowExceptions before any app code.\n\
+                 require_relative \"runtime/action_dispatch_session_store\"\n\
+                 require_relative \"runtime/action_dispatch_show_exceptions\"\n\
+                 # `require \"active_job\"` defines its error classes before app code.\n\
+                 require_relative \"runtime/active_job_errors\"\n\
+                 # `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
                  # (railties rails.rb:13): `Rails.backtrace_cleaner`, ported.\n\
                  require_relative \"runtime/active_support_backtrace_cleaner\"\n\
                  # Active Record's railtie: LogSubscriber.backtrace_cleaner and its\n\
@@ -3922,6 +4021,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  require_relative \"runtime/rails_railtie\"\n\
                  require_relative \"runtime/rails_engine\"\n",
             );
+            // The app's `inflect.*` declarations (config/initializers), which
+            // Rails runs after the gems load and before the app's code, in
+            // registration order: replayed into the port (loaded with the
+            // gems, runtime/gem_facades.rb) before app/models, so no app
+            // caller (nor Core's memoizing prepend) sees the bare defaults.
+            let replay = inflection_replay(&crate::naming::app_inflections());
+            if !replay.is_empty() {
+                let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
+                content.insert_str(at, &replay);
+            }
             content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
             content.push_str(&programs);
@@ -3942,6 +4051,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.rfind(eager).ok_or("PostgreSQL bootstrap: missing eager load in app/models.rb")?;
             content.insert_str(at, &environment);
             let at = at + environment.len();
+            content.insert_str(at, &deprecation_behavior);
+            let at = at + deprecation_behavior.len();
             content.insert_str(
                 at,
                 "# Application#initialize!: the railties' and engines' initializers, in\n\
@@ -4585,6 +4696,41 @@ fn environment_program_block(app: &App) -> String {
         "else\n  raise \"Rails environment has been set to #{Rails.env} but config/environments/#{Rails.env}.rb does not exist.\"\nend\n",
     );
     out
+}
+
+/// The `config.active_support` keys activesupport's
+/// `active_support.deprecation_behavior` initializer reads, by the
+/// keyword `Rails::Application.apply_deprecation_behavior` takes
+/// (runtime/active_support_deprecation.rb).
+const DEPRECATION_BEHAVIOR_KEYS: &[&str] =
+    &["report_deprecations", "deprecation", "disallowed_deprecation", "disallowed_deprecation_warnings"];
+
+/// activesupport 8.2.0.alpha railtie.rb:92-110: after the environment
+/// program, first of the railties' initializers (ActiveSupport's railtie
+/// loads first), configure `Rails.application.deprecators` from the
+/// app's `config.active_support` deprecation keys. A key the app writes
+/// is read through the reader ingest lifts onto the Application reopen
+/// (`ingest::app::APPLIED_FRAMEWORK_CONFIG_KEYS`); one it never writes
+/// is nil, as Rails' OrderedOptions answers.
+fn deprecation_behavior_block(app: &App) -> String {
+    let lifted = |reader: &str| {
+        app.rails_application.as_ref().is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == reader))
+    };
+    let args: Vec<String> = DEPRECATION_BEHAVIOR_KEYS
+        .iter()
+        .map(|key| {
+            let reader = crate::ingest::app::applied_framework_config_reader(&format!("active_support.{key}"));
+            let value = if lifted(&reader) { format!("Rails.application.{reader}") } else { "nil".to_string() };
+            format!("{key}: {value}")
+        })
+        .collect();
+    format!(
+        "# activesupport's `active_support.deprecation_behavior` initializer\n\
+         # (railtie.rb:92): the app's config.active_support deprecation keys\n\
+         # configure every registered deprecator (runtime/active_support_deprecation.rb).\n\
+         Rails::Application.apply_deprecation_behavior({})\n",
+        args.join(", ")
+    )
 }
 
 /// End each emitted class file with the `ActiveSupport.run_load_hooks`
@@ -8525,6 +8671,12 @@ fn spinel_files_with_assertions(
         && p != "runtime/semian_adapter.rb" && p != "runtime/semian_net_http.rb"
         && p != "runtime/active_support_lazy_load_hooks.rb"
         && p != "runtime/active_support_backtrace_cleaner.rb"
+        && p != "runtime/active_support_deprecation.rb"
+        && p != "runtime/active_job_errors.rb"
+        && p != "runtime/active_support_tryable.rb"
+        && p != "runtime/active_support_inflector.rb"
+        && p != "runtime/action_dispatch_session_store.rb"
+        && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the

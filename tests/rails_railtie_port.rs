@@ -155,6 +155,8 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
             "Gem.paths = { 'GEM_PATH' => [ENV['RH_TEST_GEMS'], *Gem.path].join(File::PATH_SEPARATOR) }\n\
              require_relative 'runtime/active_support_lazy_load_hooks'\n\
              $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
              require_relative 'runtime/rails'\n\
              require 'hashlike'\n\
              require_relative 'runtime/rails_railtie'\n\
@@ -191,6 +193,8 @@ fn railtie_initializers_run_in_rails_order() {
             "-e",
             "require_relative 'runtime/active_support_lazy_load_hooks'\n\
              $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
              require 'rails/railtie'\n\
              ORDER = []\n\
              ActiveSupport.on_load(:before_initialize) { |app| ORDER << :before_initialize }\n\
@@ -250,6 +254,8 @@ fn a_railtie_needing_unported_rails_is_named_and_the_rest_run() {
             "-e",
             "require_relative 'runtime/active_support_lazy_load_hooks'\n\
              $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
              require 'rails'\n\
              RAN = []\n\
              class Sessionish < Rails::Railtie\n\
@@ -311,6 +317,8 @@ fn a_railtie_s_finisher_hooks_run_after_the_app_s_initializers() {
             "-e",
             "require_relative 'runtime/active_support_lazy_load_hooks'\n\
              $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
              require_relative 'runtime/rails'\n\
              require_relative 'runtime/rails_configuration'\n\
              require_relative 'config/application'\n\
@@ -408,6 +416,8 @@ fn a_railtie_cannot_load_the_gem_home_copy_of_a_compiled_gem() {
          {block}\
          require_relative 'runtime/active_support_lazy_load_hooks'\n\
          $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+         require_relative 'runtime/module_delegate'\n\
+         require_relative 'runtime/active_support_inflector'\n\
          require_relative 'runtime/rails'\n\
          # The compiled gem (app/models/paqlike.rb in the tree).\n\
          module Paqlike\n  ORIGIN = :compiled\nend\n\
@@ -489,4 +499,52 @@ fn rails_app_revision_reads_env_then_the_revision_file_then_git() {
     assert_eq!(case(None, Some("\n")), format!("{head}nil\nnil\n\"42\"\n"));
     // No file and a root outside any git checkout: git fails, nil.
     assert_eq!(case(None, None), format!("{head}nil\nnil\n\"42\"\n"));
+}
+
+/// A railtie's and an isolated engine's names go through the app's
+/// acronyms, as railties' `generate_railtie_name` and `isolate_namespace`
+/// call ActiveSupport::Inflector.underscore: the port (loaded with the
+/// gems, runtime/gem_facades.rb) and native Rails 8.2.0.alpha
+/// (tests/support/rails_oracle.rb) agree.
+#[test]
+fn railtie_and_engine_names_follow_the_apps_acronyms_as_rails() {
+    const PROGRAM: &str = "ActiveSupport::Inflector.inflections(:en) { |i| i.acronym 'GraphQL' }\n\
+                           class GraphQLTie < Rails::Railtie; end\n\
+                           class APIKeyTie < Rails::Railtie; end\n\
+                           module GraphQLKit\n  class Engine < Rails::Engine\n    isolate_namespace GraphQLKit\n  end\nend\n\
+                           p [GraphQLTie.railtie_name, APIKeyTie.railtie_name, GraphQLKit::Engine.engine_name, GraphQLKit::Engine.config.default_scope, GraphQLKit::Engine.isolated?]\n";
+    // The engine's root is the nearest directory above its file with a
+    // lib/ (`find_root_with_flag "lib"`): each program runs from one.
+    let probe = std::env::temp_dir().join(format!("rh_railtie_names_{}", std::process::id()));
+    std::fs::create_dir_all(probe.join("lib")).unwrap();
+    let run = |name: &str, header: String| {
+        let script = probe.join(name);
+        std::fs::write(&script, format!("{header}{PROGRAM}")).unwrap();
+        emit_and_run::ruby().arg(&script).current_dir(&probe).output().expect("ruby")
+    };
+    let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    let native = run("native.rb", format!("require {oracle:?}\nRailsOracle.activate(\"railties\")\nrequire 'rails'\n"));
+    let native_out = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(native.status.success(), "native: {native_out}\n{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(native_out, "[\"graphql_tie\", \"api_key_tie\", \"graphql_kit\", {module: \"graphql_kit\"}, true]\n");
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_railtie_port\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let runtime = dir.join("runtime");
+    let out = run(
+        "emitted.rb",
+        format!(
+            "require File.join({runtime:?}, 'active_support_lazy_load_hooks')\n\
+             $LOAD_PATH.unshift(File.join({runtime:?}, 'features'))\n\
+             require File.join({runtime:?}, 'module_delegate')\n\
+             require File.join({runtime:?}, 'active_support_inflector')\n\
+             require 'rails'\n"
+        ),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, native_out);
+    std::fs::remove_dir_all(&probe).unwrap();
 }

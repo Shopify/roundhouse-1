@@ -291,10 +291,16 @@ pub(super) fn classify(path: &[String]) -> ConfigWrite {
 }
 
 /// The railtie default of an applied framework key, for an environment
-/// that does not write it: activerecord 8.2.0.alpha railtie.rb:32.
+/// that does not write it: activerecord 8.2.0.alpha railtie.rb:32; the
+/// deprecation keys are unset in `config.active_support` (an
+/// OrderedOptions, so nil) unless the app writes them.
 fn applied_default(reader: &str) -> Option<&'static str> {
     match reader {
         "active_record_maintain_test_schema" => Some("true"),
+        "active_support_deprecation"
+        | "active_support_disallowed_deprecation"
+        | "active_support_disallowed_deprecation_warnings"
+        | "active_support_report_deprecations" => Some("nil"),
         _ => None,
     }
 }

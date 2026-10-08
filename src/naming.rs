@@ -345,6 +345,13 @@ pub struct AppInflections {
     /// `inflect.plural`/`inflect.singular` REGEX rules the port cannot
     /// carry; counted so ingest can report the gap.
     pub regex_rules: usize,
+    /// Every applied declaration in registration order across files —
+    /// the method and its literal words — which the PostgreSQL tree
+    /// replays into the runtime's ActiveSupport::Inflector at boot, as
+    /// Rails runs the initializer (`irregular` and the string rules
+    /// prepend, and both delete uncountables, so order is part of the
+    /// answer).
+    pub calls: Vec<(String, Vec<String>)>,
 }
 
 thread_local! {

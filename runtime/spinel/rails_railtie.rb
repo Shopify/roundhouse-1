@@ -462,12 +462,11 @@ module Rails
         end
 
       private
-        # ActiveSupport::Inflector.underscore without the acronym table
-        # (the tree has no Inflector acronyms).
+        # ActiveSupport::Inflector (runtime/active_support_inflector.rb,
+        # which runtime/gem_facades.rb loads before any gem; boot.rb
+        # replays the app's acronyms into it before the app's code).
         def generate_railtie_name(string)
-          word = string.to_s.gsub("::", "/")
-          word = word.gsub(/(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z\d])(?=[A-Z])/, "_")
-          word.tr("-", "_").downcase.tr("/", "_")
+          ActiveSupport::Inflector.underscore(string).tr("/", "_")
         end
 
         def respond_to_missing?(name, _)

@@ -114,6 +114,77 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rails", &[
         ("backtrace_cleaner", class("Rails::BacktraceCleaner")),
     ], &[]);
+    // ActiveSupport::Deprecation and its Deprecators collection,
+    // `ActiveSupport.deprecator` and `Rails.deprecator`, answered by
+    // runtime/spinel/active_support_deprecation.rb (Rails 8.2.0.alpha),
+    // which only the PostgreSQL CRuby tree carries (`runtime_reads`
+    // refuses the read elsewhere). The instance methods come from the
+    // Behavior/Reporting/Disallowed modules the class includes, which
+    // the runtime index does not follow. `warn` answers the full message
+    // or nil when silenced; a block-taking method answers its block.
+    let deprecation = class("ActiveSupport::Deprecation");
+    let deprecators = class("ActiveSupport::Deprecation::Deprecators");
+    register_stdlib_class(classes, "ActiveSupport::Deprecation", &[
+        ("new", deprecation.clone()), ("_instance", deprecation.clone()),
+    ], &[
+        ("warn", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }),
+        ("deprecation_warning", Ty::Str),
+        ("silence", Ty::Untyped), ("allow", Ty::Untyped),
+        ("begin_silence", Ty::Int), ("end_silence", Ty::Int),
+        ("silenced", Ty::Untyped), ("silenced=", Ty::Untyped),
+        ("behavior", untyped_arr()), ("behavior=", Ty::Untyped),
+        ("disallowed_behavior", untyped_arr()), ("disallowed_behavior=", Ty::Untyped),
+        ("disallowed_warnings", Ty::Untyped), ("disallowed_warnings=", Ty::Untyped),
+        ("debug", Ty::Untyped), ("debug=", Ty::Untyped),
+        ("gem_name", Ty::Untyped), ("gem_name=", Ty::Untyped),
+        ("deprecation_horizon", Ty::Untyped), ("deprecation_horizon=", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::Deprecation::Deprecators", &[
+        ("new", deprecators.clone()),
+    ], &[
+        ("[]", Ty::Union { variants: vec![deprecation.clone(), Ty::Nil] }), ("[]=", deprecation.clone()),
+        ("each", Ty::Untyped), ("silence", Ty::Untyped),
+        ("silenced=", Ty::Untyped), ("debug=", Ty::Untyped), ("behavior=", Ty::Untyped),
+        ("disallowed_behavior=", Ty::Untyped), ("disallowed_warnings=", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "Rails", &[("deprecator", deprecation.clone())], &[]);
+    register_stdlib_class(classes, "ActiveSupport", &[("deprecator", deprecation.clone())], &[]);
+    // ActiveSupport::Inflector and its Inflections, answered by
+    // runtime/spinel/active_support_inflector.rb (Rails 8.2.0.alpha),
+    // which only the PostgreSQL CRuby tree carries (`runtime_reads`
+    // refuses the read elsewhere). The module `extend self`s, which the
+    // runtime index does not follow, so its methods answer on both sides.
+    // `inflections` with a block answers the block's value.
+    let inflections = class("ActiveSupport::Inflector::Inflections");
+    let uncountables = class("ActiveSupport::Inflector::Inflections::Uncountables");
+    let inflector: Vec<(&str, Ty)> = [
+        "pluralize", "singularize", "camelize", "underscore", "humanize", "upcase_first",
+        "downcase_first", "titleize", "tableize", "classify", "dasherize", "demodulize",
+        "deconstantize", "foreign_key", "parameterize", "transliterate", "ordinal", "ordinalize",
+    ]
+    .into_iter()
+    .map(|m| (m, Ty::Str))
+    .chain([("constantize", Ty::Untyped), ("safe_constantize", Ty::Untyped), ("inflections", Ty::Untyped)])
+    .collect();
+    register_stdlib_class(classes, "ActiveSupport::Inflector", &inflector, &inflector);
+    register_stdlib_class(classes, "ActiveSupport::Inflector::Inflections", &[
+        ("new", inflections.clone()), ("instance", inflections.clone()),
+        ("instance_or_fallback", inflections.clone()), ("all_instances", untyped_arr()),
+    ], &[
+        ("plurals", untyped_arr()), ("singulars", untyped_arr()), ("humans", untyped_arr()),
+        ("uncountables", uncountables.clone()),
+        ("acronyms", Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) }),
+        ("acronym", Ty::Untyped), ("plural", Ty::Untyped), ("singular", Ty::Untyped),
+        ("irregular", Ty::Untyped), ("uncountable", Ty::Untyped), ("human", Ty::Untyped),
+        ("clear", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::Inflector::Inflections::Uncountables", &[
+        ("new", uncountables.clone()),
+    ], &[
+        ("uncountable?", Ty::Bool), ("to_a", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("<<", uncountables.clone()), ("add", uncountables.clone()), ("delete", Ty::Untyped),
+        ("empty?", Ty::Bool), ("each", Ty::Untyped),
+    ]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");
@@ -157,7 +228,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // (`sorbet_check::alias_value`). The call's value is the source
     // `Cast`'s to type.
     let mut sorbet_check = ClassInfo::default();
-    for method in ["cast", "nilable", "any", "generic", "class_of", "fixed_hash", "fixed_array", "untyped", "anything", "boolean", "type_alias", "mixes_in_class_methods"] {
+    for method in ["cast", "nilable", "any", "all", "proc_type", "void", "generic", "class_of", "fixed_hash", "fixed_array", "untyped", "anything", "boolean", "type_alias", "mixes_in_class_methods"] {
         sorbet_check.class_methods.insert(Symbol::from(method), Ty::Untyped);
     }
     classes.insert(ClassId(Symbol::from(crate::ingest::sorbet_check::HELPER)), sorbet_check);

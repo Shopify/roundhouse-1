@@ -162,6 +162,7 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
                 let mut words = Vec::new();
                 args.iter().for_each(|a| strings(a, &mut words));
                 let literal = args.iter().all(all_literal);
+                let call = (method.as_str().to_string(), words.clone());
                 let applied = match method.as_str() {
                     "irregular" if words.len() == 2 => {
                         out.irregular.push((words[0].clone(), words[1].clone()));
@@ -193,6 +194,7 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
                 // What is applied is consumed; a regex rule (or a
                 // declaration with a non-literal word) stays a gap.
                 if applied {
+                    out.calls.push(call);
                     super::initializers::consume(file, e.span.start as usize, e.span.end as usize);
                 }
             }
@@ -8370,10 +8372,27 @@ const INERT_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
 /// loads the schema only when it is set. Shopify Core sets it false
 /// under `DB_ADAPTER=postgresql` (config/application.rb), whose test
 /// database is prepared explicitly.
-pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[(
-    "active_record.maintain_test_schema",
-    "runtime/database_configuration.rb DatabaseConfiguration.maintain_test_schema gates the boot schema load",
-)];
+///
+/// `active_support.{deprecation, disallowed_deprecation,
+/// disallowed_deprecation_warnings, report_deprecations}`: activesupport
+/// 8.2.0.alpha railtie.rb:92-110 (`active_support.deprecation_behavior`)
+/// configures every deprecator `Rails.application.deprecators` holds from
+/// them. Boot applies them after the environment program, before the
+/// railties' initializers (`project::DEPRECATION_BEHAVIOR_KEYS`,
+/// runtime/active_support_deprecation.rb).
+pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
+    (
+        "active_record.maintain_test_schema",
+        "runtime/database_configuration.rb DatabaseConfiguration.maintain_test_schema gates the boot schema load",
+    ),
+    ("active_support.deprecation", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
+    ("active_support.disallowed_deprecation", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
+    (
+        "active_support.disallowed_deprecation_warnings",
+        "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior",
+    ),
+    ("active_support.report_deprecations", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
+];
 
 /// The `Rails::Application` reader ingest lifts for an applied
 /// framework key (`active_record.maintain_test_schema` →
