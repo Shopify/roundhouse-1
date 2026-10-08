@@ -543,14 +543,108 @@ fn runtime_base_methods() -> &'static crate::det::HashSet<String> {
     })
 }
 
+/// The PostgreSQL CRuby tree's ActiveRecord::Base ancestry
+/// (runtime/spinel/cruby/active_record_core.rb and
+/// active_record_active_model.rb, which `project::apply_postgres_bootstrap`
+/// carries): the instance methods of the modules Base includes there, and
+/// the runtime base's own methods it removes from Base so the modules'
+/// answer.
+struct PostgresBase {
+    module_methods: crate::det::HashSet<String>,
+    removed: crate::det::HashSet<String>,
+}
+
+const POSTGRES_BASE_FILES: [(&str, &str); 2] = [
+    ("runtime/spinel/cruby/active_record_core.rb", include_str!("../../../runtime/spinel/cruby/active_record_core.rb")),
+    (
+        "runtime/spinel/cruby/active_record_active_model.rb",
+        include_str!("../../../runtime/spinel/cruby/active_record_active_model.rb"),
+    ),
+];
+
+fn postgres_base() -> &'static PostgresBase {
+    static BASE: std::sync::OnceLock<PostgresBase> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        let mut classes = Vec::new();
+        let mut removed = crate::det::HashSet::default();
+        for (file, text) in POSTGRES_BASE_FILES {
+            classes.extend(
+                crate::ingest::ingest_library_classes(text.as_bytes(), file).expect("Active Record Base overlay must ingest"),
+            );
+            let result = crate::ingest::prism::parse_silent(text.as_bytes());
+            collect_remove_method(&result.node(), &mut removed);
+        }
+        let base = classes.iter().filter(|c| !c.is_module && c.name.0.as_str() == "ActiveRecord::Base");
+        let included: Vec<&ClassId> = base.flat_map(|c| c.includes.iter()).collect();
+        // A module's own includes come with it (AttributeAssignment's
+        // ForbiddenAttributesProtection). A name matches the module it
+        // names in full or relative to an enclosing namespace.
+        let mut modules: Vec<&LibraryClass> = Vec::new();
+        let mut pending: Vec<&ClassId> = included;
+        while let Some(name) = pending.pop() {
+            let relative = format!("::{}", name.0.as_str());
+            for m in classes.iter().filter(|c| c.is_module && (c.name == *name || c.name.0.as_str().ends_with(&relative))) {
+                if !modules.iter().any(|n| n.name == m.name) {
+                    modules.push(m);
+                    pending.extend(m.includes.iter());
+                }
+            }
+        }
+        let module_methods = modules
+            .iter()
+            .flat_map(|m| m.methods.iter())
+            .filter(|d| d.receiver == MethodReceiver::Instance)
+            .map(|d| d.name.as_str().to_string())
+            .collect();
+        PostgresBase { module_methods, removed }
+    })
+}
+
+/// The symbols `remove_method :name` names in `node`.
+fn collect_remove_method(node: &ruby_prism::Node<'_>, out: &mut crate::det::HashSet<String>) {
+    struct V<'o> {
+        out: &'o mut crate::det::HashSet<String>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for V<'_> {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none() && node.name().as_slice() == b"remove_method" {
+                for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                    if let Some(sym) = arg.as_symbol_node() {
+                        self.out.insert(String::from_utf8_lossy(sym.unescaped()).into_owned());
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    ruby_prism::Visit::visit(&mut V { out }, node);
+}
+
+/// Framework methods the PostgreSQL CRuby tree's Base ancestry defines
+/// in an overridable module but does not run on every path Rails does,
+/// with what an override misses.
+const PARTIAL_BASE_HOOKS: &[(&str, &str)] = &[
+    (
+        "_assign_attributes",
+        "only `assign_attributes`/`attributes=` run it; the compiled `new`, `create` and `update` write each column directly, in column order",
+    ),
+    (
+        "initialize",
+        "records loaded from the database are built through `new`, so the override runs for them where Rails' `instantiate` skips it",
+    ),
+];
+
 /// What a boot include of ActiveRecord::Base overrides that the runtime
 /// base does not run: each instance method of `include` that calls
 /// `super` (so it wraps a framework method) and that the runtime base
 /// either defines in the class itself, ahead of any included module, so
 /// the override never runs, or neither defines nor calls, so nothing
 /// runs it and its `super` has no target. Ruby's own hooks
-/// ([`RUBY_OBJECT_HOOKS`]) run as natively.
-pub(crate) fn base_include_gaps(include: &LibraryClass) -> Vec<String> {
+/// ([`RUBY_OBJECT_HOOKS`]) run as natively. On a PostgreSQL app, whose
+/// CRuby tree gives Base Rails' module ancestry for some of them
+/// ([`PostgresBase`]), an override of one of those modules' methods runs
+/// as in Rails, short of what [`PARTIAL_BASE_HOOKS`] names.
+pub(crate) fn base_include_gaps(include: &LibraryClass, postgresql: bool) -> Vec<String> {
     fn calls_super(e: &Expr) -> bool {
         if matches!(&*e.node, ExprNode::Super { .. }) {
             return true;
@@ -560,13 +654,31 @@ pub(crate) fn base_include_gaps(include: &LibraryClass) -> Vec<String> {
         found
     }
     let base = runtime_base_methods();
-    let (mut shadowed, mut never) = (Vec::new(), Vec::new());
+    let overlay = postgresql.then(postgres_base);
+    let (mut shadowed, mut never, mut partial) = (Vec::new(), Vec::new(), Vec::new());
     for def in include.methods.iter().filter(|d| d.receiver == MethodReceiver::Instance && calls_super(&d.body)) {
         let name = def.name.as_str();
         if RUBY_OBJECT_HOOKS.contains(&name) {
             continue;
         }
-        let list = if base.contains(name) { &mut shadowed } else { &mut never };
+        let in_class = base.contains(name) && !overlay.is_some_and(|o| o.removed.contains(name));
+        let in_module = overlay.is_some_and(|o| o.module_methods.contains(name));
+        let list = if in_class {
+            &mut shadowed
+        } else if in_module {
+            match PARTIAL_BASE_HOOKS.iter().find(|(n, _)| *n == name) {
+                Some((_, missing)) => {
+                    let entry = format!("`{name}` ({missing})");
+                    if !partial.contains(&entry) {
+                        partial.push(entry);
+                    }
+                }
+                None => {}
+            }
+            continue;
+        } else {
+            &mut never
+        };
         if !list.iter().any(|n: &String| n == name) {
             list.push(name.to_string());
         }
@@ -582,6 +694,7 @@ pub(crate) fn base_include_gaps(include: &LibraryClass) -> Vec<String> {
             quote(&shadowed)
         ));
     }
+    out.extend(partial);
     out
 }
 
@@ -623,7 +736,9 @@ impl<'s, 'a> Walk<'s, 'a> {
     /// replayed.
     fn module_extended(&mut self, m: &'a LibraryClass, name: &str) -> Result<(), String> {
         if let Some(include) = self.side.base_include_of(m) {
-            let gaps = base_include_gaps(include);
+            let postgresql =
+                self.side.app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql);
+            let gaps = base_include_gaps(include, postgresql);
             if !gaps.is_empty() {
                 return Err(format!(
                     "`{name}` comes from `{}`, which `{}` extends onto ActiveRecord::Base when boot includes it there, and the runtime base does not run what that include overrides: {}",

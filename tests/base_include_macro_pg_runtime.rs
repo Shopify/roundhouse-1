@@ -10,8 +10,9 @@
 //! (`App::framework_base_includes`) as an app macro does, so macro_replay
 //! replays it, and its `attribute` call retypes the column it names. A
 //! hooks module that overrides framework instance methods the runtime
-//! base does not dispatch to (`init_internals`, as MoneyColumn does)
-//! gets the macro refused with the exact missing behavior.
+//! base does not dispatch to (Rails' private Persistence#_create_record,
+//! which the runtime's save never calls) gets the macro refused with the
+//! exact missing behavior.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -178,19 +179,18 @@ fn the_base_include_macro_is_replayed() {
     assert!(shop.contains("tagged(:code, prefix: \"shop\")") || shop.contains("tagged :code, prefix: \"shop\""), "{shop}");
 }
 
-/// MoneyColumn's `init_internals` override: the runtime base never calls
-/// it, so a macro whose methods read what it sets up is refused, naming
-/// the override.
+/// An override of `_create_record`: the runtime base never calls it, so
+/// a macro of the include is refused, naming the override.
 #[test]
 fn a_hooks_module_overriding_unported_framework_methods_refuses_the_macro() {
     let hooks = GEM_HOOKS.replace(
         "    def tag_for(column)",
-        "    private\n\n    def init_internals\n      @tag_cache = {}\n      super\n    end\n\n    public\n\n    def tag_for(column)",
+        "    private\n\n    def _create_record(*)\n      @tag_cache = {}\n      super\n    end\n\n    public\n\n    def tag_for(column)",
     );
     let (_emitted, errors) =
         overlay().write("vendor/gems/tagging-1.0.0/lib/tagging/hooks.rb", &hooks).emit(roundhouse::project::BuildTarget::Ruby);
     assert!(
-        errors.iter().any(|e| e.contains("tagged") && e.contains("model macro call on `Shop` not lowered") && e.contains("init_internals")),
+        errors.iter().any(|e| e.contains("tagged") && e.contains("model macro call on `Shop` not lowered") && e.contains("`_create_record`")),
         "{}",
         errors.join("\n")
     );
