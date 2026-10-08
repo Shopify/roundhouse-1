@@ -17,7 +17,8 @@
 //! STI subclass (a library class) does its own; the same shape runs
 //! natively on Core's pinned activerecord with sqlite3
 //! (tests/support/rails_oracle.rb) and emitted on the SQLite CRuby tree,
-//! and must print the same. Calls on ActiveRecord's own chains
+//! and must print the same, including callbacks registered inside
+//! `with_options if: do ... end` (expanded at ingest). Calls on ActiveRecord's own chains
 //! (`skip_callback :save, ...`), which a lowered model does not run
 //! through the port, and any other class-body DSL call model lowering
 //! drops, are `check` errors. Spinel refuses the module by name.
@@ -116,6 +117,9 @@ const CARD: &str = r#"class Card < ApplicationRecord
   after_revocation :notify_revoked
   after_revocation -> { log << :conditional }, if: -> { log.size > 1 }
   around_redaction :capture_around
+  with_options if: -> { log.include?(:x) } do
+    after_revocation :flag
+  end
 
   def log
     @log ||= []
@@ -133,6 +137,10 @@ const CARD: &str = r#"class Card < ApplicationRecord
 
   def notify_revoked
     log << :notified
+  end
+
+  def flag
+    log << :flagged
   end
 
   def capture_around
@@ -171,7 +179,9 @@ const JOB: &str = r#"class Job < ApplicationRecord
   define_callbacks :perform, skip_after_callbacks_if_terminated: true
   set_callback :perform, :before, :prepare
   set_callback :perform, :after, :finish
-  set_callback :perform, :after, :audit, if: -> { name == "audited" }
+  with_options if: -> { name == "audited" } do
+    set_callback :perform, :after, :audit
+  end
 
   def log
     @log ||= []
@@ -264,7 +274,7 @@ p [:agreement_chains, Grant::Agreement._revocation_callbacks.map(&:kind), Grant.
 "#;
 
 const EXPECTED: &str = r#"[:card_revoke, [:revoke, :notified]]
-[:card_revoke_cond, [:x, :revoke, :conditional, :notified]]
+[:card_revoke_cond, [:x, :revoke, :flagged, :conditional, :notified]]
 [:card_redact, [:around_before, :redact, :around_after]]
 [:grant_redact, [:revoke, :redact]]
 [:agreement_redact, [:revoke, :disabled, :redact, [:wrapped, "a"]]]
@@ -300,7 +310,7 @@ fn native() -> String {
     }
     let loads: String = FILES.iter().map(|(path, _)| format!("load {path:?}\n")).collect();
     let program = format!(
-        "require {oracle:?}\nRailsOracle.activate(\"activerecord\", sqlite3: \"2.9.2\")\nrequire \"active_record\"\n\
+        "require {oracle:?}\nRailsOracle.activate(\"activerecord\", sqlite3: \"2.9.2\")\nrequire \"active_support/all\"\nrequire \"active_record\"\n\
          abort \"native: activerecord is not Core's\" unless Gem.loaded_specs[\"activerecord\"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)\n\
          ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
          ActiveRecord::Migration.verbose = false\nload \"db/schema.rb\"\n{loads}{OBSERVE}"
@@ -331,6 +341,7 @@ fn model_callback_chains_run_like_activerecord() {
         "define_callbacks :redaction",
         "after_revocation :notify_revoked",
         "around_redaction :capture_around",
+        "after_revocation :flag, if: -> { log.include?(:x) }",
     ] {
         assert!(card.contains(line), "card.rb lacks {line:?}:\n{card}");
     }
@@ -340,7 +351,8 @@ fn model_callback_chains_run_like_activerecord() {
     assert!(agreement.contains("after_revocation :disable") && agreement.contains("around_redaction :wrap, if: :wrap?"), "{agreement}");
     assert!(read("app/models/quiet_job.rb").contains("skip_callback :perform, :after, :finish"));
     let job = read("app/models/job.rb");
-    assert!(job.contains("include ActiveSupport::Callbacks") && job.contains("define_callbacks :perform, skip_after_callbacks_if_terminated: true"), "{job}");
+    assert!(job.contains("include ActiveSupport::Callbacks") && job.contains("define_callbacks :perform, skip_after_callbacks_if_terminated: true")
+        && job.contains("set_callback :perform, :after, :audit, if: -> { name == \"audited\" }"), "{job}");
     assert!(dir.join("runtime/active_support_callbacks.rb").exists());
 
     let script = format!("require File.expand_path('main', Dir.pwd)\nMain.configure_default_adapter!\n{OBSERVE}");
@@ -364,12 +376,14 @@ fn spinel_refuses_the_models_callbacks() {
 
 /// What model lowering drops is a `check` error, not a warning: a call on
 /// one of ActiveRecord's own chains (which the lowered model runs without
-/// the port), in a model or an STI subclass, and an unknown macro.
+/// the port), in a model or an STI subclass, and an unknown macro, in a
+/// model or in a concern (one row for all its includers).
 #[test]
 fn dropped_model_dsl_is_a_check_error() {
     let app = app()
         .edit("app/models/card.rb", "  around_redaction :capture_around\n", "  around_redaction :capture_around\n  set_callback :save, :after, :notify_revoked\n  frobnicate :x\n")
-        .edit("app/models/quiet_job.rb", "  skip_callback :perform, :after, :finish\n", "  skip_callback :perform, :after, :finish\n  skip_callback :save, :before, :prepare\n");
+        .edit("app/models/quiet_job.rb", "  skip_callback :perform, :after, :finish\n", "  skip_callback :perform, :after, :finish\n  skip_callback :save, :before, :prepare\n")
+        .edit("app/models/concerns/vault/after_revocation.rb", "      define_callbacks :revocation\n", "      define_callbacks :revocation\n      tally :revocations\n");
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     for expected in [
         "set_callback not supported (all targets): model DSL call on `Card` not lowered; the class does not run it",
@@ -378,5 +392,8 @@ fn dropped_model_dsl_is_a_check_error() {
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "{expected}: {errors:#?}");
     }
-    assert_eq!(errors.len(), 3, "{errors:#?}");
+    // The concern's statement, spliced into Card and Grant, is one row.
+    let tally: Vec<_> = errors.iter().filter(|e| e.contains("tally not supported")).collect();
+    assert!(tally.len() == 1 && tally[0].contains("` (and 1 more includer) not lowered; the class does not run it"), "{errors:#?}");
+    assert_eq!(errors.len(), 4, "{errors:#?}");
 }

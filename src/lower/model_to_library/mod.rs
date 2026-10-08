@@ -734,9 +734,29 @@ pub(crate) fn dropped_statement_name(call: &Expr) -> String {
 /// Every model's [`unclaimed_unknowns`], for `analyze::diagnose`: `check`
 /// and the emit gate report the same refusals.
 pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
-    let mut out: Vec<_> =
+    let mut all: Vec<_> =
         app.models.iter().flat_map(|model| unclaimed_unknowns(model, &app.models, &app.schema)).collect();
-    out.extend(unclaimed_sti_subclass_calls(app));
+    all.extend(unclaimed_sti_subclass_calls(app));
+    // A concern's statement is spliced into every includer: one row per
+    // statement, naming the first includer and counting the rest.
+    let mut first: std::collections::BTreeMap<(u32, u32, u32), (usize, usize)> = Default::default();
+    let mut out: Vec<crate::diagnostic::Diagnostic> = Vec::new();
+    for d in all {
+        let key = (d.span.file.0, d.span.start, d.span.end);
+        match first.get_mut(&key) {
+            Some((_, others)) if !d.span.is_synthetic() => *others += 1,
+            _ => {
+                first.insert(key, (out.len(), 0));
+                out.push(d);
+            }
+        }
+    }
+    for (index, others) in first.into_values() {
+        if others > 0 {
+            let more = if others == 1 { "1 more includer".to_string() } else { format!("{others} more includers") };
+            out[index].message = out[index].message.replacen("` not lowered;", &format!("` (and {more}) not lowered;"), 1);
+        }
+    }
     out
 }
 
