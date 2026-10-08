@@ -1041,6 +1041,16 @@ module ActiveRecord
       relation
     end
 
+    # Rails' `type_condition`: a relation on an STI subclass reads only
+    # its rows and its subclasses', `unscoped` included, so a class
+    # method reached through the subclass (`Dog.recent`) does too.
+    # `Relation#initialize` applies it; `emit::ruby` writes each STI
+    # subclass's (`sti_scope::push_type_condition_methods`), and every
+    # other class adds none.
+    def self._apply_type_condition(relation)
+      relation
+    end
+
     def self._default_scope_attributes
       {}
     end

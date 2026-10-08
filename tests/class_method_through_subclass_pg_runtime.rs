@@ -153,7 +153,8 @@ const PROBE: &str = r##"class ClassMethodThroughSubclassProbe
 end
 "##;
 
-/// The shapes that still differ from native (see the ignored test).
+/// A model's class methods reached through a subclass that load all
+/// rows, and the STI shapes whose type condition is a runtime one.
 const GAP_PROBE: &str = r##"class StiClassMethodProbe
   def self.lines
     out = []
@@ -168,6 +169,7 @@ const GAP_PROBE: &str = r##"class StiClassMethodProbe
     out << "sti base itself: #{Animal.recent.map { |a| a.class.name }.join(",")} #{Animal.first_two.map(&:name).join(",")}"
     out << "sti own: #{Dog.loud.map(&:name).join(",")} #{Dog.newest.name} #{Dog.every.join(",")} #{Dog.named_rex.map { |a| a.class.name }.join(",")} #{Dog.first_one.map(&:name).join(",")}"
     out << "sti own inherited: #{Puppy.loud.map(&:name).join(",")} #{Puppy.newest.name} #{Puppy.every.join(",")} #{Puppy.named_rex.size}"
+    out << "sti unscoped: #{Dog.recent.unscoped.count} #{Puppy.loud.unscoped.count} #{Animal.recent.unscoped.count}"
     out
   end
 end
@@ -183,12 +185,13 @@ const EXPECTED: [&str; 4] = [
 ];
 
 /// Native Rails 8.2 on the same PostgreSQL for [`GAP_PROBE`].
-const GAP_EXPECTED: [&str; 5] = [
+const GAP_EXPECTED: [&str; 6] = [
     "model via subclass all: BigAsset",
     "sti base via subclass: rex,fido,bit tom,rex Dog,Dog,Puppy bit",
     "sti base itself: Dog,Cat,Dog,Puppy,Cat rex,tom",
     "sti own: rex,bit bit rex,fido,bit Dog rex",
     "sti own inherited: bit bit bit 0",
+    "sti unscoped: 3 1 5",
 ];
 
 /// What native Rails requires, in order.
@@ -277,16 +280,15 @@ fn model_class_methods_through_a_subclass_match_native_rails_on_postgresql() {
     assert_eq!(emitted_lines, native, "emitted");
 }
 
-/// Still differs from native. An arel-folded `all.to_a` in a model class
-/// method hydrates through the model constant (`Asset.from_stmt`), so
-/// `BigAsset.everything` answers Assets. And an STI relation carries its
-/// type condition only where `sti_scope` writes it at a constant call
-/// site: `Relation.new(Dog)` has none at runtime, so a base class method
-/// reached through `Dog` answers every animal; a subclass's own bare
-/// scope call (`named("rex")`) roots on the base; and `Puppy` inheriting
-/// `Dog.loud` keeps Dog's static type list.
+/// A model's implicit `all` in a class method reads the receiving class
+/// (`BigAsset.everything` loads BigAssets: the arel fold is held back),
+/// and an STI subclass's relation carries its type condition at runtime
+/// (`_apply_type_condition`), `unscoped` included: a base class method
+/// reached through `Dog` reads Dogs, a subclass's own bare scope call
+/// (`named("rex")`) runs on it, and `Puppy` inheriting `Dog.loud` reads
+/// Puppies.
 #[test]
-#[ignore = "known gap (arel-folded model class method hydration; STI type condition on a runtime relation); also requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL"]
+#[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn sti_class_methods_match_native_rails_on_postgresql() {
     let (emitted, errors) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
     let (native, emitted_lines) = pg_probe::native_and_emitted(
