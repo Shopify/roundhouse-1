@@ -195,9 +195,13 @@ pub(crate) fn validation_statements_split<'v>(
         // as `read_attribute_for_validation` reads it.
         let any_assoc = model.associations().any(|a| a.name() == &v.attribute);
         for rule in &v.rules {
+            // A value read with the class as `self` reads the declaring
+            // class's.
+            let mut bound = rule.clone();
+            bind_class_scope(&mut bound, &declarer.name);
             // `allow_nil:` / `allow_blank:` / `message:` / `if:` /
             // `unless:` wrap the rule they apply to.
-            let (rule, options) = match rule {
+            let (rule, options) = match &bound {
                 ValidationRule::Guarded { rule, options } => (&**rule, Some(options)),
                 other => (other, None),
             };
@@ -234,6 +238,7 @@ pub(crate) fn validation_statements_split<'v>(
                 (validation_rule_to_calls(model, &declarer.finder, &v.attribute, rule, attr_ty, &value, &text), value)
             };
             let prepend = options.is_some_and(|o| o.prepend);
+            let strict = options.and_then(|o| o.strict.as_ref());
             let checks = match options {
                 Some(o) => guard_rule(value, checks, o),
                 None => checks,
@@ -242,9 +247,13 @@ pub(crate) fn validation_statements_split<'v>(
                 .into_iter()
                 .map(|mut check| {
                     // Each expanded check attributes to its `validates` line,
-                    // and each message it adds to the validated attribute.
+                    // and each message it adds to the validated attribute;
+                    // a strict one raises the message instead.
                     check.inherit_span(span);
-                    tag_error_attribute(&mut check, &v.attribute);
+                    match strict {
+                        Some(exception) => raise_instead_of_adding(&mut check, exception),
+                        None => tag_error_attribute(&mut check, &v.attribute),
+                    }
                     check
                 })
                 .collect();
@@ -318,18 +327,93 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
     out
 }
 
+/// `errors << msg` as ActiveModel's `errors.add(..., strict: exception)`
+/// runs it: `raise exception, error.full_message`, the error not added.
+/// The accumulator's messages are full messages already.
+fn raise_instead_of_adding(check: &mut Expr, exception: &Expr) {
+    if is_errors_push(check) {
+        let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
+        let message = args[0].clone();
+        check.hint = None;
+        *check.node = ExprNode::Send {
+            recv: None,
+            method: Symbol::from("raise"),
+            args: vec![exception.clone(), message],
+            block: None,
+            parenthesized: false,
+        };
+        return;
+    }
+    check.node.for_each_child_mut(&mut |c| raise_instead_of_adding(c, exception));
+}
+
+/// `errors << msg`, the accumulator push every check lowers its error to.
+fn is_errors_push(check: &Expr) -> bool {
+    matches!(
+        &*check.node,
+        ExprNode::Send { recv: Some(r), method, args, .. }
+            if method.as_str() == "<<" && args.len() == 1
+                && matches!(&*r.node, ExprNode::Send { recv: None, method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty())
+    )
+}
+
+/// Bind every [`RuleValue::ClassScoped`] in `rule` to `class`, the
+/// class whose body declared it: `self` reads the class, and a method
+/// call without a receiver is the class's (`-> { minimum }` →
+/// `-> { Post.minimum }`). Ingest admits such a value only when it reads
+/// no instance variable of the class.
+pub(crate) fn bind_class_scope(rule: &mut ValidationRule, class: &ClassId) {
+    fn bind(value: &mut RuleValue, class: &ClassId) {
+        let RuleValue::ClassScoped { value: inner } = value else { return };
+        let mut inner = (**inner).clone();
+        match &mut inner {
+            RuleValue::Expr { expr } => class_self(expr, class),
+            RuleValue::Call { callable, .. } => class_self(callable, class),
+            _ => {}
+        }
+        *value = inner;
+    }
+    fn class_self(e: &mut Expr, class: &ClassId) {
+        let konst = || {
+            Expr::new(Span::synthetic(), ExprNode::Const { path: class.0.as_str().split("::").map(Symbol::from).collect() })
+        };
+        match &mut *e.node {
+            ExprNode::SelfRef => *e = konst(),
+            ExprNode::Send { recv: recv @ None, method, .. }
+                if !crate::ingest::validates::SELFLESS_KERNEL.contains(&method.as_str()) =>
+            {
+                *recv = Some(konst())
+            }
+            _ => {}
+        }
+        e.node.for_each_child_mut(&mut |c| class_self(c, class));
+    }
+    match rule {
+        ValidationRule::Guarded { rule, .. } => bind_class_scope(rule, class),
+        ValidationRule::Inclusion { list_of: Some(v), .. } => bind(v, class),
+        ValidationRule::Numericality { checks, .. } | ValidationRule::Comparison { checks } => {
+            for check in checks {
+                if let Some(bound) = &mut check.bound {
+                    bind(bound, class);
+                }
+            }
+        }
+        ValidationRule::LengthOf { checks, .. } => {
+            for check in checks {
+                bind(&mut check.bound, class);
+            }
+        }
+        ValidationRule::FormatOf { regexp, .. } => bind(regexp, class),
+        _ => {}
+    }
+}
+
 /// Tag each `errors << msg` push in `check` that carries no attribute yet
 /// with the one it is for (`IrHint::ErrorAttribute`): the accumulator
 /// keeps only the message, and `errors.attribute_names` needs the
 /// attribute on the trees that record it.
 pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
-    let is_push = matches!(
-        &*check.node,
-        ExprNode::Send { recv: Some(r), method, args, .. }
-            if method.as_str() == "<<" && args.len() == 1
-                && matches!(&*r.node, ExprNode::Send { recv: None, method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty())
-    );
-    if is_push && check.hint.is_none() {
+    if is_errors_push(check) && check.hint.is_none() {
         check.hint = Some(crate::expr::IrHint::ErrorAttribute(attr.clone()));
     }
     check.node.for_each_child_mut(&mut |c| tag_error_attribute(c, attr));
@@ -651,6 +735,12 @@ fn validation_rule_to_calls(
             inline_numericality_check(attr, *only_integer, checks, text)
         }
         ValidationRule::Comparison { checks } => inline_comparison_check(attr, value, checks, text),
+        // `acceptance:`: `errors.add(attr, :accepted) unless
+        // Array(accept).include?(value)`.
+        ValidationRule::Acceptance { accept } => vec![if_with_nil_else(
+            not(send(accept.clone(), "include?", vec![value.clone()])),
+            text.push("accepted", None, || value.clone()),
+        )],
         // `validate do ... end`: the block, called inside the record's
         // method (its `self`, as under `instance_exec`).
         // `validate SomeValidations.new` → `<object>.validate(self)`.
@@ -1896,6 +1986,8 @@ fn resolve(value: &RuleValue) -> Expr {
                 parenthesized: true,
             },
         ),
+        // `validation_statements_split` binds these first.
+        RuleValue::ClassScoped { value } => resolve(value),
     }
 }
 

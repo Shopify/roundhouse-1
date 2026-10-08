@@ -70,7 +70,10 @@ pub(super) fn parse_validation_call(
         .and_then(|rest| rest.strip_suffix("_of"))
         .filter(|key| BUILT_IN.contains(key))
         .map(str::to_string);
-    if name != "validates" && family_key.is_none() {
+    // `validates!` is `validates` with `strict: true` over any given.
+    // Its span stands for the exception class it implies.
+    let bang = (name == "validates!").then(|| super::util::node_span(&call.as_node(), file));
+    if name != "validates" && bang.is_none() && family_key.is_none() {
         return Ok(None);
     }
     let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
@@ -163,7 +166,7 @@ pub(super) fn parse_validation_call(
             }
         };
         for attr in &attrs {
-            let rule = validator_rule(&key, attr, &defaults, &entries, file)?;
+            let rule = validator_rule(&key, attr, &defaults, &entries, bang, file)?;
             if let Some(rule) = rule {
                 out.push(Validation { attribute: attr.clone(), rules: vec![rule] });
             }
@@ -240,6 +243,7 @@ fn own_keys(key: &str) -> &'static [&'static str] {
         "comparison" => &[
             "greater_than", "greater_than_or_equal_to", "equal_to", "less_than", "less_than_or_equal_to", "other_than",
         ],
+        "acceptance" => &["accept"],
         _ => &[],
     }
 }
@@ -251,13 +255,18 @@ fn validator_rule(
     attr: &Symbol,
     defaults: &[(String, Node<'_>)],
     entries: &[(String, Node<'_>)],
+    bang: Option<Span>,
     file: &str,
 ) -> IngestResult<Option<ValidationRule>> {
     if !BUILT_IN.contains(&key) {
+        if bang.is_some() {
+            return Ok(Some(unsupported(key, "`validates!` (strict) on a custom validator")));
+        }
         return custom_validator(key, attr, defaults, entries, file).map(Some);
     }
     let mut options = RuleOptions::default();
     let mut allow_given = false;
+    let mut allow_nil_given = false;
     let mut allow_blank_false = false;
     let mut own: Vec<(&str, &Node<'_>)> = Vec::new();
     // Defaults first, then the validator's own keys over them.
@@ -274,6 +283,7 @@ fn validator_rule(
                 };
                 allow_given |= v.as_nil_node().is_none();
                 if k == "allow_nil" {
+                    allow_nil_given = true;
                     options.allow_nil = b;
                 } else {
                     options.allow_blank = b;
@@ -293,7 +303,10 @@ fn validator_rule(
                 Some(on) => options.except_on = on,
                 None => return Ok(Some(unsupported(key, "`except_on:` that is not a Symbol or an Array of Symbols"))),
             },
-            "strict" => return Ok(Some(unsupported(key, "`strict:` (raising validations)"))),
+            "strict" => match strict_exception(v, file)? {
+                Ok(exception) => options.strict = exception,
+                Err(detail) => return Ok(Some(unsupported(key, detail))),
+            },
             "message" => match message(v, file)? {
                 Ok(m) => options.message = Some(m),
                 Err(detail) => return Ok(Some(unsupported(key, detail))),
@@ -318,8 +331,19 @@ fn validator_rule(
         "format" => format_rule(&own, file)?,
         "uniqueness" => uniqueness_rule(&own, file)?,
         "comparison" => comparison_rule(&own, file)?,
+        "acceptance" => {
+            // AcceptanceValidator's defaults, under the given options:
+            // `{ allow_nil: true, accept: ["1", true] }.merge!(options)`.
+            if !allow_nil_given {
+                options.allow_nil = true;
+            }
+            acceptance_rule(&own, file)?
+        }
         other => Err(format!("the `{other}` validator is not modeled")),
     };
+    if let Some(span) = bang {
+        options.strict = Some(strict_validation_failed(span));
+    }
     let rule = match rule {
         Ok(rule) => rule,
         Err(detail) => return Ok(Some(unsupported(key, detail))),
@@ -638,11 +662,14 @@ fn callable(expr: &Expr) -> Option<(Expr, usize)> {
 /// evaluated where the class body wrote it, with the class as `self`;
 /// lowered into the record's `validate`, such a read would see the
 /// record instead.
+/// Receiverless calls that do not read `self`: Kernel's.
+pub(crate) const SELFLESS_KERNEL: &[&str] = &[
+    "lambda", "proc", "raise", "format", "sprintf", "Integer", "Float", "String", "Array", "Hash",
+    "Rational", "BigDecimal", "loop", "freeze",
+];
+
 fn reads_self(expr: &Expr) -> bool {
-    const KERNEL: &[&str] = &[
-        "lambda", "proc", "raise", "format", "sprintf", "Integer", "Float", "String", "Array", "Hash",
-        "Rational", "BigDecimal", "loop", "freeze",
-    ];
+    const KERNEL: &[&str] = SELFLESS_KERNEL;
     let mut found = false;
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
@@ -657,6 +684,96 @@ fn reads_self(expr: &Expr) -> bool {
         e.node.for_each_child(&mut |c| stack.push(c));
     }
     false
+}
+
+/// Whether a value that reads `self` can be evaluated against the
+/// declaring class from the record's `validate`: its method calls and
+/// `self` name the class (`Class.m`, `Class`), which an instance
+/// variable of the class (or `yield`, `super`, `block_given?`) cannot.
+fn class_bindable(expr: &Expr) -> bool {
+    let mut ok = true;
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match &*e.node {
+            ExprNode::Ivar { .. } | ExprNode::Yield { .. } | ExprNode::Super { .. } => ok = false,
+            ExprNode::Send { recv: None, method, .. }
+                if matches!(method.as_str(), "block_given?" | "binding" | "instance_variable_get" | "instance_variable_set") =>
+            {
+                ok = false
+            }
+            _ => {}
+        }
+        if !ok {
+            return false;
+        }
+        e.node.for_each_child(&mut |c| stack.push(c));
+    }
+    true
+}
+
+/// `ActiveModel::StrictValidationFailed`, what `strict: true` raises.
+/// At `span`, the declaration that asked for it, so a target without
+/// the class reports it there (a synthetic span is never ledgered).
+fn strict_validation_failed(span: Span) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Const { path: vec![Symbol::from("ActiveModel"), Symbol::from("StrictValidationFailed")] },
+    )
+}
+
+/// `strict:`: `true` raises `ActiveModel::StrictValidationFailed`, a
+/// constant names the exception class, `false` / `nil` add the error.
+fn strict_exception(v: &Node<'_>, file: &str) -> IngestResult<Result<Option<Expr>, String>> {
+    if v.as_true_node().is_some() {
+        return Ok(Ok(Some(strict_validation_failed(super::util::node_span(v, file)))));
+    }
+    if v.as_false_node().is_some() || v.as_nil_node().is_some() {
+        return Ok(Ok(None));
+    }
+    let expr = ingest_expr(v, file)?;
+    if matches!(&*expr.node, ExprNode::Const { .. }) {
+        return Ok(Ok(Some(expr)));
+    }
+    Ok(Err("`strict:` that is not `true`, `false`, `nil` or an exception class constant".into()))
+}
+
+/// `acceptance:`: the values `accept:` names (`["1", true]` unless
+/// given), as `Array(accept)` reads them.
+fn acceptance_rule(own: &[(&str, &Node<'_>)], file: &str) -> IngestResult<Result<ValidationRule, String>> {
+    let s = Span::synthetic();
+    let lit = |value| Expr::new(s, ExprNode::Lit { value });
+    let Some((_, v)) = own.iter().rev().find(|(k, _)| *k == "accept") else {
+        let accept = Expr::new(
+            s,
+            ExprNode::Array {
+                elements: vec![lit(Literal::Str { value: "1".into() }), lit(Literal::Bool { value: true })],
+                style: ArrayStyle::Brackets,
+            },
+        );
+        return Ok(Ok(ValidationRule::Acceptance { accept }));
+    };
+    let expr = ingest_expr(v, file)?;
+    if reads_self(&expr) {
+        return Ok(Err("an `accept:` expression that reads `self` (evaluated in the class body)".into()));
+    }
+    let accept = match &*expr.node {
+        ExprNode::Array { .. } => expr,
+        ExprNode::Lit { value } if !matches!(value, Literal::Nil) => {
+            Expr::new(s, ExprNode::Array { elements: vec![expr.clone()], style: ArrayStyle::Brackets })
+        }
+        ExprNode::Lit { .. } => Expr::new(s, ExprNode::Array { elements: Vec::new(), style: ArrayStyle::Brackets }),
+        _ => Expr::new(
+            s,
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("Array"),
+                args: vec![expr],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+    };
+    Ok(Ok(ValidationRule::Acceptance { accept }))
 }
 
 /// A value ActiveModel resolves on each run (`resolve_value`): an
@@ -675,15 +792,24 @@ fn rule_value(v: &Node<'_>, k: &str, file: &str) -> IngestResult<Result<RuleValu
         if arity > 1 {
             return Ok(Err(format!("`{k}:` lambda with more than one parameter")));
         }
+        let value = RuleValue::Call { callable: callable.clone(), with_record: arity == 1 };
         if reads_self(&callable) {
-            return Ok(Err(format!(
-                "`{k}:` lambda that reads `self` (ActiveModel calls it with the class as `self`)"
-            )));
+            // ActiveModel calls it with the class as `self`.
+            if !class_bindable(&callable) {
+                return Ok(Err(format!(
+                    "`{k}:` lambda that reads an instance variable of the class (ActiveModel calls it with the class as `self`)"
+                )));
+            }
+            return Ok(Ok(RuleValue::ClassScoped { value: Box::new(value) }));
         }
-        return Ok(Ok(RuleValue::Call { callable, with_record: arity == 1 }));
+        return Ok(Ok(value));
     }
     if reads_self(&expr) {
-        return Ok(Err(format!("`{k}:` expression that reads `self` (evaluated in the class body)")));
+        // Evaluated in the class body, with the class as `self`.
+        if !class_bindable(&expr) {
+            return Ok(Err(format!("`{k}:` expression that reads an instance variable of the class (evaluated in the class body)")));
+        }
+        return Ok(Ok(RuleValue::ClassScoped { value: Box::new(RuleValue::Expr { expr }) }));
     }
     Ok(Ok(RuleValue::Expr { expr }))
 }
@@ -906,7 +1032,12 @@ fn inclusion_rule(
     }
     let expr = ingest_expr(list, file)?;
     if reads_self(&expr) {
-        return Ok(Err("an `in:` expression that reads `self` (evaluated in the class body)".into()));
+        // Evaluated in the class body, with the class as `self`.
+        if !class_bindable(&expr) {
+            return Ok(Err("an `in:` expression that reads an instance variable of the class (evaluated in the class body)".into()));
+        }
+        let value = RuleValue::ClassScoped { value: Box::new(RuleValue::Expr { expr }) };
+        return Ok(Ok(ValidationRule::Inclusion { list: nil, list_of: Some(value), exclusion, cover: false }));
     }
     // Rails asks a Range over numbers (or times) `cover?`, any other
     // enumerable `include?`.

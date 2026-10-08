@@ -17,6 +17,9 @@
 //! subclass and its descendants), while the base's asks the whole
 //! table. A Symbol message with no translation names the subclass's
 //! I18n keys, then its parents' up to the base (`lookup_ancestors`).
+//! Each line also reads `errors.attribute_names`: every check, block,
+//! object and comparison records the attribute it adds to (`:base` for
+//! `errors.add(:base, ...)`), and `errors[:title]`.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -99,7 +102,7 @@ const NOTE: &str = "class NotePost < Post\nend\n";
 const PROBE: &str = r##"class Probe
   def self.line(label, record, context = nil)
     valid = context.nil? ? record.valid? : record.valid?(context)
-    "#{label}: #{valid} #{record.errors.full_messages.inspect}"
+    "#{label}: #{valid} #{record.errors.full_messages.inspect} #{record.errors.attribute_names.inspect} #{record.errors[:title].inspect}"
   end
 
   def self.lines
@@ -167,29 +170,38 @@ const FILES: &[(&str, &str)] = &[
 const OBSERVE: &str = "puts Probe.lines\n";
 
 fn app() -> emit_and_run::Overlay {
+    app_of(FILES, SCHEMA)
+}
+
+fn app_of(files: &[(&str, &str)], schema: &str) -> emit_and_run::Overlay {
     let mut app = emit_and_run::empty_app();
-    for (path, text) in FILES {
+    for (path, text) in files {
         app = app.write(path, text);
     }
-    app.write("db/schema.rb", SCHEMA)
+    app.write("db/schema.rb", schema)
         .write("roundhouse.yml", "test_paths:\n  - test\n")
         .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: \":memory:\"\n")
 }
 
 fn native() -> String {
+    native_of("sti", FILES, SCHEMA, OBSERVE)
+}
+
+fn native_of(label: &str, files: &[(&str, &str)], schema: &str, observe: &str) -> String {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
-    let dir = std::env::temp_dir().join(format!("rh_active_record_validations_sti_native_{}", std::process::id()));
-    for (path, text) in FILES.iter().chain([&("db/schema.rb", SCHEMA)]) {
+    let dir = std::env::temp_dir()
+        .join(format!("rh_active_record_validations_{label}_native_{}", std::process::id()));
+    for (path, text) in files.iter().chain([&("db/schema.rb", schema)]) {
         let file = dir.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, text).unwrap();
     }
-    let loads: String = FILES.iter().map(|(path, _)| format!("load {path:?}\n")).collect();
+    let loads: String = files.iter().map(|(path, _)| format!("load {path:?}\n")).collect();
     let program = format!(
         "require {oracle:?}\nRailsOracle.activate(\"activerecord\", sqlite3: \"2.9.2\")\nrequire \"active_support/all\"\nrequire \"active_record\"\n\
          abort \"native: activerecord is not Core's\" unless Gem.loaded_specs[\"activerecord\"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)\n\
          ActiveRecord::Base.establish_connection(adapter: \"sqlite3\", database: \":memory:\")\n\
-         ActiveRecord::Migration.verbose = false\nload \"db/schema.rb\"\n{loads}{OBSERVE}"
+         ActiveRecord::Migration.verbose = false\nload \"db/schema.rb\"\n{loads}{observe}"
     );
     std::fs::write(dir.join("native.rb"), program).unwrap();
     let out = Command::new("ruby")
@@ -207,44 +219,50 @@ fn native() -> String {
 /// Lines the native run must print (the observations this test is
 /// about), before the emitted run is compared with it whole.
 const EXPECT: &[&str] = &[
-    "post blank: false [\"Title can't be blank\"]",
-    "post shouty publish: false [\"Body is missing\", \"Title is shouty\"]",
-    "post rank big: false [\"Rank is too big\"]",
-    "post rank big skip: true []",
-    "post ends early: false [\"Ends before it starts\", \"Ends must be greater than or equal to 5\"]",
-    "post long draft: true []",
-    "post long: false [\"Title is too long (maximum is 10 characters)\"]",
-    "post tab: false [\"Title has a tab\"]",
-    "post tab update: true []",
+    "post blank: false [\"Title can't be blank\"] [:title]",
+    "post shouty publish: false [\"Body is missing\", \"Title is shouty\"] [:body, :title] [\"is shouty\"]",
+    "post rank big: false [\"Rank is too big\"] [:rank] []",
+    "post rank big skip: true [] []",
+    "post ends early: false [\"Ends before it starts\", \"Ends must be greater than or equal to 5\"] [:base, :ends]",
+    "post long draft: true [] []",
+    "post long: false [\"Title is too long (maximum is 10 characters)\"] [:title]",
+    "post tab: false [\"Title has a tab\"] [:title]",
+    "post tab update: true [] []",
     "save create: true",
-    "post saved update: false [\"Rank exceeds 50\"]",
+    "post saved update: false [\"Rank exceeds 50\"] [:rank]",
     "save publish: false",
-    "featured draft: false [\"Title cannot be draft\"]",
-    "featured draft update: true []",
-    "note: true []",
-    "post first: false [\"Post first\", \"Rank is too big\"]",
-    "featured first: false [\"Featured first\", \"Post first\", \"Featured needs a longer body\"]",
-    "post dup publish: false [\"Title has already been taken\"]",
-    "featured dup of post: true []",
-    "featured dup: false [\"Title has already been taken\"]",
-    "pinned dup of featured: false [\"Title has already been taken\"]",
-    "featured dup of pinned: false [\"Title has already been taken\"]",
-    "note dup publish: false [\"Title has already been taken\"]",
-    "note dup: true []",
+    "featured draft: false [\"Title cannot be draft\"] [:title] [\"cannot be draft\"]",
+    "featured draft update: true [] []",
+    "note: true [] []",
+    "post first: false [\"Post first\", \"Rank is too big\"] [:base, :rank]",
+    "featured first: false [\"Featured first\", \"Post first\", \"Featured needs a longer body\"] [:base]",
+    "post dup publish: false [\"Title has already been taken\"] [:title]",
+    "featured dup of post: true [] []",
+    "featured dup: false [\"Title has already been taken\"] [:title]",
+    "pinned dup of featured: false [\"Title has already been taken\"] [:title] [\"has already been taken\"]",
+    "featured dup of pinned: false [\"Title has already been taken\"] [:title]",
+    "note dup publish: false [\"Title has already been taken\"] [:title]",
+    "note dup: true [] []",
     "en.activerecord.errors.models.featured_post.attributes.rank.needs_rank",
     "en.activerecord.errors.models.post.attributes.rank.needs_rank",
     "Rank must be less than 10",
+    "featured blank: false [\"Title can't be blank\", \"Body can't be blank\", \"Rank Translation missing.",
+    "\"Featured needs a longer body\"] [:title, :body, :rank, :base]",
+    "pinned: false [\"Rank must be less than 10\"] [:rank]",
 ];
 
 #[test]
 fn validate_forms_and_sti_subclass_validations_run_like_activerecord() {
-    let native = native();
-    for seen in EXPECT {
+    compare(app(), native(), EXPECT, "app/models/featured_post.rb", OBSERVE);
+}
+
+fn compare(app: emit_and_run::Overlay, native: String, expect: &[&str], show: &str, observe: &str) {
+    for seen in expect {
         assert!(native.contains(seen), "native run lacks {seen:?}:\n{native}");
     }
-    let (dir, errors) = app().emit(BuildTarget::Ruby);
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
-    let script = format!("require File.expand_path('main', Dir.pwd)\nMain.configure_default_adapter!\n{OBSERVE}");
+    let script = format!("require File.expand_path('main', Dir.pwd)\nMain.configure_default_adapter!\n{observe}");
     let out = emit_and_run::ruby()
         .current_dir(&*dir)
         .args(["-W0", "-e", &script])
@@ -256,9 +274,173 @@ fn validate_forms_and_sti_subclass_validations_run_like_activerecord() {
         out.status.success(),
         "{stdout}\n{}\n{}",
         String::from_utf8_lossy(&out.stderr),
-        std::fs::read_to_string(dir.join("app/models/featured_post.rb")).unwrap_or_default()
+        std::fs::read_to_string(dir.join(show)).unwrap_or_default()
     );
     assert_eq!(stdout, native, "emitted vs native activerecord");
+}
+
+const ACCOUNT: &str = r##"class Account < ApplicationRecord
+  def self.max_rank
+    10
+  end
+
+  def self.kinds
+    %w[a b]
+  end
+
+  validates :terms, acceptance: true
+  validates :agreed, acceptance: { accept: "yes" }
+  validates :name, presence: true, strict: true
+  validates :rank, comparison: { less_than: -> { max_rank } }, allow_nil: true
+  validates :kind, inclusion: { in: -> { kinds } }, allow_nil: true
+end
+"##;
+
+const PREMIUM: &str = r##"class PremiumError < StandardError
+end
+
+class Premium < Account
+  def self.levels
+    %w[gold silver]
+  end
+
+  validates :cira, acceptance: true
+  validates :code, presence: true, strict: PremiumError
+  validates! :level, inclusion: { in: levels }, allow_nil: true
+  validates :rank, numericality: { greater_than: -> { min_rank } }, allow_nil: true
+
+  def self.min_rank
+    2
+  end
+end
+"##;
+
+const GOLD: &str = r##"class Gold < Premium
+  validates :vip, acceptance: { accept: [true, "y"] }
+  validates :kind, inclusion: { in: -> { kinds - ["b"] } }, allow_nil: true
+end
+"##;
+
+const ACCOUNT_PROBE: &str = r##"class AccountProbe
+  def self.line(label, record)
+    valid = begin
+      record.valid?
+    rescue StandardError => e
+      "raised #{e.class}: #{e.message}"
+    end
+    "#{label}: #{valid} #{record.errors.full_messages.inspect} #{record.errors.attribute_names.inspect}"
+  end
+
+  def self.lines
+    out = []
+    out << line("account ok", Account.new(name: "n"))
+    out << line("account terms 0", Account.new(name: "n", terms: "0"))
+    out << line("account terms 1", Account.new(name: "n", terms: "1"))
+    out << line("account terms true", Account.new(name: "n", terms: true))
+    out << line("account terms false", Account.new(name: "n", terms: false))
+    out << line("account agreed yes", Account.new(name: "n", agreed: "yes"))
+    out << line("account agreed 1", Account.new(name: "n", agreed: "1"))
+    out << line("account unnamed", Account.new(terms: "0"))
+    out << line("account rank", Account.new(name: "n", rank: 10))
+    out << line("account kind", Account.new(name: "n", kind: "c"))
+    out << line("account kind b", Account.new(name: "n", kind: "b"))
+    out << line("premium ok", Premium.new(name: "n", code: "c"))
+    out << line("premium cira 0", Premium.new(name: "n", code: "c", cira: "0"))
+    out << line("premium cira true", Premium.new(name: "n", code: "c", cira: true))
+    out << line("premium terms 0", Premium.new(name: "n", code: "c", terms: "0"))
+    out << line("premium no code", Premium.new(name: "n"))
+    out << line("premium level", Premium.new(name: "n", code: "c", level: "tin"))
+    out << line("premium level gold", Premium.new(name: "n", code: "c", level: "gold"))
+    out << line("premium rank", Premium.new(name: "n", code: "c", rank: 1))
+    out << line("premium rank big", Premium.new(name: "n", code: "c", rank: 11))
+    out << line("gold ok", Gold.new(name: "n", code: "c"))
+    out << line("gold vip n", Gold.new(name: "n", code: "c", vip: "n"))
+    out << line("gold vip y", Gold.new(name: "n", code: "c", vip: "y", cira: "1"))
+    out << line("gold cira 0", Gold.new(name: "n", code: "c", cira: "0"))
+    out << line("gold kind b", Gold.new(name: "n", code: "c", kind: "b"))
+    out << line("gold kind a", Gold.new(name: "n", code: "c", kind: "a"))
+    out << "gold type: #{Gold.new.type.inspect}"
+    premium = Premium.create!(name: "n", code: "c", cira: "1")
+    out << "premium saved cira: #{premium.cira.inspect}"
+    out << "premium update cira 0: #{premium.update(cira: "0")} #{premium.errors.full_messages.inspect}"
+    gold = Gold.create!(name: "n", code: "c")
+    out << "gold update vip n: #{gold.update(vip: "n")} #{gold.errors.full_messages.inspect}"
+    begin
+      gold.update!(vip: "n")
+    rescue ActiveRecord::RecordInvalid => e
+      out << "gold update! vip n: #{e.message}"
+    end
+    account = Account.create!(name: "n")
+    out << "account update terms 0: #{account.update(terms: "0")} #{account.errors.full_messages.inspect}"
+    out
+  end
+end
+"##;
+
+const ACCOUNT_SCHEMA: &str = r#"ActiveRecord::Schema.define(version: 1) do
+  create_table "accounts", force: :cascade do |t|
+    t.string "name"
+    t.string "code"
+    t.integer "rank"
+    t.string "kind"
+    t.string "level"
+    t.string "agreed"
+    t.string "type"
+  end
+end
+"#;
+
+const ACCOUNT_FILES: &[(&str, &str)] = &[
+    ("app/models/application_record.rb", APPLICATION_RECORD),
+    ("app/models/account.rb", ACCOUNT),
+    ("app/models/premium.rb", PREMIUM),
+    ("app/models/gold.rb", GOLD),
+    ("app/models/account_probe.rb", ACCOUNT_PROBE),
+];
+
+const ACCOUNT_OBSERVE: &str = "puts AccountProbe.lines\n";
+
+/// `acceptance:` (a virtual attribute on the model and on STI
+/// subclasses, and a column), `strict:` / `validates!` (raise instead
+/// of recording), and `comparison:` / `inclusion:` / `numericality:`
+/// values that read the class (a lambda calling a class method, a
+/// class-body expression).
+const ACCOUNT_EXPECT: &[&str] = &[
+    "account ok: true [] []",
+    "account terms 0: false [\"Terms must be accepted\"] [:terms]",
+    "account terms 1: true [] []",
+    "account terms true: true [] []",
+    "account terms false: false [\"Terms must be accepted\"] [:terms]",
+    "account agreed yes: true [] []",
+    "account agreed 1: false [\"Agreed must be accepted\"] [:agreed]",
+    "account unnamed: raised ActiveModel::StrictValidationFailed: Name can't be blank",
+    "account rank: false [\"Rank must be less than 10\"] [:rank]",
+    "account kind: false [\"Kind is not included in the list\"] [:kind]",
+    "account kind b: true [] []",
+    "premium cira 0: false [\"Cira must be accepted\"] [:cira]",
+    "premium cira true: true [] []",
+    "premium terms 0: false [\"Terms must be accepted\"] [:terms]",
+    "premium no code: raised PremiumError: Code can't be blank",
+    "premium level: raised ActiveModel::StrictValidationFailed: Level is not included in the list",
+    "premium level gold: true [] []",
+    "premium rank: false [\"Rank must be greater than 2\"] [:rank]",
+    "premium rank big: false [\"Rank must be less than 10\"] [:rank]",
+    "gold vip n: false [\"Vip must be accepted\"] [:vip]",
+    "gold vip y: true [] []",
+    "gold cira 0: false [\"Cira must be accepted\"] [:cira]",
+    "gold kind b: false [\"Kind is not included in the list\"] [:kind]",
+    "gold kind a: true [] []",
+    "gold type: \"Gold\"",
+    "premium update cira 0: false [\"Cira must be accepted\"]",
+    "gold update vip n: false [\"Vip must be accepted\"]",
+    "gold update! vip n: Validation failed: Vip must be accepted",
+    "account update terms 0: false [\"Terms must be accepted\"]",
+];
+
+#[test]
+fn acceptance_strict_and_class_reading_values_run_like_activerecord() {
+    let native = native_of("accounts", ACCOUNT_FILES, ACCOUNT_SCHEMA, ACCOUNT_OBSERVE);
+    compare(app_of(ACCOUNT_FILES, ACCOUNT_SCHEMA), native, ACCOUNT_EXPECT, "app/models/gold.rb", ACCOUNT_OBSERVE);
 }
 
 /// An STI subclass's unmodeled validator is the validates gap, reported
@@ -268,13 +450,46 @@ fn unmodeled_sti_subclass_validation_is_a_check_error() {
     let app = app().edit(
         "app/models/pinned_post.rb",
         "  validates :rank, numericality: { less_than: 10 }\n",
-        "  validates :rank, numericality: { less_than: 10 }\n  validates :rank, comparison: { greater_than: -> { minimum } }\n",
+        "  validates :rank, numericality: { less_than: 10 }\n  validates :rank, comparison: { greater_than: -> { @minimum } }\n",
     );
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     assert!(
-        errors.iter().any(|e| e.contains("`validates comparison:` not supported (all targets): on `rank` in STI subclass `PinnedPost`, `greater_than:` lambda that reads `self`")),
+        errors.iter().any(|e| e.contains("`validates comparison:` not supported (all targets): on `rank` in STI subclass `PinnedPost`, `greater_than:` lambda that reads an instance variable of the class (ActiveModel calls it with the class as `self`)")),
         "{errors:#?}"
     );
     assert!(!errors.iter().any(|e| e.contains("STI subclass body call")), "{errors:#?}");
     assert_eq!(errors.len(), 1, "{errors:#?}");
+}
+
+/// A subclass that writes `def validate` shadows the hook the emitted
+/// record runs its validations through (Rails' own `validate` is only
+/// the `valid?` alias, and never runs it): a check error at each
+/// declaration, not a lowering that would drop the method or the rules.
+#[test]
+fn sti_subclass_with_its_own_validate_is_a_check_error() {
+    let app = app().edit(
+        "app/models/pinned_post.rb",
+        "  validates :rank, numericality: { less_than: 10 }\n",
+        "  validates :rank, numericality: { less_than: 10 }\n\n  def validate\n    true\n  end\n",
+    );
+    let (_dir, errors) = app.emit(BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("`PinnedPost` defines its own `validate`: in Rails that replaces only the `valid?` alias")),
+        "{errors:#?}"
+    );
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+}
+
+/// A strict validation raises `ActiveModel::StrictValidationFailed`,
+/// which only the Ruby-family runtime declares: a strict target reports
+/// it at each declaration that implies it (`strict: true`, `validates!`)
+/// rather than emitting a raise of an undefined class. An app-defined
+/// exception class (`strict: PremiumError`) is no such gap.
+#[test]
+fn strict_validation_failed_is_a_check_error_on_a_strict_target() {
+    let (_dir, errors) = app_of(ACCOUNT_FILES, ACCOUNT_SCHEMA).emit(BuildTarget::Crystal);
+    let strict: Vec<&String> = errors.iter().filter(|e| e.contains("ActiveModel::StrictValidationFailed")).collect();
+    assert!(strict.iter().all(|e| !e.contains("FileId(0)")), "each at its declaration: {errors:#?}");
+    assert_eq!(strict.len(), 2, "`strict: true` on Account and `validates!` on Premium: {errors:#?}");
+    assert!(!errors.iter().any(|e| e.contains("PremiumError")), "{errors:#?}");
 }

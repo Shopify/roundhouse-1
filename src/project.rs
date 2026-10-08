@@ -7733,6 +7733,7 @@ pub const RUBY_FAMILY_RUNTIME_CONSTANTS: &[&str] = &[
     "ActionController::UnknownFormat",
     "ActionController::RoutingError",
     "ActionView::MissingTemplate",
+    "ActiveModel::StrictValidationFailed",
 ];
 
 /// Availability policy for class/module *values* that inference
@@ -7995,9 +7996,18 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
                 );
             }
         }
-        if matches!(&*expr.node, crate::expr::ExprNode::Const { .. }) {
+        if let crate::expr::ExprNode::Const { path } = &*expr.node {
             if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
                 report_unavailable_class_value(app, target, id.0.as_str(), expr.span);
+            } else if expr.ty.is_none() {
+                // A lowering's own constant (a strict validation's
+                // `raise ActiveModel::StrictValidationFailed`) carries no
+                // inferred type; its path names a ruby-family class all
+                // the same.
+                let name = path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::");
+                if RUBY_FAMILY_RUNTIME_CONSTANTS.contains(&name.as_str()) {
+                    report_unavailable_class_value(app, target, &name, expr.span);
+                }
             }
         }
         // A mapped JSON call does not emit a Ruby module object. Skip
@@ -8124,6 +8134,19 @@ fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
             }
             for call in &class.unknown_calls {
                 visit(call);
+            }
+        }
+    }
+    // `strict:` / `validates!`: the exception class the lowered check
+    // raises, which the model lowering only writes at emit.
+    for model in &app.models {
+        for validation in model.validations() {
+            for rule in &validation.rules {
+                if let crate::dialect::ValidationRule::Guarded { options, .. } = rule {
+                    if let Some(exception) = &options.strict {
+                        visit(exception);
+                    }
+                }
             }
         }
     }
