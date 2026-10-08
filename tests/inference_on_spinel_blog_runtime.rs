@@ -260,6 +260,13 @@ fn untyped_subexpressions_baseline() {
         all_untyped.len(),
         app.library_classes.len()
     );
+    // Every site, one per line, for diffing two runtimes' site sets
+    // (the companion RBS probe reads the same variable).
+    if std::env::var_os("RUNTIME_PROBE_DUMP").is_some() {
+        for site in &all_untyped {
+            eprintln!("{site}");
+        }
+    }
 
     // Loose ceiling — current measurement plus headroom. Tighten as
     // inference improves; failing low is a good thing (un-pin and
@@ -313,7 +320,38 @@ fn untyped_subexpressions_baseline() {
     // RBS probe is NOT at zero here: 6 type_for_attribute /
     // attribute_types sites, the unbound `&block` and the sig-less
     // `ActiveModel::Type.default_value`.)
-    const CEILING: usize = 546;
+    // 546 -> 615, MEASURED per commit with this collector over
+    // ffbaf0de7..eeca64e54 (site sets diffed at each commit; dump them
+    // with RUNTIME_PROBE_DUMP=1):
+    // - 02de31568 (type registries, class-side `attribute`): +12.
+    //   attribute (5: the `name`/`type` params, the `[type, options]`
+    //   value, `no_default`), _reset_attribute_types (5),
+    //   _declared_attribute_types (1), type_for_attribute (1: `declared`).
+    // - af58747ac (uuid attributes, composite and Yugabyte keys): +31.
+    //   _attribute_cast 7, _attribute_for_database 4, _attribute_deserialize
+    //   2, _attribute_serialize 2, _primary_key_from_database 2,
+    //   _cast_primary_key +2 (`key_type.cast(id)`), _declared_attribute_types
+    //   +12 (the `|n, (type, options)|` registry loop), attribute -3;
+    //   Relation#column_predicate / #pluck / #update_all +1 each, downstream
+    //   of the untyped `_attribute_for_database` answer.
+    // - 29615ac72 (query_constraints): +18. query_constraints 14 (the
+    //   `*columns_list` rest param and what it feeds), query_constraints_list
+    //   4 (its ivar return and three reads on `parent = superclass`).
+    // - 8b80002e4 (exists? sentinel): -3. 41d879340: 0.
+    // - eeca64e54 (ignored_columns): +16. ignored_columns= 14 (the
+    //   `columns` param and what it feeds), ignored_columns 2 (the ivar
+    //   return, `parent.ignored_columns`).
+    // - analyzer, this commit: -5. `C.subclasses` types as `Array[C]`, so
+    //   _reset_attribute_types's `subclasses.each(&:_reset_attribute_types)`
+    //   resolves.
+    // Untypable without signatures, by the rule above: the params of
+    // attribute, query_constraints, ignored_columns= and the _attribute_* /
+    // _cast_primary_key / _primary_key_from_database helpers, whose values
+    // and type objects come from app code, the emitted model or the type
+    // registry. The superclass reads (query_constraints_list,
+    // ignored_columns, _declared_attribute_types) and the registry loop are
+    // typable by narrower runtime code; the companion RBS probe names them.
+    const CEILING: usize = 615;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\

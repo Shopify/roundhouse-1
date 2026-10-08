@@ -31,7 +31,7 @@ use roundhouse::expr::{Expr, ExprNode, InterpPart};
 use roundhouse::ident::{ClassId, Symbol};
 use roundhouse::ingest::ingest_library_classes;
 use roundhouse::rbs::{parse_app_ivars, parse_app_signatures};
-use roundhouse::ty::Ty;
+use roundhouse::ty::{ParamKind, Ty};
 
 const RUNTIME_DIR: &str = "runtime/ruby/active_record";
 
@@ -45,6 +45,7 @@ const DEPENDENCY_RBS: &[&str] = &[
     "runtime/ruby/rails.rbs",
     "runtime/ruby/action_controller/message_verifier.rbs",
     "runtime/ruby/active_support_time_parsing.rbs",
+    "runtime/spinel/active_model_type.rbs",
 ];
 
 /// Walk a typed expression tree, collecting every node whose `ty` is
@@ -432,6 +433,17 @@ fn build_method_ctx(
             for (param, p) in method.params.iter().zip(params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
             }
+            // `def self.type_for_attribute(name, &block)`: the captured
+            // block is the signature's Block-kind param, which
+            // `method.params` does not carry. The production flow
+            // (`runtime_src::parse_methods_with_rbs_in_ctx`) binds it the
+            // same way; without this the probe scored every read of a
+            // declared `&block` as an inference gap.
+            if let Some(block_param) = &method.block_param {
+                if let Some(p) = params.iter().find(|p| matches!(p.kind, ParamKind::Block)) {
+                    ctx.local_bindings.insert(block_param.name.clone(), p.ty.clone());
+                }
+            }
         }
     }
     ctx
@@ -640,7 +652,28 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // its subclasses call, tests/runtime_errors_strict_constructors.rs)
     // cost the old branch one site, `super.arg[0]`. Under main's
     // canonical class-ID lookup it adds none: measured 0 with it.
-    const CEILING: usize = 0;
+    //
+    // 0 -> 15 at eeca64e54, MEASURED (29 before this commit's harness
+    // `&block` binding, active_model_type.rbs and the `subclasses` typing).
+    // Every residual is in connection.rb, and each goes with narrower
+    // runtime code; measured 0 with all of these applied:
+    // - query_constraints_list 3, ignored_columns 1,
+    //   _declared_attribute_types 1: a method called on `superclass`,
+    //   which is `Class`. Compare it with the base instead of asking
+    //   respond_to?: `parent = superclass` then `parent <= ActiveRecord::Base
+    //   ? parent.m : default`, or `return nil unless parent <
+    //   ActiveRecord::Base` (narrowing types `parent` as the base's
+    //   singleton on the true side).
+    // - _declared_attribute_types 9: the `|n, (type, options)|` loop over
+    //   the undeclared `@__declared_attribute_types || {}`. Declare
+    //   `self.@__declared_attribute_types: Hash[String, [Symbol |
+    //   ActiveModel::Type::Value, Hash[Symbol, untyped]]]?` and iterate
+    //   with `&.each` (the `|| {}` arm's unknown elements otherwise ride
+    //   along in the tuple's union).
+    // - attribute 1: `no_default`, bound only inside the `default:` param's
+    //   default expression. A private sentinel constant (as `exists?`'s
+    //   EXISTS_ANY_ROW) types it.
+    const CEILING: usize = 15;
 
     assert!(
         all_untyped.len() <= CEILING,

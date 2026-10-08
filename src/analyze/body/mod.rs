@@ -2803,8 +2803,7 @@ impl<'a> BodyTyper<'a> {
                     // Per-position typing via `multiassign_target_ty`;
                     // targets with no usable RHS signal are left as-is.
                     if let ExprNode::MultiAssign { targets, value } = &*e.node {
-                        let rhs = value.ty.clone();
-                        for (i, target) in targets.iter().enumerate() {
+                        let rhs = value.ty.clone();                        for (i, target) in targets.iter().enumerate() {
                             let Some(ty) = multiassign_target_ty(&rhs, i) else {
                                 continue;
                             };
@@ -4040,6 +4039,66 @@ mod tests {
                 id: ClassId(Symbol::from("Post")),
                 args: vec![]
             }
+        );
+    }
+
+    /// `parent = superclass; parent <= ActiveRecord::Base ? parent.m : d` —
+    /// a class object of unknown class narrows to the compared class on
+    /// the true side and keeps its type on the false side.
+    #[test]
+    fn subclass_comparison_narrows_a_class_object_to_the_compared_class() {
+        let class_ty = |n: &str| Ty::Class { id: ClassId(Symbol::from(n)), args: vec![] };
+        let base = || synth(ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("Base")] });
+        for op in ["<", "<="] {
+            let cond = send(Some(var("parent")), op, vec![base()]);
+            let pred = extract_narrowing(&cond).expect("class comparison recognized");
+            let ctx = ctx_with_local("parent", class_ty("Class"));
+            let then_ctx = apply_narrowing(&ctx, &pred, true);
+            let else_ctx = apply_narrowing(&ctx, &pred, false);
+            assert_eq!(then_ctx.local_bindings[&Symbol::from("parent")], class_ty("ActiveRecord::Base"), "{op}");
+            assert_eq!(else_ctx.local_bindings[&Symbol::from("parent")], class_ty("Class"), "{op}");
+            // `return nil unless parent < Base` reaches the rest through the negation.
+            let negated = send(Some(cond), "!", vec![]);
+            let pred = extract_narrowing(&negated).expect("negated comparison recognized");
+            let after = apply_narrowing(&ctx, &pred, false);
+            assert_eq!(after.local_bindings[&Symbol::from("parent")], class_ty("ActiveRecord::Base"), "!{op}");
+        }
+    }
+
+    /// The same spelling compares values: `count < LIMIT` leaves an
+    /// Integer (or a user instance with Comparable) as it was.
+    #[test]
+    fn subclass_comparison_leaves_non_class_objects_alone() {
+        let limit = synth(ExprNode::Const { path: vec![Symbol::from("Limit")] });
+        let cond = send(Some(var("x")), "<", vec![limit]);
+        let pred = extract_narrowing(&cond).expect("recognized syntactically");
+        let version = Ty::Class { id: ClassId(Symbol::from("Version")), args: vec![] };
+        for ty in [Ty::Int, version, Ty::Union { variants: vec![Ty::Int, Ty::Nil] }] {
+            let ctx = ctx_with_local("x", ty.clone());
+            let then_ctx = apply_narrowing(&ctx, &pred, true);
+            assert_eq!(then_ctx.local_bindings[&Symbol::from("x")], ty);
+        }
+        // A literal right-hand side is never a class: no predicate at all.
+        let lit = synth(ExprNode::Lit { value: Literal::Int { value: 3 } });
+        assert!(extract_narrowing(&send(Some(var("x")), "<", vec![lit])).is_none());
+    }
+
+    /// `subclasses` answers the receiver's own class; `<` on a `Class`
+    /// object answers true/false/nil.
+    #[test]
+    fn class_introspection_types_subclasses_and_comparison() {
+        let class_ty = |n: &str| Ty::Class { id: ClassId(Symbol::from(n)), args: vec![] };
+        let mut ctx = ctx_with_local("k", class_ty("Post"));
+        ctx.local_bindings.insert(Symbol::from("parent"), class_ty("Class"));
+        let mut expr = send(Some(var("k")), "subclasses", vec![]);
+        assert_eq!(
+            BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx),
+            Ty::Array { elem: Box::new(class_ty("Post")) }
+        );
+        let mut expr = send(Some(var("parent")), "<=", vec![var("k")]);
+        assert_eq!(
+            BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx),
+            Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }
         );
     }
 
