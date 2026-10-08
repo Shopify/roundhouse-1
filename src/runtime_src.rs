@@ -433,7 +433,9 @@ pub fn parse_methods(source: &str) -> Result<Vec<MethodDef>, String> {
 
     let root = result.node();
     let mut out = Vec::new();
-    walk_scope(&root, &mut out, None)?;
+    // Lend the text so trailing `#:` ascriptions read as they do in the
+    // library ingest of the same file (`parse_library_with_rbs`).
+    crate::ingest::sources::with_unregistered_text(VIRTUAL_FILE, source, || walk_scope(&root, &mut out, None))?;
     Ok(out)
 }
 
@@ -1913,6 +1915,20 @@ mod tests {
         let m = parse_one(src);
         assert!(m.params.is_empty());
         assert!(matches!(&*m.body.node, ExprNode::Seq { exprs } if exprs.is_empty()));
+    }
+
+    #[test]
+    fn a_trailing_ascription_reads_as_in_the_library_ingest() {
+        let m = parse_one("def keys\n  values = [] #: Array[untyped]\n  values\nend\n");
+        let ExprNode::Seq { exprs } = &*m.body.node else { panic!("body is a sequence") };
+        let ExprNode::Assign { value, .. } = &*exprs[0].node else { panic!("first statement assigns") };
+        assert!(
+            matches!(&*value.node, ExprNode::Cast { target_ty: Ty::Array { elem }, .. } if **elem == Ty::Untyped),
+            "the `#:` comment ascribes the literal: {:?}",
+            value.node
+        );
+        // The text is lent for the parse only.
+        assert!(crate::ingest::sources::with_text(VIRTUAL_FILE, |_| ()).is_none());
     }
 
     // ── parse_methods_with_rbs ──────────────────────────────────────
