@@ -250,35 +250,22 @@ pub(crate) fn is_validation_macro(name: &str) -> bool {
 /// class that validates (`ingest::app`'s `validating_active_model`).
 /// Any other class declaring a validation is a library class, and
 /// the emitter replays its body only on a base it does not model
-/// (`emit::ruby::replays_class_body`); otherwise the call is dropped
-/// with a `lower_residue` warning that `check` never saw. Core's
-/// `class Form < BaseForm; include ActiveModel::Validations; validates
-/// …` would answer `valid?` without the rule, so a dropped rule is an
-/// error, as a dropped model DSL call is
-/// (`model_to_library::diagnose_unclaimed_model_dsl`, which also covers
-/// an STI subclass of a model, skipped here).
+/// (`emit::ruby::replays_class_body`), or its validation calls over the
+/// ActiveModel::Validations port where it includes the module and the
+/// tree carries the port (`emit::ruby::library::active_model_validation_calls`);
+/// otherwise the call is dropped with a `lower_residue` warning that
+/// `check` never saw. Core's `class Form < BaseForm; include
+/// ActiveModel::Validations; validates …` would answer `valid?` without
+/// the rule, so a dropped rule is an error, as a dropped model DSL call
+/// is (`model_to_library::diagnose_unclaimed_model_dsl`, which also
+/// covers an STI subclass of a model, skipped here).
 pub(crate) fn diagnose_dropped_validations(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    // A class below a model, directly or through library classes, is
-    // an STI subclass `lower::sti_subclass_validations` lowers or
-    // refuses (and `diagnose_unclaimed_model_dsl` reports).
-    let below_model = |lc: &LibraryClass| {
-        let mut seen: Vec<&ClassId> = vec![&lc.name];
-        let mut parent = lc.parent.as_ref();
-        while let Some(p) = parent {
-            if app.models.iter().any(|m| &m.name == p) {
-                return true;
-            }
-            if seen.contains(&p) {
-                return false;
-            }
-            seen.push(p);
-            parent = app.library_classes.iter().find(|c| &c.name == p && !c.is_module).and_then(|c| c.parent.as_ref());
-        }
-        false
-    };
     for lc in &app.library_classes {
-        if below_model(lc)
+        // A class below a model is an STI subclass
+        // `lower::sti_subclass_validations` lowers or refuses (and
+        // `diagnose_unclaimed_model_dsl` reports).
+        if below_model(lc, app)
             || !lc.unknown_calls.iter().any(|call| validation_call(call).is_some())
             || crate::emit::ruby::replays_class_body(lc, app)
         {
@@ -287,6 +274,15 @@ pub(crate) fn diagnose_dropped_validations(app: &App) -> Vec<Diagnostic> {
         let kept = crate::emit::ruby::modelled_class_body_calls(lc, app);
         let why = if lc.is_module {
             "it is a module body, which no lowering runs validations from".to_string()
+        } else if crate::emit::ruby::includes_active_model_validations(lc, app) {
+            let parent = lc
+                .parent
+                .as_ref()
+                .map(|p| format!(" (its superclass `{}` is no model the tree lowers)", p.0.as_str()))
+                .unwrap_or_default();
+            format!(
+                "it is a library class{parent} over ActiveModel::Validations, whose port only the PostgreSQL Ruby-family tree carries"
+            )
         } else if let Some(parent) = &lc.parent {
             format!(
                 "it is a library class (its superclass `{}` is no model the tree lowers), so its `valid?` would not run the rule",
@@ -312,11 +308,138 @@ pub(crate) fn diagnose_dropped_validations(app: &App) -> Vec<Diagnostic> {
     out
 }
 
-/// The macro name of a bare (or `self.`) validation call.
-fn validation_call(call: &Expr) -> Option<&str> {
-    let ExprNode::Send { recv, method, .. } = &*call.node else { return None };
+/// Whether `lc`'s superclass chain, through library classes, reaches a
+/// model.
+pub(crate) fn below_model(lc: &LibraryClass, app: &App) -> bool {
+    let mut seen: Vec<&ClassId> = vec![&lc.name];
+    let mut parent = lc.parent.as_ref();
+    while let Some(p) = parent {
+        if app.models.iter().any(|m| &m.name == p) {
+            return true;
+        }
+        if seen.contains(&p) {
+            return false;
+        }
+        seen.push(p);
+        parent = app.library_classes.iter().find(|c| &c.name == p && !c.is_module).and_then(|c| c.parent.as_ref());
+    }
+    false
+}
+
+/// The classes whose `errors` is the ActiveModel::Errors port
+/// (runtime/active_model_validations.rb) rather than the shared
+/// runtime's `Array[String]` accumulator: on the PostgreSQL tree, every
+/// library class over ActiveModel::Validations that no model is above
+/// (api_versioning's FrozenRecord ApiVersionRecord), and every app
+/// module only such classes include (its ApiVersionValidations, whose
+/// `handle_is_valid` runs `errors.add(:handle, msg)` on the record).
+/// The errors lowerings (errors_add, errors_index, errors_full_messages)
+/// rewrite the accumulator's spellings, so they stand down on these.
+pub(crate) struct ValidationsPort {
+    owners: crate::det::HashSet<ClassId>,
+}
+
+impl ValidationsPort {
+    pub(crate) fn of(app: &App) -> Self {
+        let mut owners = crate::det::HashSet::default();
+        if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
+            return ValidationsPort { owners };
+        }
+        let port: Vec<&LibraryClass> = app
+            .library_classes
+            .iter()
+            .filter(|lc| {
+                !lc.is_module
+                    && !below_model(lc, app)
+                    && crate::emit::ruby::includes_active_model_validations(lc, app)
+            })
+            .collect();
+        if port.is_empty() {
+            return ValidationsPort { owners };
+        }
+        owners.extend(port.iter().map(|lc| lc.name.clone()));
+        let names = |include: &ClassId, module: &str| {
+            let include = include.0.as_str().trim_start_matches("::");
+            include == module || module.ends_with(&format!("::{include}"))
+        };
+        for module in app.library_classes.iter().filter(|c| c.is_module) {
+            let name = module.name.0.as_str();
+            if !port.iter().any(|lc| crate::emit::ruby::includes_module(lc, app, name)) {
+                continue;
+            }
+            // Any includer off the port (a model, another library
+            // class, or a module one of those includes) keeps the
+            // module on the accumulator's spellings, as before.
+            let library_includer = app.library_classes.iter().any(|c| {
+                !c.is_module
+                    && !owners.contains(&c.name)
+                    && crate::emit::ruby::includes_module(c, app, name)
+            });
+            let model_includer = app.models.iter().any(|m| {
+                crate::analyze::model_includes(m).iter().any(|include| {
+                    names(include, name)
+                        || app.library_classes.iter().any(|c| {
+                            c.is_module
+                                && names(include, c.name.0.as_str())
+                                && crate::emit::ruby::includes_module(c, app, name)
+                        })
+                })
+            });
+            if !library_includer && !model_includer {
+                owners.insert(module.name.clone());
+            }
+        }
+        ValidationsPort { owners }
+    }
+
+    /// Whether `errors` (a zero-arg `errors` send) reads the port's
+    /// Errors: the body's owner answers it for a receiver-less or `self`
+    /// send, the receiver's type otherwise (`record.errors` on a record
+    /// typed as one of the classes, or a nilable one).
+    pub(crate) fn answers(&self, errors: &Expr, owner: Option<&ClassId>) -> bool {
+        if self.owners.is_empty() {
+            return false;
+        }
+        let ExprNode::Send { recv, .. } = &*errors.node else { return false };
+        let port_class = |ty: &crate::ty::Ty| {
+            matches!(ty, crate::ty::Ty::Class { id, .. } if self.owners.contains(id))
+        };
+        match recv {
+            None => owner.is_some_and(|o| self.owners.contains(o)),
+            Some(r) if matches!(&*r.node, ExprNode::SelfRef) => owner.is_some_and(|o| self.owners.contains(o)),
+            Some(r) => match r.ty.as_ref() {
+                Some(crate::ty::Ty::Union { variants }) => {
+                    variants.iter().any(port_class)
+                        && variants.iter().all(|v| port_class(v) || matches!(v, crate::ty::Ty::Nil))
+                }
+                Some(ty) => port_class(ty),
+                None => false,
+            },
+        }
+    }
+}
+
+/// A class-body call ActiveModel::Validations answers: a validation
+/// macro, or a `with_options` whose block holds only such calls
+/// (api_versioning's `with_options unless: :reconnaissance do validates
+/// … end`). The name is the call's.
+pub(crate) fn validation_call(call: &Expr) -> Option<&str> {
+    let ExprNode::Send { recv, method, block, .. } = &*call.node else { return None };
     if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
         return None;
     }
-    is_validation_macro(method.as_str()).then_some(method.as_str())
+    if is_validation_macro(method.as_str()) {
+        return Some(method.as_str());
+    }
+    if method.as_str() != "with_options" {
+        return None;
+    }
+    let Some(block) = block else { return None };
+    let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+    let statements: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+    (!statements.is_empty() && statements.iter().all(|s| validation_call(s).is_some())).then_some(method.as_str())
 }
+

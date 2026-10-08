@@ -44,7 +44,11 @@ use crate::ty::Ty;
 pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let localized = app.locale_files.first().map(|f| (f.clone(), app.locale_files.len()));
-    super::for_each_hook_body(app, &mut |body| rewrite_errors_add(body, localized.as_ref(), &mut diags));
+    let port = super::active_model_model::ValidationsPort::of(app);
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let owner = owner.cloned();
+        rewrite_errors_add(body, &Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref() }, &mut diags)
+    });
     diags
 }
 
@@ -81,9 +85,18 @@ fn fold_str_concat(e: Expr) -> Expr {
     Expr::new(e.span, ExprNode::Lit { value: Literal::Str { value: format!("{lv}{rv}") } })
 }
 
-fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diags: &mut Vec<Diagnostic>) {
+/// Where a body sits: the app's locale files, and which classes keep
+/// ActiveModel::Errors (the port) with the body's owner.
+struct Site<'a> {
+    localized: Option<&'a (String, usize)>,
+    port: &'a super::active_model_model::ValidationsPort,
+    owner: Option<&'a crate::ident::ClassId>,
+}
+
+fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
+    let localized = site.localized;
     expr.node
-        .for_each_child_mut(&mut |c| rewrite_errors_add(c, localized, diags));
+        .for_each_child_mut(&mut |c| rewrite_errors_add(c, site, diags));
     // Any `add` on an `errors` reader is this pass's construct; decide
     // ground-vs-residue below.
     let recognized = matches!(
@@ -104,6 +117,12 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
     // `ActiveModel::Errors` is the accumulator and grounds.
     let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { unreachable!() };
     if r.ty.as_ref().is_some_and(names_own_class) {
+        return;
+    }
+    // A class over the ActiveModel::Validations port (and a module only
+    // those include) holds the real ActiveModel::Errors: `add` is its
+    // own, with Rails' arguments and messages.
+    if site.port.answers(r, site.owner) {
         return;
     }
     // The field: a Symbol literal is baked at lower time; a local or

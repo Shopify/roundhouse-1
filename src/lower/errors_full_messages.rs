@@ -35,16 +35,17 @@
 
 use crate::app::App;
 use crate::expr::{Expr, ExprNode};
-use crate::ident::Symbol;
+use crate::ident::{ClassId, Symbol};
 
 pub fn apply_errors_full_messages_lowering(app: &mut App) {
     if app_defines_full_messages(app) {
         return;
     }
-    super::for_each_hook_body(app, &mut rewrite);
-    super::for_each_test_body(app, &mut rewrite);
+    let port = super::active_model_model::ValidationsPort::of(app);
+    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, &port, owner));
+    super::for_each_test_body(app, &mut |body| rewrite(body, &port, None));
     for view in &mut app.views {
-        rewrite(&mut view.body);
+        rewrite(&mut view.body, &port, None);
     }
 }
 
@@ -64,12 +65,19 @@ pub(crate) fn app_defines_full_messages(app: &App) -> bool {
         .any(|lc| lc.methods.iter().any(|m| is_fm(&m.name)))
 }
 
-fn rewrite(expr: &mut Expr) {
-    expr.node.for_each_child_mut(&mut rewrite);
-    rewrite_node(expr);
+fn rewrite(expr: &mut Expr, port: &super::active_model_model::ValidationsPort, owner: Option<&ClassId>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, port, owner));
+    rewrite_node(expr, port, owner);
 }
 
-pub(crate) fn rewrite_node(expr: &mut Expr) {
+/// `owner` is the class whose body this is; an `errors` that `port`
+/// answers (a class over the ActiveModel::Validations port, reading
+/// its own or another such record's) keeps Rails' `full_messages`.
+pub(crate) fn rewrite_node(
+    expr: &mut Expr,
+    port: &super::active_model_model::ValidationsPort,
+    owner: Option<&ClassId>,
+) {
     // `<recv>.errors.full_messages` — zero-arg, block-free on both hops.
     // The receiver being an `errors` reader is what makes this our
     // accumulator rather than some other object's method of the same
@@ -85,7 +93,8 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
                     &*r.node,
                     ExprNode::Send { method: em, args: ea, block: None, .. }
                         if em.as_str() == "errors" && ea.is_empty()
-                ) =>
+                )
+                && !port.answers(r, owner) =>
         {
             Some((*r.node).clone())
         }

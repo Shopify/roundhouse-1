@@ -7770,6 +7770,9 @@ fn emit_library_class_decl_inner(
     } else {
         let mut calls = app_extension_calls(lc, app);
         calls.extend(app_prepend_calls(lc, app).into_iter().map(|(call, _)| call));
+        // A replayed `validates_with SomeValidator` reads its validator
+        // at load.
+        calls.extend(active_model_validation_calls(lc, app));
         calls
     };
     let replayed = |call: &&Expr| {
@@ -9904,6 +9907,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
     let parent = lc.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p));
     let claimed = |c: &Expr| parent.is_some_and(|m| m.claimed_body_calls.contains(&c.span));
     let gem_effects = gem_source_body_effects(lc, app);
+    let validations = active_model_validation_calls(lc, app);
     lc.unknown_calls
         .iter()
         .filter(|c| {
@@ -9912,9 +9916,78 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
                 || gem_effects.iter().any(|e| std::ptr::eq(*e, *c))
+                || validations.iter().any(|e| std::ptr::eq(*e, *c))
                 || claimed(c)
         })
         .collect()
+}
+
+/// The class-body validation calls (`validates`, `validate`,
+/// `validates_with`, `validates_each`, the `validates_*_of` helpers, a
+/// `with_options` of them, and `before_validation`/`after_validation`
+/// where it includes ActiveModel::Validations::Callbacks) of a library
+/// class that includes ActiveModel::Validations, itself or through a
+/// library superclass or an included app module, on a tree that carries
+/// the ActiveModel::Validations port: the PostgreSQL Ruby-family tree
+/// (`project::active_model_ports_carried`, runtime/spinel/
+/// active_model_validations.rb). Replayed as written, they declare the
+/// rules on the class as activemodel's would, and `valid?` runs them.
+/// api_versioning's ApiVersionRecord and ApiChangeRecord (FrozenRecord
+/// classes, whose superclass no lowering models) are such classes.
+///
+/// Not a class below a model (an STI subclass, whose validations
+/// `lower::sti_subclass_validations` handles), and not a module body:
+/// a module's `validates` runs on the module itself, which the module
+/// does not answer.
+fn active_model_validation_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    if lc.is_module
+        || app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql)
+        || crate::lower::active_model_model::below_model(lc, app)
+        || !includes_active_model_validations(lc, app)
+    {
+        return Vec::new();
+    }
+    let callbacks = includes_module(lc, app, "ActiveModel::Validations::Callbacks");
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            crate::lower::active_model_model::validation_call(call).is_some()
+                || (callbacks
+                    && matches!(&*call.node, ExprNode::Send { recv: None, method, .. }
+                        if matches!(method.as_str(), "before_validation" | "after_validation")))
+        })
+        .collect()
+}
+
+/// Whether `lc` includes ActiveModel::Validations: in its own body, a
+/// library superclass's, or an app module either includes.
+pub(crate) fn includes_active_model_validations(lc: &LibraryClass, app: &App) -> bool {
+    includes_module(lc, app, "ActiveModel::Validations")
+}
+
+pub(crate) fn includes_module(lc: &LibraryClass, app: &App, module: &str) -> bool {
+    let mut seen: Vec<String> = Vec::new();
+    let mut queue: Vec<&LibraryClass> = vec![lc];
+    while let Some(c) = queue.pop() {
+        if seen.iter().any(|s| s == c.name.0.as_str()) {
+            continue;
+        }
+        seen.push(c.name.0.as_str().to_string());
+        for include in &c.includes {
+            let name = include.0.as_str().trim_start_matches("::");
+            if name == module {
+                return true;
+            }
+            queue.extend(library_classes_named(name, app).into_iter().filter(|m| m.is_module));
+        }
+        if !c.is_module {
+            if let Some(parent) = &c.parent {
+                let name = parent.0.as_str().trim_start_matches("::");
+                queue.extend(library_classes_named(name, app).into_iter().filter(|p| !p.is_module));
+            }
+        }
+    }
+    false
 }
 
 /// A captured `alias_method :to, :from` (bare, or on `singleton_class`
