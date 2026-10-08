@@ -2790,6 +2790,10 @@ end
     // their accessors and binds consult the declared type, and the
     // attribute row types them gradually (`attribute_type_unevaluated`):
     // what the type casts to is decided when the class loads.
+    // What every model inherits from ActiveRecord::Base's boot includes:
+    // their class macros are judged as the app's (macro_replay, and the
+    // retypable columns below).
+    super::base_includes::collect(&mut app);
     let retypable: Vec<Vec<crate::ident::Symbol>> =
         app.models.iter().map(|m| crate::analyze::retypable_attributes::retypable_attributes(m, &app)).collect();
     let defaulted: Vec<Vec<crate::ident::Symbol>> =

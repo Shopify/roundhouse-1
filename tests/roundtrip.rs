@@ -186,6 +186,8 @@ fn tiny_blog_round_trips() {
         global_id_locate_models: std::collections::BTreeSet::new(),
         attachable_unsigned_models: Vec::new(),
         load_hook_class_macros: Vec::new(),
+        framework_base_includes: Vec::new(),
+        lifted_autoload_callbacks: Vec::new(),
         partial_local_types: roundhouse::det::HashMap::default(),
         view_ivar_types: roundhouse::det::HashMap::default(),
         html_safe_methods: std::collections::BTreeSet::new(),

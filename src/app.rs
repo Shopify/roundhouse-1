@@ -281,6 +281,17 @@ pub struct App {
     /// (not a seeded `include` set on every model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hook_class_macros: Vec<ClassId>,
+    /// Modules boot includes into ActiveRecord::Base, in the order found
+    /// (`ingest::base_includes`): a carried railtie's, a support file's
+    /// or a boot initializer's `ActiveSupport.on_load(:active_record) {
+    /// include M }` (or `ActiveRecord::Base.include(M)`, `.send(:include,
+    /// M)`), as shopify-money's MoneyColumn::Railtie includes
+    /// MoneyColumn::ActiveRecordHooks. Every model inherits them, so the
+    /// class methods their `included` hook extends onto the base are
+    /// class macros of every model (`macro_replay::ClassSide`). Gem
+    /// modules count: the tree carries their source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub framework_base_includes: Vec<ClassId>,
     /// Partial → local name → type, harvested by the analyzer from the
     /// RENDER SITES that pass each local (`render partial: "form",
     /// locals: { new_message: @new_message }` with `@new_message` typed
@@ -1348,6 +1359,7 @@ impl App {
             global_id_locate_models: BTreeSet::new(),
             attachable_unsigned_models: Vec::new(),
             load_hook_class_macros: Vec::new(),
+            framework_base_includes: Vec::new(),
             partial_local_types: HashMap::default(),
             view_ivar_types: HashMap::default(),
             html_safe_methods: BTreeSet::new(),

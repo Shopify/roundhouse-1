@@ -519,8 +519,25 @@ fn keyed_calls<'a>(model: &Model, side: &ClassSide<'a>, body: Vec<&'a Expr>) -> 
         .collect()
 }
 
+/// Every positional argument a literal ([`literal_only`]), and keyword
+/// options, if any, literal too (`money_column :price, currency_column:
+/// :currency`): the options name no column the call retypes, which only
+/// its positional names do.
 fn literal_call(call: &Expr) -> bool {
-    matches!(&*call.node, ExprNode::Send { args, .. } if args.iter().all(literal_only))
+    let ExprNode::Send { args, .. } = &*call.node else { return false };
+    let (positional, options) = match args.split_last() {
+        Some((last, rest)) if matches!(&*last.node, ExprNode::Hash { kwargs: true, .. }) => (rest, Some(last)),
+        _ => (args.as_slice(), None),
+    };
+    let literal_value = |e: &Expr| {
+        literal_only(e)
+            || matches!(&*e.node, ExprNode::Lit { value: Literal::Bool { .. } | Literal::Nil | Literal::Int { .. } })
+    };
+    positional.iter().all(literal_only)
+        && options.is_none_or(|o| {
+            matches!(&*o.node, ExprNode::Hash { entries, .. }
+                if entries.iter().all(|(k, v)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } }) && literal_value(v)))
+        })
 }
 
 /// The model's own body calls of an app class macro that reaches `target`
@@ -624,6 +641,10 @@ struct ClassSide<'a> {
     own: Vec<&'a MethodDef>,
     chain: Vec<&'a Model>,
     extended: Vec<&'a LibraryClass>,
+    /// The class-method modules ActiveRecord::Base's boot includes give
+    /// every model (`macro_replay::base_include_class_modules`), read
+    /// when nothing nearer answers.
+    base: std::cell::OnceCell<Vec<&'a LibraryClass>>,
 }
 
 impl<'a> ClassSide<'a> {
@@ -670,7 +691,7 @@ impl<'a> ClassSide<'a> {
                 extended.extend(args.iter().filter_map(|a| module_named(app, m.name.0.as_str(), a)));
             }
         }
-        Self { app, own, chain, extended }
+        Self { app, own, chain, extended, base: std::cell::OnceCell::new() }
     }
 
     fn class_method(&self, name: &str) -> Option<&'a MethodDef> {
@@ -685,6 +706,15 @@ impl<'a> ClassSide<'a> {
                 })
             })
             .or_else(|| self.extended.iter().find_map(|m| self.module_method(m, name, &mut Vec::new())))
+            .or_else(|| {
+                let base = self.base.get_or_init(|| {
+                    crate::lower::model_to_library::macro_replay::base_include_class_modules(self.app)
+                        .into_iter()
+                        .map(|(provider, _)| provider)
+                        .collect()
+                });
+                base.iter().find_map(|m| self.module_method(m, name, &mut Vec::new()))
+            })
     }
 
     fn module_method(&self, m: &'a LibraryClass, name: &str, seen: &mut Vec<String>) -> Option<&'a MethodDef> {

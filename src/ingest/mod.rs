@@ -55,6 +55,7 @@ pub mod thread_mattr;
 pub mod model;
 pub(crate) mod validates;
 mod delegated_type;
+mod base_includes;
 mod load_hook_includes;
 mod model_macros;
 mod define_method_loops;

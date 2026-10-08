@@ -4990,6 +4990,10 @@ fn gem_source_dependency_block(app: &App) -> String {
 fn initializer_program_block(app: &App) -> String {
     let mut registers = false;
     for_each_file_load_hook_registration(app, &mut |_, _| registers = true);
+    // A carried railtie's body registers them too (shopify-money's
+    // MoneyColumn::Railtie: `ActiveSupport.on_load(:active_record) {
+    // ActiveRecord::Base.send(:include, …) }`).
+    registers = registers || railtie_registers_load_hook(app);
     if app.initializer_programs.is_empty() && !registers {
         return String::new();
     }
@@ -5019,6 +5023,30 @@ fn initializer_program_block(app: &App) -> String {
         ));
     }
     out
+}
+
+/// Does a carried railtie's body call `ActiveSupport.on_load`?
+fn railtie_registers_load_hook(app: &App) -> bool {
+    use crate::expr::{Expr, ExprNode};
+    fn registers(expr: &Expr) -> bool {
+        if let ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node {
+            if method.as_str() == "on_load"
+                && matches!(&*recv.node, ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport"]))
+            {
+                return true;
+            }
+        }
+        let mut found = false;
+        expr.node.for_each_child(&mut |child| found = found || registers(child));
+        found
+    }
+    app.railties.iter().any(|railtie| {
+        app.library_classes
+            .iter()
+            .filter(|lc| lc.name == railtie.name)
+            .any(|lc| lc.unknown_calls.iter().chain(lc.class_ivar_initializers.iter()).any(registers))
+    })
 }
 
 /// Run `config/environments/#{Rails.env}.rb`'s program
