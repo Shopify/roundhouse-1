@@ -128,6 +128,14 @@ pub struct Model {
     /// model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub defaulted_attributes: Vec<Symbol>,
+    /// `alias_attribute :new, :old` calls over a column, `(new, old)`, the
+    /// model ancestors' first, in body order
+    /// (`analyze::retypable_attributes::attribute_aliases`). The new name
+    /// gets the column's attribute methods and resolves as a key
+    /// (`lower::model_to_library::attribute_alias`). Empty for nearly every
+    /// model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribute_aliases: Vec<(Symbol, Symbol)>,
     /// The columns a `query_constraints` call in the body names, directly
     /// or through an app class macro that reaches it (stamped at the end
     /// of ingest by `analyze::retypable_attributes`). The compiled update,

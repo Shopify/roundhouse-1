@@ -2734,7 +2734,9 @@ end
         app.models.iter().map(|m| crate::analyze::retypable_attributes::retypable_attributes(m, &app)).collect();
     let defaulted: Vec<Vec<crate::ident::Symbol>> =
         app.models.iter().map(|m| crate::analyze::retypable_attributes::defaulted_attributes(m, &app)).collect();
-    for ((model, cols), defaulted) in app.models.iter_mut().zip(retypable).zip(defaulted) {
+    let aliases: Vec<Vec<(crate::ident::Symbol, crate::ident::Symbol)>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::attribute_aliases(m, &app)).collect();
+    for (((model, cols), defaulted), aliases) in app.models.iter_mut().zip(retypable).zip(defaulted).zip(aliases) {
         for col in &cols {
             if let Some(ty) = model.attributes.fields.get_mut(col) {
                 *ty = crate::ty::Ty::Untyped;
@@ -2742,10 +2744,12 @@ end
         }
         model.retypable_attributes = cols;
         model.defaulted_attributes = defaulted;
-        // A `serialize` with an app coder, or an `attribute` with a
-        // `default:`, runs at class load as written; the runtime's
-        // `serialize` decorates the column's type, its `attribute`
-        // records the default.
+        model.attribute_aliases = aliases;
+        // A `serialize` with an app coder, an `attribute` with a
+        // `default:`, or an `alias_attribute` over a column, runs at class
+        // load as written; the runtime's `serialize` decorates the
+        // column's type, its `attribute` records the default, its
+        // `alias_attribute` checks the compiled alias.
         if let Some(table) = app.schema.tables.get(&model.table.0) {
             for item in model.body.iter_mut() {
                 let crate::dialect::ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
@@ -2753,6 +2757,7 @@ end
                 };
                 if crate::analyze::retypable_attributes::serialized_column(expr, table).is_some()
                     || crate::analyze::retypable_attributes::defaulted_attribute(expr, table).is_some()
+                    || crate::analyze::retypable_attributes::alias_attribute_decl(expr, table).is_some()
                 {
                     *item = crate::dialect::ModelBodyItem::ClassBody {
                         expr: expr.clone(),

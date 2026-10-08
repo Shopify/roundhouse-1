@@ -160,7 +160,7 @@ pub(super) fn push_schema_methods(
             // false/nil on those lanes anyway.
             let demanded = demanded.get_or_insert_with(|| model_body_names(models));
             for (name, runtime, ret) in pending_change_methods(col) {
-                if demanded.contains(&name)
+                if (demanded.contains(&name) || super::attribute_alias::demanded_as_alias(model, col, &name, demanded))
                     && !super::associations::model_defines_instance_method(model, &name)
                 {
                     methods.push(synth_column_delegate(owner, col, name, runtime, ret));
@@ -502,6 +502,10 @@ pub(super) fn push_schema_methods(
     if let Some(m) = synth_fill_timestamps(owner, table) {
         methods.push(m);
     }
+
+    // `alias_attribute :new, :old` — the new name's twins of the
+    // column's methods above, and its keys.
+    super::attribute_alias::push_alias_methods(methods, model, table);
 }
 
 /// Per-model `fill_timestamps(creating)` — the compile-time

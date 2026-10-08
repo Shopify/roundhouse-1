@@ -1605,11 +1605,12 @@ module ActiveRecord
     # which built memberships for user 0.
     def pluck(col)
       prior = @select_sql
-      @select_sql = "#{@table}.#{col} AS v"
+      # A column with a declared type reads through it, as Rails' does; an
+      # alias names its column.
+      name = @model._attribute_name(col.to_s)
+      @select_sql = "#{@table}.#{name} AS v"
       rows = ActiveRecord.adapter.select_rows(to_sql)
       @select_sql = prior
-      # A column with a declared type reads through it, as Rails' does.
-      name = col.to_s
       rows.map { |row| @model._attribute_deserialize(name, row["v"]) }
     end
 
@@ -1938,7 +1939,8 @@ module ActiveRecord
             parts << column_predicate("#{key}.#{col}", v)
           end
         else
-          parts << column_predicate(key.to_s, val)
+          # An alias names its column (`where(subdomain:)`).
+          parts << column_predicate(@model._attribute_name(key.to_s), val)
         end
       end
       parts.join(" AND ")
@@ -2151,7 +2153,10 @@ module ActiveRecord
       if p.is_a?(Hash)
         format_order_hash(p)
       else
-        order_string(p.to_s)
+        # A Symbol names an attribute, an alias its column
+        # (`order(:subdomain)`); a String is SQL.
+        s = p.to_s
+        order_string(p.is_a?(Symbol) ? @model._attribute_name(s) : s)
       end
     end
 
@@ -2159,13 +2164,14 @@ module ActiveRecord
     # `order_term`'s Hash|String union does not narrow, and untyped
     # `col` interpolations blow the Bar B ceiling.
     def format_order_hash(h)
+      given = h #: Hash[Symbol, untyped]
       parts = []
-      h.each do |col, dir|
+      given.each do |col, dir|
         if dir.is_a?(Hash)
           inner_col = dir.keys[0]
           parts << "#{sql_ident(col)}.#{sql_ident(inner_col)} #{order_direction(dir[inner_col])}"
         else
-          parts << "#{sql_ident(col)} #{order_direction(dir)}"
+          parts << "#{sql_ident(@model._attribute_name(col.to_s))} #{order_direction(dir)}"
         end
       end
       parts.join(", ")

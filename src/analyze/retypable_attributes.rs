@@ -137,6 +137,58 @@ pub(crate) fn defaulted_attribute(expr: &Expr, table: &crate::schema::Table) -> 
     table.columns.iter().find(|c| c.name.as_str() == name).map(|c| c.name.clone())
 }
 
+/// The `alias_attribute` calls (`alias_attribute_decl`) of the model and
+/// its model ancestors, `(new, old)`, an ancestor's first and each class's
+/// in body order. A later call for the same new name replaces the
+/// earlier one in place (Rails' `attribute_aliases` Hash merge).
+pub(crate) fn attribute_aliases(model: &Model, app: &App) -> Vec<(Symbol, Symbol)> {
+    let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
+    let mut chain: Vec<&Model> = Vec::new();
+    let mut at = Some(model);
+    while let Some(m) = at {
+        if chain.iter().any(|c| c.name == m.name) {
+            break;
+        }
+        chain.push(m);
+        at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
+    }
+    let mut out: Vec<(Symbol, Symbol)> = Vec::new();
+    for m in chain.into_iter().rev() {
+        for (new, old) in body_statements(m).filter_map(|e| alias_attribute_decl(e, table)) {
+            match out.iter_mut().find(|(n, _)| *n == new) {
+                Some(slot) => slot.1 = old,
+                None => out.push((new, old)),
+            }
+        }
+    }
+    out
+}
+
+/// A direct `alias_attribute :new, :old` body statement, both names
+/// literal, `old` a column of `table` and `new` not one: Rails defines
+/// the new name's attribute methods over the column's. The call runs at
+/// class load as written (`ModelBodyItem::ClassBody`) for the runtime's
+/// `alias_attribute`, which checks the compiled class defines it. An
+/// alias of an association or another alias stays unclaimed.
+pub(crate) fn alias_attribute_decl(expr: &Expr, table: &crate::schema::Table) -> Option<(Symbol, Symbol)> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "alias_attribute" || !on_self(recv) {
+        return None;
+    }
+    let name = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let [new, old] = args.as_slice() else { return None };
+    let (new, old) = (name(new)?, name(old)?);
+    if new == old || table.columns.iter().any(|c| c.name.as_str() == new) {
+        return None;
+    }
+    let old = table.columns.iter().find(|c| c.name.as_str() == old)?;
+    Some((Symbol::from(new.as_str()), old.name.clone()))
+}
+
 /// The body calls of the model's STI subclasses (library classes whose
 /// superclass is the model) of an app class macro reaching `target`,
 /// each with its class and the literal names it passes; and their direct
@@ -355,6 +407,7 @@ pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::S
     if let Some(table) = app.schema.tables.get(&model.table.0) {
         out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
         out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
+        out.extend(body_statements(model).filter(|e| alias_attribute_decl(e, table).is_some()).map(|e| e.span));
         for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
             out.extend(lc.unknown_calls.iter().filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
         }

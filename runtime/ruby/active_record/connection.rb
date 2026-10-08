@@ -656,6 +656,53 @@ module ActiveRecord
       value.is_a?(Proc) ? value.call : value
     end
     
+    # attribute_methods.rb's `alias_attribute(new_name, old_name)` over a
+    # column. The compiler defines the new name's attribute methods and
+    # this class's `attribute_aliases` from the call it saw; here the call
+    # is checked against them, and an alias the compiled class does not
+    # define raises instead of answering nothing.
+    def self.alias_attribute(new_name, old_name)
+      new_key = new_name.to_s
+      old_key = old_name.to_s
+      unless attribute_aliases[new_key] == old_key
+        raise NotImplementedError, "#{self.name}.alias_attribute(:#{new_key}, :#{old_key}): the compiled class does not define the alias"
+      end
+      nil
+    end
+    
+    # Rails' `attribute_aliases`, the new name to the column's: a model
+    # with an `id` column aliases `id_value` to it. A model with aliases
+    # answers its own (compiled).
+    def self.attribute_aliases
+      return {} if self == ActiveRecord::Base || abstract_class?
+      schema_columns.include?(:id) ? { "id_value" => "id" } : {}
+    end
+    
+    def self.attribute_alias?(name)
+      attribute_aliases.key?(name.to_s)
+    end
+    
+    def self.attribute_alias(name)
+      attribute_aliases[name.to_s]
+    end
+    
+    # The column an attribute name reads (Rails' `attribute_alias(name) ||
+    # name`): what `where`, `order` and `pluck` keys resolve through.
+    def self._attribute_name(name)
+      attribute_aliases[name] || name
+    end
+    
+    # `attrs` with each alias key under its column's (the compiled `new`
+    # and `update` assign by column); `attrs` itself when none is one.
+    def self._resolve_attribute_aliases(attrs)
+      given = attrs #: Hash[Symbol, untyped]
+      aliases = attribute_aliases #: Hash[String, String]
+      return given unless given.any? { |key, _| aliases.key?(key.to_s) }
+      resolved = {} #: Hash[Symbol, untyped]
+      given.each { |key, value| resolved[(aliases[key.to_s] || key.to_s).to_sym] = value }
+      resolved
+    end
+    
     # attribute_methods/serialization.rb's `serialize(attr_name, coder:,
     # type:, comparable:, yaml:, **options)`, for a call the class body
     # makes at load with an app coder. The column serializer is built at
@@ -797,6 +844,7 @@ module ActiveRecord
       @__attribute_types = nil
       @__declared_types_memo = nil
       subclasses.each(&:_reset_attribute_types)
+      nil
     end
     
     # The compiled path of a retypable column (`_retypable_attribute_names`):
