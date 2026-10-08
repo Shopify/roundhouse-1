@@ -258,6 +258,17 @@ fn ancestor_method<'a>(app: &[&'a LibraryClass], lc: &LibraryClass, name: &str, 
     None
 }
 
+/// Whether `lc` (any of its reopenings) or an app superclass of it
+/// defines `name` on `receiver`'s side.
+pub(crate) fn answers(app: &[LibraryClass], lc: &LibraryClass, name: &str, receiver: MethodReceiver) -> bool {
+    let candidates: Vec<&LibraryClass> = app.iter().collect();
+    named(&candidates, lc.name.0.as_str())
+        .into_iter()
+        .chain(std::iter::once(lc))
+        .any(|c| c.methods.iter().any(|m| m.name.as_str() == name && m.receiver == receiver))
+        || ancestor_method(&candidates, lc, name, receiver).is_some()
+}
+
 /// A captured `alias_method` of `lc` that [`decide`] carried for a core
 /// ancestor's method: `lc` defines no method of the original's name on
 /// that side, and its superclass chain reaches a core class that does

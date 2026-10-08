@@ -144,7 +144,7 @@ fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &'a [Lib
 /// as a constant of an app library superclass (`include(WithIdentifiers)`
 /// in `Customers::CustomerEntity < CustomerFoundations::Entity` names
 /// `CustomerFoundations::Entity::WithIdentifiers`).
-fn resolve_in_ancestry<'a>(lc: &LibraryClass, written: &str, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
+pub(super) fn resolve_in_ancestry<'a>(lc: &LibraryClass, written: &str, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
     if let Some(found) = resolve(lc, written, true, classes) {
         return Some(found);
     }
@@ -305,4 +305,93 @@ fn parse_methods(body: &str) -> Vec<MethodDef> {
         Ok(classes) if diags.is_empty() => classes.into_iter().flat_map(|c| c.methods).collect(),
         _ => Vec::new(),
     }
+}
+
+/// A class-body loop over a literal list whose block is one `class_eval`
+/// of a string, unrolled into the methods Ruby evaluates. activemerchant
+/// 1.137.0's `CreditCard`:
+///
+/// ```ruby
+/// %w(month year start_month start_year).each do |m|
+///   class_eval <<~RUBY, __FILE__, __LINE__ + 1
+///     def #{m}=(v)
+///       @#{m} = case v ... end
+///     end
+///   RUBY
+/// end
+/// ```
+///
+/// The walk captured no call on a literal receiver, so the loop and its
+/// four writers were dropped with no diagnostic (`Model#initialize`'s
+/// `send("month=", 9)` then raised NoMethodError). Each element (a
+/// literal Symbol or String) replaces the block parameter in the string,
+/// so the result is the exact text Ruby evaluates. This applies only
+/// when every interpolation is that parameter. The text is read as a
+/// class body. Its methods are public, as a string `class_eval` starts
+/// public. The file and line arguments only locate the text. `None` for
+/// any other shape, and the caller keeps the call.
+pub(super) fn unrolled_class_eval_loop(stmt: &Expr) -> Option<Vec<MethodDef>> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*stmt.node else {
+        return None;
+    };
+    if method.as_str() != "each" || !args.is_empty() {
+        return None;
+    }
+    let ExprNode::Array { elements, .. } = &*recv.node else { return None };
+    let items: Vec<String> = elements
+        .iter()
+        .map(|e| match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. } = &*block.node else {
+        return None;
+    };
+    let [param] = params.as_slice() else { return None };
+    let statement = match &*body.node {
+        ExprNode::Seq { exprs } => match exprs.as_slice() {
+            [only] => only,
+            _ => return None,
+        },
+        _ => body,
+    };
+    let ExprNode::Send { recv: eval_recv, method: eval, args: eval_args, block: None, .. } = &*statement.node else {
+        return None;
+    };
+    if !matches!(eval.as_str(), "class_eval" | "module_eval")
+        || eval_recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef))
+        || eval_args.is_empty()
+        || eval_args.len() > 3
+    {
+        return None;
+    }
+    let ExprNode::StringInterp { parts } = &*eval_args[0].node else { return None };
+    let mut out = Vec::new();
+    for item in &items {
+        let mut src = String::new();
+        for part in parts {
+            match part {
+                InterpPart::Text { value } => src.push_str(value),
+                InterpPart::Expr { expr } => match &*expr.node {
+                    ExprNode::Var { name, .. } if name == param => src.push_str(item),
+                    _ => return None,
+                },
+            }
+        }
+        if !src.contains("def ") {
+            return None;
+        }
+        let methods = parse_methods(&src);
+        if methods.is_empty() {
+            return None;
+        }
+        out.extend(methods.into_iter().map(|mut m| {
+            m.visibility = crate::dialect::MethodVisibility::Public;
+            m.name_span = crate::span::Span::synthetic();
+            m
+        }));
+    }
+    Some(out)
 }

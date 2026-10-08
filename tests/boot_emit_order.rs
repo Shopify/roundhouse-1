@@ -311,3 +311,99 @@ fn a_class_declared_in_class_less_less_self_of_a_gem_module_is_loaded() {
     gem_same_as_native("gqlc", SINGLETON_ONLY, "gqlc/singleton", "p Gqlc::Singleton.make\n", ":visitor\n");
     gem_same_as_native("gqlc", SINGLETON_BESIDE_DEF, "gqlc/singleton", "p Gqlc::Singleton.make, Gqlc::Singleton.x\n", "[:visitor, 1]\n1\n");
 }
+
+/// activemerchant 1.137.0's `CreditCard`: a class-side `attr_accessor`
+/// in `class << self` that the body then writes (`self.require_name =
+/// true`), and writers made by a loop over a literal list that
+/// `class_eval`s one def per element. The write was dropped as an
+/// unmodelled class-body call, and the loop with no diagnostic, so
+/// `Model#initialize`'s `send("month=", ...)` raised NoMethodError.
+const CARDLIKE: &[(&str, &str)] = &[(
+    "cardlike.rb",
+    r##"module Cardlike
+  class Card
+    class << self
+      attr_accessor :require_name
+    end
+
+    self.require_name = true
+
+    %w(month year).each do |m|
+      class_eval <<~RUBY, __FILE__, __LINE__ + 1
+        def #{m}=(v)
+          @#{m} = case v
+          when "", nil, 0
+            nil
+          else
+            v.to_i
+          end
+        end
+      RUBY
+    end
+
+    attr_reader :month, :year
+
+    def requires_name? = self.class.require_name
+  end
+
+  class Gift < Card
+    self.require_name = false
+  end
+end
+"##,
+)];
+
+#[test]
+fn a_class_side_writer_call_and_a_class_eval_loop_run_as_native() {
+    gem_same_as_native(
+        "cardlike",
+        CARDLIKE,
+        "cardlike",
+        "c = Cardlike::Card.new\nc.month = \"9\"\nc.year = \"\"\np [c.month, c.year, c.requires_name?, Cardlike::Gift.new.requires_name?, Cardlike::Card.public_method_defined?(:month=)]\np [Cardlike::Card.require_name, Cardlike::Gift.require_name]\n",
+        "[9, nil, true, false, true]\n[true, false]\n",
+    );
+}
+
+/// activemerchant 1.137.0's billing/compatibility.rb ends `module
+/// Billing` with `Compatibility::Model.include Rails::Model`: one app
+/// module including another from a third body, which gives
+/// `Compatibility::Model#valid?`'s `super` its method. It was dropped as
+/// an unmodelled class-body call (NoMethodError: no superclass method).
+const COMPAT: &[(&str, &str)] = &[(
+    "compat.rb",
+    r##"module Compat
+  module Billing
+    module Compatibility
+      module Model
+        def valid?
+          [:compat, super]
+        end
+      end
+    end
+
+    module Rails
+      module Model
+        def valid? = :rails
+      end
+    end
+
+    class Card
+      include Compatibility::Model
+    end
+
+    Compatibility::Model.include Rails::Model
+  end
+end
+"##,
+)];
+
+#[test]
+fn an_include_written_in_another_body_is_the_modules_own() {
+    gem_same_as_native(
+        "compat",
+        COMPAT,
+        "compat",
+        "b = Compat::Billing\np b::Card.new.valid?, b::Compatibility::Model.ancestors, b::Card.ancestors.take(3)\n",
+        "[:compat, :rails]\n[Compat::Billing::Compatibility::Model, Compat::Billing::Rails::Model]\n[Compat::Billing::Card, Compat::Billing::Compatibility::Model, Compat::Billing::Rails::Model]\n",
+    );
+}

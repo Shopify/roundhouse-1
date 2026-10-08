@@ -2540,8 +2540,13 @@ end
     // ATTRIBUTE's ivar, which that pass has the declarations for. What
     // reaches here is the general shape, whose target is a method.
     super::delegate::lower_delegates(&mut app);
+    // `Other.include(M)` written in another body: `Other`'s include.
+    super::external_include::carry(&mut app);
     super::class_eval_macro::qualify_inherited_includes(&mut app);
     super::class_eval_macro::expand_class_eval_macros(&mut app);
+    // A module's `included(base)` hook that declares `class_attribute`
+    // on `base`: the includer gets the accessors the hook would define.
+    super::hook_class_attribute::expand(&mut app);
     // After the includes are qualified and the passes above have made
     // their methods: an alias of an ancestor's method copies it.
     super::inherited_alias::resolve(&mut app);
