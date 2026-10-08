@@ -54,6 +54,13 @@ pub struct Lockfile {
     /// analyzed like the rest of the app rather than being a boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_repo: Vec<String>,
+    /// Each `PATH` source's `remote:` with the specs it resolves, lock
+    /// order: the gem's directory, as written (relative to the
+    /// lockfile unless absolute). Core's `in_repo_gem("graphql-cardinal")`
+    /// locks `in_repo-graphql-cardinal` under `remote: gems/graphql-cardinal`,
+    /// so the directory is not the spec's name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_sources: Vec<(String, Vec<String>)>,
     /// The `GIT` sources, lock order. Bundler checks such a gem out under
     /// `<gem dir>/bundler/gems/<repo>-<revision[0, 12]>` and puts the
     /// checkout's require paths on the load path; RubyGems alone never
@@ -110,6 +117,9 @@ impl Lockfile {
                 if section == "GIT" {
                     lock.git.push(GitSource::default());
                 }
+                if section == "PATH" {
+                    lock.path_sources.push((String::new(), Vec::new()));
+                }
                 continue;
             }
             let indent = line.len() - line.trim_start().len();
@@ -118,6 +128,11 @@ impl Lockfile {
                 "GEM" | "PATH" | "GIT" | "PLUGIN SOURCE" => {
                     if indent == 2 {
                         in_specs = body == "specs:";
+                        if let (true, Some(path), Some(remote)) =
+                            (section == "PATH", lock.path_sources.last_mut(), body.strip_prefix("remote:"))
+                        {
+                            path.0 = remote.trim().to_string();
+                        }
                         if let (true, Some(git)) = (section == "GIT", lock.git.last_mut()) {
                             if let Some(remote) = body.strip_prefix("remote:") {
                                 git.remote = remote.trim().to_string();
@@ -134,6 +149,9 @@ impl Lockfile {
                         lock.specs.push((name.to_string(), version.to_string()));
                         if section == "PATH" {
                             lock.in_repo.push(name.to_string());
+                            if let Some(path) = lock.path_sources.last_mut() {
+                                path.1.push(name.to_string());
+                            }
                         }
                         if let (true, Some(git)) = (section == "GIT", lock.git.last_mut()) {
                             git.specs.push(name.to_string());
@@ -876,6 +894,10 @@ GEM
 ";
         assert_eq!(lock_path_remotes(lock), vec!["lib/billing", "../shared"]);
         assert!(lock_path_remotes(LOCK).is_empty());
+        assert_eq!(
+            Lockfile::parse(lock).path_sources,
+            vec![("lib/billing".to_string(), vec!["billing".to_string()]), ("../shared".to_string(), vec!["shared".to_string()])]
+        );
     }
 }
 

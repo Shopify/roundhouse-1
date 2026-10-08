@@ -569,6 +569,26 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// `Head::Rest` read through a constant of an enclosing scope that
+    /// names a class or module (`Head = Gem::Module`, an entry of the
+    /// scope's `ClassInfo::type_aliases` from `class_constant_aliases`):
+    /// the path Ruby reads, `Gem::Module::Rest`. The innermost lexical
+    /// scope that has the alias answers, as Ruby's lexical lookup does.
+    fn aliased_constant_path(&self, span: crate::span::Span, path: &[Symbol]) -> Option<Vec<Symbol>> {
+        let (head, rest) = path.split_first()?;
+        if rest.is_empty() || head.as_str().is_empty() {
+            return None;
+        }
+        let resolver = self.const_resolver.as_ref()?;
+        resolver.unresolved_nesting(span, path).iter().find_map(|scope| {
+            let info = self.classes().get(&ClassId(Symbol::from(scope.as_ref())))?;
+            let Ty::Class { id, .. } = info.type_aliases.get(head)? else { return None };
+            let mut target: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
+            target.extend(rest.iter().cloned());
+            Some(target)
+        })
+    }
+
     /// The nearest ancestor of the enclosing class that models `name`,
     /// in Ruby's order: each class's included modules (the last included
     /// first), then its superclass. A superclass counts by its modeled
@@ -1340,11 +1360,19 @@ impl<'a> BodyTyper<'a> {
                     Some(None) => {
                         let lexical = self.lexical_external_constant(expr_span, path);
                         let extended = if lexical.is_none() { self.extended_constant(expr_span, path) } else { None };
+                        // A gem's private constant (google-protobuf's
+                        // `private_constant :AbstractMessage`) is read
+                        // only as written: qualified, it is NameError.
+                        let private = |full: &ClassId| self.gem_sources.as_deref().is_some_and(|s| s.private.contains(full.0.as_str()));
                         if let Some((full, declaration)) = extended {
-                            qualify_resolved_path(path, &full);
+                            let full_path: Vec<Symbol> = full.0.as_str().split("::").map(Symbol::from).collect();
+                            let modeled_at = if private(&full) { full_path.as_slice() } else {
+                                qualify_resolved_path(path, &full);
+                                path.as_slice()
+                            };
                             match declaration {
                                 Some(declaration) => self.typed_constant(&declaration).cloned().unwrap_or_else(unknown),
-                                None => exact_modeled_class(path),
+                                None => exact_modeled_class(modeled_at),
                             }
                         } else {
                         let full = lexical.or_else(|| {
@@ -1352,10 +1380,30 @@ impl<'a> BodyTyper<'a> {
                             self.inherited_constant_owner(ctx, path.first()?)
                                 .map(|owner| ClassId(Symbol::from(format!("{}::{written}", owner.0).as_str())))
                         });
-                        if let Some(full) = full {
-                            qualify_resolved_path(path, &full);
+                        match full {
+                            Some(full) if private(&full) => {
+                                let full_path: Vec<Symbol> = full.0.as_str().split("::").map(Symbol::from).collect();
+                                exact_modeled_class(&full_path)
+                            }
+                            Some(full) => {
+                                qualify_resolved_path(path, &full);
+                                exact_modeled_class(path)
+                            }
+                            None => match self.aliased_constant_path(expr_span, path) {
+                                // `DECISION::DROP`, where the enclosing
+                                // class wrote `DECISION =
+                                // OpenTelemetry::SDK::Trace::Samplers::Decision`
+                                // (opentelemetry-shopify's verbosity
+                                // sampler): Ruby reads `DROP` in the
+                                // aliased module, which only the gem's RBI
+                                // declares. The read stays as written.
+                                Some(target) => {
+                                    let ty = exact_modeled_class(&target);
+                                    if matches!(ty, Ty::Var { .. }) { exact_modeled_class(path) } else { ty }
+                                }
+                                None => exact_modeled_class(path),
+                            },
                         }
-                        exact_modeled_class(path)
                         }
                     }
                     // A borrowed span is not evidence of a written constant
@@ -1459,7 +1507,13 @@ impl<'a> BodyTyper<'a> {
                         };
                         match sources.provider(written.0.as_str(), scope) {
                             Some(crate::gem_boundary::SourceProvider::Declared { name, .. }) => {
-                                qualify_resolved_path(path, &ClassId(Symbol::from(name.as_str())));
+                                // A private constant (`private_constant
+                                // :AbstractMessage` in `Google::Protobuf`)
+                                // reached from a lexical scope is readable
+                                // only so: qualified, it raises NameError.
+                                if !sources.private.contains(name.as_str()) {
+                                    qualify_resolved_path(path, &ClassId(Symbol::from(name.as_str())));
+                                }
                                 expr.decisions |= crate::expr::GEM_CONSTANT_REF;
                                 Ty::Untyped
                             }

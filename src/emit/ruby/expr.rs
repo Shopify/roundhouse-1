@@ -33,6 +33,9 @@ thread_local! {
     /// outside a per-file emit, where the literal is written as is.
     static EMITTED_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    /// Set while a class is rendered for splicing into another file
+    /// (`with_spliced_into`): the inner per-file emit keeps that file.
+    static EMITTED_FILE_PINNED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether the tree being emitted binds keywords natively (ruby family).
@@ -60,10 +63,26 @@ pub fn with_error_attributes<R>(on: bool, f: impl FnOnce() -> R) -> R {
 /// Run `f` while emitting the file that lands at `out_path` (relative
 /// to the output root), restoring the previous setting after.
 pub(super) fn with_emitted_file<R>(out_path: &std::path::Path, f: impl FnOnce() -> R) -> R {
+    if EMITTED_FILE_PINNED.with(Cell::get) {
+        return f();
+    }
     let prev = EMITTED_FILE.with(|c| c.replace(Some(out_path.to_path_buf())));
     let r = f();
     EMITTED_FILE.with(|c| *c.borrow_mut() = prev);
     r
+}
+
+/// Run `f`, which renders a class as its own file, for a file that lands
+/// at `out_path` instead: a nested class spliced into its parent's file
+/// (`library::splice_nested`) anchors `__dir__` on the parent's file,
+/// where it runs, not on the file it would have had.
+pub(super) fn with_spliced_into<R>(out_path: &std::path::Path, f: impl FnOnce() -> R) -> R {
+    with_emitted_file(out_path, || {
+        let prev = EMITTED_FILE_PINNED.with(|c| c.replace(true));
+        let r = f();
+        EMITTED_FILE_PINNED.with(|c| c.set(prev));
+        r
+    })
 }
 
 /// `__FILE__` / `__dir__` from a source file the Ruby family emits

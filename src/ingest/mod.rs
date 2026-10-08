@@ -59,6 +59,7 @@ mod trusted_id_attribute;
 pub(crate) use define_method_loops::REFUSAL_CONSTRUCT as DEFINE_METHOD_REFUSAL;
 pub mod on_load_hooks;
 pub mod on_load_reopen;
+pub mod opened_modules;
 pub mod prism;
 pub mod rbi;
 pub mod rate_limit;

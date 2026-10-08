@@ -6049,13 +6049,77 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                     .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         })
     };
+    // A lockfile PATH gem's directory, whatever its spec is named (Core's
+    // `in_repo_gem("graphql-cardinal", require: "graphql/cardinal")` locks
+    // `in_repo-graphql-cardinal` at `gems/graphql-cardinal`), where
+    // native boot requires its entry (Bundler.require) and so its own
+    // requires load its files. Not one holding an `app/` (an engine or
+    // component), nor a library no boot require enters, whose `lib/`
+    // keeps the rules above.
+    let rel_of = |path: &str| -> String {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    let path_gem_dirs: Vec<String> = app
+        .gem_lock
+        .iter()
+        .flat_map(|lock| lock.path_sources.iter())
+        .map(|(remote, _)| remote.trim_start_matches("./").trim_end_matches('/').to_string())
+        .filter(|remote| !remote.is_empty() && !remote.starts_with('/') && !remote.starts_with(".."))
+        .filter(|remote| {
+            let engine = format!("{remote}/app/");
+            !app.sources.iter().any(|source| rel_of(&source.path).starts_with(&engine))
+        })
+        .filter(|remote| {
+            let lib = format!("{remote}/lib/");
+            app.boot_loads.iter().chain(&app.boot_conditional_loads).any(|load| rel_of(&load.source).starts_with(&lib))
+        })
+        .collect();
+    // The gem `lib/` directory a source is under (`vendor/gems/verdict-19.34.0/lib`).
+    let gem_lib = |source: &str| -> Option<String> {
+        let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+        if let Some(dir) = path_gem_dirs.iter().find(|dir| rel.starts_with(&format!("{dir}/lib/"))) {
+            return Some(format!("{dir}/lib"));
+        }
+        let segments: Vec<&str> = rel.split('/').collect();
+        (1..segments.len().saturating_sub(1))
+            .find(|&i| segments[i] == "lib" && gem_dir(segments[i - 1]))
+            .map(|i| segments[..=i].join("/"))
+    };
+    // A gem that sets up a Zeitwerk loader of its own in a form
+    // `ingest::zeitwerk` does not model (verdict 19.34.0 builds its
+    // `Zeitwerk::Loader.new` in a memoized class method, pushes its
+    // `lib/` and calls `Verdict.loader.setup` from verdict.rb): its files
+    // are autoloaded natively, so they keep their autoloads, as a modeled
+    // loader's root does. Read from the source text, since the loader is
+    // not ingested.
+    let self_loading_libs: std::collections::BTreeSet<String> = {
+        let mut creates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut sets_up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for source in &app.sources {
+            let Some(lib) = gem_lib(&source.path) else { continue };
+            let text = source.text.as_str();
+            if text.contains("Zeitwerk::Loader.new") || text.contains("Zeitwerk::Loader.for_gem") {
+                creates.insert(lib.clone());
+            }
+            if text.lines().any(|line| {
+                let line = line.trim();
+                !line.starts_with('#') && line.contains("loader") && line.ends_with(".setup")
+            }) {
+                sets_up.insert(lib);
+            }
+        }
+        creates
+            .into_iter()
+            .filter(|lib| sets_up.contains(lib))
+            .filter(|lib| !loader_roots.iter().any(|root| *root == lib || root.starts_with(&format!("{lib}/"))))
+            .collect()
+    };
     let required_gem_file = |source: &str| -> bool {
         let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
         if loader_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/"))) {
             return false;
         }
-        let segments: Vec<&str> = rel.split('/').collect();
-        (1..segments.len().saturating_sub(1)).any(|i| segments[i] == "lib" && gem_dir(segments[i - 1]))
+        gem_lib(source).is_some_and(|lib| !self_loading_libs.contains(&lib))
     };
     let gem_only = |anchor: &str| {
         declaring.get(anchor).is_some_and(|sources| !sources.is_empty() && sources.iter().all(|s| required_gem_file(s)))
@@ -6438,7 +6502,14 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     require_namespace_files_first(files, app);
     load_declarations_through_their_program(files, app, &program_of_file);
-    for program in &autoloaded_programs {
+    // Each program that is an autoload, and each a load-time need is
+    // required through (`require_through`), autoloaded or not: that
+    // reads whether the program is loading from what `entering_program`
+    // noted. A plain gem's program has no autoload, and verdict.rb's was
+    // loading when verdict/instrumentation.rb's statement needed
+    // `Verdict`: required again, a circular require.
+    let entered: std::collections::BTreeSet<&String> = autoloaded_programs.iter().chain(program_of_file.values()).collect();
+    for program in entered {
         let file = format!("app/{program}.rb");
         if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
             // After the program's header comment (through its "else at
@@ -8729,6 +8800,7 @@ fn spinel_files_with_assertions(
     // anything the emit produces at the same path wins.
     let mut data = Vec::new();
     walk_data_files_into(fixture, &mut data)?;
+    walk_gem_source_data_into(app, fixture, &mut data)?;
     files.splice(0..0, data);
 
     let mut files = dedupe_last_wins(files);
@@ -10006,8 +10078,14 @@ const RAILS_DEPENDENT_GEMS: &[(&str, &str)] = &[
     ("shopify-money", "money.rb requires money_column when ActiveRecord is defined"),
     ("elasticsearch-shopify", "it requires semian, which calls `ActiveSupport.on_load(:active_record)` when ActiveSupport is defined"),
     ("opentelemetry-shopify", "it requires its railtie, and with it `active_support/parameter_filter`, when Rails is defined"),
-    ("opentelemetry-sdk", "only opentelemetry-shopify requires it"),
-    ("opentelemetry-instrumentation-rack", "only opentelemetry-shopify requires it"),
+    // Not opentelemetry-sdk or opentelemetry-instrumentation-rack: each
+    // requires no Rails framework file (the gem home's probe loads none),
+    // and only opentelemetry-shopify requires them. Compiled as a gem
+    // source, its `require "opentelemetry/sdk"` loads the SDK natively,
+    // so the SDK's constants (`Samplers::Result`, read by its verbosity
+    // sampler at load) run as the gem's
+    // (`ingest::gem_source_constants::scan_gem_source_requires`); with
+    // no tree requiring them, they are a gem no emitted tree loads.
     ("panama_client", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
     ("actionpack-xml_parser", "with Rails::Railtie defined (runtime/rails_railtie.rb) it requires its railtie, which requires active_support and action_dispatch"),
     ("panama_metadata", "it requires hashie, which requires `rails/railtie` when Rails is defined"),
@@ -12400,6 +12478,47 @@ fn carried_secrets_file(root: &Path, rel: &str) -> bool {
     }).and_then(|f| f.get("core_path")).and_then(|p| p.as_str()) else { return false };
     let same = matches!((fs::read(root.join(rel)), fs::read(core_root.join(core_path))), (Ok(a), Ok(b)) if a == b);
     same && tracked(core_root, core_path)
+}
+
+/// The files other than Ruby of each gem the app carries as source
+/// (`gem_sources:`, `gem_source_entries`), verbatim at their paths in the
+/// source tree: the gem reads its own data beside its code
+/// (shopify_spanner 4.9.0's `File.read(File.join(__dir__,
+/// "hydrate_search_query.sql"))`, shopify-i18n's
+/// `data/cldr/likely_subtags.yml`), and the emitted `__dir__` of a gem
+/// file names its directory there. `walk_data_files_into` skips `vendor/`
+/// and reads only YAML and JSON. A file [`named_for_secrets`] is not
+/// carried; one that is not UTF-8 is `collect_binary_assets`' to carry.
+fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    // A source's path is the root's join (absolute) or root-relative.
+    let base = format!("{}/", root.display());
+    let mut dirs: Vec<String> = gem_source_entries(app)
+        .into_iter()
+        .filter_map(|(_, _, lib)| {
+            let lib = lib.strip_prefix(base.as_str()).unwrap_or(&lib);
+            (!lib.starts_with('/')).then(|| lib.strip_suffix("lib/").map(str::to_string)).flatten()
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+        let mut found = Vec::new();
+        if root.join(&dir).is_dir() {
+            walk_dir_into(&root.join(&dir), &dir, &mut found)?;
+        }
+        found.sort();
+        for (rel, content) in found {
+            if rel.ends_with(".rb") {
+                continue;
+            }
+            if rel.split('/').any(named_for_secrets) {
+                eprintln!("roundhouse: note: {rel} is named for secrets and is not carried into the tree");
+                continue;
+            }
+            out.push((rel, content));
+        }
+    }
+    Ok(())
 }
 
 /// The app's data files (`*.yml`, `*.yaml`, `*.json`, each optionally

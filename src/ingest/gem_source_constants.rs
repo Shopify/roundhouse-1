@@ -57,6 +57,9 @@ struct DirScan {
     /// Module -> what its bodies give it as a mixin (`SourceMixin`),
     /// names resolved once the whole gem is read.
     mixins: BTreeMap<String, SourceMixin>,
+    /// Constants a namespace body makes private (`private_constant :X`),
+    /// fully qualified.
+    private: BTreeSet<String>,
     /// The mixin references the walk saw, resolved by `resolve_mixins`.
     pending: Vec<PendingMixin>,
     files: usize,
@@ -114,6 +117,7 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         for (name, mixin) in &read.mixins {
             out.mixins.entry(name.clone()).or_default().insert(gem.clone(), mixin.clone());
         }
+        out.private.extend(read.private.iter().cloned());
         out.scans.insert(
             gem.clone(),
             GemSourceScan {
@@ -206,13 +210,17 @@ const RAILS_GEMS: &[&str] = &["activesupport", "activerecord", "activemodel", "a
 /// Rails gem (the boot refuses its feature), a ported gem (its runtime
 /// port answers, `project::gem_port_files`), a gem the app carries, and
 /// a gem already read. Runs after the sources are registered, which the
-/// feature walk reads.
-pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut crate::app::App) {
+/// feature walk reads. A gem owning a feature required for certain (not
+/// only under an `if`) joins `GemBoundary::loaded`.
+pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Path, app: &mut crate::app::App) {
     let Some(lock) = app.gem_lock.as_ref() else { return };
     let (features, _, _) = crate::project::gem_source_dependencies_with(app, true);
     if features.is_empty() {
         return;
     }
+    // What the gem sources require for certain, which the boot's gem
+    // facades require in the CRuby tree (`project::gem_source_dependencies`).
+    let (certain, _, _) = crate::project::gem_source_dependencies(app);
     fn deps<'a>(lock: &'a Lockfile, gem: &str) -> impl Iterator<Item = &'a str> {
         lock.spec_deps.get(gem).into_iter().flatten().map(String::as_str)
     }
@@ -242,6 +250,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     let sources = &app.gem_boundary.source_constants;
     let mut installed = None;
     let mut found = BTreeSet::new();
+    let mut loads = BTreeSet::new();
     for gem in candidates {
         if sources.scans.contains_key(gem)
             || lock.is_in_repo(gem)
@@ -261,7 +270,18 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
         if features.iter().any(|f| owns(f)) {
             found.insert(gem.to_string());
         }
+        if certain.iter().any(|f| owns(f)) {
+            loads.insert(gem.to_string());
+        }
     }
+    // Such a gem loads natively in the CRuby tree as surely as a
+    // Bundler.require entry does: a constant its RBI declares
+    // (elastic-transport's `Elastic::Transport::Transport::Errors::Gone`,
+    // read by elasticsearch-shopify's errors.rb at load) runs as the gem's.
+    // Its RBI, which the boundary read before the gem sources were
+    // registered skipped, types those constants (`Decision::DROP`).
+    super::rbi::read_more_gem_rbis(vfs, dir, lock, &mut app.gem_boundary, &loads);
+    app.gem_boundary.loaded.extend(loads);
     if found.is_empty() {
         return;
     }
@@ -279,6 +299,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     for (name, gems) in read.mixins {
         sources.mixins.entry(name).or_default().extend(gems);
     }
+    sources.private.extend(read.private);
     sources.scans.extend(read.scans);
 }
 
@@ -703,6 +724,18 @@ impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
                 }
             }
         }
+        // `private_constant :X, :Y` in a namespace body: `X` is read only
+        // lexically, never as `Owner::X`.
+        if method == b"private_constant" && self.singleton == 0 && self.in_def == 0 {
+            let on_self = node.receiver().is_none_or(|r| r.as_self_node().is_some());
+            if let (true, Some(namespace)) = (on_self, self.current().map(str::to_string)) {
+                for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                    if let Some(name) = literal_name(&arg).filter(|n| is_constant_name(n)) {
+                        self.out.private.insert(format!("{namespace}::{name}"));
+                    }
+                }
+            }
+        }
         if (method == b"autoload" || method == b"const_set") && self.singleton == 0 {
             let first = node.arguments().and_then(|a| a.arguments().iter().next());
             if let (Some(first), Some(namespace)) = (first, self.receiver_namespace(node.receiver())) {
@@ -772,6 +805,12 @@ mod tests {
         let class_methods = &out.mixins["SmartProperties::ClassMethods"];
         assert_eq!(class_methods.instance_methods.iter().collect::<Vec<_>>(), ["property", "property!", "props"]);
         assert_eq!(out.mixins["Other"].mixes_in_class_methods, ["SmartProperties::ClassMethods"]);
+    }
+
+    #[test]
+    fn private_constant_marks_the_namespace_s_constant_private() {
+        let out = read("module Timeout\n  class State; end\n  Error = 1\n  private_constant :State, 'Error'\n  def self.x; private_constant :Hidden; end\nend\nprivate_constant :Top\n");
+        assert_eq!(out.private.iter().collect::<Vec<_>>(), ["Timeout::Error", "Timeout::State"]);
     }
 
     #[test]

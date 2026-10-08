@@ -143,6 +143,13 @@ impl Overlay {
     /// required and the default adapter configured on an in-memory
     /// database before the script's first line.
     pub fn run_ruby(self, script: &str) -> Run {
+        self.run_ruby_env(script, &[])
+    }
+
+    /// [`Overlay::run_ruby`] with more environment for the process
+    /// (`RUBYLIB` naming a gem the tree loads natively).
+    #[allow(dead_code)]
+    pub fn run_ruby_env(self, script: &str, env: &[(&str, &str)]) -> Run {
         let (emitted, errors) = self.emit_tree(BuildTarget::Ruby);
         let script = format!(
             "require File.expand_path(\"main\", Dir.pwd)\nMain.configure_default_adapter!\n{script}"
@@ -152,6 +159,7 @@ impl Overlay {
             .arg(&script)
             .current_dir(&emitted)
             .env("BLOG_DB", ":memory:")
+            .envs(env.iter().copied())
             .output()
             .expect("spawn ruby");
         Run::new("ruby -e <script>".into(), emitted, errors, output)
