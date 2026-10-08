@@ -10783,6 +10783,10 @@ fn carried_railtie(lc: &LibraryClass, app: &App) -> bool {
 fn body_scope_locals(e: &Expr, out: &mut Vec<String>) {
     use crate::expr::LValue;
     let mut add = |name: &str| {
+        // A global (`$VERBOSE = true`) or a class variable is no local.
+        if name.starts_with('$') || name.starts_with('@') {
+            return;
+        }
         if !out.iter().any(|n| n == name) {
             out.push(name.to_string());
         }
@@ -11285,8 +11289,6 @@ pub(super) fn emit_file_program(
     }
     let mut locals = Vec::new();
     locals_of(&program.items, &mut locals);
-    // A global (`$VERBOSE = true`) is no local.
-    locals.retain(|local| !local.starts_with('$'));
     for local in &locals {
         writeln!(s, "{local} = nil").unwrap();
     }
