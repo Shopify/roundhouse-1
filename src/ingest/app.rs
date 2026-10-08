@@ -5648,7 +5648,11 @@ fn map_enum_labels(app: &mut App) {
 /// (`class GraphApi::ConnectionDataBuilder; class CursorPrefetch …`)
 /// adds no member to the class, so it cannot reorder one and is not
 /// counted (`declares_on_class`); a class left with one such
-/// declaration is not listed.
+/// declaration is not listed. Nor is one that also restates the
+/// superclass (Core's `class GiftCard < GlobalDB::ShopRecord; module
+/// RedeemabilityPolicy …` in gift_card/redeemability_policy.rb): a
+/// merged group has one superclass, which every declaration naming one
+/// names, so where it is written changes no lookup.
 fn merge_library_class_reopens(
     classes: &mut Vec<LibraryClass>,
     sources: &[crate::span::SourceFile],
@@ -5716,14 +5720,14 @@ fn merge_library_class_reopens(
     merged
 }
 
-/// Whether one declaration of a class gives it anything of its own: a
-/// superclass, a mixin, a method, alias, visibility change or
-/// conditional definition, a class-body call, a constant or a class
-/// ivar. One that does none of these only opens the namespace for nested
-/// classes, which ingest records as classes of their own.
+/// Whether one declaration of a class gives it a member of its own: a
+/// mixin, a method, alias, visibility change or conditional definition,
+/// a class-body call, a constant or a class ivar. One that does none of
+/// these only opens the namespace for nested classes, which ingest
+/// records as classes of their own, and at most restates the group's one
+/// superclass (`mergeable`).
 fn declares_on_class(lc: &LibraryClass) -> bool {
-    lc.parent.is_some()
-        || !lc.includes.is_empty()
+    !lc.includes.is_empty()
         || !lc.methods.is_empty()
         || !lc.method_aliases.is_empty()
         || !lc.visibility_overrides.is_empty()

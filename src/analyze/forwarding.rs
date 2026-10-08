@@ -115,9 +115,9 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
 /// keywords as positionals, so it is refused too: off the CRuby tree
 /// always, and there too where a flattened keyword is not written back.
 ///
-/// Four of these refusals hold only off the CRuby tree
+/// Five of these refusals hold only off the CRuby tree
 /// ([`OFF_RUBY_FAMILY`]); this returns the rest, which hold on every
-/// target. [`nameless_rest_refusals_off_ruby`] returns those four.
+/// target. [`nameless_rest_refusals_off_ruby`] returns those five.
 fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<'_>) -> Vec<Diagnostic> {
     keyword_splats_into_nameless_rest_with_index(app, contracts)
         .into_iter()
@@ -138,12 +138,15 @@ fn keyword_splats_into_nameless_rest(app: &App, contracts: &SourceContractIndex<
 /// name the call sites there too. A library class's `delegate` the
 /// strict targets decline is written on the CRuby tree as the `(...)`
 /// forwarder Rails generates (`App::ruby_declined_delegate_forwarders`),
-/// which hands the rest what the caller passed, as native Ruby does.
-const OFF_RUBY_FAMILY: [&str; 4] = [
+/// which hands the rest what the caller passed, as native Ruby does. Its
+/// `delegate_missing_to` is written there as Rails' `method_missing(method,
+/// ...)` and `respond_to_missing?` pair, which forwards the same way.
+const OFF_RUBY_FAMILY: [&str; 5] = [
     "method object of an anonymous positional rest",
     "keyword splat into an anonymous positional rest",
     "implicit super with keywords into an anonymous positional rest",
     "argument-forwarding delegate to an anonymous positional rest",
+    "argument-forwarding delegate_missing_to to an anonymous positional rest",
 ];
 
 fn off_ruby_family(d: &Diagnostic) -> bool {
@@ -327,7 +330,9 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
     // at the name it forwards (`App::ruby_declined_delegate_forwarders`)
     // and written unless the class defines that name itself: where
     // every name reaching a rest has one, the refusal is off the CRuby
-    // tree only.
+    // tree only. A `delegate_missing_to` the CRuby tree writes as Rails'
+    // `method_missing` pair (placed at the call) is refused off it only
+    // too.
     let delegations = classes(app).flat_map(|c| c.unknown_calls.iter().map(move |call| (Some(c), call))).chain(
         app.controllers.iter().flat_map(|c| c.body.iter()).filter_map(|item| match item {
             crate::dialect::ControllerBodyItem::Unknown { expr, .. } => Some((None, expr)),
@@ -362,7 +367,26 @@ fn keyword_splats_into_nameless_rest_with_index(app: &App, contracts: &SourceCon
                     })
                 })
             });
-        let (construct, reason) = if forwarded_on_ruby {
+        let missing_on_ruby = method.as_str() == "delegate_missing_to"
+            && class.is_some_and(|class| {
+                let pair = app.ruby_declined_delegate_forwarders.get(&class.name);
+                let defines = |name: &str| {
+                    classes(app).filter(|c| c.name == class.name).any(|c| {
+                        c.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name)
+                    })
+                };
+                ["method_missing", "respond_to_missing?"].iter().all(|name| {
+                    pair.into_iter().flatten().any(|f| {
+                        f.name_span == call.span && f.receiver == MethodReceiver::Instance && f.name.as_str() == *name
+                    }) && !defines(name)
+                })
+            });
+        let (construct, reason) = if missing_on_ruby {
+            (
+                "argument-forwarding delegate_missing_to to an anonymous positional rest",
+                "this target writes no `method_missing` for it; the CRuby tree writes Rails' `method_missing` and `respond_to_missing?`",
+            )
+        } else if forwarded_on_ruby {
             (
                 "argument-forwarding delegate to an anonymous positional rest",
                 "this target writes no forwarder for it; the CRuby tree writes Rails' `(...)` forwarder",

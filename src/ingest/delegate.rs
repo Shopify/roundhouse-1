@@ -59,6 +59,13 @@
 //! it gets the `(...)` forwarders Rails generates
 //! (`App::ruby_declined_delegate_forwarders`).
 //!
+//! `delegate_missing_to :target` is the same split. Rails writes a
+//! `respond_to_missing?` and a `method_missing(method, ...)` that
+//! forwards every argument. That is argument forwarding by computed name,
+//! which the strict targets do not lower, so the call stays in
+//! `unknown_calls` and they refuse it. The CRuby tree gets Rails' pair
+//! ([`missing_delegators`]) in the same map.
+//!
 //! ## Forwardable
 //!
 //! Ruby's own `def_delegators :@validation, :group_id, …` and
@@ -122,7 +129,8 @@ pub fn lower_delegates(app: &mut crate::App) {
     let mut generated: Vec<(usize, Vec<MethodDef>)> = Vec::new();
     for (i, lc) in app.library_classes.iter_mut().enumerate() {
         let had_definer = lc.unknown_calls.iter().any(forwardable_definer);
-        let (methods, full, declined) = expand_delegates_declining(lc, &nameless_rest);
+        let (methods, full, mut declined) = expand_delegates_declining(lc, &nameless_rest);
+        declined.extend(missing_delegators(lc));
         if had_definer {
             drop_spent_forwardable_extend(lc);
         }
@@ -524,6 +532,106 @@ fn take_delegate_decls(
         needs_forwarding
     });
     out
+}
+
+/// The target and `allow_nil` of a class body's `delegate_missing_to
+/// :target` (or `"target"`), with an optional literal `allow_nil:`, or
+/// `None` for any other shape. The target must be an instance variable
+/// or a method name: Rails interpolates it into the generated source,
+/// and a richer expression is not reproduced.
+pub(crate) fn delegate_missing_to_decl(call: &Expr) -> Option<(String, bool)> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+    if method.as_str() != "delegate_missing_to" {
+        return None;
+    }
+    let (target, options) = match args.as_slice() {
+        [target] => (target, None),
+        [target, options] => (target, Some(options)),
+        _ => return None,
+    };
+    let target = name_literal(target).filter(|t| simple_accessor(t))?;
+    let mut allow_nil = false;
+    if let Some(options) = options {
+        let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+        for (k, v) in entries {
+            let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { return None };
+            if key.as_str() != "allow_nil" {
+                return None;
+            }
+            allow_nil = match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value } } => *value,
+                ExprNode::Lit { value: Literal::Nil } => false,
+                _ => return None,
+            };
+        }
+    }
+    Some((target, allow_nil))
+}
+
+/// The CRuby tree's `respond_to_missing?` and `method_missing` for a
+/// class body's `delegate_missing_to`. This is the source
+/// `ActiveSupport::Delegation.generate_method_missing` writes
+/// (Shopify/rails 5813559f4aed, activesupport 8.2.0.alpha,
+/// active_support/delegation.rb). The name in the nil-target error is
+/// the receiver as written there.
+///
+/// Rails defines both where the call is, so a definition of either name
+/// later in the body replaces it. None is written for a fragment that
+/// defines either name: the call stays refused. With two calls, the
+/// last one's pair is the one that stands, as in Ruby.
+///
+/// Both methods are placed at the call (`name_span`), which is how the
+/// analysis and the emit find the pair of a call.
+fn missing_delegators(lc: &LibraryClass) -> Vec<MethodDef> {
+    let defines = |name: &str| lc.methods.iter().any(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name);
+    if defines("method_missing") || defines("respond_to_missing?") {
+        return Vec::new();
+    }
+    let Some((call, (target, allow_nil))) =
+        lc.unknown_calls.iter().filter_map(|c| delegate_missing_to_decl(c).map(|d| (c, d))).last()
+    else {
+        return Vec::new();
+    };
+    // Rails' `RESERVED_METHOD_NAMES` (Ruby's keywords, `_`, `arg`, `args`,
+    // `block`) and the generated method's own local: `receiver`'s list
+    // less the names only `synthesized_source`'s forwarders bind.
+    let own_locals = ["value", "key", "other", "__delegate_target"];
+    let target = if target == "__target" {
+        "self.__target".to_string()
+    } else if own_locals.contains(&target.as_str()) {
+        target
+    } else {
+        receiver(&target).into_owned()
+    };
+    let nil_behavior = if allow_nil {
+        "nil".to_string()
+    } else {
+        format!("::Kernel.raise ::ActiveSupport::DelegationError.nil_target(method, :'{target}')")
+    };
+    let src = format!(
+        "class {class}\n  def respond_to_missing?(name, include_private = false)\n    return false if name == :marshal_dump || name == :_dump\n    {target}.respond_to?(name) || super\n  end\n\n  def method_missing(method, ...)\n    __target = {target}\n    if __target.nil? && !nil.respond_to?(method)\n      {nil_behavior}\n    elsif __target.respond_to?(method)\n      __target.public_send(method, ...)\n    else\n      super\n    end\n  end\nend\n",
+        class = lc.name.0.as_str().replace("::", "__"),
+    );
+    let (parsed, diags) =
+        crate::ingest::prism::scope(|| crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate_missing_to>"));
+    match parsed {
+        Ok(classes) if diags.is_empty() => {
+            let mut methods: Vec<MethodDef> = classes.into_iter().flat_map(|c| c.methods).collect();
+            for method in &mut methods {
+                anchor(method, call.span);
+            }
+            methods
+        }
+        Ok(_) => {
+            let file = super::sources::path_of(call.span.file).unwrap_or_else(|| "<delegate_missing_to>".to_string());
+            super::survey::record_synthesis_failure(file, "delegate_missing_to's method_missing", &diags);
+            Vec::new()
+        }
+        Err(err) => {
+            super::survey::record(&err);
+            Vec::new()
+        }
+    }
 }
 
 /// Which of Forwardable's instance-side definers a class-body call is.
