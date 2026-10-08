@@ -2792,6 +2792,11 @@ pub(super) const SORBET_ANNOTATIONS: &[&str] = &[
     "sealed!",
     "type_parameters",
     "requires_ancestor",
+    // `T::Generic`'s, likewise empty-bodied (generic.rb:23); the `extend
+    // T::Generic` that provides it is dropped with the annotation mixins,
+    // so a carried call is a NoMethodError at load (Core's
+    // `CI::TestGroup::FilteredRunnableMethods`).
+    "has_attached_class!",
 ];
 
 const POSITION_SENSITIVE_MARKERS: &[&str] = &[
