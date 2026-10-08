@@ -46,6 +46,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
     ("runtime/spinel/active_support_deprecation.rb", "runtime/active_support_deprecation.rb"),
     ("runtime/spinel/active_job_errors.rb", "runtime/active_job_errors.rb"),
+    ("runtime/spinel/active_support_tryable.rb", "runtime/active_support_tryable.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
@@ -676,6 +677,7 @@ mod tests {
             ("ActiveJob::DeserializationError", "runtime/active_job_errors.rb"),
             ("ActiveJob::DeserializationError::RecordNotFound", "runtime/active_job_errors.rb"),
             ("ActiveJob::SerializationError", "runtime/active_job_errors.rb"),
+            ("ActiveSupport::Tryable", "runtime/active_support_tryable.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
         ] {
