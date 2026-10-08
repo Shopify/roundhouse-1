@@ -28,7 +28,7 @@ fn a_concrete_model_without_a_schema_table_is_reported() {
     let errors: Vec<String> = roundhouse::analyze::diagnose(&app)
         .into_iter()
         .map(|d| d.to_string())
-        .filter(|d| d.contains("model_table"))
+        .filter(|d| d.contains("model_table_not_in_schema"))
         .collect();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("`Gizmo` reads table `gizmos`"), "{errors:?}");

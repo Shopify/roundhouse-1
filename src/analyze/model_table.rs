@@ -32,7 +32,7 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
         {
             continue;
         }
-        out.push(Diagnostic::unsupported(model.span, None, "model_table", format!(
+        out.push(Diagnostic::unsupported(model.span, None, "model_table_not_in_schema", format!(
             "`{}` reads table `{}`, which the schema does not declare; every query it makes names a relation that does not exist",
             model.name.0, model.table.0
         )));
