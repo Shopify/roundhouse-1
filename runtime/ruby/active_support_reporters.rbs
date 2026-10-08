@@ -11,8 +11,8 @@ module ActiveSupport
 
     @mask: untyped
     @no_filters: bool
-    @regexps: Array[Regexp]
-    @deep_regexps: Array[Regexp]
+    @regexps: Array[::Regexp]
+    @deep_regexps: Array[::Regexp]
     @blocks: Array[untyped]
 
     def initialize: (?Array[untyped] filters, ?mask: untyped) -> void
@@ -126,7 +126,7 @@ module ActiveSupport
     def debug_mode=: (bool value) -> bool
     def handle: (*untyped error_classes, ?severity: Symbol, ?context: Hash[untyped, untyped], ?fallback: untyped, ?source: String) { () -> untyped } -> untyped
     def record: (*untyped error_classes, ?severity: Symbol, ?context: Hash[untyped, untyped], ?source: String) { () -> untyped } -> untyped
-    def unexpected: (untyped error, ?severity: Symbol, ?context: Hash[untyped, untyped], ?source: String) -> nil
+    def unexpected: (::Exception | String error, ?severity: Symbol, ?context: Hash[untyped, untyped], ?source: String) -> nil
     def subscribe: (untyped subscriber) -> Array[untyped]
     def unsubscribe: (untyped subscriber) -> Array[untyped]
     def disable: (untyped subscriber) { () -> untyped } -> untyped

@@ -102,6 +102,10 @@ pub fn type_method_body(
 ) {
     let typer = crate::analyze::BodyTyper::new(classes);
     let mut ctx = crate::analyze::Ctx::default();
+    ctx.enclosing_def = Some((
+        method.name.clone(),
+        matches!(method.receiver, crate::dialect::MethodReceiver::Class),
+    ));
     if let Some(Ty::Fn { params, .. }) = &method.signature {
         for (param, sig) in method.params.iter().zip(params.iter()) {
             ctx.local_bindings.insert(param.name.clone(), sig.ty.clone());

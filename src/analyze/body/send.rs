@@ -893,14 +893,21 @@ impl<'a> BodyTyper<'a> {
                 return super::union_of(ty.clone(), Ty::Nil);
             }
         }
-        // `.call` on a value TYPED as a function (an RBS `^() -> T`
-        // parameter — `broadcast_render(blk)`'s `blk.call` is the
-        // runtime site) answers the function's declared return. Only
-        // a `Ty::Fn` receiver claims this; anything else keeps its
-        // own `call` (a callable app class, an untyped proc).
-        if method.as_str() == "call" {
-            if let Some(Ty::Fn { ret, .. }) = recv_ty {
-                return (**ret).clone();
+        // Invoking a proc: `call`, its aliases `yield`, `[]` and
+        // `===`, and `.()` (which parses as `call`). On a value TYPED
+        // as a function (an RBS `^() -> T` parameter, a captured
+        // `&block` — `broadcast_render(blk)`'s `blk.call` is the
+        // runtime site) the answer is the function's declared return.
+        // On a bare `Proc` (an `is_a?(Proc)` guard, an RBS `Proc`) the
+        // block type is unknown, and core's `Proc#call: (?) -> untyped`
+        // (rbs/core/proc.rbs) is the declared answer, as for a block
+        // whose signature is unknown. Anything else keeps its own
+        // `call` (a callable app class).
+        if matches!(method.as_str(), "call" | "yield" | "[]" | "===") {
+            match recv_ty {
+                Some(Ty::Fn { ret, .. }) => return (**ret).clone(),
+                Some(Ty::Class { id, .. }) if id.0.as_str() == "Proc" => return Ty::Untyped,
+                _ => {}
             }
         }
         // `then` / `yield_self` are the receiver-identity pair's mirror:
@@ -1826,6 +1833,7 @@ impl<'a> BodyTyper<'a> {
             // uses. Unmodeled methods fall back to `unknown()` (an
             // inference gap) rather than the parent-chain walk — `Time`
             // has no user-defined ancestors in this corpus.
+            Some(Ty::Time) if matches!(method.as_str(), "+" | "-") => time_arithmetic(method, args),
             Some(Ty::Time) => time_method(method).unwrap_or_else(unknown),
             Some(Ty::Date) => date_method(method, args).unwrap_or_else(unknown),
             // `Integer#in_time_zone` lowers only for ≤1 arg (invariant 6).
@@ -2164,6 +2172,25 @@ pub(super) fn time_method(method: &Symbol) -> Option<Ty> {
         _ => return None,
     };
     Some(ty)
+}
+
+/// `Time + x` / `Time - x` by the argument (rbs/core/time.rbs): a
+/// Numeric (seconds) gives a Time either way, and `Time - Time` the
+/// Float seconds between them. A Duration (`1.day`, typed `Untyped`)
+/// or an unknown argument stays `Untyped`, as `time_method` answers
+/// without the argument.
+fn time_arithmetic(method: &Symbol, args: &[crate::expr::Expr]) -> Ty {
+    match (method.as_str(), args.first().and_then(|arg| arg.ty.as_ref())) {
+        (_, Some(Ty::Int | Ty::Float)) => Ty::Time,
+        ("-", Some(Ty::Time)) => Ty::Float,
+        _ => Ty::Untyped,
+    }
+}
+
+/// A `Thread::Backtrace::Location` (Kernel#caller_locations,
+/// Exception#backtrace_locations).
+fn backtrace_location() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("Thread::Backtrace::Location")), args: vec![] }
 }
 
 /// Ruby's native date-only surface. Do not inherit the Time table:
@@ -3194,10 +3221,12 @@ pub(super) fn universal_method(method: &Symbol) -> Option<Ty> {
         // Kernel#block_given? — bare call inside any method body
         // (`yield x if block_given?` in the runtime's create/create!).
         "block_given?" => Some(Ty::Bool),
-        // Kernel#caller_locations — the frames above the caller
-        // (`Thread::Backtrace::Location`s, untyped here like
-        // Exception#backtrace_locations).
-        "caller_locations" => Some(Ty::Array { elem: Box::new(Ty::Untyped) }),
+        // Kernel#caller_locations — the frames above the caller, as
+        // `Thread::Backtrace::Location`s (rbs/core/kernel.rbs), whose
+        // readers `registry::stdlib` registers. RBS also says `?` (nil
+        // when the start is past the stack); like `Exception#backtrace`
+        // here, the Array is not unioned with nil.
+        "caller_locations" => Some(Ty::Array { elem: Box::new(backtrace_location()) }),
         // `class` is receiver-aware and handled in `dispatch` itself
         // (preserves `Ty::Class { id }` so chained `obj.class.foo`
         // resolves against `id`'s registry entry).

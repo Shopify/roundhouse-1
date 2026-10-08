@@ -223,13 +223,47 @@ pub fn text_of(path: &str) -> Option<String> {
 /// Run `f` on the text registered for `path`, without copying it.
 /// For lookups made per expression, where `text_of`'s clone of the
 /// whole file would make ingest quadratic in file size.
+///
+/// Text lent by [`with_unregistered_text`] answers for its label too,
+/// so a `<…>` label that never occupies a slot can still be read.
 pub fn with_text<R>(path: &str, f: impl FnOnce(&str) -> R) -> Option<R> {
+    let lent = UNREGISTERED.with(|u| {
+        u.borrow().iter().rev().find(|(label, _)| label == path).map(|(_, text)| text.clone())
+    });
+    if let Some(text) = lent {
+        return Some(f(&text));
+    }
     SOURCES.with(|s| {
         let reg = s.borrow();
         let id = reg.by_path.get(path)?;
         let i = (id.0 as usize).checked_sub(1)?;
         reg.files.get(i).map(|file| f(&file.text))
     })
+}
+
+thread_local! {
+    static UNREGISTERED: RefCell<Vec<(String, std::rc::Rc<str>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `text` readable through [`with_text`] under `label`,
+/// without registering it. For a `<…>` label ([`register`] refuses
+/// those): the runtime source parser ingests under `"<runtime>"`, and
+/// a trailing `#:` ascription is read from the text after the
+/// expression, so without the text the parser dropped every
+/// ascription the library ingest of the same file honours. Spans stay
+/// synthetic; only the text is lent, and only for the call.
+pub fn with_unregistered_text<R>(label: &str, text: &str, f: impl FnOnce() -> R) -> R {
+    struct Return;
+    impl Drop for Return {
+        fn drop(&mut self) {
+            UNREGISTERED.with(|u| {
+                u.borrow_mut().pop();
+            });
+        }
+    }
+    UNREGISTERED.with(|u| u.borrow_mut().push((label.to_string(), text.into())));
+    let _return = Return;
+    f()
 }
 
 /// `compute` over `path`'s registered text, once per file and ingest.

@@ -433,7 +433,9 @@ pub fn parse_methods(source: &str) -> Result<Vec<MethodDef>, String> {
 
     let root = result.node();
     let mut out = Vec::new();
-    walk_scope(&root, &mut out, None)?;
+    // Lend the text so trailing `#:` ascriptions read as they do in the
+    // library ingest of the same file (`parse_library_with_rbs`).
+    crate::ingest::sources::with_unregistered_text(VIRTUAL_FILE, source, || walk_scope(&root, &mut out, None))?;
     Ok(out)
 }
 
@@ -640,6 +642,7 @@ pub fn parse_library_with_rbs(
                          ivars: &crate::det::HashMap<Symbol, Ty>|
          -> crate::analyze::Ctx {
             let mut ctx = crate::analyze::Ctx::default();
+            ctx.enclosing_def = Some((m.name.clone(), matches!(m.receiver, MethodReceiver::Class)));
             if let Some(Ty::Fn { params, .. }) = &m.signature {
                 for (param, p) in m.params.iter().zip(params.iter()) {
                     ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
@@ -823,6 +826,19 @@ pub fn parse_methods_with_rbs_in_ctx(
         }
     }
 
+    // RBS `@ivar: T` and `self.@ivar: T` declarations, re-keyed by the
+    // bare class name like the signatures. A declared type is the
+    // contract: it wins over the flow-inferred one, as in
+    // `parse_library_with_rbs`, and is read as written (a nil-able
+    // ivar says `T?`).
+    let mut declared_ivars: crate::det::HashMap<String, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
+    for (cid, ivars) in crate::rbs::parse_app_ivars(rbs_src)? {
+        let raw = cid.0.as_str();
+        let last = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        declared_ivars.entry(last).or_default().extend(ivars);
+    }
+
     let flat_sigs = parse_signatures(rbs_src)?;
     let abstract_methods: crate::det::HashSet<Symbol> =
         flat_sigs.abstract_methods.iter().cloned().collect();
@@ -962,6 +978,7 @@ pub fn parse_methods_with_rbs_in_ctx(
                      ivars: &crate::det::HashMap<Symbol, Ty>|
      -> crate::analyze::Ctx {
         let mut ctx = crate::analyze::Ctx::default();
+        ctx.enclosing_def = Some((m.name.clone(), matches!(m.receiver, MethodReceiver::Class)));
         if let Some(Ty::Fn { params, .. }) = &m.signature {
             for (param, p) in m.params.iter().zip(params.iter()) {
                 ctx.local_bindings.insert(param.name.clone(), p.ty.clone());
@@ -981,6 +998,11 @@ pub fn parse_methods_with_rbs_in_ctx(
             });
         }
         ctx.ivar_bindings = ivars.clone();
+        if let Some(declared) = m.enclosing_class.as_ref().and_then(|c| declared_ivars.get(c.as_str())) {
+            for (name, ty) in declared {
+                ctx.ivar_bindings.insert(name.clone(), ty.clone());
+            }
+        }
         ctx.constants = constants.clone();
         ctx
     };
@@ -1893,6 +1915,20 @@ mod tests {
         let m = parse_one(src);
         assert!(m.params.is_empty());
         assert!(matches!(&*m.body.node, ExprNode::Seq { exprs } if exprs.is_empty()));
+    }
+
+    #[test]
+    fn a_trailing_ascription_reads_as_in_the_library_ingest() {
+        let m = parse_one("def keys\n  values = [] #: Array[untyped]\n  values\nend\n");
+        let ExprNode::Seq { exprs } = &*m.body.node else { panic!("body is a sequence") };
+        let ExprNode::Assign { value, .. } = &*exprs[0].node else { panic!("first statement assigns") };
+        assert!(
+            matches!(&*value.node, ExprNode::Cast { target_ty: Ty::Array { elem }, .. } if **elem == Ty::Untyped),
+            "the `#:` comment ascribes the literal: {:?}",
+            value.node
+        );
+        // The text is lent for the parse only.
+        assert!(crate::ingest::sources::with_text(VIRTUAL_FILE, |_| ()).is_none());
     }
 
     // ── parse_methods_with_rbs ──────────────────────────────────────

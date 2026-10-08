@@ -139,16 +139,29 @@ fn walk_ruby_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// emission (Rust). Non-recursive in itself; calls
 /// `count_gradual_recurse` to descend.
 fn count_gradual(e: &Expr) -> usize {
-    let mut total = 0usize;
+    gradual_sites(e).len()
+}
+
+/// Every `Ty::Untyped` site under `e`, in walk order, as its source
+/// offset and node kind (`Send:name`, `Var:name`, ...): what
+/// `count_gradual` counts, for RUNTIME_PROBE_DUMP=1.
+fn gradual_sites(e: &Expr) -> Vec<(u32, String)> {
+    let mut total = Vec::new();
     count_gradual_recurse(e, &mut total);
     total
 }
 
-fn count_gradual_recurse(e: &Expr, total: &mut usize) {
-    if matches!(&e.ty, Some(Ty::Untyped)) {
-        *total += 1;
-    }
+fn count_gradual_recurse(e: &Expr, total: &mut Vec<(u32, String)>) {
     use ExprNode as N;
+    if matches!(&e.ty, Some(Ty::Untyped)) {
+        let name = match &*e.node {
+            N::Send { method, .. } => format!(":{method}"),
+            N::Var { name, .. } | N::Ivar { name } => format!(":{name}"),
+            N::Const { path } => format!(":{}", path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")),
+            _ => String::new(),
+        };
+        total.push((e.span.start, format!("{}{name}", e.node.kind_str())));
+    }
     match &*e.node {
         N::Lit { .. }
         | N::Var { .. }
@@ -462,6 +475,13 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
 /// `Untyped`) is a separate, stricter goal tracked by the
 /// `inference_on_spinel_blog_runtime_with_rbs::untyped_subexpressions_with_rbs_baseline`
 /// probe and the GradualUntyped diagnostic pipeline.
+/// Signatures runtime/ruby bodies call that live with their source
+/// outside runtime/ruby: active_model_type.rb ships from runtime/spinel,
+/// and connection.rb's attribute API calls its `ActiveRecord::Type`
+/// registry. The RBS inference probe seeds the same file
+/// (`inference_on_spinel_blog_runtime_with_rbs::DEPENDENCY_RBS`).
+const SHARED_RUNTIME_RBS: &[&str] = &["runtime/spinel/active_model_type.rbs"];
+
 #[test]
 fn every_runtime_method_body_is_fully_typed() {
     let stems = runtime_ruby_stems();
@@ -504,13 +524,20 @@ fn every_runtime_method_body_is_fully_typed() {
         ClassId(roundhouse::ident::Symbol::new(&last))
     };
 
+    // Shared-runtime contracts outside runtime/ruby come first, so a
+    // runtime/ruby `.rbs` declaring the same method wins.
+    let mut rbs_paths: Vec<std::path::PathBuf> =
+        SHARED_RUNTIME_RBS.iter().map(std::path::PathBuf::from).collect();
     for stem in &stems {
         let rbs_path = Path::new("runtime/ruby").join(format!("{stem}.rbs"));
         if !rbs_path.exists() {
             missing_rbs.push(stem.clone());
             continue;
         }
-        let rbs = fs::read_to_string(&rbs_path)
+        rbs_paths.push(rbs_path);
+    }
+    for rbs_path in &rbs_paths {
+        let rbs = fs::read_to_string(rbs_path)
             .unwrap_or_else(|_| panic!("read {rbs_path:?}"));
         let per_file = match parse_app_signatures(&rbs) {
             Ok(m) => m,
@@ -721,10 +748,15 @@ fn every_runtime_method_body_concretely_typed() {
         ClassId(roundhouse::ident::Symbol::new(&last))
     };
 
-    for stem in &stems {
-        let rbs_path = Path::new("runtime/ruby").join(format!("{stem}.rbs"));
+    // The shared-runtime contracts Bar A seeds, first so runtime/ruby wins.
+    let rbs_paths: Vec<std::path::PathBuf> = SHARED_RUNTIME_RBS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(stems.iter().map(|stem| Path::new("runtime/ruby").join(format!("{stem}.rbs"))))
+        .collect();
+    for rbs_path in &rbs_paths {
         if !rbs_path.exists() { continue; }
-        let rbs = fs::read_to_string(&rbs_path).unwrap();
+        let rbs = fs::read_to_string(rbs_path).unwrap();
         let Ok(per_file) = parse_app_signatures(&rbs) else { continue };
         for (class_id, methods) in per_file {
             let entry = class_registry.entry(short_id(&class_id)).or_default();
@@ -778,6 +810,17 @@ fn every_runtime_method_body_concretely_typed() {
             if n > 0 {
                 *by_file.entry(stem.clone()).or_insert(0) += n;
                 total_gradual += n;
+            }
+            // Every site as `file:line method kind`, for diffing two
+            // trees' site sets.
+            if std::env::var_os("RUNTIME_PROBE_DUMP").is_some() {
+                for (start, kind) in gradual_sites(&m.body) {
+                    let line = 1 + ruby.as_bytes()[..(start as usize).min(ruby.len())]
+                        .iter()
+                        .filter(|b| **b == b'\n')
+                        .count();
+                    eprintln!("BAR_B {stem}.rb:{line} {} {kind}", m.name);
+                }
             }
         }
     }
@@ -847,6 +890,32 @@ fn every_runtime_method_body_concretely_typed() {
     // (and LockWaitTimeout, RecordNotSaved, ...) clauses name real
     // classes and rescue by Rails' ancestry
     // (tests/active_record_errors_hierarchy.rs).
+    //
+    // 520 -> 568 at b0b27ec0e, OVER the ceiling without raising it.
+    // Each first-parent runtime tree measured with 43323af00's analyzer
+    // held constant, unless noted:
+    //   +5  02de31568 Rails type registries and a class-side `attribute`
+    //   +31 af58747ac uuid attributes, composite and Yugabyte keys
+    //   +5  a157bbde5 composite primary key: Rails 8.2 semantics
+    //   +13 81f34bbb9 STI subclass attribute (574 with its own analyzer)
+    //   -9  c9d39872e merge core-db-r13: runtime entry points typed (565)
+    //   +3  b0b27ec0e's own analyzer (fix-runtime-typing-2): `(context
+    //       || {}).each` in the reporters reads the declared untyped (2),
+    //       `subscribers.each(&:_reset_attribute_types)` its `-> untyped`
+    //   +9  577138343 connection.rb `attribute default:`, `serialize`,
+    //       `_attribute_force_equality?`, `_attribute_cast` (565 -> 574
+    //       with 43323af00's analyzer)
+    // All of connection.rb's growth is the attribute API and composite
+    // keys, whose values are caller-defined.
+    // -> 514 MEASURED (fix-runtime-src-bars), by typing rather than by
+    // declaring: `super` in an instance `initialize` is its parent's
+    // void `initialize` (-38); the runtime typer honours the sidecar's
+    // `@ivar: T` declarations (-11); Proc `call`/`()`/`[]`/`yield`, Time
+    // `+`/`-` and `caller_locations` answer their core signatures (-9
+    // together); `ErrorReporter#unexpected` takes Rails' `Exception | String` (-9).
+    // Trailing `#:` ascriptions now read as in the library ingest, +3:
+    // the `Array[untyped]` / `Hash[String, untyped]` they declare are
+    // untyped sites, where the unascribed reads were unknown (Bar A).
     const CEILING: usize = 520;
     assert!(
         total_gradual <= CEILING,
