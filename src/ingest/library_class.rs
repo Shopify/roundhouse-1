@@ -388,15 +388,21 @@ fn program_items(
         }
         if declaration {
             let mut names: Vec<ClassId> = Vec::new();
+            // In source order, as Ruby evaluates them: oid_service.rb's
+            // `module Validation` loads before the `class Local` below it
+            // that extends it. An enclosing declaration starts before what
+            // it nests, so it still loads first.
             let classes = find_all_classes_with_scope(stmt).into_iter().filter_map(|(scope, c)| {
-                class_name_path(&c).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+                let start = c.location().start_offset();
+                class_name_path(&c).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
             });
             let modules = find_all_module_declarations_with_scope(stmt).into_iter().filter_map(|(scope, m)| {
-                module_name_path(&m).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+                let start = m.location().start_offset();
+                module_name_path(&m).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
             });
-            let mut found: Vec<String> = classes.chain(modules).collect();
-            found.sort_by_key(|n| n.matches("::").count());
-            for name in found {
+            let mut found: Vec<(usize, String)> = classes.chain(modules).collect();
+            found.sort_by_key(|(start, _)| *start);
+            for (_, name) in found {
                 if carried.contains(name.as_str()) && !names.iter().any(|n| n.0.as_str() == name) {
                     names.push(ClassId(Symbol::from(name)));
                 }
