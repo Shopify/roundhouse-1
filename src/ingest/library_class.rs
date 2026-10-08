@@ -3655,7 +3655,15 @@ fn walk_decl_body_in<'pr>(
         // defines class-level methods on the enclosing scope.
         if let Some(sc) = stmt.as_singleton_class_node() {
             let claimed = declaration_body && !force_class_receiver && sc.expression().as_self_node().is_some();
-            out.extend(walk_decl_body_in(sc.body(), owner, file, true, visibility, claimed)?);
+            let mut inner = walk_decl_body_in(sc.body(), owner, file, true, visibility, claimed)?;
+            // Its constants are the singleton class's
+            // (`SINGLETON_CONSTANT_WRITE`), as the body's own `self` is.
+            if !force_class_receiver && sc.expression().as_self_node().is_some() {
+                for (_, value) in &mut inner.constants {
+                    value.decisions |= crate::expr::SINGLETON_CONSTANT_WRITE;
+                }
+            }
+            out.extend(inner);
             continue;
         }
         // `module ClassMethods … end` is not folded here: it is its own

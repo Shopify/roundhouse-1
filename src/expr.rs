@@ -149,6 +149,20 @@ pub const RUBY_NATIVE_KEYWORD_SPLAT: u64 = 1 << 18;
 /// load-time constant definition assign it unconditionally.
 pub const GUARDED_CONSTANT_WRITE: u64 = 1 << 19;
 
+/// On a class-body constant's value (or a replayed `NAME = value`
+/// statement): the source wrote it inside `class << self`, so Ruby puts
+/// the constant on the singleton class (`X.singleton_class.constants`,
+/// not `X.constants`). Ingest registers and types it on the class like
+/// any other; the Ruby family writes it back inside `class << self`.
+/// Targets without singleton classes keep it on the class.
+pub const SINGLETON_CONSTANT_WRITE: u64 = 1 << 24;
+
+/// On a `Const` read the analyzer qualified to a [`SINGLETON_CONSTANT_WRITE`]
+/// constant (Rubydex resolved it to `X::<X>::NAME`, from a method or
+/// statement of that `class << self`): the path is `X::NAME`, and the
+/// Ruby family reads it as `X.singleton_class::NAME`, where it lives.
+pub const SINGLETON_CONSTANT_REF: u64 = 1 << 25;
+
 /// Whether `expr` is a [`SELF_BINDING`] cast.
 pub fn is_self_binding(expr: &Expr) -> bool {
     expr.decisions & SELF_BINDING != 0
@@ -1898,7 +1912,8 @@ mod tests {
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
-            RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION,
+            RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
+            SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF,
         ];
         let mut seen = 0u64;
         for bit in bits {

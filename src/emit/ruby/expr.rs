@@ -194,6 +194,27 @@ pub fn emit_expr(e: &Expr) -> String {
             return emit_expr(value);
         }
     }
+    // A constant of `X`'s `class << self`, read where Ruby's lexical
+    // lookup found it (`SINGLETON_CONSTANT_REF`). The ruby family's
+    // interpreters have singleton classes; the spinel tree keeps the
+    // constant hoisted onto the class, writes and reads alike.
+    if e.decisions & crate::expr::SINGLETON_CONSTANT_REF != 0
+        && native_keywords()
+        && let ExprNode::Const { path } = &*e.node
+        && let [owner @ .., name] = &path[..]
+        && !owner.is_empty()
+    {
+        return format!("{}.singleton_class::{name}", emit_const_path(owner));
+    }
+    // A replayed `NAME = value` the source wrote in `class << self`
+    // (`SINGLETON_CONSTANT_WRITE`).
+    if e.decisions & crate::expr::SINGLETON_CONSTANT_WRITE != 0
+        && native_keywords()
+        && matches!(&*e.node, ExprNode::Assign { target: crate::expr::LValue::Const { .. }, .. })
+    {
+        // Unindented: a heredoc's lines are whitespace-significant.
+        return format!("class << self\n{}\nend", emit_node(&e.node).trim_end());
+    }
     emit_node(&e.node)
 }
 

@@ -46,7 +46,9 @@ pub(super) enum ResolvedConstant {
     /// `alias`: the name written resolved through an RBS class alias
     /// (`Queue` for `Thread::Queue`); `class` is the alias's target.
     Namespace { class: Arc<ClassId>, runtime: bool, stdlib: bool, alias: Option<Arc<ClassId>> },
-    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>>, stdlib: bool },
+    /// `singleton`: declared directly in a `class << self` (`X::<X>::NAME`);
+    /// `name` is the hoisted `X::NAME` ([`hoisted_name`]).
+    Value { declaration: DeclarationId, name: Arc<ClassId>, runtime: Option<Arc<Ty>>, stdlib: bool, singleton: bool },
 }
 
 /// Rubydex answers for one source file.
@@ -337,6 +339,15 @@ fn hoisted_name(name: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(
         name.split("::").filter(|segment| !segment.starts_with('<')).collect::<Vec<_>>().join("::"),
     )
+}
+
+/// `X::<X>::NAME`: a constant written directly in `X`'s `class << self`
+/// (one singleton level, X's own).
+fn declared_on_singleton(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.len() >= 3
+        && segments.iter().filter(|s| s.starts_with('<')).count() == 1
+        && segments[segments.len() - 2] == format!("<{}>", segments[segments.len() - 3])
 }
 
 /// The full names of the namespaces the first segment of a written path
@@ -940,7 +951,13 @@ fn resolved_constant(
         } else {
             None
         };
-        ResolvedConstant::Value { declaration: id, name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))), runtime, stdlib }
+        ResolvedConstant::Value {
+            declaration: id,
+            name: Arc::new(ClassId(Symbol::from(hoisted_name(name).as_ref()))),
+            runtime,
+            stdlib,
+            singleton: declared_on_singleton(name),
+        }
     };
     Some(resolved)
 }

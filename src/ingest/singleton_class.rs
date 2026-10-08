@@ -114,7 +114,14 @@ fn walk_statement(
             return Ok(());
         }
         return match ingest_expr(stmt, file) {
-            Ok(expr) => {
+            Ok(mut expr) => {
+                // The singleton class's constant
+                // (`SINGLETON_CONSTANT_WRITE`), on the statement and on
+                // its value, whichever form the enclosing walk keeps.
+                expr.decisions |= crate::expr::SINGLETON_CONSTANT_WRITE;
+                if let ExprNode::Assign { value, .. } = &mut *expr.node {
+                    value.decisions |= crate::expr::SINGLETON_CONSTANT_WRITE;
+                }
                 out.class_body.push(expr);
                 Ok(())
             }

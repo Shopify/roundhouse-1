@@ -64,7 +64,9 @@ fn a_module_in_a_singleton_body_is_read_at_its_hoisted_name() {
         .collect();
     assert!(serializer.contains("Outer::Serializer::ASer") && serializer.contains("Outer::Serializer::BSer"), "{serializer}");
     assert!(!serializer.contains("roundhouse:"), "{serializer}");
-    for name in ["aser.rb", "bser.rb"] {
+    // Rails' `underscore` names the files (`ASer` -> `a_ser`, as
+    // Zeitwerk expects; `naming::snake_case` since adf504b5e).
+    for name in ["/a_ser.rb", "/b_ser.rb"] {
         assert!(files.iter().any(|f| f.path.to_string_lossy().ends_with(name)), "{name} emitted");
     }
 }
