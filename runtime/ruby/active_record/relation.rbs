@@ -199,6 +199,8 @@ module ActiveRecord
     def each_with_object: (untyped memo) { (Base, untyped) -> untyped } -> untyped
     def first: () -> Base?
     def take: () -> Base?
+    def order_by_key: (String direction) -> bool
+    def key_order_terms: (String direction) -> Array[String]
     def first!: () -> Base
     def last: () -> Base?
     def first_n: (Integer | Float | String n) -> Array[Base]

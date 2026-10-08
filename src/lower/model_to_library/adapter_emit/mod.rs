@@ -257,7 +257,8 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: S
 }
 
 /// `def self._adapter_last` — `SELECT <cols> FROM <table> ORDER BY
-/// <table>.id DESC LIMIT 1`, a single nilable hydrate. Mirrors Rails'
+/// <table>.id DESC LIMIT 1` (each query constraint column DESC once
+/// `query_constraints` ran), a single nilable hydrate. Mirrors Rails'
 /// `Model.last` (one row) instead of the old `_adapter_all().last()`
 /// full-table scan; goes through the same `Db.prepare`/`from_stmt` path
 /// as `_adapter_find_by_id`, so it works for every app (the raw
@@ -267,22 +268,28 @@ fn synth_adapter_last(model: &Model, table: &Table, schema: &Schema, dialect: Sq
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
 
-    let op = ArelOp::Select(Select {
-        single_record: true, // _adapter_last — one record or nil
-        table: TableRef(table.name.clone()),
-        columns: ColumnSpec::All,
-        conditions: None,
-        orders: vec![Order {
-            column: ColRef {
-                table: TableRef(table.name.clone()),
-                column: key_column_name(model, table),
-            },
-            direction: Direction::Desc,
-        }],
-        limit: Some(LimitSpec(1)),
-        joins: vec![],
-        preloads: vec![],
-    });
+    let last = |columns: Vec<Symbol>| {
+        let op = ArelOp::Select(Select {
+            single_record: true, // _adapter_last — one record or nil
+            table: TableRef(table.name.clone()),
+            columns: ColumnSpec::All,
+            conditions: None,
+            orders: columns
+                .into_iter()
+                .map(|column| Order { column: ColRef { table: TableRef(table.name.clone()), column }, direction: Direction::Desc })
+                .collect(),
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        });
+        dialect.visit(&op, schema, owner)
+    };
+    let single = last(vec![key_column_name(model, table)]);
+    // Rails orders `last` by `query_constraints_list` once the call ran.
+    let body = match query_constraint_columns(model, table) {
+        Some(cols) => when_query_constraints_on(false, last(cols.iter().map(|c| c.name.clone()).collect()), single),
+        None => single,
+    };
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -292,7 +299,7 @@ fn synth_adapter_last(model: &Model, table: &Table, schema: &Schema, dialect: Sq
         name: Symbol::from("_adapter_last"),
         receiver: MethodReceiver::Class,
         params: vec![],
-        body: dialect.visit(&op, schema, owner),
+        body: body,
         signature: Some(fn_sig(vec![], nilable_owner)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -857,13 +864,21 @@ fn eq_query_constraints(model: &Model, table: &Table, cols: &[&crate::schema::Co
 /// end`: the composite WHERE once the class body's `query_constraints`
 /// call has run (Core's runs it only under its Yugabyte configuration).
 fn when_query_constraints(composite: Expr, single: Expr) -> Expr {
+    when_query_constraints_on(true, composite, single)
+}
+
+/// [`when_query_constraints`] in an instance method (`self.class`) or a
+/// class method (`self`).
+fn when_query_constraints_on(instance: bool, composite: Expr, single: Expr) -> Expr {
     let send = |recv: Expr, method: &str| {
         Expr::new(
             Span::synthetic(),
             ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args: vec![], block: None, parenthesized: false },
         )
     };
-    let cond = send(send(Expr::new(Span::synthetic(), ExprNode::SelfRef), "class"), "query_constraints_list");
+    let receiver = Expr::new(Span::synthetic(), ExprNode::SelfRef);
+    let receiver = if instance { send(receiver, "class") } else { receiver };
+    let cond = send(receiver, "query_constraints_list");
     Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: composite, else_branch: single })
 }
 

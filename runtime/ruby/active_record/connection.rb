@@ -819,16 +819,16 @@ module ActiveRecord
     # (`Category.first` in lobsters' specs); lowered call sites don't
     # land here. `last` lives in base.rb over `_adapter_last` — this
     # one is ruby-family-only because Relation#first already carries
-    # the ORDER BY <pk> ASC LIMIT 1 shape.
+    # the ORDER BY <key> ASC LIMIT 1 shape (`order_by_key`).
     def self.first
       ActiveRecord::Relation.new(self).first
     end
 
     # `User.take` — the Rails 8 authentication generator's tests set up
     # with it (`setup { @user = User.take }`), so the Rails Guides store
-    # reaches here. Same row as `first` under SQLite; see Relation#take.
+    # reaches here. No order imposed (Relation#take).
     def self.take
-      ActiveRecord::Relation.new(self).first
+      ActiveRecord::Relation.new(self).take
     end
 
     # The Relation load path's Hash fallback for a hand-written model

@@ -1151,9 +1151,11 @@ module ActiveRecord
 
     def first
       prior = @limit
+      keyed = order_by_key("ASC")
       @limit = 1
       rows = to_a
       @limit = prior
+      @orders = [] if keyed
       # The one-row load must NOT stay memoized: `@records` is the
       # loaded-relation cache a later `each`/`map` reads, and a cache
       # holding the single row `first` asked for would answer those with
@@ -1162,11 +1164,39 @@ module ActiveRecord
       rows.length == 0 ? nil : rows[0]
     end
 
-    # `take` — a row with no ordering imposed. Rails leaves the order
-    # to the database; SQLite hands back the lowest rowid, which is the
-    # row `first` orders to, so one query shape serves both.
+    # `take` — a row with no ordering imposed: Rails leaves the order to
+    # the database, so unlike `first` no key order is added.
     def take
-      first
+      prior = @limit
+      @limit = 1
+      rows = to_a
+      @limit = prior
+      @records = nil
+      rows.length == 0 ? nil : rows[0]
+    end
+
+    # Rails' `ordered_relation` for `first` and `first(n)`: a relation
+    # with no ORDER BY of its own, not yet loaded, orders by the model's
+    # key columns (`_order_columns`: `query_constraints_list` once the
+    # call has run, else the primary key). PostgreSQL answers an
+    # unordered SELECT in heap order, which an UPDATE changes. Whether it
+    # added the order, so the caller can drop it again.
+    def order_by_key(direction)
+      return false unless @records.nil? && @orders.empty?
+      terms = key_order_terms(direction)
+      return false if terms.empty?
+      own_lists
+      terms.each { |term| @orders << term }
+      true
+    end
+
+    # A model without a primary key has no order columns, and Rails then
+    # leaves the relation unordered.
+    def key_order_terms(direction)
+      columns = @model.query_constraints_list || [@model.primary_key]
+      terms = []
+      columns.each { |column| terms << "#{@table}.#{column} #{direction}" unless column.nil? || column.to_s.empty? }
+      terms
     end
 
     # `first!` — like `first`, but raises `RecordNotFound` (→ 404 in the
@@ -1199,9 +1229,11 @@ module ActiveRecord
     def first_n(n)
       n = sql_limit(n)
       prior = @limit
+      keyed = order_by_key("ASC")
       @limit = n
       rows = to_a
       @limit = prior
+      @orders = [] if keyed
       @records = nil
       rows
     end
@@ -1227,7 +1259,7 @@ module ActiveRecord
         i += 1
       end
       if @orders.empty?
-        @orders << "#{@table}.#{@model.primary_key} DESC"
+        key_order_terms("DESC").each { |term| @orders << term }
       else
         reversed = []
         i = 0
@@ -1702,7 +1734,7 @@ module ActiveRecord
     # than issued unconditionally.
     def find_by(conditions)
       pushed = add_condition(conditions, [], false)
-      record = first
+      record = take
       @wheres.pop if pushed
       record
     end

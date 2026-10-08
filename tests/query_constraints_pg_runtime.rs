@@ -75,6 +75,7 @@ const PROBE: &str = r##"class QueryConstraintsProbe
     Developer.where(company_id: 20).update_all(name: "b2")
     Developer.where(company_id: 10).update_all(name: "a3")
     out << "reload: #{a.reload.name} #{b.reload.name}"
+    out << "first: #{Developer.first.name} #{Developer.last.name} #{Developer.where(id: 1).first.company_id} #{Developer.where(id: 1).first(2).map(&:name).inspect}"
     b.destroy
     out << "destroy: #{Developer.count} #{Developer.where(company_id: 10).pluck(:name).inspect}"
     note = Note.create!(page_id: 5, body: "x")
@@ -82,6 +83,10 @@ const PROBE: &str = r##"class QueryConstraintsProbe
     out << "note: #{Note.find(note.id).body} #{Note.query_constraints_list.inspect}"
     note.destroy
     out << "note destroy: #{Note.count}"
+    n1 = Note.create!(page_id: 2, body: "n1")
+    Note.create!(page_id: 1, body: "n2")
+    n1.update!(body: "n1b")
+    out << "note first: #{Note.first.body} #{Note.last.body} #{Note.find_by(page_id: 2).body}"
     out
   end
 end
@@ -89,13 +94,15 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 6] = [
+const EXPECTED: [&str; 8] = [
     r#"list: ["company_id", "id"] ["company_id", "id"]"#,
     r#"update: true ["a2"] ["b"]"#,
     "reload: a3 b2",
+    r#"first: a3 b2 10 ["a3", "b2"]"#,
     r#"destroy: 1 ["a3"]"#,
     r#"note: y ["page_id", "id"]"#,
     "note destroy: 0",
+    "note first: n2 n1b n1b",
 ];
 
 /// What native Rails requires, in order.
