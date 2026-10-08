@@ -1052,8 +1052,9 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
         n if n.as_string_node().is_some() => {
             let s = n.as_string_node().unwrap();
             let bytes = s.unescaped();
-            ExprNode::Lit {
-                value: Literal::Str { value: String::from_utf8_lossy(bytes).into_owned() },
+            match std::str::from_utf8(bytes) {
+                Ok(text) => ExprNode::Lit { value: Literal::Str { value: text.to_string() } },
+                Err(_) => binary_string(&s, span, file)?,
             }
         }
         n if n.as_interpolated_string_node().is_some() => {
@@ -4092,4 +4093,49 @@ fn note_signature(body: &Expr, signature: &crate::expr::BlockSignature) {
             seen.push((body.span, signature.clone()));
         }
     });
+}
+
+/// A string literal whose bytes are not UTF-8: `"\x99*\n"` in a
+/// protobuf descriptor (Core's generated `*_pb.rb` files hand
+/// `descriptor_data` to `DescriptorPool#add_serialized_file`). A
+/// `Literal::Str` holds UTF-8 text, and read lossily every invalid byte
+/// became U+FFFD, so the emitted descriptor no longer parsed ("Unable to
+/// parse FileDescriptorProto"). The literal is the same bytes in the
+/// same encoding instead, built from their hex digits:
+/// `["0a21…"].pack("H*").force_encoding("UTF-8")`, then `.freeze` where
+/// the file's `frozen_string_literal: true` froze the literal. Ruby gives
+/// a `\x` escape outside ASCII in a UTF-8 source the UTF-8 encoding,
+/// invalid (`"\xff".encoding == Encoding::UTF_8`), which Prism flags as
+/// forced UTF-8; Prism's forced binary (a US-ASCII source) is
+/// ASCII-8BIT, what `pack` returns. A literal in another source
+/// encoding is refused by name.
+fn binary_string(s: &ruby_prism::StringNode<'_>, span: Span, file: &str) -> IngestResult<ExprNode> {
+    let encoding = if s.is_forced_binary_encoding() {
+        None
+    } else if s.is_forced_utf8_encoding() {
+        Some("UTF-8")
+    } else {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "a non-UTF-8 string literal in a source encoding other than UTF-8 or US-ASCII is not modeled"
+                .into(),
+        });
+    };
+    let hex: String = s.unescaped().iter().map(|b| format!("{b:02x}")).collect();
+    let lit = |value: String| Expr::new(span, ExprNode::Lit { value: Literal::Str { value } });
+    let send = |recv: Expr, method: &str, args: Vec<Expr>| {
+        Expr::new(
+            span,
+            ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args, block: None, parenthesized: true },
+        )
+    };
+    let array = Expr::new(span, ExprNode::Array { elements: vec![lit(hex)], style: crate::expr::ArrayStyle::Brackets });
+    let mut value = send(array, "pack", vec![lit("H*".to_string())]);
+    if let Some(encoding) = encoding {
+        value = send(value, "force_encoding", vec![lit(encoding.to_string())]);
+    }
+    if s.is_frozen() {
+        value = send(value, "freeze", Vec::new());
+    }
+    Ok(*value.node)
 }

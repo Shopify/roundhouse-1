@@ -153,13 +153,43 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // path, the last reopening silently replaced the others (a bridge
     // `def self.included` in one file, its `module ClassMethods` in the
     // next, lost the hook). Nested children splice into the last.
+    //
+    // A factory class (`Box = Data.define(:w) do … end`) is the
+    // declaration that CREATES its class, so it goes first among those
+    // of its name, wherever the ingest listed it: a `class Box`
+    // reopening written before it opened a plain class and the factory
+    // assignment then redefined the constant ("already initialized
+    // constant", which Core's StrictWarning raises; Core's
+    // adaptive_pricing/breakdown.rb). Ruby itself only reaches a
+    // reopening after the assignment, since `class Box` before it would
+    // define a different class. Nested children never splice into the
+    // factory's block, whose constants are the ENCLOSING scope's
+    // (`factory_class::block_constant_writes`), but into the last plain
+    // reopening, which a factory class with nested children always has
+    // (`owns_a_file`).
+    let is_factory = |lc: &LibraryClass| matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }));
+    let order: Vec<usize> = {
+        let mut slots: crate::det::HashMap<&str, Vec<usize>> = crate::det::HashMap::default();
+        for (i, lc) in lcs.iter().enumerate() {
+            slots.entry(lc.name.0.as_str()).or_default().push(i);
+        }
+        let mut order: Vec<usize> = (0..lcs.len()).collect();
+        for at in slots.values().filter(|at| at.len() > 1 && at.iter().any(|&i| is_factory(&lcs[i]))) {
+            let mut sorted = at.clone();
+            sorted.sort_by_key(|&i| (!is_factory(&lcs[i]), i));
+            for (&slot, &i) in at.iter().zip(&sorted) {
+                order[slot] = i;
+            }
+        }
+        order
+    };
     let mut last_of_name: crate::det::HashMap<&str, usize> = crate::det::HashMap::default();
-    for (i, lc) in lcs.iter().enumerate() {
+    for (i, lc) in lcs.iter().enumerate().filter(|(_, lc)| !is_factory(lc)) {
         last_of_name.insert(lc.name.0.as_str(), i);
     }
     let mut out: Vec<EmittedFile> = Vec::new();
     let mut at_path: crate::det::HashMap<PathBuf, usize> = crate::det::HashMap::default();
-    for (i, lc) in lcs.iter().enumerate().filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
+    for (i, lc) in order.iter().map(|&i| (i, &lcs[i])).filter(|(_, lc)| owner_in_this_tree(lc).is_none()) {
         // `underscore`, not `snake_case`: a namespaced reopen
         // (lobsters' `ActiveRecord::Base.q`, `Net::HTTP`,
         // `ShortId::CandidateId`) nests as `active_record/base.rb` —
@@ -3566,6 +3596,13 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
     let no_helpers: HashMap<Symbol, ClassId> = HashMap::default();
     let renames = helper_instance_renames(app);
     let reach = HelperReach::new(lcs, app, &helper_modules);
+    // The declarations of each class declared more than once (a
+    // reopening), for the own-method shadowing below.
+    let mut declarations: crate::det::HashMap<&str, Vec<&LibraryClass>> = crate::det::HashMap::default();
+    for other in &app.library_classes {
+        declarations.entry(other.name.0.as_str()).or_default().push(other);
+    }
+    declarations.retain(|_, all| all.len() > 1);
     for lc in lcs.iter_mut() {
         // CONTROLLERS in the index provide `helper_method`s to views:
         // only the call-site rewrite applies to them — their methods
@@ -3632,7 +3669,7 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
         // are not singleton-defined), and loses the names whose flipped
         // copy is renamed below: the bare call has to go to that copy, so
         // the index rewrite takes it.
-        let own_instance_side: crate::det::HashSet<Symbol> = lc
+        let mut own_instance_side: crate::det::HashSet<Symbol> = lc
             .methods
             .iter()
             .filter(|m| {
@@ -3642,12 +3679,27 @@ pub(crate) fn apply_helper_lowering(lcs: &mut [LibraryClass], app: &App) {
             .filter(|m| !renames.contains_key(&(lc.name.clone(), m.name.clone())))
             .map(|m| m.name.clone())
             .collect();
-        let own_class_side: crate::det::HashSet<Symbol> = lc
+        let mut own_class_side: crate::det::HashSet<Symbol> = lc
             .methods
             .iter()
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
+        // A reopening is the same class: what its other declarations
+        // define is self-dispatch here too. Core's adaptive_pricing/
+        // breakdown.rb reopens `Breakdown = Data.define(...)` with a
+        // `class Breakdown` whose bare `h` is the member reader the
+        // factory class defines, not the view helper `h`.
+        if !is_helper_module {
+            for other in declarations.get(lc.name.0.as_str()).into_iter().flatten() {
+                for m in &other.methods {
+                    match m.receiver {
+                        MethodReceiver::Instance => own_instance_side.insert(m.name.clone()),
+                        MethodReceiver::Class => own_class_side.insert(m.name.clone()),
+                    };
+                }
+            }
+        }
         for m in &mut lc.methods {
             // A singleton method body runs on the module, never on the
             // view: it reaches no helper bare, and none of this pass's
