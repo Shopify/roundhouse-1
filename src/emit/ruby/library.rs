@@ -2942,7 +2942,10 @@ pub(crate) fn apply_belongs_to_autosave(lcs: &mut [LibraryClass], app: &App) {
         let names: Vec<(Symbol, Symbol)> = model
             .associations()
             .filter_map(|a| match a {
-                Association::BelongsTo { name, foreign_key, polymorphic: false, .. } => {
+                // `autosave: false` never saves the target.
+                Association::BelongsTo { name, foreign_key, polymorphic: false, autosave, .. }
+                    if *autosave != Some(false) =>
+                {
                     Some((name.clone(), foreign_key.clone()))
                 }
                 _ => None,

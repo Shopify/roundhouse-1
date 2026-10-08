@@ -473,6 +473,12 @@ pub enum Association {
         /// `None` means `id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         primary_key: Option<Symbol>,
+        /// The declaration's `autosave:`. `Some(false)` (Core's readonly
+        /// associations merge it) never saves an assigned target, where
+        /// the default saves a new one (`apply_belongs_to_autosave`), as
+        /// ActiveRecord's `save_belongs_to_association` reads it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        autosave: Option<bool>,
     },
     HasMany {
         name: Symbol,

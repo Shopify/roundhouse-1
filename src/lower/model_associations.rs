@@ -314,6 +314,7 @@ mod tests {
             default: None,
             touch: None,
             foreign_type: None,
+            autosave: None,
             primary_key: None,
         }
     }

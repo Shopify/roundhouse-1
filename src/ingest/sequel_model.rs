@@ -292,6 +292,7 @@ fn parse_sequel_association(
             // is the `touch` plugin, declared on the model.
             touch: None,
             foreign_type: None,
+            autosave: None,
             primary_key: None,
         },
         "many_to_many" => Association::HasAndBelongsToMany {

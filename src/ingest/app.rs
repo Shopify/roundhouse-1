@@ -6270,7 +6270,7 @@ fn qualify_relative_includes(app: &mut App) {
 /// reads per includer) have no single owner, so they are only unrooted.
 fn qualify_association_targets(app: &mut App) {
     use crate::dialect::{Association, ModelBodyItem};
-    use crate::ident::{ClassId, Symbol};
+    use crate::ident::ClassId;
 
     fn target_of(item: &mut ModelBodyItem) -> Option<&mut ClassId> {
         let ModelBodyItem::Association { assoc, .. } = item else { return None };
