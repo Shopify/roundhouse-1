@@ -779,7 +779,7 @@ pub fn apply_post_analyze_lowerings(
     params_permit::apply_params_permit_lowering(app);
     ran!("params_permit");
     crate::timings::phase("post-analyze: fused send rewrites", || {
-        fused::apply_fused_independent_rewrites(app);
+        diags.extend(fused::apply_fused_independent_rewrites(app));
     });
     ran!("pathname_ctor");
     ran!("array_ordinal");

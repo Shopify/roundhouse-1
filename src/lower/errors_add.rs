@@ -34,6 +34,7 @@
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
+use super::active_model_model::Reading;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
@@ -47,8 +48,11 @@ pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let port = super::active_model_model::ValidationsPort::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let owner = owner.cloned();
-        rewrite_errors_add(body, &Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref() }, &mut diags)
+        let locals = port.locals(body);
+        let site = Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref(), locals: &locals };
+        rewrite_errors_add(body, &site, &mut diags)
     });
+    diags.extend(port.take_notes());
     diags
 }
 
@@ -91,6 +95,7 @@ struct Site<'a> {
     localized: Option<&'a (String, usize)>,
     port: &'a super::active_model_model::ValidationsPort,
     owner: Option<&'a crate::ident::ClassId>,
+    locals: &'a super::active_model_model::PortLocals,
 }
 
 fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
@@ -122,12 +127,14 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // A class over the ActiveModel::Validations port (and a module only
     // those include) holds the real ActiveModel::Errors: `add` is its
     // own, with Rails' arguments and messages.
-    if site.port.answers(r, site.owner) {
-        return;
-    }
-    if site.port.unknown(r, site.owner) {
-        site.port.refuse(expr, "errors.add");
-        return;
+    match site.port.classify(r, site.owner, site.locals) {
+        Reading::Port => return,
+        Reading::Refused => {
+            site.port.refuse(expr, "errors.add");
+            return;
+        }
+        Reading::Untyped => site.port.note_untyped("errors_add", "errors.add", expr.span),
+        Reading::Accumulator => {}
     }
     // The field: a Symbol literal is baked at lower time; a local or
     // parameter (`errors.add(attribute, …)` in an EachValidator's
@@ -302,11 +309,19 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // dispatching — leaving `ty = None` here makes it false-positive a
     // `send_dispatch_failed` on a receiver it can see the type of.
     let recv_ty = recv.as_ref().and_then(|r| r.ty.clone());
-    // The attribute the message is for, which the accumulator drops: the
-    // CRuby and JRuby trees record it for `errors.attribute_names`.
+    // The attribute the message is for and where its short message
+    // starts, which the accumulator drops: the CRuby and JRuby trees
+    // record them for `errors.attribute_names`, `to_hash`, `as_json` and
+    // `messages`. A local's message is the one built just above, the bare
+    // message on `base` and the run-time humanized prefix otherwise.
     let attribute = match &*field_expr.node {
-        ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(value.clone())),
-        ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(name.clone())),
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(
+            super::model_to_library::validations::error_tag(value, &message),
+        )),
+        ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(crate::expr::ErrorTag {
+            attribute: name.clone(),
+            short: crate::expr::ErrorShort::AfterHumanized,
+        })),
         _ => None,
     };
     expr.hint = attribute;
