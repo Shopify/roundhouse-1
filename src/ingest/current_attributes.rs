@@ -22,7 +22,12 @@
 //! * `delegate … to: :x, prefix: true, allow_nil: true` expanded to real
 //!   methods (`request_host` → `@request.nil? ? nil : @request.host`);
 //! * a `self.<name>` forwarder for every instance method, which is what
-//!   makes the class-level call sites app code actually writes resolve.
+//!   makes the class-level call sites app code actually writes resolve;
+//! * `before_reset` / `resets` / `after_reset` callbacks (a block or
+//!   method names) run by `self.reset` as Rails' `run_callbacks(:reset)`
+//!   runs them: the before ones in order on the instance being reset,
+//!   the after ones in reverse order on the reset one. api_versioning
+//!   4.6.0's `ThreadLocalVersionStorage` `resets` its `requested_handle`.
 //!
 //! ## `super` in an app-written writer
 //!
@@ -31,7 +36,9 @@
 //! Ruby-family-only, and the strict targets have no equivalent — the
 //! `super` call is REWRITTEN to the storage write it means (`@session =
 //! value`). Same reasoning as the concern splices: resolve it in the IR
-//! once, for all thirteen targets.
+//! once, for all thirteen targets. A `super` in an app-written reader is
+//! the storage read (`@session`): api_versioning's
+//! `def requested_handle; super || UNSPECIFIED_VERSION; end`.
 
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -50,8 +57,10 @@ pub fn lower_current_attributes(app: &mut crate::App) {
         }
         let (attrs, declared) = take_attribute_decls(lc);
         let delegates = take_delegate_decls(lc);
+        let callbacks = take_reset_callbacks(lc);
         rewrite_super_writers(lc, &attrs);
-        let src = synthesized_source(lc, &attrs, &delegates);
+        rewrite_super_readers(lc, &attrs);
+        let src = synthesized_source(lc, &attrs, &delegates, &callbacks);
         // Isolated in its own `prism::scope` — never the outer one
         // that spans the whole app's ingest — so a bug in
         // `synthesized_source` can't render its parse errors against
@@ -62,6 +71,7 @@ pub fn lower_current_attributes(app: &mut crate::App) {
         let methods = match parsed {
             Ok(classes) if diags.is_empty() => {
                 let mut methods: Vec<MethodDef> = classes.into_iter().flat_map(|c| c.methods).collect();
+                fill_reset_callback_blocks(&mut methods, &callbacks);
                 for (name, signature) in declare_attribute_types(&mut methods, &declared) {
                     signatures.push((lc.name.clone(), name, signature));
                 }
@@ -224,6 +234,107 @@ fn take_delegate_decls(lc: &mut LibraryClass) -> Vec<Delegation> {
     out
 }
 
+/// When a reset callback runs (`ActiveSupport::CurrentAttributes`'
+/// `before_reset`, and `after_reset` with its alias `resets`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetPhase {
+    Before,
+    After,
+}
+
+/// What a reset callback runs: a block, instance-exec'd on the
+/// instance (its body becomes a generated instance method), or one of
+/// the class's methods by name.
+enum ResetCallback {
+    Block(Expr),
+    Method(Symbol),
+}
+
+/// The generated instance method a reset callback block becomes.
+fn reset_block_method(index: usize) -> String {
+    format!("__rh_reset_callback_{index}")
+}
+
+/// `before_reset { … }`, `resets do … end`, `after_reset :name` —
+/// consumed, in source order. Rails sets each as a `:reset` callback
+/// (`set_callback :reset, :before | :after, *methods, &block`). Only a
+/// block without parameters and plain symbol names are reproduced;
+/// anything else (options such as `if:`, a block taking the instance)
+/// stays in `unknown_calls`, visible.
+fn take_reset_callbacks(lc: &mut LibraryClass) -> Vec<(ResetPhase, ResetCallback)> {
+    let mut out = Vec::new();
+    lc.unknown_calls.retain(|call| {
+        let ExprNode::Send { recv: None, method, args, block, .. } = &*call.node else { return true };
+        let phase = match method.as_str() {
+            "before_reset" => ResetPhase::Before,
+            "resets" | "after_reset" => ResetPhase::After,
+            _ => return true,
+        };
+        let names: Option<Vec<Symbol>> = args
+            .iter()
+            .map(|a| match &*a.node {
+                ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        let Some(names) = names else { return true };
+        let body = match block.as_ref().map(|b| &*b.node) {
+            None => None,
+            Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. }) if params.is_empty() => {
+                Some(body.clone())
+            }
+            Some(_) => return true,
+        };
+        if names.is_empty() && body.is_none() {
+            return true;
+        }
+        out.extend(names.into_iter().map(|n| (phase, ResetCallback::Method(n))));
+        if let Some(body) = body {
+            out.push((phase, ResetCallback::Block(body)));
+        }
+        false
+    });
+    out
+}
+
+/// The generated callback-block methods get their blocks' bodies.
+fn fill_reset_callback_blocks(methods: &mut [MethodDef], callbacks: &[(ResetPhase, ResetCallback)]) {
+    for (index, (_, callback)) in callbacks.iter().enumerate() {
+        let ResetCallback::Block(body) = callback else { continue };
+        let name = reset_block_method(index);
+        if let Some(m) = methods
+            .iter_mut()
+            .find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == name)
+        {
+            m.body = body.clone();
+        }
+    }
+}
+
+/// `super` inside an app-written attribute reader is the generated
+/// storage read: rewritten to `@attr`, as the writers' `super(value)`
+/// is to the storage write.
+fn rewrite_super_readers(lc: &mut LibraryClass, attrs: &[Symbol]) {
+    fn rewrite(expr: &mut Expr, ivar: &Symbol) {
+        expr.node.for_each_child_mut(&mut |c| rewrite(c, ivar));
+        let ExprNode::Super { args, block: None } = &*expr.node else { return };
+        if args.as_ref().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        let span = expr.span;
+        *expr = Expr::new(span, ExprNode::Ivar { name: ivar.clone() });
+    }
+    for m in &mut lc.methods {
+        if m.receiver != MethodReceiver::Instance || !m.params.is_empty() {
+            continue;
+        }
+        if attrs.iter().any(|a| *a == m.name) {
+            let ivar = m.name.clone();
+            rewrite(&mut m.body, &ivar);
+        }
+    }
+}
+
 /// `super(value)` inside an app-written `<attr>=` is the generated
 /// storage write. Rewrite it in place so no superclass is needed.
 fn rewrite_super_writers(lc: &mut LibraryClass, attrs: &[Symbol]) {
@@ -265,6 +376,7 @@ fn synthesized_source(
     lc: &LibraryClass,
     attrs: &[Symbol],
     delegates: &[Delegation],
+    callbacks: &[(ResetPhase, ResetCallback)],
 ) -> String {
     let class = lc.name.0.as_str();
     let defines = |name: &str| {
@@ -294,11 +406,55 @@ fn synthesized_source(
     // and EVERY class-level forwarder register `Untyped`. The reader
     // narrows its slot read behind `is_a?`, not `nil?`, for the same
     // reason: `Thread#[]` answers untyped, and a `nil?` test leaves it so.
+    //
+    // The reset callbacks run around the replacement as Rails'
+    // `run_callbacks(:reset)` runs them around the attribute reset: the
+    // before ones in order on the instance being reset, the after ones in
+    // reverse order on the reset one.
     let key = format!("__current_attrs_{}", class.replace("::", "_"));
+    let call = |index: usize, callback: &ResetCallback| match callback {
+        ResetCallback::Block(_) => reset_block_method(index),
+        ResetCallback::Method(name) => name.as_str().to_string(),
+    };
+    let before: Vec<String> = callbacks
+        .iter()
+        .enumerate()
+        .filter(|(_, (phase, _))| *phase == ResetPhase::Before)
+        .map(|(i, (_, c))| call(i, c))
+        .collect();
+    let after: Vec<String> = callbacks
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, (phase, _))| *phase == ResetPhase::After)
+        .map(|(i, (_, c))| call(i, c))
+        .collect();
+    let mut reset = String::new();
+    if !before.is_empty() {
+        reset.push_str(&format!("    {class}.instance.__rh_before_reset\n"));
+    }
+    reset.push_str(&format!("    Thread.current[:{key}] = {class}.new\n"));
+    if !after.is_empty() {
+        reset.push_str(&format!("    {class}.instance.__rh_after_reset\n"));
+    }
     body.push_str(&format!(
         "  def self.instance\n    c = Thread.current[:{key}]\n    return c if c.is_a?({class})\n    c = {class}.new\n    Thread.current[:{key}] = c\n    c\n  end\n\n\
-         \x20 def self.reset\n    Thread.current[:{key}] = {class}.new\n    nil\n  end\n\n"
+         \x20 def self.reset\n{reset}    nil\n  end\n\n"
     ));
+    for (runner, calls) in [("__rh_before_reset", &before), ("__rh_after_reset", &after)] {
+        if !calls.is_empty() {
+            body.push_str(&format!("  def {runner}\n"));
+            for c in calls.iter() {
+                body.push_str(&format!("    {c}\n"));
+            }
+            body.push_str("    nil\n  end\n\n");
+        }
+    }
+    for (index, (_, callback)) in callbacks.iter().enumerate() {
+        if matches!(callback, ResetCallback::Block(_)) {
+            body.push_str(&format!("  def {}\n    nil\n  end\n\n", reset_block_method(index)));
+        }
+    }
 
     for a in attrs {
         let a = a.as_str();
