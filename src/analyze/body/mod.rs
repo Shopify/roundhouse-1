@@ -847,6 +847,19 @@ impl<'a> BodyTyper<'a> {
         self
     }
 
+    /// Type each parameter default under `ctx`, then bind the locals the
+    /// defaults assign (see [`bind_default_assigned_locals`]). For the
+    /// paths that seed a body from a signature and never typed the
+    /// defaults: `runtime_src` and the probes that mirror it.
+    pub fn seed_param_default_locals(&self, params: &mut [crate::dialect::Param], ctx: &mut Ctx) {
+        for p in params.iter_mut() {
+            if let Some(default) = &mut p.default {
+                self.analyze_expr(default, ctx);
+            }
+        }
+        bind_default_assigned_locals(params, ctx);
+    }
+
     /// Analyze an expression: compute its type, populate `expr.ty`,
     /// return the computed type. Recurses into sub-expressions, which
     /// in turn get their `ty` populated. After typing, runs a
@@ -1884,7 +1897,20 @@ impl<'a> BodyTyper<'a> {
                     if matches!(lt, Ty::Nil) {
                         return rt;
                     }
-                    narrowing::remove_nil(&lt)
+                    let peeled = narrowing::remove_nil(&lt);
+                    // `(@registry || {})`: an empty literal holds no
+                    // element, so it is a value of whatever Hash (or
+                    // Array) type the left arm has. Joining its own
+                    // `Hash[_, _]` instead left every element a union
+                    // with an unknown, and `.each do |n, (a, b)|` could
+                    // not destructure the tuple values. Only a literal
+                    // written empty: an unknown container of the same
+                    // spine may hold anything.
+                    if is_empty_container_literal(right) && same_container_spine(&peeled, &rt) {
+                        right.ty = Some(peeled.clone());
+                        return peeled;
+                    }
+                    peeled
                 } else {
                     // `a && b` answers `a` only when `a` was falsy, so only
                     // the arms of `a` that CAN be falsy belong to the result:
@@ -3668,6 +3694,40 @@ fn collect_var_assignments_into(expr: &Expr, out: &mut HashMap<Symbol, Ty>) {
     }
 }
 
+/// `default: (no_default = true)`: a local a parameter default assigns is
+/// in scope for the whole body, and is nil on a call that passed the
+/// argument (the default never ran), so it binds as `T | nil`. Ruby's
+/// own idiom for "was this keyword given". Reads the defaults' types, so
+/// they must be typed first. A parameter of the same name is left alone.
+pub fn bind_default_assigned_locals(params: &[crate::dialect::Param], ctx: &mut Ctx) {
+    for default in params.iter().filter_map(|p| p.default.as_ref()) {
+        let mut assigned = HashMap::default();
+        collect_var_assignments_into(default, &mut assigned);
+        for (name, ty) in assigned {
+            if !params.iter().any(|p| p.name == name) {
+                ctx.local_bindings.insert(name, union_of(ty, Ty::Nil));
+            }
+        }
+    }
+}
+
+/// `{}` or `[]` as written: a literal with no entries.
+fn is_empty_container_literal(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Hash { entries, .. } => entries.is_empty(),
+        ExprNode::Array { elements, .. } => elements.is_empty(),
+        _ => false,
+    }
+}
+
+/// Both Hashes or both Arrays.
+fn same_container_spine(known: &Ty, literal: &Ty) -> bool {
+    matches!(
+        (known, literal),
+        (Ty::Hash { .. }, Ty::Hash { .. }) | (Ty::Array { .. }, Ty::Array { .. })
+    )
+}
+
 pub(crate) fn union_of(a: Ty, b: Ty) -> Ty {
     // Bottom is the divergent-expression type — the branch carrying
     // it doesn't contribute a value, so it drops out of joins.
@@ -4100,6 +4160,81 @@ mod tests {
             BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx),
             Ty::Union { variants: vec![Ty::Bool, Ty::Nil] }
         );
+    }
+
+    #[test]
+    fn or_with_an_empty_literal_keeps_the_left_container_type() {
+        // `(@registry || {})` with `@registry: Hash[String, [Symbol, Int]]?`:
+        // the empty literal is a value of the left's Hash type, so the
+        // join is that type, not `Hash[String | _, V | _]`; the literal
+        // itself is stamped with it.
+        let tuple = Ty::Tuple { elems: vec![Ty::Sym, Ty::Int] };
+        let hash = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(tuple) };
+        let ctx = ctx_with_local("h", Ty::Union { variants: vec![hash.clone(), Ty::Nil] });
+        let mut expr = synth(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: var("h"),
+            right: synth(ExprNode::Hash { entries: vec![], kwargs: false }),
+        });
+        assert_eq!(BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx), hash);
+        let ExprNode::BoolOp { right, .. } = &*expr.node else { unreachable!() };
+        assert_eq!(right.ty, Some(hash.clone()));
+
+        let list = Ty::Array { elem: Box::new(Ty::Str) };
+        let ctx = ctx_with_local("a", Ty::Union { variants: vec![list.clone(), Ty::Nil] });
+        let mut expr = synth(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: var("a"),
+            right: synth(ExprNode::Array { elements: vec![], style: Default::default() }),
+        });
+        assert_eq!(BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx), list);
+    }
+
+    #[test]
+    fn or_with_an_unknown_container_still_joins() {
+        // Only a literal written empty adopts the left's type: an unknown
+        // Hash of the same spine may hold anything.
+        let hash = Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Int) };
+        let unknown = Ty::Hash {
+            key: Box::new(Ty::Var { var: TyVar(0) }),
+            value: Box::new(Ty::Var { var: TyVar(0) }),
+        };
+        let mut ctx = ctx_with_local("h", Ty::Union { variants: vec![hash.clone(), Ty::Nil] });
+        ctx.local_bindings.insert(Symbol::from("other"), unknown.clone());
+        let mut expr = synth(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: Default::default(),
+            left: var("h"),
+            right: var("other"),
+        });
+        assert_eq!(
+            BodyTyper::new(&empty_classes()).analyze_expr(&mut expr, &ctx),
+            union_of(hash, unknown)
+        );
+    }
+
+    #[test]
+    fn a_local_a_default_assigns_is_nilable_in_the_body() {
+        // `def m(default: (no_default = true))`: `no_default` is `true`
+        // when the default ran and nil when the caller passed the keyword.
+        let mut params = vec![crate::dialect::Param {
+            default: Some(synth(ExprNode::Assign {
+                target: LValue::Var { id: VarId(0), name: Symbol::from("no_default") },
+                value: synth(ExprNode::Lit { value: Literal::Bool { value: true } }),
+            })),
+            keyword: true,
+            ..crate::dialect::Param::positional(Symbol::from("default"))
+        }];
+        let mut ctx = Ctx::default();
+        BodyTyper::new(&empty_classes()).seed_param_default_locals(&mut params, &mut ctx);
+        assert_eq!(
+            ctx.local_bindings.get(&Symbol::from("no_default")),
+            Some(&union_of(Ty::Bool, Ty::Nil))
+        );
+        // The parameter itself is the caller's business, not the default's.
+        assert!(!ctx.local_bindings.contains_key(&Symbol::from("default")));
     }
 
     #[test]

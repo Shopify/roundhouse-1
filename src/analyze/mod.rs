@@ -5201,16 +5201,19 @@ impl Analyzer {
                 ctx.local_bindings.insert(param.name.clone(), Ty::Untyped);
                 continue;
             }
+            let declared = self.declared_param_ty(class_id, &method.name, ctx.class_side, positional, &param.name);
             let from_sites = observed.and_then(|v| v.get(i)).cloned();
             let seeded = param_ty_with_default(from_sites, param);
-            let ty = prefer_declared(
-                self.declared_param_ty(class_id, &method.name, ctx.class_side, positional, &param.name),
-                seeded,
-            );
+            let ty = rest_param_ty(param, declared.clone(), seeded.clone())
+                .or_else(|| prefer_declared(declared, seeded));
             if let Some(ty) = ty {
                 ctx.local_bindings.insert(param.name.clone(), ty);
             }
         }
+        // Reads the defaults' types: the model, controller and library
+        // passes type them before seeding; where a caller does not, an
+        // untyped default binds nothing.
+        crate::analyze::body::bind_default_assigned_locals(&method.params, &mut ctx);
         // An indexed module's Ruby callback gets its host as a Module object,
         // even when the hook is dormant and no explicit call site supplies types.
         if ctx.class_side && self.classes.get(class_id).is_some_and(|c| c.is_module)
@@ -8627,6 +8630,52 @@ fn prefer_declared(declared: Option<Ty>, observed: Option<Ty>) -> Option<Ty> {
         (_, Some(o)) if !matches!(o, Ty::Var { .. }) => Some(o),
         (d, o) => d.or(o),
     }
+}
+
+/// The binding a rest parameter's body sees, whatever its callers pass.
+///
+/// Ruby binds `*names` to an Array and `**options` to a Hash with Symbol
+/// keys on every call, so the container is known even where nothing
+/// says what is in it; leaving the slot a bare type variable made every
+/// read of the parameter (`names.each`, `names.empty?`) an untyped site.
+///
+/// - `*names`: a declared `*T names` (RBS, which stores `Array[T]`)
+///   wins; otherwise `Array[_]`. Call-site observations are NOT read:
+///   `collect_send_sites` records arguments by position, so the slot
+///   under a rest parameter sees one vararg (or a splatted Array), never
+///   the bundle — the same reason the stamped signature leaves it
+///   untyped.
+/// - `**options` (and the positional `from_kwrest` slot ingest flattens
+///   one into): a Hash the declaration or the call sites supply wins,
+///   since a site binds the keyword group to exactly this slot;
+///   otherwise `Hash[Symbol, _]`.
+///
+/// `None` for every other parameter, and for the anonymous `*` / `**` /
+/// `...`, which bind no local.
+fn rest_param_ty(param: &crate::dialect::Param, declared: Option<Ty>, seeded: Option<Ty>) -> Option<Ty> {
+    if param.forwarding || param.name.as_str().is_empty() {
+        return None;
+    }
+    let unknown = || Box::new(Ty::Var { var: crate::ident::TyVar(0) });
+    if param.rest && !param.keyword {
+        return Some(match declared {
+            Some(ty @ Ty::Array { .. }) => ty,
+            Some(elem) => Ty::Array { elem: Box::new(elem) },
+            None => Ty::Array { elem: unknown() },
+        });
+    }
+    if (param.rest && param.keyword) || param.from_kwrest {
+        return Some(match prefer_declared(declared, seeded) {
+            // The `{}` default alone types as `Hash[_, _]`; the keys of a
+            // keyword group are Symbols either way.
+            Some(Ty::Hash { key, value }) if matches!(*key, Ty::Var { .. }) => {
+                Ty::Hash { key: Box::new(Ty::Sym), value }
+            }
+            Some(ty @ Ty::Hash { .. }) => ty,
+            _ => Ty::Hash { key: Box::new(Ty::Sym), value: unknown() },
+        });
+    }
+    None
 }
 
 fn param_ty_with_default(observed: Option<Ty>, param: &crate::dialect::Param) -> Option<Ty> {

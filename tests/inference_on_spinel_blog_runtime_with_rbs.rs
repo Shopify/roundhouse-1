@@ -587,7 +587,10 @@ fn untyped_subexpressions_with_rbs_baseline() {
         let lc_name = lc.name.clone();
         for method in &mut lc.methods {
             let empty: HashMap<Symbol, Ty> = HashMap::default();
-            let ctx = build_method_ctx(&lc_name, method, &sigs, &empty);
+            let mut ctx = build_method_ctx(&lc_name, method, &sigs, &empty);
+            // As `runtime_src` does: type the defaults, bind the locals
+            // they assign (`default: (no_default = true)`).
+            typer.seed_param_default_locals(&mut method.params, &mut ctx);
             typer.analyze_expr(&mut method.body, &ctx);
         }
     }
@@ -605,7 +608,8 @@ fn untyped_subexpressions_with_rbs_baseline() {
         let lc_name = lc.name.clone();
         let wrapped = ivars_by_class.get(&lc_name).cloned().unwrap_or_default();
         for method in &mut lc.methods {
-            let ctx = build_method_ctx(&lc_name, method, &sigs, &wrapped);
+            let mut ctx = build_method_ctx(&lc_name, method, &sigs, &wrapped);
+            typer.seed_param_default_locals(&mut method.params, &mut ctx);
             typer.analyze_expr(&mut method.body, &ctx);
         }
     }
@@ -653,10 +657,14 @@ fn untyped_subexpressions_with_rbs_baseline() {
     // cost the old branch one site, `super.arg[0]`. Under main's
     // canonical class-ID lookup it adds none: measured 0 with it.
     //
-    // 0 -> 15 at eeca64e54, MEASURED (29 before this commit's harness
-    // `&block` binding, active_model_type.rbs and the `subclasses` typing).
-    // Every residual is in connection.rb, and each goes with narrower
-    // runtime code; measured 0 with all of these applied:
+    // Ceiling 0, held. Measured 29 at c9d39872e; 14 with this branch's
+    // analyzer and harness work (the harness binds the signature's
+    // `&block`, active_model_type.rbs declares the type registry,
+    // `subclasses` types as `Array[C]`, a default-assigned local such as
+    // attribute's `no_default` binds as `T | nil`, and `x || {}` keeps
+    // x's Hash type). The 14 are in connection.rb / connection.rbs, the
+    // check lane's files, and each goes with narrower runtime code;
+    // measured 0 with exactly these four edits applied:
     // - query_constraints_list 3, ignored_columns 1,
     //   _declared_attribute_types 1: a method called on `superclass`,
     //   which is `Class`. Compare it with the base instead of asking
@@ -665,15 +673,12 @@ fn untyped_subexpressions_with_rbs_baseline() {
     //   ActiveRecord::Base` (narrowing types `parent` as the base's
     //   singleton on the true side).
     // - _declared_attribute_types 9: the `|n, (type, options)|` loop over
-    //   the undeclared `@__declared_attribute_types || {}`. Declare
+    //   the undeclared class-side ivar. Declare
     //   `self.@__declared_attribute_types: Hash[String, [Symbol |
-    //   ActiveModel::Type::Value, Hash[Symbol, untyped]]]?` and iterate
-    //   with `&.each` (the `|| {}` arm's unknown elements otherwise ride
-    //   along in the tuple's union).
-    // - attribute 1: `no_default`, bound only inside the `default:` param's
-    //   default expression. A private sentinel constant (as `exists?`'s
-    //   EXISTS_ANY_ROW) types it.
-    const CEILING: usize = 15;
+    //   ActiveModel::Type::Value, Hash[Symbol, untyped]]]?` in
+    //   connection.rbs; the loop itself needs no change.
+    // Until those land this test reports 14 against 0.
+    const CEILING: usize = 0;
 
     assert!(
         all_untyped.len() <= CEILING,

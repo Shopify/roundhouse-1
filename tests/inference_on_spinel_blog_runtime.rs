@@ -22,6 +22,21 @@
 //! contract) and is `#[ignore]`'d while the framework-typing residual
 //! closes. This test runs by default and tracks the inference-only
 //! number — same fixture surface, different machinery.
+//!
+//! Inline RBS method signatures (`#: (String) -> Integer` above a `def`)
+//! are NOT read here, by decision: they are declarations, which this
+//! probe excludes, not code. Ingest puts them in `App::rbs_signatures`,
+//! the same table the `sig/` sidecars fill, and only `ingest_app` reads
+//! them, for application source; `runtime_src`, which types these runtime
+//! files in production, reads only the `.rbs` sidecars. Counting them here
+//! would score typing no production path performs, and would let a
+//! comment above an entry point stand in for the inference this probe
+//! measures. A runtime method's declared type belongs in its `.rbs`
+//! sidecar, where the companion probe
+//! (`inference_on_spinel_blog_runtime_with_rbs`) and production both
+//! read it. An inline `#:` ascription on a local (`values = [] #:
+//! Array[untyped]`) is different in kind: ingest folds it into the
+//! method body, so it is code inference follows, here and in production.
 
 use std::fs;
 use std::path::Path;
@@ -320,38 +335,28 @@ fn untyped_subexpressions_baseline() {
     // RBS probe is NOT at zero here: 6 type_for_attribute /
     // attribute_types sites, the unbound `&block` and the sig-less
     // `ActiveModel::Type.default_value`.)
-    // 546 -> 615, MEASURED per commit with this collector over
-    // ffbaf0de7..eeca64e54 (site sets diffed at each commit; dump them
-    // with RUNTIME_PROBE_DUMP=1):
-    // - 02de31568 (type registries, class-side `attribute`): +12.
-    //   attribute (5: the `name`/`type` params, the `[type, options]`
-    //   value, `no_default`), _reset_attribute_types (5),
-    //   _declared_attribute_types (1), type_for_attribute (1: `declared`).
-    // - af58747ac (uuid attributes, composite and Yugabyte keys): +31.
-    //   _attribute_cast 7, _attribute_for_database 4, _attribute_deserialize
-    //   2, _attribute_serialize 2, _primary_key_from_database 2,
-    //   _cast_primary_key +2 (`key_type.cast(id)`), _declared_attribute_types
-    //   +12 (the `|n, (type, options)|` registry loop), attribute -3;
-    //   Relation#column_predicate / #pluck / #update_all +1 each, downstream
-    //   of the untyped `_attribute_for_database` answer.
-    // - 29615ac72 (query_constraints): +18. query_constraints 14 (the
-    //   `*columns_list` rest param and what it feeds), query_constraints_list
-    //   4 (its ivar return and three reads on `parent = superclass`).
-    // - 8b80002e4 (exists? sentinel): -3. 41d879340: 0.
-    // - eeca64e54 (ignored_columns): +16. ignored_columns= 14 (the
-    //   `columns` param and what it feeds), ignored_columns 2 (the ivar
-    //   return, `parent.ignored_columns`).
-    // - analyzer, this commit: -5. `C.subclasses` types as `Array[C]`, so
-    //   _reset_attribute_types's `subclasses.each(&:_reset_attribute_types)`
-    //   resolves.
-    // Untypable without signatures, by the rule above: the params of
-    // attribute, query_constraints, ignored_columns= and the _attribute_* /
-    // _cast_primary_key / _primary_key_from_database helpers, whose values
-    // and type objects come from app code, the emitted model or the type
-    // registry. The superclass reads (query_constraints_list,
-    // ignored_columns, _declared_attribute_types) and the registry loop are
-    // typable by narrower runtime code; the companion RBS probe names them.
-    const CEILING: usize = 615;
+    // Ceiling 546, held: the count comes back under it rather than the
+    // bound rising to meet it. Over ffbaf0de7..c9d39872e the count rose
+    // to 649 (entry-point params of the attribute / query_constraints /
+    // ignored_columns / composite-key surface) and 7dccef02f's runtime
+    // restructures brought it to 600. MEASURED with this collector, site
+    // sets diffed at each step (RUNTIME_PROBE_DUMP=1 dumps them):
+    // - `C.subclasses` types as `Array[C]`, and `x < C` narrows a Class
+    //   binding to C: 600 -> 595 (_reset_attribute_types).
+    // - a rest parameter binds as `Array[_]` and a keyword rest as
+    //   `Hash[Symbol, _]`: 595 -> 491. Relation's `*parts` / `*names` /
+    //   `*records` / `*specs` / `*args` methods, and everything downstream
+    //   of them (order_column 32, sort_in_place! 13 and order_descending?
+    //   9 through the now-typed `parts.map { order_term(p) }`), and
+    //   query_constraints' `*columns_list`.
+    // - a local a default assigns (attribute's `no_default`) binds as
+    //   `T | nil`: 491 -> 490.
+    // Untypable by inference alone, as before: the params of entry points
+    // with no caller under runtime/ruby/active_record (attribute,
+    // ignored_columns=, the _attribute_* / _cast_primary_key /
+    // _primary_key_from_database helpers, the error_classes.rb
+    // constructors), and what only they feed.
+    const CEILING: usize = 546;
     assert!(
         all_untyped.len() <= CEILING,
         "{} untyped sub-expressions on spinel-blog runtime — exceeds ceiling of {CEILING}.\n\
