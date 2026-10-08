@@ -10,6 +10,14 @@
 # flow ride the BeginRescue lowering, which the ruby-family targets and
 # spinel AOT share.
 module ActionController
+  # Rails' base of Action Controller's own errors (8.2.0.alpha
+  # action_controller/metal/exceptions.rb), the superclass of
+  # UnknownFormat and RoutingError below, as there. The PostgreSQL CRuby
+  # tree's action_controller_exceptions.rb defines the rest of that file
+  # over these.
+  class ActionControllerError < StandardError
+  end
+
   class ParameterMissing < StandardError
     def initialize(param)
       @param = param
@@ -31,7 +39,7 @@ module ActionController
   class UnpermittedParameters < StandardError
   end
 
-  class UnknownFormat < StandardError
+  class UnknownFormat < ActionControllerError
   end
 
   # Raised by app code to answer 404 for a path that a route matches
@@ -42,7 +50,7 @@ module ActionController
   # of the Rails constructor: the message is required, and `failures`
   # is optional. Rails fills `failures` from its router. App code
   # passes an empty Array, so the RBS declares `Array[String]`.
-  class RoutingError < StandardError
+  class RoutingError < ActionControllerError
     def initialize(message, failures = [])
       @failures = failures
       super(message)

@@ -35,6 +35,16 @@ require "active_job"
 require "active_support/core_ext/object/blank"
 require "active_support/multibyte/unicode"
 require "active_support/core_ext/module/attribute_accessors_per_thread"
+# softer_delete's, polaris', typed_parameters' and Core's component
+# gems' sub-feature requires.
+require "active_support/concern"
+require "active_support/core_ext/object/try"
+require "active_support/core_ext/hash/keys"
+require "active_support/lazy_load_hooks"
+require "active_support/notifications"
+require "active_support/logger"
+require "action_controller/metal/exceptions"
+require "action_view"
 
 require "rails/engine"
 
@@ -68,6 +78,122 @@ module ProbeGem
     config.app_generators.test_unit fixture: false, aliases: { f: :fixture }
   end
 
+  # softer_delete's shape: a concern with an `included` block, class
+  # methods and a concern it depends on.
+  module Stamped
+    extend ActiveSupport::Concern
+
+    included do
+      attr_accessor :stamp
+    end
+
+    class_methods do
+      def stamped? = true
+    end
+  end
+
+  module SoftDeletable
+    extend ActiveSupport::Concern
+    include Stamped
+
+    module ClassMethods
+      def deleted_scope = (name.split("::").last.downcase + "_deleted").to_sym
+    end
+
+    included do
+      self.deletable_columns = [:deleted_at]
+    end
+
+    prepended do
+      @prepended_into = true
+    end
+  end
+
+  class Record
+    class << self
+      attr_accessor :deletable_columns
+    end
+    include SoftDeletable
+  end
+
+  class PrependedRecord
+    class << self
+      attr_accessor :deletable_columns
+    end
+    prepend SoftDeletable
+  end
+
+  ActiveSupport.on_load(:probe_gem_hook) { HOOKS << [:ran, self] }
+  HOOKS = []
+
+  def self.concern
+    twice = begin
+      Module.new do
+        extend ActiveSupport::Concern
+        included { 1 }
+        included { 2 }
+      end
+    rescue ActiveSupport::Concern::MultipleIncludedBlocks => e
+      e.message
+    end
+    r = Record.new
+    r.stamp = :s
+    [Record.ancestors.take(3).map(&:name), Record.stamped?, Record.deleted_scope, Record.deletable_columns, r.stamp,
+     PrependedRecord.ancestors.take(3).map(&:name), PrependedRecord.deleted_scope, PrependedRecord.instance_variable_get(:@prepended_into), twice]
+  end
+
+  def self.try
+    [nil.try(:length), "abc".try(:length), "abc".try(:nope), "abc".try { |s| s.upcase }, nil.try!(:length),
+     begin; "abc".try!(:nope); rescue NoMethodError => e; e.name; end]
+  end
+
+  def self.hash_keys
+    h = { a: { b: [{ c: 1 }] }, "d" => 2, 3 => :x }
+    bang = { a: 1, "b" => 2 }
+    bang.stringify_keys!
+    invalid = begin
+      { a: 1, z: 2 }.assert_valid_keys(:a, [:b])
+    rescue ArgumentError => e
+      e.message
+    end
+    [h.stringify_keys, h.symbolize_keys, h.deep_stringify_keys, h.deep_symbolize_keys, h.to_options, bang,
+     h.deep_transform_keys(&:to_s), { a: 1 }.assert_valid_keys(:a, :b), invalid]
+  end
+
+  def self.notifications
+    events = []
+    subscriber = ActiveSupport::Notifications.subscribe("probe_gem.ran") { |event| events << [event.name, event.payload] }
+    result = ActiveSupport::Notifications.instrument("probe_gem.ran", id: 7) { :done }
+    ActiveSupport::Notifications.unsubscribe(subscriber)
+    ActiveSupport::Notifications.instrument("probe_gem.ran", id: 8)
+    [result, events]
+  end
+
+  def self.logger
+    io = StringIO.new
+    logger = ActiveSupport::Logger.new(io)
+    logger.info("hello")
+    logger.debug { "lazy" }
+    logger.level = :warn
+    logger.info("dropped")
+    logger.silence { logger.error("silenced") }
+    logger.warn("kept")
+    [ActiveSupport::Logger.ancestors.include?(::Logger), io.string]
+  end
+
+  def self.controller_errors
+    ac = ActionController
+    chain = ->(klass) { klass.ancestors.take_while { |k| k != StandardError }.map(&:name) }
+    routing = ac::RoutingError.new("No route", [:x])
+    [chain[ac::BadRequest], chain[ac::RoutingError], chain[ac::UnknownFormat], chain[ac::MissingExactTemplate], chain[ac::NotImplemented],
+     ac::BadRequest.new("Invalid parameter: x").message, ac::MethodNotAllowed.new(:get, :post, :put).message,
+     ac::SessionOverflowError.new.message.split(".").first, ac::RespondToMismatchError.new.message.split(".").first,
+     [routing.message, routing.failures], ac::MissingExactTemplate.new("m", :c, :a).then { |e| [e.message, e.controller, e.action_name] },
+     ac::UrlGenerationError.new("u", nil, :r, :m).then { |e| [e.routes, e.route_name, e.method_name] },
+     [ac::RenderError, ac::MissingFile, ac::UnknownHttpMethod, ac::TooManyRequests].map { |k| k.superclass.name },
+     ActionView::MissingTemplate < StandardError]
+  end
+
   def self.report
     unicode = ActiveSupport::Multibyte::Unicode
     latin1 = "caf\xE9".dup.force_encoding(Encoding::UTF_8)
@@ -86,6 +212,13 @@ module ProbeGem
       per_thread: per_thread,
       app_generators: generators,
       engine: engine,
+      concern: concern,
+      try: try,
+      hash_keys: hash_keys,
+      load_hooks: (ActiveSupport.run_load_hooks(:probe_gem_hook, :base); HOOKS),
+      notifications: notifications,
+      logger: logger,
+      controller_errors: controller_errors,
     }
   end
 
@@ -162,6 +295,17 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // The route block recorded, not run; isolate_namespace's methods.
         "engine: [\"probe_gem_dashboard\", true, \"probe_gem_dashboard\", [true, false, false, false, false], true, false, []]",
 
+        // ActiveSupport::Concern: dependencies first, ClassMethods,
+        // `included`/`prepended` blocks, a second `included` refused.
+        "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
+        "try: [nil, 3, nil, \"ABC\", nil, :nope]",
+        "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",
+        "Unknown key: :z. Valid keys are: :a, :b",
+        "load_hooks: [[:ran, :base]]",
+        "logger: [true, \"hello\\nlazy\\nsilenced\\nkept\\n\"]",
+        "notifications: [:done, [[\"probe_gem.ran\", {id: 7}]]]",
+        "controller_errors: [[\"ActionController::BadRequest\", \"ActionController::ActionControllerError\"]",
+        "\"Only get, post, and put requests are allowed.\"",
         // Per thread, with the default seeded in each thread.
         "per_thread: [\"main\", \"main\", :info, [nil, :info, \"t\", \"t\"], \"invalid attribute name: bad-name\"]",
     ] {
@@ -179,6 +323,25 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
         let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
+    // Every other Rails feature with no port (polaris' Numeric
+    // extensions, the whole core_ext set): by name, not as a plain
+    // `cannot load such file`, which is left to everything else.
+    for feature in ["active_support/core_ext/numeric", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
+        let line = format!(
+            "{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded\n"
+        );
+        assert!(out.contains(&line), "missing {line:?}:\n{out}");
+    }
+    for line in [
+        "active_model_serializers_probe: LoadError: cannot load such file -- active_model_serializers_probe\n",
+        "probe_missing/active_support: LoadError: cannot load such file -- probe_missing/active_support\n",
+        // A framework feature's file that loads but itself requires what
+        // is missing keeps the inner LoadError.
+        "active_support/probe_inner: LoadError: cannot load such file -- probe_gem_inner_dependency\n",
+    ] {
+        assert!(out.contains(line), "missing {line:?}:\n{out}");
+    }
+    assert_eq!(out.matches("framework_feature_not_ported").count(), 6, "{out}");
     assert!(out.contains("routes: NotImplementedError: error[route_set_not_drawn]: the routes block at "), "{out}");
     for method in ["url_helpers", "recognize_path"] {
         let line = format!("routes: NotImplementedError: error[route_set_not_drawn]: ActionDispatch::Routing::RouteSet#{method} needs a drawn route set");

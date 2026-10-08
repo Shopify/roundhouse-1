@@ -1,4 +1,7 @@
 module ActionController
+  class ActionControllerError < StandardError
+  end
+
   class ParameterMissing < StandardError
     @param: String
     def initialize: (String param) -> void
@@ -8,10 +11,10 @@ module ActionController
   class UnpermittedParameters < StandardError
   end
 
-  class UnknownFormat < StandardError
+  class UnknownFormat < ActionControllerError
   end
 
-  class RoutingError < StandardError
+  class RoutingError < ActionControllerError
     @failures: Array[String]
     def initialize: (String message, ?Array[String] failures) -> void
     def failures: () -> Array[String]
