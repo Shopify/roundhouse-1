@@ -32,6 +32,7 @@ mod fixpoint_debug;
 mod recursion;
 mod enum_raw_input;
 mod extension_modules;
+mod model_table;
 mod presence_not_null;
 mod test_teardown;
 pub(crate) mod test_constants;

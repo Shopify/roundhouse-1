@@ -47,6 +47,7 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // field's resolved value.
     out.extend(super::graphql::diagnose(app, diagnose_expr));
     out.extend(super::enum_raw_input::diagnose(app));
+    out.extend(super::model_table::diagnose(app));
     out.extend(super::presence_not_null::diagnose(app));
     out.extend(super::fixture_entries::diagnose(app));
     out.extend(super::test_teardown::diagnose(app));
