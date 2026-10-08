@@ -166,9 +166,31 @@ fn on_port(expr: &Expr, site: &Site<'_>) -> bool {
     site.0.answers(errors, site.1.as_ref())
 }
 
+/// The `errors` a site `rewrite` would ground reads (`errors[x]`, or a
+/// `messages` question it answers), with the site's spelling.
+fn grounded_errors(expr: &Expr) -> Option<(&Expr, &'static str)> {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() == "[]" && args.len() == 1 && is_errors_read(r) {
+        return Some((r, "errors[]"));
+    }
+    let known = matches!(
+        (method.as_str(), args.len()),
+        ("[]" | "key?" | "has_key?" | "include?" | "member?", 1) | ("blank?" | "empty?" | "present?" | "any?", 0)
+    );
+    if !known || !is_messages_read(r) {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(errors), .. } = &*r.node else { return None };
+    Some((errors, "errors.messages"))
+}
+
 fn rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
     expr.node.for_each_child_mut(&mut |c| rewrite(c, site, diags));
     if on_port(expr, site) {
+        return;
+    }
+    if let Some((_, spelling)) = grounded_errors(expr).filter(|(errors, _)| site.0.unknown(errors, site.1.as_ref())) {
+        site.0.refuse(expr, spelling);
         return;
     }
     rewrite_messages(expr, diags);

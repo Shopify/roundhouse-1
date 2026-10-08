@@ -2068,7 +2068,19 @@ impl<'a> BodyTyper<'a> {
                 // them as instance methods on the enclosing class (and
                 // miss). Catch them here before the recv_ty fall-through.
                 if recv.is_none() {
-                    if matches!(
+                    // A method of the enclosing class by that name (frozen_record's
+                    // `class << self; alias_method :load, :new`) shadows the
+                    // Kernel one, as Ruby's lookup does: self's class comes first.
+                    let shadowed = matches!(
+                        ctx.self_ty.as_ref(),
+                        Some(Ty::Class { id, .. })
+                            if self.classes().get(id).is_some_and(|cls| if ctx.class_side {
+                                cls.has_class_method(method)
+                            } else {
+                                cls.has_instance_method(method)
+                            })
+                    );
+                    if !shadowed && matches!(
                         method.as_str(),
                         "require" | "require_relative" | "load" | "autoload"
                     ) {
@@ -2161,11 +2173,16 @@ impl<'a> BodyTyper<'a> {
                 // call: `CurrencyDb.load` runs `YamlDb.load` with `self ==
                 // CurrencyDb`. Typing it as the class the `def` sits in made
                 // every subclass factory answer the base class.
+                // So does a class-side alias of Class#new (frozen_record's
+                // `alias_method :load, :new`, which its own `new` calls).
                 if ctx.class_side
-                    && method.as_str() == "new"
                     && recv.as_ref().map_or(true, |r| matches!(&*r.node, ExprNode::SelfRef))
                     && matches!(recv_ty, Some(Ty::Class { .. }))
-                    && !self.has_declared_constructor(recv_ty.as_ref())
+                    && if method.as_str() == "new" {
+                        !self.has_declared_constructor(recv_ty.as_ref())
+                    } else {
+                        self.class_method_builds_receiver(recv_ty.as_ref(), method)
+                    }
                 {
                     for a in args.iter_mut() {
                         self.analyze_expr(a, ctx);
@@ -5597,6 +5614,24 @@ fn time_parse_ty(recv: &Expr, method: &Symbol, args: &[Expr]) -> Option<Ty> {
 impl BodyTyper<'_> {
     // A declared constructor can return another class. Only the default
     // Class#new operation promises an instance of the receiving class.
+    /// Whether the class-side `method` the receiver's class (or the
+    /// nearest ancestor defining it) answers is registered as building an
+    /// instance of the receiving class (`Ty::SelfInstance`).
+    fn class_method_builds_receiver(&self, ty: Option<&Ty>, method: &Symbol) -> bool {
+        let Some(Ty::Class { id, .. }) = ty else { return false };
+        let mut next = Some(id);
+        let mut seen = crate::det::HashSet::default();
+        while let Some(id) = next {
+            if !seen.insert(id) { break; }
+            let Some(class) = self.classes().get(id) else { break };
+            if let Some(found) = class.class_method(method) {
+                return matches!(found, Ty::SelfInstance);
+            }
+            next = class.parent_id();
+        }
+        false
+    }
+
     fn has_declared_constructor(&self, ty: Option<&Ty>) -> bool {
         let Some(Ty::Class { id, .. }) = ty else { return false };
         let mut next = Some(id);
