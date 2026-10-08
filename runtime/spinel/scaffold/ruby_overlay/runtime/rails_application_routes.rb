@@ -14,13 +14,17 @@
 # `RouteTable`: a nested `RouteTable` hides the emitted top-level
 # `RouteTable` that `recognize_path` reads.
 require "uri"
+require_relative "action_controller/parameter_missing"
 
 module ActionController
   # Raised by `recognize_path` for a verb that Rails does not accept.
   # It lives in this overlay and not in runtime/ruby/, so `check` still
-  # reports app code that names it. The Rails superclass is
-  # `ActionControllerError`, which the runtime does not define.
-  class UnknownHttpMethod < StandardError
+  # reports app code that names it. Its superclass is Rails'
+  # `ActionControllerError` from parameter_missing.rb, the one
+  # action_controller_exceptions.rb (a native gem's `require
+  # "action_controller/metal/exceptions"`) reopens this class over; a
+  # different superclass here made that require a TypeError.
+  class UnknownHttpMethod < ActionControllerError
   end
 end
 
