@@ -43,11 +43,12 @@ use crate::ident::{ClassId, Symbol};
 
 pub fn expand_class_eval_macros(app: &mut App) {
     let mut planned: Vec<(usize, Vec<(ClassEvalExpansion, Vec<MethodDef>)>)> = Vec::new();
+    let classes = Classes::indexed(&app.library_classes);
     for (i, lc) in app.library_classes.iter().enumerate() {
         if lc.is_module {
             continue;
         }
-        let modules = extended_modules(lc, &app.library_classes);
+        let modules = extended_modules(lc, &classes);
         if modules.is_empty() {
             continue;
         }
@@ -59,12 +60,12 @@ pub fn expand_class_eval_macros(app: &mut App) {
         let hooked = lc
             .includes
             .iter()
-            .filter_map(|inc| resolve_in_ancestry(lc, inc.0.as_str(), &app.library_classes))
+            .filter_map(|inc| ancestry_resolve(lc, inc.0.as_str(), &classes))
             .flat_map(included_hook_calls)
             .map(|call| (call, true));
         for (call, hook) in own.chain(hooked).collect::<Vec<_>>() {
             let ExprNode::Send { method, args, block: None, .. } = &*call.node else { continue };
-            let Some(def) = modules.iter().find_map(|m| module_method(m, method, &app.library_classes, &mut Vec::new()))
+            let Some(def) = modules.iter().find_map(|m| module_method(m, method, &classes, &mut Vec::new()))
             else {
                 continue;
             };
@@ -109,17 +110,18 @@ pub fn expand_class_eval_macros(app: &mut App) {
 /// from the class, to the same module.
 pub fn qualify_inherited_includes(app: &mut App) {
     let mut planned: Vec<(usize, usize, ClassId)> = Vec::new();
+    let classes = Classes::indexed(&app.library_classes);
     for (i, lc) in app.library_classes.iter().enumerate() {
         if lc.origin.is_some() {
             continue;
         }
         for (j, inc) in lc.includes.iter().enumerate() {
             let written = inc.0.as_str();
-            if written.starts_with("::") || resolve(lc, written, true, &app.library_classes).is_some() {
+            if written.starts_with("::") || resolve(lc, written, true, &classes).is_some() {
                 continue;
             }
-            let Some(found) = resolve_in_ancestry(lc, written, &app.library_classes) else { continue };
-            if resolve(lc, found.name.0.as_str(), true, &app.library_classes).is_some_and(|m| m.name == found.name) {
+            let Some(found) = ancestry_resolve(lc, written, &classes) else { continue };
+            if resolve(lc, found.name.0.as_str(), true, &classes).is_some_and(|m| m.name == found.name) {
                 planned.push((i, j, found.name.clone()));
             }
         }
@@ -129,14 +131,45 @@ pub fn qualify_inherited_includes(app: &mut App) {
     }
 }
 
+/// The app's library classes, looked up by name: scanned, or through
+/// an index of each (name, is_module)'s first app (origin-less) class.
+/// The passes here resolve per namespace prefix, per call, per class,
+/// which scanned was quadratic in the library classes.
+struct Classes<'a> {
+    all: &'a [LibraryClass],
+    first: Option<crate::det::HashMap<(&'a str, bool), &'a LibraryClass>>,
+}
+
+impl<'a> Classes<'a> {
+    fn scanned(all: &'a [LibraryClass]) -> Self {
+        Classes { all, first: None }
+    }
+
+    fn indexed(all: &'a [LibraryClass]) -> Self {
+        let mut first: crate::det::HashMap<(&str, bool), &LibraryClass> = crate::det::HashMap::default();
+        for c in all.iter().filter(|c| c.origin.is_none()) {
+            first.entry((c.name.0.as_str(), c.is_module)).or_insert(c);
+        }
+        Classes { all, first: Some(first) }
+    }
+
+    /// The first app class (`module: true`, module) named `name`.
+    fn find(&self, name: &str, module: bool) -> Option<&'a LibraryClass> {
+        match &self.first {
+            Some(first) => first.get(&(name, module)).copied(),
+            None => self.all.iter().find(|c| c.is_module == module && c.origin.is_none() && c.name.0.as_str() == name),
+        }
+    }
+}
+
 /// `written` as Ruby resolves it from `lc`'s namespace outwards, among
 /// the app's library classes (`module: true` for a module).
-fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
+fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &Classes<'a>) -> Option<&'a LibraryClass> {
     let written = written.trim_start_matches("::");
     let scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
     (0..=scope.len()).rev().find_map(|n| {
         let name = if n == 0 { written.to_string() } else { format!("{}::{written}", scope[..n].join("::")) };
-        classes.iter().find(|c| c.is_module == module && c.origin.is_none() && c.name.0.as_str() == name)
+        classes.find(&name, module)
     })
 }
 
@@ -145,6 +178,10 @@ fn resolve<'a>(lc: &LibraryClass, written: &str, module: bool, classes: &'a [Lib
 /// in `Customers::CustomerEntity < CustomerFoundations::Entity` names
 /// `CustomerFoundations::Entity::WithIdentifiers`).
 pub(super) fn resolve_in_ancestry<'a>(lc: &LibraryClass, written: &str, classes: &'a [LibraryClass]) -> Option<&'a LibraryClass> {
+    ancestry_resolve(lc, written, &Classes::scanned(classes))
+}
+
+fn ancestry_resolve<'a>(lc: &LibraryClass, written: &str, classes: &Classes<'a>) -> Option<&'a LibraryClass> {
     if let Some(found) = resolve(lc, written, true, classes) {
         return Some(found);
     }
@@ -157,7 +194,7 @@ pub(super) fn resolve_in_ancestry<'a>(lc: &LibraryClass, written: &str, classes:
         }
         seen.push(&c.name);
         let name = format!("{}::{written}", c.name.0.as_str());
-        if let Some(found) = classes.iter().find(|m| m.is_module && m.origin.is_none() && m.name.0.as_str() == name) {
+        if let Some(found) = classes.find(&name, true) {
             return Some(found);
         }
         at = c.parent.as_ref().and_then(|p| resolve(c, p.0.as_str(), false, classes));
@@ -191,7 +228,7 @@ fn included_hook_calls(m: &LibraryClass) -> Vec<&Expr> {
 
 /// The app modules a bare `extend M` in `lc` or in one of its app library
 /// superclasses gives it as singleton methods.
-fn extended_modules<'a>(lc: &'a LibraryClass, classes: &'a [LibraryClass]) -> Vec<&'a LibraryClass> {
+fn extended_modules<'a>(lc: &'a LibraryClass, classes: &Classes<'a>) -> Vec<&'a LibraryClass> {
     let mut out = Vec::new();
     let mut at = Some(lc);
     let mut seen: Vec<&ClassId> = Vec::new();
@@ -222,7 +259,7 @@ fn extended_modules<'a>(lc: &'a LibraryClass, classes: &'a [LibraryClass]) -> Ve
 fn module_method<'a>(
     m: &'a LibraryClass,
     name: &Symbol,
-    classes: &'a [LibraryClass],
+    classes: &Classes<'a>,
     seen: &mut Vec<&'a ClassId>,
 ) -> Option<&'a MethodDef> {
     if seen.contains(&&m.name) {

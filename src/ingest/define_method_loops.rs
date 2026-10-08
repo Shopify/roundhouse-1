@@ -117,6 +117,38 @@ enum Owner {
     Model(usize),
 }
 
+/// The app's library classes and models by name, for the macro
+/// lookups: each was a scan of every library class, per namespace
+/// prefix, per ancestor, per class-body call.
+struct Names<'a> {
+    /// Each name's app (origin-less) classes, not modules, in order.
+    classes: HashMap<&'a str, Vec<&'a crate::dialect::LibraryClass>>,
+    /// Each name's first app module.
+    modules: HashMap<&'a str, &'a crate::dialect::LibraryClass>,
+    models: HashSet<&'a str>,
+}
+
+impl<'a> Names<'a> {
+    fn new(app: &'a App) -> Self {
+        let mut classes: HashMap<&str, Vec<&crate::dialect::LibraryClass>> = HashMap::default();
+        let mut modules: HashMap<&str, &crate::dialect::LibraryClass> = HashMap::default();
+        for c in app.library_classes.iter().filter(|c| c.origin.is_none()) {
+            if c.is_module {
+                modules.entry(c.name.0.as_str()).or_insert(c);
+            } else {
+                classes.entry(c.name.0.as_str()).or_default().push(c);
+            }
+        }
+        let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+        Names { classes, modules, models }
+    }
+
+    /// The app classes (not modules) named `name`, in order.
+    fn classes(&self, name: &str) -> &[&'a crate::dialect::LibraryClass] {
+        self.classes.get(name).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// How a macro call reaches the macro it runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reach {
@@ -146,6 +178,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
     // defines, natively (`emit::ruby::library`'s `app_extension_calls`).
     let mut replayed: HashSet<(usize, usize)> = HashSet::default();
     let mut inherited: HashSet<(usize, usize)> = HashSet::default();
+    let names = Names::new(app);
     for (i, lc) in app.library_classes.iter().enumerate() {
         if lc.origin.is_some() {
             continue;
@@ -157,7 +190,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
                 continue;
             }
             if let Some((outcome, reach)) =
-                plan(app, sources, &constants, Owner::Library(i), call)
+                plan(app, &names, sources, &constants, Owner::Library(i), call)
             {
                 if reach != Reach::Own {
                     replayed.insert((i, j));
@@ -175,7 +208,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             let ModelBodyItem::Unknown { expr, .. } = item else {
                 continue;
             };
-            if let Some((outcome, _)) = plan(app, sources, &constants, Owner::Model(i), expr) {
+            if let Some((outcome, _)) = plan(app, &names, sources, &constants, Owner::Model(i), expr) {
                 models.push((i, j, outcome));
             }
         }
@@ -184,9 +217,18 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
     settle_collisions(app, &mut library, Owner::Library);
     settle_collisions(app, &mut models, Owner::Model);
 
-    let dropped: Vec<bool> = (0..app.library_classes.len())
-        .map(|i| body_dropped(app, i))
-        .collect();
+    // Only a refused call reads its class's answer.
+    let dropped: Vec<bool> = {
+        let asked: HashSet<usize> = library
+            .iter()
+            .filter(|(i, j, outcome)| outcome.is_err() && !replayed.contains(&(*i, *j)))
+            .map(|(i, ..)| *i)
+            .collect();
+        let lineage = (!asked.is_empty()).then(|| Lineage::new(app));
+        (0..app.library_classes.len())
+            .map(|i| lineage.as_ref().is_some_and(|lineage| asked.contains(&i) && body_dropped(app, lineage, i)))
+            .collect()
+    };
     // Apply in reverse index order so earlier indices stay valid.
     library.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
     for (i, j, outcome) in library {
@@ -263,14 +305,10 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
 /// other class replays its class body verbatim when the emitted file
 /// loads (the gem's class is its receiver), so the statement runs there
 /// and an unexpanded one is no gap to report.
-fn body_dropped(app: &App, i: usize) -> bool {
+fn body_dropped(app: &App, lineage: &Lineage<'_>, i: usize) -> bool {
     let app_class = |name: &str| {
         let name = name.trim_start_matches("::");
-        app.models.iter().any(|m| m.name.0.as_str() == name)
-            || app
-                .library_classes
-                .iter()
-                .any(|c| c.origin.is_none() && c.name.0.as_str().trim_start_matches("::") == name)
+        lineage.models.contains(name) || lineage.app_classes.contains(name)
     };
     let lc = &app.library_classes[i];
     if lc.is_module {
@@ -282,17 +320,43 @@ fn body_dropped(app: &App, i: usize) -> bool {
         if !app_class(p.0.as_str()) {
             return false;
         }
-        if app.models.iter().any(|m| m.name == *p) || seen.contains(&p.0.as_str()) {
+        if lineage.models.contains(p.0.as_str()) || seen.contains(&p.0.as_str()) {
             return true;
         }
         seen.push(p.0.as_str());
-        parent = app
-            .library_classes
-            .iter()
-            .filter(|c| !c.is_module && c.name == *p)
-            .find_map(|c| c.parent.as_ref());
+        parent = lineage.parents.get(p.0.as_str()).copied();
     }
     true
+}
+
+/// What [`body_dropped`] asks of every class, by name.
+struct Lineage<'a> {
+    models: HashSet<&'a str>,
+    /// The app (origin-less) library classes' names, without a leading `::`.
+    app_classes: HashSet<&'a str>,
+    /// Each name's first parent among its classes (not modules).
+    parents: HashMap<&'a str, &'a ClassId>,
+}
+
+impl<'a> Lineage<'a> {
+    fn new(app: &'a App) -> Self {
+        let mut parents: HashMap<&str, &ClassId> = HashMap::default();
+        for c in app.library_classes.iter().filter(|c| !c.is_module) {
+            if let Some(parent) = &c.parent {
+                parents.entry(c.name.0.as_str()).or_insert(parent);
+            }
+        }
+        Lineage {
+            models: app.models.iter().map(|m| m.name.0.as_str()).collect(),
+            app_classes: app
+                .library_classes
+                .iter()
+                .filter(|c| c.origin.is_none())
+                .map(|c| c.name.0.as_str().trim_start_matches("::"))
+                .collect(),
+            parents,
+        }
+    }
 }
 
 fn refuse(call: &mut Expr, reason: String) {
@@ -483,6 +547,7 @@ fn source_of<'a>(sources: &'a [SourceFile], span: Span) -> Option<&'a SourceFile
 /// macro.
 fn plan(
     app: &App,
+    names: &Names<'_>,
     sources: &[SourceFile],
     constants: &HashSet<String>,
     owner: Owner,
@@ -521,7 +586,7 @@ fn plan(
     {
         return None;
     }
-    let (def, via, inherited) = macro_for(app, owner, method, call.span)?;
+    let (def, via, inherited) = macro_for(app, names, owner, method, call.span)?;
     if !defines(&def.body) {
         return None;
     }
@@ -562,6 +627,7 @@ fn defines(expr: &Expr) -> bool {
 /// calls it.
 fn macro_for<'a>(
     app: &'a App,
+    names: &Names<'a>,
     owner: Owner,
     name: &Symbol,
     at: Span,
@@ -623,16 +689,16 @@ fn macro_for<'a>(
             let ExprNode::Const { path } = &*arg.node else {
                 continue;
             };
-            let Some(module) = resolve_module(app, scope, path) else {
+            let Some(module) = resolve_module(names, scope, path) else {
                 continue;
             };
-            if let Some(def) = module_method(app, module, name, &mut Vec::new()) {
+            if let Some(def) = module_method(names, module, name, &mut Vec::new()) {
                 return Some((def, module.name.0.to_string(), false));
             }
         }
     }
     match owner {
-        Owner::Library(i) => inherited_macro(app, &app.library_classes[i], name)
+        Owner::Library(i) => inherited_macro(names, &app.library_classes[i], name)
             .map(|(def, via)| (def, via, true)),
         Owner::Model(_) => None,
     }
@@ -647,7 +713,7 @@ fn macro_for<'a>(
 /// a model, a gem class or a cycle ends the chain. A name an ancestor
 /// defines more than once (a reopened class) is not guessed at.
 fn inherited_macro<'a>(
-    app: &'a App,
+    names: &Names<'a>,
     lc: &'a crate::dialect::LibraryClass,
     name: &Symbol,
 ) -> Option<(&'a MethodDef, String)> {
@@ -657,16 +723,12 @@ fn inherited_macro<'a>(
     let mut seen: Vec<&ClassId> = vec![&lc.name];
     let mut at = lc;
     while let Some(parent) = at.parent.as_ref() {
-        let ancestor = resolve_class(app, &at.name, parent.0.as_str())?;
-        if seen.contains(&ancestor) || app.models.iter().any(|m| &m.name == ancestor) {
+        let ancestor = resolve_class(names, &at.name, parent.0.as_str())?;
+        if seen.contains(&ancestor) || names.models.contains(ancestor.0.as_str()) {
             return None;
         }
         seen.push(ancestor);
-        let parts: Vec<&crate::dialect::LibraryClass> = app
-            .library_classes
-            .iter()
-            .filter(|c| !c.is_module && c.origin.is_none() && &c.name == ancestor)
-            .collect();
+        let parts: &[&crate::dialect::LibraryClass] = names.classes(ancestor.0.as_str());
         let own: Vec<&MethodDef> = parts
             .iter()
             .flat_map(|c| c.methods.iter())
@@ -677,7 +739,7 @@ fn inherited_macro<'a>(
             [] => {}
             _ => return None,
         }
-        for part in &parts {
+        for part in parts {
             for call in part.unknown_calls.iter().rev() {
                 let ExprNode::Send { recv: None, method, args, .. } = &*call.node else {
                     continue;
@@ -689,10 +751,10 @@ fn inherited_macro<'a>(
                     let ExprNode::Const { path } = &*arg.node else {
                         continue;
                     };
-                    let Some(module) = resolve_module(app, ancestor, path) else {
+                    let Some(module) = resolve_module(names, ancestor, path) else {
                         continue;
                     };
-                    if let Some(def) = module_method(app, module, name, &mut Vec::new()) {
+                    if let Some(def) = module_method(names, module, name, &mut Vec::new()) {
                         return Some((def, module.name.0.to_string()));
                     }
                 }
@@ -705,13 +767,8 @@ fn inherited_macro<'a>(
 
 /// The app library class (not a module) `written` names, read from
 /// `scope`'s namespace outwards.
-fn resolve_class<'a>(app: &'a App, scope: &ClassId, written: &str) -> Option<&'a ClassId> {
-    let find = |name: &str| {
-        app.library_classes
-            .iter()
-            .find(|c| !c.is_module && c.origin.is_none() && c.name.0.as_str() == name)
-            .map(|c| &c.name)
-    };
+fn resolve_class<'a>(names: &Names<'a>, scope: &ClassId, written: &str) -> Option<&'a ClassId> {
+    let find = |name: &str| names.classes(name).first().map(|c| &c.name);
     if let Some(rooted) = written.strip_prefix("::") {
         return find(rooted);
     }
@@ -726,7 +783,7 @@ fn resolve_class<'a>(app: &'a App, scope: &ClassId, written: &str) -> Option<&'a
 }
 
 fn resolve_module<'a>(
-    app: &'a App,
+    names: &Names<'a>,
     scope: &ClassId,
     path: &[Symbol],
 ) -> Option<&'a crate::dialect::LibraryClass> {
@@ -743,14 +800,12 @@ fn resolve_module<'a>(
         } else {
             format!("{}::{written}", segments[..n].join("::"))
         };
-        app.library_classes
-            .iter()
-            .find(|c| c.is_module && c.origin.is_none() && c.name.0.as_str() == name)
+        names.modules.get(name.as_str()).copied()
     })
 }
 
 fn module_method<'a>(
-    app: &'a App,
+    names: &Names<'a>,
     module: &'a crate::dialect::LibraryClass,
     name: &Symbol,
     seen: &mut Vec<&'a ClassId>,
@@ -769,8 +824,8 @@ fn module_method<'a>(
     }
     module.includes.iter().rev().find_map(|inc| {
         let path: Vec<Symbol> = inc.0.as_str().split("::").map(Symbol::from).collect();
-        resolve_module(app, &module.name, &path)
-            .and_then(|inner| module_method(app, inner, name, seen))
+        resolve_module(names, &module.name, &path)
+            .and_then(|inner| module_method(names, inner, name, seen))
     })
 }
 

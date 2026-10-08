@@ -3255,6 +3255,11 @@ fn ruby_family_files(
     // emit and the autoload table each scanned every library class per
     // question, quadratic on the full Core closure.
     let _indexes = emit::ruby::install_lookup_indexes(app);
+    // Each model's GeneratedAttributeMethods split
+    // (`emit::ruby::library::generated_attribute_methods`) synthesizes
+    // its columns' methods over `app.models`; one demand set of their
+    // bodies serves them all, as in the model lowering.
+    let _body_names = crate::lower::model_to_library::schema::share_model_body_names(&app.models, &Default::default());
     let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
     crate::timings::lap_start();
     if matches!(flavor, RubyFlavor::CRuby) {
@@ -7359,13 +7364,19 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             .filter(|lib| !loader_roots.iter().any(|root| *root == lib || root.starts_with(&format!("{lib}/"))))
             .collect()
     };
-    let required_gem_file = |source: &str| -> bool {
+    let required_gem_file_uncached = |source: &str| -> bool {
         let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
         if loader_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/"))) {
             return false;
         }
         gem_lib(source).is_some_and(|lib| !self_loading_libs.contains(&lib))
     };
+    // Each source's answer, once: asked per source per model anchor,
+    // it was most of `apply_models_autoload` on Shopify Core.
+    let required_sources: crate::det::HashMap<&str, bool> =
+        app.sources.iter().map(|source| (source.path.as_str(), required_gem_file_uncached(&source.path))).collect();
+    let required_gem_file =
+        |source: &str| -> bool { required_sources.get(source).copied().unwrap_or_else(|| required_gem_file_uncached(source)) };
     let gem_only = |anchor: &str| {
         declaring.get(anchor).is_some_and(|sources| !sources.is_empty() && sources.iter().all(|s| required_gem_file(s)))
     };
@@ -7384,6 +7395,30 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             .filter(|source| required_gem_file(&source.path) && source.text.contains("autoload") && source.text.contains("Dir"))
             .flat_map(|source| crate::ingest::autoload_glob::file_autoloads(&source.text, &source.path, &listing))
             .collect()
+    };
+    let required_files: Vec<&crate::span::SourceFile> = app.sources.iter().filter(|source| required_gem_file(&source.path)).collect();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // Each name a required gem file writes `autoload :Name` or
+    // `autoload(:Name` for => those files (indices into `required_files`), so
+    // an anchor reads the few files that name it rather than every one.
+    let autoload_writers: crate::det::HashMap<&str, Vec<usize>> = {
+        let mut out: crate::det::HashMap<&str, Vec<usize>> = crate::det::HashMap::default();
+        for (i, source) in required_files.iter().enumerate() {
+            let text = source.text.as_str();
+            for pattern in ["autoload :", "autoload(:"] {
+                for (at, _) in text.match_indices(pattern) {
+                    let rest = &text[at + pattern.len()..];
+                    let name = &rest[..rest.find(|c: char| !word(c)).unwrap_or(rest.len())];
+                    if !name.is_empty() {
+                        let files = out.entry(name).or_default();
+                        if files.last() != Some(&i) {
+                            files.push(i);
+                        }
+                    }
+                }
+            }
+        }
+        out
     };
     let gem_autoloads = |full: &str| -> bool {
         if glob_autoloads.contains(full) {
@@ -7407,7 +7442,14 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 path.rsplit("::").next() == Some(parent)
             }) || names(text, &format!("{parent}.autoload"))
         };
-        app.sources.iter().filter(|source| required_gem_file(&source.path)).any(|source| {
+        // A word name is written exactly where `autoload_writers` saw
+        // it; any other is read from every file, as before.
+        if !name.is_empty() && name.chars().all(word) {
+            return autoload_writers
+                .get(name)
+                .is_some_and(|files| files.iter().any(|&i| parent.is_empty() || opens(&required_files[i].text)));
+        }
+        required_files.iter().any(|source| {
             let text = source.text.as_str();
             (names(text, &format!("autoload :{name}")) || names(text, &format!("autoload(:{name}")))
                 && (parent.is_empty() || opens(text))

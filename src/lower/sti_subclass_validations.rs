@@ -82,21 +82,74 @@ struct Read {
     gaps: Vec<(Span, String, String)>,
 }
 
+/// The app's models and library classes by name, for the parent-chain
+/// walks: each name's first model and first library class, the answers
+/// of `iter().find` by name, so a step is a lookup rather than a scan of
+/// every library class (per class, per declaring subclass: 600 s of
+/// `sti_subclass_callbacks` on Shopify Core).
+struct Lineage<'a> {
+    app: &'a App,
+    models: crate::det::HashMap<&'a str, &'a Model>,
+    classes: crate::det::HashMap<&'a str, &'a LibraryClass>,
+}
+
+impl<'a> Lineage<'a> {
+    fn new(app: &'a App) -> Self {
+        let mut models: crate::det::HashMap<&str, &Model> = crate::det::HashMap::default();
+        for model in &app.models {
+            models.entry(model.name.0.as_str()).or_insert(model);
+        }
+        let mut classes: crate::det::HashMap<&str, &LibraryClass> = crate::det::HashMap::default();
+        for lc in &app.library_classes {
+            classes.entry(lc.name.0.as_str()).or_insert(lc);
+        }
+        Lineage { app, models, classes }
+    }
+
+    fn model(&self, name: &ClassId) -> Option<&'a Model> {
+        self.models.get(name.0.as_str()).copied()
+    }
+
+    fn class(&self, name: &ClassId) -> Option<&'a LibraryClass> {
+        self.classes.get(name.0.as_str()).copied()
+    }
+
+    /// Each of `subs` => the library classes (indices, in order) whose
+    /// first eight parents (`class`'s chain) include it: the classes
+    /// [`type_names`] keeps.
+    fn below(&self, subs: &crate::det::HashMap<ClassId, Symbol>) -> crate::det::HashMap<&'a ClassId, Vec<usize>> {
+        let mut out: crate::det::HashMap<&ClassId, Vec<usize>> = crate::det::HashMap::default();
+        for (j, lc) in self.app.library_classes.iter().enumerate() {
+            let mut cursor = lc.parent.as_ref();
+            let mut reached: Vec<&ClassId> = Vec::new();
+            for _ in 0..8 {
+                let Some(parent) = cursor else { break };
+                if subs.contains_key(parent) && !reached.contains(&parent) {
+                    reached.push(parent);
+                    out.entry(parent).or_default().push(j);
+                }
+                cursor = self.class(parent).and_then(|c| c.parent.as_ref());
+            }
+        }
+        out
+    }
+}
+
 /// The nearest model ancestor of `lc` and the classes from `lc` up to
 /// it (`lc` first, the model last), through intermediate library classes.
-fn model_ancestry<'a>(lc: &LibraryClass, app: &'a App) -> Option<(&'a Model, Vec<ClassId>)> {
+fn model_ancestry<'a>(lc: &LibraryClass, lineage: &Lineage<'a>) -> Option<(&'a Model, Vec<ClassId>)> {
     let mut chain = vec![lc.name.clone()];
     let mut cursor = lc.parent.clone();
     for _ in 0..8 {
         let parent = cursor?;
-        if let Some(model) = app.models.iter().find(|m| m.name == parent) {
+        if let Some(model) = lineage.model(&parent) {
             chain.push(model.name.clone());
             return Some((model, chain));
         }
         if chain.contains(&parent) {
             return None;
         }
-        let next = app.library_classes.iter().find(|c| c.name == parent)?;
+        let next = lineage.class(&parent)?;
         chain.push(parent);
         cursor = next.parent.clone();
     }
@@ -201,20 +254,14 @@ fn read(lc: &LibraryClass, app: &App) -> Read {
 }
 
 /// The STI type names a subclass's relation keeps: its own and every
-/// library class's below it.
-fn type_names(sub: &ClassId, app: &App) -> Vec<String> {
+/// library class's below it (within eight parents), in
+/// `library_classes` order. `below` is [`Lineage::below`].
+fn type_names(sub: &ClassId, below: &crate::det::HashMap<&ClassId, Vec<usize>>, app: &App) -> Vec<String> {
     let mut names = vec![sub.0.as_str().to_string()];
-    for lc in &app.library_classes {
-        let mut cursor = lc.parent.as_ref();
-        for _ in 0..8 {
-            let Some(parent) = cursor else { break };
-            if parent == sub {
-                if !names.iter().any(|n| n == lc.name.0.as_str()) {
-                    names.push(lc.name.0.as_str().to_string());
-                }
-                break;
-            }
-            cursor = app.library_classes.iter().find(|c| &c.name == parent).and_then(|c| c.parent.as_ref());
+    for &j in below.get(sub).into_iter().flatten() {
+        let lc = &app.library_classes[j];
+        if !names.iter().any(|n| n == lc.name.0.as_str()) {
+            names.push(lc.name.0.as_str().to_string());
         }
     }
     names
@@ -223,9 +270,11 @@ fn type_names(sub: &ClassId, app: &App) -> Vec<String> {
 pub fn apply_sti_subclass_validations(app: &mut App) {
     define_acceptance_attributes(app);
     let sti = crate::lower::sti_scope::sti_columns(app);
+    let lineage = Lineage::new(app);
+    let below = std::cell::OnceCell::new();
     let mut plans: Vec<(usize, Vec<usize>, Vec<crate::dialect::MethodDef>)> = Vec::new();
     for (index, lc) in app.library_classes.iter().enumerate() {
-        let Some((model, chain)) = model_ancestry(lc, app) else { continue };
+        let Some((model, chain)) = model_ancestry(lc, &lineage) else { continue };
         let read = read(lc, app);
         if read.declared.is_empty() {
             continue;
@@ -235,7 +284,11 @@ pub fn apply_sti_subclass_validations(app: &mut App) {
             i18n_keys: chain.iter().map(|c| crate::naming::underscore(c.0.as_str())).collect(),
             finder: Finder::Declaring {
                 class: lc.name.clone(),
-                type_names: if sti.contains_key(&lc.name) { type_names(&lc.name, app) } else { Vec::new() },
+                type_names: if sti.contains_key(&lc.name) {
+                    type_names(&lc.name, below.get_or_init(|| lineage.below(&sti)), app)
+                } else {
+                    Vec::new()
+                },
                 type_column: sti.get(&lc.name).map(|c| c.as_str().to_string()).unwrap_or_default(),
             },
         };
@@ -380,8 +433,9 @@ fn define_acceptance_attributes(app: &mut App) {
     // STI subclasses: the reader and writer, and the constructor's and
     // `update`'s assignment the base's attrs loop does not know.
     let mut plans: Vec<(usize, Vec<Symbol>)> = Vec::new();
+    let lineage = Lineage::new(app);
     for (index, lc) in app.library_classes.iter().enumerate() {
-        let Some((model, _)) = model_ancestry(lc, app) else { continue };
+        let Some((model, _)) = model_ancestry(lc, &lineage) else { continue };
         let read = read(lc, app);
         let names: Vec<Symbol> = accepted_attributes(read.declared.iter().flat_map(|(_, _, vs, _)| vs.iter()))
             .into_iter()
@@ -535,8 +589,9 @@ fn define_virtual_on_subclass(lc: &mut LibraryClass, name: &Symbol) {
 /// this pass cannot lower.
 pub(crate) fn diagnose(app: &App) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    let lineage = Lineage::new(app);
     for lc in &app.library_classes {
-        if model_ancestry(lc, app).is_none() {
+        if model_ancestry(lc, &lineage).is_none() {
             continue;
         }
         let read = read(lc, app);

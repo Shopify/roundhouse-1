@@ -288,6 +288,7 @@ pub(crate) fn lower_models_inner_for_dialect(
 ) -> (Vec<LibraryClass>, HashMap<ClassId, crate::analyze::ClassInfo>) {
     let mut all_methods: Vec<(Vec<MethodDef>, ClassId, Option<&Table>, &Model)> = Vec::new();
     let mut classes: HashMap<ClassId, crate::analyze::ClassInfo> = HashMap::default();
+    let _body_names = schema::share_model_body_names(models, &Default::default());
     for model in models {
         let methods = build_methods_for_dialect(model, models, schema, params_specs, finder_inputs, dialect);
         let table = schema.tables.get(&model.table.0);
@@ -1736,6 +1737,8 @@ pub(crate) struct ModelSynthesis<'a> {
     built: std::cell::RefCell<HashMap<usize, std::rc::Rc<Vec<MethodDef>>>>,
     /// Time spent synthesizing, for `ROUNDHOUSE_TIMINGS`.
     spent: std::cell::Cell<std::time::Duration>,
+    /// `app.models`' body names, shared by every model's synthesis.
+    body_names: schema::ModelBodyNames,
 }
 
 impl<'a> ModelSynthesis<'a> {
@@ -1745,6 +1748,7 @@ impl<'a> ModelSynthesis<'a> {
             specs: std::cell::OnceCell::new(),
             built: std::cell::RefCell::new(HashMap::default()),
             spent: std::cell::Cell::new(std::time::Duration::ZERO),
+            body_names: Default::default(),
         }
     }
 
@@ -1773,6 +1777,7 @@ impl<'a> ModelSynthesis<'a> {
                 specs.mark_file_fields(&app.models);
                 specs
             });
+            let _body_names = schema::share_model_body_names(&app.models, &self.body_names);
             build_methods(&app.models[position], &app.models, &app.schema, specs)
         })
         .0;
