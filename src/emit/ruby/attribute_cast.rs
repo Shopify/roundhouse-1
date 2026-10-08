@@ -28,9 +28,11 @@
 //!
 //! The cast type is the one the model's `schema_column_types` names
 //! (`emit::ruby::attribute_api`): a column whose type the port does not
-//! carry (`[:unported, ...]`, an enum, JSON), the primary key, and a
+//! carry (`[:unported, ...]`, an enum, JSON), the primary key, a
 //! retypable column (`Model::retypable_attributes`, which casts through
-//! its declared type already) keep the shared lowering's writer.
+//! its declared type already) and a JSON `serialize`d one (its coder's
+//! type, not the column's, casts: `lower::serialize`) keep the shared
+//! lowering's writer.
 //!
 //! A new record's `id` reader answers nil, as Rails' does, and its
 //! `to_param` nil with it; the slot keeps the unsaved sentinel.
@@ -75,11 +77,13 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             continue;
         };
         let specs = spec_kinds(lc);
+        let serialized: Vec<Symbol> =
+            crate::lower::serialize::serialize_decls(model).into_iter().map(|d| d.column).collect();
         let cols: Vec<(&Column, Kind)> = table
             .columns
             .iter()
             .filter_map(|c| {
-                if c.primary_key || is_retypable(model, c) || model.enums.contains_key(&c.name) {
+                if c.primary_key || is_retypable(model, c) || model.enums.contains_key(&c.name) || serialized.contains(&c.name) {
                     return None;
                 }
                 let kind = specs.iter().find(|(n, _)| n == c.name.as_str())?.1?;

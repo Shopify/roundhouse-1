@@ -1050,6 +1050,16 @@ module ActiveRecord
       _default_scoped? && (@_unscoped_depth.nil? || @_unscoped_depth == 0)
     end
 
+    # A join onto this model (`Shelf.joins(:docs)`) carries its default
+    # scope's conditions in the ON clause, as Rails' join scope does:
+    # `lower::scope_chain` appends this to the join it renders. Empty
+    # when no default scope applies or it has no conditions.
+    def self._join_scope_sql
+      return "" unless _default_scope_applies?
+      clauses = ActiveRecord::Relation.new(self).where_clauses
+      clauses.empty? ? "" : " AND " + clauses.join(" AND ")
+    end
+
     # `Model.unscoped` is a relation without the default scope;
     # `Model.unscoped { ... }` runs the block with the class's own finders,
     # relations and `new` unscoped.

@@ -99,28 +99,28 @@ module ActiveRecord
       self
     end
 
-    # Rails' `Relation#new` / `build` / `create` / `create!`: a record of
-    # the model with the relation's scope attributes, under the
-    # relation's default scoping (an unscoped relation's record gets no
-    # default-scope attributes).
-    def new(attrs = {})
+    # Rails' `Relation#build` / `create` / `create!`: a record of the
+    # model with the relation's scope attributes, under the relation's
+    # default scoping (an unscoped relation's record gets no
+    # default-scope attributes). Rails' `Relation#new` is this `build`:
+    # there is no `new` here (the NO `new` HERE note below explains why),
+    # so `lower::default_scope` calls `build` for an `X.unscoped` chain's
+    # `new`, and `scope_chain` builds a typed relation's through the
+    # model.
+    def build(attrs = {})
       merged = @scope_attributes.empty? ? attrs : @scope_attributes.merge(attrs)
       return @model.new(merged) if @default_scoped
       @model.unscoped { @model.new(merged) }
     end
 
-    def build(attrs = {})
-      new(attrs)
-    end
-
     def create(attrs = {})
-      record = new(attrs)
+      record = build(attrs)
       record.save
       record
     end
 
     def create!(attrs = {})
-      record = new(attrs)
+      record = build(attrs)
       raise RecordInvalid, record unless record.save
       record
     end
@@ -222,7 +222,7 @@ module ActiveRecord
 
     # `where(hash)` / `where("raw sql")` / `where("a = ? AND b = ?", x, y)`.
     def where(condition = nil, *args)
-      add_condition(condition, args, false)
+      add_condition(condition, args, false, true)
       self
     end
 
@@ -301,12 +301,16 @@ module ActiveRecord
     # condition pushes none. `find_by` is the caller that needs the
     # answer: it borrows a predicate and gives it back, so it has to
     # know whether there is one to pop. The chain methods ignore it.
-    def add_condition(condition, args, negate)
+    #
+    # `note` (`where`, not `find_by`'s borrowed predicate): the hash's
+    # equalities also seed records built through the relation
+    # (`note_equality`).
+    def add_condition(condition, args, negate, note = false)
       own_lists
       @records = nil
       return false if condition.nil?
       sql = if condition.is_a?(Hash)
-        hash_conditions(condition)
+        hash_conditions(condition, note)
       else
         substitute_binds(condition.to_s, args)
       end
@@ -369,7 +373,7 @@ module ActiveRecord
     # operation under a second name (bodies duplicated rather than
     # splat-forwarded — strict targets inline, not forward, rest args).
     def where!(condition = nil, *args)
-      add_condition(condition, args, false)
+      add_condition(condition, args, false, true)
       self
     end
 
@@ -929,8 +933,14 @@ module ActiveRecord
       records = if @select_sql.nil?
         @model._hydrate_all(select_sql_with(@model._columns_sql))
       else
+        # A partial projection: the columns it left out answer
+        # `has_attribute?` false (`Base#_note_unloaded`).
         rows = ActiveRecord.adapter.select_rows(to_sql)
-        rows.map { |row| @model.instantiate(row) }
+        rows.map do |row|
+          record = @model.instantiate(row)
+          record._note_unloaded(row)
+          record
+        end
       end
       if @includes.length > 0 && !@skip_preloading && records.length > 0
         pending = ActiveRecord::PendingPreload.new(@model, records, @includes.dup)
@@ -1976,7 +1986,7 @@ module ActiveRecord
     # A hash of conditions ANDed: `{is_deleted: false, user_id: 3}` ->
     # `is_deleted = 0 AND user_id = 3`. Array value -> `IN`, nil ->
     # `IS NULL`, nested Hash -> qualified `table.col = ...`.
-    def hash_conditions(hash)
+    def hash_conditions(hash, note = false)
       parts = []
       hash.each do |key, val|
         if val.is_a?(Hash)
@@ -1985,7 +1995,7 @@ module ActiveRecord
           end
         else
           # An alias names its column (`where(subdomain:)`).
-          parts << column_predicate(@model._attribute_name(key.to_s), val)
+          parts << column_predicate(@model._attribute_name(key.to_s), val, note)
         end
       end
       parts.join(" AND ")
@@ -2007,7 +2017,7 @@ module ActiveRecord
       end.join(".")
     end
 
-    def column_predicate(col, val)
+    def column_predicate(col, val, note = false)
       qcol = col.include?(".") ? quote_column_path(col) : "#{@table}.#{quote_column_path(col)}"
       # A column of this model with a declared type (`attribute`) binds
       # what the type serializes, as Rails' QueryAttribute does.
@@ -2034,6 +2044,7 @@ module ActiveRecord
         ids = ids.map { |x| @model._attribute_for_database(own, x) } unless own.nil?
         "#{qcol} IN (#{escape_list(ids)})"
       elsif val.nil?
+        note_equality(own, nil) if note
         "#{qcol} IS NULL"
       elsif val.is_a?(Base)
         # A whole record under a (fk-renamed) key reads its id —
@@ -2041,10 +2052,25 @@ module ActiveRecord
         # static `v && v.id` narrowing was dropped in favor of this
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
+        note_equality(own, val.id) if note
         "#{qcol} = #{ActiveRecord.adapter.escape_value(own.nil? ? val.id : @model._attribute_for_database(own, val.id))}"
       else
+        note_equality(own, val) if note
         "#{qcol} = #{ActiveRecord.adapter.escape_value(own.nil? ? val : @model._attribute_for_database(own, val))}"
       end
+    end
+
+    # Rails' `scope_for_create` reads a relation's `where` equalities on
+    # its own columns, so `Doc.where(name: "q").new` and
+    # `shelf.docs.where(name: "r").create!` come back with `name` set. A
+    # list, relation or joined-table value only filters, as in Rails.
+    # Reassigned rather than written into: a spawned relation shares the
+    # Hash (`copy_scope_attributes`).
+    def note_equality(own, val)
+      return nil if own.nil?
+      col = own.to_sym
+      @scope_attributes = @scope_attributes.merge({ col => val }) if @model.schema_columns.include?(col)
+      nil
     end
 
     # For positional binds, split only the original `?` placeholders,

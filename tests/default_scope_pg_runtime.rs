@@ -54,6 +54,10 @@ end
 
 const SHELF: &str = r#"class Shelf < ApplicationRecord
   has_many :docs
+
+  def self.doc_counts
+    Shelf.includes(:docs).order(:id).map { |s| s.docs.size }.join(",")
+  end
 end
 "#;
 
@@ -115,6 +119,15 @@ const PROBE: &str = r##"class DefaultScopeProbe
     out << "association: #{shelf.docs.count} #{names(shelf.docs)} #{shelf.docs.where(name: "gone").exists?}"
     out << "arel: #{Doc.listed}"
     out << "belongs_to: #{gone.shelf == shelf}"
+    out << "preload: #{names(Shelf.preload(:docs).find(shelf.id).docs)} #{Shelf.includes(:docs).where(id: shelf.id).to_a.first.docs.size} #{Shelf.doc_counts}"
+    out << "joins: #{Shelf.joins(:docs).count}"
+    partial = Doc.select(:id, :name).find_by(name: "a")
+    missing = begin
+      partial.is_not_deleted.inspect
+    rescue NoMethodError => e
+      e.class.name
+    end
+    out << "select: #{partial.name} #{partial.has_attribute?(:is_not_deleted)} #{missing}"
     gone.update!(is_not_deleted: true)
     out << "restored: #{Doc.count} #{names(Doc.where(shelf_id: shelf.id))}"
     Tag.create!(title: "c", status: "live")
@@ -127,14 +140,33 @@ const PROBE: &str = r##"class DefaultScopeProbe
     Pinned.create!(title: "x")
     Pinned.unscoped.create!(title: "w", status: "draft")
     out << "sti: #{Pinned.new.status} #{Pinned.all.map(&:title).join(",")} #{Pinned.count} #{Note.count} #{Pinned.unscoped.count} #{Note.unscoped.count} #{Pinned.first.title}"
+    q = Doc.where(name: "q").new
+    made = shelf.docs.where(name: "r").create!
+    out << "where-new: #{q.name} #{q.is_not_deleted.inspect} #{made.shelf_id == shelf.id} #{made.name} #{Doc.where(name: %w[a b]).new.name.inspect} #{Doc.where.not(name: "q").new.name.inspect} #{Doc.where(is_not_deleted: false).new.is_not_deleted.inspect} #{Doc.unscoped.where(name: "u").new.is_not_deleted.inspect} #{Tag.where(status: "s").build.status} #{Doc.where(name: nil).new.name.inspect}"
+    bare = Shelf.create!
+    Doc.unscoped.create!(name: "x", shelf: bare, is_not_deleted: false)
+    out << "left-joins: #{Shelf.left_joins(:docs).where(docs: { id: nil }).count} #{Shelf.left_outer_joins(:docs).count} #{Shelf.joins(:docs).where(id: bare.id).count}"
     out
   end
 end
 "##;
 
+/// A controller action's chain is the kind the arel pass folds into
+/// direct SQL, whose batched preload would skip the target's default
+/// scope. The emitted action must keep the preload on the relation.
+/// (Here `scope_chain` roots the chain on the relation before arel sees
+/// it; `default_scope::scoped_preload` is the arel pass's own guard.)
+const SHELVES_CONTROLLER: &str = r#"class ShelvesController < ApplicationController
+  def index
+    @shelves = Shelf.includes(:docs).order(:id)
+    render plain: @shelves.map { |s| s.docs.size }.join(",")
+  end
+end
+"#;
+
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 16] = [
     "new: true nil",
     "all: 2 a,b 0 false",
     "find: ActiveRecord::RecordNotFound nil a",
@@ -142,10 +174,15 @@ const EXPECTED: [&str; 11] = [
     "association: 2 a,b false",
     "arel: a,b",
     "belongs_to: true",
+    "preload: a,b 2 2",
+    "joins: 2",
+    "select: a false ActiveModel::MissingAttributeError",
     "restored: 3 a,b,gone",
     "order: a,b,c a c c",
     "extending: b,c 2",
     "sti: live x,y 2 3 3 4 x",
+    "where-new: q true true r nil nil false nil s nil",
+    "left-joins: 1 5 0",
 ];
 
 /// What native Rails requires, in order.
@@ -160,7 +197,7 @@ const LOADS: [&str; 8] = [
     "app/models/default_scope_probe",
 ];
 
-const FILES: [(&str, &str); 12] = [
+const FILES: [(&str, &str); 14] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -173,6 +210,8 @@ const FILES: [(&str, &str); 12] = [
     ("app/models/note.rb", NOTE),
     ("app/models/pinned.rb", PINNED),
     ("app/models/default_scope_probe.rb", PROBE),
+    ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
+    ("app/controllers/shelves_controller.rb", SHELVES_CONTROLLER),
 ];
 
 fn overlay() -> emit_and_run::Overlay {
@@ -201,4 +240,6 @@ fn default_scope_matches_native_rails_on_postgresql() {
     assert_eq!(native, EXPECTED, "native");
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
     assert_eq!(emitted_lines, native, "emitted");
+    let controller = std::fs::read_to_string(emitted.join("app/controllers/shelves_controller.rb")).expect("controller");
+    assert!(controller.contains("includes(:docs)"), "the arel pass folded a default-scoped preload:\n{controller}");
 }

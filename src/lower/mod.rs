@@ -387,6 +387,11 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // every later pass already reads; consumes nothing any pass
     // produces, so no ordering constraints.
     ("sti_scope", &[]),
+    // `X.unscoped.<chain>.new` -> `.build` (Rails' `Relation#new`); the
+    // runtime Relation has no `new`. Renames a send nothing else keys
+    // on; after `sti_scope`, whose `Sub.unscoped` rewrite keeps the
+    // `unscoped` root this pass reads.
+    ("unscoped_build", &["sti_scope"]),
     // `@ivar = <Relation>` → `@ivar = <Relation>.to_a` where the same
     // ivar is an Array on another branch. Reads assignment value TYPES
     // stamped by analysis and writes a `to_a` send no other pass keys
@@ -836,6 +841,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("where_range_split");
     sti_scope::apply_sti_scope_lowering(app);
     ran!("sti_scope");
+    default_scope::apply_unscoped_build(app);
+    ran!("unscoped_build");
     relation_ivar_materialize::apply_relation_ivar_materialize(app);
     ran!("relation_ivar_materialize");
     defined_ivar_memo::apply_defined_ivar_memo_lowering(app);

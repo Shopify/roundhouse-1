@@ -115,6 +115,7 @@ module ActiveRecord
     def self._apply_default_scope: (Relation relation) -> Relation
     def self._default_scope_attributes: () -> Hash[Symbol, untyped]
     def self._default_scope_applies?: () -> bool
+    def self._join_scope_sql: () -> String
     def self.unscoped: () ?{ () -> untyped } -> untyped
     def _seed_default_scope_attributes: (Hash[Symbol, untyped] attrs) -> void
     def self.count: () -> Integer

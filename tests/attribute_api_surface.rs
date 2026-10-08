@@ -18,6 +18,7 @@ const SCHEMA: &str = r#"ActiveRecord::Schema[8.0].define(version: 1) do
     t.text "notes"
     t.boolean "live"
     t.decimal "price"
+    t.decimal "cost", precision: 10, scale: 2
   end
 end
 "#;
@@ -95,7 +96,10 @@ fn the_schema_column_types_follow_the_postgresql_type_map() {
         r#""shop_id" => [:integer, 4]"#,
         r#""notes" => [:text, nil]"#,
         r#""live" => [:boolean, nil]"#,
-        r#""price" => [:unported, "ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Decimal"]"#,
+        // OID::Decimal's precision and scale, nil where the column
+        // declares neither (native `type_for_attribute`).
+        r#""price" => [:decimal, nil, nil]"#,
+        r#""cost" => [:decimal, 10, 2]"#,
     ] {
         assert!(body.contains(entry), "{entry} missing from {body}");
     }

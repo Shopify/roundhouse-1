@@ -1169,7 +1169,18 @@ pub struct AssocRegistry {
     /// association names produces different flattened names, which is
     /// also correct.
     assoc_extension: crate::det::HashSet<(Symbol, Symbol)>,
+    /// (model, association name) -> per hop of its join tail, the
+    /// default-scoped model the hop joins (`lower::default_scope`), or
+    /// `None`. Present only when some hop is one: Rails puts that
+    /// model's default-scope conditions in the hop's ON clause, so the
+    /// rendered join appends `Model._join_scope_sql` there
+    /// ([`join_spec_sql`]).
+    join_scoped: HashMap<(ClassId, Symbol), Vec<Option<ClassId>>>,
 }
+
+/// Marks where [`join_spec_sql`] appends a default-scoped model's join
+/// conditions; [`join_literal`] turns each into `#{Model._join_scope_sql}`.
+const JOIN_SCOPE_MARK: char = '\u{1}';
 
 impl AssocRegistry {
     /// The table `model` stores in. Falls back to Rails' derivation for
@@ -1184,6 +1195,29 @@ impl AssocRegistry {
     }
     fn join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<&String> {
         self.join_tails.get(&(model.clone(), assoc.clone()))
+    }
+    /// The join tail with a [`JOIN_SCOPE_MARK`]ed model name after each
+    /// hop that joins a default-scoped model. A `:through` tail's second
+    /// hop starts at its ` INNER JOIN ` (`build_assoc_registry`).
+    fn scoped_join_tail(&self, model: &ClassId, assoc: &Symbol) -> Option<String> {
+        let tail = self.join_tail(model, assoc)?;
+        let Some(hops) = self.join_scoped.get(&(model.clone(), assoc.clone())) else {
+            return Some(tail.clone());
+        };
+        let mark = |scoped: &Option<ClassId>| match scoped {
+            Some(m) => format!("{JOIN_SCOPE_MARK}{}{JOIN_SCOPE_MARK}", m.0.as_str()),
+            None => String::new(),
+        };
+        let pieces: Vec<&str> = if hops.len() == 2 {
+            tail.splitn(2, " INNER JOIN ").collect()
+        } else {
+            vec![tail.as_str()]
+        };
+        if pieces.len() != hops.len() {
+            return Some(tail.clone());
+        }
+        let marked: Vec<String> = pieces.iter().zip(hops).map(|(p, h)| format!("{p}{}", mark(h))).collect();
+        Some(marked.join(" INNER JOIN "))
     }
     fn belongs_to_fk(&self, model: &ClassId, assoc: &Symbol) -> Option<&Symbol> {
         self.belongs_to_fk.get(&(model.clone(), assoc.clone()))
@@ -1299,8 +1333,37 @@ pub fn build_assoc_registry(models: &[Model]) -> AssocRegistry {
     for m in models {
         reg.tables.insert(m.name.clone(), m.table.0.as_str().to_string());
     }
+    let scoped = |c: &ClassId| {
+        models
+            .iter()
+            .find(|o| &o.name == c)
+            .is_some_and(|o| crate::lower::default_scope::applies(o, models))
+            .then(|| c.clone())
+    };
     for m in models {
         let own = reg.table_for(&m.name);
+        for a in m.associations() {
+            match a {
+                Association::BelongsTo { name, target, .. }
+                | Association::HasMany { name, target, through: None, .. }
+                | Association::HasOne { name, target, .. } => {
+                    if let Some(t) = scoped(target) {
+                        reg.join_scoped.insert((m.name.clone(), name.clone()), vec![Some(t)]);
+                    }
+                }
+                Association::HasMany { name, target, through: Some(thr_name), .. } => {
+                    let thr = m.associations().find_map(|a| match a {
+                        Association::HasMany { name, target, .. } if name == thr_name => Some(target),
+                        _ => None,
+                    });
+                    let hops = vec![thr.and_then(|t| scoped(t)), scoped(target)];
+                    if hops.iter().any(Option::is_some) {
+                        reg.join_scoped.insert((m.name.clone(), name.clone()), hops);
+                    }
+                }
+                _ => {}
+            }
+        }
         for a in m.associations() {
             match a {
                 Association::BelongsTo { name, target, foreign_key, .. } => {
@@ -2786,7 +2849,7 @@ fn range_clause(col: &str, e: &Expr, binds: &mut Vec<Expr>) -> Option<String> {
 fn join_spec_sql(model: &ClassId, spec: &Expr, kind: &str, ctx: &Ctx) -> Option<String> {
     match &*spec.node {
         ExprNode::Lit { value: Literal::Sym { value } } => {
-            Some(format!("{kind} {}", ctx.assocs.join_tail(model, value)?))
+            Some(format!("{kind} {}", ctx.assocs.scoped_join_tail(model, value)?))
         }
         ExprNode::Hash { entries, .. } if !entries.is_empty() => {
             let mut out = String::new();
@@ -2794,7 +2857,7 @@ fn join_spec_sql(model: &ClassId, spec: &Expr, kind: &str, ctx: &Ctx) -> Option<
                 let ExprNode::Lit { value: Literal::Sym { value: name } } = &*k.node else {
                     return None;
                 };
-                let head = ctx.assocs.join_tail(model, name)?;
+                let head = ctx.assocs.scoped_join_tail(model, name)?;
                 let next = ctx.assocs.assoc_target(model, name)?.clone();
                 if !out.is_empty() {
                     out.push(' ');
@@ -2819,6 +2882,38 @@ fn join_spec_sql(model: &ClassId, spec: &Expr, kind: &str, ctx: &Ctx) -> Option<
     }
 }
 
+/// The rendered join: its SQL as a String literal, or, where a hop
+/// joins a default-scoped model, `"…ON cond#{Model._join_scope_sql}…"`.
+fn join_literal(sql: String, span: crate::span::Span) -> ExprNode {
+    if !sql.contains(JOIN_SCOPE_MARK) {
+        return ExprNode::Lit { value: Literal::Str { value: sql } };
+    }
+    let parts = sql
+        .split(JOIN_SCOPE_MARK)
+        .enumerate()
+        .filter(|(i, text)| i % 2 == 1 || !text.is_empty())
+        .map(|(i, text)| {
+            if i % 2 == 0 {
+                return crate::expr::InterpPart::Text { value: text.to_string() };
+            }
+            let model = syn(span, ExprNode::Const { path: text.split("::").map(Symbol::from).collect() });
+            crate::expr::InterpPart::Expr {
+                expr: syn(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(model),
+                        method: Symbol::from("_join_scope_sql"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+            }
+        })
+        .collect();
+    ExprNode::StringInterp { parts }
+}
+
 fn lower_relation_args(
     model: &ClassId,
     method: &Symbol,
@@ -2831,7 +2926,7 @@ fn lower_relation_args(
             let kind = if method.as_str() == "joins" { "INNER JOIN" } else { "LEFT OUTER JOIN" };
             for a in args {
                 if let Some(sql) = join_spec_sql(model, a, kind, ctx) {
-                    *a.node = ExprNode::Lit { value: Literal::Str { value: sql } };
+                    *a.node = join_literal(sql, a.span);
                 }
             }
         }
