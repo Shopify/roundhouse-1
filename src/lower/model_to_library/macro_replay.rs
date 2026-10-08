@@ -492,7 +492,7 @@ impl<'s, 'a> Walk<'s, 'a> {
         match &*expr.node {
             ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
                 self.expr(value, aliases)?;
-                if matches!(&*value.node, ExprNode::SelfRef) || matches!(&*value.node, ExprNode::Var { name: v, .. } if aliases.iter().any(|a| a == v.as_str())) {
+                if self.is_self(value, aliases) {
                     aliases.push(name.as_str().to_string());
                 } else {
                     aliases.retain(|a| a != name.as_str());
@@ -581,9 +581,12 @@ impl<'s, 'a> Walk<'s, 'a> {
         }
     }
 
+    /// `self`, a local bound to it, or either under an inline cast
+    /// (Core's `untyped_self = self #: as untyped`).
     fn is_self(&self, recv: &Expr, aliases: &[String]) -> bool {
         match &*recv.node {
             ExprNode::SelfRef => true,
+            ExprNode::Cast { value, .. } => self.is_self(value, aliases),
             ExprNode::Var { name, .. } => aliases.iter().any(|a| a == name.as_str()),
             _ => false,
         }

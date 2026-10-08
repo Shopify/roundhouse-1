@@ -69,6 +69,11 @@ end
       belongs_to(name, optional: true, autosave: false)
       define_method("#{name}_ro") { send(name) }
     end
+
+    def keyed_by(*columns)
+      untyped_self = self #: as untyped
+      untyped_self.query_constraints(*columns) if ENV["KEYED"]
+    end
   end
 end
 "##,
@@ -260,13 +265,14 @@ fn app_class_macros_replay_like_activerecord() {
     assert_eq!(stdout, native(), "emitted vs native activerecord");
 }
 
-/// A macro that reaches model DSL, an `extend` whose hook calls a method
+/// A macro that reaches model DSL (directly, or through a cast alias of
+/// `self` under a runtime condition), an `extend` whose hook calls a method
 /// the lowered class lacks, and a macro of that module are refused, each
 /// naming the reason.
 #[test]
 fn macros_the_lowered_model_cannot_run_are_refused_with_the_reason() {
     let app = app()
-        .edit("app/models/post.rb", "  belongs_to :author\n", "  belongs_to :author\n  readonly_ref :author\n")
+        .edit("app/models/post.rb", "  belongs_to :author\n", "  belongs_to :author\n  readonly_ref :author\n  keyed_by :id\n")
         .write(
             "app/models/concerns/attributed.rb",
             "module Attributed\n  def self.extended(base)\n    base.class_attribute(:attributed, default: {})\n  end\n\n  def attribute_flag(name)\n    self.attributed = attributed.merge(name => true)\n  end\nend\n",
@@ -275,10 +281,11 @@ fn macros_the_lowered_model_cannot_run_are_refused_with_the_reason() {
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     for expected in [
         "readonly_ref not supported (all targets): model macro call on `Post` not lowered; `readonly_ref` reaches `belongs_to`, which the lowered model declares statically from its body, not at class-body run time",
+        "keyed_by not supported (all targets): model macro call on `Post` not lowered; `keyed_by` reaches `query_constraints`, which the lowered model declares statically from its body, not at class-body run time",
         "extend not supported (all targets): model macro call on `Author` not lowered; `extend Attributed`: `Attributed.extended` calls `class_attribute`, which the lowered `Author` does not define",
         "attribute_flag not supported (all targets): model macro call on `Author` not lowered; `attribute_flag` comes from `Attributed`, whose extend is not replayed",
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "{expected}: {errors:#?}");
     }
-    assert_eq!(errors.len(), 3, "{errors:#?}");
+    assert_eq!(errors.len(), 4, "{errors:#?}");
 }
