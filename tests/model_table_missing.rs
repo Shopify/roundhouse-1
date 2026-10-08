@@ -39,5 +39,5 @@ fn a_concrete_model_without_a_schema_table_is_reported() {
         .collect();
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(errors.iter().any(|e| e.contains("`Gizmo` reads table `gizmos`")), "{errors:?}");
-    assert!(errors.iter().any(|e| e.contains("`Report` reads table `reports`")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("`Report` reads table `reports` on database `analytics`,")), "{errors:?}");
 }
