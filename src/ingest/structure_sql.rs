@@ -33,6 +33,7 @@
 
 use crate::det::HashSet;
 
+use crate::schema::generated::GeneratedExpressionDialect;
 use crate::schema::{
     Column, ColumnType, ForeignKey, GeneratedColumn, GeneratedColumnStorage, Index,
     ReferentialAction, Schema, Table,
@@ -68,7 +69,24 @@ pub fn recorded_migration_versions(source: &[u8]) -> HashSet<String> {
     out
 }
 
+/// Ingest a structure dump with the Portable generated-expression grammar.
+/// PostgreSQL-only casts require the explicit DDL-dialect entry point.
 pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
+    ingest_structure_sql_with_generated_expression_dialect(
+        source,
+        file,
+        GeneratedExpressionDialect::Portable,
+    )
+}
+
+/// Ingest a PostgreSQL structure dump with an explicit generated-expression
+/// grammar. The default [`ingest_structure_sql`] remains Portable for app
+/// analysis and current target emission.
+pub fn ingest_structure_sql_with_generated_expression_dialect(
+    source: &[u8],
+    file: &str,
+    dialect: GeneratedExpressionDialect,
+) -> IngestResult<Schema> {
     let text = String::from_utf8_lossy(source).into_owned();
     super::sources::register(file, &text);
 
@@ -89,7 +107,15 @@ pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
         if stmt.is_empty() {
             continue;
         }
-        dispatch_statement(stmt, file, &mut schema, &mut enum_types, &mut gaps, &mut seen_heads);
+        dispatch_statement(
+            stmt,
+            file,
+            &mut schema,
+            &mut enum_types,
+            &mut gaps,
+            &mut seen_heads,
+            dialect,
+        );
     }
 
     if !gaps.is_empty() {
@@ -108,6 +134,7 @@ pub fn ingest_structure_sql(source: &[u8], file: &str) -> IngestResult<Schema> {
 // Statement dispatch
 // ---------------------------------------------------------------------
 
+/// Dispatch one top-level dump statement to its schema handler.
 fn dispatch_statement(
     stmt: &str,
     file: &str,
@@ -115,6 +142,7 @@ fn dispatch_statement(
     enum_types: &mut HashSet<String>,
     gaps: &mut Vec<IngestError>,
     seen_heads: &mut HashSet<String>,
+    dialect: GeneratedExpressionDialect,
 ) {
     // A child partition attached via `ALTER TABLE … ATTACH PARTITION
     // …` rather than declared `PARTITION OF` up front (the shape this
@@ -138,7 +166,7 @@ fn dispatch_statement(
     }
 
     if starts_with_ci(stmt, "CREATE TABLE") {
-        handle_create_table(stmt, file, schema, enum_types, gaps);
+        handle_create_table(stmt, file, schema, enum_types, gaps, dialect);
         return;
     }
     if starts_with_ci(stmt, "CREATE MATERIALIZED VIEW")
@@ -234,12 +262,14 @@ fn record_unmodeled(gaps: &mut Vec<IngestError>, seen_heads: &mut HashSet<String
 // CREATE TABLE
 // ---------------------------------------------------------------------
 
+/// Parse one `CREATE TABLE` and validate generated expressions under `dialect`.
 fn handle_create_table(
     stmt: &str,
     file: &str,
     schema: &mut Schema,
     enum_types: &HashSet<String>,
     gaps: &mut Vec<IngestError>,
+    dialect: GeneratedExpressionDialect,
 ) {
     // `CREATE TABLE child PARTITION OF parent FOR VALUES …` — the
     // parent's own CREATE TABLE already carries the columns, and this
@@ -334,7 +364,7 @@ fn handle_create_table(
         virtual_module: None,
         primary_key_columns,
     };
-    let invalid_generated = crate::schema::generated::validate_table(&table);
+    let invalid_generated = crate::schema::generated::validate_table_with_dialect(&table, dialect);
     for (column, reason) in &invalid_generated {
         gaps.push(IngestError::Unsupported {
             file: file.into(),
@@ -536,25 +566,42 @@ fn parse_column_def(
 }
 
 /// Keep only the negative type provenance that `ColumnType` cannot
-/// express. `inet`, `interval`, enums, `citext`, and fixed `character`
-/// spellings normalize to text-like Rust types for ordinary app typing,
-/// but are not admitted as portable operands/results in our generated
-/// text-expression subset. Unbounded `character varying`/`varchar` and
-/// `text` already normalize faithfully and need no marker; a text typmod
-/// is marked because this IR does not retain it.
+/// express. Ordinary app typing deliberately strips schema qualifiers,
+/// so a custom qualified domain named `text`, `varchar`, `json`, or
+/// `jsonb` can normalize to a built-in-looking `ColumnType`. Generated
+/// expressions admit only bare built-ins or the real `pg_catalog` names
+/// `text`, `varchar`, `json`, and `jsonb`; in particular,
+/// `pg_catalog.character varying` is not a qualified built-in spelling.
+/// Quoted qualified names are also rejected because type normalization
+/// lowercases their contents without preserving SQL identifier case.
+/// Other aliases (`inet`, `interval`, enums, `citext`, and fixed
+/// `character`) also normalize to text-like types without portable text
+/// semantics. A text typmod is marked because this IR does not retain it.
 fn has_nonportable_text_source_type(
     type_phrase: &str,
     enum_types: &HashSet<String>,
 ) -> bool {
-    let (mut base, first_type_modifier, _) = strip_parens_capture_nums(type_phrase);
-    if let Some(dot) = base.rfind('.') {
-        base = base[dot + 1..].to_string();
-    }
+    let (base, first_type_modifier, _) = strip_parens_capture_nums(type_phrase);
+    let (qualifier, base_name) = base
+        .rsplit_once('.')
+        .map(|(schema, name)| (Some(schema), name))
+        .unwrap_or((None, base.as_str()));
+    let text_or_json_alias = matches!(
+        base_name,
+        "text" | "varchar" | "character varying" | "character" | "char" | "bpchar"
+            | "citext" | "json" | "jsonb" | "inet" | "cidr" | "macaddr"
+            | "macaddr8" | "interval"
+    );
+    let qualified_non_builtin = qualifier.is_some_and(|schema| {
+        !schema.eq_ignore_ascii_case("pg_catalog")
+            || !matches!(base_name, "text" | "varchar" | "json" | "jsonb")
+    });
     matches!(
-        base.as_str(),
+        base_name,
         "inet" | "cidr" | "macaddr" | "macaddr8" | "interval" | "character" | "char" | "bpchar" | "citext"
-    ) || enum_types.contains(&base)
-        || (base == "text" && first_type_modifier.is_some())
+    ) || enum_types.contains(base_name)
+        || (base_name == "text" && first_type_modifier.is_some())
+        || (text_or_json_alias && qualified_non_builtin)
 }
 
 fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> IngestError {

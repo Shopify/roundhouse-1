@@ -233,6 +233,10 @@ pub fn render_schema_statements_for(schema: &Schema, dialect: Dialect) -> Result
 /// invokes this gate before emitting any files; the PostgreSQL renderer
 /// also checks it directly.
 pub fn validate_schema_for_dialect(schema: &Schema, dialect: Dialect) -> Result<(), String> {
+    let expression_dialect = match dialect {
+        Dialect::Sqlite => crate::schema::generated::GeneratedExpressionDialect::Portable,
+        Dialect::Postgres => crate::schema::generated::GeneratedExpressionDialect::Postgres,
+    };
     for table in schema.tables.values() {
         if let Some(vm) = &table.virtual_module {
             if dialect != Dialect::Sqlite {
@@ -243,7 +247,9 @@ pub fn validate_schema_for_dialect(schema: &Schema, dialect: Dialect) -> Result<
                 ));
             }
         }
-        for (column, reason) in crate::schema::generated::validate_table(table) {
+        for (column, reason) in
+            crate::schema::generated::validate_table_with_dialect(table, expression_dialect)
+        {
             return Err(format!("generated column unsupported: {}.{column}: {reason}", table.name.as_str()));
         }
         if dialect == Dialect::Postgres {

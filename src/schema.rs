@@ -70,7 +70,9 @@ pub struct Column {
     /// `character`) normalize to `String { limit: None }` or `Text` for
     /// Roundhouse's ordinary-column typing. `Some(false)` records that
     /// the original type does not have the portable text semantics
-    /// required by the supported generated-expression grammar. `None`
+    /// required by the supported generated-expression grammar. The same
+    /// negative evidence also guards custom-qualified JSON types after
+    /// normalization: their built-in JSON semantics are not proven. `None`
     /// means the normalized `col_type` is sufficient evidence. This is
     /// sparse so well-represented ordinary types retain their serialized form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
