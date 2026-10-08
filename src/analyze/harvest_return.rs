@@ -18,6 +18,7 @@ use crate::ident::Symbol;
 use crate::ty::Ty;
 
 use super::body;
+use super::cycles::{depth, limit, DEPTH_FLOOR};
 
 fn gradual_nil() -> Ty {
     body::union_of(Ty::Nil, Ty::Untyped)
@@ -90,9 +91,17 @@ fn untie(ty: &Ty, prior: &Ty) -> Ty {
 }
 
 /// A return that nests the previous round's return is a recursive method
-/// (`value.map { |v| sanitize(v) }`) unrolled one level more: left alone it
-/// doubles every round and never converges. The nested copy is cut to
-/// `untyped`. A scalar previous return is too weak a witness to cut on.
+/// (`value.map { |v| sanitize(v) }`, or `{ key => sub_set.serialize! }`
+/// through another instance) unrolled one level more: left alone it
+/// doubles every round and never converges. It is cut as the cycle
+/// widening's k-limit cuts a slot that keeps nesting deeper: below the
+/// larger of [`DEPTH_FLOOR`] and the previous return's depth every
+/// container becomes `untyped`, and the levels above keep their types, so
+/// the return settles at that depth. (Cutting the nested copy itself to
+/// `untyped` settled on the first unrolling and lost the levels the
+/// k-limit keeps: `NestedFieldSet#serialize!`'s hashes held `untyped`
+/// rather than the nested sets' Arrays.) A scalar previous return is too
+/// weak a witness to cut on.
 fn untie_recursive_return(existing: &Ty, new: &Ty) -> Option<Ty> {
     if !matches!(
         existing,
@@ -102,8 +111,11 @@ fn untie_recursive_return(existing: &Ty, new: &Ty) -> Option<Ty> {
     {
         return None;
     }
-    let untied = untie(new, existing);
-    (untied != *new).then_some(untied)
+    if untie(new, existing) == *new {
+        return None;
+    }
+    let keep = depth(existing).max(DEPTH_FLOOR);
+    (depth(new) > keep).then(|| limit(new.clone(), keep))
 }
 
 enum HarvestWrite {
@@ -321,43 +333,77 @@ mod tests {
         Ty::Union { variants }
     }
 
+    /// Stores `first`, then the body type `unroll` builds from the stored
+    /// return (the next round's harvest), until the return stops changing.
+    /// The return after the first unrolling, and the settled one.
+    fn settle(method: &str, first: Ty, unroll: impl Fn(&Ty) -> Ty) -> (Ty, Ty) {
+        let method = Symbol::from(method);
+        let mut table = HashMap::default();
+        insert_inferred_return(&mut table, &method, first);
+        let mut once = None;
+        for _ in 0..12 {
+            let before = table[&method].clone();
+            insert_inferred_return(&mut table, &method, unroll(&before));
+            let now = table[&method].clone();
+            once.get_or_insert_with(|| now.clone());
+            if now == before {
+                return (once.unwrap(), now);
+            }
+        }
+        panic!("the recursive return kept unrolling: {:?}", table[&method]);
+    }
+
     // `def sanitize(v) = v.is_a?(Array) ? v.map { sanitize(_1) } : v.to_s`
     #[test]
-    fn insert_recursive_return_that_nests_its_previous_round_keeps_the_previous() {
-        let method = Symbol::from("sanitize");
-        let mut table = HashMap::default();
+    fn insert_recursive_return_that_nests_its_previous_round_settles_at_the_depth_floor() {
+        let sanitize = |r: &Ty| union(vec![Ty::Str, arr(r.clone())]);
         let first = union(vec![Ty::Str, arr(Ty::Untyped)]);
-        insert_inferred_return(&mut table, &method, first.clone());
-        insert_inferred_return(&mut table, &method, union(vec![Ty::Str, arr(first.clone())]));
-        assert_eq!(table.get(&method), Some(&first));
+        let (once, settled) = settle("sanitize", first.clone(), sanitize);
+        // Above the floor an unrolling is kept: the elements' own shape
+        // is known.
+        assert_eq!(once, sanitize(&first));
+        // Below it, containers are `untyped`, and a further unrolling
+        // changes nothing.
+        let leaf = body::union_of(Ty::Str, Ty::Untyped);
+        assert_eq!(settled, sanitize(&sanitize(&sanitize(&sanitize(&leaf)))));
+        assert_eq!(depth(&settled), DEPTH_FLOOR);
     }
 
     #[test]
-    fn insert_recursive_return_flattened_into_a_union_is_cut() {
-        let method = Symbol::from("sanitize");
-        let mut table = HashMap::default();
+    fn insert_recursive_return_flattened_into_a_union_settles_at_the_depth_floor() {
+        // The previous return flattens into the union it joins, so it is
+        // never there as one term.
+        let unroll = |r: &Ty| {
+            let mut variants = match r {
+                Ty::Union { variants } => variants.clone(),
+                other => vec![other.clone()],
+            };
+            variants.push(Ty::Int);
+            union(vec![Ty::Str, sym_hash(union(variants))])
+        };
         let first = union(vec![Ty::Str, sym_hash(Ty::Untyped)]);
-        insert_inferred_return(&mut table, &method, first.clone());
-        let nested = union(vec![Ty::Str, sym_hash(union(vec![Ty::Str, sym_hash(Ty::Untyped), Ty::Int]))]);
-        insert_inferred_return(&mut table, &method, nested);
-        let cut = union(vec![Ty::Str, sym_hash(union(vec![Ty::Int, Ty::Untyped]))]);
-        assert_eq!(table.get(&method), Some(&cut));
-        insert_inferred_return(&mut table, &method, union(vec![Ty::Str, sym_hash(union(vec![Ty::Str, sym_hash(union(vec![Ty::Int, Ty::Untyped])), Ty::Int]))]));
-        assert_eq!(table.get(&method), Some(&cut));
+        let (once, settled) = settle("sanitize", first.clone(), unroll);
+        assert_eq!(once, unroll(&first));
+        assert_eq!(depth(&settled), DEPTH_FLOOR);
+        let Ty::Union { variants } = &settled else { panic!("{settled:?}") };
+        let Some(Ty::Hash { value, .. }) = variants.iter().find(|v| matches!(v, Ty::Hash { .. })) else {
+            panic!("{settled:?}")
+        };
+        let Ty::Union { variants } = &**value else { panic!("{settled:?}") };
+        assert!(variants.contains(&Ty::Int) && variants.iter().any(|v| matches!(v, Ty::Hash { .. })), "{settled:?}");
     }
 
     // `def wrap(v) = { nested: wrap(v.inner) }`
     #[test]
-    fn insert_recursive_return_nested_in_a_record_keeps_the_previous() {
-        let method = Symbol::from("wrap");
-        let record = |field: Ty| Ty::Record {
-            row: crate::ty::Row { fields: [(Symbol::from("nested"), field)].into_iter().collect(), rest: None },
+    fn insert_recursive_return_nested_in_a_record_settles_at_the_depth_floor() {
+        let record = |field: &Ty| Ty::Record {
+            row: crate::ty::Row { fields: [(Symbol::from("nested"), field.clone())].into_iter().collect(), rest: None },
         };
-        let mut table = HashMap::default();
-        let first = record(Ty::Untyped);
-        insert_inferred_return(&mut table, &method, first.clone());
-        insert_inferred_return(&mut table, &method, record(first.clone()));
-        assert_eq!(table.get(&method), Some(&first));
+        let first = record(&Ty::Untyped);
+        let (once, settled) = settle("wrap", first.clone(), record);
+        assert_eq!(once, record(&first));
+        assert_eq!(settled, record(&record(&record(&first))));
+        assert_eq!(depth(&settled), DEPTH_FLOOR);
     }
 
     #[test]
