@@ -250,6 +250,10 @@ fn diagnostic_signature(d: &roundhouse::analyze::Diagnostic) -> (String, String)
         DiagnosticKind::IngestUnsupported { detail } => {
             ("IngestUnsupported".into(), detail.clone())
         }
+        DiagnosticKind::AttributeTypeUnevaluated { model, attribute, .. } => (
+            "AttributeTypeUnevaluated".into(),
+            format!("{}.{}", model.as_str(), attribute.as_str()),
+        ),
     }
 }
 
