@@ -277,7 +277,19 @@ fn validate_activation(
                     let supplied = direct.contains(&id) && model.as_ref().is_some_and(|m| m.body.iter().any(|item| {
                         matches!(item, ModelBodyItem::Unknown { expr: carried, .. } if carried.span == expr.span)
                     }));
-                    if !supplied && reported.insert(expr.span) {
+                    if supplied {
+                        continue;
+                    }
+                    // A gathering Concern's splice also carries its
+                    // dependencies' `included` items into the model. This
+                    // refusal is that copy's one report: drop the copy, so
+                    // the per-model refusals neither report it a second
+                    // time nor lower the accessor.
+                    if let Some(model) = model.as_mut() {
+                        model.body.retain(|item| !matches!(item,
+                            ModelBodyItem::Unknown { expr: carried, .. } if carried.span == expr.span));
+                    }
+                    if reported.insert(expr.span) {
                         unwrap_or_record::<()>(Err(IngestError::Unsupported {
                             file: app.sources[(expr.span.file.0 - 1) as usize].path.clone(),
                             message: format!("concern attr_accessor on {}: only direct model inclusion is supported", owner.0),
