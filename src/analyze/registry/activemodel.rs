@@ -113,6 +113,19 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `merge!(other)`: another collection's errors, each with its
         // attribute; answers `other`'s Error objects.
         ("merge!", Ty::Array { elem: Box::new(error_ty.clone()) }),
+        // The queries by attribute (and type, and options), `delete`
+        // (the short messages removed, or nil) and `import(error,
+        // override_options)`, answered from the same records.
+        ("where", Ty::Array { elem: Box::new(error_ty.clone()) }),
+        ("key?", Ty::Bool),
+        ("has_key?", Ty::Bool),
+        ("exclude?", Ty::Bool),
+        ("of_kind?", Ty::Bool),
+        ("added?", Ty::Bool),
+        ("full_messages_for", str_arr()),
+        ("full_message", Ty::Str),
+        ("delete", Ty::Union { variants: vec![str_arr(), Ty::Nil] }),
+        ("import", Ty::Array { elem: Box::new(error_ty.clone()) }),
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }

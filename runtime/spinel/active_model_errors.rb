@@ -194,6 +194,119 @@ module ActiveModel
       objects(other)
     end
 
+    # Rails' `where(attribute, type = nil, **options)`: the Errors on
+    # `attribute` (of `type`, with `options`), in order.
+    def self.where(errors, attribute, type = nil, **options)
+      return errors.where(attribute, type, **options) unless errors.is_a?(Array)
+      attribute, type = normalize_arguments("where", attribute, type)
+      objects(errors).select { |error| error.match?(attribute, type, **options) }
+    end
+
+    # Rails' `include?(attribute)`, `key?` and `has_key?`: whether an
+    # error is on `attribute` (ActiveSupport's `exclude?` reaches it as
+    # `!include?`, `lower::exclude_predicate`).
+    def self.key?(errors, attribute)
+      return errors.key?(attribute) unless errors.is_a?(Array)
+      attribute = attribute.to_sym
+      objects(errors).any? { |error| error.match?(attribute) }
+    end
+
+    # Rails' `of_kind?(attribute, type = :invalid)`: an error of a
+    # Symbol type on `attribute`, or a message added as text.
+    def self.of_kind?(errors, attribute, type = :invalid)
+      return errors.of_kind?(attribute, type) unless errors.is_a?(Array)
+      attribute, type = normalize_arguments("of_kind?", attribute, type)
+      type.is_a?(Symbol) ? !where(errors, attribute, type).empty? : messages_for(errors, attribute).include?(type)
+    end
+
+    # Rails' `added?(attribute, type = :invalid, options = {})`: an error
+    # of a Symbol type with exactly these options (but the callback and
+    # `message:` ones), or a message added as text.
+    def self.added?(errors, attribute, type = :invalid, options = {})
+      return errors.added?(attribute, type, options) unless errors.is_a?(Array)
+      attribute, type = normalize_arguments("added?", attribute, type)
+      if type.is_a?(Symbol)
+        objects(errors).any? { |error| error.strict_match?(attribute, type, **options) }
+      else
+        messages_for(errors, attribute).include?(type)
+      end
+    end
+
+    # Rails' `messages_for(attribute, type = nil)`: the short messages.
+    def self.messages_for(errors, attribute, type = nil)
+      return errors.messages_for(attribute, type) unless errors.is_a?(Array)
+      where(errors, attribute, type).map(&:message)
+    end
+
+    # Rails' `full_messages_for(attribute, type = nil)`, frozen.
+    def self.full_messages_for(errors, attribute, type = nil)
+      return errors.full_messages_for(attribute, type) unless errors.is_a?(Array)
+      where(errors, attribute, type).map(&:full_message).freeze
+    end
+
+    # Rails' `full_message(attribute, message)`: the bare message on
+    # :base, else `"%{attribute} %{message}"` with the attribute
+    # humanized as the pushes humanize it (`add_humanized`).
+    def self.full_message(errors, attribute, message)
+      return errors.full_message(attribute, message) unless errors.is_a?(Array)
+      return message if attribute == :base
+      "#{ActiveSupport.humanize(attribute.to_s.tr(".", "_"))} #{message}"
+    end
+
+    # Rails' `delete(attribute, type = nil, **options)`: removes the
+    # matching errors, answering their short messages, or nil for none.
+    def self.delete(errors, attribute, type = nil, **options)
+      return errors.delete(attribute, type, **options) unless errors.is_a?(Array)
+      attribute, type = normalize_arguments("delete", attribute, type)
+      matches = []
+      each_record(errors) do |message, record|
+        error = Error.new(message, record)
+        matches << [message, record, error] if error.match?(attribute, type, **options)
+      end
+      pairs = pairs_of(errors)
+      matches.each do |message, record, _error|
+        errors.delete_at(errors.index { |m| m.equal?(message) })
+        pairs.delete_at(pairs.index { |pair| pair.equal?(record) })
+      end
+      messages = matches.map { |_message, _record, error| error.message }
+      messages.empty? ? nil : messages
+    end
+
+    # Rails' `import(error, override_options = {})`: `error` appended as a
+    # NestedError, whose attribute and type the options may override,
+    # with its raw type, options and short message, and this record's
+    # full message for them. Answers the Errors.
+    def self.import(errors, error, override_options = {})
+      return errors.import(error, override_options) unless errors.is_a?(Array)
+      override_options = override_options.dup
+      [:attribute, :type].each do |key|
+        override_options[key] = override_options[key].to_sym if override_options.key?(key)
+      end
+      attribute = override_options.fetch(:attribute) { error.attribute }
+      raw_type, options = error.is_a?(Error) ? error.recorded_detail : [error.raw_type, error.options]
+      short = error.message
+      prefix = attribute == :base ? "" : "#{ActiveSupport.humanize(attribute.to_s.tr(".", "_"))} "
+      add(errors, attribute, "#{prefix}#{short}", prefix, raw_type, options)
+      if override_options.key?(:type)
+        pairs_of(errors).last << override_options[:type]
+      elsif error.is_a?(Error)
+        type = error.recorded_type
+        pairs_of(errors).last << type if type
+      end
+      objects(errors)
+    end
+
+    # Rails' `normalize_arguments`: the attribute as a Symbol. A Proc type
+    # is called with the record, which the accumulator does not keep.
+    def self.normalize_arguments(read, attribute, type)
+      if type.respond_to?(:call)
+        raise "roundhouse: ActiveModel::Errors##{read}: a type that responds to `call` is called with the record, " \
+              "which the emitted record's errors do not keep"
+      end
+      [attribute.to_sym, type]
+    end
+    private_class_method :normalize_arguments
+
     # Rails' `objects` (`errors`): an Error for each message, in order.
     # A message pushed without its attribute is an Error whose readers
     # raise naming it.
@@ -232,7 +345,11 @@ module ActiveModel
         type
       end
 
+      # A NestedError's type may differ from its raw type (`import`'s
+      # `type:` override, kept sixth on the record).
       def type
+        override = keyed![5]
+        return override if override
         raw_type || :invalid
       end
 
@@ -280,6 +397,17 @@ module ActiveModel
 
       def hash
         attributes_for_hash.hash
+      end
+
+      # The raw type and options as recorded, unknown or not, for an
+      # import of this Error to carry.
+      def recorded_detail
+        [keyed![3], @record[4]]
+      end
+
+      # The type override `import` recorded, if any.
+      def recorded_type
+        keyed![5]
       end
 
       protected

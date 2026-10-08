@@ -214,6 +214,37 @@ const PROBE: &str = r##"class SurfaceProbe
        post.errors.sort_by { |error| error.attribute.to_s }.map(&:attribute),
        post.errors.to_a.size, post.errors.errors.map(&:attribute), post.errors.objects.map(&:message)]
     end
+    show(out, "queries by attribute") do
+      entry = Entry.new(title: "x", code: "abc", kind: "spam", pages: "lots", terms: "0", rank: 1)
+      entry.valid?
+      errors = entry.errors
+      [errors.include?(:title), errors.include?(:missing), errors.key?("kind"), errors.has_key?(:rank), errors.exclude?(:title),
+       errors.of_kind?(:title, :too_short), errors.of_kind?(:title), errors.of_kind?(:title, "is too short (minimum is 2 characters)"),
+       errors.added?(:title, :too_short, count: 2), errors.added?(:title, :too_short), errors.added?(:terms, :accepted),
+       errors.where(:title).map(&:type), errors.where(:rank, :greater_than, count: 2).size, errors.where(:rank, count: 3).size,
+       errors.messages_for(:kind), errors.full_messages_for(:code), errors.full_messages_for(:missing).frozen?,
+       errors.full_message(:post_id, "is odd"), errors.full_message(:base, "is odd")]
+    end
+    show(out, "queries on text messages") do
+      post = invalid("LOUD")
+      [post.errors.of_kind?(:base, "no shouting"), post.errors.added?(:author_id, "must be set"),
+       post.errors.added?(:base, :invalid), post.errors.where(:base, "no shouting").map(&:full_message)]
+    end
+    show(out, "delete") do
+      entry = Entry.new(title: "x", code: "abc", kind: "spam", pages: "lots", terms: "0", rank: 1)
+      entry.valid?
+      [entry.errors.delete(:title), entry.errors.delete(:kind, :inclusion), entry.errors.delete(:kind, :exclusion),
+       entry.errors.delete(:missing), entry.errors.delete("rank", :greater_than, count: 2),
+       entry.errors.full_messages, entry.errors.attribute_names]
+    end
+    show(out, "import") do
+      post = invalid("")
+      other = invalid("LOUD")
+      post.errors.import(other.errors.first)
+      post.errors.import(other.errors.where(:author_id).first, attribute: "title", type: "unset")
+      [post.errors.full_messages, post.errors.details, post.errors.map { |error| [error.attribute, error.type, error.message] },
+       post.errors.of_kind?(:title, :unset), post.errors.added?(:title, "must be set")]
+    end
     show(out, "a validator's errors") do
       found = check(nil)
       [found.errors.map(&:full_message), found.errors.map(&:details), found.errors.first.strict_match?(:name, :blank)]
@@ -247,6 +278,10 @@ const EXPECTED: &[&str] = &[
     r#"map over the errors: [["no shouting", "Author must be set"], [[:base, "no shouting"], [:author_id, "must be set"]], [{error: "no shouting"}, {error: "must be set"}], [:base, "no shouting", :author_id, "must be set"]]"#,
     r#"queries over the errors: [:base, "Author must be set", true, true, 1, true, true, 1]"#,
     r#"collections of the errors: [["no shouting"], ["must be set"], ["must be set"], {base: ["no shouting"], author_id: ["must be set"]}, {base: "no shouting", author_id: "must be set"}, [:author_id, :base], 2, [:base, :author_id], ["no shouting", "must be set"]]"#,
+    r#"queries by attribute: [true, false, true, true, false, true, false, true, true, false, true, [:too_short], 1, 0, ["is reserved"], ["Code is invalid"], true, "Post is odd", "is odd"]"#,
+    r#"queries on text messages: [true, true, false, ["no shouting"]]"#,
+    r#"delete: [["is too short (minimum is 2 characters)"], nil, ["is reserved"], nil, ["must be greater than 2"], ["Post must exist", "Code is invalid", "Pages is not a number", "Terms must be accepted"], [:post, :code, :pages, :terms]]"#,
+    r#"import: [["Title can't be blank", "no shouting", "Title must be set"], {title: [{error: :blank}, {error: "must be set"}], base: [{error: "no shouting"}]}, [[:title, :blank, "can't be blank"], [:base, "no shouting", "no shouting"], [:title, :unset, "must be set"]], true, true]"#,
     r#"a validator's errors: [["Name can't be blank"], [{error: :blank}], true]"#,
     r#"then revalidated: {}"#,
 ];
@@ -356,6 +391,9 @@ fn spinel_refuses_the_calls() {
         "ActiveModel::Errors#map",
         "ActiveModel::Errors#first",
         "ActiveModel::Errors#group_by",
+        "ActiveModel::Errors#where",
+        "ActiveModel::Errors#delete",
+        "ActiveModel::Errors#import",
     ] {
         assert!(
             errors.iter().any(|e| e.contains(call)
@@ -419,6 +457,17 @@ const PORT_PROBE: &str = r##"class PortProbe
       [check.errors.map { |error| [error.attribute, error.type] }, post.errors.map(&:details),
        check.errors.select { |error| error.attribute == :base }.map(&:full_message), check.errors.first.message]
     end
+    show(out, "each side's queries") do
+      check = PortCheck.new(nil)
+      check.valid?
+      post = Post.new(title: "LOUD")
+      post.valid?
+      check.errors.import(post.errors.first, attribute: :name)
+      post.errors.import(check.errors.first)
+      [check.errors.include?(:name), check.errors.of_kind?(:name, :blank), check.errors.full_messages_for(:name),
+       check.errors.delete(:name, :blank), check.errors.full_messages,
+       post.errors.added?(:name, :blank), post.errors.where(:name).map(&:full_message), post.errors.delete(:base), post.errors.full_messages]
+    end
     out
   end
 end
@@ -428,6 +477,7 @@ const PORT_EXPECTED: &[&str] = &[
     r#"record takes a port's: [["no shouting", "Author must be set", "Name can't be blank"], {base: ["no shouting"], author_id: ["must be set"], name: ["can't be blank"]}]"#,
     r#"port takes a record's: [["Name can't be blank", "no shouting", "Author must be set"], {name: ["can't be blank"], base: ["no shouting"], author_id: ["must be set"]}, {name: [{error: :blank}], base: [{error: "no shouting"}], author_id: [{error: "must be set"}]}]"#,
     r#"each side's errors: [[[:name, :blank], [:base, "no shouting"], [:author_id, "must be set"]], [{error: "no shouting"}, {error: "must be set"}], ["no shouting"], "can't be blank"]"#,
+    r#"each side's queries: [true, true, ["Name can't be blank", "Name no shouting"], ["can't be blank"], ["Name no shouting"], true, ["Name can't be blank"], ["no shouting"], ["Author must be set", "Name can't be blank"]]"#,
 ];
 
 const DATABASE_YML: &str = "test:\n  adapter: postgresql\n  encoding: unicode\n  database: rh_e2e_errors_surface\n";

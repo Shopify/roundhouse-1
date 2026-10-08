@@ -85,7 +85,10 @@ pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 /// A call on a receiver typed as Rails' `ActiveModel::Errors` that the
 /// models' `Array[String]` accumulator cannot answer by itself
 /// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `details`,
-/// `merge!`, and Enumerable over the Errors, [`errors_enumerable`]):
+/// `merge!`, the queries by attribute (`where`, `include?`, `of_kind?`,
+/// `added?`, `messages_for`, `full_messages_for`, `full_message`),
+/// `delete`, `import`, and Enumerable over the Errors,
+/// [`errors_enumerable`]):
 /// the messages by attribute, or another collection's errors. The CRuby
 /// and JRuby trees write it `ActiveModel::ErrorAttributes.<method>(errors,
 /// ...)` over what each push records (`emit::ruby::expr::
@@ -101,6 +104,11 @@ pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
         "to_hash" | "as_json" => args <= 1 && !block,
         "messages" | "details" => args == 0 && !block,
         "merge!" => args == 1 && !block,
+        // Rails' queries by attribute, and `delete` / `import`.
+        "include?" | "key?" | "has_key?" | "exclude?" => args == 1 && !block,
+        "of_kind?" | "messages_for" | "full_messages_for" | "import" => (1..=2).contains(&args) && !block,
+        "full_message" => args == 2 && !block,
+        "where" | "added?" | "delete" => (1..=3).contains(&args) && !block,
         _ => errors_enumerable(method, args, block),
     }
 }

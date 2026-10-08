@@ -87,6 +87,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
         },
     );
     include.ty = Some(crate::ty::Ty::Bool);
+    // Rails' collection answers `include?` as the analyzer routed its
+    // `exclude?` (`expr::ERRORS_PORT_CALL`).
+    include.decisions |= expr.decisions & crate::expr::ERRORS_PORT_CALL;
     let mut negated = Expr::new(
         span,
         ExprNode::Send {
