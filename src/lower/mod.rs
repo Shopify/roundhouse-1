@@ -828,6 +828,7 @@ pub fn apply_post_analyze_lowerings(
     defined_ivar_memo::apply_defined_ivar_memo_lowering(app);
     ran!("defined_ivar_memo");
     sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
+    model_to_library::include_callbacks_in_sti_subclasses(app);
     ran!("sti_subclass_callbacks");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
         fused::apply_fused_pre_tag_rewrites(app);

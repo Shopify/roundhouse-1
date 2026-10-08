@@ -83,7 +83,7 @@ pub fn content_class() -> ClassId {
 /// Only the single-symbol form is claimed. A declaration carrying
 /// options (`encrypted: true`, `store_if_blank: false`) changes what
 /// the expansion must be, and this pass implements none of them — so
-/// it is left unclaimed, and `report_unclaimed_unknowns` names it.
+/// it is left unclaimed, and `model_to_library::unclaimed_unknowns` names it.
 pub fn rich_text_attrs(model: &Model) -> Vec<(Span, Symbol)> {
     let mut out = Vec::new();
     for item in &model.body {

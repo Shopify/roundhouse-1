@@ -90,26 +90,12 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
             continue;
         }
         let mut folds: Vec<(&'static str, Vec<Symbol>)> = Vec::new();
-        lc.unknown_calls.retain(|call| {
-            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else {
-                return true;
-            };
-            let Some(hook) = hook_method(method.as_str()) else { return true };
-            // Every argument must be a bare symbol. A trailing option
-            // hash (`if:`, `on:`) means conditions this fold cannot
-            // honor, so the whole declaration is left alone.
-            let mut targets = Vec::new();
-            for a in args {
-                let ExprNode::Lit { value: Literal::Sym { value } } = &*a.node else {
-                    return true;
-                };
-                targets.push(value.clone());
+        lc.unknown_calls.retain(|call| match fold_targets(call) {
+            Some(fold) => {
+                folds.push(fold);
+                false
             }
-            if targets.is_empty() {
-                return true;
-            }
-            folds.push((hook, targets));
-            false
+            None => true,
         });
         for (hook, targets) in folds {
             for target in targets {
@@ -120,6 +106,27 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
             stamp_inheritance_column(lc);
         }
     }
+}
+
+/// Does the fold claim `call` (a lifecycle declaration whose every
+/// argument is a bare symbol)? `check` asks, before the pass runs.
+pub(crate) fn folds(call: &Expr) -> bool {
+    fold_targets(call).is_some()
+}
+
+/// The hook and target methods of a declaration the fold claims. Every
+/// argument must be a bare symbol: a trailing option hash (`if:`, `on:`)
+/// means conditions this fold cannot honor, so the whole declaration is
+/// left alone.
+fn fold_targets(call: &Expr) -> Option<(&'static str, Vec<Symbol>)> {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return None };
+    let hook = hook_method(method.as_str())?;
+    let mut targets = Vec::new();
+    for a in args {
+        let ExprNode::Lit { value: Literal::Sym { value } } = &*a.node else { return None };
+        targets.push(value.clone());
+    }
+    (!targets.is_empty()).then_some((hook, targets))
 }
 
 /// `def initialize(attrs = {}); super(attrs); self.type = "<Name>" if

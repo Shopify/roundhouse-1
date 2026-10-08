@@ -52,7 +52,7 @@ pub(crate) struct SecureTokenDecl {
 }
 
 /// The declarations in `body` this pass expands. The ONE place that
-/// decides what is claimed — `report_unclaimed_unknowns` asks it by
+/// decides what is claimed — `model_to_library::unclaimed_unknowns` asks it by
 /// span rather than re-deriving the shape, so a form that stops being
 /// expanded starts warning again in the same commit.
 pub(crate) fn secure_token_decls(body: &[ModelBodyItem]) -> Vec<SecureTokenDecl> {

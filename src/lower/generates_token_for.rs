@@ -77,7 +77,7 @@
 //! or a key that is not an Integer `id` declines the whole model, and
 //! every declaration on it warns.
 //! `token_for_decls` is the one place that decides, and
-//! `report_unclaimed_unknowns` asks `claims` by span.
+//! `model_to_library::unclaimed_unknowns` asks `claims` by span.
 
 use super::duration::literal_seconds;
 use super::model_to_library::fn_sig;
@@ -115,7 +115,7 @@ pub(crate) fn token_for_decls(model: &Model) -> Vec<TokenForDecl> {
 /// Whether the declaration at `span` is one this pass handles: an
 /// expandable form on a model it does not decline, including one a
 /// later declaration supersedes, which Rails discards too.
-/// `report_unclaimed_unknowns` asks.
+/// `model_to_library::unclaimed_unknowns` asks.
 pub(crate) fn claims(model: &Model, span: Span) -> bool {
     model_decls(model).is_some()
         && parse_decls(&model.body).iter().any(|d| matches!(d, Ok(decl) if decl.span == span))

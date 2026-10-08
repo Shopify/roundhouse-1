@@ -542,6 +542,16 @@ pub(crate) fn ruby_family_runtime_includes(app: &App) -> Vec<(Span, String, &'st
                 }
             }
         }
+        // ActiveRecord::Base includes ActiveSupport::Callbacks, so a model
+        // runs `define_callbacks`/`set_callback` without naming it; the
+        // lowered class includes the port (`model_to_library::model_class`).
+        const CALLBACKS: &str = "ActiveSupport::Callbacks";
+        let named = out.iter().any(|(_, owner, _, name)| owner == model.name.0.as_str() && name == CALLBACKS);
+        if !named && gated(CALLBACKS) {
+            if let Some(call) = crate::lower::model_to_library::callback_dsl_calls(model, &app.models).first() {
+                out.push((call.span, model.name.0.to_string(), "uses", CALLBACKS.to_string()));
+            }
+        }
     }
     out
 }
