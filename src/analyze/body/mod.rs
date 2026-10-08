@@ -507,17 +507,41 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
-    /// The nearest superclass of the enclosing class whose modeled
-    /// constant table has `name`.
+    /// The nearest ancestor of the enclosing class that models `name`,
+    /// in Ruby's order: each class's included modules (the last included
+    /// first), then its superclass. A superclass counts by its modeled
+    /// constant table; a module also by a modeled class nested in it
+    /// (`Result` in a class that includes shopify-adt's `Shopify::Adt`).
     fn inherited_constant_owner(&self, ctx: &Ctx, name: &Symbol) -> Option<ClassId> {
         let Some(Ty::Class { id, .. }) = ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) else { return None };
-        let mut class = self.classes().get(id)?.parent.clone()?;
+        let mut info = self.classes().get(id)?;
         for _ in 0..32 {
-            let info = self.classes().get(&class)?;
+            if let Some(owner) = self.included_constant_owner(&info.includes, name, 0) {
+                return Some(owner);
+            }
+            let class = info.parent.clone()?;
+            info = self.classes().get(&class)?;
             if info.constants.contains_key(name) {
                 return Some(class);
             }
-            class = info.parent.clone()?;
+        }
+        None
+    }
+
+    fn included_constant_owner(&self, includes: &[ClassId], name: &Symbol, depth: u8) -> Option<ClassId> {
+        if depth > 8 {
+            return None;
+        }
+        for module in includes.iter().rev() {
+            let Some(info) = self.classes().get(module) else { continue };
+            if info.constants.contains_key(name)
+                || self.classes().contains_key(&ClassId(Symbol::from(format!("{}::{}", module.0, name).as_str())))
+            {
+                return Some(module.clone());
+            }
+            if let Some(owner) = self.included_constant_owner(&info.includes, name, depth + 1) {
+                return Some(owner);
+            }
         }
         None
     }
@@ -1189,14 +1213,15 @@ impl<'a> BodyTyper<'a> {
                     // a declaration the source index cannot see, found as
                     // Ruby finds it: in an enclosing scope (`KeyUtilities`
                     // inside a reopened `TokenProtocol::Crypto`, whose
-                    // gem RBI declares it), then on a superclass
+                    // gem RBI declares it), then on an ancestor
                     // (`REQUEST_TIME` in a subclass of shopify_metrics'
-                    // `RequestMetrics`). Read at its full name.
+                    // `RequestMetrics`, `Result` beside `include
+                    // Shopify::Adt`). Read at its full name.
                     Some(None) => {
-                        let full = self.lexical_external_constant(expr_span, path).or_else(|| match path.as_slice() {
-                            [name] => self.inherited_constant_owner(ctx, name)
-                                .map(|owner| ClassId(Symbol::from(format!("{}::{}", owner.0, name).as_str()))),
-                            _ => None,
+                        let full = self.lexical_external_constant(expr_span, path).or_else(|| {
+                            let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+                            self.inherited_constant_owner(ctx, path.first()?)
+                                .map(|owner| ClassId(Symbol::from(format!("{}::{written}", owner.0).as_str())))
                         });
                         if let Some(full) = full {
                             qualify_resolved_path(path, &full);

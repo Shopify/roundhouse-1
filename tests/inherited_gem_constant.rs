@@ -27,6 +27,25 @@ module ShopifyMetrics::KeyUtilities
   def self.convert(x); end
 end
 ShopifyMetrics::KeyUtilities::CURVE = T.let(T.unsafe(nil), String)
+module ShopifyMetrics::Adt; end
+module ShopifyMetrics::Adt::Result
+  sig { params(x: String).returns(String) }
+  def self.error(x); end
+end
+"#;
+
+/// Core's `ServerPixelService` includes shopify-adt's `Shopify::Adt` and
+/// reads its `Result` bare.
+const INCLUDER: &str = r#"
+class PixelService
+  include ShopifyMetrics::Adt
+
+  #: -> String
+  def failed = Result.error("x")
+
+  #: -> untyped
+  def missing = Outcome
+end
 "#;
 
 /// Core's `TokenProtocol::Crypto` patch reopens the gem's namespace and
@@ -69,6 +88,7 @@ fn errors() -> Vec<String> {
         ("sorbet/rbi/gems/shopify_metrics@2.0.0.rbi", RBI),
         ("app/models/stats_middleware.rb", MIDDLEWARE),
         ("app/models/shopify_metrics/cache_entry.rb", PATCH),
+        ("app/models/pixel_service.rb", INCLUDER),
     ]
     .into_iter()
     .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
@@ -88,6 +108,13 @@ fn a_bare_constant_resolves_on_a_gem_superclass() {
 fn a_name_no_ancestor_declares_stays_refused() {
     let errors = errors();
     assert!(errors.iter().any(|e| e.contains("NOT_THERE")), "{errors:?}");
+}
+
+#[test]
+fn a_bare_constant_resolves_in_an_included_gem_module() {
+    let errors = errors();
+    assert!(!errors.iter().any(|e| e.contains("Result")), "{errors:?}");
+    assert!(errors.iter().any(|e| e.contains("Outcome")), "{errors:?}");
 }
 
 #[test]
