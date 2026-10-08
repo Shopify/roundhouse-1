@@ -8318,35 +8318,10 @@ fn emit_library_class_decl_inner(
             .filter(|c| !crate::analyze::is_include_refusal(c) && !is_body_statement(c))
             .collect()
     } else {
-        let own = modelled_class_body_calls(lc, app);
-        // A Concern's `included do` that ingest gave every class it runs
-        // on (or reported there) is not missing from any of them.
-        let carried_block = |call: &Expr| {
-            app.carried_included_blocks.contains(&lc.name)
-                && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
-                    if method.as_str() == "included")
-        };
-        // A `delegate_missing_to` is written as the `method_missing` pair
-        // placed at it (`ingest::delegate::missing_delegators`), added
-        // to the methods above.
-        let written_pair = |call: &Expr| {
-            app.ruby_declined_delegate_forwarders.contains_key(&lc.name)
-                && lc.methods.iter().any(|m| {
-                    m.receiver == MethodReceiver::Instance && m.name.as_str() == "method_missing" && m.name_span == call.span
-                })
-        };
-        for call in &lc.unknown_calls {
-            if !own.iter().any(|c| std::ptr::eq(*c, call))
-                && !crate::analyze::is_include_refusal(call)
-                && !carried_block(call)
-                && !modelled_elsewhere(lc, call)
-                && !written_pair(call)
-                && !is_body_statement(call)
-            {
-                report_dropped_class_body_call(lc, call);
-            }
+        for call in dropped_class_body_calls(lc, app) {
+            report_dropped_class_body_call(lc, call);
         }
-        own.into_iter().filter(|c| !is_body_statement(c)).collect()
+        modelled_class_body_calls(lc, app).into_iter().filter(|c| !is_body_statement(c)).collect()
     };
     // The body statements the ingest kept (`carries_body_statement`),
     // written where the source has them on CRuby/JRuby: among the other
@@ -12150,6 +12125,44 @@ fn modelled_elsewhere(lc: &LibraryClass, call: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// The class-body calls the Ruby family drops from `lc` (each reported
+/// by `report_dropped_class_body_call`): none where the body replays
+/// (a railtie, a foreign base), else every unknown call no lowering
+/// writes or answers elsewhere.
+pub(crate) fn dropped_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    if carried_railtie(lc, app) || replays_foreign_class_body(lc, app) {
+        return Vec::new();
+    }
+    let own = modelled_class_body_calls(lc, app);
+    // A Concern's `included do` that ingest gave every class it runs
+    // on (or reported there) is not missing from any of them.
+    let carried_block = |call: &Expr| {
+        app.carried_included_blocks.contains(&lc.name)
+            && matches!(&*call.node, crate::expr::ExprNode::Send { recv: None, method, block: Some(_), .. }
+                if method.as_str() == "included")
+    };
+    // A `delegate_missing_to` is written as the `method_missing` pair
+    // placed at it (`ingest::delegate::missing_delegators`), added
+    // to the methods above.
+    let written_pair = |call: &Expr| {
+        app.ruby_declined_delegate_forwarders.contains_key(&lc.name)
+            && lc.methods.iter().any(|m| {
+                m.receiver == MethodReceiver::Instance && m.name.as_str() == "method_missing" && m.name_span == call.span
+            })
+    };
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            !own.iter().any(|c| std::ptr::eq(*c, *call))
+                && !crate::analyze::is_include_refusal(call)
+                && !carried_block(call)
+                && !modelled_elsewhere(lc, call)
+                && !written_pair(call)
+                && !is_body_statement(call)
+        })
+        .collect()
 }
 
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {

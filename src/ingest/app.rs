@@ -3099,6 +3099,27 @@ fn collect_subclass_declarations(app: &mut App) {
 /// that every class, gem and base is known. The rest leave the class:
 /// each stays the `file_statement_unsupported` gap its discard names.
 fn keep_carried_body_statements(app: &mut App) {
+    // A call on a literal list (`%i[a b].each do |n| define_method(n) …
+    // end`) is captured as a class-body call: replayed where the body
+    // replays, written out by `define_method_loops` where it expands. One
+    // the Ruby family would drop instead is a body statement like any
+    // other: kept in place where it can be, else a gap named here.
+    let literal_lists: Vec<Vec<usize>> = app
+        .library_classes
+        .iter()
+        .map(|lc| {
+            crate::emit::ruby::dropped_class_body_calls(lc, app)
+                .into_iter()
+                .filter(|c| is_literal_list_call(c))
+                .filter_map(|c| lc.unknown_calls.iter().position(|u| std::ptr::eq(u, c)))
+                .collect()
+        })
+        .collect();
+    for (lc, at) in app.library_classes.iter_mut().zip(&literal_lists) {
+        for &j in at {
+            lc.unknown_calls[j].decisions |= crate::expr::BODY_STATEMENT;
+        }
+    }
     let verdicts: Vec<Vec<bool>> = app
         .library_classes
         .iter()
@@ -3111,10 +3132,17 @@ fn keep_carried_body_statements(app: &mut App) {
                 .collect()
         })
         .collect();
-    for (lc, keep) in app.library_classes.iter_mut().zip(verdicts) {
+    let mut gaps = Vec::new();
+    for ((lc, keep), literal) in app.library_classes.iter_mut().zip(verdicts).zip(literal_lists) {
+        for (j, call) in lc.unknown_calls.iter().enumerate() {
+            if !keep[j] && literal.contains(&j) {
+                gaps.push(literal_list_gap(call, &app.sources));
+            }
+        }
         let mut keep = keep.into_iter();
         lc.unknown_calls.retain(|_| keep.next().unwrap_or(true));
     }
+    app.file_statement_gaps.extend(gaps);
     // Likewise the declarations a file program carries inline (in a
     // file-level branch or behind a `return`), and `class_eval` bodies
     // (`carries_body_statement` carries none of theirs).
@@ -3156,6 +3184,35 @@ fn keep_carried_body_statements(app: &mut App) {
         walk(&mut program.items, app);
     }
     app.file_programs = programs;
+}
+
+/// `[…].m …` / `%i[…].m …`: a call whose receiver is a literal list.
+fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
+    matches!(&*call.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if matches!(&*r.node, crate::expr::ExprNode::Array { .. }))
+}
+
+/// The `file_statement_unsupported` gap of a literal-list call the body
+/// cannot keep in place.
+fn literal_list_gap(call: &crate::expr::Expr, sources: &[crate::span::SourceFile]) -> crate::app::InitializerGap {
+    let method = match &*call.node {
+        crate::expr::ExprNode::Send { method, .. } => method.as_str(),
+        _ => "",
+    };
+    let text = (call.span.file.0 as usize)
+        .checked_sub(1)
+        .and_then(|i| sources.get(i))
+        .and_then(|s| s.text.get(call.span.start as usize..call.span.end as usize))
+        .unwrap_or_default();
+    // The list is often one element per line (`[\n  :a,\n  :b,\n].each`),
+    // so the statement's head reads collapsed.
+    let head: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+    crate::app::InitializerGap {
+        span: call.span,
+        construct: format!("<expr>.{method}"),
+        detail: format!(
+            "a call on a literal list in a class or module body is not carried; Ruby runs it when the body loads: {head}"
+        ),
+    }
 }
 
 /// A support file the walk holds back for `inherited_alias::decide`:
