@@ -26,6 +26,12 @@
 //! `attribute: :id` form is left alone: its body branches on
 //! `composite_primary_key?`, which the runtime does not model. A call
 //! left alone stays a dropped model-DSL statement.
+//!
+//! Interim: this step is keyed on the module and macro name, which a
+//! lowering should not be. It stays as a measurement until generic model
+//! macro replay lands (the model counterpart of
+//! `inherited_class_macro_calls`, running the real macro against the
+//! runtime). Replace it with that replay then; do not extend it.
 
 use crate::det::HashSet;
 
