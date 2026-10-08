@@ -287,34 +287,15 @@ class Hash
   end
 
   alias nested_under_indifferent_access with_indifferent_access
-
-  # core_ext/hash/keys.rb (activesupport 8.2.0.alpha, Shopify/rails
-  # 5813559f): the key conversions. Core's SerializationOptions reads
-  # `stringify_keys` of a Hash entry in `methods:`.
-  def stringify_keys
-    transform_keys { |k| Symbol === k ? k.name : k.to_s }
-  end
-
-  def stringify_keys!
-    transform_keys! { |k| Symbol === k ? k.name : k.to_s }
-  end
-
-  def symbolize_keys
-    transform_keys { |key| key.to_sym rescue key }
-  end
-  alias_method :to_options,  :symbolize_keys
-
-  def symbolize_keys!
-    transform_keys! { |key| key.to_sym rescue key }
-  end
-  alias_method :to_options!, :symbolize_keys!
 end
 
 # core_ext/hash/keys.rb (Rails 8.1.4), which hash/indifferent_access
 # loads natively: a gem compiled as source that requires it calls
 # `params.stringify_keys` on whatever Hash it is given (activemerchant
 # 1.137.0's `Billing::Response#initialize`), where no type lets
-# `lower::symbolize_keys` ground the call. Ported method for method.
+# `lower::symbolize_keys` ground the call; Core's SerializationOptions
+# reads `stringify_keys` of a Hash entry in `methods:`. Ported method
+# for method.
 class Hash
   def stringify_keys
     transform_keys { |k| Symbol === k ? k.name : k.to_s }
