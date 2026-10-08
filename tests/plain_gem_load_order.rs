@@ -399,6 +399,13 @@ fn a_bare_read_of_a_gems_private_constant_stays_lexical() {
     );
     let extra = [("roundhouse.yml", config.as_str()), ("Gemfile.lock", lock.as_str())];
     let _ = same_as_native_from("lexical", &[("tp", TP)], "tp", "p Tp.state\n", "\"Timeout::State\"\n", false, &extra);
+    // Core's google-protobuf RBI declares `class
+    // Google::Protobuf::AbstractMessage` as well: the read resolves to the
+    // RBI's class, and stays lexical all the same.
+    let rbi_path = format!("sorbet/rbi/gems/timeout@{version}.rbi");
+    let rbi = "# typed: true\n\nmodule Timeout; end\nclass Timeout::State; end\n";
+    let extra = [("roundhouse.yml", config.as_str()), ("Gemfile.lock", lock.as_str()), (rbi_path.as_str(), rbi)];
+    let _ = same_as_native_from("lexical-rbi", &[("tp", TP)], "tp", "p Tp.state\n", "\"Timeout::State\"\n", false, &extra);
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -471,4 +478,53 @@ fn a_constant_of_a_gem_a_gem_source_requires_runs_as_that_gems() {
         &extra,
     );
     assert!(!run.stderr.contains("no emitted tree loads"), "{}", run.stderr);
+}
+
+/// The same read where the gem's RBI declares the private class
+/// (Core's google-protobuf@3.25.8.rbi has `class
+/// Google::Protobuf::AbstractMessage`): the source index does not see
+/// it, the RBI's class is found from the enclosing scope, and the read
+/// was qualified there. pb is a gem the tree loads natively from the gem
+/// home, on RUBYLIB for both runs.
+#[test]
+fn a_bare_read_of_a_private_constant_an_rbi_declares_stays_lexical() {
+    let home = std::env::temp_dir().join(format!("roundhouse-plain-gem-home-rbi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let lib = home.join("gems/pb-1.0.0/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(lib.join("pb.rb"), "module Pb\n  class Abstract\n  end\n  private_constant :Abstract\nend\n").unwrap();
+    std::fs::write(
+        home.join("specifications/pb-1.0.0.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"pb\".freeze\n  s.version = \"1.0.0\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n",
+    )
+    .unwrap();
+    let kp = "require \"pb\"\n\nmodule Pb\n  AbstractPublic = Abstract\nend\n\nmodule Kp\n  def self.name_of\n    Pb::AbstractPublic.name\n  end\nend\n";
+    let rubylib = lib.display().to_string();
+    let kp_dir = home.join("kp/lib");
+    std::fs::create_dir_all(&kp_dir).unwrap();
+    std::fs::write(kp_dir.join("kp.rb"), kp).unwrap();
+    let native = emit_and_run::ruby()
+        .args(["-W", "-I"])
+        .arg(&kp_dir)
+        .args(["-r", "kp", "-e", "p Kp.name_of"])
+        .env("RUBYLIB", &rubylib)
+        .output()
+        .expect("CRuby control");
+    assert!(native.status.success(), "native control failed:\n{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "\"Pb::Abstract\"\n", "native control");
+
+    let run = emit_and_run::empty_app()
+        .write("roundhouse.yml", &format!("gem_home: {}\ngem_sources:\n  kp: vendor/gems/kp-1.0.0\n", home.display()))
+        .write(
+            "Gemfile.lock",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    kp (1.0.0)\n      pb\n    pb (1.0.0)\n\nDEPENDENCIES\n  kp\n",
+        )
+        .write("sorbet/rbi/gems/pb@1.0.0.rbi", "# typed: true\n\nmodule Pb; end\nclass Pb::Abstract; end\n")
+        .write("config/application.rb", "require \"kp\"\n")
+        .write("vendor/gems/kp-1.0.0/lib/kp.rb", kp)
+        .run_ruby_env("p Kp.name_of\n", &[("RUBYLIB", rubylib.as_str())]);
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(run.success, "emitted tree failed in {}\n=== stderr ===\n{}", run.emitted.display(), run.stderr);
+    assert_eq!(run.stdout, "\"Pb::Abstract\"\n");
 }

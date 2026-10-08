@@ -1279,11 +1279,19 @@ impl<'a> BodyTyper<'a> {
                     Some(None) => {
                         let lexical = self.lexical_external_constant(expr_span, path);
                         let extended = if lexical.is_none() { self.extended_constant(expr_span, path) } else { None };
+                        // A gem's private constant (google-protobuf's
+                        // `private_constant :AbstractMessage`) is read
+                        // only as written: qualified, it is NameError.
+                        let private = |full: &ClassId| self.gem_sources.as_deref().is_some_and(|s| s.private.contains(full.0.as_str()));
                         if let Some((full, declaration)) = extended {
-                            qualify_resolved_path(path, &full);
+                            let full_path: Vec<Symbol> = full.0.as_str().split("::").map(Symbol::from).collect();
+                            let modeled_at = if private(&full) { full_path.as_slice() } else {
+                                qualify_resolved_path(path, &full);
+                                path.as_slice()
+                            };
                             match declaration {
                                 Some(declaration) => self.typed_constant(&declaration).cloned().unwrap_or_else(unknown),
-                                None => exact_modeled_class(path),
+                                None => exact_modeled_class(modeled_at),
                             }
                         } else {
                         let full = lexical.or_else(|| {
@@ -1291,10 +1299,17 @@ impl<'a> BodyTyper<'a> {
                             self.inherited_constant_owner(ctx, path.first()?)
                                 .map(|owner| ClassId(Symbol::from(format!("{}::{written}", owner.0).as_str())))
                         });
-                        if let Some(full) = full {
-                            qualify_resolved_path(path, &full);
+                        match full {
+                            Some(full) if private(&full) => {
+                                let full_path: Vec<Symbol> = full.0.as_str().split("::").map(Symbol::from).collect();
+                                exact_modeled_class(&full_path)
+                            }
+                            Some(full) => {
+                                qualify_resolved_path(path, &full);
+                                exact_modeled_class(path)
+                            }
+                            None => exact_modeled_class(path),
                         }
-                        exact_modeled_class(path)
                         }
                     }
                     // A borrowed span is not evidence of a written constant
