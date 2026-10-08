@@ -4,7 +4,9 @@
 //! for Rails' `query_constraints` option) runs `belongs_to(name, ...)`.
 //! Its associations had no reader, so `order` in OrderRisk resolved to
 //! the AR `order` scope and `persisted?` was refused on a Relation.
-//! The reader is typed like a `belongs_to`; the macro call still runs.
+//! The reader is typed like a `belongs_to`; the macro call itself is
+//! refused (it would run `belongs_to` at class-body time, which the
+//! lowered model declares statically).
 
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,9 +54,13 @@ end
 
 #[test]
 fn a_macro_forwarding_its_name_to_belongs_to_types_the_reader() {
-    let (ok, text) = check(FORWARDS, RISK);
-    assert!(ok, "{text}");
+    let (_ok, text) = check(FORWARDS, RISK);
     assert!(!text.contains("Relation[Risk]"), "{text}");
+    // The macro reaches `belongs_to`, which the runtime base does not
+    // answer at class-body time, so its call is refused rather than
+    // replayed; those refusals are the only errors.
+    assert!(text.contains(" 2 error(s)"), "{text}");
+    assert_eq!(text.matches("`belongs_with_keys` reaches `belongs_to`").count(), 2, "{text}");
 }
 
 #[test]

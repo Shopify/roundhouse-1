@@ -2788,6 +2788,8 @@ fn parse_association(
     let mut source_type: Option<String> = None;
     let mut dependent: Option<Dependent> = None;
     let mut optional: Option<bool> = None;
+    // `required: x` is ActiveRecord's older spelling of `optional: !x`, and wins.
+    let mut required: Option<bool> = None;
     let mut join_table: Option<String> = None;
     let mut scope: Option<crate::expr::Expr> = None;
     let mut polymorphic: Option<bool> = None;
@@ -2837,6 +2839,7 @@ fn parse_association(
                     dependent = symbol_value(&value).and_then(|s| dependent_from_sym(&s))
                 }
                 "optional" => optional = bool_value(&value),
+                "required" => required = bool_value(&value),
                 // `touch: true` / `touch: :last_message_at`. A `false`
                 // is Rails' explicit opt-out and reads as no touch,
                 // which is what `None` already means.
@@ -2875,6 +2878,7 @@ fn parse_association(
     }
 
     let foreign_key_explicit = foreign_key.is_some();
+    let optional = required.map(|r| !r).or(optional);
 
     // Rails `foreign_key` demodulizes: `Billing::Invoice` → `invoice_id`.
     let owner_snake = snake_case(crate::naming::demodulize(owner.0.as_str()));
@@ -2972,6 +2976,7 @@ fn parse_association(
                 .map(|s| Symbol::from(s.as_str()))
                 .unwrap_or_else(|| Symbol::from(format!("{name_str}_id"))),
             optional: optional.unwrap_or(false),
+            declared_optional: optional,
             polymorphic: polymorphic.unwrap_or(false),
             // Filled by `resolve_polymorphic_targets` once every
             // model's inverse `as:` declarations are ingested.

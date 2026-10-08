@@ -277,6 +277,7 @@ fn parse_sequel_association(
             // Optional exactly when the FK column is nullable — Sequel
             // has no `optional:` kwarg; the schema is the authority.
             optional: fk_nullable(schema, owner_table, &format!("{name_str}_id")),
+            declared_optional: Some(fk_nullable(schema, owner_table, &format!("{name_str}_id"))),
             polymorphic: false,
             polymorphic_targets: Vec::new(),
             default: None,

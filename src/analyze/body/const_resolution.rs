@@ -977,16 +977,30 @@ fn answer_file(
         // A superclass or mixin reference spans its whole `A::B` path,
         // so it starts at the same offset as the `A` reference. Only a
         // reference whose span is exactly its written name belongs to
-        // that offset.
+        // that offset; such a path reference (`extend
+        // Article::Identification` in `class Article`) is the path's
+        // final name, which `reference` looks up at the span end minus
+        // the name's length, as for any other written path.
         let written = text.get(offset.start() as usize..offset.end() as usize);
         let name = graph
             .names()
             .get(reference.name_id())
             .and_then(|name| graph.strings().get(name.str()));
-        if !name.is_some_and(|name| written == Some(name.as_str())) {
-            continue;
-        }
-        if parenthesized_receivers.contains(&offset.start())
+        let start = match (name, written) {
+            (Some(name), Some(written)) if written == name.as_str() => offset.start(),
+            (Some(name), Some(written))
+                if written.strip_suffix(name.as_str()).is_some_and(|owner| {
+                    owner.len() > 2
+                        && owner.ends_with("::")
+                        && owner.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                }) =>
+            {
+                offset.end() - name.as_str().len() as u32
+            }
+            _ => continue,
+        };
+        let path_reference = start != offset.start();
+        if !path_reference && parenthesized_receivers.contains(&offset.start())
             && let Some(target) = resolved_namespace(graph, *reference.name_id())
                 .filter(|target| is_runtime_declaration(graph, target))
         {
@@ -998,6 +1012,7 @@ fn answer_file(
             .or_else(|| delegator_const_missing(graph, *reference.name_id(), 0))
             .and_then(|id| resolved_constant(graph, id, class_cache));
         if let Some(ResolvedConstant::Value { declaration, .. }) = &target
+            && !path_reference
             && graph.names().get(reference.name_id())
                 .is_some_and(|name| matches!(name.parent_scope(), ParentScope::None))
         {
@@ -1006,10 +1021,10 @@ fn answer_file(
         if target.is_none() {
             let nesting = lexical_nesting(graph, *reference.name_id());
             if !nesting.is_empty() {
-                answers.unresolved_nesting.insert(offset.start(), nesting);
+                answers.unresolved_nesting.insert(start, nesting);
             }
         }
-        match answers.references.entry(offset.start()) {
+        match answers.references.entry(start) {
             Entry::Vacant(slot) => {
                 slot.insert(target);
             }

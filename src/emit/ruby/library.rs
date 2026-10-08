@@ -8742,6 +8742,7 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let carried = carried_class_macro_calls(lc, app);
     let mut runtime = runtime_mixin_macro_calls(lc, app);
     runtime.extend(model_callback_calls(lc, app));
+    runtime.extend(sti_macro_calls(lc, app));
     if gem.is_empty() && carried.is_empty() && runtime.is_empty() {
         return own;
     }
@@ -8777,6 +8778,18 @@ fn model_callback_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     let own: Vec<&crate::dialect::MethodDef> =
         lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).collect();
     callback_calls(lc.unknown_calls.iter(), &own, lc.parent.as_ref(), &app.models)
+}
+
+/// An STI subclass's body calls of app class macros (a model ancestor's,
+/// its own, or an extended app module's) and `extend`s of app modules
+/// that pass the reach gate (`model_to_library::macro_replay`): what Ruby
+/// runs at load is something the emitted class answers.
+fn sti_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    crate::lower::model_to_library::macro_replay::sti_macro_verdicts(lc, app)
+        .into_iter()
+        .filter(|(_, v)| *v == crate::lower::model_to_library::macro_replay::MacroVerdict::Replay)
+        .map(|(e, _)| e)
+        .collect()
 }
 
 /// The class-body calls the Ruby-family emit of `lc` writes when it

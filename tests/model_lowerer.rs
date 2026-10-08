@@ -1580,8 +1580,11 @@ fn lowered_real_blog_typing_residual() {
     );
 }
 
+/// An unclaimed model DSL call is a `check` error at its site (both
+/// `check` and the emit gate run `diagnose`), not an emit warning: the
+/// lowered class does not run it.
 #[test]
-fn unclaimed_model_dsl_reports_spanned_warning() {
+fn unclaimed_model_dsl_reports_spanned_error() {
     use roundhouse::analyze::Severity;
     use roundhouse::diagnostic::DiagnosticKind;
     use roundhouse::ingest::ingest_model;
@@ -1600,9 +1603,9 @@ end
         .expect("ingest")
         .expect("model");
 
-    let (_lc, diags) = roundhouse::emit::diagnostics::scope(|| {
-        lower_model_to_library_class(&model, &Schema::default())
-    });
+    let mut app = roundhouse::App::default();
+    app.models.push(model);
+    let diags = roundhouse::lower::model_to_library::diagnose_unclaimed_model_dsl(&app);
 
     let unsupported: Vec<_> = diags
         .iter()
@@ -1616,7 +1619,7 @@ end
         "has_one_attached is claimed by lower::attached and must not report: {diags:?}"
     );
     let d = unsupported[0];
-    assert_eq!(d.severity, Severity::Warning, "tolerable per-app: warning, not error");
+    assert_eq!(d.severity, Severity::Error, "the class does not run it: a check error");
     assert!(!d.span.is_synthetic(), "declaration site is located");
     // validates was claimed by the recognizer; only the unclaimed DSL reports.
     assert!(
@@ -1626,8 +1629,10 @@ end
     );
 }
 
+/// A dropped class-body write is a `check` error at its site, as an
+/// unclaimed DSL call is.
 #[test]
-fn unclaimed_model_class_writes_report_spanned_warnings() {
+fn unclaimed_model_class_writes_report_spanned_errors() {
     use roundhouse::diagnostic::{DiagnosticKind, Severity};
     use roundhouse::ingest::ingest_model;
     use roundhouse::schema::Schema;
@@ -1640,12 +1645,12 @@ fn unclaimed_model_class_writes_report_spanned_warnings() {
         let model = ingest_model(
             source.as_bytes(), "app/models/widget.rb", &Schema::default(), &Default::default(),
         ).expect("ingest").expect("model");
-        let (_, diags) = roundhouse::emit::diagnostics::scope(|| {
-            lower_model_to_library_class(&model, &Schema::default())
-        });
+        let mut app = roundhouse::App::default();
+        app.models.push(model);
+        let diags = roundhouse::lower::model_to_library::diagnose_unclaimed_model_dsl(&app);
         assert_eq!(diags.len(), 1, "dropped class-body write must report: {diags:?}");
         let d = &diags[0];
-        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.severity, Severity::Error);
         assert!(matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
             if construct.as_str() == setter));
         assert_eq!(&source[d.span.start as usize..d.span.end as usize], statement);

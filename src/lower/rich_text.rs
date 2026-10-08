@@ -162,6 +162,7 @@ pub fn synthesize_record_model(app: &mut App) {
             target: ClassId(Symbol::from("Record")),
             foreign_key: Symbol::from("record_id"),
             optional: false,
+            declared_optional: Some(false),
             polymorphic: true,
             polymorphic_targets: Vec::new(),
             default: None,
