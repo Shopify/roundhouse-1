@@ -3120,7 +3120,7 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
 
     // A default scope's `where` equalities, for the attributes not given
     // (`lower::default_scope`), before the after_initialize hook sees them.
-    if crate::lower::default_scope::applies(model, models) {
+    if crate::lower::default_scope::applies(model, models) || model.subclass_default_scope {
         stmts.push(Expr::new(Span::synthetic(), ExprNode::Send {
             recv: None,
             method: Symbol::from("_seed_default_scope_attributes"),

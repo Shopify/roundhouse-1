@@ -29,6 +29,21 @@ CREATE TABLE tags (
     CONSTRAINT tags_pkey PRIMARY KEY (id)
 );
 
+CREATE TABLE badges (
+    id bigserial NOT NULL,
+    title character varying,
+    status character varying,
+    archived boolean,
+    CONSTRAINT badges_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE rules (
+    id bigserial NOT NULL,
+    rule_type integer,
+    title character varying,
+    CONSTRAINT rules_pkey PRIMARY KEY (id)
+);
+
 CREATE TABLE notes (
     id bigserial NOT NULL,
     type character varying,
@@ -95,6 +110,27 @@ const PINNED: &str = r#"class Pinned < Note
 end
 "#;
 
+/// A default scope of named scopes, one declared after it (Rails runs
+/// the block lazily).
+const BADGE: &str = r#"class Badge < ApplicationRecord
+  scope :kept, -> { where(archived: false) }
+  default_scope { kept.shown }
+  scope :shown, -> { where.not(status: "hidden") }
+end
+"#;
+
+const RULE: &str = r#"class Rule < ApplicationRecord
+  MARKDOWN = 2
+end
+"#;
+
+/// A model's subclass on a table with no `type` column: no STI, but its
+/// own default scope (on the parent's constant) still applies.
+const MARKDOWN_RULE: &str = r#"class MarkdownRule < Rule
+  default_scope { where(rule_type: MARKDOWN) }
+end
+"#;
+
 const PROBE: &str = r##"class DefaultScopeProbe
   def self.names(docs)
     docs.map(&:name).sort.join(",")
@@ -146,6 +182,13 @@ const PROBE: &str = r##"class DefaultScopeProbe
     bare = Shelf.create!
     Doc.unscoped.create!(name: "x", shelf: bare, is_not_deleted: false)
     out << "left-joins: #{Shelf.left_joins(:docs).where(docs: { id: nil }).count} #{Shelf.left_outer_joins(:docs).count} #{Shelf.joins(:docs).where(id: bare.id).count}"
+    Badge.create!(title: "a", status: "shown")
+    Badge.create!(title: "b", status: "hidden")
+    Badge.unscoped.create!(title: "c", status: "shown", archived: true)
+    out << "named: #{Badge.new.archived.inspect} #{Badge.count} #{Badge.unscoped.count} #{Badge.all.map(&:title).join(",")} #{Badge.where(title: "b").exists?}"
+    Rule.create!(title: "r", rule_type: 1)
+    MarkdownRule.create!(title: "m")
+    out << "plain: #{MarkdownRule.new.rule_type} #{MarkdownRule.count} #{Rule.count} #{MarkdownRule.all.map(&:title).join(",")} #{MarkdownRule.first.title} #{Rule.order(:id).last.title} #{MarkdownRule.unscoped.count} #{MarkdownRule.where(title: "r").exists?}"
     out
   end
 end
@@ -166,7 +209,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 16] = [
+const EXPECTED: [&str; 18] = [
     "new: true nil",
     "all: 2 a,b 0 false",
     "find: ActiveRecord::RecordNotFound nil a",
@@ -183,10 +226,12 @@ const EXPECTED: [&str; 16] = [
     "sti: live x,y 2 3 3 4 x",
     "where-new: q true true r nil nil false nil s nil",
     "left-joins: 1 5 0",
+    "named: false 1 3 a false",
+    "plain: 2 1 2 m m m 2 false",
 ];
 
 /// What native Rails requires, in order.
-const LOADS: [&str; 8] = [
+const LOADS: [&str; 11] = [
     "app/models/application_record",
     "app/models/shelf",
     "app/models/doc",
@@ -194,10 +239,13 @@ const LOADS: [&str; 8] = [
     "app/models/tag",
     "app/models/note",
     "app/models/pinned",
+    "app/models/badge",
+    "app/models/rule",
+    "app/models/markdown_rule",
     "app/models/default_scope_probe",
 ];
 
-const FILES: [(&str, &str); 14] = [
+const FILES: [(&str, &str); 17] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
     ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
@@ -209,6 +257,9 @@ const FILES: [(&str, &str); 14] = [
     ("app/models/tag.rb", TAG),
     ("app/models/note.rb", NOTE),
     ("app/models/pinned.rb", PINNED),
+    ("app/models/badge.rb", BADGE),
+    ("app/models/rule.rb", RULE),
+    ("app/models/markdown_rule.rb", MARKDOWN_RULE),
     ("app/models/default_scope_probe.rb", PROBE),
     ("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n"),
     ("app/controllers/shelves_controller.rb", SHELVES_CONTROLLER),

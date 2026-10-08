@@ -102,6 +102,16 @@ const BECOMES_FROM: &str = "becomes_from";
 
 pub fn apply_sti_scope_lowering(app: &mut App) {
     let bases = sti_bases(app);
+    // A model's subclass on a table with no `type` column is no STI
+    // subclass: its relations carry no type condition, yet Rails applies
+    // the subclass's own default scope to them, after the model's. Its
+    // inherited relation entry points run on the subclass already.
+    let models: HashSet<ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    for lc in &mut app.library_classes {
+        if !bases.contains_key(&lc.name) && lc.parent.as_ref().is_some_and(|p| models.contains(p)) {
+            super::default_scope::push_subclass_methods(lc);
+        }
+    }
     if bases.is_empty() {
         return;
     }

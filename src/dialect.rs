@@ -120,6 +120,12 @@ pub struct Model {
     /// then lowers exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retypable_attributes: Vec<Symbol>,
+    /// A subclass of this model declares a reproduced default scope of
+    /// its own (stamped at the end of ingest, `lower::default_scope`):
+    /// the compiled `initialize` the subclass inherits seeds the scope's
+    /// attributes. False for nearly every model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subclass_default_scope: bool,
     /// The retypable columns a claimed `attribute` call gives a
     /// `default:`, the model's, a model ancestor's or an STI subclass's
     /// (`analyze::retypable_attributes::defaulted_attributes`). The
