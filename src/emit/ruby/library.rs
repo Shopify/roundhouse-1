@@ -317,6 +317,8 @@ struct NestedBlocks {
     /// Each nested class's block, in load order, with where the source
     /// wrote it among the parent's constants (`nested_position`).
     blocks: Vec<(Option<crate::span::Span>, String)>,
+    /// The class each of `blocks` renders.
+    names: Vec<String>,
     sidecar_blocks: Vec<String>,
     hoisted: Vec<String>,
 }
@@ -427,6 +429,7 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
     };
     let kids = &kids[..];
     let mut blocks: Vec<(Option<crate::span::Span>, String)> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
     for kid in kids {
@@ -483,6 +486,7 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
             .collect();
         let Some(block) = unwrapped(&body, depth) else { continue };
         blocks.push((nested_position(parent, kid), block));
+        names.push(kid.name.0.as_str().to_string());
         // The sidecar `emit_library_class_pair` would have written for
         // the child's own file, minus the same wrapper. Its type names
         // were resolved inside the child's enclosing segments, which
@@ -494,7 +498,7 @@ fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, paren
             sidecar_blocks.push(block);
         }
     }
-    NestedBlocks { blocks, sidecar_blocks, hoisted }
+    NestedBlocks { blocks, names, sidecar_blocks, hoisted }
 }
 
 /// Where the source wrote `kid` among `parent`'s constants: the first
@@ -588,6 +592,10 @@ struct NestedPending {
     owner: String,
     /// Index into `NestedBlocks::blocks`, position, block, placed.
     blocks: Vec<(usize, crate::span::Span, String, bool)>,
+    /// The blocks of classes a load-time conditional of the owner
+    /// declares (`ConditionalArm::declarations`): index, class, block,
+    /// placed. Only that conditional's branch writes them.
+    declared: Vec<(usize, String, String, bool)>,
 }
 
 thread_local! {
@@ -600,14 +608,56 @@ struct NestedPlacementGuard {
 
 impl NestedPlacement {
     fn install(parent: &LibraryClass, nested: &NestedBlocks) -> NestedPlacementGuard {
+        let in_branch: Vec<&str> = parent
+            .conditional_definitions
+            .iter()
+            .flat_map(|c| c.arms.iter())
+            .flat_map(|arm| arm.declarations.iter())
+            .map(|d| d.name.0.as_str())
+            .collect();
+        let declared_in = |name: &str| in_branch.iter().any(|d| declares(d, name));
         let blocks = nested
             .blocks
             .iter()
             .enumerate()
+            .filter(|(j, _)| !declared_in(&nested.names[*j]))
             .filter_map(|(j, (at, block))| at.map(|at| (j, at, block.clone(), false)))
             .collect();
-        NESTED_PLACEMENT.with(|slot| *slot.borrow_mut() = Some(NestedPending { owner: parent.name.0.as_str().to_string(), blocks }));
+        let declared = nested
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| declared_in(&nested.names[*j]))
+            .map(|(j, (_, block))| (j, nested.names[j].clone(), block.clone(), false))
+            .collect();
+        NESTED_PLACEMENT.with(|slot| {
+            *slot.borrow_mut() = Some(NestedPending { owner: parent.name.0.as_str().to_string(), blocks, declared })
+        });
         NestedPlacementGuard { count: nested.blocks.len() }
+    }
+
+    /// Write, in load order and indented one level more, the blocks of
+    /// the classes `declaration` (one of `owner`'s conditional branches')
+    /// declares: the class and what it nests.
+    fn place_declared(owner: &ClassId, s: &mut String, declaration: &str) {
+        NESTED_PLACEMENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(pending) = slot.as_mut().filter(|p| p.owner == owner.0.as_str()) else { return };
+            for (_, name, block, placed) in pending.declared.iter_mut() {
+                if !*placed && declares(declaration, name) {
+                    for line in block.lines() {
+                        if line.trim().is_empty() {
+                            s.push('\n');
+                        } else {
+                            s.push_str("  ");
+                            s.push_str(line);
+                            s.push('\n');
+                        }
+                    }
+                    *placed = true;
+                }
+            }
+        });
     }
 
     /// Write, in load order, the pending blocks of `owner` that `here`
@@ -631,7 +681,13 @@ impl NestedPlacementGuard {
     /// The blocks left for the header, as indices in load order.
     fn finish(self) -> Vec<usize> {
         let placed: Vec<usize> = NESTED_PLACEMENT.with(|slot| {
-            slot.borrow().as_ref().map(|p| p.blocks.iter().filter(|b| b.3).map(|b| b.0).collect()).unwrap_or_default()
+            slot.borrow()
+                .as_ref()
+                .map(|p| {
+                    let placed = p.blocks.iter().filter(|b| b.3).map(|b| b.0);
+                    placed.chain(p.declared.iter().filter(|b| b.3).map(|b| b.0)).collect()
+                })
+                .unwrap_or_default()
         });
         (0..self.count).filter(|j| !placed.contains(j)).collect()
     }
@@ -641,6 +697,11 @@ impl Drop for NestedPlacementGuard {
     fn drop(&mut self) {
         NESTED_PLACEMENT.with(|slot| *slot.borrow_mut() = None);
     }
+}
+
+/// Whether the class `name` is `declaration` or nested in it.
+fn declares(declaration: &str, name: &str) -> bool {
+    name.strip_prefix(declaration).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
 use crate::facades::{Facade, EXTRAS_FACADES};
@@ -7859,9 +7920,34 @@ fn emit_library_class_decl_inner(
 
     // A load-time conditional definition (`ConditionalDefinitions`) is
     // written whole, as the source has it, where its first member stands.
+    // One that defines no method (its branches only declare classes)
+    // stands before the first method the source has below it.
     let mut first = true;
     let mut written = vec![false; lc.conditional_definitions.len()];
+    let methodless: Vec<(usize, usize)> = lc
+        .conditional_definitions
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.arms.iter().all(|arm| arm.methods.is_empty()))
+        .map(|(at, c)| {
+            let before = lc
+                .methods
+                .iter()
+                .position(|m| m.name_span.file == c.span.file && m.name_span.start > c.span.start)
+                .unwrap_or(lc.methods.len());
+            (at, before)
+        })
+        .collect();
+    let write_methodless = |s: &mut String, first: &mut bool, index: usize| {
+        for &(at, _) in methodless.iter().filter(|(_, before)| *before == index) {
+            if !std::mem::replace(first, false) {
+                writeln!(s).unwrap();
+            }
+            write_conditional_definitions(s, lc, &lc.conditional_definitions[at], &body_pad);
+        }
+    };
     for (index, m) in lc.methods.iter().enumerate() {
+        write_methodless(&mut s, &mut first, index);
         let conditional = lc.conditional_definitions.iter().position(|c| c.contains(m));
         if let Some(at) = conditional {
             if std::mem::replace(&mut written[at], true) {
@@ -7893,6 +7979,7 @@ fn emit_library_class_decl_inner(
     // method building `self`), so the alias follows every def. The
     // class's own definition of the name would have kept the alias
     // from resolving to an ancestor (`ingest::inherited_alias`).
+    write_methodless(&mut s, &mut first, lc.methods.len());
     for (index, m) in lc.methods.iter().enumerate() {
         if inherited_alias(lc, m).is_some() {
             writeln!(s).unwrap();
@@ -8150,14 +8237,27 @@ fn write_conditional_definitions(
             let pad = if n == 0 { body_pad } else { inner_pad.as_str() };
             writeln!(s, "{pad}{line}").unwrap();
         }
+        // The branch's methods and declarations, in source order.
+        let mut items: Vec<(u32, Option<usize>, Option<&crate::dialect::ConditionalDeclaration>)> = arm
+            .methods
+            .iter()
+            .filter_map(|member| lc.methods.iter().position(|m| member.is(m)))
+            .map(|index| (lc.methods[index].name_span.start, Some(index), None))
+            .chain(arm.declarations.iter().map(|d| (d.start, None, Some(d))))
+            .collect();
+        items.sort_by_key(|(start, _, _)| *start);
         let mut first = true;
-        for member in &arm.methods {
-            let Some(index) = lc.methods.iter().position(|m| member.is(m)) else { continue };
+        for (_, index, declaration) in items {
             if !first {
                 writeln!(s).unwrap();
             }
             first = false;
-            write_library_method(s, lc, index, &inner_pad);
+            if let Some(index) = index {
+                write_library_method(s, lc, index, &inner_pad);
+            }
+            if let Some(declaration) = declaration {
+                NestedPlacement::place_declared(&lc.name, s, declaration.name.0.as_str());
+            }
         }
     }
     writeln!(s, "{body_pad}end").unwrap();
@@ -8434,6 +8534,8 @@ struct NameIndex {
     constant_paths: std::cell::OnceCell<std::rc::Rc<crate::det::HashSet<String>>>,
     /// `superclass_nesting`'s parses, by source file id.
     superclass_nestings: std::cell::RefCell<std::collections::BTreeMap<u32, std::rc::Rc<Vec<(usize, Vec<String>)>>>>,
+    /// `conditional_declarations`.
+    conditional_declarations: HashMap<String, String>,
 }
 
 thread_local! {
@@ -8464,6 +8566,7 @@ impl NameIndex {
             carried: std::cell::OnceCell::new(),
             constant_paths: std::cell::OnceCell::new(),
             superclass_nestings: std::cell::RefCell::default(),
+            conditional_declarations: conditional_declarations(app),
         };
         let key = app as *const App as usize;
         let previous = NAME_INDEX.with(|slot| slot.borrow_mut().replace((key, std::rc::Rc::new(index))));
@@ -8473,6 +8576,40 @@ impl NameIndex {
     fn current(app: &App) -> Option<std::rc::Rc<NameIndex>> {
         let key = app as *const App as usize;
         NAME_INDEX.with(|slot| slot.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, index)| index.clone()))
+    }
+}
+
+/// Each name a library class's load-time conditional declares
+/// (`ConditionalArm::declarations`) => that class.
+fn conditional_declarations(app: &App) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::default();
+    for lc in &app.library_classes {
+        for declaration in lc.conditional_definitions.iter().flat_map(|c| c.arms.iter()).flat_map(|arm| arm.declarations.iter()) {
+            out.entry(declaration.name.0.as_str().to_string()).or_insert_with(|| lc.name.0.as_str().to_string());
+        }
+    }
+    out
+}
+
+/// The library class whose load-time conditional declares `name` or a
+/// class enclosing it: the outermost such declaration's owner.
+fn conditional_owner(name: &str, app: &App) -> Option<String> {
+    let lookup = |declarations: &HashMap<String, String>| {
+        let mut end = 0;
+        loop {
+            let prefix_end = name[end..].find("::").map_or(name.len(), |at| end + at);
+            if let Some(owner) = declarations.get(&name[..prefix_end]) {
+                return Some(owner.clone());
+            }
+            if prefix_end == name.len() {
+                return None;
+            }
+            end = prefix_end + 2;
+        }
+    };
+    match NameIndex::current(app) {
+        Some(index) => lookup(&index.conditional_declarations),
+        None => lookup(&conditional_declarations(app)),
     }
 }
 
@@ -10359,6 +10496,11 @@ fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
 /// `A::B::C` classes belongs in `A::B`'s file, because that is the
 /// body whose end must happen once.
 pub(super) fn file_owner(name: &str, app: &App) -> String {
+    // A class a load-time conditional declares is written inside that
+    // conditional, in its owner's body, wherever that is.
+    if let Some(owner) = conditional_owner(name, app) {
+        return file_owner(&owner, app);
+    }
     let segments: Vec<&str> = name.split("::").collect();
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");

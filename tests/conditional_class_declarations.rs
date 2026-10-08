@@ -1,0 +1,103 @@
+//! A class or module declared inside a load-time `if` / `unless` exists
+//! only when its branch runs. graphql-client 0.25.0's
+//! query_typename.rb declares `InsertTypenameVisitor` in `module
+//! QueryTypename` only in the branch that finds graphql-ruby's node
+//! mutation API. Each case runs natively and emitted, in every branch.
+#[path = "support/emit_and_run.rs"]
+mod emit_and_run;
+
+fn native(files: &[(&str, &str)], script: &str, env: &[(&str, &str)]) -> String {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("rh_conditional_class_{}_{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for (path, text) in files {
+        let file = root.join("lib").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    }
+    let mut command = emit_and_run::ruby();
+    command.arg("-I").arg(root.join("lib")).arg("-e").arg(script);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `files` vendored as the gem `gqlc` (a `gem_sources` entry, as Core
+/// carries graphql-client), `entry` required from config/application.rb.
+/// Under each environment, the emitted tree prints what native Ruby
+/// prints, which is the `expected` given for it.
+fn same_as_native(files: &[(&str, &str)], entry: &str, script: &str, runs: &[(&[(&str, &str)], &str)]) {
+    for (env, expected) in runs {
+        assert_eq!(native(files, &format!("require {entry:?}\n{script}"), env), *expected, "native control under {env:?}");
+    }
+    for (env, expected) in runs {
+        let mut overlay = emit_and_run::empty_app()
+            .write("roundhouse.yml", "gem_sources:\n  gqlc: vendor/gems/gqlc-1.0.0\n")
+            .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    gqlc (1.0.0)\n\nDEPENDENCIES\n  gqlc\n")
+            .write("config/application.rb", &format!("require {entry:?}\n"));
+        for (path, text) in files {
+            overlay = overlay.write(&format!("vendor/gems/gqlc-1.0.0/lib/{path}"), text);
+        }
+        let run = overlay.run_ruby_env(script, env);
+        assert!(run.success, "emitted tree failed under {env:?} in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+        assert!(!run.stderr.contains("not_carried"), "{}", run.stderr);
+        assert_eq!(run.stdout, *expected, "under {env:?}: {}", run.stderr);
+    }
+}
+
+const VISITOR: &str = "module Gqlc\n  class Visitor\n    def initialize(doc)\n      @doc = doc\n    end\n\n    def visit = [:base, @doc]\n  end\nend\n";
+
+/// query_typename.rb's shape: the class and the method that builds it
+/// in one branch, the other branch's method alone, and a method after
+/// the conditional.
+const QUERY_TYPENAME: &str = "require \"gqlc/visitor\"\n\nmodule Gqlc\n  module QueryTypename\n    if ENV[\"GQLC_LEGACY\"].nil?\n      class InsertVisitor < Gqlc::Visitor\n        def initialize(doc, types:)\n          @types = types\n          super(doc)\n        end\n\n        def visit = [:insert, @types, *super]\n      end\n\n      def self.insert(doc) = InsertVisitor.new(doc, types: 1).visit\n    else\n      def self.insert(doc) = [:legacy, doc]\n    end\n\n    def self.flatten = 1\n  end\nend\n";
+
+#[test]
+fn a_class_declared_in_a_module_body_conditional_exists_only_in_its_branch() {
+    same_as_native(
+        &[("gqlc/visitor.rb", VISITOR), ("gqlc/query_typename.rb", QUERY_TYPENAME)],
+        "gqlc/query_typename",
+        "p Gqlc::QueryTypename.insert(:d), defined?(Gqlc::QueryTypename::InsertVisitor), Gqlc::QueryTypename.flatten\n",
+        &[
+            (&[], "[:insert, 1, :base, :d]\n\"constant\"\n1\n"),
+            (&[("GQLC_LEGACY", "1")], "[:legacy, :d]\nnil\n1\n"),
+        ],
+    );
+}
+
+/// `elsif` / `else` arms declaring a class, a module and a class beside
+/// a method, then an `unless` declaring a class alone. The gem's entry
+/// requires the file, as client.rb requires query_typename.rb.
+const SHAPES: &str = "module Gqlc\n  module Shapes\n    if ENV[\"GQLC_SHAPE\"] == \"a\"\n      class Alpha\n        def self.tag = :alpha\n      end\n    elsif ENV[\"GQLC_SHAPE\"] == \"b\"\n      module Beta\n        def self.tag = :beta\n      end\n    else\n      class Gamma\n        def self.tag = :gamma\n      end\n\n      def self.fallback = Gamma.tag\n    end\n\n    unless ENV[\"GQLC_SHAPE\"] == \"a\"\n      class Delta\n        def self.tag = :delta\n      end\n    end\n\n    def self.names = constants.sort\n  end\nend\n";
+
+#[test]
+fn elsif_else_and_unless_arms_declare_what_their_branch_runs() {
+    same_as_native(
+        &[("gqlc.rb", "require \"gqlc/shapes\"\n"), ("gqlc/shapes.rb", SHAPES)],
+        "gqlc",
+        "p Gqlc::Shapes.names, Gqlc::Shapes.respond_to?(:fallback)\np Gqlc::Shapes.names.map { |n| Gqlc::Shapes.const_get(n).tag }\n",
+        &[
+            (&[("GQLC_SHAPE", "a")], "[:Alpha]\nfalse\n[:alpha]\n"),
+            (&[("GQLC_SHAPE", "b")], "[:Beta, :Delta]\nfalse\n[:beta, :delta]\n"),
+            (&[], "[:Delta, :Gamma]\ntrue\n[:delta, :gamma]\n"),
+        ],
+    );
+}
+
+/// The same at file level, which the file program already carried.
+const TOP: &str = "if ENV[\"GQLC_TOP\"]\n  module Gqlc\n    class Top\n      def self.tag = :top\n    end\n  end\nend\n\nmodule Gqlc\n  def self.top = const_defined?(:Top) ? Top.tag : nil\nend\n";
+
+#[test]
+fn a_class_declared_in_a_file_body_conditional_exists_only_in_its_branch() {
+    same_as_native(
+        &[("gqlc/top.rb", TOP)],
+        "gqlc/top",
+        "p Gqlc.top\n",
+        &[(&[("GQLC_TOP", "1")], ":top\n"), (&[], "nil\n")],
+    );
+}

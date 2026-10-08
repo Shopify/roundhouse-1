@@ -1399,8 +1399,9 @@ pub struct LibraryClass {
 /// class bodies sees both definitions.
 ///
 /// Ingest admits only branches of plain `def`s (an inline `private def`
-/// included), with the visibility in effect around the statement; a
-/// branch with a visibility marker, an accessor, a constant or any
+/// included), with the visibility in effect around the statement, and
+/// `class` / `module` declarations ([`ConditionalArm::declarations`]);
+/// a branch with a visibility marker, an accessor, a constant or any
 /// other statement keeps the file refused, by name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalDefinitions {
@@ -1423,6 +1424,22 @@ pub struct ConditionalArm {
     /// The `methods` entries this branch defines, by identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<ConditionalMember>,
+    /// The classes and modules this branch declares, in source order.
+    /// Each is an ordinary library class (with what it nests), so
+    /// analysis types it like any other; the Ruby family writes it here,
+    /// inside the branch, so it exists only when Ruby runs the branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarations: Vec<ConditionalDeclaration>,
+}
+
+/// A `class` / `module` statement in a [`ConditionalArm`]: the name it
+/// declares, qualified (every library class it or its body declares is
+/// this name or nested in it), and where the statement starts, which
+/// orders it among the branch's methods.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConditionalDeclaration {
+    pub name: ClassId,
+    pub start: u32,
 }
 
 /// One method a [`ConditionalArm`] defines: its name, side and the span

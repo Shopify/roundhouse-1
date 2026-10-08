@@ -137,24 +137,29 @@ fn an_alias_of_an_inherited_method_is_carried() {
 /// graphql-client 0.25.0's query_typename.rb declares
 /// `InsertTypenameVisitor` in `module QueryTypename` only in the branch
 /// of `if GraphQL::Language::Nodes::AbstractNode.method_defined?(:merge)`
-/// that finds graphql-ruby's node mutation API. Ruby defines the class
-/// only when that branch runs, so carrying it unconditionally would be
-/// wrong, and the ingest does not model a conditional class. The file
-/// stays refused, and the refusal names that construct at the class
-/// rather than "a statement other than a `def`".
+/// that finds graphql-ruby's node mutation API. The conditional is now
+/// carried with the class inside its arm (tests/conditional_class_declarations.rs
+/// runs both branches), so the file is no longer refused. A class
+/// declared in a conditional inside `class << self` is still named as
+/// the gap.
 const QUERY_TYPENAME: &str = "module Gqlc\n  module QueryTypename\n    if ENV[\"GQLC_LEGACY\"].nil?\n      class InsertVisitor\n        def visit = :visitor\n      end\n\n      def self.insert = InsertVisitor.new.visit\n    else\n      def self.insert = :legacy\n    end\n\n    def self.flatten = 1\n  end\nend\n";
 
+const SINGLETON_CONDITIONAL: &str = "module Gqlc\n  module Singleton\n    def self.x = 1\n\n    class << self\n      if ENV[\"GQLC_LEGACY\"].nil?\n        class Inner\n          def visit = :visitor\n        end\n      end\n    end\n  end\nend\n";
+
 #[test]
-fn a_class_declared_in_a_class_body_conditional_is_named_as_the_gap() {
+fn a_class_declared_in_a_class_body_conditional_is_carried() {
     let files = [("lib/gqlc/query_typename.rb", QUERY_TYPENAME)];
     let script = "require \"gqlc/query_typename\"\np Gqlc::QueryTypename.insert, defined?(Gqlc::QueryTypename::InsertVisitor)\n";
     assert_eq!(native(&files, script), ":visitor\n\"constant\"\n");
     assert_eq!(native(&files, &format!("ENV[\"GQLC_LEGACY\"] = \"1\"\n{script}")), ":legacy\nnil\n");
 
-    let text = check_gem_tree("gap", &[("lib/gqlc/query_typename.rb", QUERY_TYPENAME)]);
-    let row = text.lines().find(|l| l.contains("query_typename.rb:4:7:")).unwrap_or_else(|| panic!("{text}"));
+    let text = check_gem_tree("carried", &files);
+    assert!(!text.contains("query_typename.rb"), "{text}");
+
+    let text = check_gem_tree("singleton", &[("lib/gqlc/singleton.rb", SINGLETON_CONDITIONAL)]);
+    let row = text.lines().find(|l| l.contains("singleton.rb:7:9:")).unwrap_or_else(|| panic!("{text}"));
     assert!(
-        row.contains("a class or module declared in a load-time conditional definition is not modeled"),
+        row.contains("a class or module declared in a load-time conditional inside `class << self` is not modeled"),
         "{row}"
     );
 }

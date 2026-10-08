@@ -117,8 +117,21 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<Conditiona
         return None;
     }
     arms.iter()
-        .any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some()))
+        .any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some() || is_declaration(stmt)))
         .then_some(ConditionalDefinition { negated, arms })
+}
+
+/// A `class` or `module` statement. In a load-time conditional's branch
+/// it declares only when the branch runs (`ConditionalArm::declarations`).
+pub(super) fn is_declaration(stmt: &Node<'_>) -> bool {
+    stmt.as_class_node().is_some() || stmt.as_module_node().is_some()
+}
+
+impl ConditionalDefinition<'_> {
+    /// Whether a branch defines a method (not only declares classes).
+    pub(super) fn defines(&self) -> bool {
+        self.arms.iter().any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some()))
+    }
 }
 
 pub(super) fn marker(call: &CallNode<'_>) -> bool {
@@ -671,7 +684,7 @@ impl Visibility {
                 format!("a load-time conditional definition in {scope} is not modeled"),
             ));
         }
-        if module_function {
+        if module_function && conditional.defines() {
             return Err(Self::unsupported(
                 file,
                 "a load-time conditional definition under `module_function` is not modeled",
@@ -698,6 +711,17 @@ impl Visibility {
             for stmt in statements {
                 let offset = stmt.location().start_offset();
                 STATEMENT.set(Some((offset, stmt.location().end_offset())));
+                // A class or module is a body of its own, walked by its
+                // own pass; the visibility around it is unchanged.
+                if is_declaration(stmt) {
+                    if class_side {
+                        return Err(Self::unsupported(
+                            file,
+                            "a class or module declared in a load-time conditional inside `class << self` is not modeled",
+                        ));
+                    }
+                    continue;
+                }
                 let Some(def) = definition(stmt) else {
                     return Err(Self::unsupported(file, Self::conditional_branch_refusal(stmt)));
                 };
@@ -766,13 +790,6 @@ impl Visibility {
             "`class << self` inside a load-time conditional definition is not modeled"
         } else if stmt.as_constant_write_node().is_some() {
             "a constant assigned in a load-time conditional definition is not modeled"
-        } else if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
-            // graphql-client's query_typename.rb declares
-            // `InsertTypenameVisitor` only in the branch that finds
-            // graphql-ruby's node mutation API; defined either way, the
-            // class would exist where Ruby leaves it undefined.
-            "a class or module declared in a load-time conditional definition is not modeled \
-             (Ruby defines it only when its branch runs)"
         } else if wrapped_declaration(stmt).is_some()
             || stmt.as_call_node().is_some_and(|c| {
                 c.receiver().is_none()
@@ -1005,7 +1022,9 @@ impl Visibility {
                 }
                 continue;
             }
-            if let Some(conditional) = conditional_definition(node) {
+            // A conditional declaring classes only, in a body whose
+            // conditionals are refused (a model's), is left as it was.
+            if let Some(conditional) = conditional_definition(node).filter(|c| self.conditionals || c.defines()) {
                 self.walk_conditional(node, &conditional, class_side, default, module_function, file)?;
                 continue;
             }
