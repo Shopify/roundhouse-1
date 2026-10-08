@@ -175,5 +175,5 @@ ALTER TABLE ONLY public.comments
 SET search_path TO "$user", public;
 
 INSERT INTO "schema_migrations" (version) VALUES
-('20261002052542'),
-('20261002052541');
+('20260929042427'),
+('20260929042426');

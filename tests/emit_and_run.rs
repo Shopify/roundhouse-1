@@ -5345,7 +5345,11 @@ end
 /// each as the head of an unmodeled statement and stopped. The dump is
 /// the blog's `db/schema.rb` loaded into PostgreSQL 18.3 and dumped with
 /// Rails' flags (`--schema-only --no-privileges --no-owner`), with the
-/// `SET search_path` and `schema_migrations` lines Rails appends.
+/// `SET search_path` and `schema_migrations` lines Rails appends. Those
+/// record the blog's own two migrations, as a dump of the database they
+/// built does. They once named 20261002052541/2, versions the blog
+/// lacks: natively `maintain_test_schema!` raises PendingMigrationError
+/// on that app, and `db:migrate` fails creating tables that exist.
 #[test]
 fn a_structure_sql_from_pg_dump_18_runs() {
     emit_and_run::real_blog()
