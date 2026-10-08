@@ -33,6 +33,15 @@ const FILES: &[(&str, &str)] = &[
   extend ActiveSupport::Concern
 
   class_methods do
+    #: -> untyped
+    def flag_methods
+      @flag_methods ||= Module.new.tap { |m| include m }
+    end
+
+    def flagged(name)
+      flag_methods.send(:define_method, "#{name}_flag") { send(name).to_s.upcase }
+    end
+
     def metadata_accessor(name, default: nil)
       @metadata_names ||= []
       @metadata_names << name.to_s
@@ -120,7 +129,7 @@ end
     ("app/models/author.rb", "class Author < ApplicationRecord\n  def greet(greeting) = \"#{greeting}, #{name}\"\nend\n"),
     (
         "app/models/post.rb",
-        "class Post < ApplicationRecord\n  belongs_to :author\n  metadata_accessor :color, default: \"red\"\n  delegate :name, to: :author, prefix: true, allow_nil: true\n  delegate :greet, to: :author\n\n  def hello = greet(\"hi\")\nend\n",
+        "class Post < ApplicationRecord\n  belongs_to :author\n  metadata_accessor :color, default: \"red\"\n  flagged :title\n  delegate :name, to: :author, prefix: true, allow_nil: true\n  delegate :greet, to: :author\n\n  def hello = greet(\"hi\")\nend\n",
     ),
     (
         "app/models/note.rb",
@@ -184,6 +193,7 @@ memo = Memo.new
 p [:memo, memo.size, Memo.metadata_names, memo.draft_tag]
 p [:memo_without_author, Memo.new(reviewer_id: a.id).valid?]
 written = Post.new(author_id: a.id)
+p [:flag, Post.new(title: "x").title_flag]
 p [:delegate, written.author_name, Post.new.author_name, written.hello, written.greet("yo")]
 "#;
 
@@ -201,6 +211,7 @@ const EXPECTED: &str = r#"[:post_without_author, false]
 [:marked, true, false]
 [:memo, 0, ["size"], "memo:draft"]
 [:memo_without_author, false]
+[:flag, "X"]
 [:delegate, "a", nil, "hi, a", "yo, a"]
 "#;
 

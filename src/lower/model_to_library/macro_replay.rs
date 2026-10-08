@@ -571,6 +571,17 @@ impl<'s, 'a> Walk<'s, 'a> {
                     self.expr(arg, aliases)?;
                 }
                 if let Some(block) = block {
+                    // `mod.send(:define_method, name) do ... end` (Core's
+                    // generated-methods modules) defers its block like a
+                    // direct `define_method`, whatever the receiver.
+                    let sent = match (method.as_str(), args.first().map(|a| &*a.node)) {
+                        ("send" | "public_send" | "__send__", Some(ExprNode::Lit { value: Literal::Sym { value } })) => {
+                            Some(value.as_str().to_string())
+                        }
+                        ("send" | "public_send" | "__send__", Some(ExprNode::Lit { value: Literal::Str { value } })) => Some(value.clone()),
+                        _ => None,
+                    };
+                    let name = sent.unwrap_or_else(|| name.clone());
                     // `Module.new do ... end`: another `self`.
                     let new_scope = name == "new"
                         && recv.as_ref().is_some_and(|r| {
