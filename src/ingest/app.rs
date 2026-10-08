@@ -569,6 +569,25 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             }
         }
     }
+    // The engines of the installed gems the boot's Bundler.require
+    // loads: their `isolate_namespace` prefixes an app model in the
+    // namespace too (Core's `MaintenanceTasks::CrossPodRun` reads
+    // `maintenance_tasks_cross_pod_runs`). The app's own engine and
+    // declared prefix come first: a module's own `table_name_prefix`
+    // wins in Rails.
+    if let Some(lock) = &app.gem_lock {
+        if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
+            let required: std::collections::BTreeSet<String> = app
+                .bundler_gems
+                .iter()
+                .filter(|gem| gem.envs.is_empty() || gem.envs.iter().any(|e| e == "test"))
+                .map(|gem| gem.name.clone())
+                .collect();
+            for (module, prefix) in super::gem_source_constants::engine_isolated_prefixes(vfs, &home, lock, &required) {
+                isolated_prefixes.entry(module).or_insert(prefix);
+            }
+        }
+    }
     for (module, prefix) in isolated_prefixes {
         table_prefixes.entry(module).or_insert(prefix);
     }

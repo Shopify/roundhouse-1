@@ -102,9 +102,18 @@ end
     });
     assert_eq!(survey_files, strict_files, "no emitted behavior changed");
     assert_eq!(survey_emit, strict_emit);
+    // The unlowered `labeled` declaration stays refused. Since 3580863f4
+    // an unclaimed model DSL call is a check error from `diagnose`
+    // (`diagnose_unclaimed_model_dsl`) rather than an emit warning, so
+    // check and emit agree; survey mode must not hide it.
+    let strict_check: Vec<String> =
+        roundhouse::analyze::diagnose(&strict).into_iter().map(|d| d.to_string()).collect();
+    let survey_check: Vec<String> =
+        roundhouse::analyze::diagnose(&surveyed).into_iter().map(|d| d.to_string()).collect();
+    assert_eq!(survey_check, strict_check);
     assert!(
-        survey_emit.iter().any(|d| d.message.contains("labeled")),
-        "declaration warning must remain: {survey_emit:?}"
+        survey_check.iter().any(|d| d.contains("labeled") && d.contains("model DSL call on `Article` not lowered")),
+        "declaration refusal must remain: {survey_check:?}"
     );
     let article = survey_files
         .iter()
