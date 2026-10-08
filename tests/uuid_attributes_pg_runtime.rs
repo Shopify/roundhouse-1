@@ -21,9 +21,8 @@
 //! prints must be equal, and equal to what Rails is known to answer.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
-
-use std::path::{Path, PathBuf};
-use std::process::Command;
+#[path = "support/pg_probe.rs"]
+mod pg_probe;
 
 const STRUCTURE: &str = r#"CREATE TABLE shops (
     id uuid NOT NULL,
@@ -186,6 +185,16 @@ const EXPECTED: [&str; 20] = [
     "shop find: a 4660",
 ];
 
+/// What native Rails requires, in order.
+const LOADS: [&str; 6] = [
+    "lib/probe/uuid_as_integer",
+    "config/initializers/uuid_types",
+    "app/models/application_record",
+    "app/models/shop",
+    "app/models/product",
+    "app/models/uuid_probe",
+];
+
 const FILES: [(&str, &str); 10] = [
     ("roundhouse.yml", "database_adapter: postgresql\n"),
     ("config/database.yml", DATABASE_YML),
@@ -204,14 +213,12 @@ fn overlay() -> emit_and_run::Overlay {
 }
 
 /// `check`'s errors other than the PostgreSQL adapter notice every
-/// PostgreSQL probe app carries and the two `uuid_attributes` body calls,
-/// which run as written at class load (the runtime's `attribute`) until
-/// macro replay answers them at compile time.
+/// PostgreSQL probe app carries. The two `uuid_attributes` body calls are
+/// claimed: they run as written at class load (the runtime's `attribute`).
 fn real_errors(errors: &[String]) -> Vec<&String> {
     errors
         .iter()
         .filter(|e| !e.contains("database_adapter not supported"))
-        .filter(|e| !e.contains("uuid_attributes not supported"))
         .collect()
 }
 
@@ -239,42 +246,10 @@ fn uuid_attributes_compile_to_declared_type_calls() {
 #[test]
 #[ignore = "requires pg gem, Core's pinned Rails and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
 fn uuid_attributes_match_native_rails_on_postgresql() {
-    assert!(std::env::var_os("ROUNDHOUSE_PG_TEST_URL").is_some(), "set ROUNDHOUSE_PG_TEST_URL");
     let (emitted, errors) = overlay().emit(roundhouse::project::BuildTarget::Ruby);
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
-    let native_root: PathBuf = Path::new(env!("CARGO_TARGET_TMPDIR")).join("uuid-attributes-native");
-    let _ = std::fs::remove_dir_all(&native_root);
-    for (path, text) in FILES {
-        let full = native_root.join(path);
-        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(full, text).unwrap();
-    }
-    // The pg gem and Rails' native extensions come from Core's gem home,
-    // as the oracle (tests/support/rails_oracle.rb) loads them.
-    let gem_home = std::env::var("CORE_GEM_HOME")
-        .unwrap_or_else(|_| "/nix/store/kr4swvh5mw01fs3kixfa9afy57zsyihg-ruby-gems-dev/lib/ruby/gems/4.0.0".into());
-    let jemalloc = std::env::var("RH_JEMALLOC").unwrap_or_else(|_| {
-        "/nix/store/c04j2i0fkin1bw5fab35gx896558knsd-jemalloc-5.3.0-unstable-2025-09-12/lib/libjemalloc.so.2".into()
-    });
-    let result = Command::new("ruby")
-        .arg("tests/uuid_attributes_pg_runtime.rb")
-        .arg(&native_root)
-        .arg(&*emitted)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("GEM_HOME", &gem_home)
-        .env("GEM_PATH", &gem_home)
-        .env("LD_PRELOAD", &jemalloc)
-        .output()
-        .expect("ruby");
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(result.status.success(), "stdout={stdout}\nstderr={}", String::from_utf8_lossy(&result.stderr));
-    let answers: serde_json::Value = serde_json::from_str(stdout.trim()).expect("driver prints JSON");
-    let lines = |side: &str| -> Vec<String> {
-        let run = &answers[side];
-        assert_eq!(run["ok"], true, "{side} run failed:\n{}", run["stderr"].as_str().unwrap_or(""));
-        run["lines"].as_array().unwrap().iter().map(|l| l.as_str().unwrap().to_string()).collect()
-    };
-    let (native, emitted) = (lines("native"), lines("emitted"));
+    let (native, emitted) =
+        pg_probe::native_and_emitted("uuid-attributes", &FILES, &emitted, "rh_e2e_uuid_attributes", "UuidProbe", &LOADS);
     assert_eq!(native, EXPECTED, "native");
     assert_eq!(emitted, native, "emitted");
 }

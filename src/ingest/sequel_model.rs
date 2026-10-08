@@ -99,6 +99,8 @@ pub fn ingest_sequel_model(
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         span: Span {
             file: super::sources::file_id(file),
             start: class_loc.start_offset() as u32,

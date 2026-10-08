@@ -1041,6 +1041,12 @@ pub(crate) fn unclaimed_unknowns(
                 }
             }
         }
+        // An app class macro reaching `attribute` or `query_constraints`
+        // whose literal columns the model's compiled methods answer
+        // (`analyze::retypable_attributes::claimed_body_calls`).
+        if model.claimed_body_calls.contains(&expr.span) {
+            continue;
+        }
         let d = Diagnostic::unsupported(
             expr.span,
             None,
@@ -1120,6 +1126,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
             if kept.iter().any(|k| std::ptr::eq(*k, call))
                 || crate::analyze::is_include_refusal(call)
                 || crate::lower::sti_subclass_callbacks::folds(call)
+                || app.models.iter().any(|m| lc.parent.as_ref() == Some(&m.name) && m.claimed_body_calls.contains(&call.span))
             {
                 continue;
             }

@@ -176,6 +176,8 @@ pub fn synthesize_record_model(app: &mut App) {
     app.models.push(Model {
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         name: class,
         parent: Some(ClassId(Symbol::from("ApplicationRecord"))),
         parent_span: Default::default(),

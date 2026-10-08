@@ -120,6 +120,20 @@ pub struct Model {
     /// then lowers exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retypable_attributes: Vec<Symbol>,
+    /// The columns a `query_constraints` call in the body names, directly
+    /// or through an app class macro that reaches it (stamped at the end
+    /// of ingest by `analyze::retypable_attributes`). The compiled update,
+    /// destroy and reload also carry a WHERE on all of them, taken when
+    /// the call has run. Empty for nearly every model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_constraints: Vec<Symbol>,
+    /// Spans of the body calls (the model's and its STI subclasses') that
+    /// `retypable_attributes` and `query_constraints` answer: an app class
+    /// macro that reaches `attribute` or `query_constraints` with literal
+    /// column names (`analyze::retypable_attributes::claimed_body_calls`).
+    /// The unclaimed-DSL checks skip them. Empty for nearly every model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claimed_body_calls: Vec<crate::span::Span>,
     /// Named visibility for methods the body does not define as a local
     /// `MethodDef`: inherited ones, schema/association readers, and
     /// accessors the lowering synthesizes. See [`VisibilityOverride`].

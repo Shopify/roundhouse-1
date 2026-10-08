@@ -1,12 +1,13 @@
-# Driver for tests/uuid_attributes_pg_runtime.rs: runs the probe app's
-# `UuidProbe.lines` on native Rails and on the emitted program, each
-# against a freshly created rh_e2e_uuid_attributes database on the
-# ROUNDHOUSE_PG_TEST_URL server, and prints both answers as JSON.
+# Driver for the PostgreSQL probe tests (tests/*_pg_runtime.rs that
+# compare with native Rails): runs the probe app's `PROBE.lines` on native
+# Rails and on the emitted program, each against a freshly created
+# DATABASE on the ROUNDHOUSE_PG_TEST_URL server, and prints both answers
+# as JSON.
 #
-#   ruby tests/uuid_attributes_pg_runtime.rb APP_ROOT OUT_ROOT
+#   ruby tests/support/pg_probe_driver.rb APP_ROOT OUT_ROOT DATABASE PROBE LOAD...
 #
 # native: Core's pinned Rails 8.2 (tests/support/rails_oracle.rb), the
-# app's type, initializer and models over `establish_connection` to the
+# app files LOAD (relative to APP_ROOT, in order) over `establish_connection` to the
 # database. emitted: the emitted tree's main.rb, its database
 # configuration pointed at the same database through
 # ROUNDHOUSE_DATABASE_URL.
@@ -14,15 +15,15 @@ require "pg"
 require "json"
 require "open3"
 require "rbconfig"
-require_relative "support/rails_oracle"
+require_relative "rails_oracle"
 
 app_root, out_root = File.expand_path(ARGV.fetch(0)), File.expand_path(ARGV.fetch(1))
 admin_options = PG::Connection.conninfo_parse(ENV.fetch("ROUNDHOUSE_PG_TEST_URL"))
   .each_with_object({}) { |o, h| h[o[:keyword].to_sym] = o[:val] if o[:val] }
-DATABASE = "rh_e2e_uuid_attributes"
+DATABASE = ARGV.fetch(2)
+PROBE = ARGV.fetch(3)
 DDL = File.read(File.join(app_root, "db/structure.sql")).freeze
-LOADS = %w[lib/probe/uuid_as_integer config/initializers/uuid_types app/models/application_record
-  app/models/shop app/models/product app/models/uuid_probe].freeze
+LOADS = ARGV.drop(4).freeze
 
 def admin(options)
   conn = PG.connect(**options)
@@ -46,17 +47,17 @@ end
 clean = %w[RAILS_ENV RACK_ENV DATABASE_URL ROUNDHOUSE_DATABASE_URL].to_h { |k| [k, nil] }
 endpoint = { host: admin_options[:host], port: admin_options[:port], username: admin_options[:user], database: DATABASE }
 native_script = <<~RUBY
-  require #{File.join(__dir__, "support/rails_oracle").inspect}
+  require #{File.join(__dir__, "rails_oracle").inspect}
   RailsOracle.activate("activesupport", "activemodel", "activerecord")
   require "active_record"
   ActiveRecord::Base.establish_connection(#{{ adapter: "postgresql" }.merge(endpoint.compact).inspect})
   #{LOADS.map { |m| "require #{File.join(app_root, m).inspect}" }.join("\n")}
-  puts UuidProbe.lines
+  puts #{PROBE}.lines
 RUBY
 emitted_script = <<~RUBY
   require File.expand_path("main", Dir.pwd)
   Main.configure_default_adapter!
-  puts UuidProbe.lines
+  puts #{PROBE}.lines
 RUBY
 conninfo = endpoint.compact.map { |k, v| "#{k == :username ? "user" : k == :database ? "dbname" : k}=#{v}" }.join(" ")
 

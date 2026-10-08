@@ -51,6 +51,8 @@ fn length_rule_fans_out_into_min_and_max_checks() {
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         span: roundhouse::span::Span::synthetic(),
         body: vec![ModelBodyItem::Validation {
             validation: Validation {
@@ -88,6 +90,8 @@ fn multiple_rules_on_one_attribute_stay_grouped() {
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         span: roundhouse::span::Span::synthetic(),
         body: vec![ModelBodyItem::Validation {
             validation: Validation {

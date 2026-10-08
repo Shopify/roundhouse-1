@@ -598,6 +598,46 @@ module ActiveRecord
     def self._retypable_attribute_names
       []
     end
+
+    # persistence.rb's `query_constraints(*columns_list)`: the columns
+    # update, destroy and reload key a record on, in order. The compiled
+    # `_adapter_update`/`_adapter_delete`/`_adapter_reload` carry that WHERE
+    # for the list the class body names (`_compiled_query_constraints`,
+    # emitted per model) and use it when this list is set; any other list
+    # raises rather than being recorded and ignored.
+    def self.query_constraints(*columns_list)
+      raise ArgumentError, "You must specify at least one column to be used in querying" if columns_list.empty?
+      list = columns_list.map(&:to_s)
+      unless list == _compiled_query_constraints
+        raise NotImplementedError, "#{name}.query_constraints(#{list.join(", ")}): the compiled update, destroy and reload key on #{(_compiled_query_constraints || [primary_key]).join(", ")}"
+      end
+      @query_constraints_list = list
+      @has_query_constraints = list
+    end
+
+    def self.has_query_constraints?
+      @has_query_constraints
+    end
+
+    # A model's own list, else its base class's when the two share a
+    # primary key (an STI subclass), as in Rails. A composite
+    # `primary_key` is not ported, so there is no implicit list.
+    def self.query_constraints_list
+      return @query_constraints_list if @query_constraints_list
+      parent = superclass
+      return nil if parent.equal?(ActiveRecord::Base) || !parent.respond_to?(:query_constraints_list) || parent.abstract_class?
+      parent.primary_key == primary_key ? parent.query_constraints_list : nil
+    end
+
+    def self.composite_query_constraints_list
+      query_constraints_list || [primary_key]
+    end
+
+    # The list the compiled adapter methods key on; nil when they key on
+    # the primary key alone. Emitted models override it.
+    def self._compiled_query_constraints
+      nil
+    end
     
     # Read on every retypable accessor and bind, so memoized; a later
     # `attribute` here or in a superclass clears it.

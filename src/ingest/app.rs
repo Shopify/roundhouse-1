@@ -2634,6 +2634,34 @@ end
         }
         model.retypable_attributes = cols;
     }
+    // The columns a `query_constraints` call in the body names; the
+    // compiled update, destroy and reload key on them once it has run.
+    let constraints: Vec<Vec<crate::ident::Symbol>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::query_constraint_columns(m, &app)).collect();
+    for (model, cols) in app.models.iter_mut().zip(constraints) {
+        // A direct call naming exactly those columns runs at class load
+        // as written; the runtime's `query_constraints` sets the list.
+        for item in model.body.iter_mut() {
+            let crate::dialect::ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
+                continue;
+            };
+            if crate::analyze::retypable_attributes::carries_query_constraints(expr, &cols) {
+                *item = crate::dialect::ModelBodyItem::ClassBody {
+                    expr: expr.clone(),
+                    leading_comments: std::mem::take(leading_comments),
+                    leading_blank_line: *leading_blank_line,
+                };
+            }
+        }
+        model.query_constraints = cols;
+    }
+    // The macro calls those columns answer, which the unclaimed-DSL
+    // checks then skip.
+    let claimed: Vec<Vec<crate::span::Span>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::claimed_body_calls(m, &app)).collect();
+    for (model, spans) in app.models.iter_mut().zip(claimed) {
+        model.claimed_body_calls = spans;
+    }
     Ok(app)
 }
 

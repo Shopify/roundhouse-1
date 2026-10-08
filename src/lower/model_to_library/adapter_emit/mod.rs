@@ -74,6 +74,9 @@ pub(super) fn push_adapter_methods(
     methods.push(synth_adapter_reload(model, table, dialect));
     methods.push(synth_columns_sql(owner, table, dialect));
     methods.push(synth_hydrate_all(owner));
+    if !model.query_constraints.is_empty() {
+        methods.push(synth_compiled_query_constraints(model));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,9 +321,17 @@ fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: 
     // set by the app, or minted just below — so it is written like any
     // other column and answered from the ivar; the rowid says nothing
     // about it (#90).
+    //
+    // A key the table does not flag, one column of a composite primary
+    // key that `self.primary_key` names, has no generated identity to
+    // return when it has no default: Rails writes the value the record
+    // holds (Core's GenerateOid assigns it before create), and so does
+    // this INSERT. A nil one fails the NOT NULL constraint, as in Rails.
     let key = key_column(model, table);
-    let supplied_key =
-        key.filter(|c| !matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt));
+    let unflagged = super::primary_key_column(table).is_none();
+    let supplied_key = key.filter(|c| {
+        !matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt) || (unflagged && c.default.is_none())
+    });
 
     // SQL column names are the PUBLIC names; the value reads the STORAGE
     // ivar (`@col_raw` for temporal — stored ISO-8601 text goes to disk).
@@ -434,11 +445,14 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
         })
         .collect();
 
-    let op = ArelOp::Update(Update {
-        table: TableRef(table.name.clone()),
-        assignments,
-        conditions: Some(eq_id_ivar(model, table)),
-    });
+    let update = |conditions: Predicate| {
+        ArelOp::Update(Update { table: TableRef(table.name.clone()), assignments: assignments.clone(), conditions: Some(conditions) })
+    };
+    let mut body = dialect.visit(&update(eq_id_ivar(model, table)), schema, owner);
+    if let Some(cols) = query_constraint_columns(model, table) {
+        let composite = dialect.visit(&update(eq_query_constraints(model, table, &cols)), schema, owner);
+        body = when_query_constraints(composite, body);
+    }
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -448,7 +462,7 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
         name: Symbol::from("_adapter_update"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: dialect.visit(&op, schema, owner),
+        body,
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -463,10 +477,12 @@ fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: 
 /// See `synth_adapter_insert` for the receiver-rationale.
 fn synth_adapter_delete(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
     let owner = &model.name;
-    let op = ArelOp::Delete(Delete {
-        table: TableRef(table.name.clone()),
-        conditions: Some(eq_id_ivar(model, table)),
-    });
+    let delete = |conditions: Predicate| ArelOp::Delete(Delete { table: TableRef(table.name.clone()), conditions: Some(conditions) });
+    let mut body = dialect.visit(&delete(eq_id_ivar(model, table)), schema, owner);
+    if let Some(cols) = query_constraint_columns(model, table) {
+        let composite = dialect.visit(&delete(eq_query_constraints(model, table, &cols)), schema, owner);
+        body = when_query_constraints(composite, body);
+    }
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -476,7 +492,7 @@ fn synth_adapter_delete(model: &Model, table: &Table, schema: &Schema, dialect: 
         name: Symbol::from("_adapter_delete"),
         receiver: MethodReceiver::Instance,
         params: vec![],
-        body: dialect.visit(&op, schema, owner),
+        body,
         signature: Some(fn_sig(vec![], Ty::Nil)),
         effects: EffectSet::default(),
         enclosing_class: Some(owner.0.clone()),
@@ -651,65 +667,13 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
     // The key column and its ivar, bound with the key's type — the same
     // column the visitor-emitted find/exists paths compare.
     let key = key_column_name(model, table);
-    let (bind_method, escape_method) = match key_value_type(model, table) {
-        ValueType::Str => ("bind_text", "escape_string"),
-        ValueType::StrOpt => ("bind_text_opt", "escape_string_opt"),
-        ValueType::IntOpt => ("bind_int_opt", "escape_int_opt"),
-        _ => ("bind_int", "escape_int"),
-    };
     let id_ivar = match key_column(model, table) {
         Some(c) => column_bind_expr(model, c),
         None => Expr::new(Span::synthetic(), ExprNode::Ivar { name: key.clone() }),
     };
-    let (sql_concat, bind_id) = if param {
-        // SQL: "SELECT <cols> FROM <table> WHERE <key> = ?" + " LIMIT 1"
-        let sql = arel_concat(vec![
-            arel_lit_str(format!(
-                "SELECT {} FROM {} WHERE {} = ",
-                cols_csv,
-                dialect.ident(table.name.as_str()),
-                dialect.ident(key.as_str())
-            )),
-            arel_lit_str(dialect.placeholder(1)),
-            arel_lit_str(" LIMIT 1".to_string()),
-        ]);
-        // Db.bind_int(stmt, 1, @id) — or bind_text for a string key
-        let bind = arel_db_call(
-            &db,
-            bind_method,
-            vec![var_ref(&stmt), arel_lit_int(1), id_ivar],
-        );
-        (sql, Some(bind))
-    } else {
-        // SQL: "SELECT <cols> FROM <table> WHERE <key> = " + Db.escape_int(@id) + " LIMIT 1"
-        let sql_prefix = arel_lit_str(format!(
-            "SELECT {} FROM {} WHERE {} = ",
-            cols_csv,
-            dialect.ident(table.name.as_str()),
-            dialect.ident(key.as_str())
-        ));
-        let escape_id = Expr::new(
-            Span::synthetic(),
-            ExprNode::Send {
-                recv: Some(Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Const { path: vec![Symbol::from("Db")] },
-                )),
-                method: Symbol::from(escape_method),
-                args: vec![id_ivar],
-                block: None,
-                parenthesized: true,
-            },
-        );
-        let sql_suffix = arel_lit_str(" LIMIT 1".to_string());
-        (arel_concat(vec![sql_prefix, escape_id, sql_suffix]), None)
-    };
-
-    // stmt = Db.prepare(sql)
-    let stmt_assign = arel_assign(
-        &stmt,
-        arel_db_call(&db, "prepare", vec![sql_concat]),
-    );
+    let select = format!("SELECT {} FROM {} WHERE ", cols_csv, dialect.ident(table.name.as_str()));
+    let (sql_concat, binds) =
+        reload_lookup(&select, &[(key, id_ivar, key_value_type(model, table))], param, dialect, &db, &stmt);
 
     // if Db.step?(stmt) ; @<col> = Db.column_<int|text>(stmt, i) ; ... ; mark_persisted! ; end
     let mut if_body: Vec<Expr> = Vec::new();
@@ -768,17 +732,22 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
         },
     );
 
-    let finalize = arel_db_call(&db, "finalize", vec![var_ref(&stmt)]);
-    let self_ref = Expr::new(Span::synthetic(), ExprNode::SelfRef);
     // stmt = prepare ; [bind_int(stmt, 1, @id)] ; if step? {…} ; finalize ; self
-    let mut body_exprs = vec![stmt_assign];
-    if let Some(bind) = bind_id {
-        body_exprs.push(bind);
+    let assemble = |sql: Expr, binds: Vec<Expr>| {
+        let mut body_exprs = vec![arel_assign(&stmt, arel_db_call(&db, "prepare", vec![sql]))];
+        body_exprs.extend(binds);
+        body_exprs.push(if_expr.clone());
+        body_exprs.push(arel_db_call(&db, "finalize", vec![var_ref(&stmt)]));
+        body_exprs.push(Expr::new(Span::synthetic(), ExprNode::SelfRef));
+        Expr::new(Span::synthetic(), ExprNode::Seq { exprs: body_exprs })
+    };
+    let mut body = assemble(sql_concat, binds);
+    // Rails' reload finds the row by `_in_memory_query_constraints_hash`.
+    if let Some(cols) = query_constraint_columns(model, table) {
+        let keys: Vec<_> = cols.iter().map(|c| (c.name.clone(), column_bind_expr(model, c), bind_type(model, c))).collect();
+        let (sql, binds) = reload_lookup(&select, &keys, param, dialect, &db, &stmt);
+        body = when_query_constraints(assemble(sql, binds), body);
     }
-    body_exprs.push(if_expr);
-    body_exprs.push(finalize);
-    body_exprs.push(self_ref);
-    let body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: body_exprs });
 
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,
@@ -797,6 +766,105 @@ fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> Me
             mutates_self: false,
             block_param: None,
     }
+}
+
+/// The WHERE of `_adapter_reload`'s SELECT on `keys` (column, bound
+/// value, bind type): each `<col> = <value>`, joined by AND, then
+/// ` LIMIT 1`. Returns the SQL and, when the values are placeholders, the
+/// `Db.bind_*` calls; inline, the values are escaped into the SQL.
+fn reload_lookup(
+    select: &str,
+    keys: &[(Symbol, Expr, ValueType)],
+    param: bool,
+    dialect: SqlDialect,
+    db: &ClassId,
+    stmt: &Symbol,
+) -> (Expr, Vec<Expr>) {
+    let mut parts = Vec::new();
+    let mut binds = Vec::new();
+    for (i, (column, value, ty)) in keys.iter().enumerate() {
+        let lead = if i == 0 { select } else { " AND " };
+        parts.push(arel_lit_str(format!("{lead}{} = ", dialect.ident(column.as_str()))));
+        let (bind_method, escape_method) = match ty {
+            ValueType::Str => ("bind_text", "escape_string"),
+            ValueType::StrOpt => ("bind_text_opt", "escape_string_opt"),
+            ValueType::IntOpt => ("bind_int_opt", "escape_int_opt"),
+            _ => ("bind_int", "escape_int"),
+        };
+        if param {
+            parts.push(arel_lit_str(dialect.placeholder(i + 1)));
+            binds.push(arel_db_call(db, bind_method, vec![var_ref(stmt), arel_lit_int(i as i64 + 1), value.clone()]));
+        } else {
+            parts.push(arel_db_call(db, escape_method, vec![value.clone()]));
+        }
+    }
+    parts.push(arel_lit_str(" LIMIT 1".to_string()));
+    (arel_concat(parts), binds)
+}
+
+/// `def self._compiled_query_constraints; ["shop_id", "id"]; end` — the
+/// list the compiled update, destroy and reload key on
+/// (`Model::query_constraints`). The runtime's `query_constraints`
+/// accepts this list and raises for any other.
+fn synth_compiled_query_constraints(model: &Model) -> MethodDef {
+    let owner = &model.name;
+    let elements = model.query_constraints.iter().map(|c| arel_lit_str(c.as_str().to_string())).collect();
+    let mut body = Expr::new(Span::synthetic(), ExprNode::Array { elements, style: crate::expr::ArrayStyle::Brackets });
+    body.ty = Some(Ty::Array { elem: Box::new(Ty::Str) });
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: Symbol::from("_compiled_query_constraints"),
+        receiver: MethodReceiver::Class,
+        params: vec![],
+        body,
+        signature: Some(fn_sig(vec![], Ty::Array { elem: Box::new(Ty::Str) })),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// The columns `query_constraints` names (`Model::query_constraints`),
+/// when the class body names any.
+fn query_constraint_columns<'a>(model: &Model, table: &'a Table) -> Option<Vec<&'a crate::schema::Column>> {
+    if model.query_constraints.is_empty() {
+        return None;
+    }
+    model.query_constraints.iter().map(|n| table.columns.iter().find(|c| &c.name == n)).collect()
+}
+
+/// `<a> = @a AND <b> = @b`, in the order `query_constraints` names them:
+/// Rails' `_query_constraints_hash`.
+fn eq_query_constraints(model: &Model, table: &Table, cols: &[&crate::schema::Column]) -> Predicate {
+    cols.iter()
+        .map(|c| {
+            Predicate::Eq(
+                ColRef { table: TableRef(table.name.clone()), column: c.name.clone() },
+                Value::Runtime { expr: column_bind_expr(model, c), ty: bind_type(model, c) },
+            )
+        })
+        .reduce(|a, b| Predicate::And(Box::new(a), Box::new(b)))
+        .expect("query_constraints names at least one column")
+}
+
+/// `if self.class.query_constraints_list then <composite> else <single>
+/// end`: the composite WHERE once the class body's `query_constraints`
+/// call has run (Core's runs it only under its Yugabyte configuration).
+fn when_query_constraints(composite: Expr, single: Expr) -> Expr {
+    let send = |recv: Expr, method: &str| {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: Some(recv), method: Symbol::from(method), args: vec![], block: None, parenthesized: false },
+        )
+    };
+    let cond = send(send(Expr::new(Span::synthetic(), ExprNode::SelfRef), "class"), "query_constraints_list");
+    Expr::new(Span::synthetic(), ExprNode::If { cond, then_branch: composite, else_branch: single })
 }
 
 /// An identifier quoted the way Rails' SQLite adapter always quotes one

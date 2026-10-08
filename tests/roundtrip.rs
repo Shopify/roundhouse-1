@@ -64,6 +64,8 @@ fn tiny_blog_round_trips() {
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         span: Span::synthetic(),
         visibility_overrides: Vec::new(),
     };

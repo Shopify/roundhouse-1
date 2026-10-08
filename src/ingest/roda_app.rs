@@ -137,6 +137,8 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        query_constraints: Vec::new(),
+        claimed_body_calls: Vec::new(),
         visibility_overrides: Vec::new(),
     });
     let models_dir = dir.join("models");
