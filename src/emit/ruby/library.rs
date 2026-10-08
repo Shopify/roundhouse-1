@@ -9908,6 +9908,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
         .iter()
         .filter(|c| {
             aliases_ancestor_method(lc, c)
+                || crate::ingest::inherited_alias::aliases_core_method(&app.library_classes, lc, c)
                 || crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))

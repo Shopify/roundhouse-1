@@ -163,6 +163,33 @@ fn an_alias_of_an_inherited_method_is_carried() {
     );
 }
 
+/// activemerchant 1.137.0's billing/compatibility.rb: `class Errors <
+/// Hash` does `alias count size`, naming a method of its core
+/// superclass (`Hash#size`, `alias size length` in its RBS). Only app
+/// ancestors were looked up, so the file was refused ("alias names a
+/// method this body has not defined") and `Compatibility::Model` was
+/// undefined where billing/model.rb includes it (NameError at boot).
+/// Plain `Plainer` aliases Object's `inspect`, through no written
+/// superclass.
+const CORE_ALIAS: &[(&str, &str)] = &[
+    ("amlike.rb", "require \"amlike/errors\"\n"),
+    (
+        "amlike/errors.rb",
+        "module Amlike\n  class Errors < Hash\n    def initialize\n      super() { |h, k| h[k] = [] }\n    end\n\n    alias count size\n\n    def [](key)\n      super(key.to_s)\n    end\n  end\n\n  class Plainer\n    alias described inspect\n  end\nend\n",
+    ),
+];
+
+#[test]
+fn an_alias_of_a_core_superclass_method_is_carried() {
+    gem_same_as_native(
+        "amlike",
+        CORE_ALIAS,
+        "amlike",
+        "e = Amlike::Errors.new\ne[:card] << \"bad\"\ne[\"name\"] << \"blank\"\np e.count, e[\"card\"], Amlike::Errors.instance_method(:count).original_name\np Amlike::Plainer.new.described.start_with?(\"#<Amlike::Plainer\")\n",
+        "2\n[\"bad\"]\n:size\ntrue\n",
+    );
+}
+
 /// graphql-client 0.25.0's query_typename.rb declares
 /// `InsertTypenameVisitor` in `module QueryTypename` only in the branch
 /// of `if GraphQL::Language::Nodes::AbstractNode.method_defined?(:merge)`
