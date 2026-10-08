@@ -28,6 +28,9 @@
 //! retypable column (`Model::retypable_attributes`, which casts through
 //! its declared type already) keep the shared lowering's writer.
 //!
+//! A new record's `id` reader answers nil, as Rails' does, and its
+//! `to_param` nil with it; the slot keeps the unsaved sentinel.
+//!
 //! `attributes` is Rails' `@attributes.to_hash`: every column in schema
 //! order, the id included (nil on a new record, where the slot holds
 //! the unsaved sentinel), each as its type reads it (a temporal column's
@@ -85,6 +88,66 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             cast_writes(lc, &cols);
         }
         public_attributes(lc, model, table);
+        nil_unsaved_id(lc, model, table);
+    }
+    for lc in lcs.iter_mut().filter(|lc| app.models.iter().any(|m| m.name == lc.name)) {
+        nil_unsaved_param(lc);
+    }
+}
+
+/// Rails' new record has no id (`Owner.new.id` is nil): the `id`
+/// reader answers nil while the slot holds the unsaved sentinel, so
+/// equality (`!id.nil? && other.id == id`), `hash`, and the key a
+/// belongs_to writer takes from an unsaved target (`pet.owner =
+/// Owner.new`) read nil as Rails'. The slot keeps the sentinel the
+/// shared lowering and every target's guards test. A new record given
+/// id 0 reads nil, where Rails reads 0.
+fn nil_unsaved_id(lc: &mut LibraryClass, model: &Model, table: &Table) {
+    let Some(col) = table.columns.iter().find(|c| c.primary_key && c.name.as_str() == "id") else {
+        return;
+    };
+    if is_retypable(model, col) {
+        return;
+    }
+    let slot = col_storage_name(col);
+    for m in lc.methods.iter_mut() {
+        if m.receiver != MethodReceiver::Instance || m.name.as_str() != "id" {
+            continue;
+        }
+        if !matches!(&*m.body.node, ExprNode::Ivar { name } if *name == slot) {
+            continue;
+        }
+        let nilable = |t: Ty| Ty::Union { variants: vec![t, Ty::Nil] };
+        let ty = m.body.ty.clone().map(nilable);
+        m.body = id_value(col);
+        m.body.ty = ty;
+        if let Some(Ty::Fn { ret, .. }) = &mut m.signature {
+            **ret = nilable((**ret).clone());
+        }
+    }
+}
+
+/// Rails' `to_param` is the key joined, nil for a new record (`to_key`
+/// is nil without an id); the lowering's reads the slot (`@id.to_s`,
+/// the sentinel's "0"). It reads the `id` reader instead.
+fn nil_unsaved_param(lc: &mut LibraryClass) {
+    for m in lc.methods.iter_mut() {
+        if m.receiver != MethodReceiver::Instance || m.name.as_str() != "to_param" {
+            continue;
+        }
+        let reads_slot = matches!(&*m.body.node, ExprNode::Send { recv: Some(r), method, args, .. }
+            if method.as_str() == "to_s" && args.is_empty() && matches!(&*r.node, ExprNode::Ivar { name } if name.as_str() == "id"));
+        if !reads_slot {
+            continue;
+        }
+        let id = || send(self_ref(), "id", vec![]);
+        let ty = m.body.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil] });
+        m.body = sp(ExprNode::If {
+            cond: send(id(), "nil?", vec![]),
+            then_branch: lit(Literal::Nil),
+            else_branch: send(id(), "to_s", vec![]),
+        });
+        m.body.ty = ty;
     }
 }
 

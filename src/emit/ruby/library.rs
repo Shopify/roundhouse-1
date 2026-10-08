@@ -2471,6 +2471,11 @@ pub(crate) fn app_calls_association(app: &App) -> bool {
                 return;
             }
         }
+        // `Associations::Preloader` reads each record's association object.
+        if matches!(&*e.node, ExprNode::Const { path } if path.len() >= 2 && path[path.len() - 2].as_str() == "Associations" && path[path.len() - 1].as_str() == "Preloader") {
+            *found = true;
+            return;
+        }
         e.node.for_each_child(&mut |c| walk(c, found));
     }
     let mut found = false;
@@ -12526,6 +12531,11 @@ fn expr_mentions_includes(expr: &Expr) -> bool {
                 *found = true;
                 return;
             }
+        }
+        // `Associations::Preloader` (runtime/spinel/active_record_associations.rb) drives the same loaders.
+        if matches!(&*e.node, ExprNode::Const { path } if path.len() >= 2 && path[path.len() - 2].as_str() == "Associations" && path[path.len() - 1].as_str() == "Preloader") {
+            *found = true;
+            return;
         }
         e.node.for_each_child(&mut |c| walk(c, found));
     }
