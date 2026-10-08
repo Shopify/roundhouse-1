@@ -62,6 +62,16 @@ pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 /// refuses it on every other (`analyze::runtime_reads`).
 pub const RUNTIME_VALUE_REF: u64 = 1 << 20;
 
+/// An `as_json` send no static method answers (an untyped receiver, a
+/// core value, a plain object): ActiveSupport's core_ext/object/json.rb
+/// answers it by reopening Object and the core classes, which no tree
+/// does. `lower::as_json_residue` routes it to the port's
+/// `ActiveSupport::JSON::Encoding.as_json(value, options)`
+/// (runtime/spinel/active_support_json.rb), which answers the same
+/// table; `project` refuses it where the finished tree lacks the port
+/// (`analyze::runtime_reads`).
+pub const OBJECT_AS_JSON: u64 = 1 << 21;
+
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
 /// keyword arguments, or a `yield(**value)` argument, which ingest takes
@@ -1669,7 +1679,7 @@ mod tests {
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
-            RUNTIME_VALUE_REF,
+            RUNTIME_VALUE_REF, OBJECT_AS_JSON,
         ];
         let mut seen = 0u64;
         for bit in bits {

@@ -1,13 +1,15 @@
 //! One gap, one row. `diagnose` reports a send whose known receiver
 //! answered no type as `send_dispatch_failed`, a fallback for sites
 //! nothing else explains. A send the typer already refused carries its
-//! own, more specific row: `plain.as_json` is ActiveSupport's Object
-//! extension, which Ruby has (`Plain.new.respond_to?(:as_json)`) and
-//! the runtime has not ported. Reporting "no known method `as_json` on
-//! Plain" beside it counted the one gap twice, and the second row was
-//! false. Core's GraphQL user-error classes and controllers had these
-//! pairs (`GiftCards::RecipientParams#as_json`). A send that nothing
-//! else covers still gets the fallback.
+//! own, more specific row: `plain.instance_values` is ActiveSupport's
+//! Object extension, which Ruby has (`Plain.new.respond_to?(
+//! :instance_values)`) and the runtime has not ported. Reporting "no
+//! known method `instance_values` on Plain" beside it counted the one
+//! gap twice, and the second row was false. Core's GraphQL user-error
+//! classes and controllers had these pairs for `as_json`
+//! (`GiftCards::RecipientParams#as_json`), which now routes to the
+//! JSON port (`lower::as_json_residue`) and has no row at all. A send
+//! that nothing else covers still gets the fallback.
 
 use std::process::Command;
 
@@ -36,12 +38,12 @@ fn check(files: &[(&str, &str)]) -> String {
 #[test]
 fn a_refused_send_is_not_also_a_missing_method() {
     let native = Command::new("ruby")
-        .args(["-W0", "-e", "require \"active_support\"\nrequire \"active_support/core_ext/object/json\"\nclass Plain; end\np [Plain.new.respond_to?(:as_json), Plain.new.respond_to?(:frobnicate)]"])
+        .args(["-W0", "-e", "require \"active_support\"\nrequire \"active_support/core_ext/object/json\"\nclass Plain; end\np [Plain.new.respond_to?(:instance_values), Plain.new.respond_to?(:as_json), Plain.new.respond_to?(:frobnicate)]"])
         .output()
         .expect("ruby");
-    assert_eq!(String::from_utf8_lossy(&native.stdout), "[true, false]\n", "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "[true, true, false]\n", "{}", String::from_utf8_lossy(&native.stderr));
 
-    let controller = "class ThingsController < ApplicationController\n  #: (Plain) -> untyped\n  def flash_of(d) = d.as_json\n\n  #: (Plain) -> untyped\n  def missing_of(d) = d.frobnicate\nend\n";
+    let controller = "class ThingsController < ApplicationController\n  #: (Plain) -> untyped\n  def flash_of(d) = d.instance_values\n\n  #: (Plain) -> untyped\n  def missing_of(d) = d.frobnicate\n\n  #: (Plain) -> untyped\n  def json_of(d) = d.as_json\nend\n";
     let text = check(&[("app/lib/plain.rb", "class Plain\nend\n"), ("app/controllers/things_controller.rb", controller)]);
     let rows = |line: &str| -> Vec<String> {
         text.lines()
@@ -50,8 +52,12 @@ fn a_refused_send_is_not_also_a_missing_method() {
             .collect()
     };
     assert_eq!(rows("3"), ["error[unsupported]"], "{text}");
-    assert!(text.contains("Object extension not supported (all targets): as_json"), "{text}");
+    assert!(text.contains("Object extension not supported (all targets): instance_values"), "{text}");
     assert_eq!(rows("6"), ["error[send_dispatch_failed]"], "{text}");
     assert!(text.contains("no known method `frobnicate` on Plain"), "{text}");
-    assert!(!text.contains("no known method `as_json`"), "{text}");
+    assert!(!text.contains("no known method `instance_values`"), "{text}");
+    // `as_json` is the JSON port's: no error row. Its value (Plain's
+    // instance values) is untyped, a gradual warning.
+    assert_eq!(rows("9"), ["warning[gradual_untyped]"], "{text}");
+    assert!(!text.contains("as_json"), "{text}");
 }

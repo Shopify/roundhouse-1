@@ -3334,6 +3334,19 @@ fn ruby_family_files(
             ));
         }
         replace_message_verifier_stand_in(&mut files)?;
+    } else if carries_active_support_json(&files) {
+        // ActiveSupport::JSON's coder and its `as_json` table alone, where
+        // emitted app code names `ActiveSupport::JSON::Encoding`: an app
+        // read of the switches (`time_precision`), or `lower::
+        // as_json_residue`'s route for an `as_json` no static method
+        // answers. active_support_ext.rb then requires the port, which
+        // replaces its flat-Hash `encode` (as it does under messages).
+        files.push((
+            "runtime/active_support_json.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_json.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_json.rb: {e}"))?,
+        ));
+        require_active_support_json(&mut files)?;
     }
     // ActiveModel's attribute types and ActiveRecord::Type's names over
     // them (Value, ImmutableString, String, Text, Integer, Boolean,
@@ -11405,6 +11418,29 @@ fn replace_message_verifier_stand_in(files: &mut [(String, String)]) -> Result<(
         MESSAGE_VERIFIER_STAND_IN,
         "  # (ActiveSupport::MessageVerifier is runtime/active_support_messages.rb's\n  # on this tree; the stand-in is dropped.)\n  require_relative \"active_support_messages\"\n",
     );
+    Ok(())
+}
+
+/// True where the app's own emitted code (not the runtime, not a test
+/// body) names `ActiveSupport::JSON::Encoding`, which only
+/// runtime/spinel/active_support_json.rb declares
+/// (`lower::as_json_residue` emits `ActiveSupport::JSON::Encoding.as_json(v)`).
+fn carries_active_support_json(files: &[(String, String)]) -> bool {
+    files.iter().any(|(path, content)| {
+        path.ends_with(".rb")
+            && !path.starts_with("runtime/")
+            && !path.starts_with("test/")
+            && mentions_messages_constant(content, "ActiveSupport::JSON::Encoding")
+    })
+}
+
+/// Load the JSON port after active_support_ext.rb's `ActiveSupport::JSON`
+/// (the messages port requires it itself).
+fn require_active_support_json(files: &mut [(String, String)]) -> Result<(), String> {
+    let Some((_, ext)) = files.iter_mut().find(|(p, _)| p == "runtime/active_support_ext.rb") else {
+        return Err("require_active_support_json: the tree has no runtime/active_support_ext.rb".into());
+    };
+    ext.push_str("\n# ActiveSupport::JSON's coder and `as_json` table (runtime/active_support_json.rb),\n# carried where app code names ActiveSupport::JSON::Encoding.\nrequire_relative \"active_support_json\"\n");
     Ok(())
 }
 

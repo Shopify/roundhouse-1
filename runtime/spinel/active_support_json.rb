@@ -6,17 +6,24 @@
 # table of core_ext/object/json.rb) for the CRuby and JRuby trees.
 # It replaces runtime/ruby/active_support_ext.rb's flat-Hash `encode`
 # where the messages port (runtime/spinel/active_support_messages.rb)
-# is carried: a verifier or encryptor whose serializer is
-# `ActiveSupport::JSON`, and every legacy metadata envelope
-# (`{"_rails":{"message":…,"exp":…,"pur":…}}`), go through `dump` /
-# `encode`, `load` / `decode`. tests/messages_runtime.rb holds both
-# to that native ActiveSupport.
+# is carried, or where emitted app code names `ActiveSupport::JSON::
+# Encoding` (project.rs `carries_active_support_json`): a verifier or
+# encryptor whose serializer is `ActiveSupport::JSON`, and every legacy
+# metadata envelope (`{"_rails":{"message":…,"exp":…,"pur":…}}`), go
+# through `dump` / `encode`, `load` / `decode`, and `lower::
+# as_json_residue` routes an `as_json` no static method answers to
+# `Encoding.as_json(value, options)`. tests/messages_runtime.rb holds
+# the coder to native ActiveSupport, tests/active_support_json_runtime.rb
+# the `as_json` table, value by value.
 #
 # Differences, all at the edges:
 # - `as_json` is not installed on core classes (no Object / Hash /
-#   Time reopen). `Encoding.as_json` answers the same table for the
-#   values a message carries: an object that defines its own `as_json`
-#   (a record) is asked, everything else follows core_ext/object/json.
+#   Time reopen). `Encoding.as_json` answers the same table as a
+#   function of the value: an object that defines its own `as_json`
+#   (a record, a serializer) is asked, everything else follows
+#   core_ext/object/json. A String, Symbol, Float, Hash or Array
+#   subclass that defines its own `as_json` is not asked.
+#   ActiveSupport::TimeWithZone is not ported; a Time answers as Time.
 #   `to_json` is not rerouted through this encoder.
 # - The encoder is JSONGemEncoder. Rails picks JSONGemCoderEncoder when
 #   json >= 2.15.2 (Core's bundle has 2.19); the two produce the same
@@ -209,15 +216,28 @@ module ActiveSupport
               value
             end
             result = {}
-            subset.each { |k, v| result[k.to_s] = as_json(v, options) }
+            if options
+              options = options.dup.freeze unless options.frozen?
+              subset.each { |k, v| result[k.to_s] = as_json(v, options) }
+            else
+              subset.each { |k, v| result[k.to_s] = as_json(v) }
+            end
             result
           when Array
-            value.map { |v| as_json(v, options) }
+            if options
+              options = options.dup.freeze unless options.frozen?
+              value.map { |v| as_json(v, options) }
+            else
+              value.map { |v| as_json(v) }
+            end
           else
             if value.respond_to?(:as_json)
               options ? value.as_json(options) : value.as_json
+            elsif defined?(::ActiveSupport::Duration) && ::ActiveSupport::Duration === value
+              value.to_i
             elsif defined?(::BigDecimal) && ::BigDecimal === value
-              value.finite? ? value.to_s : nil
+              # core_ext/big_decimal/conversions: `to_s` is `to_s("F")`.
+              value.finite? ? value.to_s("F") : nil
             elsif Numeric === value
               value
             elsif Time === value || DateTime === value
@@ -226,12 +246,21 @@ module ActiveSupport
               elsif DateTime === value
                 value.strftime("%Y/%m/%d %H:%M:%S %z")
               else
+                # formatted_offset(false) is strftime's %z for every offset.
                 %(#{value.strftime("%Y/%m/%d %H:%M:%S")} #{value.strftime("%z")})
               end
             elsif Date === value
               use_standard_json_time_format ? value.strftime("%Y-%m-%d") : value.strftime("%Y/%m/%d")
             elsif Module === value
               value.name
+            elsif defined?(::IPAddr) && ::IPAddr === value
+              if (value.ipv4? && value.prefix == 32) || (value.ipv6? && value.prefix == 128)
+                value.to_s
+              else
+                "#{value}/#{value.prefix}"
+              end
+            elsif Process::Status === value
+              { exitstatus: value.exitstatus, pid: value.pid }
             elsif Regexp === value || Range === value || Exception === value || IO === value
               value.to_s
             elsif (defined?(::URI::Generic) && ::URI::Generic === value) || (defined?(::Pathname) && ::Pathname === value)
@@ -243,7 +272,7 @@ module ActiveSupport
             elsif value.respond_to?(:to_hash)
               as_json(value.to_hash, options)
             else
-              values = value.instance_variables.to_h { |name| [name[1..-1], value.instance_variable_get(name)] }
+              values = value.instance_variables.to_h { |name| [name[1..-1].freeze, value.instance_variable_get(name)] }
               as_json(values, options)
             end
           end

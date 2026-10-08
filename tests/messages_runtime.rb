@@ -36,7 +36,15 @@ RAILS_LIBS = %w[activesupport activemodel activerecord].map { |lib| File.join(RA
 def ruby_command(mode)
   return [{}, RbConfig.ruby] unless mode == "native"
   abort "native: Core's Rails checkout #{RAILS_CHECKOUT} is missing (set CORE_GEM_HOME)" unless File.directory?(RAILS_CHECKOUT)
-  [{ "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
+  env = { "GEM_HOME" => CORE_GEM_HOME, "GEM_PATH" => CORE_GEM_HOME }
+  # The gem home's native extensions (json's parser.so) are built against
+  # a jemalloc Ruby and fail to load without it (tests/support/rails_oracle.rb).
+  jemalloc = ENV.fetch("RH_JEMALLOC", "/nix/store/c04j2i0fkin1bw5fab35gx896558knsd-jemalloc-5.3.0-unstable-2025-09-12/lib/libjemalloc.so.2")
+  preload = ENV["LD_PRELOAD"].to_s
+  if File.exist?(jemalloc) && !preload.include?("jemalloc")
+    env["LD_PRELOAD"] = [jemalloc, *preload.split(/[: ]/).reject(&:empty?)].join(":")
+  end
+  [env, RbConfig.ruby, *RAILS_LIBS.flat_map { |lib| ["-I", lib] }]
 end
 
 # Loaded from the checkout, not from some other installed Rails.
@@ -110,6 +118,8 @@ else
   %w[active_support_messages active_support_json active_support_notifications].each do |name|
     FileUtils.cp(File.join(root, "runtime/spinel/#{name}.rb"), tree)
   end
+  # active_support_ext.rb's own require_relative, beside it in the tree.
+  FileUtils.cp(File.join(root, "runtime/ruby/active_support_inflections.rb"), tree)
   require File.join(tree, "active_support_ext")
 end
 

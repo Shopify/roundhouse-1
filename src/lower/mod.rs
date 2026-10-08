@@ -47,6 +47,7 @@ pub mod seeds_to_library;
 pub mod test_module_to_library;
 pub mod create_block;
 pub mod as_json_poro;
+pub mod as_json_residue;
 pub mod active_model_model;
 pub mod enumerable_ext;
 mod fused;
@@ -458,6 +459,10 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     ("status_literal", &[]),
     // `"#{v.to_param}"` on an untyped receiver → `ActiveSupport.to_param(v)`.
     ("to_param_residue", &[]),
+    // `x.as_json(opts)` that no static method answers (the analyzer's
+    // `expr::OBJECT_AS_JSON`) → `ActiveSupport::JSON::Encoding.as_json(x,
+    // opts)`; rewrites a flagged send no other pass produces or consumes.
+    ("as_json_residue", &[]),
     // `x_path(format: :json)` → `x_path() + ".json"`. Must run before
     // the route-helper lowering surveys call sites for query keys; the
     // two do not overlap (`format` is on NON_QUERY_OPTIONS) but the
@@ -858,6 +863,8 @@ pub fn apply_post_analyze_lowerings(
     ran!("session_options");
     ran!("status_literal");
     ran!("to_param_residue");
+    as_json_residue::apply_as_json_residue_lowering(app);
+    ran!("as_json_residue");
     crate::timings::phase("post-analyze: fused mid rewrites", || {
         fused::apply_fused_mid_rewrites(app);
     });

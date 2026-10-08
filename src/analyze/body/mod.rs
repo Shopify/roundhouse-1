@@ -2468,8 +2468,40 @@ impl<'a> BodyTyper<'a> {
                         };
                     }
                 }
+                // String / Array / Hash `as_json` the core tables answer
+                // (send.rs) is ActiveSupport's core_ext too, which no tree
+                // reopens: the same route, with the table's type.
+                if method.as_str() == "as_json" && self.inquirers.is_some() && expr.diagnostic.is_none()
+                    && recv.is_some() && !class_object_receiver && send::as_json_core_receiver(recv_ty.as_ref())
+                    && matches!(self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some(), false, ctx),
+                        send::AsJsonResidue::Route)
+                {
+                    expr.decisions |= crate::expr::OBJECT_AS_JSON;
+                }
                 if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
                     && !self.owns_operator(recv_ty.as_ref(), method, class_object_receiver) {
+                    // ActiveSupport's core_ext `as_json` on a value no static
+                    // method answers: `lower::as_json_residue` routes it to
+                    // the port's `ActiveSupport::JSON::Encoding.as_json`,
+                    // which asks an object with an `as_json` of its own and
+                    // answers core_ext/object/json.rb's table for the rest.
+                    if method.as_str() == "as_json" && expr.diagnostic.is_none() {
+                        match self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some(), class_object_receiver, ctx) {
+                            send::AsJsonResidue::Route => {
+                                expr.decisions |= crate::expr::OBJECT_AS_JSON;
+                                return send::object_as_json_ty(recv_ty.as_ref(), class_object_receiver);
+                            }
+                            send::AsJsonResidue::Refuse(construct, detail) => {
+                                expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                                    target: None,
+                                    construct: Symbol::from(construct),
+                                    detail: detail.to_string(),
+                                });
+                                return dispatched;
+                            }
+                            send::AsJsonResidue::Gap => {}
+                        }
+                    }
                     let gap = match recv_ty.as_ref() {
                         Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "ActiveModel::Errors" | "ActiveModel::Error") => Some(id.0.as_str()),
                         Some(Ty::Class { id, .. })
@@ -2478,9 +2510,13 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some(id.0.as_str())
                         }
-                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d" | "as_json") => Some("String extension"),
+                        Some(Ty::Str) if matches!(method.as_str(), "to_date" | "to_time" | "to_datetime" | "in_time_zone" | "to_d") => Some("String extension"),
                         Some(Ty::Hash { .. }) if method.as_str() == "to_sentence" => Some("Hash extension"),
                         _ if method.as_str() == "not_nil!" => Some("not_nil!"),
+                        // `as_json` with more than one options argument, a block or
+                        // a splat: the port's `Encoding.as_json(value, options)`
+                        // takes neither.
+                        _ if method.as_str() == "as_json" => Some("Object extension"),
                         // `to_param` on Untyped goes through ActiveSupport.to_param
                         // (residue lowering + runtime). Refuse only on a nominal
                         // class with no modeled/synthesized reader (e.g. a plain
@@ -2491,7 +2527,7 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some("Object extension")
                         }
-                        _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "as_json" | "with_options" | "pretty_inspect") => Some("Object extension"),
+                        _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
                     if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
