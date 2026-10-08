@@ -3086,6 +3086,10 @@ end
 module ActiveRecord
   DatabaseConfigurations = ::DatabaseConfigurations::Configurations
 end
+
+# ActiveRecord::TestFixtures, which Active Record autoloads in any process;
+# the test helper includes it into the test base, as rails/test_help.rb does.
+require_relative "active_record_test_fixtures"
 "#)
 }
 
@@ -4367,6 +4371,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let transactions = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_transactions.rb")
         .map_err(|e| format!("read transactions runtime: {e}"))?;
     files.push(("runtime/active_record_transactions.rb".into(), transactions));
+    // In runtime_files::POSTGRESQL_TEST_PORTS, which the analyzer indexes.
     let test_fixtures = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/active_record_test_fixtures.rb")
         .map_err(|e| format!("read test fixtures runtime: {e}"))?;
     files.push(("runtime/active_record_test_fixtures.rb".into(), test_fixtures));
@@ -4606,9 +4611,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
-            // rails/test_help.rb's ActiveRecord::TestFixtures: transactional
-            // tests on every writing pool.
-            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\n");
+            // rails/test_help.rb's ActiveRecord::TestFixtures (transactional
+            // tests on every writing pool): `ActiveSupport.on_load(:active_support_test_case)
+            // { include ActiveRecord::TestFixtures }`.
+            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\nTestBase.include(ActiveRecord::TestFixtures)\n");
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")

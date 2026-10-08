@@ -209,7 +209,7 @@ fn validate_activation(
     if spans.is_empty() {
         return Ok(());
     }
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let mut includes = BTreeMap::<crate::ClassId, Vec<crate::ClassId>>::new();
     let mut modules = HashSet::default();
     let retained: HashSet<_> = app.library_classes.iter().map(|c| &c.name)

@@ -1288,7 +1288,7 @@ end
 /// file loads it and the analyzer inherits its helpers. Any other
 /// parent keeps its written path.
 pub(super) fn resolve_test_parents(app: &mut crate::App) {
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let defined: crate::det::HashSet<ClassId> = app.test_modules.iter().map(|tm| tm.name.clone()).collect();
     for tm in &mut app.test_modules {
         let (Some(span), Some(parent)) = (tm.parent_span, &tm.parent) else { continue };

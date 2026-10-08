@@ -100,6 +100,9 @@ pub(crate) struct ConstResolver {
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
+    /// Whether the PostgreSQL runtime's test-tree ports were indexed
+    /// (`App::carries_postgresql_runtime`).
+    postgresql_runtime: bool,
 }
 
 fn is_indexed(source: &SourceFile) -> bool {
@@ -523,8 +526,15 @@ fn runtime_value_types() -> &'static HashMap<String, Arc<Ty>> {
 
 impl ConstResolver {
     /// Index real Ruby app sources with their original 1-based file IDs.
+    #[cfg(test)]
     pub(crate) fn from_app_sources(sources: &[SourceFile]) -> Self {
-        let mut graph = crate::timings::phase("rubydex: index", || index_sources(sources));
+        Self::from_sources(sources, false)
+    }
+
+    /// `postgresql_runtime` also indexes the test-tree ports the
+    /// PostgreSQL bootstrap carries (`runtime_files::POSTGRESQL_TEST_PORTS`).
+    pub(crate) fn from_sources(sources: &[SourceFile], postgresql_runtime: bool) -> Self {
+        let mut graph = crate::timings::phase("rubydex: index", || index_sources(sources, postgresql_runtime));
         // Rubydex resolves all source references after every file enters
         // its graph, including declarations in later files.
         crate::timings::phase("rubydex: resolve", || Resolver::new(&mut graph).resolve());
@@ -582,6 +592,7 @@ impl ConstResolver {
             nested_namespaces,
             source_constants,
             source_fingerprint: source_fingerprint(sources),
+            postgresql_runtime,
         }
     }
 
@@ -752,12 +763,24 @@ impl PreparedConstResolver {
     /// The answers that ingest prepared, if they cover these sources.
     /// Cloning an app retains the cache, but callers can edit its public
     /// sources. Rebuild when paths, text or file order have changed.
+    pub(crate) fn for_app(&self, app: &crate::App) -> Arc<ConstResolver> {
+        self.for_sources_with(&app.sources, app.carries_postgresql_runtime())
+    }
+
+    #[cfg(test)]
     pub(crate) fn for_sources(&self, sources: &[SourceFile]) -> Arc<ConstResolver> {
+        self.for_sources_with(sources, false)
+    }
+
+    fn for_sources_with(&self, sources: &[SourceFile], postgresql_runtime: bool) -> Arc<ConstResolver> {
         match &self.0 {
-            Some(resolver) if resolver.source_fingerprint == source_fingerprint(sources) => {
+            Some(resolver)
+                if resolver.source_fingerprint == source_fingerprint(sources)
+                    && resolver.postgresql_runtime == postgresql_runtime =>
+            {
                 Arc::clone(resolver)
             }
-            _ => Arc::new(ConstResolver::from_app_sources(sources)),
+            _ => Arc::new(ConstResolver::from_sources(sources, postgresql_runtime)),
         }
     }
 }
@@ -786,19 +809,24 @@ pub(crate) struct ConstResolverTask {
 }
 
 impl ConstResolverTask {
+    #[cfg(test)]
     pub(crate) fn start(sources: Arc<Vec<SourceFile>>) -> Self {
+        Self::start_for(sources, false)
+    }
+
+    pub(crate) fn start_for(sources: Arc<Vec<SourceFile>>, postgresql_runtime: bool) -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let thread = std::thread::Builder::new()
                 .name("rubydex".into())
                 .stack_size(crate::stack::COMPILER_STACK_BYTES)
-                .spawn(move || ConstResolver::from_app_sources(&sources))
+                .spawn(move || ConstResolver::from_sources(&sources, postgresql_runtime))
                 .expect("spawn the Rubydex thread");
             Self { thread }
         }
         #[cfg(target_arch = "wasm32")]
         Self {
-            resolver: ConstResolver::from_app_sources(&sources),
+            resolver: ConstResolver::from_sources(&sources, postgresql_runtime),
         }
     }
 
@@ -817,7 +845,7 @@ impl ConstResolverTask {
 /// Framework declarations come from embedded Ruby implementations and
 /// Ruby core RBS, never from fabricated suffix aliases. App sources keep
 /// their paths as URIs so answers map back to their file IDs.
-fn index_sources(sources: &[SourceFile]) -> Graph {
+fn index_sources(sources: &[SourceFile], postgresql_runtime: bool) -> Graph {
     let mut documents: Vec<Document<'_>> = crate::stdlib_rbs::documents()
         .map(|(path, text)| Document {
             uri_prefix: STDLIB_URI_PREFIX,
@@ -833,13 +861,16 @@ fn index_sources(sources: &[SourceFile]) -> Graph {
         text: crate::stdlib_rbs::alias_document(),
         language: LanguageId::Ruby,
     });
+    let test_ports = postgresql_runtime.then(crate::runtime_files::postgresql_test_ruby_sources);
     documents.extend(
-        crate::runtime_files::ruby_sources().map(|(path, text)| Document {
-            uri_prefix: RUNTIME_URI_PREFIX,
-            path,
-            text,
-            language: LanguageId::Ruby,
-        }),
+        crate::runtime_files::ruby_sources()
+            .chain(test_ports.into_iter().flatten())
+            .map(|(path, text)| Document {
+                uri_prefix: RUNTIME_URI_PREFIX,
+                path,
+                text,
+                language: LanguageId::Ruby,
+            }),
     );
     let texts: Vec<_> = sources
         .iter()

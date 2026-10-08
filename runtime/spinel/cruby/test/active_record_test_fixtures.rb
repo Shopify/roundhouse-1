@@ -19,6 +19,10 @@
 # transaction was not clean) has nothing to keep. `pre_loaded_fixtures`
 # and `use_instantiated_fixtures` are not ported. A class's
 # `self.use_transactional_tests = <literal>` compiles to its class reader.
+#
+# Active Record autoloads the module in any process, so the PostgreSQL
+# boot (runtime/database_configuration.rb) requires it; the test helper
+# includes it into TestBase, as rails/test_help.rb does.
 module ActiveRecord
   module TestFixtures
     module ClassMethods
@@ -191,7 +195,3 @@ module ActiveRecord
       end
   end
 end
-
-# rails/test_help.rb: `ActiveSupport.on_load(:active_support_test_case)
-# { include ActiveRecord::TestFixtures }`.
-TestBase.include(ActiveRecord::TestFixtures)

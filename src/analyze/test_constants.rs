@@ -175,7 +175,7 @@ pub(crate) fn harness_reads(app: &App) -> Vec<(crate::span::Span, String)> {
 }
 
 fn walk(app: &App) -> Found {
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let app_namespace = |name: &str| resolver.has_source_namespace(name);
     let mut out = Found::default();
     for module in &app.test_modules {

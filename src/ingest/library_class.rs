@@ -6511,7 +6511,7 @@ fn struct_member_from_expr(call: &Expr) -> Option<SorbetStructMember> {
 /// model other than the class itself, so a superclass outside the app
 /// keeps its written path.
 pub(super) fn resolve_library_parents(app: &mut crate::App) {
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let known: HashSet<ClassId> = app.library_classes.iter().map(|lc| lc.name.clone())
         .chain(app.models.iter().map(|model| model.name.clone()))
         .collect();

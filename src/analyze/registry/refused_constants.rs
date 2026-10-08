@@ -13,8 +13,9 @@
 /// nested under `name` (`ActiveRecord::Fixture::FormatError`).
 const REFUSED: &[(&str, bool, &str)] = &[
     // fixtures.rb, fixture_set/*.rb. Not test_fixtures.rb: the PostgreSQL
-    // test tree carries ActiveRecord::TestFixtures' transactional tests
-    // (runtime/spinel/cruby/test/active_record_test_fixtures.rb).
+    // tree carries ActiveRecord::TestFixtures' transactional tests
+    // (runtime/spinel/cruby/test/active_record_test_fixtures.rb, indexed
+    // where the app carries that runtime).
     ("ActiveRecord::FixtureSet", true, FIXTURES),
     ("ActiveRecord::Fixture", true, FIXTURES),
     ("ActiveRecord::FixtureClassNotFound", false, FIXTURES),

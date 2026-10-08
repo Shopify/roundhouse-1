@@ -117,7 +117,7 @@ pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[Ingest
         return;
     }
     let ctx = AttributionCtx::build(app, gaps);
-    let resolver = diags.iter().any(is_constant_refusal).then(|| app.const_resolver.for_sources(&app.sources));
+    let resolver = diags.iter().any(is_constant_refusal).then(|| app.const_resolver.for_app(app));
     let dropped = resolver.as_deref().map(|resolver| DroppedDefinitions::build(app, gaps, resolver));
     // Sites of constants whose declaring file recorded a gap, for the ivar pass below.
     let mut constant_sites: Vec<(FileId, u32, String)> = Vec::new();
@@ -560,7 +560,7 @@ impl<'a> AttributionCtx<'a> {
             .copied();
 
         let mut gap_receivers: HashMap<String, &str> = HashMap::default();
-        let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
+        let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_app(app));
         if let Some(resolver) = &resolver {
             // A namespace several gap files reopen (`module Discourse` in
             // `config/application.rb` and `lib/discourse.rb`) names one

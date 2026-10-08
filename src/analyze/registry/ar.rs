@@ -102,7 +102,7 @@ pub(in crate::analyze) fn connection_switches() -> impl Iterator<Item = (&'stati
 /// `apply_postgres_bootstrap`, runtime/spinel/cruby/database_configurations.rb).
 /// Elsewhere the read stays a named gap.
 pub(in crate::analyze) fn carries_database_configurations(app: &crate::App) -> bool {
-    app.database_yml.is_some() && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+    app.carries_postgresql_runtime()
 }
 
 pub(in crate::analyze) fn register_database_configurations(classes: &mut HashMap<ClassId, ClassInfo>) {
