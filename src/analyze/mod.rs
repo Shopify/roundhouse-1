@@ -1574,7 +1574,15 @@ impl Analyzer {
                     }
                     // `::A::B` is never a lexical neighbour.
                     let rooted = path.first().is_some_and(|head| head.as_str().is_empty());
-                    let known = self.classes.contains_key(&id)
+                    // A view-helper marker that reaches here was
+                    // settled at ingest (`view_helper_includes`): every
+                    // member the model uses through it is answered, or
+                    // the call already carries that refusal.
+                    let marker = crate::ingest::util::is_view_helper_marker_include(
+                        &name.split("::").collect::<Vec<_>>(),
+                    );
+                    let known = marker
+                        || self.classes.contains_key(&id)
                         || (!rooted && body::lexical_class(&id, model.name.0.as_str(), body::Classes::new(&self.classes, None)).is_some())
                         || body::RUBY_TOP_LEVEL.contains(&name.as_str())
                         || runtime_reads::ruby_family_runtime_names().contains_key(name.as_str())

@@ -18,6 +18,7 @@ module ActionView
     # untyped. (Same shadowing shape the view-constant rooting fixes on
     # the emit side.)
     def self.time_ago_in_words: (::Time from_time, ?include_seconds: bool) -> String
+    def self.distance_of_time_in_words_to_now: (::Time from_time, ?include_seconds: bool) -> String
     def self.distance_of_time_in_words: (::Time from_time, ::Time to_time, ?include_seconds: bool) -> String
     def self.distance_of_seconds_in_words: (Integer from_seconds, Integer to_seconds, ?include_seconds: bool) -> String
     def self.distance_in_words: (Float elapsed, Integer leap_minutes, bool include_seconds) -> String

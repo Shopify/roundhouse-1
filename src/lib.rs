@@ -80,6 +80,7 @@ pub mod sha256;
 pub mod span;
 pub mod ty;
 pub mod vfs;
+pub(crate) mod view_helpers;
 
 pub use adapter::{ArMethodKind, DatabaseAdapter, SqliteAdapter, SqliteAsyncAdapter};
 pub use app::{App, ControllerResolution, ResolvedFilter};

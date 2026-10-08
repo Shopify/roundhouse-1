@@ -3293,6 +3293,28 @@ fn walk_decl_body_with_visibility<'pr>(
                                     let segs: Vec<&str> =
                                         path.iter().map(|p| p.as_str()).collect();
                                     if crate::ingest::util::is_view_helper_marker_include(&segs) {
+                                        // Never an include of the class:
+                                        // held as the class-body call it
+                                        // is until every class exists,
+                                        // when `view_helper_includes`
+                                        // drops it (each member it is
+                                        // used for is answered) or
+                                        // refuses it.
+                                        let single = args.arguments().len() == 1;
+                                        let call = if single { ingest_expr(&stmt, file) } else { ingest_expr(&arg, file) };
+                                        if let Ok(call) = call {
+                                            out.unknown_calls.push(if single {
+                                                call
+                                            } else {
+                                                Expr::new(call.span, ExprNode::Send {
+                                                    recv: None,
+                                                    method: Symbol::from("include"),
+                                                    args: vec![call],
+                                                    block: None,
+                                                    parenthesized: false,
+                                                })
+                                            });
+                                        }
                                         continue;
                                     }
                                     // `include ::A::B` keeps its root, so the

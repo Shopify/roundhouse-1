@@ -1085,16 +1085,16 @@ pub(super) fn slice_has_blank_line(bytes: &[u8], from: usize, to: usize) -> bool
 /// number helpers. No target ships the namespace, so the `include` is an
 /// `uninitialized constant` at class-definition time — before any
 /// request, which means it takes the whole tree's boot with it, not one
-/// route. It contributes nothing either way: every member the app calls
-/// through it is qualified to `ActionView::ViewHelpers.<name>` at emit
-/// (`emit::ruby::library::is_framework_view_helper`).
+/// route. It is dropped only when every helper member the class reaches
+/// through it is answered in the emitted tree, and refused otherwise
+/// (`ingest::view_helper_includes`, reading `crate::view_helpers`).
 ///
 /// Called from BOTH homes that build an include list —
 /// `analyze::model_includes` for models, `ingest::library_class`'s decl
 /// walk for everything else — because the same source line means the
 /// same thing in either.
 pub(crate) fn is_view_helper_marker_include(path: &[&str]) -> bool {
-    matches!(path, ["ActionView", "Helpers", ..] | ["ActiveSupport", "NumberHelper"])
+    crate::view_helpers::is_marker_include(path)
 }
 
 /// `ActiveModel::*` (Validations / Conversion / AttributeMethods /

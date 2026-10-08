@@ -135,7 +135,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
                 }
                 refusals(expr, &mut out);
                 if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic {
-                    if matches!(construct.as_str(), "include" | "gem_requires_rails") {
+                    if matches!(construct.as_str(), "include" | "gem_requires_rails")
+                        || construct.as_str() == crate::view_helpers::REFUSAL_CONSTRUCT
+                    {
                         out.push(Diagnostic::unsupported(expr.span, None, construct.as_str(), detail.clone()));
                     }
                 }
