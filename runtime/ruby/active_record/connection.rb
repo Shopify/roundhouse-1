@@ -718,7 +718,8 @@ module ActiveRecord
       return @query_constraints_list if @query_constraints_list
       return _compiled_query_constraints if composite_primary_key?
       parent = superclass
-      return nil if parent.equal?(ActiveRecord::Base) || !parent.respond_to?(:query_constraints_list) || parent.abstract_class?
+      return nil unless parent < ActiveRecord::Base
+      return nil if parent.abstract_class?
       parent.primary_key == primary_key ? parent.query_constraints_list : nil
     end
 
@@ -744,7 +745,7 @@ module ActiveRecord
     def self.ignored_columns
       return @ignored_columns if @ignored_columns
       parent = superclass
-      parent.respond_to?(:ignored_columns) ? parent.ignored_columns : IGNORED_COLUMNS_NONE
+      parent <= ActiveRecord::Base ? parent.ignored_columns : IGNORED_COLUMNS_NONE
     end
 
     def self.ignored_columns=(columns)
@@ -777,7 +778,8 @@ module ActiveRecord
     # the type it would otherwise have.
     def self._declared_attribute_types
       @__declared_types_memo ||= begin
-        inherited = superclass.respond_to?(:_declared_attribute_types) ? superclass._declared_attribute_types : {}
+        parent = superclass
+        inherited = parent <= ActiveRecord::Base ? parent._declared_attribute_types : {}
         own = {}
         (@__declared_attribute_types || {}).each do |n, (type, options)|
           own[n] = type.is_a?(Symbol) ? ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) : type

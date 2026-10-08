@@ -42,6 +42,7 @@ module ActiveRecord
 
   class Base
     @__pending_preload: PendingPreload?
+    self.@__declared_attribute_types: Hash[String, [Symbol | ActiveModel::Type::Value, Hash[Symbol, untyped]]]?
     def _pend_preload: (PendingPreload pending) -> nil
     def _await_preload: () -> nil
     # Request values stay intact until the schema-selected scalar adapter.
