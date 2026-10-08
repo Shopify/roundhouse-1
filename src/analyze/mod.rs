@@ -1154,6 +1154,9 @@ impl Analyzer {
         // ActiveRecord::AdapterInterface contract, and the Arel node family —
         // see `registry::ar`.
         registry::ar::register(&mut classes);
+        if registry::ar::carries_database_configurations(app) {
+            registry::ar::register_database_configurations(&mut classes);
+        }
         registry::ar::register_action_text(&mut classes);
         registry::ar::register_action_cable(&mut classes);
 

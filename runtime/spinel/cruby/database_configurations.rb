@@ -106,7 +106,80 @@ module DatabaseConfigurations
       env_name == DatabaseConfiguration.default_env
     end
 
+    # The pool and query-cache readers of hash_config.rb (activerecord
+    # 8.2.0.alpha), over the same configuration_hash.
+    def max_connections
+      max_connections = configuration_hash.fetch(:max_connections) {
+        configuration_hash.fetch(:pool, 5)
+      }&.to_i
+      max_connections if max_connections && max_connections >= 0
+    end
+
+    def min_connections
+      (configuration_hash[:min_connections] || 0).to_i
+    end
+
+    def min_threads
+      (configuration_hash[:min_threads] || 0).to_i
+    end
+
+    def max_threads
+      (configuration_hash[:max_threads] || (max_connections || 5).clamp(0, 5)).to_i
+    end
+
+    def max_age
+      v = configuration_hash[:max_age]&.to_i
+      if v && v > 0
+        v
+      else
+        Float::INFINITY
+      end
+    end
+
+    def query_cache
+      configuration_hash[:query_cache]
+    end
+
+    def max_queue
+      max_threads * 4
+    end
+
+    def checkout_timeout
+      (configuration_hash[:checkout_timeout] || 5).to_f
+    end
+
+    def reaping_frequency
+      configuration_hash.fetch(:reaping_frequency, default_reaping_frequency)&.to_f
+    end
+
+    def idle_timeout
+      timeout = configuration_hash.fetch(:idle_timeout, 300).to_f
+      timeout if timeout > 0
+    end
+
+    def keepalive
+      case keepalive = configuration_hash[:keepalive]
+      when false
+        nil
+      when nil, true
+        600.0 # default
+      else
+        keepalive = keepalive.to_f
+        keepalive if keepalive > 0.0
+      end
+    end
+
+    # hash_config.rb `primary?`: asks the configurations Base holds.
+    def primary?
+      ::ActiveRecord::Base.configurations.primary?(name)
+    end
+
     private
+
+    # hash_config.rb `default_reaping_frequency`.
+    def default_reaping_frequency
+      [20, idle_timeout, max_age, keepalive].compact.min
+    end
 
     # hash_config.rb:221-234.
     def validate_configuration!
@@ -225,14 +298,29 @@ module DatabaseConfigurations
   end
 
   # ActiveRecord::DatabaseConfigurations (database_configurations.rb),
-  # over an explicit environment name and ENV, without a Base.
+  # over an explicit environment name and ENV, without a Base. Rails'
+  # `new(configurations = {})` reads the environment name from
+  # ConnectionHandling::DEFAULT_ENV, which DatabaseConfiguration.default_env
+  # is; boot passes it explicitly.
   class Configurations
+    # Rails nests the configuration classes in the class
+    # (ActiveRecord::DatabaseConfigurations::HashConfig, ...).
+    HashConfig = DatabaseConfigurations::HashConfig
+    UrlConfig = DatabaseConfigurations::UrlConfig
+    ConnectionUrlResolver = DatabaseConfigurations::ConnectionUrlResolver
+    InvalidConfigurationError = DatabaseConfigurations::InvalidConfigurationError
+
     attr_reader :configurations, :default_env
 
-    def initialize(configurations, default_env:, environment: ENV)
+    def initialize(configurations = {}, default_env: DatabaseConfiguration.default_env, environment: ENV)
       @default_env = default_env.to_s
       @environment = environment
       @configurations = build_configs(configurations)
+    end
+
+    # `delegate :any?, to: :configurations`.
+    def any?(...)
+      configurations.any?(...)
     end
 
     def configs_for(env_name: nil, name: nil, config_key: nil, include_hidden: false)
@@ -311,6 +399,9 @@ module DatabaseConfigurations
     end
 
     def build_configs(configs)
+      return configs.configurations if configs.is_a?(Configurations)
+      return configs if configs.is_a?(Array)
+
       db_configs = configs.flat_map do |env_name, config|
         if config.is_a?(Hash) && config.values.all?(Hash)
           config.map { |name, sub_config| build_db_config_from_raw_config(env_name.to_s, name.to_s, sub_config) }
