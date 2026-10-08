@@ -7797,8 +7797,24 @@ fn emit_library_class_decl_inner(
     let extends_of = |inc: &ClassId| -> Vec<ClassId> {
         include_extends.iter().filter(|(i, _)| *i == inc).flat_map(|(_, c)| c.iter().cloned()).collect()
     };
+    // Includes the source has below a callback registration of the
+    // body's own (`late_includes`): written where the body's statements
+    // reach them (`flush_late`), not at its top, so an include's carried
+    // callbacks register after the body's above it, as Ruby runs them.
+    let late = std::cell::RefCell::new(if railtie { Vec::new() } else { late_includes(lc, app, &positioned) });
+    let flush_late = |s: &mut String, upto: Option<Span>| {
+        let mut late = late.borrow_mut();
+        let due = late
+            .iter()
+            .take_while(|(at, _)| upto.is_none_or(|u| !u.is_synthetic() && u.file == at.file && at.start < u.start))
+            .count();
+        for (_, inc) in late.drain(..due) {
+            write_include(s, inc);
+            extends_of(inc).iter().for_each(|carrier| write_extend(s, carrier));
+        }
+    };
     for inc in &lc.includes {
-        if positioned.iter().any(|(_, p)| *p == inc) {
+        if positioned.iter().any(|(_, p)| *p == inc) || late.borrow().iter().any(|(_, l)| *l == inc) {
             continue;
         }
         write_include(&mut s, inc);
@@ -7967,6 +7983,7 @@ fn emit_library_class_decl_inner(
         };
         for &i in which {
             for call in calls_before.get(&i).into_iter().flatten() {
+                flush_late(s, Some(call.span));
                 place_above(s, call.span);
                 for line in super::emit_expr(call).lines() {
                     if line.is_empty() {
@@ -7976,6 +7993,7 @@ fn emit_library_class_decl_inner(
                     }
                 }
             }
+            flush_late(s, Some(lc.constants[i].1.span));
             place_above(s, lc.constants[i].1.span);
             written.borrow_mut().insert(i);
             let (cname, value) = &lc.constants[i];
@@ -8141,6 +8159,7 @@ fn emit_library_class_decl_inner(
     let railtie_root = app.railties.iter().find(|r| r.name == lc.name).and_then(|r| r.root.clone());
     let mut sources: Option<std::rc::Rc<CarriedSources>> = None;
     for effect in &body_effects {
+        flush_late(&mut s, Some(effect.span));
         let text = if railtie {
             super::emit_expr(&carried_loads(effect, app, railtie_root.as_deref(), &mut sources))
         } else {
@@ -8163,6 +8182,8 @@ fn emit_library_class_decl_inner(
             writeln!(s, "{body_pad}end").unwrap();
         }
     }
+    // The rest: below every body effect, above the methods.
+    flush_late(&mut s, None);
     if !replayed.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -8320,6 +8341,59 @@ fn emit_library_class_decl_inner(
     }
 
     EmittedFile { path: out_path, content: s }
+}
+
+/// The includes of `lc` the source has below the first callback
+/// registration of its own body (`job_class_side::is_callbacks_port_call`,
+/// a `before_perform` in a job), each with where it stands, in source
+/// order: the emitted body writes them at their statement instead of
+/// opening the body with them.
+///
+/// The include bucket opens the body, and an include's carried
+/// `included do` callbacks are written right after it (`write_include`).
+/// Ruby registers them where the include is: Core's BackgroundQueue::Job
+/// registers its own `before_perform`s and then includes
+/// Podding::JobShopLock, whose `included do` adds one more, so the chain
+/// runs the body's first. Written at the top, the include's ran first.
+///
+/// Matched by the written name (`job_class_side::include_offsets`) in
+/// the file of that registration. An include not written there (one a
+/// carried `included do` adds) stays with the one before it, so the
+/// includes keep their order; `positioned` ones (`hooked_include_position`)
+/// are written among the methods and are none of these.
+fn late_includes<'a>(lc: &'a LibraryClass, app: &App, positioned: &[(usize, &ClassId)]) -> Vec<(Span, &'a ClassId)> {
+    let first = lc
+        .unknown_calls
+        .iter()
+        .filter(|c| !c.span.is_synthetic() && crate::lower::job_class_side::is_callbacks_port_call(c))
+        .map(|c| c.span)
+        .min_by_key(|span| (span.file.0, span.start));
+    let Some(first) = first else { return Vec::new() };
+    let Some(source) = (first.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) else {
+        return Vec::new();
+    };
+    let offsets = crate::lower::job_class_side::include_offsets(&source.text, lc.name.0.as_str());
+    let mut cursor = 0;
+    let mut previous: Option<u32> = None;
+    let mut late = Vec::new();
+    for inc in lc.includes.iter().filter(|inc| !positioned.iter().any(|(_, p)| p == inc)) {
+        let id = inc.0.as_str().trim_start_matches("::");
+        let found = offsets[cursor..]
+            .iter()
+            .position(|(written, _)| id == written || id.ends_with(&format!("::{written}")));
+        let at = match found {
+            Some(k) => {
+                cursor += k + 1;
+                Some(offsets[cursor - 1].1)
+            }
+            None => previous,
+        };
+        previous = at;
+        if let Some(at) = at.filter(|at| *at > first.start) {
+            late.push((Span { file: first.file, start: at, end: at }, inc));
+        }
+    }
+    late
 }
 
 /// Where `include inc` must be written in `lc`'s body when the source's

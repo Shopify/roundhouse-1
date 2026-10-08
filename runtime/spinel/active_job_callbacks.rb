@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
 # ActiveJob::Callbacks, with the parts of ActiveJob::Core, Enqueuing and
-# Execution that run its two chains, ported from the activejob native Core
-# runs (Shopify/rails 5813559f4aed, 8.2.0.alpha: lib/active_job/callbacks.rb,
-# core.rb, enqueuing.rb, execution.rb) for the CRuby and JRuby trees.
+# Execution that run its two chains, and ActiveJob::QueueName, ported from
+# the activejob native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha:
+# lib/active_job/callbacks.rb, core.rb, enqueuing.rb, execution.rb,
+# queue_name.rb) for the CRuby and JRuby trees.
 #
 # Core's jobs register `before_/after_/around_perform` and `_enqueue`
 # callbacks, `set_callback` on chains of their own and `rescue_from`
@@ -39,9 +40,20 @@
 #   Logging (their `around_enqueue` callbacks and `perform_now` wrappers
 #   emit notifications and tag a logger), ExecutionState's locale and time
 #   zone, the singleton `:execute` chain around `Base.execute`, argument
-#   serialization (the arguments are passed as they are), `after_discard`
-#   procs, `ActiveSupport::ExecutionContext[:job]`, and the queue name and
-#   priority (`queue_as` stays inert, active_job.rb).
+#   serialization (the arguments are passed as they are),
+#   `ActiveSupport::ExecutionContext[:job]`, and the priority. The
+#   queue name is QueueName's, and routes nothing: the in-process adapter
+#   has one queue (active_job.rb), so it is only what a job and its
+#   callbacks read back.
+# - QueueName's class attributes are written out as their readers and
+#   writers, Concern's `included` block as `append_features`, and
+#   `ActiveSupport::Ractors.try_shareable_proc` as the block itself (it
+#   returns the block unless an app configures Ractor shareability).
+# - Exceptions has `discard_on`, `after_discard` and `retry_job`, without
+#   their `instrument` notifications. `retry_on` is not ported: Core's
+#   BackgroundQueue::Retry replaces it with a `raise`, and its waits
+#   schedule a re-enqueue the in-process adapter has no schedule for (the
+#   shared base's `retry_on` stays inert, active_job.rb).
 # - `set` keeps `scheduled_at`; the in-process adapter has no schedule, so
 #   a scheduled job is enqueued like any other, as the generated wrapper
 #   does with the `set(wait:)` options it drops.
@@ -68,6 +80,9 @@ module ActiveJob
 
     attr_accessor :enqueue_error
 
+    # Queue in which the job will reside.
+    attr_writer :queue_name
+
     # Creates a new job instance. Takes the arguments that will be
     # passed to the perform method.
     def initialize(*arguments, **kwargs)
@@ -77,12 +92,14 @@ module ActiveJob
       @scheduled_at = nil
       @executions = 0
       @exception_executions = {}
+      @queue_name = self.class.queue_name
     end
 
     # Configures the job with the given options.
     def set(options = {}) # :nodoc:
       self.scheduled_at = Time.now + options[:wait].to_f if options[:wait]
       self.scheduled_at = options[:wait_until] if options[:wait_until]
+      self.queue_name   = self.class.queue_name_from_part(options[:queue]) if options[:queue]
       self
     end
   end
@@ -145,12 +162,13 @@ module ActiveJob
       def _raw_enqueue
         job_class = self.class
         name = job_class.name
-        enqueued = [arguments, job_id, executions]
+        enqueued = [arguments, job_id, executions, queue_name]
         work = -> do
-          arguments, job_id, executions = enqueued
+          arguments, job_id, executions, queue_name = enqueued
           job = job_class.new(*arguments)
           job.job_id = job_id
           job.executions = executions
+          job.queue_name = queue_name
           job.perform_now
           nil
         end
@@ -200,6 +218,7 @@ module ActiveJob
       handled = rescue_with_handler(exception)
       return handled if handled
 
+      run_after_discard_procs(exception)
       raise
     end
 
@@ -215,6 +234,260 @@ module ActiveJob
       end
   end
 
+  # ActiveJob::QueueName.
+  module QueueName
+    @default_queue_name = "default"
+    singleton_class.attr_reader :default_queue_name # :nodoc:
+
+    def self.default_queue_name=(name) # :nodoc:
+      @default_queue_name = -name.to_s
+    end
+
+    # The `included` block: the three class attributes' defaults.
+    def self.append_features(base)
+      return false if base < self
+      super
+      base.extend ClassMethods
+      base.queue_name = proc { self.class.default_queue_name }
+      base.queue_name_delimiter = "_"
+      base.queue_name_prefix = nil
+    end
+
+    # Includes the ability to override the default queue name and prefix.
+    module ClassMethods
+      def default_queue_name
+        QueueName.default_queue_name
+      end
+
+      def default_queue_name=(name)
+        QueueName.default_queue_name = name
+      end
+
+      # Specifies the name of the queue to process the job on.
+      #
+      #   class PublishToFeedJob < ActiveJob::Base
+      #     queue_as :feeds
+      #
+      #     def perform(post)
+      #       post.to_feed!
+      #     end
+      #   end
+      #
+      # Can be given a block that will evaluate in the context of the job
+      # so that a dynamic queue name can be applied:
+      #
+      #   class PublishToFeedJob < ApplicationJob
+      #     queue_as do
+      #       post = self.arguments.first
+      #
+      #       if post.paid?
+      #         :paid_feeds
+      #       else
+      #         :feeds
+      #       end
+      #     end
+      #
+      #     def perform(post)
+      #       post.to_feed!
+      #     end
+      #   end
+      def queue_as(part_name = nil, &block)
+        if block_given?
+          self.queue_name = block
+        else
+          self.queue_name = queue_name_from_part(part_name)
+        end
+      end
+
+      def queue_name_from_part(part_name) # :nodoc:
+        queue_name = part_name || default_queue_name
+        name_parts = [QueueName.presence(queue_name_prefix), queue_name]
+        -name_parts.compact.join(queue_name_delimiter)
+      end
+
+      # The class_attribute readers (`instance_accessor: false` for the
+      # first two): the value the nearest class that assigned one holds.
+      def queue_name
+        QueueName.inherited_value(self, :@queue_name)
+      end
+
+      def queue_name=(value)
+        @queue_name = value
+      end
+
+      def queue_name?
+        !!queue_name
+      end
+
+      def queue_name_delimiter
+        QueueName.inherited_value(self, :@queue_name_delimiter)
+      end
+
+      def queue_name_delimiter=(value)
+        @queue_name_delimiter = value
+      end
+
+      def queue_name_delimiter?
+        !!queue_name_delimiter
+      end
+
+      def queue_name_prefix
+        QueueName.inherited_value(self, :@queue_name_prefix)
+      end
+
+      def queue_name_prefix=(value)
+        @queue_name_prefix = value
+      end
+
+      def queue_name_prefix?
+        !!queue_name_prefix
+      end
+    end
+
+    # `class_attribute :queue_name_prefix`'s instance reader, writer and
+    # predicate.
+    def queue_name_prefix
+      defined?(@queue_name_prefix) ? @queue_name_prefix : self.class.queue_name_prefix
+    end
+
+    def queue_name_prefix=(value)
+      @queue_name_prefix = value
+    end
+
+    def queue_name_prefix?
+      !!queue_name_prefix
+    end
+
+    # Returns the name of the queue the job will be run on.
+    def queue_name
+      if @queue_name.is_a?(Proc)
+        @queue_name = self.class.queue_name_from_part(instance_exec(&@queue_name))
+      end
+      @queue_name
+    end
+
+    def self.inherited_value(klass, ivar) # :nodoc:
+      owner = klass
+      owner = owner.superclass until owner.instance_variable_defined?(ivar)
+      owner.instance_variable_get(ivar)
+    end
+
+    # `Object#presence` (active_support/core_ext/object/blank.rb): a
+    # String is blank when it is all whitespace, anything else that has
+    # `empty?` when it is empty, the rest when it is falsy.
+    def self.presence(value) # :nodoc:
+      blank =
+        if value.is_a?(String)
+          value.match?(/\A[[:space:]]*\z/)
+        elsif value.respond_to?(:empty?)
+          value.empty?
+        else
+          !value
+        end
+      blank ? nil : value
+    end
+  end
+
+  # ActiveJob::Exceptions: `discard_on` and `after_discard` on the
+  # Rescuable port, and `retry_job`.
+  module Exceptions
+    # The `included` block: the two class attributes' defaults.
+    def self.append_features(base)
+      return false if base < self
+      super
+      base.extend ClassMethods
+      base.retry_jitter = 0.0
+      base.after_discard_procs = []
+    end
+
+    module ClassMethods
+      # Discard the job with no attempts to retry, if the exception is raised. This is useful when the subject of the job,
+      # like an Active Record, is no longer available, and the job is thus no longer relevant.
+      #
+      # Passing the <tt>:report</tt> option reports the error through the error reporter before discarding the job.
+      #
+      # You can also pass a block that'll be invoked. This block is yielded with the job instance as the first and the error instance as the second parameter.
+      #
+      # +retry_on+ and +discard_on+ handlers are searched from bottom to top, and up the class hierarchy. The handler of the first class for
+      # which <tt>exception.is_a?(klass)</tt> holds true is the one invoked, if any.
+      def discard_on(*exceptions, report: false)
+        rescue_from(*exceptions) do |error|
+          ActiveSupport.error_reporter.report(error, source: "application.active_job") if report
+          yield self, error if block_given?
+          run_after_discard_procs(error)
+        end
+      end
+
+      # A block to run when a job is about to be discarded for any reason.
+      def after_discard(&blk)
+        self.after_discard_procs += [blk]
+      end
+
+      # The class_attribute readers (`instance_accessor: false` for
+      # `retry_jitter`): the value the nearest class that assigned one
+      # holds.
+      def retry_jitter
+        QueueName.inherited_value(self, :@retry_jitter)
+      end
+
+      def retry_jitter=(value)
+        @retry_jitter = value
+      end
+
+      def retry_jitter?
+        !!retry_jitter
+      end
+
+      def after_discard_procs
+        QueueName.inherited_value(self, :@after_discard_procs)
+      end
+
+      def after_discard_procs=(value)
+        @after_discard_procs = value
+      end
+
+      def after_discard_procs?
+        !!after_discard_procs
+      end
+    end
+
+    # `class_attribute :after_discard_procs`'s instance reader, writer and
+    # predicate.
+    def after_discard_procs
+      defined?(@after_discard_procs) ? @after_discard_procs : self.class.after_discard_procs
+    end
+
+    def after_discard_procs=(value)
+      @after_discard_procs = value
+    end
+
+    def after_discard_procs?
+      !!after_discard_procs
+    end
+
+    # Reschedules the job to be re-executed. This is useful in combination with
+    # {rescue_from}[rdoc-ref:ActiveSupport::Rescuable::ClassMethods#rescue_from].
+    # When you rescue an exception from your job you can ask Active Job to retry
+    # performing your job.
+    def retry_job(options = {})
+      scheduled_at, queue_name = self.scheduled_at, self.queue_name
+      enqueue options
+    ensure
+      self.scheduled_at, self.queue_name = scheduled_at, queue_name
+    end
+
+    private
+      def run_after_discard_procs(exception)
+        exceptions = []
+        after_discard_procs.each do |blk|
+          instance_exec(self, exception, &blk)
+        rescue StandardError => e
+          exceptions << e
+        end
+        raise exceptions.last unless exceptions.empty?
+      end
+  end
+
   module Callbacks
     # ActiveJob::Base's includes, Concern#append_features's way: the
     # dependencies first, then the module, its class methods and its
@@ -222,6 +495,7 @@ module ActiveJob
     def self.append_features(base)
       return false if base < self
       base.include Core
+      base.include QueueName
       base.include Enqueuing
       base.extend Enqueuing::ClassMethods
       base.include ActiveSupport::Rescuable
@@ -232,6 +506,7 @@ module ActiveJob
       base.extend ClassMethods
       base.define_callbacks :perform, skip_after_callbacks_if_terminated: true
       base.define_callbacks :enqueue, skip_after_callbacks_if_terminated: true
+      base.include Exceptions
     end
 
     # These methods will be included into any Active Job object, adding

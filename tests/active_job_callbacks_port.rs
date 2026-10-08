@@ -297,13 +297,22 @@ fn requires() -> String {
 }
 
 fn native() -> String {
+    let files: Vec<(&str, &str)> = FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    native_of(&files, &format!("{}{NATIVE_ADAPTER}{OBSERVE}", requires()))
+}
+
+/// `program` run natively on Core's pinned activejob (`:inline`), beside
+/// `files` written at their emitted paths, so one set of
+/// `require_relative`s serves both sides.
+fn native_of(files: &[(&str, &str)], program: &str) -> String {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
+    static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "rh_active_job_callbacks_native_{}",
-        std::process::id()
+        "rh_active_job_callbacks_native_{}_{}",
+        std::process::id(),
+        RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
-    // The emitted tree's layout, so the one `requires()` serves both.
-    for (_, emitted, text) in FILES {
+    for (emitted, text) in files {
         let file = dir.join(emitted);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, text).unwrap();
@@ -313,8 +322,7 @@ fn native() -> String {
          require \"active_support\"\nrequire \"active_job\"\nrequire \"logger\"\n\
          abort \"native: activejob is not Core's\" unless Gem.loaded_specs[\"activejob\"].full_gem_path.start_with?(RailsOracle::CORE_GEM_HOME)\n\
          ActiveJob::Base.queue_adapter = :inline\nActiveJob::Base.logger = Logger.new(nil)\n\
-         {}{NATIVE_ADAPTER}{OBSERVE}",
-        requires()
+         {program}"
     );
     std::fs::write(dir.join("native.rb"), program).unwrap();
     let out = Command::new("ruby")
@@ -467,25 +475,328 @@ fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
 
 const SCHEMA: &str = "ActiveRecord::Schema.define(version: 1) do\nend\n";
 
-/// A job that includes a callback concern below a callback of its own
-/// registers the concern's after its own natively; the emitted body
-/// writes includes first, so it is refused rather than reordered.
+/// Core's BackgroundQueue::Job shape: a job that registers callbacks
+/// and a handler of its own, then includes a callback concern
+/// (Podding::JobShopLock), then registers more. Ruby registers the
+/// concern's `included do` callbacks where the include is, so the chain
+/// and the handler lookup interleave the two; the emitted body writes
+/// the include at its statement, and runs as native activejob does.
+const LATE_JOB: &str = r#"class LateJob < ApplicationJob
+  include Stamped
+
+  before_perform { |job| job.trail << "late own first" }
+  around_perform do |job, block|
+    job.trail << "late around in"
+    block.call
+    job.trail << "late around out"
+  end
+  rescue_from(StandardError) { |e| trail << "late rescued #{e.class}" }
+  include Traced
+  LIMIT = 2
+  after_perform { |job| job.trail << "late after #{LIMIT}" }
+  before_perform :late_own_last
+
+  def perform(kind)
+    trail << "late perform #{kind}"
+    raise KeyError, "late" if kind == :key
+    raise IOError, "late" if kind == :io
+    kind
+  end
+
+  private
+
+  def late_own_last
+    trail << "late own last"
+  end
+end
+"#;
+
+const LATE_OBSERVE: &str = r#"def run(label)
+  ApplicationJob::TRAIL.clear
+  result = begin
+    yield
+  rescue Exception => e
+    [:raised, e.class.name, e.message]
+  end
+  result = result.class.name if result.is_a?(ActiveJob::Base)
+  p [label, result, ApplicationJob::TRAIL.dup]
+end
+run(:now) { LateJob.perform_now(:ok) }
+run(:key) { LateJob.perform_now(:key) }
+run(:io) { LateJob.perform_now(:io) }
+run(:later) { LateJob.perform_later(:ok) }
+p [LateJob._perform_callbacks.map(&:kind), LateJob.rescue_handlers.map(&:first), LateJob.stamp]
+"#;
+
+const LATE_FILES: &[(&str, &str, &str)] = &[
+    ("app/jobs/application_job.rb", "app/models/application_job.rb", APPLICATION_JOB),
+    ("app/jobs/concerns/traced.rb", "app/models/traced.rb", TRACED),
+    ("app/jobs/concerns/stamped.rb", "app/models/stamped.rb", STAMPED),
+    ("app/jobs/late_job.rb", "app/models/late_job.rb", LATE_JOB),
+];
+
 #[test]
-fn an_include_below_an_own_callback_is_refused() {
-    let late = "class LateJob < ApplicationJob\n  before_perform { trail << \"late own\" }\n  include Traced\n\n  def perform\n    trail << \"late perform\"\n  end\nend\n";
-    let error = ingest_app_from_tree(tree(&[
-        ("db/schema.rb", SCHEMA),
-        ("app/jobs/application_job.rb", APPLICATION_JOB),
-        ("app/jobs/concerns/traced.rb", TRACED),
-        ("app/jobs/late_job.rb", late),
-    ]))
-    .err()
-    .expect("the late include is refused")
-    .to_string();
+fn an_include_below_an_own_callback_registers_where_it_stands() {
+    let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+    for (path, _, text) in LATE_FILES {
+        app = app.write(path, text);
+    }
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let late = std::fs::read_to_string(dir.join("app/models/late_job.rb")).unwrap();
+    assert!(!late.contains("roundhouse:"), "{late}");
+    let at = |needle: &str| late.find(needle).unwrap_or_else(|| panic!("{needle}: {late}"));
+    // The source's statement order: the include between the body's own.
+    assert!(at("include Stamped") < at("late own first"), "{late}");
+    assert!(at("rescue_from(StandardError)") < at("include Traced"), "{late}");
+    assert!(at("include Traced") < at("before_enqueue :note_enqueue"), "{late}");
+    assert!(at("before_enqueue :note_enqueue") < at("LIMIT = 2"), "{late}");
+    assert!(at("LIMIT = 2") < at("before_perform :late_own_last"), "{late}");
+
+    let requires: String = LATE_FILES
+        .iter()
+        .map(|(_, emitted, _)| format!("require_relative {:?}\n", emitted.trim_end_matches(".rb")))
+        .collect();
+    let script = format!("require File.expand_path('main', Dir.pwd)\n{requires}{LATE_OBSERVE}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args(["-W0", "-e", &script])
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<(&str, &str)> = LATE_FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    let native = native_of(&files, &format!("{requires}{LATE_OBSERVE}"));
+    // The body's first callbacks run ahead of the concern's, and the
+    // concern's KeyError handler, registered later, wins over the body's
+    // StandardError one.
     assert!(
-        error.contains("`before_perform` in `included do` of Traced: LateJob includes Traced below a callback its own body registers (line 2)"),
-        "{error}"
+        native.starts_with(r#"[:now, :ok, ["late own first", "late around in", "traced before ok", "traced around in", "late own last", "late perform ok", "late after 2", "traced around out", "late around out"]]
+[:key, #<KeyError: late>, ["late own first", "late around in", "traced before key", "traced around in", "late own last", "late perform key", "traced rescued late"]]
+"#),
+        "{native}"
     );
+    assert_eq!(stdout, native, "emitted on the port vs native activejob");
+}
+
+/// activejob's ActiveJob::QueueName on the port: `queue_as` with a name,
+/// a block and from a Concern's `included do`, the prefix and delimiter
+/// class attributes, the default name, inheritance, and Core's
+/// BackgroundQueue::Job `self.queue_name = self.default_queue_name = nil`.
+const QUEUED: &str = r#"module Queued
+  extend ActiveSupport::Concern
+
+  included do
+    queue_as :concerned
+  end
+end
+"#;
+
+const NAMELESS_JOB: &str = r#"class NamelessJob < ApplicationJob
+  self.queue_name = self.default_queue_name = nil
+end
+"#;
+const LOW_JOB: &str = r#"class LowJob < ApplicationJob
+  queue_as :low
+  before_enqueue { |job| job.trail << "enqueue on #{job.queue_name}" }
+
+  def perform
+    trail << "perform on #{queue_name}"
+    queue_name
+  end
+end
+"#;
+const INHERITING_JOB: &str = r#"class InheritingJob < LowJob
+end
+"#;
+const DYNAMIC_JOB: &str = r#"class DynamicJob < ApplicationJob
+  queue_as do
+    arguments.first == :paid ? :paid_feeds : :feeds
+  end
+
+  def perform(kind)
+    queue_name
+  end
+end
+"#;
+const DEFAULT_JOB: &str = r#"class DefaultJob < ApplicationJob
+  def perform
+    queue_name
+  end
+end
+"#;
+const PREFIXED_JOB: &str = r#"class PrefixedJob < ApplicationJob
+  self.queue_name_prefix = "shop"
+  self.queue_name_delimiter = "."
+  queue_as :mid
+
+  def perform
+    queue_name
+  end
+end
+"#;
+const CONCERNED_JOB: &str = r#"class ConcernedJob < ApplicationJob
+  include Queued
+
+  def perform
+    queue_name
+  end
+end
+"#;
+
+const QUEUE_OBSERVE: &str = r#"p [LowJob.queue_name, InheritingJob.queue_name, PrefixedJob.queue_name, ConcernedJob.queue_name, NamelessJob.queue_name]
+p [DefaultJob.queue_name.is_a?(Proc), DefaultJob.queue_name_delimiter, PrefixedJob.queue_name_delimiter, PrefixedJob.queue_name_prefix, LowJob.queue_name_prefix, PrefixedJob.queue_name_prefix?]
+p [LowJob.perform_now, InheritingJob.perform_now, DynamicJob.perform_now(:paid), DynamicJob.perform_now(:free), DefaultJob.perform_now, PrefixedJob.perform_now, ConcernedJob.perform_now]
+p [DynamicJob.new(:paid).queue_name, LowJob.new.queue_name_prefix, PrefixedJob.new.queue_name_prefix]
+ApplicationJob::TRAIL.clear
+LowJob.perform_later
+InheritingJob.new.enqueue(queue: :other)
+p ApplicationJob::TRAIL
+p [LowJob.queue_name_from_part(:x), PrefixedJob.queue_name_from_part(nil), NamelessJob.default_queue_name]
+LowJob.default_queue_name = :fallback
+p [DefaultJob.perform_now, DefaultJob.default_queue_name, PrefixedJob.queue_name_from_part(nil)]
+"#;
+
+const QUEUE_FILES: &[(&str, &str, &str)] = &[
+    ("app/jobs/application_job.rb", "app/models/application_job.rb", APPLICATION_JOB),
+    ("app/jobs/concerns/queued.rb", "app/models/queued.rb", QUEUED),
+    ("app/jobs/nameless_job.rb", "app/models/nameless_job.rb", NAMELESS_JOB),
+    ("app/jobs/low_job.rb", "app/models/low_job.rb", LOW_JOB),
+    ("app/jobs/inheriting_job.rb", "app/models/inheriting_job.rb", INHERITING_JOB),
+    ("app/jobs/dynamic_job.rb", "app/models/dynamic_job.rb", DYNAMIC_JOB),
+    ("app/jobs/default_job.rb", "app/models/default_job.rb", DEFAULT_JOB),
+    ("app/jobs/prefixed_job.rb", "app/models/prefixed_job.rb", PREFIXED_JOB),
+    ("app/jobs/concerned_job.rb", "app/models/concerned_job.rb", CONCERNED_JOB),
+];
+
+#[test]
+fn queue_names_resolve_like_activejob() {
+    let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+    for (path, _, text) in QUEUE_FILES {
+        app = app.write(path, text);
+    }
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let requires: String = QUEUE_FILES
+        .iter()
+        .map(|(_, emitted, _)| format!("require_relative {:?}\n", emitted.trim_end_matches(".rb")))
+        .collect();
+    let script = format!("require File.expand_path('main', Dir.pwd)\n{requires}{QUEUE_OBSERVE}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args(["-W0", "-e", &script])
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<(&str, &str)> = QUEUE_FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    let native = native_of(&files, &format!("{requires}{QUEUE_OBSERVE}"));
+    assert!(
+        native.starts_with(r#"["low", "low", "shop.mid", "concerned", nil]
+"#),
+        "{native}"
+    );
+    assert_eq!(stdout, native, "emitted on the port vs native activejob");
+}
+
+/// activejob's `discard_on`, `after_discard` and `retry_job` on the port
+/// (ActiveJob::Exceptions), with Core's BackgroundQueue::Retry shape: a
+/// Concern whose ClassMethods `discard_on` records the classes and calls
+/// `super`. (Retry records them in a class attribute its `included do`
+/// declares; a carried class attribute's methods are written below the
+/// body's calls, so here a constant holds them.)
+const DISCARDS: &str = r#"module Discards
+  extend ActiveSupport::Concern
+
+  RECORDED = []
+
+  module ClassMethods
+    def discard_on(*exceptions, report: false)
+      RECORDED.concat(exceptions)
+      super
+    end
+  end
+end
+"#;
+
+const DISCARD_JOB: &str = r#"class DiscardJob < ApplicationJob
+  include Discards
+
+  queue_as :first
+  after_discard { |job, error| job.trail << "after_discard #{error.class}" }
+  discard_on KeyError
+  discard_on(IOError) { |job, error| job.trail << "discarded #{error.message} #{job.arguments.inspect}" }
+  rescue_from(RangeError) do |e|
+    trail << "range #{executions} #{queue_name}"
+    retry_job(queue: :again) if executions < 2
+    trail << "kept #{queue_name}"
+  end
+  before_enqueue { |job| job.trail << "enqueue #{job.queue_name}" }
+
+  def perform(kind)
+    trail << "perform #{kind} #{executions}"
+    raise KeyError, "k" if kind == :key
+    raise IOError, "io" if kind == :io
+    raise RangeError, "r" if kind == :range
+    raise ArgumentError, "arg" if kind == :arg
+    kind
+  end
+end
+"#;
+
+const DISCARD_OBSERVE: &str = r#"def run(label)
+  ApplicationJob::TRAIL.clear
+  result = begin
+    yield
+  rescue Exception => e
+    [:raised, e.class.name, e.message]
+  end
+  result = result.class.name if result.is_a?(ActiveJob::Base)
+  result = [result.class.name, result.message] if result.is_a?(Exception)
+  p [label, result, ApplicationJob::TRAIL.dup]
+end
+run(:ok) { DiscardJob.perform_now(:ok) }
+run(:key) { DiscardJob.perform_now(:key) }
+run(:io) { DiscardJob.perform_now(:io) }
+run(:arg) { DiscardJob.perform_now(:arg) }
+run(:range) { DiscardJob.perform_later(:range) }
+p [Discards::RECORDED, DiscardJob.rescue_handlers.map(&:first), DiscardJob.after_discard_procs.size, DiscardJob.retry_jitter]
+"#;
+
+const DISCARD_FILES: &[(&str, &str, &str)] = &[
+    ("app/jobs/application_job.rb", "app/models/application_job.rb", APPLICATION_JOB),
+    ("app/jobs/concerns/discards.rb", "app/models/discards.rb", DISCARDS),
+    ("app/jobs/discard_job.rb", "app/models/discard_job.rb", DISCARD_JOB),
+];
+
+#[test]
+fn discard_on_runs_like_activejob() {
+    let mut app = emit_and_run::empty_app().write("roundhouse.yml", "test_paths:\n  - test\n");
+    for (path, _, text) in DISCARD_FILES {
+        app = app.write(path, text);
+    }
+    let (dir, errors) = app.emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let requires: String = DISCARD_FILES
+        .iter()
+        .map(|(_, emitted, _)| format!("require_relative {:?}\n", emitted.trim_end_matches(".rb")))
+        .collect();
+    let script = format!("require File.expand_path('main', Dir.pwd)\n{requires}{DISCARD_OBSERVE}");
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args(["-W0", "-e", &script])
+        .env("BLOG_DB", ":memory:")
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let job = std::fs::read_to_string(dir.join("app/models/discard_job.rb")).unwrap();
+    assert!(out.status.success(), "{stdout}\n{}\n{job}", String::from_utf8_lossy(&out.stderr));
+    let files: Vec<(&str, &str)> = DISCARD_FILES.iter().map(|(_, emitted, text)| (*emitted, *text)).collect();
+    let native = native_of(&files, &format!("{requires}{DISCARD_OBSERVE}"));
+    assert!(native.contains("after_discard ArgumentError"), "{native}");
+    assert_eq!(stdout, native, "emitted on the port vs native activejob");
 }
 
 /// The WithFallback hook is consumed for jobs only: a plain class that
