@@ -197,8 +197,8 @@ fn limit_from_call(call: &Expr, controller_path: &str) -> Option<Limit> {
                 // The guard evaluates the predicate. Storing the lambda
                 // would test the lambda object, which is always truthy.
                 // A parameter has no binding once the body is inlined.
-                ExprNode::Lambda { params, rest_param, block_param, body, .. }
-                    if params.is_empty() && rest_param.is_none() && block_param.is_none() =>
+                ExprNode::Lambda { params, rest_param, block_param, body, signature, .. }
+                    if params.is_empty() && rest_param.is_none() && block_param.is_none() && signature.is_empty() =>
                 {
                     if_cond_expr = Some((*body).clone())
                 }

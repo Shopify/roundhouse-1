@@ -72,8 +72,9 @@ pub(crate) fn rewrite_node(expr: &mut Expr) {
             ExprNode::Lambda {
                 params,
                 rest_param: None,
+                signature,
                 ..
-            } if params.len() >= 2 => true,
+            } if params.len() >= 2 && signature.is_empty() => true,
             _ => false,
         };
 
@@ -269,7 +270,7 @@ mod tests {
     fn lambda(params: &[&str], body: Expr) -> Expr {
         Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { signature: Default::default(),
                 params: params.iter().map(|p| Symbol::from(*p)).collect(),
                 rest_param: None,
                 block_param: None,
@@ -384,7 +385,7 @@ mod tests {
         let each = send(Some(var("items")), "each", vec![], None);
         let block = Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { signature: Default::default(),
                 params: vec![Symbol::from("item")],
                 rest_param: Some(Symbol::from("rest")),
                 block_param: None,

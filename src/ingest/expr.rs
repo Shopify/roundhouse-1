@@ -1363,7 +1363,8 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             // opening_loc is `{`); `->(x) do body end` exists but isn't
             // idiomatic and doesn't appear in any fixture yet.
             let block_style = block_style_from_opening(l.opening_loc().as_slice());
-            ExprNode::Lambda { rest_param, params, block_param, body, block_style }
+            let signature = block_signature(l.parameters(), file)?;
+            ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature }
         }
         n if n.as_yield_node().is_some() => {
             let y = n.as_yield_node().unwrap();
@@ -3089,7 +3090,7 @@ fn ingest_call_block(
                 );
                 return Ok(Some(Expr::new(
                     sym_span,
-                    ExprNode::Lambda { rest_param: None,
+                    ExprNode::Lambda { signature: Default::default(), rest_param: None,
                         params,
                         block_param: None,
                         body,
@@ -3168,9 +3169,10 @@ fn ingest_call_block(
                 let body = open_with_destructures(destructures, body);
                 let body = desugar_post_params(&mut rest_param, block_post_params(lam.parameters()), body);
                 let block_style = block_style_from_opening(lam.opening_loc().as_slice());
+                let signature = block_signature(lam.parameters(), file)?;
                 return Ok(Some(Expr::new(
                     Span::synthetic(),
-                    ExprNode::Lambda { rest_param, params, block_param, body, block_style },
+                    ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
                 )));
             }
             // Any other proc-valued expression is evaluated once and passed as the block.
@@ -3243,9 +3245,10 @@ fn ingest_block_node_as_lambda(b: &ruby_prism::BlockNode<'_>, file: &str) -> Ing
     let body = open_with_destructures(destructures, body);
     let body = desugar_post_params(&mut rest_param, block_post_params(b.parameters()), body);
     let block_style = block_style_from_opening(b.opening_loc().as_slice());
+    let signature = block_signature(b.parameters(), file)?;
     Ok(Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda { rest_param, params, block_param, body, block_style },
+        ExprNode::Lambda { rest_param, params, block_param, body, block_style, signature },
     ))
 }
 
@@ -3437,7 +3440,7 @@ fn refused_block_signature(
     let mut body = Expr::new(span, ExprNode::Lit { value: Literal::Nil });
     body.diagnostic = Some(crate::diagnostic::DiagnosticKind::IngestRefused {
         detail: format!(
-            "block/lambda parameter{} {} not represented in block IR (only required, rest, post and block parameters are); the block was refused rather than run without {}",
+            "block/lambda parameter{} {} not represented in block IR; the block was refused rather than run without {}",
             if unrepresented.len() == 1 { "" } else { "s" },
             unrepresented.join(", "),
             if unrepresented.len() == 1 { "it" } else { "them" },
@@ -3445,7 +3448,7 @@ fn refused_block_signature(
     });
     Some(Expr::new(
         span,
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             rest_param: Some(Symbol::from("__refused_args")),
             params: vec![],
             block_param: None,
@@ -3455,34 +3458,58 @@ fn refused_block_signature(
     ))
 }
 
-/// The block or lambda parameters Lambda IR has no slot for, spelled as
-/// in the source: optional (`b = 1`), keyword (`item:`, `context: 1`)
-/// and named keyword-rest (`**opts`). Ingest used to drop them, so the
-/// emitted `lambda do |item:, context: 1|` was `lambda do` with a body
-/// reading names nothing bound. A nameless `**` binds nothing the body
-/// can read and stays accepted, as does `**nil`.
+/// The block or lambda parameters Lambda IR cannot hold, spelled as in
+/// the source: optional ones (`b = 1`) ahead of post parameters
+/// (`|a, b = 1, *r, c|`). Posts are bound by popping the rest after the
+/// optionals bind, where Ruby binds the posts first, so `(1, 2)` would
+/// give `b` 2 and `c` nil instead of `b` 1 and `c` 2.
 fn unrepresented_block_params(pn: &ruby_prism::ParametersNode<'_>) -> Vec<String> {
-    let mut out = Vec::new();
+    if pn.posts().iter().next().is_none() {
+        return Vec::new();
+    }
+    pn.optionals()
+        .iter()
+        .filter_map(|opt| opt.as_optional_parameter_node())
+        .map(|op| format!("`{} = …` (an optional parameter ahead of post parameters)", constant_id_str(&op.name())))
+        .collect()
+}
+
+/// A block's or lambda's optional, keyword and named keyword-rest
+/// parameters (`|a, b = 1, item:, context: 1, **opts|`). Ingest used to
+/// drop them, so the emitted `lambda do |item:, context: 1|` was
+/// `lambda do` with a body reading names nothing bound. A nameless `**`
+/// binds nothing the body can read and stays absent, as does `**nil`.
+fn block_signature(params_node: Option<Node<'_>>, file: &str) -> IngestResult<crate::expr::BlockSignature> {
+    let mut signature = crate::expr::BlockSignature::default();
+    let Some(pn) = params_node
+        .as_ref()
+        .and_then(|p| p.as_block_parameters_node())
+        .and_then(|bpn| bpn.parameters())
+    else {
+        return Ok(signature);
+    };
     for opt in pn.optionals().iter() {
         if let Some(op) = opt.as_optional_parameter_node() {
-            out.push(format!("`{} = …`", constant_id_str(&op.name())));
+            signature
+                .optionals
+                .push((Symbol::from(constant_id_str(&op.name())), ingest_expr(&op.value(), file)?));
         }
     }
     for kw in pn.keywords().iter() {
         if let Some(okw) = kw.as_optional_keyword_parameter_node() {
-            out.push(format!("`{}: …`", constant_id_str(&okw.name())));
+            signature
+                .keywords
+                .push((Symbol::from(constant_id_str(&okw.name())), Some(ingest_expr(&okw.value(), file)?)));
         } else if let Some(rkw) = kw.as_required_keyword_parameter_node() {
-            out.push(format!("`{}:`", constant_id_str(&rkw.name())));
+            signature.keywords.push((Symbol::from(constant_id_str(&rkw.name())), None));
         }
     }
-    if let Some(name) = pn
+    signature.kwrest = pn
         .keyword_rest()
         .and_then(|k| k.as_keyword_rest_parameter_node())
         .and_then(|k| k.name())
-    {
-        out.push(format!("`**{}`", constant_id_str(&name)));
-    }
-    out
+        .map(|name| Symbol::from(constant_id_str(&name)));
+    Ok(signature)
 }
 
 /// A positional block parameter's name. A destructuring one (`|(k, v),

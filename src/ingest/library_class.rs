@@ -1666,7 +1666,7 @@ fn synth_sorbet_enum_methods(owner: &ClassId, members: &[SorbetEnumMember]) -> V
 fn block_of(param: &str, body: Expr) -> Expr {
     Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             params: vec![Symbol::from(param)],
             rest_param: None,
             block_param: None,
@@ -4287,9 +4287,10 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
             }
         }
         let mut inner: Vec<Symbol> = shadowed.to_vec();
-        if let ExprNode::Lambda { params, rest_param, block_param, .. } = &*expr.node {
+        if let ExprNode::Lambda { params, rest_param, block_param, signature, .. } = &*expr.node {
             inner.extend(params.iter().cloned());
             inner.extend(rest_param.iter().cloned());
+            inner.extend(signature.names().cloned());
             inner.extend(block_param.iter().cloned());
         }
         let mut result = Ok(());

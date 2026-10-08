@@ -307,10 +307,11 @@ fn rewrite(
             rest_param,
             block_param,
             body,
+            signature,
             ..
         } => {
             let mut inner = rebound.clone();
-            for p in lp.iter() {
+            for p in lp.iter().chain(signature.names()) {
                 inner.remove(p);
             }
             if let Some(r) = rest_param.as_ref() {
@@ -553,9 +554,11 @@ fn collect_names(expr: &Expr, out: &mut HashSet<Symbol>) {
             params,
             rest_param,
             block_param,
+            signature,
             ..
         } => {
             out.extend(params.iter().cloned());
+            out.extend(signature.names().cloned());
             if let Some(r) = rest_param {
                 out.insert(r.clone());
             }

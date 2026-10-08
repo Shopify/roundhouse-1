@@ -1998,7 +1998,7 @@ impl<'a> BodyTyper<'a> {
                 self.analyze_expr(body, &inner)
             }
 
-            ExprNode::Lambda { params, rest_param, block_param, body, .. } => {
+            ExprNode::Lambda { params, rest_param, block_param, body, signature, .. } => {
                 let mut inner = ctx.clone();
                 for name in params.iter().chain(rest_param.iter()).chain(block_param.iter()) {
                     inner.class_objects.remove(name);
@@ -2006,6 +2006,32 @@ impl<'a> BodyTyper<'a> {
                 // `->(&blk)` binds the block the call passes (a Proc, or
                 // nil), shadowing any outer local of that name.
                 if let Some(name) = block_param {
+                    inner.local_bindings.insert(name.clone(), Ty::Untyped);
+                }
+                // `|b = 1, item:, context: 1, **opts|`: what a caller passes
+                // is not known here, so each is Untyped, except that a
+                // non-nil literal default types its parameter. A default
+                // is evaluated in the block's scope, after the parameters
+                // before it are bound.
+                for (name, default) in signature.optionals.iter_mut() {
+                    let ty = self.analyze_expr(default, &inner);
+                    let ty = block_default_ty(default, ty);
+                    inner.class_objects.remove(name);
+                    inner.local_bindings.insert(name.clone(), ty);
+                }
+                for (name, default) in signature.keywords.iter_mut() {
+                    let ty = match default {
+                        Some(d) => {
+                            let ty = self.analyze_expr(d, &inner);
+                            block_default_ty(d, ty)
+                        }
+                        None => Ty::Untyped,
+                    };
+                    inner.class_objects.remove(name);
+                    inner.local_bindings.insert(name.clone(), ty);
+                }
+                if let Some(name) = &signature.kwrest {
+                    inner.class_objects.remove(name);
                     inner.local_bindings.insert(name.clone(), Ty::Untyped);
                 }
                 let body_ty = self.analyze_expr(body, &inner);
@@ -3476,9 +3502,10 @@ fn forget_class_object_writes(expr: &Expr, ctx: &mut Ctx) {
                 if let LValue::Var { name, .. } = target { names.push(name.clone()); }
             }
         }
-        ExprNode::Lambda { params, rest_param, block_param, .. } => {
+        ExprNode::Lambda { params, rest_param, block_param, signature, .. } => {
             names.extend(params.iter().cloned());
             names.extend(rest_param.iter().cloned());
+            names.extend(signature.names().cloned());
             names.extend(block_param.iter().cloned());
         }
         ExprNode::Let { name, .. } => names.push(name.clone()),
@@ -4157,7 +4184,7 @@ mod tests {
         // the method's.
         let mut ctx = Ctx::default();
         ctx.enclosing_def = Some((Symbol::from("initialize"), false));
-        let mut block = synth(ExprNode::Lambda {
+        let mut block = synth(ExprNode::Lambda { signature: Default::default(),
             rest_param: None,
             params: vec![],
             block_param: None,
@@ -4633,7 +4660,7 @@ mod tests {
     use crate::expr::BlockStyle;
 
     fn lambda(params: Vec<&str>, body: Expr) -> Expr {
-        synth(ExprNode::Lambda { rest_param: None,
+        synth(ExprNode::Lambda { signature: Default::default(), rest_param: None,
             params: params.into_iter().map(Symbol::from).collect(),
             block_param: None,
             body,
@@ -5923,3 +5950,12 @@ pub(super) const RUBY_TOP_LEVEL: &[&str] = &[
     "Socket", "StringIO", "Struct", "Tempfile", "Thread", "Time", "Timeout", "URI", "YAML",
     "Zlib",
 ];
+
+/// The type a block parameter's default gives it: a non-nil literal's
+/// own type, else Untyped (a call may pass anything).
+fn block_default_ty(default: &Expr, ty: Ty) -> Ty {
+    match &*default.node {
+        ExprNode::Lit { value } if !matches!(value, crate::expr::Literal::Nil) => ty,
+        _ => Ty::Untyped,
+    }
+}

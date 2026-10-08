@@ -305,7 +305,7 @@ fn collection_text(value: &Expr, id: &ClassId) -> Expr {
     );
     let block = Expr::new(
         span,
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             rest_param: None,
             params: vec![item],
             block_param: None,

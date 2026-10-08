@@ -364,10 +364,10 @@ fn try_rewrite(e: &mut Expr, acc: &str, variants: &HashMap<(String, String), Var
     if cargs.len() != variant.arity {
         return false;
     }
-    let ExprNode::Lambda { params: bparams, rest_param, block_param, body, .. } = &*blk.node else {
+    let ExprNode::Lambda { params: bparams, rest_param, block_param, body, signature, .. } = &*blk.node else {
         return false;
     };
-    if !bparams.is_empty() || rest_param.is_some() || block_param.is_some() {
+    if !bparams.is_empty() || rest_param.is_some() || block_param.is_some() || !signature.is_empty() {
         return false;
     }
     let Some(cap) = capture_block_acc(body) else { return false };

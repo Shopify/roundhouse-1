@@ -381,7 +381,7 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             block: Some(block),
             ..
         } if method.as_str() == "each" && args.is_empty() => {
-            let ExprNode::Lambda { params, rest_param, body, block_style, .. } = &*block.node else {
+            let ExprNode::Lambda { params, rest_param, body, block_style, signature, .. } = &*block.node else {
                 return vec![todo_io_append("each block shape", stmt.span)];
             };
             let var_name = params
@@ -406,7 +406,7 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             };
             let block_lambda = Expr::new(
                 Span::synthetic(),
-                ExprNode::Lambda { rest_param: rest_param.clone(),
+                ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
                     params: params.clone(),
                     block_param: None,
                     body: inner_body,
@@ -1176,7 +1176,7 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
         parenthesized,
     } = &*inner.node
     {
-        if let ExprNode::Lambda { rest_param, params, block_param, body, block_style } = &*block.node {
+        if let ExprNode::Lambda { signature, rest_param, params, block_param, body, block_style } = &*block.node {
             if block_body_is_template(body) {
                 // NESTED CAPTURES NEED DISTINCT NAMES. A block-with-block
                 // helper (campfire's rooms/show wraps `messages_tag` inside
@@ -1207,7 +1207,7 @@ fn emit_io_append(arg: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                 cap_stmts.push(accumulator_result_ref(cap));
                 let new_block = Expr::new(
                     block.span,
-                    ExprNode::Lambda { rest_param: rest_param.clone(),
+                    ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
                         params: params.clone(),
                         block_param: block_param.clone(),
                         body: seq(cap_stmts),
@@ -1347,7 +1347,7 @@ fn turbo_stream_collection_fragment(
         Vec::new(),
         Some(Expr::new(
             Span::synthetic(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { signature: Default::default(),
                 rest_param: None,
                 params: vec![var],
                 block_param: None,
@@ -1737,7 +1737,7 @@ mod tests {
                 args,
                 block: Some(Expr::new(
                     Span::default(),
-                    ExprNode::Lambda {
+                    ExprNode::Lambda { signature: Default::default(),
                         rest_param: None,
                         params: Vec::new(),
                         block_param: None,
@@ -1981,7 +1981,7 @@ mod tests {
     fn block_helper_call_with(method: &str, args: Vec<Expr>) -> Expr {
         let inner = Expr::new(
             Span::default(),
-            ExprNode::Lambda { rest_param: None,
+            ExprNode::Lambda { signature: Default::default(), rest_param: None,
                 params: Vec::new(),
                 block_param: None,
                 body: buf_append(str_lit("inner")),

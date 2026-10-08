@@ -1418,13 +1418,13 @@ fn exception_class_name(arg: &Expr) -> Option<String> {
 /// arity matches; a block naming its own parameters is left as it is
 /// (mocha would hand it every argument, and this slot has one).
 fn predicate_lambda(block: Expr) -> Option<Expr> {
-    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = *block.node else {
+    let ExprNode::Lambda { signature, params, rest_param, block_param, body, block_style } = *block.node else {
         return None;
     };
     let params = if params.is_empty() && rest_param.is_none() { vec![Symbol::from("_host")] } else { params };
     Some(Expr::new(
         block.span,
-        ExprNode::Lambda { params, rest_param, block_param, body, block_style },
+        ExprNode::Lambda { signature, params, rest_param, block_param, body, block_style },
     ))
 }
 
@@ -1532,7 +1532,7 @@ mod tests {
     fn lambda() -> Expr {
         Expr::new(
             sp(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { signature: Default::default(),
                 rest_param: None,
                 params: vec![],
                 block_param: None,
@@ -1659,7 +1659,7 @@ mod tests {
         );
         let tap_block = Expr::new(
             sp(),
-            ExprNode::Lambda {
+            ExprNode::Lambda { signature: Default::default(),
                 rest_param: None,
                 params: vec![Symbol::from("m")],
                 block_param: None,

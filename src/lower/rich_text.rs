@@ -713,7 +713,7 @@ fn each_destroy(rows: Expr) -> Expr {
     let var = Symbol::from("rich_text");
     let block = Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             params: vec![var.clone()],
             rest_param: None,
             block_param: None,

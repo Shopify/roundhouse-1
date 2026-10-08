@@ -320,8 +320,8 @@ fn scoped_creation_model(e: &Expr, models: &ModelColumns) -> Option<ClassId> {
         || args.len() != 1 || scalar_pairs(&args[0]).is_none()
         || !match block.as_ref().map(|block| &*block.node) {
             None => true,
-            Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. }) =>
-                params.len() == 1 && !has_block_control_flow(body) && !has_other_local_assignment(body, &params[0]),
+            Some(ExprNode::Lambda { params, rest_param: None, block_param: None, body, signature, .. }) =>
+                params.len() == 1 && signature.is_empty() && !has_block_control_flow(body) && !has_other_local_assignment(body, &params[0]),
             _ => false,
         }
     {

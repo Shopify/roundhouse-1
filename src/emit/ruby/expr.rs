@@ -373,10 +373,8 @@ fn emit_node(n: &ExprNode) -> String {
         ExprNode::Let { name, value, body, .. } => {
             format!("{name} = {}\n{}", emit_expr(value), emit_expr(body))
         }
-        ExprNode::Lambda { params, rest_param, block_param, body, .. } => {
-            let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
-            if let Some(r) = rest_param { ps.push(format!("*{r}")); }
-            if let Some(b) = block_param { ps.push(format!("&{b}")); }
+        ExprNode::Lambda { params, rest_param, block_param, body, signature, .. } => {
+            let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
             if ps.is_empty() {
                 format!("-> {{ {} }}", emit_expr(body))
             } else {
@@ -1662,12 +1660,44 @@ fn is_setter_method(m: &str) -> bool {
     true
 }
 
+/// A block's or lambda's parameter list in Ruby's order: required,
+/// optional, rest, keyword, keyword rest, block (`|a, b = 1, *r, k:,
+/// j: 2, **o, &blk|`). Post parameters were desugared off the rest at
+/// ingest.
+fn block_params(
+    params: &[crate::ident::Symbol],
+    rest_param: Option<&crate::ident::Symbol>,
+    signature: &crate::expr::BlockSignature,
+    block_param: Option<&crate::ident::Symbol>,
+) -> Vec<String> {
+    let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+    for (name, default) in &signature.optionals {
+        ps.push(format!("{name} = {}", emit_arg(default)));
+    }
+    if let Some(r) = rest_param {
+        ps.push(format!("*{r}"));
+    }
+    for (name, default) in &signature.keywords {
+        match default {
+            Some(d) => ps.push(format!("{name}: {}", emit_arg(d))),
+            None => ps.push(format!("{name}:")),
+        }
+    }
+    if let Some(k) = &signature.kwrest {
+        ps.push(format!("**{k}"));
+    }
+    if let Some(b) = block_param {
+        ps.push(format!("&{b}"));
+    }
+    ps
+}
+
 /// Emit a `Send + block` in plain Ruby form. Honors the Lambda's
 /// `block_style` to pick `{ … }` vs `do … end`. `{ }` emits a single-line
 /// body; `do … end` spans multiple lines when the body has newlines.
 pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     use crate::expr::BlockStyle;
-    let ExprNode::Lambda { params, rest_param, block_param, body, block_style } = &*block.node else {
+    let ExprNode::Lambda { signature, params, rest_param, block_param, body, block_style } = &*block.node else {
         // A non-Lambda block expression is a Proc FORWARD (`&block` —
         // ingest lowers the block-pass arg to a bare Var in the block
         // slot). Rendering it as a literal `{ block }` block made the
@@ -1691,14 +1721,7 @@ pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
     // The splat has to survive to the emitted source: the body reads
     // `args`, and an emitted module answers a bare name from its own
     // functions when no local binds it.
-    let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
-    if let Some(r) = rest_param {
-        ps.push(format!("*{r}"));
-    }
-    // `|*args, &blk|`: the block's own block parameter, last.
-    if let Some(b) = block_param {
-        ps.push(format!("&{b}"));
-    }
+    let ps = block_params(params, rest_param.as_ref(), signature, block_param.as_ref());
     let params_str = if ps.is_empty() {
         String::new()
     } else {
@@ -2192,7 +2215,7 @@ mod tests {
         // modifier-if wrap above.
         let block = Expr::new(
             Span::default(),
-            ExprNode::Lambda { rest_param: None,
+            ExprNode::Lambda { signature: Default::default(), rest_param: None,
                 params: vec![],
                 block_param: None,
                 body: lit_sym("body"),

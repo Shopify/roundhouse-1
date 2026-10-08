@@ -1055,7 +1055,7 @@ fn field_declaration(call: &Expr) -> Option<FieldDecl> {
     // (an extension, a `|field|` form) is not read.
     if let Some(block) = block {
         match &*block.node {
-            ExprNode::Lambda { params, body, .. } if params.is_empty() => {
+            ExprNode::Lambda { params, body, signature, .. } if params.is_empty() && signature.is_empty() => {
                 for stmt in statements(body) {
                     match &*stmt.node {
                         ExprNode::Send {

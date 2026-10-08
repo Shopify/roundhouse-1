@@ -545,7 +545,7 @@ pub(crate) fn alias_value(value: &Node<'_>, file: &str) -> IngestResult<Option<E
     let span = Span { file: super::sources::file_id(file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 };
     let block = Expr::new(
         Span::synthetic(),
-        ExprNode::Lambda {
+        ExprNode::Lambda { signature: Default::default(),
             params: Vec::new(),
             rest_param: None,
             block_param: None,
