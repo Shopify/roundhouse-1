@@ -8,7 +8,8 @@
 //! String. Ingest keeps the subclasses as library classes over the
 //! model's compiled accessors, so the model compiles `value` as retypable
 //! and each subclass's call runs as written at class load. A call with
-//! `default:` or other options stays refused (the runtime ports neither).
+//! options other than `default:` stays refused (the runtime ports none;
+//! `default:` is `tests/attribute_default_pg_runtime.rs`).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -125,12 +126,12 @@ fn sti_subclass_attribute_runs_on_the_subclass() {
     assert!(flag.contains("  attribute :value, :boolean\n"), "bool_setting:\n{flag}");
 }
 
-/// A subclass `attribute` call with `default:` stays refused.
+/// A subclass `attribute` call with another option stays refused.
 #[test]
-fn sti_subclass_attribute_with_a_default_is_refused() {
+fn sti_subclass_attribute_with_an_option_is_refused() {
     let app = overlay().write(
         "app/models/bool_setting.rb",
-        "class BoolSetting < Setting\n  attribute :value, :boolean, default: true\nend\n",
+        "class BoolSetting < Setting\n  attribute :value, :boolean, default: true, limit: 1\nend\n",
     );
     let (_emitted, errors) = app.emit(roundhouse::project::BuildTarget::Ruby);
     assert!(

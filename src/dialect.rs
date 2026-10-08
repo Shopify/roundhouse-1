@@ -120,6 +120,14 @@ pub struct Model {
     /// then lowers exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retypable_attributes: Vec<Symbol>,
+    /// The retypable columns a claimed `attribute` call gives a
+    /// `default:`, the model's, a model ancestor's or an STI subclass's
+    /// (`analyze::retypable_attributes::defaulted_attributes`). The
+    /// compiled `initialize` starts them from the class's declared
+    /// default when the attrs leave them out. Empty for nearly every
+    /// model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defaulted_attributes: Vec<Symbol>,
     /// The columns a `query_constraints` call in the body names, directly
     /// or through an app class macro that reaches it (stamped at the end
     /// of ingest by `analyze::retypable_attributes`). The compiled update,

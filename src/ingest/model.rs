@@ -700,6 +700,7 @@ pub(super) fn ingest_model_with_enum_constants(
         parent_span,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        defaulted_attributes: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
         ignored_columns: Vec::new(),

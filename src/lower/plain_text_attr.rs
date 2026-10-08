@@ -150,6 +150,7 @@ pub fn synthesize_record_model(app: &mut App) {
     app.models.push(Model {
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        defaulted_attributes: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
         ignored_columns: Vec::new(),

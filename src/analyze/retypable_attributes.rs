@@ -37,6 +37,11 @@
 //! (`serialized_column`) retypes its column too: Rails decorates the
 //! column's type with Type::Serialized when the call runs, so the column
 //! takes the same compiled path and the call runs at class load.
+//!
+//! So does a direct `attribute :col[, :type], default: value`
+//! (`defaulted_attribute`) over a column other than the primary key: the
+//! compiled `initialize` starts a new record's attribute from the class's
+//! declared default (`Model::defaulted_attributes`).
 
 use crate::App;
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Model, ModelBodyItem};
@@ -71,7 +76,65 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
         names.extend(call_names);
     }
+    names.extend(defaulted_attributes(model, app).iter().map(|c| c.as_str().to_string()));
     table.columns.iter().filter(|c| names.iter().any(|n| n == c.name.as_str())).map(|c| c.name.clone()).collect()
+}
+
+/// The columns the direct `attribute ..., default:` calls
+/// (`defaulted_attribute`) of the model, its model ancestors and its STI
+/// subclasses name, in table order. Each class's declared default
+/// applies to it and its subclasses (the runtime's per-class defaults).
+pub(crate) fn defaulted_attributes(model: &Model, app: &App) -> Vec<Symbol> {
+    let Some(table) = app.schema.tables.get(&model.table.0) else { return Vec::new() };
+    let mut names: Vec<Symbol> = Vec::new();
+    let mut at = Some(model);
+    let mut visited: Vec<&str> = Vec::new();
+    while let Some(m) = at {
+        if visited.contains(&m.name.0.as_str()) {
+            break;
+        }
+        visited.push(m.name.0.as_str());
+        names.extend(body_statements(m).filter_map(|e| defaulted_attribute(e, table)));
+        at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
+    }
+    for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+        names.extend(lc.unknown_calls.iter().filter_map(|e| defaulted_attribute(e, table)));
+    }
+    table.columns.iter().filter(|c| names.contains(&c.name)).map(|c| c.name.clone()).collect()
+}
+
+/// A direct `attribute :col[, :type], default: value` body statement
+/// over a column of `table` other than its primary key, the type (if
+/// any) a Symbol: Rails records the type (the column's own when none is
+/// named) and the value a new record's attribute starts from, a Proc
+/// called for each record. The column takes the retypable path and the
+/// call runs at class load as written (`ModelBodyItem::ClassBody`, or
+/// carried by an STI subclass) for the runtime's `attribute`. Other
+/// options, a non-Symbol type and the primary key stay unclaimed.
+pub(crate) fn defaulted_attribute(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "attribute" || !on_self(recv) {
+        return None;
+    }
+    let (name, options) = match args.as_slice() {
+        [name, options] => (name, options),
+        [name, ty, options] if matches!(&*ty.node, ExprNode::Lit { value: Literal::Sym { .. } }) => (name, options),
+        _ => return None,
+    };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+    let [(key, _)] = entries.as_slice() else { return None };
+    if !matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "default") {
+        return None;
+    }
+    if name == "id" || table.primary_key_columns.iter().any(|c| c.as_str() == name) {
+        return None;
+    }
+    table.columns.iter().find(|c| c.name.as_str() == name && !c.primary_key).map(|c| c.name.clone())
 }
 
 /// The body calls of the model's STI subclasses (library classes whose
@@ -284,11 +347,17 @@ pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Op
 /// `model_to_library::unclaimed_unknowns` and the STI subclass check skip
 /// these by span. Needs the model's `retypable_attributes` and
 /// `query_constraints` stamped. The model's own `serialize` calls with an
-/// app coder (`serialized_column`) are claimed too.
+/// app coder (`serialized_column`) are claimed too, and the direct
+/// `attribute ..., default:` calls (`defaulted_attribute`) of the model
+/// and its STI subclasses.
 pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::Span> {
     let mut out = Vec::new();
     if let Some(table) = app.schema.tables.get(&model.table.0) {
         out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
+        out.extend(body_statements(model).filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
+        for lc in app.library_classes.iter().filter(|lc| lc.parent.as_ref() == Some(&model.name)) {
+            out.extend(lc.unknown_calls.iter().filter(|e| defaulted_attribute(e, table).is_some()).map(|e| e.span));
+        }
     }
     let side = ClassSide::of(model, app);
     let body: Vec<&Expr> = body_statements(model).collect();
