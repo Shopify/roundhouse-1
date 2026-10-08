@@ -146,6 +146,53 @@ const ALIASED: &str = r#"class Aliased
 end
 "#;
 
+/// The same statement on a literal list (`%i[…].each`), which the
+/// class-body walk keeps as a class-body call: the Ruby family dropped
+/// it with only a lower_residue warning, so `generated` was missing.
+const LISTED: &str = r#"class Listed
+  #: () -> String
+  def ping = "ping"
+
+  %i[pong other generated].each { |n| define_method(n) { "generated #{n}" } }
+
+  #: () -> String
+  def other = "own other"
+
+  alias_method :pong, :ping
+end
+"#;
+
+/// essentials' `AssetCloud::CallbackLogging` shape: a module that is
+/// only a literal-list loop of `define_method`s calling `super`, which
+/// its extenders' class macros reach. With no def of its own it was
+/// taken for a namespace and dropped with its loop.
+const CALLBACK_BASE: &str = r#"class CallbackBase
+  #: (*untyped) -> Array[untyped]
+  def self.before_store(*callbacks) = (@stored ||= []).concat(callbacks)
+
+  #: () -> Array[untyped]?
+  def self.stored = @stored
+end
+"#;
+
+const CALLBACK_LOGGING: &str = r##"module CallbackLogging
+  [
+    :before_store, # def before_store
+  ].each do |method_name|
+    define_method(method_name) do |*callbacks, &block|
+      wrapped = callbacks.map { |c| "#{method_name}:#{c}" }
+      wrapped << "#{method_name}:block" if block
+      super(*wrapped)
+    end
+  end
+end
+"##;
+
+const LOGGED: &str = r#"class Logged < CallbackBase
+  extend CallbackLogging
+end
+"#;
+
 /// strict_warnings' shape: a module declared in both arms of a
 /// file-level `if`, each with its own def, so the file program carries
 /// it inline; the taken arm's body has a conditional statement.
@@ -175,9 +222,12 @@ puts Thread.current[:tracing_loaded].inspect
 puts [Wrapped.include?(Extra), Traced.new.extra].inspect
 puts [Aliased.new.pong, Aliased.new.other, Aliased.new.generated].inspect
 puts [InlineFlags.mode, Thread.current[:inline_beta]].inspect
+puts [Listed.new.pong, Listed.new.other, Listed.new.generated].inspect
+Logged.before_store(:a, :b) { }
+puts Logged.stored.inspect
 "#;
 
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 10] = [
     r#"[["FIRST", "first"], ["SHOP", "A shop"], ["APP", "An app"], ["BETA", "beta"], ["TRIED", "tried"], ["LAST", nil]]"#,
     r#"["FIRST", "SHOP", "APP", "BETA", "TRIED", "LAST"]"#,
     r#"["traced ping", "own pong"]"#,
@@ -186,6 +236,8 @@ const EXPECTED: [&str; 8] = [
     r#"[true, "extra"]"#,
     r#"["ping", "own other", "generated generated"]"#,
     r#"["set", true]"#,
+    r#"["ping", "own other", "generated generated"]"#,
+    r#"["before_store:a", "before_store:b", "before_store:block"]"#,
 ];
 
 fn gem_home(root: &Path) -> PathBuf {
@@ -223,6 +275,10 @@ fn app() -> emit_and_run::Overlay {
         .write("lib/traced.rb", TRACED)
         .write("lib/aliased.rb", ALIASED)
         .write("lib/inline_flags.rb", INLINE_FLAGS)
+        .write("lib/listed.rb", LISTED)
+        .write("lib/callback_base.rb", CALLBACK_BASE)
+        .write("lib/callback_logging.rb", CALLBACK_LOGGING)
+        .write("lib/logged.rb", LOGGED)
 }
 
 #[test]
@@ -234,7 +290,7 @@ fn class_body_statements_run_in_place_as_in_cruby() {
     let native = emit_and_run::ruby()
         .env("GEM_PATH", &gem_path)
         .args(["-renumkit", "-e"])
-        .arg(format!("{DOMAIN}\n{DOMAIN_TYPE}\n{EXTRA}\n{WRAPPED}\n{TRACING}\n{TRACED}\n{ALIASED}\n{INLINE_FLAGS}\n{SCRIPT}"))
+        .arg(format!("{DOMAIN}\n{DOMAIN_TYPE}\n{EXTRA}\n{WRAPPED}\n{TRACING}\n{TRACED}\n{ALIASED}\n{INLINE_FLAGS}\n{LISTED}\n{CALLBACK_BASE}\n{CALLBACK_LOGGING}\n{LOGGED}\n{SCRIPT}"))
         .output()
         .expect("CRuby control");
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
@@ -263,9 +319,28 @@ fn class_body_statements_run_in_place_as_in_cruby() {
 #[test]
 fn a_strict_target_refuses_each_class_body_statement_by_name() {
     let (_tree, errors) = app().emit(BuildTarget::Spinel);
-    for statement in ["FlowDomain.values.each", "include Extra if", "Wrapped.public_instance_methods(false).each", "Thread.current[:tracing_loaded] = true", "(%i[pong other generated] - %i[none]).each", "if ENV.fetch(\"RH_INLINE\""] {
+    for statement in ["FlowDomain.values.each", "include Extra if", "Wrapped.public_instance_methods(false).each", "Thread.current[:tracing_loaded] = true", "(%i[pong other generated] - %i[none]).each", "if ENV.fetch(\"RH_INLINE\"", "%i[pong other generated].each", "[ :before_store ].each"] {
         assert!(
             errors.iter().any(|e| e.contains("class body statement") && e.contains(statement)),
+            "{statement}: {errors:#?}"
+        );
+    }
+}
+
+/// A literal-list statement the body cannot keep in place (its block
+/// calls a class macro the class does not answer) is no longer dropped
+/// with a warning: the Ruby family names it as the gap it is.
+#[test]
+fn an_uncarried_literal_list_statement_is_named() {
+    let (_tree, errors) = emit_and_run::empty_app()
+        .write("lib/unanswered.rb", "class Unanswered\n  %i[a b].each { |n| unknown_macro n }\nend\n")
+        .write("lib/listed_unanswered.rb", "class ListedUnanswered\n  [\n    :c,\n  ].each { |n| unknown_macro n }\nend\n")
+        .emit(BuildTarget::Ruby);
+    for statement in ["%i[a b].each { |n| unknown_macro n }", "[ :c, ].each { |n| unknown_macro n }"] {
+        assert!(
+            errors.iter().any(|e| e.contains("file-level statement `<expr>.each`")
+                && e.contains("a call on a literal list")
+                && e.contains(statement)),
             "{statement}: {errors:#?}"
         );
     }

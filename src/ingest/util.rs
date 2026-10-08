@@ -412,6 +412,7 @@ pub(super) fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
         || body_has_route_helpers_include(m.body())
         || is_marker_module(m.body())
         || body_has_constant_receiver_call(m.body())
+        || body_has_literal_list_call(m.body())
         || body_has_mixin_include(m.body())
         || !concerning_calls(m.body()).is_empty()
 }
@@ -488,6 +489,21 @@ fn body_has_constant_receiver_call(body: Option<Node<'_>>) -> bool {
     flatten_statements(body)
         .iter()
         .any(|stmt| stmt.as_call_node().is_some_and(|call| is_constant_receiver_call(&call)))
+}
+
+/// A body statement that calls a method on a literal list: Core's
+/// `AssetCloud::CallbackLogging` is only `[:before_store, …].each do |m|
+/// define_method(m) do |*callbacks, &block| … end end`, the methods its
+/// extenders call. Ruby runs it as the body loads, so the module surfaces
+/// as one of its own and the call has a body to be carried in (or
+/// reported from).
+fn body_has_literal_list_call(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        stmt.as_call_node()
+            .and_then(|call| call.receiver())
+            .is_some_and(|r| r.as_array_node().is_some())
+    })
 }
 
 /// A module that declares nothing but itself: `module Segment; end`, or a

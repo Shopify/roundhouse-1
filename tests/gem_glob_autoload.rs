@@ -33,6 +33,8 @@ mod emit_and_run;
 
 use std::process::Command;
 
+use roundhouse::project::BuildTarget;
+
 const ORACLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
 
 const FILES: &[(&str, &str)] = &[
@@ -102,10 +104,8 @@ fn a_gem_glob_autoload_loop_registers_each_constant_as_native() {
     assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
 }
 
-#[test]
-fn a_dropped_module_body_statement_is_reported() {
-    // A global write in a module body: not carried, and now said so.
-    let run = emit_and_run::empty_app()
+fn global_write_overlay() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
         .write("roundhouse.yml", "gem_sources:\n  paygate: vendor/gems/paygate-1.0.0\n")
         .write("Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    paygate (1.0.0)\n\nDEPENDENCIES\n  paygate\n")
         .write("config/application.rb", "require \"paygate\"\n")
@@ -113,12 +113,24 @@ fn a_dropped_module_body_statement_is_reported() {
             "vendor/gems/paygate-1.0.0/lib/paygate.rb",
             "module Paygate\n  $paygate_loaded = true\n\n  def self.ready = true\nend\n",
         )
-        .run_ruby("p Paygate.ready\n");
+}
+
+#[test]
+fn a_module_body_global_write_runs_in_place() {
+    // A global write in a module body is a body statement: the Ruby
+    // family writes it back where it stands (it was dropped and reported
+    // before `expr::BODY_STATEMENT`), so it runs as the body loads.
+    let run = global_write_overlay().run_ruby("p Paygate.ready\np $paygate_loaded\n");
+    assert!(run.errors.is_empty(), "{:#?}", run.errors);
+    assert!(!run.stderr.contains("file_statement_not_carried"), "{}", run.stderr);
+    assert_eq!(run.stdout, "true\ntrue\n", "{}", run.stderr);
+}
+
+#[test]
+fn a_strict_target_refuses_the_module_body_global_write_by_name() {
+    let (_tree, errors) = global_write_overlay().emit(BuildTarget::Spinel);
     assert!(
-        run.errors.iter().any(|e| e.contains("a global variable write in a class or module body is not carried")),
-        "{:#?}",
-        run.errors
+        errors.iter().any(|e| e.contains("class body statement") && e.contains("$paygate_loaded = true")),
+        "{errors:#?}"
     );
-    assert!(run.stderr.contains("roundhouse: error[file_statement_not_carried]"), "{}", run.stderr);
-    assert!(run.stdout.ends_with("true\n"), "{}\n{}", run.stdout, run.stderr);
 }
