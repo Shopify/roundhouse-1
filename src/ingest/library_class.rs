@@ -5361,7 +5361,7 @@ fn ingest_concern_hook_items(
     enum_constants: &super::model::EnumConstants,
     hook: &str,
 ) -> ConcernModelItems {
-    use super::concern_accessors::{decline, is_candidate, is_supported};
+    use super::concern_accessors::{decline, is_candidate, is_supported, SHAPE_DETAIL};
     use crate::dialect::ModelBodyItem;
 
     let result = super::prism::parse_silent(source);
@@ -5501,12 +5501,13 @@ fn ingest_concern_hook_items(
                                 // includer. Other Unknowns stay with the
                                 // module.
                                 ModelBodyItem::Unknown { .. } => {
-                                    if is_candidate(&item) {
-                                        if !is_supported(&item) {
-                                            decline(&mut item, "unsupported accessor shape: only direct, nonempty, literal-Symbol attr_accessor is modeled");
-                                        } else if !direct.iter().any(|stmt| stmt.location().start_offset() == inner.location().start_offset()) {
-                                            decline(&mut item, "inside with_options is not modeled");
-                                        }
+                                    // The shape refusal (models only) is
+                                    // recorded after the block's context
+                                    // ones, which bind every includer.
+                                    if is_candidate(&item)
+                                        && !direct.iter().any(|stmt| stmt.location().start_offset() == inner.location().start_offset())
+                                    {
+                                        decline(&mut item, "inside with_options is not modeled");
                                     }
                                     if unknown_is_block_callback(&item)
                                         || unknown_is_model_macro(&item)
@@ -5552,6 +5553,11 @@ fn ingest_concern_hook_items(
                     if is_candidate(item) {
                         decline(item, "alongside unmodeled included-block statements is not supported");
                     }
+                }
+            }
+            for item in &mut items[block_start..] {
+                if is_candidate(item) && !is_supported(item) {
+                    decline(item, SHAPE_DETAIL);
                 }
             }
         }

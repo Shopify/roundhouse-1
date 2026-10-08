@@ -2458,6 +2458,15 @@ end
     super::channel_callbacks::lower_channel_names(&mut app);
     splice_concerns_into_models(&mut app, &concern_class_method_spans);
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
+    // Before the macro expansions: a macro's generated body may read the
+    // accessor (`session_accessor_prefix`), and a collision check reads
+    // the includer's methods.
+    let library_concern_accessors = super::concern_accessors::splice_into_library_includers(
+        &mut app,
+        &sources,
+        &concern_class_method_spans,
+        &framework_shadow_scopes,
+    )?;
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     super::define_method_loops::expand(&mut app, &sources);
     super::trusted_id_attribute::expand(&mut app);
@@ -2573,7 +2582,12 @@ end
     // Admission needs complete controller permit demand and model DSL,
     // including declarations contributed by either kind of Concern,
     // and reuses the prepared resolver rather than rebuilding it.
-    super::concern_accessors::validate(&mut app, &concern_class_method_spans, &framework_shadow_scopes)?;
+    super::concern_accessors::validate(
+        &mut app,
+        &concern_class_method_spans,
+        &framework_shadow_scopes,
+        &library_concern_accessors,
+    )?;
 
     // Model-to-database ownership reads every model, concern splice and
     // library module, so it runs once they all exist.

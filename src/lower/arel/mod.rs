@@ -138,9 +138,10 @@ const RELATION_REFINERS: &[&str] = &[
 
 /// A finder terminates a relation but still needs that relation as its
 /// receiver. If the whole call cannot lift, hydrating only its receiver
-/// would strand `find_by`/`find_by!` on an Array, just as for a refiner.
+/// would strand `find_by`/`find_by!`/`exists?` on an Array (which answers
+/// none of them), just as for a refiner.
 fn requires_relation_receiver(method: &str) -> bool {
-    RELATION_REFINERS.contains(&method) || matches!(method, "find_by" | "find_by!")
+    RELATION_REFINERS.contains(&method) || matches!(method, "find_by" | "find_by!" | "exists?")
 }
 
 /// Method names whose RESULT this class then refines with a relation
