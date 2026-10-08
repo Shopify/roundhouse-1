@@ -13110,11 +13110,16 @@ fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, Stri
 /// into the tree as `DatabaseYml`), and any file or directory
 /// [`named_for_secrets`] that [`carried_secrets_file`] does not allow.
 /// Each secrets-named path is noted on stderr by path, never content.
+///
+/// A slice (`<slice>/root`) also carries every other non-Ruby file its
+/// manifest ([`slice_named_data_files`]) lists as data, whatever the
+/// extension: the slicer followed the code that reads it.
 fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
     fn data_file(name: &str) -> bool {
         let name = name.strip_suffix(".erb").unwrap_or(name);
         [".yml", ".yaml", ".json"].iter().any(|ext| name.ends_with(ext))
     }
+    let named = slice_named_data_files(root);
     let mut stack = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else { continue };
@@ -13142,7 +13147,7 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
                 if !SKIP_DIRS.contains(&name.as_str()) && !(prefix.is_empty() && name == "sorbet") {
                     stack.push((entry.path(), format!("{rel}/")));
                 }
-            } else if ty.is_file() && data_file(&name) && rel != "config/database.yml" {
+            } else if ty.is_file() && (data_file(&name) || named.contains(&rel)) && rel != "config/database.yml" {
                 // Not UTF-8: `collect_binary_assets` carries what it can.
                 if let Ok(content) = fs::read_to_string(entry.path()) {
                     out.push((rel, content));
@@ -13151,6 +13156,32 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
         }
     }
     Ok(())
+}
+
+/// The non-Ruby files a slice's manifest (`<slice>/slice-manifest.json`,
+/// beside the `root` the emit reads) lists with role `data` or
+/// `boot-config`: files the slicer carried because carried code names
+/// them. Core's `CheckoutQueue::Lua::ScriptRunner` reads
+/// `File.join(SCRIPT_PATH, "enter_queue.lua")` with `SCRIPT_PATH =
+/// File.expand_path(__dir__)`, and `CheckoutQueue::Middleware` reads
+/// `"#{ROOT_DIR}/schema/public/checkout_queue_schema.graphql"`, both in
+/// their class bodies: without the files the boot raised Errno::ENOENT
+/// (r17-pre2 boot survey). An app without a manifest has none; its data
+/// stays the YAML and JSON `walk_data_files_into` recognises.
+fn slice_named_data_files(root: &Path) -> std::collections::HashSet<String> {
+    let mut named = std::collections::HashSet::new();
+    let Some(manifest) = root.parent().map(|p| p.join("slice-manifest.json")) else { return named };
+    let Ok(text) = fs::read_to_string(&manifest) else { return named };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return named };
+    for file in manifest.get("files").and_then(|f| f.as_array()).into_iter().flatten() {
+        let role = file.get("role").and_then(|r| r.as_str());
+        if let (Some("data" | "boot-config"), Some(path)) = (role, file.get("slice_path").and_then(|p| p.as_str())) {
+            if !path.ends_with(".rb") {
+                named.insert(path.to_string());
+            }
+        }
+    }
+    named
 }
 
 /// Orchestrates the `--site` mode of the `roundhouse` binary: for
