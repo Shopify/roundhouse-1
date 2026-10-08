@@ -82,6 +82,147 @@ module ActiveRecord
         record
       end
 
+      # `owner.<name> << record` / `.push(record, …)`, which the
+      # scope-chain lowering writes as this for an owner it can name
+      # again: Rails' CollectionAssociation#concat. Each record joins the
+      # owner's target (loaded first, as `created` does) holding the
+      # owner through its inverse. A new owner saves them with itself
+      # (`emit::ruby::collection_autosave`); a saved one saves them now,
+      # under its key (`_insert_record`), in one transaction that rolls
+      # back unless every save succeeds, after the first failure trying
+      # no more (`result &&= insert_record(record)`). A record that did
+      # not save stays in the target, unsaved. Answers the target, as
+      # the CollectionProxy answers itself. A reader that keeps no
+      # target (one this owner does not memoize) gets the records pushed
+      # onto what it answers, as before.
+      def self.concat(owner, name, *records)
+        records = records.flatten
+        owner._await_preload if owner.respond_to?(:_await_preload)
+        target = owner.public_send(name)
+        unless owner.instance_variable_get(:"@#{name}_loaded") == true && owner.respond_to?(:_insert_record)
+          records.each { |record| target << record }
+          return target
+        end
+        add = lambda do |record|
+          owner._set_inverse_instance(name, record) if owner.respond_to?(:_set_inverse_instance)
+          target << record unless target.any? { |r| r.equal?(record) }
+        end
+        if owner.new_record?
+          records.each { |record| add.call(record) }
+        else
+          within_transaction do
+            result = true
+            records.each do |record|
+              add.call(record)
+              result = owner._insert_record(name, record) if result
+            end
+            result
+          end
+        end
+        target
+      end
+
+      # The owner's save, for a model whose has_many saves its records
+      # with it (`emit::ruby::collection_autosave`): Rails runs `save`
+      # in a transaction (`with_transaction_returning_status`) that rolls
+      # back unless the save succeeded, so a record of the association
+      # that fails to save (RecordInvalid out of the owner's
+      # `after_create` / `after_update`) makes `save` answer false with
+      # the owner's INSERT or UPDATE undone. Nested inside another such
+      # save (a saved record saving its own records) it joins that
+      # transaction, as Rails' joinable one does.
+      def self.saving(owner)
+        within_transaction do
+          enroll(owner)
+          yield
+        end
+      end
+
+      # Rails' `remember_transaction_record_state`: a record saved inside
+      # `within_transaction` gets its persisted state and id back if the
+      # transaction rolls back (`restore_transaction_record_state`), so
+      # an owner whose INSERT was undone is a new record again and a
+      # record whose INSERT was undone with it saves anew next time.
+      def self.enroll(record)
+        frame = Thread.current[:__rh_association_transaction]
+        return if frame.nil? || frame.any? { |entry| entry[0].equal?(record) }
+        frame << [record, record.instance_variable_get(:@persisted), record.id]
+        nil
+      end
+
+      def self.restore(frame)
+        frame.reverse_each do |record, persisted, id|
+          record.instance_variable_set(:@persisted, persisted)
+          record.id = id
+        end
+        nil
+      end
+
+      # The block's status: false for RecordInvalid, as Rails' `save`
+      # rescues it.
+      def self.status_of
+        yield ? true : false
+      rescue ActiveRecord::RecordInvalid
+        false
+      end
+
+      # Rails' `transaction { status = yield; raise Rollback unless status }`
+      # on each tree's transactions. PostgreSQL's port of Rails'
+      # TransactionManager (`ActiveRecord::Base.current_transaction`)
+      # joins an open joinable transaction (whose rollback, if it comes,
+      # restores the records) and otherwise opens one or a savepoint.
+      # SQLite's flat `transaction` cannot nest: inside an open one the
+      # block joins it, as Rails' does, and nothing rolls back here. The
+      # JRuby driver says nothing about an open transaction, so it takes
+      # a SAVEPOINT, which SQLite opens inside one or outside.
+      def self.within_transaction(&block)
+        return status_of(&block) unless Thread.current[:__rh_association_transaction].nil?
+        frame = []
+        Thread.current[:__rh_association_transaction] = frame
+        status = false
+        begin
+          if ActiveRecord::Base.respond_to?(:current_transaction)
+            ActiveRecord::Base.transaction do |transaction|
+              transaction.after_rollback { restore(frame) }
+              status = status_of(&block)
+              raise ActiveRecord::Rollback unless status
+            end
+          elsif Db.current_dbh.respond_to?(:transaction_active?)
+            if Db.current_dbh.transaction_active?
+              status = status_of(&block)
+            else
+              begin
+                ActiveRecord::Base.transaction do
+                  status = status_of(&block)
+                  raise ActiveRecord::Rollback unless status
+                end
+              rescue ActiveRecord::Rollback
+                restore(frame)
+              rescue StandardError
+                restore(frame)
+                raise
+              end
+            end
+          else
+            Db.exec("SAVEPOINT rh_association_transaction")
+            begin
+              status = status_of(&block)
+            rescue StandardError
+              Db.exec("ROLLBACK TO SAVEPOINT rh_association_transaction")
+              Db.exec("RELEASE SAVEPOINT rh_association_transaction")
+              restore(frame)
+              raise
+            end
+            Db.exec("ROLLBACK TO SAVEPOINT rh_association_transaction") unless status
+            Db.exec("RELEASE SAVEPOINT rh_association_transaction")
+            restore(frame) unless status
+          end
+        ensure
+          Thread.current[:__rh_association_transaction] = nil
+        end
+        status
+      end
+
       # `owner.<name>.reload` / `.reset` on a collection reader, which
       # `lower::assoc_loaded` marks (`IrHint::AssociationProxy`): Rails'
       # CollectionProxy reloads or resets its association. `reload`

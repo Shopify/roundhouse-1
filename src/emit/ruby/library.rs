@@ -6359,8 +6359,9 @@ fn is_parse_db_time_body(body: &Expr) -> bool {
 /// true for everyone. For NULLABLE, non-primary-key columns, rewrite
 /// the slot assign to `row["col"].nil? ? nil : <original coercion>`.
 ///
-/// The fk 0-sentinel convention stays (belongs_to writers store 0 for
-/// nil); readers' `@fk == 0` guards are WIDENED to `@fk.nil? || @fk ==
+/// The strict targets' belongs_to writers store the 0 sentinel for nil
+/// (CRuby/JRuby store nil, `apply_belongs_to_nil_writes`); readers'
+/// `@fk == 0` guards are WIDENED to `@fk.nil? || @fk ==
 /// 0` so both representations mean "no parent". CRuby-only by
 /// placement: strict targets keep the defaulted non-nilable slots
 /// until the nullable-column typing workstream lands.
@@ -6422,6 +6423,159 @@ pub(crate) fn apply_hydration_nil_lowering(lcs: &mut [LibraryClass], app: &App) 
                 }
             }
         }
+    }
+}
+
+/// CRuby/JRuby pre-emit pass: the create and update broadcasts a
+/// `broadcasts_to` declares render the partial for the record located
+/// again by its id, as Rails' `broadcast_action_later_to` /
+/// `broadcast_replace_later_to` job does (the record travels as a
+/// GlobalID, `self.class.find(id)`), not for the saving instance. These
+/// trees keep the associations a reader loads (`library::
+/// apply_collection_memoization`), so a partial reading
+/// `article.comments.size` on the saving record would leave that
+/// record holding what the render loaded, which Rails' record never
+/// holds. The broadcast is the `Broadcasts.<action>(…)` call
+/// `model_to_library::broadcasts` folds into `after_create_commit` /
+/// `after_update_commit`, which carries the declaration's span; a
+/// hand-written `broadcast_*_to` (rendered at once, with the record, in
+/// Rails too) is left alone.
+pub(crate) fn apply_broadcast_located_record(lcs: &mut [LibraryClass], app: &App) {
+    if !super::expr::native_keywords() {
+        return;
+    }
+    for model in &app.models {
+        let declarations: Vec<Span> = model
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } => match &*expr.node {
+                    ExprNode::Send { recv: None, method, .. } if method.as_str() == "broadcasts_to" => Some(expr.span),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if declarations.is_empty() {
+            continue;
+        }
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        for m in lc.methods.iter_mut().filter(|m| {
+            m.receiver == MethodReceiver::Instance
+                && matches!(m.name.as_str(), "after_create_commit" | "after_update_commit")
+        }) {
+            locate_broadcast_records(&mut m.body, &declarations);
+        }
+    }
+}
+
+fn locate_broadcast_records(expr: &mut Expr, declarations: &[Span]) {
+    let declared = declarations.contains(&expr.span)
+        && matches!(&*expr.node, ExprNode::Send { recv: Some(r), .. }
+            if matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Broadcasts"));
+    if !declared {
+        expr.node.for_each_child_mut(&mut |c| locate_broadcast_records(c, declarations));
+        return;
+    }
+    fn locate(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut locate);
+        let ExprNode::Send { recv: Some(r), args, .. } = &mut *e.node else { return };
+        let renders = matches!(&*r.node, ExprNode::Const { path } if path.len() == 2 && path[0].as_str() == "Views");
+        if !renders || !matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::SelfRef)) {
+            return;
+        }
+        let span = args[0].span;
+        let send = |recv: Option<Expr>, method: &str, args: Vec<Expr>| {
+            Expr::new(span, ExprNode::Send { recv, method: Symbol::from(method), args, block: None, parenthesized: false })
+        };
+        let class = send(Some(Expr::new(span, ExprNode::SelfRef)), "class", vec![]);
+        let mut find = send(Some(class), "find", vec![send(None, "id", vec![])]);
+        if let ExprNode::Send { parenthesized, .. } = &mut *find.node {
+            *parenthesized = true;
+        }
+        args[0] = find;
+    }
+    locate(expr);
+}
+
+/// CRuby/JRuby pre-emit pass: writing nil to a `belongs_to` stores nil
+/// in its key (and, polymorphic, in its `_type`), so the record saves
+/// NULL and reads the association back as nil, as Rails does
+/// (`replace_keys(nil)`: `owner[foreign_key] = nil`). The shared writer
+/// (`model_to_library::associations`, `synth_belongs_to_writer` /
+/// `synth_polymorphic_writer`) stores the typed "no row" sentinel
+/// (`0`, `""`) that the strict targets' non-nilable slot needs; those
+/// trees keep it. Every `@fk == <sentinel>` guard of a key that
+/// `apply_hydration_nil_lowering` does not already widen (a NOT NULL
+/// column, which a nil write now reaches too) is widened the same way.
+pub(crate) fn apply_belongs_to_nil_writes(lcs: &mut [LibraryClass], app: &App) {
+    if !super::expr::native_keywords() {
+        return;
+    }
+    for model in &app.models {
+        let mut writers: BTreeSet<Symbol> = BTreeSet::new();
+        let mut keys: BTreeSet<Symbol> = BTreeSet::new();
+        for assoc in model.associations() {
+            let crate::dialect::Association::BelongsTo { name, foreign_key, polymorphic, foreign_type, .. } = assoc
+            else {
+                continue;
+            };
+            writers.insert(Symbol::from(format!("{}=", name.as_str())));
+            keys.insert(foreign_key.clone());
+            if *polymorphic {
+                keys.insert(foreign_type.clone().unwrap_or_else(|| Symbol::from(format!("{}_type", name.as_str()))));
+            }
+        }
+        if writers.is_empty() {
+            continue;
+        }
+        // The keys whose guards `apply_hydration_nil_lowering` widens.
+        let nullable: BTreeSet<Symbol> = app
+            .schema
+            .tables
+            .get(&model.table.0)
+            .map(|t| {
+                t.columns
+                    .iter()
+                    .filter(|c| c.nullable && !c.primary_key && c.name.as_str() != "id" && c.name.as_str().ends_with("_id"))
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let widen: BTreeSet<Symbol> = keys.iter().filter(|k| !nullable.contains(*k)).cloned().collect();
+        let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else { continue };
+        for m in &mut lc.methods {
+            if m.receiver == MethodReceiver::Instance && m.name_span.is_synthetic() && writers.contains(&m.name) {
+                store_nil_on_nil_write(&mut m.body, &keys);
+            }
+            widen_fk_zero_guards(&mut m.body, &widen);
+        }
+    }
+}
+
+/// In `if value.nil? … end`'s then-branch, `@<key> = 0` / `@<key> = ""`
+/// becomes `@<key> = nil`.
+fn store_nil_on_nil_write(expr: &mut Expr, keys: &BTreeSet<Symbol>) {
+    expr.node.for_each_child_mut(&mut |c| store_nil_on_nil_write(c, keys));
+    let ExprNode::If { cond, then_branch, .. } = &mut *expr.node else { return };
+    let tests_nil = matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, .. }
+        if method.as_str() == "nil?" && args.is_empty() && matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == "value"));
+    if !tests_nil {
+        return;
+    }
+    fn store_nil(stmt: &mut Expr, keys: &BTreeSet<Symbol>) {
+        if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &mut *stmt.node {
+            let sentinel = matches!(&*value.node, ExprNode::Lit { value: Literal::Int { value: 0 } })
+                || matches!(&*value.node, ExprNode::Lit { value: Literal::Str { value } } if value.is_empty());
+            if keys.contains(name) && sentinel {
+                *value = Expr::new(value.span, ExprNode::Lit { value: Literal::Nil });
+            }
+        }
+    }
+    if let ExprNode::Seq { exprs } = &mut *then_branch.node {
+        exprs.iter_mut().for_each(|s| store_nil(s, keys));
+    } else {
+        store_nil(then_branch, keys);
     }
 }
 

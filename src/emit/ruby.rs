@@ -370,6 +370,12 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // nullable columns); synthesized `.empty?` predicate forms in
     // model bodies tolerate the nil.
     library::apply_hydration_nil_lowering(&mut lcs, app);
+    // CRuby/JRuby: a nil written to a belongs_to stores nil (NULL), not
+    // the strict targets' 0/"" sentinel.
+    library::apply_belongs_to_nil_writes(&mut lcs, app);
+    // CRuby/JRuby: broadcasts_to renders for the record located again,
+    // as Rails' later job does.
+    library::apply_broadcast_located_record(&mut lcs, app);
     library::apply_nilsafe_empty_lowering(&mut lcs);
     library::apply_time_format_lowering(&mut lcs);
     library::apply_dynamic_render_options_lowering(&mut lcs);

@@ -24,8 +24,12 @@
 //! records.each do |record|
 //!   next if record.destroyed?
 //!   association.set_inverse_instance(record)
-//!   saved = association.insert_record(record)  # owner key, then save
-//!   errors.add(:lines) unless saved            # when validate?
+//!   saved = true
+//!   association_saved = association.insert_record(record)  # owner key, then save
+//!   if reflection.validate?
+//!     errors.add(:lines) unless association_saved
+//!     saved = association_saved
+//!   end
 //!   raise RecordInvalid.new(owner) unless saved
 //! end
 //! ```
@@ -50,10 +54,9 @@
 //! the callbacks that the model's body adds.
 //!
 //! Rails' errors compare by attribute, type and options: the
-//! association's own `:invalid` and a `validates_associated` one (which
-//! carries `value:`) both stay. The accumulator keeps only messages, so
-//! the association's error is a fresh String the dedupe recognises by
-//! identity and keeps; every other message is kept once.
+//! association's own `:invalid` and a hand-written `errors.add(:lines,
+//! :invalid)` are one error, a `validates_associated` one (which
+//! carries `value:`) another (see `DEDUPE`).
 //!
 //! The inverse (`set_inverse_instance`, Rails' automatic `inverse_of`:
 //! the target's non-polymorphic `belongs_to` named for the owner, on the
@@ -65,9 +68,21 @@
 //! holds, as Rails' presence check of the association does, rather than
 //! asking the database for the key (`accept_held_required_targets`).
 //!
-//! Differences: a record whose save fails raises RecordInvalid out of
-//! the owner's `save` (Rails' rescues it to false inside the owner's
-//! transaction, which rolls the owner's INSERT back). `autosave: true`
+//! A record whose save fails gives the owner the association's error
+//! and RecordInvalid (with `validate: false` it is passed over, as in
+//! Rails); the owner's save runs in a transaction while the association
+//! holds records (`save_after_validation` through `Association.saving`,
+//! runtime/spinel/active_record_associations.rb), so `save` answers
+//! false and `save!` raises with the owner's INSERT or UPDATE rolled
+//! back and the records' persisted state and ids given back, as Rails'
+//! `with_transaction_returning_status` and
+//! `restore_transaction_record_state` do. `_insert_record` is also what
+//! `owner.<name> << record` saves through on a saved owner
+//! (`Association.concat`).
+//!
+//! Differences: the after-commit callbacks run before the COMMIT rather
+//! than after it, and a record's attribute changes are not rewound on
+//! rollback (Rails' are re-marked dirty). `autosave: true`
 //! (every changed loaded record saved too, errors nested as
 //! `lines.sku`) is a check error (`analyze::ingest_coverage`); emitted
 //! under `--allow-unsupported` it acts as a plain has_many. CRuby and
@@ -141,7 +156,14 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             if c.validate {
                 src.push_str(&validate_records_source(c));
             }
-            src.push_str(&save_records_source(c, &owner_type));
+            src.push_str(&save_records_source(c));
+        }
+        src.push_str(&insert_record_source(&collections, &owner_type));
+        let overrides_save = lc.methods.iter().any(|m| {
+            m.name.as_str() == "save_after_validation" && m.receiver == MethodReceiver::Instance && m.params.is_empty()
+        });
+        if !overrides_save {
+            src.push_str(&save_after_validation_source(&collections));
         }
         let inverses: Vec<&Collection> = collections.iter().filter(|c| c.inverse.is_some()).collect();
         if !inverses.is_empty() {
@@ -170,6 +192,11 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         }
 
         if validates {
+            let messages: Vec<String> =
+                collections.iter().filter(|c| c.validate).map(|c| invalid_message(&c.name)).collect();
+            for m in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Instance) {
+                list_invalid_type_errors(&mut m.body, &messages);
+            }
             let at = hook(lc, "validate");
             let body = &mut lc.methods[at].body;
             let mut stmts = statements(body);
@@ -195,6 +222,29 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
             }
             *body = Expr::new(body.span, ExprNode::Seq { exprs: stmts });
         }
+    }
+}
+
+/// `errors << "Lines is invalid"` grounded from `errors.add(:lines)` /
+/// `errors.add(:lines, :invalid)` on the record's own errors becomes
+/// `errors << _association_error("Lines is invalid")`, so the dedupe
+/// keeps it once with the association's error (`DEDUPE`).
+fn list_invalid_type_errors(expr: &mut Expr, messages: &[String]) {
+    expr.node.for_each_child_mut(&mut |c| list_invalid_type_errors(c, messages));
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *expr.node else { return };
+    let own_errors = matches!(&*recv.node, ExprNode::Send { recv: owner, method: errors, args: none, .. }
+        if errors.as_str() == "errors"
+            && none.is_empty()
+            && owner.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)));
+    if method.as_str() != "<<" || !own_errors {
+        return;
+    }
+    let [message] = args.as_mut_slice() else { return };
+    let listed = message.hint == Some(crate::expr::IrHint::InvalidErrorType)
+        && matches!(&*message.node, ExprNode::Lit { value: Literal::Str { value } } if messages.contains(value));
+    if listed {
+        let text = message.clone();
+        *message = call("_association_error", Some(text));
     }
 }
 
@@ -301,10 +351,7 @@ fn validate_records_source(c: &Collection) -> String {
 {inverse}  context = nil unless custom
   valid = records.map {{ |record| record.destroyed? || record.valid?(context) }}
   if valid.include?(false)
-    message = String.new({message:?})
-    @__autosave_errors = [] if @__autosave_errors.nil?
-    @__autosave_errors << message
-    errors << message
+    errors << _association_error({message:?})
   end
   nil
 end
@@ -312,17 +359,44 @@ end
     )
 }
 
-fn save_records_source(c: &Collection, owner_type: &str) -> String {
+/// `_insert_record(name, record)`: Rails' HasManyAssociation
+/// `insert_record` — the owner's key (and `as:` type) and the inverse
+/// set on the record, then its save, which answers whether it saved.
+/// The record joins the open transaction's records first
+/// (`Association.enroll`), so a rollback gives it back its state.
+fn insert_record_source(collections: &[Collection], owner_type: &str) -> String {
+    let mut src = String::from("def _insert_record(name, record)\n  case name\n");
+    for c in collections {
+        src.push_str(&format!("  when :{}\n", c.name.as_str()));
+        if let Some(inverse) = &c.inverse {
+            src.push_str(&format!("    record.{} = self\n", inverse.as_str()));
+        }
+        src.push_str(&format!("    record.{} = id\n", c.foreign_key.as_str()));
+        if let Some(interface) = &c.as_interface {
+            src.push_str(&format!("    record.{}_type = {owner_type:?}\n", interface.as_str()));
+        }
+    }
+    src.push_str(
+        "  else\n    raise ArgumentError, \"no has_many #{name} that saves its records\"\n  end\n  \
+         ActiveRecord::Associations::Association.enroll(record)\n  record.save\nend\n",
+    );
+    src
+}
+
+/// Rails' `save_collection_association`: with `validate: false` a
+/// record that does not save is passed over (`saved` stays true); with
+/// it the owner gains the association's error and RecordInvalid, which
+/// the owner's `save` answers as false (`save_after_validation_source`).
+fn save_records_source(c: &Collection) -> String {
     let n = c.name.as_str();
-    let mut owner_attributes = String::new();
-    if let Some(inverse) = &c.inverse {
-        owner_attributes.push_str(&format!("    record.{} = self\n", inverse.as_str()));
-    }
-    owner_attributes.push_str(&format!("    record.{} = id\n", c.foreign_key.as_str()));
-    if let Some(interface) = &c.as_interface {
-        owner_attributes.push_str(&format!("    record.{}_type = {owner_type:?}\n", interface.as_str()));
-    }
-    let failed = if c.validate { format!("      errors << {:?}\n", invalid_message(&c.name)) } else { String::new() };
+    let save = if c.validate {
+        format!(
+            "    unless _insert_record(:{n}, record)\n      errors << {:?}\n      raise ActiveRecord::RecordInvalid.new(self)\n    end\n",
+            invalid_message(&c.name)
+        )
+    } else {
+        format!("    _insert_record(:{n}, record)\n")
+    };
     format!(
         r#"def _autosave_associated_records_for_{n}(was_new)
   return nil unless @{n}_loaded == true
@@ -330,23 +404,56 @@ fn save_records_source(c: &Collection, owner_type: &str) -> String {
   records = records.select {{ |record| record.new_record? }} unless was_new
   records.each do |record|
     next if record.destroyed?
-{owner_attributes}    unless record.save
-{failed}      raise ActiveRecord::RecordInvalid.new(self)
-    end
-  end
+{save}  end
   nil
 end
 "#
     )
 }
 
-const DEDUPE: &str = r#"def _ensure_no_duplicate_errors
+/// The owner's save runs in a transaction while an association that
+/// saves its records holds some (`Association.saving`): a failed record
+/// save rolls the owner's INSERT or UPDATE back and `save` answers
+/// false. With none loaded nothing but the owner is written, so the
+/// save goes as before.
+fn save_after_validation_source(collections: &[Collection]) -> String {
+    let loaded: Vec<String> = collections.iter().map(|c| format!("@{}_loaded == true", c.name.as_str())).collect();
+    format!(
+        "def save_after_validation\n  return super() unless {}\n  \
+         ActiveRecord::Associations::Association.saving(self) {{ super() }}\nend\n",
+        loaded.join(" || ")
+    )
+}
+
+/// Rails' errors compare by attribute, type and options
+/// (`errors.uniq!`). The accumulator keeps messages, so the errors of
+/// the default `:invalid` type without options (the association's own,
+/// and a hand-written `errors.add(:lines)` / `errors.add(:lines,
+/// :invalid)`, `IrHint::InvalidErrorType`) are fresh Strings
+/// `_association_error` lists: those are kept once among themselves,
+/// every other message once among the others, so a `validates_associated`
+/// one (which carries `value:`) or `errors.add(:lines, "is invalid")`
+/// stays beside the association's.
+const DEDUPE: &str = r#"def _association_error(message)
+  message = String.new(message)
+  @__autosave_errors = [] if @__autosave_errors.nil?
+  @__autosave_errors << message
+  message
+end
+
+def _ensure_no_duplicate_errors
   own = @__autosave_errors || []
   @__autosave_errors = nil
   seen = []
+  seen_own = []
   errors.select! do |message|
     if own.any? { |error| error.equal?(message) }
-      true
+      if seen_own.include?(message)
+        false
+      else
+        seen_own << message
+        true
+      end
     elsif seen.include?(message)
       false
     else

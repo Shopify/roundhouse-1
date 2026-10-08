@@ -8089,32 +8089,6 @@ fn report_unavailable_class_value(
     }
 }
 
-/// These class objects are supplied by Ruby/Spinel's bundled libraries,
-/// not by the transpiled runtimes. Recognizing them during inference
-/// must not turn a missing target implementation into a clean emit.
-///
-/// The CRuby tree's SQLite3 adapter (ruby_overlay
-/// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
-/// supply the adapter class, the statement-error classes and its transaction
-/// members, and only that tree's `Db` translates a driver error into
-/// them, so those are refused on every target but Ruby, Spinel
-/// included: by constant, and by member name for a call that names no
-/// constant.
-///
-/// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
-/// too: the harness's file database enforces no foreign key and the
-/// schema loader drops `add_foreign_key`, so nothing raises it there.
-/// The test helper's in-memory connection does enforce one (and
-/// `translate` maps it), but the name stays refused rather than
-/// supported on one setup only.
-///
-/// `transaction` with options is refused on every target but the
-/// PostgreSQL Ruby tree: the shared runtime's `Base.transaction` takes
-/// none, and Rails' `isolation:` is checked only when the transaction
-/// first runs a statement, which its eager BEGIN does not reproduce. The
-/// PostgreSQL tree carries Rails' TransactionManager
-/// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
-/// `requires_new:`, `joinable:`, `isolation:`).
 /// A validation that reads ActiveModel's validation context (`on:` /
 /// `except_on:`, and `validates_associated`, which validates each record
 /// in a custom context) is lowered to `validation_context` and
@@ -8199,6 +8173,32 @@ fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
     }
 }
 
+/// These class objects are supplied by Ruby/Spinel's bundled libraries,
+/// not by the transpiled runtimes. Recognizing them during inference
+/// must not turn a missing target implementation into a clean emit.
+///
+/// The CRuby tree's SQLite3 adapter (ruby_overlay
+/// `active_record_sqlite3_adapter.rb`) and the `sqlite3` gem under it
+/// supply the adapter class, the statement-error classes and its transaction
+/// members, and only that tree's `Db` translates a driver error into
+/// them, so those are refused on every target but Ruby, Spinel
+/// included: by constant, and by member name for a call that names no
+/// constant.
+///
+/// `ActiveRecord::InvalidForeignKey` is refused on every target, Ruby
+/// too: the harness's file database enforces no foreign key and the
+/// schema loader drops `add_foreign_key`, so nothing raises it there.
+/// The test helper's in-memory connection does enforce one (and
+/// `translate` maps it), but the name stays refused rather than
+/// supported on one setup only.
+///
+/// `transaction` with options is refused on every target but the
+/// PostgreSQL Ruby tree: the shared runtime's `Base.transaction` takes
+/// none, and Rails' `isolation:` is checked only when the transaction
+/// first runs a statement, which its eager BEGIN does not reproduce. The
+/// PostgreSQL tree carries Rails' TransactionManager
+/// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
+/// `requires_new:`, `joinable:`, `isolation:`).
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;

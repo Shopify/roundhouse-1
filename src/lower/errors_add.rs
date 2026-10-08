@@ -196,10 +196,17 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
         };
         return;
     }
+    // Rails' default error type, with no options: `errors.add(:lines)`
+    // and `errors.add(:lines, :invalid)` are the same Error as the one a
+    // has_many adds for an invalid record (`emit::ruby::
+    // collection_autosave`), which `errors.uniq!` keeps once.
+    let invalid_type = static_field
+        && !sole_message
+        && (msg.is_none() || symbol_type.as_ref().is_some_and(|t| t.as_str() == "invalid"));
     if let Some(text) = translated {
         msg = Some(str_lit(span, text));
     }
-    let message: Expr = if static_field {
+    let mut message: Expr = if static_field {
         let ExprNode::Lit { value: Literal::Sym { value: field } } = &*field_expr.node else {
             unreachable!()
         };
@@ -280,6 +287,9 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
         _ => None,
     };
     expr.hint = attribute;
+    if invalid_type {
+        message.hint = Some(crate::expr::IrHint::InvalidErrorType);
+    }
     *expr.node = ExprNode::Send {
         recv,
         method: Symbol::from("<<"),
