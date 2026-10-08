@@ -1000,6 +1000,7 @@ pub fn emit_with_assertions(
     files.push(emit_lowered_routes(app));
     files.extend(rbs_only_from_funcs(
         &route_funcs,
+        app,
         PathBuf::from("config/routes.rb"),
     ));
     crate::timings::lap("emit app: routes");
@@ -1492,7 +1493,7 @@ pub fn emit_with_assertions(
                     // the stand-in's `[]` itself and mis-compiles the
                     // heterogeneous `Integer | String` return as one C
                     // type (matz/spinel#1255).
-                    files.push(library::emit_rbs_sidecar(inner, &inner_rb_path));
+                    files.push(library::emit_rbs_sidecar(inner, app, &inner_rb_path));
                 }
                 // Splice companions ahead of the main class body but
                 // after the file-level `require_relative` headers
@@ -1578,7 +1579,7 @@ pub fn emit_with_assertions(
             // methods' (untyped, () -> void) signatures plus any
             // inferred helpers. No preamble / autorun shim — RBS is
             // pure type info, the runtime bootstrap doesn't apply.
-            files.push(library::emit_rbs_sidecar(&lc_for_emit, &rbs_path));
+            files.push(library::emit_rbs_sidecar(&lc_for_emit, app, &rbs_path));
         }
         // The emitted test index: each authored test file and the
         // emitted file, class and test names of every class it declares.
@@ -1651,12 +1652,13 @@ pub fn emit_with_assertions(
 /// `.rbs` is derived once from the same lowered functions.
 fn rbs_only_from_funcs(
     funcs: &[crate::dialect::LibraryFunction],
+    app: &crate::App,
     rb_path: PathBuf,
 ) -> Vec<EmittedFile> {
     if funcs.is_empty() {
         return Vec::new();
     }
-    vec![library::emit_rbs_sidecar_from_funcs(funcs, &rb_path)]
+    vec![library::emit_rbs_sidecar_from_funcs(funcs, app, &rb_path)]
 }
 
 /// Explicit per-test driver appended to each emitted test file.

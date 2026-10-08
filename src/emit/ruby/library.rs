@@ -511,7 +511,7 @@ fn nested_blocks(
         // were resolved inside the child's enclosing segments, which
         // are the parent's followed by the child's own — the position
         // it is spliced into.
-        let sidecar = super::rbs::emit_library_class_rbs(kid, &rb_path);
+        let sidecar = super::rbs::emit_library_class_rbs(kid, &rb_path, app);
         let lines: Vec<&str> = sidecar.content.lines().collect();
         if let Some(block) = unwrapped(&lines, depth) {
             sidecar_blocks.push(block);
@@ -7292,7 +7292,7 @@ pub(super) fn emit_library_class_pair(
     out_path: PathBuf,
 ) -> Vec<EmittedFile> {
     let rb = emit_library_class_decl(lc, app, out_path.clone());
-    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path);
+    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path, app);
     vec![rb, rbs]
 }
 
@@ -7309,7 +7309,7 @@ pub(super) fn emit_library_class_pair_with_synthesized(
         out_path.clone(),
         synthesized_siblings,
     );
-    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path);
+    let rbs = super::rbs::emit_library_class_rbs(lc, &out_path, app);
     vec![rb, rbs]
 }
 
@@ -7413,15 +7413,15 @@ pub(super) fn emit_module_file_pair(
     }
     let lc = synthesize_module_lc(funcs);
     let rb = emit_library_class_decl(&lc, app, out_path.clone());
-    let rbs = super::rbs::emit_library_class_rbs(&lc, &out_path);
+    let rbs = super::rbs::emit_library_class_rbs(&lc, &out_path, app);
     vec![rb, rbs]
 }
 
 /// Emit only the `.rbs` sidecar for a `LibraryClass`. Used when the
 /// `.rb` emit has bespoke post-processing the pair helpers can't
 /// model (e.g. test files with autorun shim + preamble).
-pub(super) fn emit_rbs_sidecar(lc: &LibraryClass, rb_path: &std::path::Path) -> EmittedFile {
-    super::rbs::emit_library_class_rbs(lc, rb_path)
+pub(super) fn emit_rbs_sidecar(lc: &LibraryClass, app: &App, rb_path: &std::path::Path) -> EmittedFile {
+    super::rbs::emit_library_class_rbs(lc, rb_path, app)
 }
 
 /// Emit only the `.rbs` sidecar derived from a `LibraryFunction` group.
@@ -7429,10 +7429,11 @@ pub(super) fn emit_rbs_sidecar(lc: &LibraryClass, rb_path: &std::path::Path) -> 
 /// emit flows through a bespoke path (e.g. `config/routes.rb`).
 pub(super) fn emit_rbs_sidecar_from_funcs(
     funcs: &[crate::dialect::LibraryFunction],
+    app: &App,
     rb_path: &std::path::Path,
 ) -> EmittedFile {
     let lc = synthesize_module_lc(funcs);
-    super::rbs::emit_library_class_rbs(&lc, rb_path)
+    super::rbs::emit_library_class_rbs(&lc, rb_path, app)
 }
 
 fn synthesize_module_lc(
@@ -8001,18 +8002,11 @@ fn emit_library_class_decl_inner(
     // `Opengraph::Fetch`, and looking up a bare `Fetch` finds nothing
     // ("Fetch is not a module" at load).
     //
-    // A test file's helper class nesting another (`class PriceRule;
-    // class DiscountCode`) is no app class, but the test file splices
-    // `class PriceRule` just above `PriceRule::DiscountCode`: its outer
-    // segment reopens that class, with the parent it was written with.
-    let test_siblings: &[LibraryClass] = app
-        .test_modules
-        .iter()
-        .find(|t| t.inner_classes.iter().any(|c| c.name == lc.name))
-        .map_or(&[], |t| t.inner_classes.as_slice());
+    // A test file's helper class nesting another reopens that helper
+    // (`test_file_outer_class`), with the parent it was written with.
     let outer_header = |i: usize, seg: &str| {
         let qualified = segments[..=i].join("::");
-        if let Some(sibling) = test_siblings.iter().find(|c| !c.is_module && c.name.0.as_str() == qualified) {
+        if let Some(sibling) = test_file_outer_class(lc, &qualified, app) {
             return match sibling.parent.as_ref() {
                 Some(p) => format!(
                     "class {seg} < {}",
@@ -12182,6 +12176,29 @@ fn lexically_qualified(written: &str, scopes: &[&str], app: &App) -> String {
         return written.to_string();
     }
     format!("::{written}")
+}
+
+/// The helper class of the test file declaring `lc` that is named
+/// `qualified`. A test file's helper class nesting another (`class
+/// PriceRule; class DiscountCode`) is no app class, but the test file
+/// splices `class PriceRule` just above `PriceRule::DiscountCode`, whose
+/// outer segment reopens it.
+fn test_file_outer_class<'a>(lc: &LibraryClass, qualified: &str, app: &'a App) -> Option<&'a LibraryClass> {
+    app.test_modules
+        .iter()
+        .find(|t| t.inner_classes.iter().any(|c| c.name == lc.name))?
+        .inner_classes
+        .iter()
+        .find(|c| !c.is_module && c.name.0.as_str() == qualified)
+}
+
+/// Whether the outer segment `qualified` of `lc`'s name is a class, as
+/// the `.rb` header reopens it (`emit_library_class_decl_inner`), so the
+/// `.rbs` sidecar declares the same kind: RBS refuses `module Account`
+/// beside `class Account < ApplicationRecord` as a duplicated
+/// declaration.
+pub(super) fn outer_segment_is_class(lc: &LibraryClass, qualified: &str, app: &App) -> bool {
+    test_file_outer_class(lc, qualified, app).is_some() || is_app_class(qualified, app)
 }
 
 fn is_app_class(name: &str, app: &App) -> bool {

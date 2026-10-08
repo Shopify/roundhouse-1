@@ -9673,3 +9673,46 @@ fn a_test_file_helper_class_carries_its_nested_classes() {
         }
     }
 }
+
+/// The `.rbs` sidecar of a constant nested in a class declares that
+/// outer segment as a class, as the `.rb` reopens it: `module Account`
+/// around `Account::Joinable` beside `class Account < ApplicationRecord`
+/// is a duplicated declaration RBS itself refuses to load, and so is
+/// `module PriceRule` around a test file helper's nested class. The
+/// emitted `sig/` tree loads into an RBS environment.
+#[test]
+fn rbs_sidecars_declare_outer_classes_as_classes() {
+    use roundhouse::project::BuildTarget;
+    let test = "require \"test_helper\"\n\nclass PriceRule\n  class Batch\n    module Codes\n      def self.size\n        3\n      end\n    end\n  end\nend\n\nclass AccountTest < ActiveSupport::TestCase\n  test \"nested constants\" do\n    assert Account.new.joined?\n    assert_equal 3, PriceRule::Batch::Codes.size\n  end\nend\n";
+    let app = || {
+        emit_and_run::empty_app()
+            .write(
+                "app/models/application_record.rb",
+                "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n",
+            )
+            .write("app/models/account.rb", "class Account < ApplicationRecord\n  include Joinable\nend\n")
+            .write(
+                "app/models/account/joinable.rb",
+                "module Account::Joinable\n  extend ActiveSupport::Concern\n\n  def joined?\n    true\n  end\nend\n",
+            )
+            .write(
+                "db/schema.rb",
+                "ActiveRecord::Schema.define do\n  create_table \"accounts\", force: :cascade do |t|\n    t.string \"name\"\n  end\nend\n",
+            )
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/models/account_test.rb", test)
+    };
+    let (emitted, errors) = app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    let joinable = std::fs::read_to_string(emitted.join("sig/app/models/account/joinable.rbs")).expect("sidecar");
+    assert!(joinable.starts_with("class Account\n  module Joinable\n"), "{joinable}");
+    let load = emit_and_run::ruby()
+        .arg("-rrbs")
+        .arg("-e")
+        .arg("loader = RBS::EnvironmentLoader.new(core_root: nil); loader.add(path: Pathname(\"sig\")); RBS::Environment.from_loader(loader).resolve_type_names; puts :loaded")
+        .current_dir(&*emitted)
+        .output()
+        .expect("spawn ruby");
+    assert!(load.status.success(), "{}", String::from_utf8_lossy(&load.stderr));
+    app().run_test("test/models/account_test.rb").assert_passes();
+}

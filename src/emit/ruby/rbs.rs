@@ -24,9 +24,9 @@ use crate::ty::{Param, ParamKind, Ty};
 /// Emit an `.rbs` sidecar for a single `LibraryClass`. The output
 /// path mirrors `rb_path` under a top-level `sig/` tree with the
 /// extension swapped to `.rbs`.
-pub(super) fn emit_library_class_rbs(lc: &LibraryClass, rb_path: &Path) -> EmittedFile {
+pub(super) fn emit_library_class_rbs(lc: &LibraryClass, rb_path: &Path, app: &crate::App) -> EmittedFile {
     let path = sig_path_for(rb_path);
-    let content = render_class(lc);
+    let content = render_class(lc, &|qualified| super::library::outer_segment_is_class(lc, qualified, app));
     EmittedFile { path, content }
 }
 
@@ -43,19 +43,25 @@ fn sig_path_for(rb_path: &Path) -> PathBuf {
     }
 }
 
-fn render_class(lc: &LibraryClass) -> String {
+/// `outer_is_class` tells which outer segments (`Account` of
+/// `Account::Joinable`, by qualified name) are classes; the rest are
+/// declared as modules. No superclass is written for them: the class's
+/// own declaration names it, and RBS merges the two.
+fn render_class(lc: &LibraryClass, outer_is_class: &dyn Fn(&str) -> bool) -> String {
     let mut s = String::new();
     let name = lc.name.0.as_str();
     let segments: Vec<&str> = name.split("::").collect();
     let depth = segments.len();
+    let outer_kind = |i: usize| if outer_is_class(&segments[..=i].join("::")) { "class" } else { "module" };
 
     if lc.is_module {
         for (i, seg) in segments.iter().enumerate() {
-            writeln!(s, "{}module {seg}", "  ".repeat(i)).unwrap();
+            let kind = if i < depth - 1 { outer_kind(i) } else { "module" };
+            writeln!(s, "{}{kind} {seg}", "  ".repeat(i)).unwrap();
         }
     } else {
         for (i, seg) in segments.iter().take(depth - 1).enumerate() {
-            writeln!(s, "{}module {seg}", "  ".repeat(i)).unwrap();
+            writeln!(s, "{}{} {seg}", "  ".repeat(i), outer_kind(i)).unwrap();
         }
         let last = segments[depth - 1];
         let pad = "  ".repeat(depth - 1);
@@ -438,7 +444,7 @@ pub(super) fn emit_library_class_rbs_decls(app: &crate::App) -> Vec<EmittedFile>
         .map(|lc| {
             let file_stem = crate::naming::underscore(lc.name.0.as_str());
             let rb_path = PathBuf::from(format!("app/models/{file_stem}.rb"));
-            emit_library_class_rbs(lc, &rb_path)
+            emit_library_class_rbs(lc, &rb_path, app)
         })
         .collect()
 }
