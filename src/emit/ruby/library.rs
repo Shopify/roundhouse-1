@@ -7748,7 +7748,8 @@ fn emit_library_class_decl_inner(
         // :each`) is the same `(...)` forwarder under its name, so it
         // stays the native alias of the one written above it.
         for m in &mut copy.methods {
-            // The copy keeps the zero-arg forwarder's spans.
+            // The copy keeps the zero-arg forwarder's body span (its name
+            // span is its `alias_method`'s).
             let original = lc
                 .method_aliases
                 .iter()
@@ -7756,10 +7757,7 @@ fn emit_library_class_decl_inner(
                 .map(|a| &a.original)
                 .filter(|o| {
                     lc.methods.iter().any(|f| {
-                        &&f.name == o
-                            && f.receiver == MethodReceiver::Instance
-                            && f.name_span == m.name_span
-                            && f.body.span == m.body.span
+                        &&f.name == o && f.receiver == MethodReceiver::Instance && f.body.span == m.body.span
                     })
                 });
             let Some(f) = full
@@ -9549,10 +9547,11 @@ fn write_conditional_definitions(
 
 /// The method `lc.methods[index]` is a native alias of: it is recorded
 /// as an alias copy, and the nearest def of the original's name on the
-/// same side before it is the very def it was copied from (same header
-/// and body spans; a replacing def has its own). Anything else (an
-/// original redefined in place, or a copy whose original a later pass
-/// dropped or moved) keeps the copied def.
+/// same side before it is the very def it was copied from (same body
+/// span; a replacing def has its own, and the copy's name span is its
+/// alias declaration). Anything else (an original redefined in place,
+/// or a copy whose original a later pass dropped or moved) keeps the
+/// copied def.
 fn inherited_alias<'a>(lc: &'a LibraryClass, m: &MethodDef) -> Option<&'a crate::dialect::MethodAlias> {
     lc.method_aliases.iter().find(|a| a.inherited && a.name == m.name && a.receiver == m.receiver)
 }
@@ -9564,10 +9563,7 @@ fn native_alias_original(lc: &LibraryClass, index: usize) -> Option<&MethodDef> 
         .iter()
         .rev()
         .find(|o| o.name == alias.original && o.receiver == m.receiver)?;
-    (original.name_span == m.name_span
-        && original.body.span == m.body.span
-        && original.params.len() == m.params.len()
-        && original.kind == m.kind)
+    (original.body.span == m.body.span && original.params.len() == m.params.len() && original.kind == m.kind)
         .then_some(original)
 }
 
@@ -10454,8 +10450,10 @@ fn ordered_class_state(lc: &LibraryClass, app: &App) -> bool {
 
 /// An ordered body's statements (`ordered_class_state`) in source order:
 /// every constant, every initializer, and every def with a source
-/// position (a synthesized one, and an alias of an inherited method,
-/// follow with the rest of the defs).
+/// position. A synthesized def (`class_attribute :knob`'s `self.knob=`)
+/// has none and comes first: a state write below its macro may call it
+/// (`self.knob = base + 1`), and a def runs nothing when it is written.
+/// An alias of an inherited method follows with the rest of the defs.
 fn ordered_state_items(lc: &LibraryClass, eager: &[usize]) -> Vec<StateItem> {
     let mut items: Vec<(u32, StateItem)> =
         eager.iter().map(|&i| (lc.constants[i].1.span.start, StateItem::Constant(i))).collect();
@@ -10464,8 +10462,8 @@ fn ordered_state_items(lc: &LibraryClass, eager: &[usize]) -> Vec<StateItem> {
         lc.methods
             .iter()
             .enumerate()
-            .filter(|(_, m)| !m.name_span.is_synthetic() && inherited_alias(lc, m).is_none())
-            .map(|(i, m)| (m.name_span.start, StateItem::Method(i))),
+            .filter(|(_, m)| inherited_alias(lc, m).is_none())
+            .map(|(i, m)| (if m.name_span.is_synthetic() { 0 } else { m.name_span.start }, StateItem::Method(i))),
     );
     // Stable: the accessors one `attr_accessor` declares share its position.
     items.sort_by_key(|(start, _)| *start);
@@ -10747,8 +10745,8 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
     let here = |span: Span| !span.is_synthetic() && span.file == call.span.file;
     let above = |span: Span| here(span) && span.start < call.span.start;
     let below = |span: Span| here(span) && span.start > call.span.start;
-    // An alias copy carries its original's spans; it takes effect where
-    // its `alias_method` stands.
+    // An alias copy carries its original's body span; it takes effect
+    // where its `alias_method` stands (its name span too).
     let mut defs: Vec<(usize, Span)> = Vec::new();
     for (i, m) in lc.methods.iter().enumerate() {
         let copied_at: Vec<Span> = lc
@@ -10760,10 +10758,7 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
                     !here(m.name_span)
                 } else {
                     lc.methods.iter().any(|o| {
-                        o.name == a.original
-                            && o.receiver == m.receiver
-                            && o.name_span == m.name_span
-                            && o.body.span == m.body.span
+                        o.name == a.original && o.receiver == m.receiver && o.body.span == m.body.span
                     })
                 }
             })
