@@ -113,6 +113,7 @@ module ActiveRecord
     self.@_unscoped_depth: Integer?
     def self._default_scoped?: () -> bool
     def self._apply_default_scope: (Relation relation) -> Relation
+    def self._apply_type_condition: (Relation relation) -> Relation
     def self._default_scope_attributes: () -> Hash[Symbol, untyped]
     def self._default_scope_applies?: () -> bool
     def self._join_scope_sql: () -> String

@@ -40,6 +40,8 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             crate::lower::model_to_library::push_subclass_model_methods(&mut lc.methods, view, &lineage, &app.models);
         }
     }
+    // An STI subclass's relations carry its type condition at runtime.
+    crate::lower::sti_scope::push_type_condition_methods(&mut lcs, app);
     apply_scope_lowering(&mut lcs, app);
     crate::timings::lap("emit library: scope_lowering");
     apply_library_partial_render_lowering(&mut lcs, app);
@@ -1729,6 +1731,15 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
+    // An STI subclass's own class methods seed their implicit relation on
+    // `self` as a plain subclass's do, its type condition applied at
+    // runtime (`sti_scope::push_type_condition_methods`); scopes and
+    // columns stay its base model's.
+    crate::lower::sti_scope::unseat_implicit_roots(lcs, app);
+    let sti_subclasses = crate::lower::sti_scope::sti_bases(app);
+    let mut self_seeded = plain_subclasses.clone();
+    self_seeded.extend(sti_subclasses.iter().map(|(sub, base)| (sub.clone(), base.clone())));
+    let sti_regs = crate::lower::scope_chain::Registries { plain_subclasses: &self_seeded, ..regs };
     let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
         // Models gain their scope class methods (already chain-normalized).
@@ -1785,17 +1796,9 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             crate::lower::sti_scope::push_inheritance_column_method(&mut lc.methods, model);
         } else if let Some(view) = subclass_views.get(&lc.name) {
             // A model subclass's own scopes (`lower::subclass_macros`).
-            let before = lc.methods.len();
+            // An STI subclass's `Relation.new(self)` default carries its
+            // type condition at runtime (`push_type_condition_methods`).
             crate::lower::model_to_library::push_scope_methods(&mut lc.methods, view, &scopes, &models, &assocs);
-            if let Some(typed) = crate::lower::sti_scope::sti_type_relation(app, &lc.name) {
-                for m in &mut lc.methods[before..] {
-                    for p in &mut m.params {
-                        if p.name.as_str() == "__rel" {
-                            p.default = Some(typed.clone());
-                        }
-                    }
-                }
-            }
         }
         // User-written class methods the registry admitted as
         // relation-taking (`def self.arrange_for_user` with bare
@@ -1914,9 +1917,10 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             // in `BigAsset < Asset` is `BigAsset.order(:id)`, rows
             // hydrated as BigAsset. scope_chain maps it to the parent
             // model for scopes and columns.
+            let sti_own = sti_subclasses.contains_key(&lc.name) && !m.name_span.is_synthetic();
             let class_self = (m.receiver == MethodReceiver::Class)
                 .then(|| {
-                    if is_model || plain_subclasses.contains_key(&lc.name) {
+                    if is_model || plain_subclasses.contains_key(&lc.name) || sti_own {
                         Some(lc.name.clone())
                     } else {
                         concern_owner.clone()
@@ -1952,9 +1956,9 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             {
                 crate::lower::scope_chain::rewrite_call_site_in(
                     &mut m.body,
-                    &regs,
+                    if sti_own { &sti_regs } else { &regs },
                     class_self.as_ref(),
-                    is_model || plain_subclasses.contains_key(&lc.name),
+                    is_model || plain_subclasses.contains_key(&lc.name) || sti_own,
                     instance_self.as_ref(),
                 );
             }

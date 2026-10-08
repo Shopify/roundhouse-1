@@ -81,6 +81,8 @@ module ActiveRecord
       @ctes = []
       @shared_lists = false
       @default_scoped = default_scoped
+      # An STI subclass's type condition, which `unscoped` keeps.
+      model._apply_type_condition(self)
       model._apply_default_scope(self) if default_scoped && model._default_scope_applies?
     end
 

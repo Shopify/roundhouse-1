@@ -344,7 +344,7 @@ pub(crate) fn materialize_models(
     // to be held back on them here or there is nothing left to re-root.
     // Same survey both passes read, for the same reason the survey
     // covers the App rather than a slice.
-    let assoc_scopes = crate::lower::scope_chain::assoc_query_method_names(
+    let mut assoc_scopes = crate::lower::scope_chain::assoc_query_method_names(
         &crate::lower::scope_chain::survey_assoc_class_methods(
             app,
             &crate::lower::scope_chain::build_assoc_registry(&app.models),
@@ -352,6 +352,9 @@ pub(crate) fn materialize_models(
         )
         .0,
     );
+    // …and a class method of a model with subclasses reading its
+    // implicit `all`, which `apply_scope_lowering` seeds on `self`.
+    assoc_scopes.extend(crate::lower::sti_scope::subclassed_self_reads(app));
     let lcs = crate::lower::model_to_library::lower_models_inner_for_dialect(
         &app.models,
         &app.schema,

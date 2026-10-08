@@ -726,6 +726,10 @@ fn rewrite(
         return;
     }
     let ExprNode::Const { path } = &*r.node else { return };
+    // A root rewritten from an implicit receiver (`name_implicit_receiver`)
+    // stays synthetic, so the Ruby family can seed it on `self` instead
+    // (`unseat_implicit_roots`).
+    let implicit = r.span.is_synthetic();
     let named = ClassId(Symbol::from(
         path.iter()
             .map(|s| s.as_str().trim_start_matches("::"))
@@ -740,7 +744,8 @@ fn rewrite(
     }
     let base = bases.get(&named).expect("checked above");
     let span = expr.span;
-    let mut root = Expr::new(span, ExprNode::Const { path: base.0.as_str().split("::").map(Symbol::from).collect() });
+    let root_span = if implicit { Span::synthetic() } else { span };
+    let mut root = Expr::new(root_span, ExprNode::Const { path: base.0.as_str().split("::").map(Symbol::from).collect() });
     if unscoped {
         root = Expr::new(
             span,
@@ -785,35 +790,192 @@ fn rewrite(
     );
 }
 
-/// `ActiveRecord::Relation.new(self).where(type: "Sub")` for an STI
-/// subclass: the relation a bare scope call on it starts from
-/// (`lower::subclass_macros`). None for a class that is no STI subclass.
-pub(crate) fn sti_type_relation(app: &App, sub: &ClassId) -> Option<Expr> {
+/// Ruby family: each STI subclass's `_apply_type_condition(relation)`,
+/// `relation.where(type: ["Dog", "Puppy"])`, which the runtime
+/// `Relation#initialize` applies to every relation on the class (Rails'
+/// `type_condition`). A relation seeded on `self` in a class method
+/// then reads the receiving class's rows: `Animal.recent` reached as
+/// `Dog.recent`, or `Dog.loud` inherited by `Puppy`. Apps without STI
+/// are left byte-identical.
+pub(crate) fn push_type_condition_methods(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
     let bases = sti_bases(app);
-    bases.get(sub)?;
+    if bases.is_empty() {
+        return;
+    }
     let types = type_names(app, &bases);
     let cols = sti_columns(app);
-    let span = Span::synthetic();
-    let column = column_of(&cols, sub).to_string();
-    Some(Expr::new(
-        span,
-        ExprNode::Send {
-            recv: Some(crate::lower::model_to_library::relation_new_self()),
-            method: Symbol::from("where"),
-            args: vec![Expr::new(
-                span,
-                ExprNode::Hash {
-                    entries: vec![(
-                        Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column.as_str()) } }),
-                        type_value(span, sub, &types),
-                    )],
-                    kwargs: true,
-                },
-            )],
-            block: None,
-            parenthesized: true,
-        },
-    ))
+    let relation = Symbol::from("relation");
+    for lc in lcs.iter_mut() {
+        if !bases.contains_key(&lc.name)
+            || lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == TYPE_CONDITION)
+        {
+            continue;
+        }
+        let span = Span::synthetic();
+        let column = column_of(&cols, &lc.name).to_string();
+        let condition = Expr::new(
+            span,
+            ExprNode::Hash {
+                entries: vec![(
+                    Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column.as_str()) } }),
+                    type_value(span, &lc.name, &types),
+                )],
+                kwargs: true,
+            },
+        );
+        let body = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(span, ExprNode::Var { id: VarId(0), name: relation.clone() })),
+                method: Symbol::from("where"),
+                args: vec![condition],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        lc.methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from(TYPE_CONDITION),
+            receiver: MethodReceiver::Class,
+            params: vec![Param::positional(relation.clone())],
+            body,
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(lc.name.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+}
+
+const TYPE_CONDITION: &str = "_apply_type_condition";
+
+/// Ruby family: in an STI subclass's own class methods, the implicit
+/// receiver `apply_sti_scope_lowering` rooted on the base with the
+/// subclass's static type list (`where(sound: "woof")` ->
+/// `Animal.where(type: ["Dog", "Puppy"]).where(sound: "woof")`) goes
+/// back to the implicit form, which `apply_scope_lowering` seeds on
+/// `self`; the runtime type condition (`push_type_condition_methods`)
+/// scopes it to the receiving class, so `Puppy` inheriting `Dog.loud`
+/// reads Puppies. An author-written constant keeps its root.
+pub(crate) fn unseat_implicit_roots(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
+    let bases = sti_bases(app);
+    if bases.is_empty() {
+        return;
+    }
+    let types = type_names(app, &bases);
+    let cols = sti_columns(app);
+    for lc in lcs.iter_mut() {
+        let Some(base) = bases.get(&lc.name) else { continue };
+        let names = types.get(&lc.name).cloned().unwrap_or_else(|| vec![lc.name.0.as_str().to_string()]);
+        let column = column_of(&cols, &lc.name).to_string();
+        let root = ImplicitRoot { base, column: &column, names: &names };
+        for m in &mut lc.methods {
+            if m.receiver == MethodReceiver::Class && !m.name_span.is_synthetic() {
+                unseat(&mut m.body, &root);
+            }
+        }
+    }
+}
+
+struct ImplicitRoot<'a> {
+    base: &'a ClassId,
+    column: &'a str,
+    names: &'a [String],
+}
+
+fn unseat(expr: &mut Expr, root: &ImplicitRoot) {
+    if is_implicit_root(expr, root) {
+        *expr = Expr::new(
+            expr.span,
+            ExprNode::Send { recv: None, method: Symbol::from("all"), args: vec![], block: None, parenthesized: false },
+        );
+        return;
+    }
+    // `Base.where(type: …).order(:id)` was `order(:id)`, a chain start
+    // `apply_scope_lowering` seeds bare (as it does `first(2)`); any
+    // other call (`all.map`, `count`) keeps `all` as its receiver.
+    if let ExprNode::Send { recv, method, args, block, .. } = &mut *expr.node {
+        let seeded_bare = matches!(
+            method.as_str(),
+            "where" | "order" | "limit" | "offset" | "joins" | "includes" | "distinct" | "group"
+        ) || (matches!(method.as_str(), "first" | "last") && args.len() == 1 && block.is_none());
+        if seeded_bare && recv.as_ref().is_some_and(|r| is_implicit_root(r, root)) {
+            *recv = None;
+        }
+    }
+    expr.node.for_each_child_mut(&mut |c| unseat(c, root));
+}
+
+/// `Base.where(type: <the subclass's type value>)` on a synthetic `Base`.
+fn is_implicit_root(expr: &Expr, root: &ImplicitRoot) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else { return false };
+    if method.as_str() != "where" || args.len() != 1 || !r.span.is_synthetic() {
+        return false;
+    }
+    let ExprNode::Const { path } = &*r.node else { return false };
+    if const_class_id(path) != *root.base {
+        return false;
+    }
+    let ExprNode::Hash { entries, .. } = &*args[0].node else { return false };
+    let [(key, value)] = entries.as_slice() else { return false };
+    let key_ok = matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == root.column);
+    let str_of = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let values: Option<Vec<String>> = match &*value.node {
+        ExprNode::Array { elements, .. } if root.names.len() > 1 => elements.iter().map(str_of).collect(),
+        _ if root.names.len() == 1 => str_of(value).map(|v| vec![v]),
+        _ => None,
+    };
+    key_ok && values.as_deref() == Some(root.names)
+}
+
+/// Ruby family: the class methods of a model with subclasses (STI or
+/// plain) that read its implicit `all` (`def self.everything; all.to_a;
+/// end`, which ingest spells `Asset.all`). Rails reads that relation on
+/// the receiving class, so `BigAsset.everything` loads BigAssets; the
+/// arel fold would bake in the model's whole-table read, so it is held
+/// back for these and `apply_scope_lowering` seeds them on `self`.
+pub(crate) fn subclassed_self_reads(app: &App) -> HashSet<(ClassId, Symbol)> {
+    let parents: HashSet<ClassId> =
+        sti_bases(app).into_values().chain(plain_model_subclasses(app).into_values()).collect();
+    let mut out = HashSet::default();
+    for model in app.models.iter().filter(|m| parents.contains(&m.name)) {
+        for m in model.methods() {
+            if m.receiver == MethodReceiver::Class && reads_implicit_all(&m.body, &model.name) {
+                out.insert((model.name.clone(), m.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn reads_implicit_all(expr: &Expr, model: &ClassId) -> bool {
+    if let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node {
+        let implicit = match recv {
+            None => true,
+            Some(r) => match &*r.node {
+                ExprNode::SelfRef => true,
+                ExprNode::Const { path } => {
+                    (r.span.is_synthetic() || r.span == expr.span) && const_class_id(path) == *model
+                }
+                _ => false,
+            },
+        };
+        if implicit && method.as_str() == "all" && args.is_empty() {
+            return true;
+        }
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || reads_implicit_all(c, model));
+    found
 }
 
 /// `"Rooms::Open"`, or `["GoldBadge", "PlatinumBadge"]` when STI
