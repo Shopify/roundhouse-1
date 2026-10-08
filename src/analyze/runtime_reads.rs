@@ -50,6 +50,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_job_errors.rb", "runtime/active_job_errors.rb"),
     ("runtime/spinel/active_support_tryable.rb", "runtime/active_support_tryable.rb"),
     ("runtime/spinel/active_support_inflector.rb", "runtime/active_support_inflector.rb"),
+    ("runtime/spinel/active_support_ractors.rb", "runtime/active_support_ractors.rb"),
     ("runtime/spinel/action_dispatch_session_store.rb", "runtime/action_dispatch_session_store.rb"),
     ("runtime/spinel/action_dispatch_show_exceptions.rb", "runtime/action_dispatch_show_exceptions.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),

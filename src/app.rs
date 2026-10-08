@@ -469,6 +469,12 @@ pub struct App {
     /// environment (`ingest::boot_requires::bundler_required_gems`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bundler_gems: Vec<BundlerGem>,
+    /// The directories of the gems `roundhouse.yml` names under
+    /// `gem_sources:`, relative to the app root and each ending in `/`: installed gem trees compiled
+    /// as app code, whose class bodies run as the gem's own Ruby does
+    /// (`emit::ruby::library::declared_in_gem_source`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gem_source_dirs: Vec<String>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
@@ -1324,6 +1330,7 @@ impl App {
             boot_loads: Vec::new(),
             boot_conditional_loads: Vec::new(),
             bundler_gems: Vec::new(),
+            gem_source_dirs: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),

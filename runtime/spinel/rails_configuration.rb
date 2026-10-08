@@ -97,6 +97,19 @@ module Rails
       ::Rails::Railtie::Configuration.new.app_middleware
     end
 
+    # `config.eager_load_namespaces`, the one list every railtie's
+    # configuration shares (Railtie::Configuration's
+    # `@@eager_load_namespaces`; Application::Configuration inherits it).
+    # worldwide 1.29.0's `worldwide.setup` initializer appends Worldwide
+    # through `application.config`. Rails' Finisher calls `eager_load!` on
+    # each entry only under `config.eager_load`. Without the Railtie port,
+    # no such key.
+    def eager_load_namespaces
+      return method_missing(:eager_load_namespaces) unless defined?(::Rails::Railtie::Configuration)
+
+      ::Rails::Railtie::Configuration.eager_load_namespaces
+    end
+
     # The boot hooks `Rails.application.config` inherits from
     # Rails::Railtie::Configuration (Application::Configuration <
     # Engine::Configuration < Railtie::Configuration): an app initializer's

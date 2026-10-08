@@ -7334,7 +7334,7 @@ fn emit_library_class_decl_inner(
     // bodies' constant refs into LOAD time with it — `Sound::BUILTIN`
     // calls `initialize`, which reads `Sound::Image`. Those refs would
     // otherwise be classified body-only and left to the aggregator.
-    let (eager, deferred) = partition_deferred_constants(lc);
+    let (eager, deferred) = partition_deferred_constants(lc, app);
     let load_time_bodies = !deferred.is_empty();
 
     // Parent + body-derived `require_relative` headers. Helpers return
@@ -7796,6 +7796,37 @@ fn emit_library_class_decl_inner(
         .into_iter()
         .filter(|c| !positioned_prepends.iter().any(|(_, p)| std::ptr::eq(*p, *c)))
         .collect();
+    // A replayed call the source has below a deferred constant runs
+    // after it, with the deferred constants below the methods: worldwide
+    // 1.29.0's `ALL_CURRENCIES.sort_by!(&:currency_code)` follows the
+    // deferred `ALL_CURRENCIES =`; above it, NameError. Each goes after
+    // the last deferred constant the source has above it. Real spans in
+    // one file only; a railtie's statements keep `run_body_statement`.
+    let mut calls_after_deferred: crate::det::HashMap<usize, Vec<&Expr>> = crate::det::HashMap::default();
+    let replayed: Vec<&Expr> = replayed
+        .into_iter()
+        .filter(|call| {
+            let at = deferred
+                .iter()
+                .copied()
+                .filter(|_| !railtie)
+                .filter(|&i| {
+                    let value = &lc.constants[i].1;
+                    !value.span.is_synthetic()
+                        && !call.span.is_synthetic()
+                        && value.span.file == call.span.file
+                        && value.span.start < call.span.start
+                })
+                .max_by_key(|&i| lc.constants[i].1.span.start);
+            match at {
+                Some(i) => {
+                    calls_after_deferred.entry(i).or_default().push(*call);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect();
     // A replayed call the source has above an eager constant runs
     // before it, as the class body does: Core's liquid_ext.rb
     // `remove_const :SYNTAX` and then assigns the new `SYNTAX`, which
@@ -7992,7 +8023,27 @@ fn emit_library_class_decl_inner(
         let own = crate::ingest::library_class::OwnClassCalls::new(&lc.name, &lc.methods);
         let carried = carried_class_macro_calls(lc, app);
         let wraps_own = |e: &Expr| carried.iter().any(|c| std::ptr::eq(*c, e)) && names_own_method(lc, e);
-        let at = body_effects.iter().position(|e| own.runs(e) || wraps_own(e)).unwrap_or(body_effects.len());
+        // A replayed `singleton_class.alias_method :new, :old` written
+        // below this class's own def of `old` (same file) needs that def
+        // above it. One written above the def aliases the method as it
+        // was before (a reopening that wraps it) and stays in place.
+        let aliases_own = |e: &Expr| {
+            matches!(&*e.node, ExprNode::Send { recv: Some(r), method, args, .. }
+                if method.as_str() == "alias_method"
+                    && matches!(&*r.node, ExprNode::Send { method, .. } if method.as_str() == "singleton_class")
+                    && args.get(1).is_some_and(|old| matches!(&*old.node,
+                        ExprNode::Lit { value: crate::expr::Literal::Sym { value } }
+                            if own_class_methods.contains(value)
+                                && lc.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class
+                                    && &m.name == value
+                                    && !m.name_span.is_synthetic()
+                                    && m.name_span.file == e.span.file
+                                    && m.name_span.start < e.span.start))))
+        };
+        let at = body_effects
+            .iter()
+            .position(|e| own.runs(e) || wraps_own(e) || aliases_own(e))
+            .unwrap_or(body_effects.len());
         body_effects.split_off(at)
     };
     // A carried railtie's body: its locals first (a statement's block
@@ -8170,7 +8221,18 @@ fn emit_library_class_decl_inner(
         if !lc.methods.is_empty() {
             writeln!(s).unwrap();
         }
-        render_constants(&mut s, &deferred);
+        for &i in &deferred {
+            render_constants(&mut s, &[i]);
+            for call in calls_after_deferred.get(&i).into_iter().flatten() {
+                for line in super::emit_expr(call).lines() {
+                    if line.is_empty() {
+                        writeln!(s).unwrap();
+                    } else {
+                        writeln!(s, "{body_pad}{line}").unwrap();
+                    }
+                }
+            }
+        }
         NestedPlacement::place(&lc.name, &mut s, |_| true);
     }
 
@@ -8765,6 +8827,90 @@ fn is_model_or_library_class(name: &str, app: &App) -> bool {
     is_model_named(name, app) || !library_classes_named(name, app).is_empty()
 }
 
+/// Whether `lc` is written in a gem the app compiles as source
+/// (roundhouse.yml `gem_sources:`, `App::gem_source_dirs`): the first
+/// real span of its methods or constants falls in one of those dirs.
+fn declared_in_gem_source(lc: &LibraryClass, app: &App) -> bool {
+    if app.gem_source_dirs.is_empty() {
+        return false;
+    }
+    let span = lc
+        .methods
+        .iter()
+        .map(|m| m.name_span)
+        .chain(lc.constants.iter().map(|(_, v)| v.span))
+        .chain(std::iter::once(lc.parent_span))
+        .find(|s| !s.is_synthetic());
+    let Some(source) = span.and_then(|s| (s.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i))) else {
+        return false;
+    };
+    let path = source.path.as_str();
+    let path = if app.root.is_empty() {
+        path
+    } else {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path)
+    };
+    app.gem_source_dirs.iter().any(|dir| path.starts_with(dir.as_str()))
+}
+
+/// The class-body statements of a gem compiled as source
+/// (`declared_in_gem_source`) that run as written, outside the modelled
+/// DSL: the gem's own Ruby, whose effects its methods depend on.
+///
+/// - a call on one of the class's own constants: worldwide 1.29.0's
+///   `ALL_CURRENCIES.sort_by!(&:currency_code)` and `.freeze` (dropped,
+///   `Currencies.all` kept the CLDR file's order), `FIRST_DAY_DATA.freeze`;
+/// - `extend` of a core Ruby mixin (`Enumerable`, `Comparable`), which
+///   ingest writes for an `include` inside `class << self`: worldwide's
+///   `Locales` (dropped, `Locales.known` was NoMethodError);
+/// - `singleton_class.alias_method :new, :old` with two symbol names:
+///   `Locales`'s `alias_method :known, :to_a`.
+///
+/// `private_constant` stays dropped: the emitter qualifies constant reads
+/// (`Worldwide::Currencies::X`), which a private constant refuses.
+fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    if !declared_in_gem_source(lc, app) {
+        return Vec::new();
+    }
+    let class_name = lc.name.0.as_str().trim_start_matches("::");
+    let own_constant = |e: &Expr| match &*e.node {
+        ExprNode::Const { path } => {
+            let Some((last, scope)) = path.split_last() else { return false };
+            let scope = scope.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            (scope.is_empty() || scope.trim_start_matches("::") == class_name)
+                && lc.constants.iter().any(|(name, _)| name == last)
+        }
+        _ => false,
+    };
+    let implicit_self = |r: &Option<Expr>| r.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+    let symbol = |e: &Expr| matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } });
+    lc.unknown_calls
+        .iter()
+        .filter(|call| match &*call.node {
+            ExprNode::Send { recv: Some(r), method, .. }
+                if own_constant(r) && !matches!(method.as_str(), "private_constant" | "autoload") =>
+            {
+                true
+            }
+            ExprNode::Send { recv, method, args, block: None, .. } if method.as_str() == "extend" => {
+                implicit_self(recv)
+                    && !args.is_empty()
+                    && args.iter().all(|a| {
+                        matches!(&*a.node, ExprNode::Const { path }
+                            if path.len() == 1 && matches!(path[0].as_str(), "Enumerable" | "Comparable"))
+                    })
+            }
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "alias_method" => {
+                matches!(&*r.node, ExprNode::Send { recv, method, args: inner, block: None, .. }
+                    if method.as_str() == "singleton_class" && inner.is_empty() && implicit_self(recv))
+                    && args.len() == 2
+                    && args.iter().all(symbol)
+            }
+            _ => false,
+        })
+        .collect()
+}
+
 /// Split a class's constants into the ones that can be initialized
 /// before its methods exist and the ones that can't. A constant defers
 /// when its initializer dispatches to this class — a bare `new(…)` or a
@@ -8784,7 +8930,7 @@ fn is_model_or_library_class(name: &str, app: &App) -> bool {
 /// suite's 52 files. The fact the rule is about is "does this
 /// initializer dispatch to this class", and both spellings are that
 /// fact.
-fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
+fn partition_deferred_constants(lc: &LibraryClass, app: &App) -> (Vec<usize>, Vec<usize>) {
     fn is_own_class(recv: &Option<Expr>, class_name: &str) -> bool {
         let Some(r) = recv else { return false };
         let ExprNode::Const { path } = &*r.node else { return false };
@@ -8915,12 +9061,66 @@ fn partition_deferred_constants(lc: &LibraryClass) -> (Vec<usize>, Vec<usize>) {
         expr.node.for_each_child(&mut |child| written_constants(child, out));
     }
 
+    /// Whether a value, as it runs, calls a method of one of the app's
+    /// classes (`X.new`, `X.m` on a model or library class): that code
+    /// may call back into this class. A stored closure runs later.
+    fn runs_app_code(expr: &Expr, app: &App) -> bool {
+        match &*expr.node {
+            ExprNode::Lambda { .. } => false,
+            ExprNode::Send { recv: Some(r), .. }
+                if matches!(&*r.node, ExprNode::Const { path }
+                    if is_model_or_library_class(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::"), app)) =>
+            {
+                true
+            }
+            // A block a call runs now (`map`, `each`) runs with the value;
+            // a `proc`/`lambda` literal is stored, as in `calls_self`.
+            ExprNode::Send { recv, method, args, block, .. } => {
+                let stores_block = matches!(method.as_str(), "proc" | "lambda");
+                recv.iter().chain(args.iter()).any(|e| runs_app_code(e, app))
+                    || (!stores_block
+                        && block.as_ref().is_some_and(|b| match &*b.node {
+                            ExprNode::Lambda { body, .. } => runs_app_code(body, app),
+                            _ => runs_app_code(b, app),
+                        }))
+            }
+            _ => {
+                let mut found = false;
+                expr.node.for_each_child(&mut |child| {
+                    if !found && runs_app_code(child, app) {
+                        found = true;
+                    }
+                });
+                found
+            }
+        }
+    }
+
     let own: crate::det::HashSet<&str> =
         lc.methods.iter().map(|m| m.name.as_str()).collect();
+    // A gem source's class body runs as the gem's Ruby does, top to
+    // bottom: a constant the source writes below one of the class's own
+    // defs, whose value runs app code, may reach that def through
+    // another class. worldwide 1.29.0's `Currencies::ALL_CURRENCIES`
+    // builds `Currency.new(code:)` below `def numeric_code_for`, and
+    // `Currency#initialize` calls `Currencies.numeric_code_for`; hoisted
+    // above the defs it raised NoMethodError at load. Such a constant
+    // waits for the methods, where the source had it.
+    let below_own_def = |value: &Expr| {
+        !value.span.is_synthetic()
+            && lc.methods.iter().any(|m| {
+                !m.name_span.is_synthetic()
+                    && m.name_span.file == value.span.file
+                    && m.name_span.start < value.span.start
+            })
+    };
+    let gem_source = declared_in_gem_source(lc, app);
     let mut deferred_names: crate::det::HashSet<String> = crate::det::HashSet::default();
     let (mut eager, mut deferred) = (Vec::new(), Vec::new());
     for (i, (name, value)) in lc.constants.iter().enumerate() {
-        if calls_self(value, &own, &deferred_names, lc.name.0.as_str()) {
+        if calls_self(value, &own, &deferred_names, lc.name.0.as_str())
+            || (gem_source && below_own_def(value) && runs_app_code(value, app))
+        {
             deferred_names.insert(name.as_str().to_string());
             written_constants(value, &mut deferred_names);
             deferred.push(i);
@@ -9247,12 +9447,14 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
     // (`analyze::retypable_attributes::claimed_body_calls`).
     let parent = lc.parent.as_ref().and_then(|p| app.models.iter().find(|m| &m.name == p));
     let claimed = |c: &Expr| parent.is_some_and(|m| m.claimed_body_calls.contains(&c.span));
+    let gem_effects = gem_source_body_effects(lc, app);
     lc.unknown_calls
         .iter()
         .filter(|c| {
             crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
+                || gem_effects.iter().any(|e| std::ptr::eq(*e, *c))
                 || claimed(c)
         })
         .collect()

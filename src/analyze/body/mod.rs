@@ -1053,6 +1053,19 @@ impl<'a> BodyTyper<'a> {
             ExprNode::Var { name, .. } => ctx.class_objects.contains(name) || typed_class_value(),
             ExprNode::Const { path } => {
                 if expr.decisions & crate::expr::RESOLVED_CLASS_REF != 0 { return true; }
+                // A gem the tree loads natively opens it with `class` or
+                // `module` in its installed source (`GemSourceConstants::
+                // kinds`): i18n's `I18n::Config`, which worldwide asks
+                // `method_defined?(:owned_by?)`. The read was resolved to
+                // that declaration (GEM_CONSTANT_REF), so it is the class
+                // object, not a value constant of the same name.
+                if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0
+                    && self.gem_sources.as_deref().is_some_and(|sources| {
+                        sources.kinds.contains_key(written_class_id(path).0.as_str().trim_start_matches("::"))
+                    })
+                {
+                    return true;
+                }
                 if let Some(answer) = self.const_resolver.as_ref().and_then(|r| r.reference(expr.span, path)) {
                     if let Some(resolved) = answer {
                         return matches!(resolved, ResolvedConstant::Namespace { .. });
