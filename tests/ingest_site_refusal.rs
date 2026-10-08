@@ -15,17 +15,17 @@ mod emit_and_run;
 use std::path::Path;
 use std::process::Command;
 
-/// `for` is a refused construct (`ingest_expr`: it needs
-/// enclosing-scope lowering). It sits mid-method, and in one branch
-/// of another method, beside code that runs.
+/// `for @x in xs` is a refused construct (`ingest_for`: a loop variable
+/// other than a plain local). It sits mid-method, and in one branch of
+/// another method, beside code that runs.
 const TALLY: &str = r#"module Tally
   LOG = []
 
   def self.sum(xs)
     LOG << :before
     total = 0
-    for x in xs
-      total += x
+    for @x in xs
+      total += @x
     end
     LOG << :after
     total
@@ -33,8 +33,8 @@ const TALLY: &str = r#"module Tally
 
   def self.pick(flag, xs)
     if flag
-      for x in xs
-        LOG << x
+      for @x in xs
+        LOG << @x
       end
       :looped
     else
@@ -58,7 +58,7 @@ begin
   results << :no_raise
 rescue NotImplementedError => e
   results << e.class
-  results << e.message.include?("`for` requires enclosing-scope lowering")
+  results << e.message.include?("`for` with a loop variable other than plain locals is not modeled")
 end
 # A ScriptError: an app's bare `rescue` does not swallow the gap.
 caught = begin
@@ -78,7 +78,7 @@ p results
 #[test]
 fn the_refused_statement_raises_and_the_rest_of_the_file_runs() {
     let run = emit_and_run::real_blog().write("app/lib/tally.rb", TALLY).run_ruby(REPORT);
-    let refusals: Vec<&String> = run.errors.iter().filter(|e| e.contains("`for` requires")).collect();
+    let refusals: Vec<&String> = run.errors.iter().filter(|e| e.contains("`for` with a loop variable")).collect();
     assert_eq!(refusals.len(), 2, "one error per refused statement:\n{}", run.errors.join("\n"));
     assert_eq!(run.errors.len(), 2, "only the refusals:\n{}", run.errors.join("\n"));
     assert!(run.success, "emitted program failed in {}:\n{}", run.emitted.display(), run.stderr);
@@ -110,7 +110,7 @@ fn check_reports_each_refusal_at_its_line() {
     }
     let text = check(&root);
     let _ = std::fs::remove_dir_all(&root);
-    let suffix = "error[ingest_unsupported]: `for` requires enclosing-scope lowering";
+    let suffix = "error[ingest_unsupported]: `for` with a loop variable other than plain locals is not modeled";
     assert!(text.contains(&format!("lib/tally.rb:7:5: {suffix}")), "{text}");
     assert!(text.contains(&format!("lib/tally.rb:16:7: {suffix}")), "{text}");
     assert_eq!(text.matches("error[ingest_unsupported]").count(), 2, "{text}");

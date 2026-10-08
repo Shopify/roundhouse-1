@@ -2207,14 +2207,9 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
             };
             ExprNode::While { cond, body, until_form: false }
         }
-        // Ruby for loops share the enclosing local scope. Refuse them until
-        // a shared lowering preserves that scope, including empty iterations.
-        n if n.as_for_node().is_some() => {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "`for` requires enclosing-scope lowering; an `each` block changes local-variable semantics".into(),
-            });
-        }
+        // `for` is `each` over the collection with the enclosing scope's
+        // locals (`ingest_for`).
+        n if n.as_for_node().is_some() => ingest_for(&n.as_for_node().unwrap(), span, file)?,
         n if n.as_until_node().is_some() => {
             let u = n.as_until_node().unwrap();
             if u.is_begin_modifier() {
@@ -3303,6 +3298,118 @@ fn do_loop(
     let body = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![body, test] });
     let always = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } });
     Ok(ExprNode::While { cond: always, body, until_form: false })
+}
+
+/// `for a, b in coll; body; end` as Ruby runs it: `coll.each` with a
+/// block whose parameters are assigned to the loop variables, where the
+/// loop variables and every local the body writes are the enclosing
+/// scope's. So those are declared first, each as `x = x` (nil when
+/// unassigned, its value otherwise: no change), and the block's writes
+/// then reach them: after the loop `a` holds the last element, a body
+/// local the last iteration's value, both nil when nothing iterated, and
+/// a body local keeps its value from one iteration to the next. The
+/// block's parameters take the yielded values as `|a, b|` would, which is
+/// how `for` destructures them (one target: the first value); the value
+/// is `each`'s, and `break`, `next`, `redo` and `return` act on the
+/// block as on the loop. A target other than a plain local (an ivar,
+/// an attribute, a splat) is refused.
+fn ingest_for(node: &ruby_prism::ForNode<'_>, span: Span, file: &str) -> IngestResult<ExprNode> {
+    use crate::expr::LValue;
+    use crate::ident::VarId;
+    use ruby_prism::Visit;
+    let refuse = || IngestError::Unsupported {
+        file: file.into(),
+        message: "`for` with a loop variable other than plain locals is not modeled".into(),
+    };
+    let local = |n: &Node<'_>| n.as_local_variable_target_node().map(|t| Symbol::from(constant_id_str(&t.name())));
+    let index = node.index();
+    let targets: Vec<Symbol> = if let Some(name) = local(&index) {
+        vec![name]
+    } else if let Some(multi) = index.as_multi_target_node() {
+        if multi.rest().is_some() || !multi.rights().is_empty() {
+            return Err(refuse());
+        }
+        multi.lefts().iter().map(|left| local(&left)).collect::<Option<_>>().ok_or_else(refuse)?
+    } else {
+        return Err(refuse());
+    };
+
+    // The locals of this scope the body writes; a block, lambda or
+    // definition inside it has its own.
+    struct Written(Vec<Symbol>);
+    impl Written {
+        fn add(&mut self, depth: u32, name: &ruby_prism::ConstantId<'_>) {
+            let name = Symbol::from(constant_id_str(name));
+            if depth == 0 && !self.0.contains(&name) {
+                self.0.push(name);
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Written {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.add(node.depth(), &node.name());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.add(node.depth(), &node.name());
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.add(node.depth(), &node.name());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.add(node.depth(), &node.name());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.add(node.depth(), &node.name());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut written = Written(targets.clone());
+    written.visit(&index);
+    if let Some(statements) = node.statements() {
+        written.visit(&statements.as_node());
+    }
+
+    let at = Span::synthetic();
+    let var = |name: &Symbol| Expr::new(at, ExprNode::Var { id: VarId(0), name: name.clone() });
+    let assign =
+        |name: &Symbol, value: Expr| Expr::new(at, ExprNode::Assign { target: LValue::Var { id: VarId(0), name: name.clone() }, value });
+    let params: Vec<Symbol> = targets.iter().map(|t| Symbol::from(format!("__rh_for_{}", t.as_str()))).collect();
+    let mut body: Vec<Expr> = targets.iter().zip(&params).map(|(t, p)| assign(t, var(p))).collect();
+    if let Some(statements) = node.statements() {
+        body.push(ingest_expr(&statements.as_node(), file)?);
+    }
+    let block = Expr::new(
+        at,
+        ExprNode::Lambda {
+            params,
+            rest_param: None,
+            block_param: None,
+            body: Expr::new(at, ExprNode::Seq { exprs: body }),
+            block_style: crate::expr::BlockStyle::Do,
+        },
+    );
+    let each = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(ingest_expr(&node.collection(), file)?),
+            method: Symbol::from("each"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+    );
+    let mut exprs: Vec<Expr> = written.0.iter().map(|name| assign(name, var(name))).collect();
+    exprs.push(each);
+    Ok(ExprNode::Seq { exprs })
 }
 
 /// A `next` or `redo` in `node` that targets the loop `node` is the
