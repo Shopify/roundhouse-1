@@ -345,6 +345,87 @@ pub(crate) struct ValidationsPort {
     notes: std::cell::RefCell<Vec<Diagnostic>>,
 }
 
+/// `library_classes` by name, for [`ValidationsPort::of`]'s walks.
+struct PortIndex<'a> {
+    app: &'a App,
+    /// Each name's library classes, in `library_classes` order.
+    by_name: crate::det::HashMap<&'a str, Vec<usize>>,
+    /// Each name's first class (not module).
+    first_class: crate::det::HashMap<&'a str, usize>,
+    models: crate::det::HashSet<&'a str>,
+}
+
+impl<'a> PortIndex<'a> {
+    fn new(app: &'a App) -> Self {
+        let mut by_name: crate::det::HashMap<&str, Vec<usize>> = crate::det::HashMap::default();
+        let mut first_class: crate::det::HashMap<&str, usize> = crate::det::HashMap::default();
+        for (j, lc) in app.library_classes.iter().enumerate() {
+            by_name.entry(lc.name.0.as_str()).or_default().push(j);
+            if !lc.is_module {
+                first_class.entry(lc.name.0.as_str()).or_insert(j);
+            }
+        }
+        let models = app.models.iter().map(|m| m.name.0.as_str()).collect();
+        PortIndex { app, by_name, first_class, models }
+    }
+
+    /// `library_classes_named`.
+    fn named(&self, name: &str) -> impl Iterator<Item = &'a LibraryClass> + '_ {
+        self.by_name.get(name).into_iter().flatten().map(|&j| &self.app.library_classes[j])
+    }
+
+    /// [`below_model`].
+    fn below_model(&self, lc: &LibraryClass) -> bool {
+        let mut seen: Vec<&ClassId> = vec![&lc.name];
+        let mut parent = lc.parent.as_ref();
+        while let Some(p) = parent {
+            if self.models.contains(p.0.as_str()) {
+                return true;
+            }
+            if seen.contains(&p) {
+                return false;
+            }
+            seen.push(p);
+            parent = self.first_class.get(p.0.as_str()).and_then(|&j| self.app.library_classes[j].parent.as_ref());
+        }
+        false
+    }
+
+    /// `crate::emit::ruby::includes_module`'s walk from
+    /// `library_classes[start]`: `visit` sees each include name it
+    /// meets, in order, and ends the walk by answering true.
+    fn walk(&self, start: usize, visit: &mut dyn FnMut(&'a str) -> bool) -> bool {
+        let classes = &self.app.library_classes;
+        let mut seen: crate::det::HashSet<&str> = crate::det::HashSet::default();
+        let mut queue: Vec<usize> = vec![start];
+        while let Some(j) = queue.pop() {
+            let c = &classes[j];
+            if !seen.insert(c.name.0.as_str()) {
+                continue;
+            }
+            for include in &c.includes {
+                let name = include.0.as_str().trim_start_matches("::");
+                if visit(name) {
+                    return true;
+                }
+                queue.extend(self.by_name.get(name).into_iter().flatten().filter(|&&m| classes[m].is_module));
+            }
+            if !c.is_module {
+                if let Some(parent) = &c.parent {
+                    let name = parent.0.as_str().trim_start_matches("::");
+                    queue.extend(self.by_name.get(name).into_iter().flatten().filter(|&&p| !classes[p].is_module));
+                }
+            }
+        }
+        false
+    }
+
+    /// `crate::emit::ruby::includes_module`.
+    fn includes(&self, start: usize, module: &str) -> bool {
+        self.walk(start, &mut |name| name == module)
+    }
+}
+
 /// How an errors lowering treats an `errors` read
 /// ([`ValidationsPort::classify`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -364,58 +445,103 @@ pub(crate) enum Reading {
 pub(crate) struct PortLocals(crate::det::HashSet<Symbol>);
 
 impl ValidationsPort {
+    /// The port, from one pass of name-indexed walks: each class's
+    /// include closure is walked once, where answering it per module
+    /// with `includes_module` (a linear `library_classes_named` per
+    /// step) was quadratic in the library classes, 2,533 s of the
+    /// fused send rewrites on Shopify Core. Same answers: the walk is
+    /// `includes_module`'s, and a class includes `module` exactly when
+    /// the walk meets it.
     pub(crate) fn of(app: &App) -> Self {
         let mut owners = crate::det::HashSet::default();
         if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
             return ValidationsPort { owners, above: Default::default(), notes: Default::default() };
         }
-        let port: Vec<&LibraryClass> = app
-            .library_classes
-            .iter()
-            .filter(|lc| {
-                !lc.is_module
-                    && !below_model(lc, app)
-                    && crate::emit::ruby::includes_active_model_validations(lc, app)
+        let index = PortIndex::new(app);
+        let classes = &app.library_classes;
+        let port: Vec<usize> = (0..classes.len())
+            .filter(|&j| {
+                let lc = &classes[j];
+                !lc.is_module && !index.below_model(lc) && index.includes(j, "ActiveModel::Validations")
             })
             .collect();
         if port.is_empty() {
             return ValidationsPort { owners, above: Default::default(), notes: Default::default() };
         }
-        owners.extend(port.iter().map(|lc| lc.name.clone()));
-        let names = |include: &ClassId, module: &str| {
-            let include = include.0.as_str().trim_start_matches("::");
-            include == module || module.ends_with(&format!("::{include}"))
-        };
-        for module in app.library_classes.iter().filter(|c| c.is_module) {
-            let name = module.name.0.as_str();
-            if !port.iter().any(|lc| crate::emit::ruby::includes_module(lc, app, name)) {
-                continue;
+        owners.extend(port.iter().map(|&j| classes[j].name.clone()));
+        // The modules some port class includes, in `library_classes`
+        // order: the only ones that can join the owners.
+        let mut port_includes: crate::det::HashSet<&str> = crate::det::HashSet::default();
+        for &j in &port {
+            index.walk(j, &mut |name| {
+                port_includes.insert(name);
+                false
+            });
+        }
+        let candidates: Vec<usize> =
+            (0..classes.len()).filter(|&j| classes[j].is_module && port_includes.contains(classes[j].name.0.as_str())).collect();
+        if !candidates.is_empty() {
+            let wanted: crate::det::HashSet<&str> = candidates.iter().map(|&j| classes[j].name.0.as_str()).collect();
+            // Each candidate => the classes off the module side that
+            // include it, checked against the owners as they grow.
+            let mut includers: crate::det::HashMap<&str, Vec<usize>> = crate::det::HashMap::default();
+            for j in 0..classes.len() {
+                if classes[j].is_module {
+                    continue;
+                }
+                let mut hit: Vec<&str> = Vec::new();
+                index.walk(j, &mut |name| {
+                    if wanted.contains(name) && !hit.contains(&name) {
+                        hit.push(name);
+                        includers.entry(name).or_default().push(j);
+                    }
+                    false
+                });
             }
-            // Any includer off the port (a model, another library
-            // class, or a module one of those includes) keeps the
-            // module on the accumulator's spellings, as before.
-            let library_includer = app.library_classes.iter().any(|c| {
-                !c.is_module
-                    && !owners.contains(&c.name)
-                    && crate::emit::ruby::includes_module(c, app, name)
-            });
-            let model_includer = app.models.iter().any(|m| {
-                crate::analyze::model_includes(m).iter().any(|include| {
-                    names(include, name)
-                        || app.library_classes.iter().any(|c| {
-                            c.is_module
-                                && names(include, c.name.0.as_str())
-                                && crate::emit::ruby::includes_module(c, app, name)
-                        })
-                })
-            });
-            if !library_includer && !model_includer {
-                owners.insert(module.name.clone());
+            // A model's include names a module when it is the module's
+            // name or a `::`-suffix of it.
+            let model_includes: crate::det::HashSet<String> = app
+                .models
+                .iter()
+                .flat_map(crate::analyze::model_includes)
+                .map(|include| include.0.as_str().trim_start_matches("::").to_string())
+                .collect();
+            let named_by_model = |module: &str| {
+                model_includes.contains(module)
+                    || (0..module.len().saturating_sub(1))
+                        .any(|at| module.as_bytes()[at..].starts_with(b"::") && model_includes.contains(&module[at + 2..]))
+            };
+            let mut model_reached: crate::det::HashSet<&str> = crate::det::HashSet::default();
+            if !model_includes.is_empty() {
+                for j in 0..classes.len() {
+                    if classes[j].is_module && named_by_model(classes[j].name.0.as_str()) {
+                        index.walk(j, &mut |name| {
+                            if wanted.contains(name) {
+                                model_reached.insert(name);
+                            }
+                            false
+                        });
+                    }
+                }
+            }
+            for &m in &candidates {
+                let module = &classes[m];
+                let name = module.name.0.as_str();
+                // Any includer off the port (a model, another library
+                // class, or a module one of those includes) keeps the
+                // module on the accumulator's spellings, as before.
+                let library_includer = includers
+                    .get(name)
+                    .is_some_and(|cs| cs.iter().any(|&c| !owners.contains(&classes[c].name)));
+                let model_includer = named_by_model(name) || model_reached.contains(name);
+                if !library_includer && !model_includer {
+                    owners.insert(module.name.clone());
+                }
             }
         }
         let mut above = crate::det::HashSet::default();
-        for lc in &port {
-            let mut queue: Vec<&LibraryClass> = vec![lc];
+        for &j in &port {
+            let mut queue: Vec<&LibraryClass> = vec![&classes[j]];
             let mut seen: Vec<&ClassId> = Vec::new();
             while let Some(c) = queue.pop() {
                 if seen.contains(&&c.name) {
@@ -427,9 +553,7 @@ impl ValidationsPort {
                 for (name, module) in c.includes.iter().map(|i| (i, true)).chain(parent.map(|p| (p, false))) {
                     let name = name.0.as_str().trim_start_matches("::");
                     above.insert(ClassId(crate::ident::Symbol::from(name)));
-                    queue.extend(
-                        crate::emit::ruby::library_classes_named(name, app).into_iter().filter(|c| c.is_module == module),
-                    );
+                    queue.extend(index.named(name).filter(|c| c.is_module == module));
                 }
             }
         }
