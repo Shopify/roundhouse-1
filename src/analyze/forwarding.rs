@@ -717,11 +717,10 @@ fn walk(
             ));
         }
     }
-    e.node
-        .for_each_child(&mut |c| {
-            let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
-            walk(app, contracts, owner, enclosing, c, out, in_block)
-        });
+    e.node.for_each_child(&mut |c| {
+        let in_block = child_in_block(contracts, Some((owner, enclosing)), e, c, in_block);
+        walk(app, contracts, owner, enclosing, c, out, in_block)
+    });
 }
 
 /// `recv.m(...)` where `recv` is typed as a Ruby core value (a Hash,
@@ -773,7 +772,7 @@ fn foreign_destination(contracts: &SourceContractIndex<'_>, e: &Expr) -> bool {
     !contracts.fragments.contains_key(id)
         && !contracts.synthesized.contains(id)
         && !contracts.mixed_into(id)
-        && !contracts.app_reopens(id.0.as_str(), method.as_str())
+        && contracts.app_reopens(id.0.as_str(), method.as_str()) == external::Reopened::No
         // An app class written `< Set` (or including a module named
         // so) may be the value; its override is the app's.
         && !contracts.parents.values().any(|parent| named(parent))
@@ -1041,10 +1040,35 @@ impl KeywordPolicy {
     }
 }
 
-/// `SourceContractIndex::super_leaves_source` for a `super` written
-/// directly in an instance method's body. Inside a block it is not shown
-/// which method the `super` belongs to: `define_method` and its kin make
-/// a block a method body, and a block can be captured and passed on.
+/// Is `child`, a node under `parent`, inside a block whose `super` may
+/// not be the enclosing method's? `define_method` and its kin make a
+/// block a method body, and a captured block can be passed on to one.
+/// The literal block of a self-send stays the enclosing method's where
+/// every method that send may reach only yields
+/// ([`SourceContractIndex::keeps_block`]); every other block does not.
+fn child_in_block(
+    contracts: &SourceContractIndex<'_>,
+    context: Option<(&ClassId, &MethodDef)>,
+    parent: &Expr,
+    child: &Expr,
+    in_block: bool,
+) -> bool {
+    if in_block || !matches!(&*child.node, ExprNode::Lambda { .. }) {
+        return in_block;
+    }
+    match (&*parent.node, context) {
+        (ExprNode::Send { block: Some(block), .. }, Some((owner, enclosing)))
+            if std::ptr::eq(block, child) && enclosing.receiver == MethodReceiver::Instance =>
+        {
+            !contracts.keeps_block(owner, parent)
+        }
+        _ => true,
+    }
+}
+
+/// `SourceContractIndex::super_leaves_source` for a `super` written in an
+/// instance method's body, outside any block but one
+/// [`child_in_block`] shows to stay the method's.
 fn super_leaves_source(
     contracts: &SourceContractIndex<'_>,
     context: Option<(&ClassId, &MethodDef)>,
@@ -1178,8 +1202,8 @@ fn keyword_calls_with_index(
                 .and_modify(|previous| *previous = previous.join(policy))
                 .or_insert(policy);
         }
-        let in_block = in_block || matches!(&*e.node, ExprNode::Lambda { .. });
         e.node.for_each_child(&mut |c| {
+            let in_block = child_in_block(contracts, context, e, c, in_block);
             visit(app, contracts, context, c, plans, fallback, in_block)
         });
     }
@@ -1206,10 +1230,96 @@ fn keyword_calls_with_index(
             );
         }
     }
+    defined_method_supers(contracts, &mut plans);
     crate::lower::for_each_forwarding_body_ref(app, &mut |e| {
         visit(app, contracts, None, e, &mut plans, true, false)
     });
     plans
+}
+
+/// A class body statement defining methods named from the superclass's
+/// own (`(Set.public_instance_methods(false) - SKIP).each do |name|
+/// define_method(name) do |*args, **kwargs, &block| … super(*args,
+/// **kwargs, &block) end end`): each `super` written directly in such a
+/// method body reaches the superclass's own declaration of its name,
+/// whatever the name. Where every such declaration has the native ABI
+/// ([`SourceContractIndex::own_methods_native`]) the Ruby family keeps
+/// the `super` as written; every other target refuses it by name.
+fn defined_method_supers(contracts: &SourceContractIndex<'_>, plans: &mut HashMap<Span, KeywordPolicy>) {
+    /// The constant whose own instance methods `e` lists, through a
+    /// difference with any list.
+    fn own_method_list(e: &Expr) -> Option<String> {
+        match &*e.node {
+            ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => match (method.as_str(), &args[..], &*recv.node) {
+                ("public_instance_methods" | "instance_methods", [flag], ExprNode::Const { path })
+                    if matches!(&*flag.node, ExprNode::Lit { value: crate::expr::Literal::Bool { value: false } }) =>
+                {
+                    Some(path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::"))
+                }
+                ("-", [_], _) => own_method_list(recv),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn reads(e: &Expr, name: &Symbol) -> bool {
+        match &*e.node {
+            ExprNode::Var { name: read, .. } => read == name,
+            ExprNode::Send { recv: None, method, args, block: None, .. } => method == name && args.is_empty(),
+            _ => false,
+        }
+    }
+    /// The `super`s with a keyword splat written in `e`, outside any
+    /// block it holds.
+    fn supers<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match &*e.node {
+            ExprNode::Lambda { .. } => return,
+            ExprNode::Super { args: Some(args), .. }
+                if args.iter().any(|a| matches!(&*a.node, ExprNode::KeywordSplat { .. })) =>
+            {
+                out.push(e)
+            }
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| supers(c, out));
+    }
+    /// `define_method(name) do … end` bodies in `e` (the loop's body),
+    /// outside any other block.
+    fn defined<'e>(e: &'e Expr, name: &Symbol, out: &mut Vec<&'e Expr>) {
+        if let ExprNode::Send { recv, method, args, block: Some(block), .. } = &*e.node
+            && method.as_str() == "define_method"
+            && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            && let [arg] = &args[..]
+            && reads(arg, name)
+            && let ExprNode::Lambda { body, .. } = &*block.node
+        {
+            out.push(body);
+            return;
+        }
+        if matches!(&*e.node, ExprNode::Lambda { .. }) {
+            return;
+        }
+        e.node.for_each_child(&mut |c| defined(c, name, out));
+    }
+    for class in classes(contracts.app) {
+        for statement in class.unknown_calls.iter().filter(|c| c.decisions & crate::expr::BODY_STATEMENT != 0) {
+            let ExprNode::Send { recv: Some(list), method, block: Some(block), .. } = &*statement.node else { continue };
+            let ExprNode::Lambda { params, body, .. } = &*block.node else { continue };
+            let (Some(source), "each", [name]) = (own_method_list(list), method.as_str(), &params[..]) else { continue };
+            let mut bodies = Vec::new();
+            defined(body, name, &mut bodies);
+            let mut found = Vec::new();
+            for body in bodies {
+                supers(body, &mut found);
+            }
+            if found.is_empty() || !contracts.own_methods_native(&class.name, &source) {
+                continue;
+            }
+            for e in found {
+                plans.entry(e.span).and_modify(|p| *p = p.join(KeywordPolicy::NativeSuper)).or_insert(KeywordPolicy::NativeSuper);
+            }
+        }
+    }
 }
 
 fn possible_full_destination(
@@ -1474,6 +1584,8 @@ struct SourceContractIndex<'a> {
     children: HashMap<ClassId, Vec<ClassId>>,
     /// Each class's positions in `virtual_owners`.
     owner_positions: HashMap<ClassId, Vec<usize>>,
+    /// What app code does to names outside the index's fragments.
+    dynamic: OnceCell<Dynamic>,
     /// Memos of pure functions of the (immutable) index.
     verified: RefCell<HashMap<ClassId, bool>>,
     descendants: RefCell<HashMap<ClassId, Rc<Vec<usize>>>>,
@@ -1498,6 +1610,7 @@ impl<'a> SourceContractIndex<'a> {
             unretained: OnceCell::new(),
             children: HashMap::default(),
             owner_positions: HashMap::default(),
+            dynamic: OnceCell::new(),
             verified: RefCell::default(),
             descendants: RefCell::default(),
             virtual_calls: RefCell::default(),
@@ -1738,7 +1851,10 @@ impl<'a> SourceContractIndex<'a> {
     /// recorded superclass (none written, or an expression) and a name
     /// that could resolve to something nested are unknown.
     fn super_leaves_source(&self, owner: &ClassId, name: &Symbol) -> bool {
-        if self.modules.contains(owner) || !self.verified(owner) {
+        if self.modules.contains(owner) {
+            return self.module_super_leaves_source(owner, name);
+        }
+        if !self.verified(owner) {
             return false;
         }
         if self
@@ -1827,22 +1943,52 @@ impl<'a> SourceContractIndex<'a> {
         self.fragments.keys().any(|name| name.0.as_str().ends_with(&suffix))
     }
 
-    /// The app declares instance method `method` on core `namespace`
-    /// (reopening it, through a module it includes there, or through an
-    /// initializer mixin naming it).
-    fn app_reopens(&self, namespace: &str, method: &str) -> bool {
+    /// What the app declares of instance method `method` on `namespace`,
+    /// a runtime, stdlib or core name: its own reopening's declaration,
+    /// or one a module it mixes in there (an include in the reopening,
+    /// an initializer's `Target.include(M)`) may hold. A reopening the
+    /// index cannot read (several fragments, a file-level `class_eval`
+    /// or mixin naming it) may declare anything.
+    fn app_reopens(&self, namespace: &str, method: &str) -> external::Reopened {
+        use external::Reopened;
         let method = Symbol::from(method);
         let id = ClassId(Symbol::from(namespace));
-        // An unverified reopening (several fragments) is not read: it may.
-        if self.fragments.contains_key(&id)
-            && (!self.verified(&id)
-                || self
-                    .declaration(&id, &method, MethodReceiver::Instance, &mut HashSet::default())
-                    .is_some())
-        {
-            return true;
+        let dynamic = self.dynamic();
+        if dynamic.touched.contains(last_segment(namespace)) {
+            return Reopened::Unknown;
         }
-        self.app.module_mixins.iter().any(|mixin| {
+        // A file-level mixin into a name with this last segment (it may
+        // be this namespace): its module must hold only its own
+        // declarations, none of them `method`.
+        if dynamic
+            .file_mixins
+            .get(last_segment(namespace))
+            .is_some_and(|modules| !modules.iter().all(|module| self.holds_only_own_without(module.as_ref(), &method)))
+        {
+            return Reopened::Unknown;
+        }
+        let mut answer = Reopened::No;
+        if self.fragments.contains_key(&id) {
+            if !self.verified(&id) || !self.prepends_without(&id, &method) {
+                return Reopened::Unknown;
+            }
+            if let Some(&(own, synthesized)) = self.instance.get(&(id.clone(), method.clone())) {
+                // The reopening's own `def` precedes its includes. The
+                // Ruby family writes it with its source keywords.
+                if synthesized
+                    || self.synthesized.contains(&id)
+                    || own.unsupported_formals.is_some()
+                    || !crate::dialect::Param::keywords_written_as_keywords(&own.params)
+                    || self.unretained(&own.name_span)
+                {
+                    return Reopened::Unknown;
+                }
+                answer = Reopened::Native;
+            } else if self.ancestors(&id, &method, MethodReceiver::Instance, &mut HashSet::default()).is_some() {
+                return Reopened::Unknown;
+            }
+        }
+        let mixed = self.app.module_mixins.iter().any(|mixin| {
             mixin.target.as_str() == namespace && {
                 let module = ClassId(mixin.module.clone());
                 !self.fragments.contains_key(&module)
@@ -1851,7 +1997,175 @@ impl<'a> SourceContractIndex<'a> {
                         .declaration(&module, &method, MethodReceiver::Instance, &mut HashSet::default())
                         .is_some()
             }
+        });
+        if mixed { Reopened::Unknown } else { answer }
+    }
+
+    /// `super_leaves_source` for a module: one the app declares in a
+    /// single fragment reopening a runtime module, which no app code
+    /// mixes in anywhere. What it is mixed into is then the runtime's
+    /// classes alone, and from each the lookup goes on from just after
+    /// it ([`external::World::after`]).
+    fn module_super_leaves_source(&self, owner: &ClassId, name: &Symbol) -> bool {
+        let written = owner.0.as_str();
+        let world = external::world();
+        if !self.verified(owner)
+            || self.synthesized.contains(owner)
+            || !self.includes(owner).is_empty()
+            || !world.runtime_declares(written)
+            || !self.module_without_app_includer(owner)
+            || self.dynamic().mixed.contains(last_segment(written))
+            || self.dynamic().touches(last_segment(written))
+        {
+            return false;
+        }
+        let Some(includers) = world.includers(written) else { return false };
+        !includers.is_empty()
+            && includers.iter().all(|&(target, prepend)| {
+                world.after(target, written, prepend, name.as_str(), &|namespace, method| {
+                    self.app_reopens(namespace, method)
+                }) == external::Step::Bound
+            })
+    }
+
+    /// Does the literal block a self-send `call` passes, from an instance
+    /// method of `owner`, stay a block of that method? It does where
+    /// every method the send may reach is a source declaration that only
+    /// yields (no block parameter, `&` or `...`): such a method hands
+    /// the block to no other code, so nothing can make it a method body.
+    fn keeps_block(&self, owner: &ClassId, call: &Expr) -> bool {
+        /// Ruby's own reifiers of a block, and dispatch by name to one.
+        const REIFYING: [&str; 16] = [
+            "define_method", "define_singleton_method", "send", "public_send", "__send__",
+            "instance_method", "method", "public_method", "class_eval", "module_eval",
+            "class_exec", "module_exec", "instance_eval", "instance_exec", "proc", "lambda",
+        ];
+        let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+        if !recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+            || REIFYING.contains(&method.as_str())
+            || self.modules.contains(owner)
+            || self.synthesized.contains(owner)
+            || !self.verified(owner)
+        {
+            return false;
+        }
+        let yields_only = |&(m, synthesized): &(&MethodDef, bool)| {
+            !synthesized && m.block_param.is_none() && !m.has_anonymous_block && !m.params.iter().any(|p| p.forwarding)
+        };
+        let Some(found) = self.declaration(owner, method, MethodReceiver::Instance, &mut HashSet::default()) else {
+            return false;
+        };
+        if !yields_only(&found) {
+            return false;
+        }
+        let Ok(overrides) = self.virtual_calls(owner, method, MethodReceiver::Instance) else { return false };
+        if !overrides.iter().all(yields_only) {
+            return false;
+        }
+        // A module a class body prepends (which the index does not
+        // record) sits before the class's own methods.
+        let mut hierarchy: Vec<&ClassId> = vec![owner];
+        let mut node = owner;
+        while let Some(parent) = self.parent(node) {
+            hierarchy.push(parent);
+            node = parent;
+        }
+        hierarchy.extend(self.descendant_positions(owner).iter().map(|&p| self.virtual_owners[p]));
+        hierarchy.iter().all(|class| {
+            !self.synthesized.contains(*class)
+                && !self.mixed_into(class)
+                && !self.dynamic().touches(last_segment(class.0.as_str()))
+                && self.prepends_without(class, method)
         })
+    }
+
+    /// Every module `class`'s body prepends (which sits before its own
+    /// methods, and which the index does not record) is an app module
+    /// whose own declarations are all it holds, none of them `method`.
+    fn prepends_without(&self, class: &ClassId, method: &Symbol) -> bool {
+        self.dynamic()
+            .prepends
+            .get(class)
+            .is_none_or(|modules| modules.iter().all(|module| self.holds_only_own_without(module.as_ref(), method)))
+    }
+
+    /// `module` is an app module whose own declarations (in verified
+    /// fragments, with no includes, and on no runtime or stdlib name)
+    /// are all it holds, none of them instance method `method`.
+    fn holds_only_own_without(&self, module: Option<&ClassId>, method: &Symbol) -> bool {
+        let world = external::world();
+        module.is_some_and(|module| {
+            self.verified(module)
+                && !world.runtime_declares(module.0.as_str())
+                && !world.stdlib_declares(module.0.as_str())
+                && self.includes(module).is_empty()
+                && !self.dynamic().touches(last_segment(module.0.as_str()))
+                && !self.instance.contains_key(&(module.clone(), method.clone()))
+        })
+    }
+
+    /// Is every instance method `source` declares itself, reached by a
+    /// `super` from `owner`, of the native ABI? `source` must be the
+    /// superclass `owner` names, with nothing between them (no app
+    /// include), and be a core, stdlib or port namespace nothing
+    /// prepends to, whose app reopening (if any) declares only methods
+    /// the Ruby family writes with their source keywords.
+    fn own_methods_native(&self, owner: &ClassId, source: &str) -> bool {
+        let world = external::world();
+        let id = ClassId(Symbol::from(source));
+        if self.modules.contains(owner)
+            || self.synthesized.contains(owner)
+            || !self.verified(owner)
+            || !self.includes(owner).is_empty()
+            || self.parent(owner) != Some(&id)
+            || self.mixed_into(owner)
+            || self.nested_constant(owner, source)
+            || self.mixed_into(&id)
+            || self.dynamic().touches(last_segment(source))
+            || !world.own_methods_native(source)
+        {
+            return false;
+        }
+        if !self.fragments.contains_key(&id) {
+            return true;
+        }
+        self.verified(&id)
+            && !self.synthesized.contains(&id)
+            && !self.dynamic().prepends.contains_key(&id)
+            && self.instance.iter().filter(|((class, _), _)| *class == id).all(|(_, &(own, synthesized))| {
+                !synthesized
+                    && own.unsupported_formals.is_none()
+                    && crate::dialect::Param::keywords_written_as_keywords(&own.params)
+                    && !self.unretained(&own.name_span)
+            })
+    }
+
+    /// Could `written`, a relative constant in the body of `owner` or
+    /// in the namespace around it, name something nested there rather
+    /// than the top-level constant? Every lexical scope the name
+    /// `owner` spells is asked (a superset of the ones its source
+    /// opens): the runtime, the stdlib or the app declaring
+    /// `Scope::written`.
+    fn nested_constant(&self, owner: &ClassId, written: &str) -> bool {
+        if written.starts_with("::") {
+            return false;
+        }
+        let world = external::world();
+        let mut scope = owner.0.as_str();
+        loop {
+            let nested = format!("{scope}::{written}");
+            if world.declares(&nested) || self.fragments.contains_key(&ClassId(Symbol::from(nested.as_str()))) {
+                return true;
+            }
+            match scope.rsplit_once("::") {
+                Some((outer, _)) => scope = outer,
+                None => return false,
+            }
+        }
+    }
+
+    fn dynamic(&self) -> &Dynamic {
+        self.dynamic.get_or_init(|| Dynamic::new(self))
     }
 
     /// `verified_hierarchy` from a fresh walk, memoized.
@@ -1989,6 +2303,175 @@ impl<'a> SourceContractIndex<'a> {
                     })
                     .flatten()
             })
+    }
+}
+
+/// What app code does to names that its class and module fragments do
+/// not show, matched by a name's last segment where a written constant
+/// is not resolved.
+struct Dynamic {
+    /// Names a file-level statement may reopen, mix into or define
+    /// methods on (`Target.prepend(M)`, `Target.class_eval do … end`), or
+    /// a declaration carried only in a file program.
+    touched: HashSet<String>,
+    /// A file-level `Target.include(M)` / `Target.prepend(M)` with
+    /// constant arguments, by the target's last segment: each module
+    /// resolved to an app fragment (`None`: not one) and whether it is
+    /// prepended. It also touches the target ([`Dynamic::touches`]).
+    file_mixins: HashMap<String, Vec<Option<ClassId>>>,
+    /// Modules some `include`, `prepend` or `extend` anywhere in the app
+    /// (a class body, a method body, a file-level statement, an
+    /// initializer) names.
+    mixed: HashSet<String>,
+    /// The modules each app class body prepends, resolved to an app
+    /// fragment (`None`: not one, or not a constant).
+    prepends: HashMap<ClassId, Vec<Option<ClassId>>>,
+}
+
+impl Dynamic {
+    /// A file-level statement may reopen, mix into or define methods on
+    /// the name.
+    fn touches(&self, last: &str) -> bool {
+        self.touched.contains(last) || self.file_mixins.contains_key(last)
+    }
+
+    fn new(index: &SourceContractIndex<'_>) -> Self {
+        use crate::app::ProgramItem;
+        const TOUCH: [&str; 16] = [
+            "include", "prepend", "extend", "class_eval", "module_eval", "class_exec", "module_exec",
+            "instance_eval", "define_method", "alias_method", "remove_method", "undef_method",
+            "send", "public_send", "__send__", "attr_accessor",
+        ];
+        const MIX: [&str; 3] = ["include", "prepend", "extend"];
+        fn const_last(e: &Expr) -> Option<String> {
+            match &*e.node {
+                ExprNode::Const { path } => path.last().map(|s| s.as_str().to_string()),
+                _ => None,
+            }
+        }
+        fn mixes(e: &Expr, mixed: &mut HashSet<String>) {
+            if let ExprNode::Send { method, args, .. } = &*e.node
+                && MIX.contains(&method.as_str())
+            {
+                mixed.extend(args.iter().filter_map(const_last));
+            }
+            e.node.for_each_child(&mut |c| mixes(c, mixed));
+        }
+        fn touches(e: &Expr, touched: &mut HashSet<String>) {
+            if let ExprNode::Send { recv: Some(recv), method, .. } = &*e.node
+                && TOUCH.contains(&method.as_str())
+                && let Some(name) = const_last(recv)
+            {
+                touched.insert(name);
+            }
+            e.node.for_each_child(&mut |c| touches(c, touched));
+        }
+        type Written = (String, Vec<Vec<Symbol>>);
+        /// `Target.include(M, …)` / `Target.prepend(M, …)`, every name
+        /// a constant and no block.
+        fn mixin(e: &Expr) -> Option<Written> {
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else {
+                return None;
+            };
+            if !matches!(method.as_str(), "include" | "prepend") || args.is_empty() {
+                return None;
+            }
+            let target = const_last(recv)?;
+            let modules = args
+                .iter()
+                .map(|arg| match &*arg.node {
+                    ExprNode::Const { path } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((target, modules))
+        }
+        fn items(
+            list: &[ProgramItem],
+            touched: &mut HashSet<String>,
+            mixed: &mut HashSet<String>,
+            written: &mut Vec<Written>,
+        ) {
+            for item in list {
+                match item {
+                    ProgramItem::Statement(e) => {
+                        match mixin(e) {
+                            Some(found) => written.push(found),
+                            None => touches(e, touched),
+                        }
+                        mixes(e, mixed);
+                    }
+                    ProgramItem::Guard(e) => {
+                        touches(e, touched);
+                        mixes(e, mixed);
+                    }
+                    ProgramItem::ClassEval { receiver, .. } => {
+                        touched.extend(const_last(receiver));
+                    }
+                    ProgramItem::Inline(classes) => {
+                        touched.extend(classes.iter().map(|c| last_segment(c.name.0.as_str()).to_string()));
+                    }
+                    ProgramItem::Branch { cond, then_items, else_items, .. } => {
+                        touches(cond, touched);
+                        items(then_items, touched, mixed, written);
+                        items(else_items, touched, mixed, written);
+                    }
+                    ProgramItem::Declared(_) | ProgramItem::Require { .. } | ProgramItem::NotCarried { .. } => {}
+                }
+            }
+        }
+        let app = index.app;
+        let mut touched = HashSet::default();
+        let mut mixed: HashSet<String> = HashSet::default();
+        let mut written = Vec::new();
+        for program in &app.file_programs {
+            items(&program.items, &mut touched, &mut mixed, &mut written);
+        }
+        mixed.extend(app.module_mixins.iter().map(|m| last_segment(m.module.as_str()).to_string()));
+        for (_, method) in methods(app) {
+            mixes(&method.body, &mut mixed);
+        }
+        let resolve = |written: &[Symbol]| -> Option<ClassId> {
+            let joined = written.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+            let suffix = format!("::{joined}");
+            let mut found = index
+                .fragments
+                .keys()
+                .filter(|name| name.0.as_str() == joined || name.0.as_str().ends_with(&suffix));
+            match (found.next(), found.next()) {
+                (Some(name), None) => Some(name.clone()),
+                _ => None,
+            }
+        };
+        let mut file_mixins: HashMap<String, Vec<Option<ClassId>>> = HashMap::default();
+        for (target, modules) in written {
+            file_mixins.entry(target).or_default().extend(modules.iter().map(|path| resolve(path)));
+        }
+        let mut prepends: HashMap<ClassId, Vec<Option<ClassId>>> = HashMap::default();
+        for class in classes(app) {
+            for call in &class.unknown_calls {
+                mixes(call, &mut mixed);
+                if let ExprNode::Send { recv: None, method, args, .. } = &*call.node
+                    && method.as_str() == "prepend"
+                {
+                    let entry = prepends.entry(class.name.clone()).or_default();
+                    for arg in args {
+                        entry.push(match &*arg.node {
+                            ExprNode::Const { path } => resolve(path),
+                            _ => None,
+                        });
+                    }
+                }
+            }
+        }
+        for model in &app.models {
+            for item in &model.body {
+                if let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item {
+                    mixes(expr, &mut mixed);
+                }
+            }
+        }
+        Dynamic { touched, file_mixins, mixed, prepends }
     }
 }
 
