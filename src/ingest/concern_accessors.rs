@@ -801,31 +801,6 @@ pub(super) fn splice_into_library_includers(
             includes: Vec::new(),
             statements: Vec::new(),
         };
-        // A job's own first callback registration, and where its includes
-        // stand in the same file: an include's carried registrations run
-        // where the include is, which the emitted body writes ahead of the
-        // body's own, so they carry only from an include above it.
-        let own_first = if job {
-            lc.unknown_calls
-                .iter()
-                .filter(|c| crate::lower::job_class_side::is_callbacks_port_call(c) && !c.span.is_synthetic())
-                .map(|c| c.span)
-                .min_by_key(|span| (span.file.0, span.start))
-        } else {
-            None
-        };
-        let include_sites = own_first
-            .and_then(|span| span.file.0.checked_sub(1).and_then(|i| sources.get(i as usize)))
-            .map(|source| include_offsets(&source.text, owner))
-            .unwrap_or_default();
-        let precedes_own = |root: usize| -> bool {
-            let Some(first) = own_first else { return true };
-            let id = top(&lc.includes[root]);
-            include_sites
-                .iter()
-                .find(|(written, _)| id.0.as_str() == written || id.0.as_str().ends_with(&format!("::{written}")))
-                .is_some_and(|(_, at)| *at < first.start)
-        };
         let mut accessors: Vec<&Expr> = Vec::new();
         for (root, concern) in &reached {
             let Some(items) = app.concern_model_items.get(concern) else { continue };
@@ -888,25 +863,11 @@ pub(super) fn splice_into_library_includers(
                     && crate::lower::job_class_side::is_callbacks_port_call(expr)
                 {
                     let root_id = top(&lc.includes[*root]);
-                    if precedes_own(*root) {
-                        let class_attributes: &[Symbol] = &declared;
-                        if let ModelBodyItem::Unknown { expr, .. } =
-                            super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
-                        {
-                            plan.statements.push((root_id, expr));
-                        }
-                    } else {
-                        let (span, name) = dropped_statement(item, included_call(app, concern), sources);
-                        let line = own_first
-                            .and_then(|at| at.file.0.checked_sub(1).and_then(|i| sources.get(i as usize)).map(|f| f.line_col(at.start).0))
-                            .unwrap_or(0);
-                        refusals.push((
-                            span,
-                            format!(
-                                "{name} in `included do` of {}: {owner} includes {} below a callback its own body registers (line {line}), and the emitted body registers an include's callbacks ahead of the body's",
-                                concern.0, root_id.0
-                            ),
-                        ));
+                    let class_attributes: &[Symbol] = &declared;
+                    if let ModelBodyItem::Unknown { expr, .. } =
+                        super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined)
+                    {
+                        plan.statements.push((root_id, expr));
                     }
                     continue;
                 }
@@ -1132,56 +1093,6 @@ struct Plan {
     /// (the base's own include it runs after, statement): a job's
     /// callback registrations (`App::included_block_statements`).
     statements: Vec<(ClassId, Expr)>,
-}
-
-/// The modules each `include M, ...` statement of `class`'s body names,
-/// as written, with the statement's offset: where each include runs.
-/// Only the body's own statements, in each declaration of `class` the
-/// file has.
-fn include_offsets(text: &str, class: &str) -> Vec<(String, u32)> {
-    struct Find<'a> {
-        scope: Vec<String>,
-        class: &'a str,
-        out: Vec<(String, u32)>,
-    }
-    impl Find<'_> {
-        fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
-            self.scope.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
-            if let Some(body) = body {
-                if self.scope.join("::") == self.class
-                    && let Some(statements) = body.as_statements_node()
-                {
-                    for statement in statements.body().iter() {
-                        let Some(call) = statement.as_call_node() else { continue };
-                        if call.receiver().is_some() || call.name().as_slice() != b"include" {
-                            continue;
-                        }
-                        let at = call.location().start_offset() as u32;
-                        for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
-                            if arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some() {
-                                let written = String::from_utf8_lossy(arg.location().as_slice());
-                                self.out.push((written.trim_start_matches("::").to_string(), at));
-                            }
-                        }
-                    }
-                }
-                ruby_prism::Visit::visit(self, &body);
-            }
-            self.scope.pop();
-        }
-    }
-    impl<'pr> ruby_prism::Visit<'pr> for Find<'_> {
-        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            self.enter(node.constant_path().location().as_slice(), node.body());
-        }
-        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            self.enter(node.constant_path().location().as_slice(), node.body());
-        }
-    }
-    let mut find = Find { scope: Vec::new(), class: class.trim_start_matches("::"), out: Vec::new() };
-    let parsed = ruby_prism::parse(text.as_bytes());
-    ruby_prism::Visit::visit(&mut find, &parsed.node());
-    find.out
 }
 
 /// The `class_attribute` names a library class body seeds.

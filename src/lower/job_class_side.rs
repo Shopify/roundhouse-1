@@ -90,6 +90,58 @@ pub(crate) fn job_class_names(classes: &[LibraryClass]) -> BTreeSet<String> {
     jobs
 }
 
+/// The modules each `include M, ...` statement of `class`'s body names,
+/// as written, with the statement's offset: where each include runs.
+/// Only the body's own statements, in each declaration of `class` the
+/// file has. The emitter writes a job's include below one of its own
+/// callback registrations where it stands among them
+/// (`emit::ruby::library`).
+pub(crate) fn include_offsets(text: &str, class: &str) -> Vec<(String, u32)> {
+    struct Find<'a> {
+        scope: Vec<String>,
+        class: &'a str,
+        out: Vec<(String, u32)>,
+    }
+    impl Find<'_> {
+        fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+            self.scope.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
+            if let Some(body) = body {
+                if self.scope.join("::") == self.class
+                    && let Some(statements) = body.as_statements_node()
+                {
+                    for statement in statements.body().iter() {
+                        let Some(call) = statement.as_call_node() else { continue };
+                        if call.receiver().is_some() || call.name().as_slice() != b"include" {
+                            continue;
+                        }
+                        let at = call.location().start_offset() as u32;
+                        for arg in call.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                            if arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some() {
+                                let written = String::from_utf8_lossy(arg.location().as_slice());
+                                self.out.push((written.trim_start_matches("::").to_string(), at));
+                            }
+                        }
+                    }
+                }
+                ruby_prism::Visit::visit(self, &body);
+            }
+            self.scope.pop();
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Find<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body());
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body());
+        }
+    }
+    let mut find = Find { scope: Vec::new(), class: class.trim_start_matches("::"), out: Vec::new() };
+    let parsed = ruby_prism::parse(text.as_bytes());
+    ruby_prism::Visit::visit(&mut find, &parsed.node());
+    find.out
+}
+
 /// The port module a job hierarchy that registers callbacks includes
 /// (runtime/spinel/active_job_callbacks.rb).
 pub(crate) const CALLBACKS_PORT: &str = "ActiveJob::Callbacks";
