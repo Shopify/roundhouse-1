@@ -2121,6 +2121,9 @@ pub struct Ctx<'a> {
     /// accessible_to_user(u)`). Unlike `class_self`, bare sends are NOT
     /// query roots (no implicit scoping on an instance).
     pub instance_self: Option<ClassId>,
+    /// A record built or created through an association joins the
+    /// owner's loaded target (see [`Registries::track_targets`]).
+    pub track_targets: bool,
 }
 
 impl Ctx<'_> {
@@ -2182,6 +2185,7 @@ impl Ctx<'_> {
             class_self: self.class_self.clone(),
             instance_self: self.instance_self.clone(),
             user_returns: self.user_returns,
+            track_targets: self.track_targets,
         }
     }
 }
@@ -3584,6 +3588,30 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                                     block,
                                     true,
                                 );
+                                // Rails adds the record to the owner's
+                                // target; a tree that keeps loaded records
+                                // has to as well, or the next read misses
+                                // it. Only for an owner the code can name
+                                // again (another owner expression is a
+                                // fresh record nothing else reads).
+                                let renamable = matches!(&*ir.node,
+                                    ExprNode::SelfRef | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+                                    || owner_reads_once(ir);
+                                if ctx.track_targets && renamable {
+                                    let created = std::mem::replace(expr, syn(span, ExprNode::Seq { exprs: vec![] }));
+                                    *expr = put(
+                                        span,
+                                        Some(const_expr(span, &ClassId(Symbol::from("ActiveRecord::Associations::Association")))),
+                                        Symbol::from("created"),
+                                        vec![
+                                            ir.clone(),
+                                            syn(span, ExprNode::Lit { value: Literal::Sym { value: aname.clone() } }),
+                                            created,
+                                        ],
+                                        None,
+                                        true,
+                                    );
+                                }
                                 return None;
                             }
                         }
@@ -3955,6 +3983,7 @@ fn rewrite_relation_taking_body(
         self_const_is_implicit,
         class_self: None,
         instance_self: None,
+        track_targets: false,
         user_returns: &empty_returns,
     };
     let mut locals = Locals::default();
@@ -3982,6 +4011,7 @@ pub fn rewrite_call_site(
         class_self: class_self.cloned(),
         instance_self: instance_self.cloned(),
         user_returns: regs.user_returns,
+        track_targets: regs.track_targets,
     };
     let mut locals = Locals::default();
     rewrite(expr, &ctx, &mut locals);
@@ -3997,6 +4027,13 @@ pub struct Registries<'a> {
     pub assoc_class_methods: &'a AssocClassMethods,
     pub user_returns: &'a UserMethodReturns,
     pub unique_keys: &'a UniqueKeys,
+    /// The tree keeps a has_many's loaded records and carries the
+    /// association object (the CRuby and JRuby trees of an app that
+    /// reads association state): a constructor through an association
+    /// (`post.comments.create!(…)`) hands its record to
+    /// `ActiveRecord::Associations::Association.created`, which adds it
+    /// to the owner's loaded target as Rails does.
+    pub track_targets: bool,
 }
 
 #[cfg(test)]
@@ -4156,6 +4193,7 @@ mod tests {
             assoc_class_methods: empty_assoc_cm(),
             user_returns: empty_returns(),
             unique_keys: empty_unique_keys(),
+            track_targets: false,
         }
     }
 
@@ -4174,6 +4212,7 @@ mod tests {
             self_const_is_implicit: false,
             class_self: None,
             instance_self: None,
+            track_targets: false,
             user_returns: empty_returns(),
         }
     }
@@ -4442,6 +4481,7 @@ mod tests {
             class_self: None,
             user_returns: empty_returns(),
             instance_self: None,
+            track_targets: false,
         }
     }
 

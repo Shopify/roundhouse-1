@@ -120,6 +120,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             ("reload", nilable_assoc),
             ("reader", Ty::Untyped),
             ("load_target", Ty::Untyped),
+            // The target class (nil for a polymorphic belongs_to with
+            // no type), the association's Relation, and whether a key
+            // write left a loaded target behind.
+            ("klass", Ty::Untyped),
+            ("scope", Ty::Untyped),
+            ("stale_target?", Ty::Bool),
         ] {
             assoc.instance_methods.insert(Symbol::from(m), ty);
         }
@@ -128,6 +134,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             "SingularAssociation",
             "CollectionAssociation",
             "BelongsToAssociation",
+            "BelongsToPolymorphicAssociation",
             "HasOneAssociation",
             "HasManyAssociation",
             "HasManyThroughAssociation",

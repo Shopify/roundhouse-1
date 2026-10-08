@@ -10,10 +10,14 @@
 //!   associations/*_association.rb): the association object, whose
 //!   `loaded?`, `target`, `target =`, `reset`, `reload`, `reader` and
 //!   `load_target` read and write the record's association caches
-//!   (runtime/spinel/active_record_associations.rb). An undeclared name
-//!   raises ActiveRecord::AssociationNotFoundError.
+//!   (runtime/spinel/active_record_associations.rb), with `klass`,
+//!   `scope` and `stale_target?`. Readers memoize as Rails' do, so
+//!   `loaded?` is true after a read that loads. A name the model does
+//!   not have raises ActiveRecord::AssociationNotFoundError; a literal
+//!   one is refused at check, as are the reflection reads not ported
+//!   for a kind (`analyze::association_surface`).
 //!
-//! The probe app below runs natively on Core's pinned activerecord over
+//! The probe apps below run natively on Core's pinned activerecord over
 //! in-memory SQLite (tests/support/rails_oracle.rb) and emitted on CRuby,
 //! and must print the same. Spinel carries neither port and refuses both
 //! reads by name.
@@ -170,8 +174,12 @@ const PROBE: &str = r##"module PortsProbe
     show("preloaded has_one") { [preloaded.association(:cover).loaded?, preloaded.association(:cover).target.url] }
 
     show("another model") { Author.new(name: "x").association(:posts).class.name }
-    show("unknown association") { fresh.association(:nope) }
-    show("unknown on another model") { Cover.new.association(:comments) }
+    # Named by a value, not a literal: a literal name no model has is
+    # refused at check (`analyze::association_surface`).
+    nope = :nope
+    show("unknown association") { fresh.association(nope) }
+    other = "comments"
+    show("unknown on another model") { Cover.new.association(other) }
   end
 end
 "##;
@@ -267,14 +275,29 @@ fn app() -> emit_and_run::Overlay {
 }
 
 fn native() -> String {
+    native_run("ports", SCHEMA, MODELS, "ports_probe", PROBE, "PortsProbe")
+}
+
+/// Run `probe`'s `<module>.run` on Core's pinned activerecord over the
+/// models, required in the order listed.
+fn native_run(
+    tag: &str,
+    schema: &str,
+    models: &[(&str, &str)],
+    probe_file: &str,
+    probe: &str,
+    module: &str,
+) -> String {
     let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle.rb");
-    let dir = std::env::temp_dir().join(format!("rh_errors_association_native_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rh_errors_association_native_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("schema.rb"), SCHEMA).unwrap();
-    std::fs::write(dir.join("ports_probe.rb"), PROBE).unwrap();
+    std::fs::write(dir.join("schema.rb"), schema).unwrap();
+    std::fs::write(dir.join(format!("{probe_file}.rb")), probe).unwrap();
     let mut requires = String::new();
-    for (name, source) in MODELS {
-        std::fs::write(dir.join(format!("{name}.rb")), source).unwrap();
+    for (name, source) in models {
+        let path = dir.join(format!("{name}.rb"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
         requires.push_str(&format!("require_relative {name:?}\n"));
     }
     let program = format!(
@@ -286,8 +309,8 @@ fn native() -> String {
          # A Rails 5+ app's defaults (`load_defaults`): a belongs_to is required.\n\
          ActiveRecord::Base.belongs_to_required_by_default = true\n\
          load File.expand_path(\"schema.rb\", __dir__)\n\
-         {requires}require_relative \"ports_probe\"\n\
-         PortsProbe.run\n"
+         {requires}require_relative {probe_file:?}\n\
+         {module}.run\n"
     );
     std::fs::write(dir.join("native.rb"), program).unwrap();
     let out = Command::new("ruby")
@@ -353,4 +376,341 @@ fn spinel_refuses_both_reads() {
         );
         assert!(!dir.join(file).exists(), "{file} stays off the spinel tree");
     }
+}
+
+// ---- The association surface: every association a model has, what a
+// read leaves loaded, `klass`, `scope`, `stale_target?`, and the
+// CollectionProxy's `reload` / `reset`.
+
+const SURFACE_SCHEMA: &str = r#"ActiveRecord::Schema[8.0].define(version: 1) do
+  create_table "authors", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "posts", force: :cascade do |t|
+    t.string "title"
+    t.string "type"
+    t.integer "author_id"
+  end
+  create_table "comments", force: :cascade do |t|
+    t.string "body"
+    t.integer "post_id"
+  end
+  create_table "notes", force: :cascade do |t|
+    t.string "text"
+    t.integer "post_id"
+  end
+  create_table "stars", force: :cascade do |t|
+    t.integer "post_id"
+    t.string "subject_type"
+    t.integer "subject_id"
+  end
+end
+"#;
+
+/// A belongs_to declared on an abstract base (`Authored`), a has_many
+/// spliced from a concern (`Annotated`), an STI child (`FeaturedPost`)
+/// inheriting both, a polymorphic belongs_to (`Star#subject`) with its
+/// `as:` side, and a has_many :through. In the order native requires
+/// them.
+const SURFACE_MODELS: &[(&str, &str)] = &[
+    ("application_record", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+    ("authored", "class Authored < ApplicationRecord\n  self.abstract_class = true\n  belongs_to :author, optional: true\nend\n"),
+    ("concerns/annotated", "module Annotated\n  extend ActiveSupport::Concern\n\n  included do\n    has_many :notes\n  end\nend\n"),
+    (
+        "author",
+        "class Author < ApplicationRecord\n  has_many :posts\n  has_many :stars, as: :subject\n  has_many :post_comments, through: :posts, source: :comments\nend\n",
+    ),
+    ("post", "class Post < Authored\n  include Annotated\n  has_many :comments\nend\n"),
+    ("featured_post", "class FeaturedPost < Post\nend\n"),
+    ("comment", "class Comment < ApplicationRecord\n  belongs_to :post\nend\n"),
+    ("note", "class Note < ApplicationRecord\n  belongs_to :post\nend\n"),
+    ("star", "class Star < ApplicationRecord\n  belongs_to :post\n  belongs_to :subject, polymorphic: true, optional: true\nend\n"),
+];
+
+const SURFACE_PROBE: &str = r##"module SurfaceProbe
+  def self.show(label)
+    value = begin
+      yield
+    rescue StandardError => e
+      [e.class.name, e.message]
+    end
+    puts "#{label}: #{value.inspect}"
+  end
+
+  def self.run
+    surface
+    edges
+  end
+
+  def self.surface
+    author = Author.create!(name: "a")
+    post = FeaturedPost.create!(title: "t", author_id: author.id)
+    Comment.create!(body: "c1", post_id: post.id)
+    Note.create!(text: "n1", post_id: post.id)
+
+    show("concern has_many") { Post.find(post.id).association(:notes).class.name }
+    show("abstract base belongs_to") { Post.find(post.id).association(:author).class.name }
+
+    show("sti child inherited") { FeaturedPost.find(post.id).association(:notes).class.name }
+
+    r = Post.find(post.id)
+    show("has_many read then loaded?") { r.comments.map(&:body); r.association(:comments).loaded? }
+    show("has_many read then flat loaded?") { r.comments.loaded? }
+    show("has_many target after read") { r.association(:comments).target.map(&:body) }
+    r2 = Post.find(post.id)
+    show("has_many first not loaded") { r2.comments.first.body; r2.association(:comments).loaded? }
+    show("has_many count not loaded") { r2.comments.count; r2.association(:comments).loaded? }
+    show("has_many size not loaded") { r2.comments.size; r2.association(:comments).loaded? }
+    show("has_many empty? not loaded") { r2.comments.empty?; r2.association(:comments).loaded? }
+    r3 = Post.find(post.id)
+    show("loaded then create! through") { r3.comments.to_a; r3.comments.create!(body: "c2"); r3.comments.map(&:body) }
+    show("loaded then create! loaded?") { r3.association(:comments).loaded? }
+    show("loaded then outside create") { Comment.create!(body: "c3", post_id: post.id); r3.comments.map(&:body) }
+    show("reload sees all") { r3.comments.reload.map(&:body) }
+    a = Author.find(author.id)
+    show("belongs_to read then loaded?") { Post.find(post.id).tap { |p| p.author.name }.association(:author).loaded? }
+    show("has_many through author") { a.posts.map(&:title); a.association(:posts).loaded? }
+
+    r4 = Post.find(post.id)
+    show("reset after read") { r4.comments.to_a; r4.comments.reset; r4.association(:comments).loaded? }
+    show("read after reset") { r4.comments.map(&:body) }
+
+    show("klass has_many") { r4.association(:comments).klass.name }
+    show("klass belongs_to inherited") { r4.association(:author).klass.name }
+    show("klass concern") { r4.association(:notes).klass.name }
+    show("scope has_many") { r4.association(:comments).scope.to_a.map(&:body).sort }
+    show("scope has_many count") { r4.association(:comments).scope.count }
+    show("scope belongs_to pick") { r4.association(:author).scope.pick(:name) }
+    show("scope concern") { r4.association(:notes).scope.pick(:text) }
+    star = Star.create!(post_id: post.id, subject_type: "Author", subject_id: author.id)
+    show("klass polymorphic") { Star.find(star.id).association(:subject).klass.name }
+    show("klass polymorphic nil") { Star.new.association(:subject).klass }
+    show("scope polymorphic") { Star.find(star.id).association(:subject).scope.pick(:name) }
+
+    other = Author.create!(name: "b")
+    p1 = Post.find(post.id)
+    show("stale before read") { p1.association(:author).stale_target? }
+    show("stale after read") { p1.author.name; p1.association(:author).stale_target? }
+    show("fk write: loaded?") { p1.author_id = other.id; p1.association(:author).loaded? }
+    show("fk write: stale?") { p1.association(:author).stale_target? }
+    show("fk write: target") { p1.association(:author).target.name }
+    show("fk write: reader") { p1.author.name }
+    show("after re-read: stale?") { p1.association(:author).stale_target? }
+    p2 = Post.find(post.id)
+    show("fk write back: stale?") { p2.author.name; p2.author_id = other.id; p2.author_id = author.id; p2.association(:author).stale_target? }
+    show("fk write back: loaded?") { p2.association(:author).loaded? }
+    p3 = Post.find(post.id)
+    show("fk write unloaded: loaded?") { p3.author_id = other.id; p3.association(:author).loaded? }
+    show("fk write unloaded: stale?") { p3.association(:author).stale_target? }
+    show("writer assign: stale?") { p3.author = author; p3.association(:author).stale_target? }
+    show("has_many stale?") { r4.association(:comments).stale_target? }
+    show("reset clears stale") { p1.author_id = author.id; p1.association(:author).reset; [p1.association(:author).loaded?, p1.association(:author).stale_target?] }
+  end
+
+  # Through, polymorphic and as: reads, and writer assignment.
+  def self.edges
+    author = Author.create!(name: "a")
+    post = Post.create!(title: "t", author_id: author.id)
+    Comment.create!(body: "c1", post_id: post.id)
+    a = Author.find(author.id)
+    show("through before") { a.association(:post_comments).loaded? }
+    show("through read") { a.post_comments.map(&:body) }
+    show("through after read") { a.association(:post_comments).loaded? }
+    show("through flat") { a.post_comments.loaded? }
+    show("through target") { a.association(:post_comments).target.map(&:body) }
+    b = Author.find(author.id)
+    show("through load_target") { b.association(:post_comments).load_target.map(&:body) }
+    show("through loaded after load_target") { [b.association(:post_comments).loaded?, b.post_comments.loaded?] }
+    s = Star.create!(post_id: post.id, subject_type: "Author", subject_id: author.id)
+    st = Star.find(s.id)
+    show("poly before") { st.association(:subject).loaded? }
+    show("poly read") { st.subject.name }
+    show("poly after read") { st.association(:subject).loaded? }
+    au = Author.find(author.id)
+    show("as: read") { au.stars.map(&:id).size }
+    show("as: after") { au.association(:stars).loaded? }
+    pp = Post.find(post.id)
+    show("belongs_to read loaded") { pp.author.name; pp.association(:author).loaded? }
+    other = Author.create!(name: "b")
+    show("belongs_to assign then read") { pp.author = other; pp.author.name }
+    show("belongs_to assign loaded/stale") { [pp.association(:author).loaded?, pp.association(:author).stale_target?] }
+    show("belongs_to assign nil") { pp.author = nil; [pp.author, pp.association(:author).loaded?] }
+    show("poly assign then read") { st.subject = other; st.subject.name }
+    st2 = Star.find(s.id)
+    show("poly fk write") { st2.subject.name; st2.subject_id = other.id; [st2.association(:subject).loaded?, st2.subject.name] }
+    show("poly klass after type write") { st2.subject_type = "Post"; st2.association(:subject).klass.name }
+    a2 = Author.find(author.id)
+    show("through chained where not loaded") { a2.post_comments.where(body: "c1").to_a.size; a2.association(:post_comments).loaded? }
+    show("through first not loaded") { a2.post_comments.first.body; a2.association(:post_comments).loaded? }
+    show("through each loads") { a2.post_comments.each { |c| c.body }; a2.association(:post_comments).loaded? }
+    show("through reload") { Comment.create!(body: "c2", post_id: post.id); a2.post_comments.reload.map(&:body) }
+    show("through reload loaded") { a2.association(:post_comments).target.map(&:body) }
+  end
+end
+"##;
+
+/// Native activerecord's answers, spelled out.
+const SURFACE_EXPECTED: &str = r#"concern has_many: "ActiveRecord::Associations::HasManyAssociation"
+abstract base belongs_to: "ActiveRecord::Associations::BelongsToAssociation"
+sti child inherited: "ActiveRecord::Associations::HasManyAssociation"
+has_many read then loaded?: true
+has_many read then flat loaded?: true
+has_many target after read: ["c1"]
+has_many first not loaded: false
+has_many count not loaded: false
+has_many size not loaded: false
+has_many empty? not loaded: false
+loaded then create! through: ["c1", "c2"]
+loaded then create! loaded?: true
+loaded then outside create: ["c1", "c2"]
+reload sees all: ["c1", "c2", "c3"]
+belongs_to read then loaded?: true
+has_many through author: true
+reset after read: false
+read after reset: ["c1", "c2", "c3"]
+klass has_many: "Comment"
+klass belongs_to inherited: "Author"
+klass concern: "Note"
+scope has_many: ["c1", "c2", "c3"]
+scope has_many count: 3
+scope belongs_to pick: "a"
+scope concern: "n1"
+klass polymorphic: "Author"
+klass polymorphic nil: nil
+scope polymorphic: "a"
+stale before read: false
+stale after read: false
+fk write: loaded?: true
+fk write: stale?: true
+fk write: target: "a"
+fk write: reader: "b"
+after re-read: stale?: false
+fk write back: stale?: false
+fk write back: loaded?: true
+fk write unloaded: loaded?: false
+fk write unloaded: stale?: false
+writer assign: stale?: false
+has_many stale?: false
+reset clears stale: [false, false]
+through before: false
+through read: ["c1"]
+through after read: true
+through flat: true
+through target: ["c1"]
+through load_target: ["c1"]
+through loaded after load_target: [true, true]
+poly before: false
+poly read: "a"
+poly after read: true
+as: read: 1
+as: after: true
+belongs_to read loaded: true
+belongs_to assign then read: "b"
+belongs_to assign loaded/stale: [true, false]
+belongs_to assign nil: [nil, true]
+poly assign then read: "b"
+poly fk write: [true, "b"]
+poly klass after type write: "Post"
+through chained where not loaded: false
+through first not loaded: false
+through each loads: true
+through reload: ["c1", "c2"]
+through reload loaded: ["c1", "c2"]
+"#;
+
+/// An authored test over the same surface.
+const SURFACE_TEST: &str = r#"require "test_helper"
+
+class PostTest < ActiveSupport::TestCase
+  test "the association answers as Rails' does" do
+    author = Author.create!(name: "a")
+    other = Author.create!(name: "b")
+    post = Post.create!(title: "t", author_id: author.id)
+    Comment.create!(body: "c1", post_id: post.id)
+    record = Post.find(post.id)
+    assert_equal Comment, record.association(:comments).klass
+    assert_equal ["c1"], record.association(:comments).scope.to_a.map(&:body)
+    assert_equal "a", record.association(:author).scope.pick(:name)
+    record.comments.map(&:body)
+    assert record.association(:comments).loaded?
+    Comment.create!(body: "c2", post_id: post.id)
+    assert_equal ["c1", "c2"], record.comments.reload.map(&:body)
+    assert_equal "a", record.author.name
+    record.author_id = other.id
+    assert record.association(:author).loaded?
+    assert record.association(:author).stale_target?
+    assert_equal "b", record.author.name
+    assert_not record.association(:author).stale_target?
+    assert_raises(ActiveRecord::AssociationNotFoundError) { record.association(:nope) }
+  end
+end
+"#;
+
+fn surface_app() -> emit_and_run::Overlay {
+    let mut app = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", SURFACE_SCHEMA)
+        .write("lib/surface_probe.rb", SURFACE_PROBE);
+    for (name, source) in SURFACE_MODELS {
+        app = app.write(&format!("app/models/{name}.rb"), source);
+    }
+    app
+}
+
+#[test]
+fn the_association_surface_runs_like_rails() {
+    let run = surface_app().run_ruby("SurfaceProbe.run");
+    run.assert_passes();
+    let probe = std::fs::read_to_string(run.emitted.join("app/models/surface_probe.rb")).unwrap();
+    // The proxy's reload and reset run on the association object.
+    assert!(probe.contains("ActiveRecord::Associations::Association.proxy(r3, :comments, :reload)"), "{probe}");
+    assert!(probe.contains("ActiveRecord::Associations::Association.proxy(r4, :comments, :reset)"), "{probe}");
+    let author = std::fs::read_to_string(run.emitted.join("app/models/author.rb")).unwrap();
+    assert!(author.contains("ActiveRecord::Associations::Association.through(self, :post_comments, "), "{author}");
+    assert_eq!(run.stdout, SURFACE_EXPECTED, "emitted vs Rails' answers");
+    assert_eq!(
+        run.stdout,
+        native_run("surface", SURFACE_SCHEMA, SURFACE_MODELS, "surface_probe", SURFACE_PROBE, "SurfaceProbe"),
+        "emitted vs native activerecord"
+    );
+}
+
+#[test]
+fn an_authored_test_reads_the_surface() {
+    let run = surface_app().write("test/models/post_test.rb", SURFACE_TEST).run_test("test/models/post_test.rb");
+    run.assert_passes();
+    assert!(run.stdout.contains("PostTest: 1 tests passed") || run.stdout.contains("PostTest: 1 test passed"), "{}", run.stdout);
+}
+
+/// What the object cannot answer as Rails does is refused at check, by
+/// name; an authored `assert_raises(ActiveRecord::AssociationNotFoundError)`
+/// around an unknown name is not (the emitted record raises it).
+#[test]
+fn check_refuses_what_the_association_cannot_answer() {
+    let refused = r#"module Refused
+  def self.run
+    post = Post.first
+    post.association(:nope)
+    post.association(:image_attachment)
+    Author.first.association(:post_comments).scope
+    Star.first.association(:subject).stale_target?
+    post.comments.reset.size
+  end
+end
+"#;
+    let (_dir, errors) = surface_app()
+        .write("lib/refused.rb", refused)
+        .write("test/models/post_test.rb", SURFACE_TEST)
+        .emit(BuildTarget::Ruby);
+    for expected in [
+        "`association(:nope)` on Post",
+        "`association(:image_attachment)` on Post",
+        "`association(:post_comments).scope` on Author: not ported for a :through association",
+        "`association(:subject).stale_target?` on Star: not ported for a polymorphic belongs_to",
+        "`comments.reset.size`",
+    ] {
+        assert!(errors.iter().any(|e| e.contains(expected)), "{expected}: {errors:#?}");
+    }
+    assert_eq!(errors.len(), 5, "only the five, not the test's assert_raises: {errors:#?}");
 }
