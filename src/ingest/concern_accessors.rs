@@ -250,6 +250,34 @@ fn validate_activation(
         &includes.iter().map(|(id, edges)| (id.clone(), edges.clone())).collect(),
         framework_shadows,
     );
+    // What a class's superclass chain already includes, transitively. A
+    // library class including such a Concern again is a no-op in Ruby (the
+    // module is in its ancestors): the accessor is the parent's, and
+    // `splice_into_library_includers` rightly supplies nothing here.
+    let parents: HashMap<crate::ClassId, crate::ClassId> = app
+        .library_classes
+        .iter()
+        .filter_map(|lc| Some((lc.name.clone(), lc.parent.clone()?)))
+        .chain(app.models.iter().filter_map(|m| Some((m.name.clone(), m.parent.clone()?))))
+        .collect();
+    let inherited = |owner: &crate::ClassId| -> HashSet<crate::ClassId> {
+        let mut out = HashSet::default();
+        let mut visited = HashSet::default();
+        let mut at = parents.get(owner).cloned();
+        while let Some(parent) = at.take() {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            let mut stack: Vec<crate::ClassId> = includes.get(&parent).cloned().unwrap_or_default();
+            while let Some(id) = stack.pop() {
+                if out.insert(id.clone()) {
+                    stack.extend(includes.get(&id).into_iter().flatten().cloned());
+                }
+            }
+            at = parents.get(&parent).cloned();
+        }
+        out
+    };
     for (owner, direct) in &includes {
         // A survey source refusal already diagnosed an omitted class.
         if deferred.contains(owner) || (!retained.contains(owner) && !modules.contains(owner)) {
@@ -273,8 +301,9 @@ fn validate_activation(
         let mut pending = direct.clone();
         let mut seen = HashSet::default();
         let mut reported = HashSet::default();
+        let ancestors_have = if model.is_none() { inherited(owner) } else { HashSet::default() };
         while let Some(id) = pending.pop() {
-            if !seen.insert(id.clone()) {
+            if !seen.insert(id.clone()) || ancestors_have.contains(&id) {
                 continue;
             }
             if let Some(items) = app.concern_model_items.get(&id) {
