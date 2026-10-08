@@ -6850,7 +6850,9 @@ fn emit_library_class_decl_inner(
         eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect();
     let readers = constant_readers(lc, app, &resolve);
     let mut split: Option<(usize, BTreeSet<String>)> = None;
-    for p in 1..per_const.len() {
+    // A factory class cannot reopen: its header builds the class.
+    let factory_class = matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }));
+    for p in (1..per_const.len()).filter(|_| !factory_class) {
         let mut before: BTreeSet<String> = body_requires.clone();
         before.extend(requires.iter().cloned());
         for q in &per_const[..p] {
@@ -7160,8 +7162,14 @@ fn emit_library_class_decl_inner(
             }
             let pad = body_pad.as_str();
             let mut lines = rendered.lines();
+            // A factory class's body is a block, which keeps the cref
+            // of the scope around it: a bare `NAME =` there writes that
+            // scope's constant. Its own constants (the ones its source
+            // wrote in `class << self`) are written through `self`, the
+            // class the block runs on.
+            let written = if factory_class { format!("self::{}", cname.as_str()) } else { cname.to_string() };
             if let Some(first_line) = lines.next() {
-                writeln!(s, "{pad}{} = {first_line}", cname.as_str()).unwrap();
+                writeln!(s, "{pad}{written} = {first_line}").unwrap();
                 for line in lines {
                     if line.is_empty() {
                         writeln!(s).unwrap();

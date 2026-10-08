@@ -100,6 +100,21 @@ fn body_constant_writes<'pr>(block: &BlockNode<'pr>) -> Vec<ConstantWriteNode<'p
     flatten_statements(body).into_iter().filter_map(|stmt| stmt.as_constant_write_node()).collect()
 }
 
+/// The names of the constants a `class << self` directly in `block`
+/// writes.
+fn singleton_constant_writes(block: &BlockNode<'_>) -> Vec<Symbol> {
+    let Some(body) = block.body() else { return Vec::new() };
+    flatten_statements(body)
+        .into_iter()
+        .filter_map(|stmt| stmt.as_singleton_class_node())
+        .filter(|sc| sc.expression().as_self_node().is_some())
+        .filter_map(|sc| sc.body())
+        .flat_map(flatten_statements)
+        .filter_map(|stmt| stmt.as_constant_write_node())
+        .map(|write| Symbol::from(constant_id_str(&write.name())))
+        .collect()
+}
+
 /// A file-level statement `factory_classes` turns into a class: a
 /// factory with a body block, or a block-less one with literal
 /// members ([`blockless_factory`]).
@@ -315,8 +330,29 @@ fn factory_class(
         .iter()
         .map(|write| Symbol::from(constant_id_str(&write.name())))
         .collect();
-    let body =
-        super::library_class::factory_class_body(block.and_then(|block| block.body()), &owner, &carried, file)?;
+    // The constants a `class << self` in the block writes are the
+    // class's own (`factory_class_body`).
+    let singleton_written = block.map(singleton_constant_writes).unwrap_or_default();
+    // Nested in a class or module body, that `class << self` is indexed
+    // as the ENCLOSING scope's singleton (Rubydex reads `self` there as
+    // the lexical scope, not the block's class), so a read of such a
+    // constant would resolve to `Scope::C`, which nothing defines.
+    if path.len() > 1 && !singleton_written.is_empty() {
+        return Err(unsupported(
+            file,
+            &format!(
+                "constant written in a `class << self` of a {generator} factory body inside a class or module \
+                 body is not modeled"
+            ),
+        ));
+    }
+    let body = super::library_class::factory_class_body(
+        block.and_then(|block| block.body()),
+        &owner,
+        &carried,
+        &singleton_written,
+        file,
+    )?;
     let loc = call.location();
     let span = Span {
         file: super::sources::file_id(file),
@@ -360,7 +396,7 @@ fn factory_class(
         methods,
         nullable_columns: Vec::new(),
         origin: Some(origin),
-        constants: Vec::new(),
+        constants: body.constants,
         unknown_calls: body.unknown_calls,
         class_ivar_initializers: Vec::new(),
         visibility_overrides: body.visibility_overrides,

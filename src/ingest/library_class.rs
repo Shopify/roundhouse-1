@@ -2586,6 +2586,9 @@ fn reject_conditional_accessor(node: &ruby_prism::Node<'_>, file: &str) -> Inges
 pub(super) struct FactoryClassBody {
     pub(super) includes: Vec<ClassId>,
     pub(super) methods: Vec<MethodDef>,
+    /// The constants a `class << self` in the block writes: the class's
+    /// own (see `factory_class_body`).
+    pub(super) constants: Vec<(Symbol, Expr)>,
     pub(super) unknown_calls: Vec<Expr>,
     /// `private :to_h` / `private :member` in the block: visibility of a
     /// method the block does not define (the factory's or an ancestor's).
@@ -2617,14 +2620,23 @@ fn block_constant_value(write: &ruby_prism::ConstantWriteNode<'_>, file: &str) -
 /// reach in. Constants and class variables in the block are lexically
 /// the ENCLOSING scope's (`class_eval` with a block keeps the caller's
 /// cref). The enclosing walk carries the constants the block writes
-/// directly (`carried`, `factory_class::block_constant_writes`); any
-/// other constant the walk reports, and every class variable, is refused.
+/// directly (`carried`, `factory_class::block_constant_writes`).
+///
+/// A `class << self` in the block opens the new class's singleton, a
+/// cref of its own, so a constant written there is the singleton's
+/// (CRuby 4.0: `X.singleton_class.const_defined?(:C, false)`, and not
+/// `Object`'s). Like every `class << self` constant (`singleton_class`)
+/// it is carried on the class itself, here the factory class, whose
+/// singleton methods read it by bare name. Any other constant the walk
+/// reports, and every class variable, is refused.
 pub(super) fn factory_class_body(
     body: Option<ruby_prism::Node<'_>>,
     owner: &ClassId,
     carried: &[Symbol],
+    singleton_written: &[Symbol],
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
+
     let DeclBody {
         includes,
         mut methods,
@@ -2642,7 +2654,12 @@ pub(super) fn factory_class_body(
                 .into(),
         });
     }
-    if constants.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
+    // A name written both in the block and in its `class << self` names
+    // two constants, which one list of the class's cannot hold apart.
+    let (own, enclosing): (Vec<_>, Vec<_>) =
+        constants.into_iter().partition(|(name, _)| singleton_written.contains(name));
+    if singleton_written.iter().any(|name| carried.contains(name))
+        || enclosing.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: "constant or class variable assigned inside a Struct.new/Data.define body block \
@@ -2651,7 +2668,7 @@ pub(super) fn factory_class_body(
         });
     }
     admit_nameless_rest(&mut methods);
-    Ok(FactoryClassBody { includes, methods, unknown_calls, visibility_overrides })
+    Ok(FactoryClassBody { includes, methods, constants: own, unknown_calls, visibility_overrides })
 }
 
 fn walk_decl_body<'pr>(

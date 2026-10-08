@@ -391,6 +391,10 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
             "X = Struct.new(:a) do\n  Inner = Data.define(:b) do\n    def c = b\n  end\n  def d = a\nend\n",
             "Struct.new/Data.define body block nested in another one is not modeled",
         ),
+        (
+            "module X\n  P = Struct.new(:a) do\n    class << self\n      C = 1\n      def c = C\n    end\n  end\nend\n",
+            "constant written in a `class << self` of a Struct factory body inside a class or module body",
+        ),
     ] {
         survey::activate();
         let result = ingest_app_from_tree(HashMap::from_iter([(
@@ -484,4 +488,54 @@ fn a_factory_class_in_other_class_method_carriers_is_refused() {
         gaps.iter().any(|gap| gap.to_string().contains("in a singleton or class-method carrier is not modeled")),
         "{gaps:?}"
     );
+}
+
+/// A constant written in a `class << self` of a factory block is the new
+/// class's singleton's (Core's `EmbeddedAppliedDiscount::
+/// PERSISTED_ATTRIBUTES`), not the enclosing scope's: `class << self`
+/// opens a cref of its own. It is carried on the class, as every
+/// `class << self` constant is, and written through `self` in the
+/// emitted block, whose bare writes would land on the scope around it.
+/// Rubydex does not index that singleton at file level, so its reads
+/// (the singleton's constant, a top-level class and its constant) are
+/// typed by their full names.
+#[test]
+fn constants_in_a_factory_blocks_class_self_belong_to_the_class() {
+    const DISCOUNT: &str = r##"Discount = Struct.new(:amount, :title, keyword_init: true) do
+  class << self
+    def new(amount:, title: nil)
+      instance = allocate
+      instance.send(:initialize, amount: amount, title: title)
+      instance
+    end
+
+    PERSISTED = [:amount, :title].freeze
+    private_constant :PERSISTED
+
+    def persisted = PERSISTED
+
+    def from_h(hash) = Discount.new(amount: hash.fetch("amount") * Rate::FACTOR)
+  end
+
+  def encode = self.class.persisted.map { |a| public_send(a) }
+end
+"##;
+    const RATE: &str = "class Rate\n  FACTOR = 2\nend\n";
+    let script = "p Discount.new(amount: 3).encode, Discount.from_h(\"amount\" => 4).amount, \
+                  Object.const_defined?(:PERSISTED)\n";
+    let expected = "[3, nil]\n8\nfalse\n";
+    let native = Command::new("ruby")
+        .arg("-e")
+        .arg(format!("{RATE}\n{DISCOUNT}\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected);
+
+    let run = emit_and_run::real_blog()
+        .write("app/lib/discount.rb", DISCOUNT)
+        .write("app/lib/rate.rb", RATE)
+        .run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
 }
