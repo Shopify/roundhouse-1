@@ -189,7 +189,7 @@ fn a_dropped_files_signatures_do_not_register_its_class() {
     let text = check_with_dropped_registry();
     assert!(text.contains("error[ingest_unsupported]: visibility of a foreign or nested singleton class is not modeled"), "{text}");
     assert!(
-        text.contains("dropped by ingest gap: Payments::Registry is defined in"),
+        text.contains("ingest gap in components/payments/app/lib/payments/registry.rb: Payments::Registry was not compiled"),
         "the reference names the gap:\n{text}"
     );
     assert!(!text.contains("no known method `size`"), "{text}");
