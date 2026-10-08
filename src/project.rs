@@ -3852,6 +3852,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         .map_err(|e| format!("read deprecation runtime: {e}"))?;
     files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
     let deprecation_behavior = deprecation_behavior_block(app);
+    // Active Job's error classes (8.2.0.alpha enqueuing.rb, core.rb,
+    // arguments.rb), which `require "active_job"` defines before app code.
+    let job_errors = crate::runtime_files::read_to_string("runtime/spinel/active_job_errors.rb")
+        .map_err(|e| format!("read active job errors runtime: {e}"))?;
+    files.push(("runtime/active_job_errors.rb".into(), job_errors));
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
@@ -3919,6 +3924,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 "# `require \"active_support\"` loads active_support/deprecation and\n\
                  # deprecator before any app code: ActiveSupport::Deprecation, ported.\n\
                  require_relative \"runtime/active_support_deprecation\"\n\
+                 # `require \"active_job\"` defines its error classes before app code.\n\
+                 require_relative \"runtime/active_job_errors\"\n\
                  # `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
                  # (railties rails.rb:13): `Rails.backtrace_cleaner`, ported.\n\
                  require_relative \"runtime/active_support_backtrace_cleaner\"\n\
@@ -8549,6 +8556,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_lazy_load_hooks.rb"
         && p != "runtime/active_support_backtrace_cleaner.rb"
         && p != "runtime/active_support_deprecation.rb"
+        && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_record_log_subscriber.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the

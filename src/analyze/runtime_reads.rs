@@ -45,6 +45,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
     ("runtime/spinel/active_support_deprecation.rb", "runtime/active_support_deprecation.rb"),
+    ("runtime/spinel/active_job_errors.rb", "runtime/active_job_errors.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
@@ -670,6 +671,11 @@ mod tests {
             ("ActiveSupport::Deprecation::Deprecators", "runtime/active_support_deprecation.rb"),
             ("ActiveSupport::Deprecation::Reporting", "runtime/active_support_deprecation.rb"),
             ("ActiveSupport::DeprecationException", "runtime/active_support_deprecation.rb"),
+            ("ActiveJob::EnqueueError", "runtime/active_job_errors.rb"),
+            ("ActiveJob::UnknownJobClassError", "runtime/active_job_errors.rb"),
+            ("ActiveJob::DeserializationError", "runtime/active_job_errors.rb"),
+            ("ActiveJob::DeserializationError::RecordNotFound", "runtime/active_job_errors.rb"),
+            ("ActiveJob::SerializationError", "runtime/active_job_errors.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
         ] {
@@ -678,6 +684,7 @@ mod tests {
         assert!(!names.contains_key("ActiveSupport"), "{names:?}");
         assert!(!names.contains_key("Rails"), "{names:?}");
         assert!(!names.contains_key("Rails::Application"), "{names:?}");
+        assert!(!names.contains_key("ActiveJob::Base"), "{names:?}");
         // active_support_ext.rb and security_utils.rb declare these for
         // every target.
         assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");
