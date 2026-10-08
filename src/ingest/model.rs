@@ -769,6 +769,40 @@ pub(super) fn ingest_model_body_items(
     if let Some(call) = stmt.as_call_node() {
         if call.receiver().is_none() {
             let name = constant_id_str(&call.name()).to_string();
+            if name == "with_options" && call.block().is_some_and(|b| b.as_block_node().is_some()) {
+                let mut defaults = class_attr_defaults;
+                if let Some(sources) = with_options_calls(&call, file) {
+                    let mut out = Vec::new();
+                    let mut comments = Some(leading_comments.clone());
+                    let mut complete = true;
+                    for (source, start) in &sources {
+                        let result = super::prism::parse(source, file);
+                        let root = result.node();
+                        let Some(inner) = root
+                            .as_program_node()
+                            .into_iter()
+                            .flat_map(|p| p.statements().body().iter().collect::<Vec<_>>())
+                            .find(|s| s.location().start_offset() == *start)
+                        else {
+                            complete = false;
+                            break;
+                        };
+                        let leading = comments.take().unwrap_or_default();
+                        out.extend(ingest_model_body_items(&inner, owner, file, leading, defaults.as_deref_mut())?);
+                    }
+                    if complete {
+                        return Ok(out);
+                    }
+                }
+                super::survey::record(&IngestError::Unsupported {
+                    file: file.to_string(),
+                    message: format!(
+                        "with_options on line {} not expanded: only literal symbol-keyed options over plain calls are merged, so its declarations do not run",
+                        super::sources::line_at(file, call.location().start_offset()).unwrap_or(0)
+                    ),
+                });
+                return Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?]);
+            }
             if let Some(parsed) = super::validates::parse_validation_call(&call, file)? {
                 return Ok(parsed
                     .into_iter()
@@ -832,6 +866,143 @@ pub(super) fn ingest_model_body_items(
         }
     }
     Ok(vec![ingest_model_body_item(stmt, owner, file, leading_comments)?])
+}
+
+/// `with_options inverse_of: :account, foreign_key: :account_id do … end`
+/// (or `do |o| o.has_many … end`): Rails' `OptionMerger` deep-merges the
+/// options into every call in the block, the call's own options winning.
+/// Core's `ShopifyPayments::Account` declares `capabilities` and ten other
+/// associations that way; the block was one Unknown item, so they were
+/// never registered (every read `no known method`) and, like the
+/// `with_options presence: true do validates …` rules in 35 Core models,
+/// did not run in the emitted app.
+///
+/// Each inner call is re-read from a copy of the file whose bytes before
+/// it are blanked (newlines kept) and whose option hashes get the missing
+/// outer pairs appended, so its own spans and lines are the file's. The
+/// copies come back as `(source, start offset)`. `None` declines: options
+/// that are not literal symbol-keyed pairs, a statement that is not a
+/// plain call, a bare call beside a block parameter (Rails sends it to
+/// `self` unmerged), a call whose only argument is a proc (Rails wraps
+/// it), or a nested `with_options`.
+fn with_options_calls(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<Vec<(Vec<u8>, usize)>> {
+    fn symbol_key(pair: &Node<'_>) -> Option<Vec<u8>> {
+        let assoc = pair.as_assoc_node()?;
+        assoc.key().as_symbol_node().map(|s| s.unescaped().to_vec())
+    }
+    fn pairs<'pr>(hash: &Node<'pr>) -> Option<Vec<Node<'pr>>> {
+        let elements = match (hash.as_keyword_hash_node(), hash.as_hash_node()) {
+            (Some(h), _) => h.elements(),
+            (_, Some(h)) => h.elements(),
+            _ => return None,
+        };
+        let out: Vec<Node<'pr>> = elements.iter().collect();
+        out.iter().all(|p| symbol_key(p).is_some()).then_some(out)
+    }
+    // Insertions `(offset, text)` that deep-merge `outer` into `inner`.
+    fn merge(outer: &[Node<'_>], inner: &Node<'_>, edits: &mut Vec<(usize, String)>) -> Option<()> {
+        let own = pairs(inner)?;
+        let mut missing = Vec::new();
+        for pair in outer {
+            let key = symbol_key(pair)?;
+            match own.iter().find(|p| symbol_key(p).as_deref() == Some(key.as_slice())) {
+                None => missing.push(String::from_utf8_lossy(pair.location().as_slice()).into_owned()),
+                Some(mine) => {
+                    let (theirs, mine) = (pair.as_assoc_node()?.value(), mine.as_assoc_node()?.value());
+                    if theirs.as_hash_node().is_some() && mine.as_hash_node().is_some() {
+                        merge(&pairs(&theirs)?, &mine, edits)?;
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Some(());
+        }
+        let text = missing.join(", ");
+        match inner.as_hash_node() {
+            Some(h) => {
+                let sep = if own.is_empty() { " " } else { ", " };
+                edits.push((h.closing_loc().start_offset(), format!("{sep}{text} ")));
+            }
+            None => edits.push((inner.location().end_offset(), format!(", {text}"))),
+        }
+        Some(())
+    }
+
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [options] = args.as_slice() else { return None };
+    let outer = pairs(options)?;
+    let block = call.block()?.as_block_node()?;
+    let param = match block.parameters() {
+        None => None,
+        Some(params) => {
+            let params = params.as_block_parameters_node()?.parameters()?;
+            let required: Vec<Node<'_>> = params.requireds().iter().collect();
+            let [only] = required.as_slice() else { return None };
+            if params.optionals().iter().next().is_some() || params.rest().is_some() || params.keywords().iter().next().is_some() {
+                return None;
+            }
+            Some(only.as_required_parameter_node()?.name().as_slice().to_vec())
+        }
+    };
+    let text = super::sources::text_of_file(super::sources::file_id(file))?;
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    for stmt in flatten_statements(block.body()?) {
+        let inner = stmt.as_call_node()?;
+        if constant_id_str(&inner.name()) == "with_options" {
+            return None;
+        }
+        let (start, end) = (stmt.location().start_offset(), stmt.location().end_offset());
+        if bytes.get(start..end) != Some(stmt.location().as_slice()) {
+            return None;
+        }
+        let mut blank: Vec<(usize, usize)> = Vec::new();
+        // Where the re-read call begins: past a blanked `o.`.
+        let mut call_start = start;
+        match (inner.receiver(), &param) {
+            (None, None) => {}
+            (Some(recv), Some(name)) => {
+                let local = recv.as_local_variable_read_node()?;
+                if local.name().as_slice() != name.as_slice() {
+                    return None;
+                }
+                call_start = inner.message_loc()?.start_offset();
+                blank.push((recv.location().start_offset(), call_start));
+            }
+            _ => return None,
+        }
+        let mut edits: Vec<(usize, String)> = Vec::new();
+        let own: Vec<Node<'_>> = inner.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let last = own.last()?;
+        if last.as_keyword_hash_node().is_some() || last.as_hash_node().is_some() {
+            merge(&outer, last, &mut edits)?;
+        } else if own.len() == 1 && last.as_lambda_node().is_some() {
+            return None;
+        } else {
+            let text: Vec<String> =
+                outer.iter().map(|p| String::from_utf8_lossy(p.location().as_slice()).into_owned()).collect();
+            edits.push((last.location().end_offset(), format!(", {}", text.join(", "))));
+        }
+        edits.sort_by_key(|(at, _)| *at);
+        let mut source: Vec<u8> = bytes[..start].iter().map(|&b| if b == b'\n' { b'\n' } else { b' ' }).collect();
+        let mut at = start;
+        for (offset, insert) in edits {
+            source.extend(bytes[at..offset].iter().enumerate().map(|(i, &b)| {
+                let pos = at + i;
+                if blank.iter().any(|(s, e)| (*s..*e).contains(&pos)) { b' ' } else { b }
+            }));
+            source.extend_from_slice(insert.as_bytes());
+            at = offset;
+        }
+        source.extend(bytes[at..end].iter().enumerate().map(|(i, &b)| {
+            let pos = at + i;
+            if blank.iter().any(|(s, e)| (*s..*e).contains(&pos)) { b' ' } else { b }
+        }));
+        source.push(b'\n');
+        out.push((source, call_start));
+    }
+    Some(out)
 }
 
 /// `mattr_*` / `cattr_*` with documented Rails defaults: `default:` and a
