@@ -146,6 +146,7 @@ fn tiny_blog_round_trips() {
         library_classes: vec![],
         current_attribute_classes: vec![],
         carried_included_blocks: vec![],
+        included_block_statements: Default::default(),
         initializer_filters: Vec::new(),
         initializer_files: Vec::new(),
         initializer_gaps: Vec::new(),
