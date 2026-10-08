@@ -1088,6 +1088,16 @@ module Db
     v.nil? ? nil : v.to_f
   end
 
+  # A decimal column's value as the driver decodes it (a BigDecimal, or
+  # the column's text), for its type to cast; never a Float.
+  def self.column_decimal(handle, i)
+    handle[:row][i]
+  end
+
+  def self.column_decimal_opt(handle, i)
+    handle[:row][i]
+  end
+
   def self.column_text_opt(handle, i)
     v = handle[:row][i]
     v.nil? ? nil : v.to_s

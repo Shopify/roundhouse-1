@@ -28,6 +28,9 @@ module Db
   def self.column_float_opt: (Integer, Integer) -> Float?
   def self.column_text_opt: (Integer, Integer) -> String?
   def self.column_bool_opt: (Integer, Integer) -> bool?
+  # A decimal column's decoded value (BigDecimal or text), uncast.
+  def self.column_decimal: (Integer, Integer) -> untyped
+  def self.column_decimal_opt: (Integer, Integer) -> untyped
   def self.finalize: (Integer) -> void
   # Placeholder binding (roundhouse#12) — bind a `?` param (1-based) on a
   # prepared stmt before the first step?, when the ROUNDHOUSE_PARAM_BINDS

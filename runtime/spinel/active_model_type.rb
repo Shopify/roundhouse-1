@@ -6,18 +6,21 @@
 # trees: Type::Value, SerializeCastValue, the Immutable / Mutable /
 # Numeric / Timezone / TimeValue / AcceptsMultiparameterTime helpers,
 # Type::{ImmutableString,String,Integer,BigInteger,Binary,Boolean,DateTime,
-# Decimal}, and ActiveRecord::Type::{Value,ImmutableString,String,Integer,
-# BigInteger,Binary,Boolean,Decimal} (the same classes), ActiveRecord::Type::Text, ActiveRecord::Type::DateTime
-# with Internal::Timezone. An app that builds column types itself needs
+# Decimal,Float,Date}, and ActiveRecord::Type::{Value,ImmutableString,String,Integer,
+# BigInteger,Binary,Boolean,Decimal,Float} (the same classes), ActiveRecord::Type::Text,
+# ActiveRecord::Type::{DateTime,Date} with Internal::Timezone, and
+# PostgreSQL's OID::{Bytea,Decimal,Date,DateTime,Timestamp,Uuid}. An app that builds column types itself needs
 # them, for example Core's DeveloperDashboard::FastDev::TablelessSchema,
 # which builds `ActiveRecord::Type::Integer.new(limit: 8)` and its
 # siblings at load.
 #
 # Each method follows the 8.2.0.alpha source (activemodel
 # lib/active_model/type/{value,serialize_cast_value,immutable_string,
-# string,integer,big_integer,binary,boolean,date_time,decimal}.rb and type/helpers/*.rb; activerecord
-# lib/active_record/type/{text,date_time}.rb and type/internal/
-# timezone.rb). tests/active_model_type_runtime.rb runs the same
+# string,integer,big_integer,binary,boolean,date_time,decimal,float,date}.rb and type/helpers/*.rb; activerecord
+# lib/active_record/type/{text,date_time,date}.rb, type/internal/
+# timezone.rb and connection_adapters/postgresql/oid/{decimal,date,
+# date_time,timestamp,uuid}.rb). The compiled models' column writers
+# cast through these (runtime `Base._cast_column`). tests/active_model_type_runtime.rb runs the same
 # observations against that native ActiveModel and this file and
 # requires them equal.
 #
@@ -42,7 +45,7 @@
 #   answer Rails' adapter gives with `decode_bytea` and marks
 #   `@ar_pg_bytea_decoded`. So a String it deserializes counts as
 #   decoded and is not unescaped again.
-# - The other types (Date, Time, Float, Json) are not
+# - The other types (Time, Json) are not
 #   ported. The registries are (see the end of this file); a built-in
 #   name whose class is missing raises NotImplementedError on lookup,
 #   and the runtime's `type_for_attribute` raises it for a column whose
@@ -886,6 +889,90 @@ module Type
           end
         end
     end
+
+    # activemodel lib/active_model/type/float.rb.
+    class Float < Value
+      include Helpers::Numeric
+
+      def type
+        :float
+      end
+
+      def type_cast_for_schema(value)
+        return "::Float::NAN" if value.respond_to?(:nan?) && value.nan?
+
+        case value
+        when ::Float::INFINITY then "::Float::INFINITY"
+        when -::Float::INFINITY then "-::Float::INFINITY"
+        else super
+        end
+      end
+
+      private
+        def cast_value(value)
+          case value
+          when ::Float then value
+          when "Infinity" then ::Float::INFINITY
+          when "-Infinity" then -::Float::INFINITY
+          when "NaN" then ::Float::NAN
+          else value.to_f
+          end
+        end
+    end
+
+    # activemodel lib/active_model/type/date.rb.
+    class Date < Value
+      include Helpers::Timezone
+      include Helpers::AcceptsMultiparameterTime.new
+
+      def type
+        :date
+      end
+
+      # `value.to_fs(:db)` is a Date's ISO 8601 text.
+      def type_cast_for_schema(value)
+        value.iso8601.inspect
+      end
+
+      private
+        def cast_value(value)
+          if value.is_a?(::String)
+            return if value.empty?
+            fast_string_to_date(value) || fallback_string_to_date(value)
+          elsif value.respond_to?(:to_date)
+            value.to_date
+          else
+            value
+          end
+        end
+
+        ISO_DATE = /\A(\d{4})-(\d\d)-(\d\d)\z/
+        def fast_string_to_date(string)
+          if string =~ ISO_DATE
+            new_date $1.to_i, $2.to_i, $3.to_i
+          end
+        end
+
+        def fallback_string_to_date(string)
+          parts = begin
+            ::Date._parse(string, false)
+          rescue ArgumentError
+          end
+
+          new_date(*parts.values_at(:year, :mon, :mday)) if parts
+        end
+
+        def new_date(year, mon, mday)
+          unless year.nil? || (year == 0 && mon == 0 && mday == 0)
+            ::Date.new(year, mon, mday) rescue nil
+          end
+        end
+
+        def value_from_multiparameter_assignment(*)
+          time = super
+          time && new_date(time.year, time.mon, time.mday)
+        end
+    end
   end
 end
 
@@ -931,11 +1018,16 @@ module ActiveRecord
     BigInteger = ActiveModel::Type::BigInteger
     Binary = ActiveModel::Type::Binary
     Decimal = ActiveModel::Type::Decimal
+    Float = ActiveModel::Type::Float
     ImmutableString = ActiveModel::Type::ImmutableString
     String = ActiveModel::Type::String
     Value = ActiveModel::Type::Value
 
     class DateTime < ActiveModel::Type::DateTime
+      include Internal::Timezone
+    end
+
+    class Date < ActiveModel::Type::Date
       include Internal::Timezone
     end
 
@@ -1229,6 +1321,110 @@ module ActiveRecord
             end
           end
         end
+
+        # oid/decimal.rb: a numeric column.
+        class Decimal < ActiveModel::Type::Decimal # :nodoc:
+          def infinity(options = {})
+            BigDecimal("Infinity") * (options[:negative] ? -1 : 1)
+          end
+        end
+
+        # oid/date.rb: a date column; PostgreSQL's infinities and BC dates.
+        class Date < ActiveRecord::Type::Date # :nodoc:
+          def cast_value(value)
+            case value
+            when "infinity" then ::Float::INFINITY
+            when "-infinity" then -::Float::INFINITY
+            when / BC$/
+              value = value.sub(/^\d+/) { |year| format("%04d", -year.to_i + 1) }
+              super(value.delete_suffix!(" BC"))
+            else
+              super
+            end
+          end
+
+          def type_cast_for_schema(value)
+            case value
+            when ::Float::INFINITY then "::Float::INFINITY"
+            when -::Float::INFINITY then "-::Float::INFINITY"
+            else super
+            end
+          end
+        end
+
+        # oid/date_time.rb.
+        class DateTime < ActiveRecord::Type::DateTime # :nodoc:
+          def cast_value(value)
+            case value
+            when "infinity" then ::Float::INFINITY
+            when "-infinity" then -::Float::INFINITY
+            when / BC$/
+              value = value.sub(/^\d+/) { |year| format("%04d", -year.to_i + 1) }
+              super(value.delete_suffix!(" BC"))
+            else
+              super
+            end
+          end
+
+          def type_cast_for_schema(value)
+            case value
+            when ::Float::INFINITY then "::Float::INFINITY"
+            when -::Float::INFINITY then "-::Float::INFINITY"
+            else super
+            end
+          end
+
+          protected
+            # `PostgreSQLAdapter.datetime_type` is :timestamp unless an
+            # app sets it, which the tree does not model.
+            def real_type_unless_aliased(real_type)
+              real_type == :timestamp ? :datetime : real_type
+            end
+        end
+
+        # oid/timestamp.rb: a `timestamp without time zone` column.
+        class Timestamp < DateTime # :nodoc:
+          def type
+            real_type_unless_aliased(:timestamp)
+          end
+        end
+
+        # oid/uuid.rb.
+        class Uuid < ActiveModel::Type::Value # :nodoc:
+          ACCEPTABLE_UUID = %r{\A(\{)?([a-fA-F0-9]{4}-?){8}(?(1)\}|)\z}
+          CANONICAL_UUID = %r{\A[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\z}
+
+          alias :serialize :deserialize
+
+          def type
+            :uuid
+          end
+
+          def changed?(old_value, new_value, _new_value_before_type_cast)
+            old_value.class != new_value.class ||
+              new_value != old_value
+          end
+
+          def changed_in_place?(raw_old_value, new_value)
+            raw_old_value.class != new_value.class ||
+              new_value != raw_old_value
+          end
+
+          private
+            def cast_value(value)
+              value = value.to_s
+              format_uuid(value) if value.match?(ACCEPTABLE_UUID)
+            end
+
+            def format_uuid(uuid)
+              if uuid.match?(CANONICAL_UUID)
+                uuid
+              else
+                uuid = uuid.delete("{}-").downcase
+                "#{uuid[..7]}-#{uuid[8..11]}-#{uuid[12..15]}-#{uuid[16..19]}-#{uuid[20..]}"
+              end
+            end
+        end
       end
     end
   end
@@ -1298,10 +1494,10 @@ module ActiveModel
     register(:big_integer, Type::BigInteger)
     register(:binary, Type::Binary)
     register(:boolean, Type::Boolean)
-    register(:date, &unported_registration("ActiveModel::Type::Date"))
+    register(:date, Type::Date)
     register(:datetime, Type::DateTime)
     register(:decimal, Type::Decimal)
-    register(:float, &unported_registration("ActiveModel::Type::Float"))
+    register(:float, Type::Float)
     register(:immutable_string, Type::ImmutableString)
     register(:integer, Type::Integer)
     register(:string, Type::String)
@@ -1471,10 +1667,10 @@ module ActiveRecord
     register(:big_integer, Type::BigInteger, override: false)
     register(:binary, Type::Binary, override: false)
     register(:boolean, Type::Boolean, override: false)
-    register(:date, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Date"))
+    register(:date, Type::Date, override: false)
     register(:datetime, Type::DateTime, override: false)
     register(:decimal, Type::Decimal, override: false)
-    register(:float, override: false, &ActiveModel::Type.unported_registration("ActiveModel::Type::Float"))
+    register(:float, Type::Float, override: false)
     register(:integer, Type::Integer, override: false)
     register(:immutable_string, Type::ImmutableString, override: false)
     register(:json, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Json"))

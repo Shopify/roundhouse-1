@@ -11540,9 +11540,10 @@ fn carries_active_support_messages(files: &[(String, String)]) -> bool {
 const ACTIVE_MODEL_TYPE_NAMES: &[&str] = &["ActiveModel::Type", "ActiveRecord::Type", "ActiveModel::RangeError"];
 
 /// The runtime methods that build the port's type objects
-/// (`connection.rb`'s `type_for_attribute` / `attribute_types`): an app
+/// (`connection.rb`'s `type_for_attribute` / `attribute_types`, and
+/// `_cast_column`, which a compiled column writer casts through): an app
 /// that asks a model for one needs the classes as much as one naming them.
-const ACTIVE_MODEL_TYPE_METHODS: &[&str] = &["type_for_attribute", "attribute_types"];
+const ACTIVE_MODEL_TYPE_METHODS: &[&str] = &["type_for_attribute", "attribute_types", "_cast_column"];
 
 /// True where the app's own emitted code (not the runtime, not a test
 /// body) names a namespace the type port declares, in any position a

@@ -916,10 +916,23 @@ module ActiveRecord
       type ? type.deserialize(value) : _cast_primary_key(value)
     end
     
+    # A compiled column writer's cast (emit::ruby::attribute_cast):
+    # attribute.rb's FromUser, `type.cast(value)` with the column's type.
+    def self._cast_column(name, value)
+      type_for_attribute(name).cast(value)
+    end
+
+    # The spec's type: PostgreSQL's type map answers its OID classes for
+    # a decimal, date, timestamp and uuid column.
     def self._cast_type_for_spec(name, spec)
       kind = spec[0]
       case kind
       when :integer then ActiveRecord::Type::Integer.new(limit: spec[1])
+      when :float then ActiveRecord::Type::Float.new
+      when :decimal then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Decimal.new(precision: spec[1], scale: spec[2])
+      when :date then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Date.new
+      when :timestamp then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Timestamp.new(precision: spec[1])
+      when :uuid then ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid.new
       when :big_integer then ActiveRecord::Type::BigInteger.new
       when :string then ActiveRecord::Type::String.new(limit: spec[1])
       when :text then ActiveRecord::Type::Text.new
@@ -1119,7 +1132,7 @@ module ActiveRecord
     # baseline-at-hydration is future work.
     def __track_saved_changes(was_new)
       previous = @__last_saved_attributes
-      current = attributes
+      current = _attribute_snapshot
       changes = {}
       current.each do |key, value|
         prev = previous.nil? ? nil : previous[key]
@@ -1151,8 +1164,17 @@ module ActiveRecord
       pair.nil? ? nil : pair[0]
     end
 
+    # What Dirty compares: a compiled model's String-keyed column values
+    # without the id, the temporal ones as their stored text
+    # (emit::ruby::attribute_cast keeps the lowering's hash under this
+    # name beside the public `attributes`). Any other record's is its
+    # `attributes`.
+    def _attribute_snapshot
+      attributes
+    end
+
     def _note_hydrated
-      @__last_saved_attributes = attributes
+      @__last_saved_attributes = _attribute_snapshot
       nil
     end
 
@@ -1192,7 +1214,7 @@ module ActiveRecord
     def changes_to_save
       previous = @__last_saved_attributes
       changes = {}
-      attributes.each do |key, value|
+      _attribute_snapshot.each do |key, value|
         prev = previous.nil? ? nil : previous[key]
         changes[key] = [prev, value] if prev != value
       end
@@ -1201,11 +1223,11 @@ module ActiveRecord
 
     # Rails' `<col>_was`: the value before the pending change, or the
     # current value when nothing is pending. Both halves are the
-    # `attributes` form, so a datetime column answers its raw stored
-    # text, as `attribute_previously_was` already does.
+    # `_attribute_snapshot` form, so a datetime column answers its raw
+    # stored text, as `attribute_previously_was` already does.
     def attribute_was(name)
       pair = changes_to_save[name]
-      pair.nil? ? attributes[name] : pair[0]
+      pair.nil? ? _attribute_snapshot[name] : pair[0]
     end
   end
 end

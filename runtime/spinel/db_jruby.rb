@@ -508,6 +508,16 @@ module Db
     v.nil? ? nil : v.to_f
   end
 
+  # A decimal column's value as the driver decodes it (a BigDecimal, or
+  # the column's text), for its type to cast; never a Float.
+  def self.column_decimal(stmt, i)
+    stmt.replay ? stmt.row[i] : stmt.rs.get_string(i + 1)
+  end
+
+  def self.column_decimal_opt(stmt, i)
+    stmt.replay ? stmt.row[i] : stmt.rs.get_string(i + 1)
+  end
+
   def self.column_text_opt(stmt, i)
     v = stmt.replay ? stmt.row[i] : stmt.rs.get_string(i + 1)
     v.nil? ? nil : v.to_s

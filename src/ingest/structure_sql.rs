@@ -533,16 +533,15 @@ fn unsupported_col(file: &str, table: &str, col: &str, type_name: &str) -> Inges
 /// `ColumnType`, mirroring exactly what `ingest_schema::column_with_type`
 /// maps for the equivalent `schema.rb` type name (see
 /// `src/ingest/schema.rs`) — including that mapping's own known limits:
-/// `numeric`/`decimal` never carry precision/scale (schema.rb ingest
-/// never captures them either, so this stays parity rather than a new
-/// capability), and array columns are never coerced to their base type
+/// a `numeric(p,s)` carries its precision and scale as schema.rb's
+/// `precision:`/`scale:` do (a bound past `u8` is left unset), and array columns are never coerced to their base type
 /// (there is no `array: true` notion on `ColumnType`). Enum-typed
 /// columns (a name registered by a preceding `CREATE TYPE … AS ENUM`)
 /// map to `String`, same as schema.rb's own `enum` → `String`. Returns
 /// `None` for anything with no mapping — the caller ledgers that as a
 /// dropped column, never a silent one.
 fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Option<ColumnType> {
-    let (mut base, num1, _num2) = strip_parens_capture_nums(type_phrase);
+    let (mut base, num1, num2) = strip_parens_capture_nums(type_phrase);
     let is_array = base.ends_with("[]");
     if is_array {
         base.truncate(base.len() - 2);
@@ -586,7 +585,10 @@ fn resolve_column_type(type_phrase: &str, enum_types: &HashSet<String>) -> Optio
             ColumnType::DateTime
         }
         "time without time zone" | "time with time zone" | "timetz" | "time" => ColumnType::Time,
-        "numeric" | "decimal" => ColumnType::Decimal { precision: None, scale: None },
+        "numeric" | "decimal" => ColumnType::Decimal {
+            precision: num1.and_then(|n| u8::try_from(n).ok()),
+            scale: num2.and_then(|n| u8::try_from(n).ok()),
+        },
         "double precision" | "real" | "float4" | "float8" | "float" | "double" => ColumnType::Float,
         "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => ColumnType::Binary,
         "json" | "jsonb" => ColumnType::Json,
@@ -1594,6 +1596,10 @@ mod tests {
         assert!(matches!(resolve_column_type("uuid", &enums), Some(ColumnType::Uuid)));
         assert!(matches!(
             resolve_column_type("numeric(10,2)", &enums),
+            Some(ColumnType::Decimal { precision: Some(10), scale: Some(2) })
+        ));
+        assert!(matches!(
+            resolve_column_type("numeric", &enums),
             Some(ColumnType::Decimal { precision: None, scale: None })
         ));
         assert!(resolve_column_type("tstzrange", &enums).is_none());

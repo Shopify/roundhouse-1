@@ -184,6 +184,15 @@ fn spec(kind: &str, limit: Option<i64>) -> Expr {
     sp(ExprNode::Array { elements: vec![sym(kind), limit], style: ArrayStyle::Brackets })
 }
 
+/// `[:decimal, precision, scale]`, PostgreSQL's OID::Decimal over them.
+fn decimal_spec(precision: Option<u8>, scale: Option<u8>) -> Expr {
+    let int = |n: Option<u8>| match n {
+        Some(n) => typed(ExprNode::Lit { value: Literal::Int { value: i64::from(n) } }, Ty::Int),
+        None => typed(ExprNode::Lit { value: Literal::Nil }, Ty::Nil),
+    };
+    sp(ExprNode::Array { elements: vec![sym("decimal"), int(precision), int(scale)], style: ArrayStyle::Brackets })
+}
+
 fn unported(class: &str) -> Expr {
     sp(ExprNode::Array { elements: vec![sym("unported"), str_lit(class)], style: ArrayStyle::Brackets })
 }
@@ -198,6 +207,7 @@ fn declared_spec(ty: &Symbol) -> Expr {
         "string" => spec("string", None),
         "text" => spec("text", None),
         "boolean" => spec("boolean", None),
+        "float" => spec("float", None),
         "binary" => spec("binary", None),
         "immutable_string" => spec("immutable_string", None),
         "value" => spec("value", None),
@@ -227,17 +237,17 @@ fn column_spec(col: &Column, adapter: Option<&DatabaseAdapter>) -> Expr {
         ColumnType::Boolean => spec("boolean", None),
         ColumnType::Binary if pg => spec("bytea", None),
         ColumnType::Binary => spec("binary", None),
-        ColumnType::Float => unported("ActiveModel::Type::Float"),
-        ColumnType::Decimal { .. } if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Decimal"),
+        ColumnType::Float => spec("float", None),
+        ColumnType::Decimal { precision, scale } if pg => decimal_spec(*precision, *scale),
         ColumnType::Decimal { .. } => unported("ActiveModel::Type::Decimal"),
-        ColumnType::Date if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Date"),
+        ColumnType::Date if pg => spec("date", None),
         ColumnType::Date => unported("ActiveModel::Type::Date"),
-        ColumnType::DateTime if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Timestamp"),
+        ColumnType::DateTime if pg => spec("timestamp", None),
         ColumnType::DateTime => unported("ActiveModel::Type::DateTime with the time zone converter"),
         ColumnType::Time => unported("ActiveModel::Type::Time"),
         ColumnType::Json if pg => unported("ActiveRecord::Type::Json or ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Jsonb"),
         ColumnType::Json => unported("ActiveRecord::Type::Json"),
-        ColumnType::Uuid if pg => unported("ActiveRecord::ConnectionAdapters::PostgreSQL::OID::Uuid"),
+        ColumnType::Uuid if pg => spec("uuid", None),
         ColumnType::Uuid => unported("a uuid column type"),
     }
 }

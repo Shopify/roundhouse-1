@@ -54,6 +54,7 @@ date_value("2025-02-28", entry.parsed_date)
 equal({"due_on" => "2024-01-31"}, entry.as_json(only: [:due_on]))
 equal(%w[due_on id observed_at opens_at], entry.as_json.keys.sort)
 equal("2024-01-31", entry.as_json["due_on"])
+date_value("2024-01-31", entry.attributes["due_on"]) # attributes reads the cast Date, as Rails
 if ARGV.first == "native"
   Time.use_zone("Pacific/Auckland") do
     date_value("2024-01-31", entry.due_on)
@@ -61,7 +62,6 @@ if ARGV.first == "native"
   end
 else
   equal("2024-01-31", entry.due_on_raw)
-  equal("2024-01-31", entry.attributes["due_on"]) # attributes remains stored text
   equal(String, entry[:observed_at].class) # timestamp index behavior is unchanged
   equal(String, entry[:opens_at].class)
   ActiveSupport.use_zone("Pacific/Auckland") do

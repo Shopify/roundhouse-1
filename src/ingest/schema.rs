@@ -1040,6 +1040,9 @@ struct ColumnOpts {
     nullable: Option<bool>,
     default: Option<String>,
     limit: Option<u32>,
+    /// A decimal's `precision:` and `scale:`.
+    precision: Option<u8>,
+    scale: Option<u8>,
     /// A reference's `polymorphic: true` and `type:`.
     polymorphic: bool,
     type_name: Option<String>,
@@ -1076,6 +1079,8 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
                         }
                     }
                 }
+                "precision" => opts.precision = integer_value(value).and_then(|n| u8::try_from(n).ok()),
+                "scale" => opts.scale = integer_value(value).and_then(|n| u8::try_from(n).ok()),
                 _ => {}
             }
         }
@@ -1113,7 +1118,7 @@ fn column_with_type(
         "integer" | "smallint" => ColumnType::Integer,
         "bigint" => ColumnType::BigInt,
         "float" => ColumnType::Float,
-        "decimal" | "numeric" => ColumnType::Decimal { precision: None, scale: None },
+        "decimal" | "numeric" => ColumnType::Decimal { precision: opts.precision, scale: opts.scale },
         "string" | "inet" | "cidr" | "macaddr" | "enum" => ColumnType::String { limit: opts.limit },
         "text" | "citext" => ColumnType::Text,
         "boolean" => ColumnType::Boolean,

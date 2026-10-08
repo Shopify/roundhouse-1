@@ -22,6 +22,7 @@ const SPINEL_TEST_HELPER: &str =
     include_str!("../../runtime/spinel/test/test_helper.rb");
 
 mod attribute_api;
+mod attribute_cast;
 mod collection_autosave;
 pub(crate) mod expr;
 mod library;
@@ -413,6 +414,10 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // write and the per-model `schema_column_types` table the runtime's
     // `type_for_attribute` reads (no-op for a model with no table).
     attribute_api::apply(&mut lcs, app);
+    // Assignment casts through each column's type, and Rails'
+    // `attributes` (every column, the id too) beside the Dirty snapshot.
+    // After `attribute_api`, whose `schema_column_types` names the types.
+    attribute_cast::apply(&mut lcs, app);
 }
 
 fn emit_model_classes(

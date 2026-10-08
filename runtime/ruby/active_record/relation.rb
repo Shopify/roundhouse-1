@@ -392,12 +392,12 @@ module ActiveRecord
     end
 
     # One row's value under `col`, as the database would order it. The
-    # synthesized `attributes` hash carries every column BUT the primary
+    # synthesized `_attribute_snapshot` hash carries every column BUT the primary
     # key, and datetimes as their raw stored text (which orders as the
     # database orders them); `id` is read off the record itself.
     def order_key_of(record, col)
       return record.id if col == "id"
-      record.attributes[col]
+      record._attribute_snapshot[col]
     end
 
     # The bare column an order term names -- `"created_at"` and
