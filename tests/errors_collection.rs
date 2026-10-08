@@ -28,7 +28,12 @@ fn unimplemented_errors_operations_are_refused() {
     let diags = dispatch_failures(
         "    errors.added?(:base, :blank)\n    errors.import(other.errors.first)\n    errors.merge!(other.errors)\n    errors.delete(:base)\n    errors.where(:base).any?\n    errors.details[:base]\n    errors.map(&:type).include?(:x)\n    errors.errors[0].options[:code]\n    errors.attribute_names\n    errors.messages",
     );
-    for name in ["added?", "import", "merge!", "delete", "where", "details", "attribute_names"] {
+    for name in ["added?", "import", "merge!", "delete", "where", "details"] {
         assert!(diags.iter().any(|d| d.contains(name)), "missing {name}: {diags:?}");
     }
+    // `attribute_names` has a shared implementation since 51fc4a07c
+    // (runtime/spinel/active_model_errors.rb), which
+    // tests/errors_association_ports.rs runs against Core's pinned
+    // activemodel; the Spinel tree still refuses it there.
+    assert!(!diags.iter().any(|d| d.contains("attribute_names")), "{diags:?}");
 }

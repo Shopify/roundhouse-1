@@ -186,12 +186,25 @@ fn library_classes(
 /// classes: classes, then modules, a `Class.new` constant right after
 /// its owner (the file-level walk adds the rest).
 fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> IngestResult<Vec<LibraryClass>> {
+    declared_classes_in(node, file, before, &[])
+}
+
+/// [`declared_classes`] for `node` written inside the body of `outer`
+/// (its qualified segments): a declaration in a load-time conditional
+/// of that body (`ConditionalArm::declarations`).
+fn declared_classes_in(
+    node: &ruby_prism::Node<'_>,
+    file: &str,
+    before: usize,
+    outer: &[String],
+) -> IngestResult<Vec<LibraryClass>> {
     let mut out = Vec::new();
+    let within = |scope: Vec<String>| -> Vec<String> { outer.iter().cloned().chain(scope).collect() };
     for (scope, class) in find_all_classes_with_scope(node) {
         if class.location().start_offset() >= before {
             continue;
         }
-        let (lc, struct_base) = library_class_and_struct_base(&class, &scope, file)
+        let (lc, struct_base) = library_class_and_struct_base(&class, &within(scope), file)
             .map_err(|err| super::error_site::at(err, &class.as_node()))?;
         // BEFORE the class it serves: a superclass has to be defined
         // when the `class X < Y` line runs, and these two share a file.
@@ -199,11 +212,21 @@ fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> I
             out.push(base);
         }
         let concerns = concerning_modules(class.body(), &lc.name, file)?;
+        let conditional = conditionally_declared(class.body(), &lc.name, file)?;
         out.push(lc);
         out.extend(concerns);
+        out.extend(conditional);
     }
-    for (scope, module) in find_all_modules_with_scope(node) {
+    for (scope, module) in find_all_module_declarations_with_scope(node) {
         if module.location().start_offset() >= before {
+            continue;
+        }
+        // A namespace module (no def of its own) is no library class,
+        // but a conditional in its body declares what it declares.
+        if !super::util::module_has_direct_def(&module) {
+            let Some(path) = module_name_path(&module) else { continue };
+            let name = ClassId(Symbol::from(within(scope).into_iter().chain(path).collect::<Vec<_>>().join("::")));
+            out.extend(conditionally_declared(module.body(), &name, file)?);
             continue;
         }
         // A nested `ClassMethods` is a module of its own, as in Ruby:
@@ -212,11 +235,36 @@ fn declared_classes(node: &ruby_prism::Node<'_>, file: &str, before: usize) -> I
         // INSTANCE methods; they reach an includer only through an
         // `extend` (the authored `included` hook, or Concern's
         // `append_features`), never the owner's own singleton.
-        let lc = library_class_from_module_node_with_scope(&module, &scope, file)
+        let lc = library_class_from_module_node_with_scope(&module, &within(scope), file)
             .map_err(|err| super::error_site::at(err, &module.as_node()))?;
         let concerns = concerning_modules(module.body(), &lc.name, file)?;
+        let conditional = conditionally_declared(module.body(), &lc.name, file)?;
         out.push(lc);
         out.extend(concerns);
+        out.extend(conditional);
+    }
+    Ok(out)
+}
+
+/// The classes and modules a load-time conditional in `body` (of the
+/// class or module `owner`) declares in its branches, with what they
+/// nest. The class walk does not descend into an `if`; the body walk
+/// records which branch declares each (`conditional_definitions`).
+fn conditionally_declared(
+    body: Option<ruby_prism::Node<'_>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<Vec<LibraryClass>> {
+    let Some(body) = body else { return Ok(Vec::new()) };
+    let outer: Vec<String> = owner.0.as_str().split("::").map(str::to_string).collect();
+    let mut out = Vec::new();
+    for stmt in flatten_statements(body) {
+        let Some(conditional) = visibility::conditional_definition(&stmt) else { continue };
+        for (_, statements) in &conditional.arms {
+            for declaration in statements.iter().filter(|s| visibility::is_declaration(s)) {
+                out.extend(declared_classes_in(declaration, file, usize::MAX, &outer)?);
+            }
+        }
     }
     Ok(out)
 }
@@ -2665,7 +2713,34 @@ fn conditional_definitions(
     for (condition, statements) in &conditional.arms {
         let condition = condition.as_ref().map(|c| ingest_expr(c, file)).transpose()?;
         let mut members = Vec::new();
+        let mut declarations = Vec::new();
         for stmt in statements {
+            // Ingested as library classes of their own
+            // (`conditionally_declared`); recorded here by name.
+            if visibility::is_declaration(stmt) {
+                let path = match (stmt.as_class_node(), stmt.as_module_node()) {
+                    (Some(class), _) => class_name_path(&class),
+                    (_, Some(module)) => module_name_path(&module),
+                    _ => None,
+                };
+                let Some(path) = path.filter(|_| !force_class_receiver) else {
+                    return Err(super::error_site::at(
+                        IngestError::Unsupported {
+                            file: file.into(),
+                            message: "a class or module declared in a load-time conditional inside `class << self` \
+                                      is not modeled"
+                                .into(),
+                        },
+                        stmt,
+                    ));
+                };
+                let name = std::iter::once(owner.0.as_str().to_string()).chain(path).collect::<Vec<_>>().join("::");
+                declarations.push(crate::dialect::ConditionalDeclaration {
+                    name: ClassId(Symbol::from(name)),
+                    start: stmt.location().start_offset() as u32,
+                });
+                continue;
+            }
             let Some(def) = visibility::definition(stmt) else {
                 return Err(super::error_site::at(
                     IngestError::Unsupported {
@@ -2685,7 +2760,7 @@ fn conditional_definitions(
             members.push(crate::dialect::ConditionalMember::of(&m));
             methods.push(m);
         }
-        arms.push(crate::dialect::ConditionalArm { condition, methods: members });
+        arms.push(crate::dialect::ConditionalArm { condition, methods: members, declarations });
     }
     let location = statement.location();
     let span = Span {
@@ -2939,7 +3014,7 @@ fn walk_decl_body_in<'pr>(
             // every branch's methods, and which branch defines each. The
             // visibility pass admitted only branches of `def`s.
             if let Some(conditional) = visibility::conditional_definition(&statement) {
-                if module_function_active || extend_self_active {
+                if (module_function_active || extend_self_active) && conditional.defines() {
                     return Err(super::error_site::at(
                         IngestError::Unsupported {
                             file: file.into(),

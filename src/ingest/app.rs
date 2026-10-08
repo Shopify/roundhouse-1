@@ -6805,7 +6805,35 @@ fn nested_under(
     classes: Vec<crate::dialect::LibraryClass>,
 ) -> Vec<crate::dialect::LibraryClass> {
     let prefix = format!("{}::", outer.0.as_str());
+    let classes = without_conditional_declarations_of(outer, classes);
     classes.into_iter().filter(|c| c.name.0.as_str().starts_with(&prefix)).collect()
+}
+
+/// `classes` without those a load-time conditional in `outer`'s body
+/// declares (`ConditionalArm::declarations`). `outer` is a model or a
+/// controller, which another pipeline emits: nothing writes the
+/// conditional around them, and on their own they would exist whether
+/// or not their branch runs. They stay uncarried, as before the library
+/// ingest read them.
+fn without_conditional_declarations_of(
+    outer: &crate::ident::ClassId,
+    classes: Vec<crate::dialect::LibraryClass>,
+) -> Vec<crate::dialect::LibraryClass> {
+    let declared: Vec<String> = classes
+        .iter()
+        .filter(|c| c.name == *outer)
+        .flat_map(|c| c.conditional_definitions.iter())
+        .flat_map(|d| d.arms.iter())
+        .flat_map(|arm| arm.declarations.iter())
+        .map(|d| d.name.0.as_str().to_string())
+        .collect();
+    classes
+        .into_iter()
+        .filter(|c| {
+            let name = c.name.0.as_str();
+            !declared.iter().any(|d| name == d || name.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with("::")))
+        })
+        .collect()
 }
 
 /// The classes a MODEL's file declares besides the model, which its own
@@ -6864,7 +6892,7 @@ fn beside_model(
         .map(|c| c.name.0.as_str().to_string())
         .collect();
     let outer_name = outer.0.as_str();
-    classes
+    without_conditional_declarations_of(outer, classes)
         .into_iter()
         .filter(|c| {
             let name = c.name.0.as_str();

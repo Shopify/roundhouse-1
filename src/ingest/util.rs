@@ -405,7 +405,7 @@ fn hoisted_singleton_body<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
     sc.body()
 }
 
-fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
+pub(super) fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
     body_has_direct_method_decl(m.body())
         || body_has_included_block(m.body())
         || body_has_constant_decl(m.body())
