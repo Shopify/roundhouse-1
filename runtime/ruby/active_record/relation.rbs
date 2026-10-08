@@ -28,7 +28,6 @@ module ActiveRecord
     @default_scoped: bool
     def unscoped: () -> Relation
     def extending: (*::Module modules) -> Relation
-    def new: (?Hash[Symbol, untyped] attrs) -> Base
     def build: (?Hash[Symbol, untyped] attrs) -> Base
     def create: (?Hash[Symbol, untyped] attrs) -> Base
     def create!: (?Hash[Symbol, untyped] attrs) -> Base
@@ -82,7 +81,7 @@ module ActiveRecord
     def excluding: (*untyped records) -> Relation
     def without: (*untyped records) -> Relation
     def or: (Relation other) -> Relation
-    def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate) -> bool
+    def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate, ?bool note) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
     # In-memory sort of a LOADED relation. Records are `Base` (same
     # interim as first/take); `preloaded` stays bare for Spinel integer
@@ -272,8 +271,9 @@ module ActiveRecord
     def count_sql: () -> String
     def distinct_count_columns: () -> String
     def exists_sql: (Integer n) -> String
-    def hash_conditions: (Hash[String | Symbol, untyped] hash) -> String
-    def column_predicate: (String col, Relation | Array[untyped] | Base | String | Integer | Float | bool | nil val) -> String
+    def hash_conditions: (Hash[String | Symbol, untyped] hash, ?bool note) -> String
+    def column_predicate: (String col, Relation | Array[untyped] | Base | String | Integer | Float | bool | nil val, ?bool note) -> String
+    def note_equality: (String? own, String | Integer | Float | bool | nil val) -> nil
     def substitute_binds: (String sql, Array[untyped] args) -> String
     def substitute_named_binds: (String sql, Hash[Symbol, untyped] binds) -> String
     def named_bind_start?: (String ch) -> bool

@@ -31,12 +31,55 @@
 #   is a schema column of that name. The runtime's STI scoping and
 #   instantiation read the `type` column whatever it is set to
 #   (lower::sti_scope).
+# - A column a partial `select` left out (`_note_unloaded`) raises
+#   ActiveModel::MissingAttributeError when read, as Rails' reader does
+#   (attribute_methods/read.rb), until `reload` reads the whole row.
+#   Rails then saves only the changed columns; the emitted UPDATE writes
+#   every column, so saving such a record raises NotImplementedError
+#   rather than writing NULL over the columns it never read.
 # - The CRuby overlay's Base#as_json (runtime/active_record_serialization.rb),
 #   the `only:` subset the other CRuby trees answer, is removed: here
 #   Base's `as_json` and `serializable_hash` are its modules', as in
 #   Rails, so a module included into Base later supers into them.
 
+module ActiveModel
+  class MissingAttributeError < NoMethodError
+  end
+end
+
 module ActiveRecord # :nodoc:
+  # Readers of the columns a partial `select` left out, and the UPDATE
+  # that would overwrite them (see the header).
+  module UnloadedAttributes
+    def _note_unloaded(row)
+      super
+      unloaded = @__unloaded_columns
+      return nil if unloaded.nil?
+      unloaded.each do |col|
+        define_singleton_method(col) do
+          if @__unloaded_columns&.include?(col)
+            raise ActiveModel::MissingAttributeError, "missing attribute '#{col}' for #{self.class.name}"
+          end
+          super()
+        end
+      end
+      define_singleton_method(:_adapter_update) do
+        missing = @__unloaded_columns
+        if missing
+          raise NotImplementedError, "#{self.class.name}: saving a record loaded by a partial select " \
+            "(#{missing.join(", ")} not loaded) is not ported; the UPDATE writes every column"
+        end
+        super()
+      end
+      nil
+    end
+
+    def reload
+      @__unloaded_columns = nil
+      super
+    end
+  end
+
   # = Active Record \Serialization
   module Serialization
     def serializable_hash(options = nil)
@@ -58,6 +101,7 @@ module ActiveRecord # :nodoc:
   end
 
   class Base
+    prepend UnloadedAttributes
     include ActiveModel::Conversion
     include ActiveModel::Serializers::JSON
     include Serialization
