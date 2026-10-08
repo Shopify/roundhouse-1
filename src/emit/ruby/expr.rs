@@ -281,10 +281,11 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         }
         (_, "attribute_names", []) if errors_typed || errors_reader => Some(read("attribute_names")),
         // Rails' `to_hash(full_messages = false)`, `as_json(options =
-        // nil)` and `messages`, where the analyzer typed the receiver as
-        // Rails' collection (`expr::ERRORS_HASH_READ`): an `errors` of
-        // another type (a GraphQL result's) keeps its own.
-        (_, "to_hash" | "as_json" | "messages", _) if e.decisions & crate::expr::ERRORS_HASH_READ != 0 => {
+        // nil)`, `messages`, `merge!(other)` (`expr::errors_port_call`),
+        // where the analyzer typed the receiver as Rails' collection
+        // (`expr::ERRORS_PORT_CALL`): an `errors` of another type (a
+        // GraphQL result's) keeps its own.
+        (_, _, _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => {
             Some(read(method.as_str()))
         }
         _ => None,

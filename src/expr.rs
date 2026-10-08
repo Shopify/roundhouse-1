@@ -82,15 +82,27 @@ pub const OBJECT_AS_JSON: u64 = 1 << 21;
 /// `only:`.
 pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 
-/// `errors.to_hash([full_messages])`, `errors.as_json([options])` or
-/// `errors.messages` on a receiver typed as Rails' `ActiveModel::Errors`:
-/// the messages by attribute, which the models' `Array[String]`
-/// accumulator does not keep. The CRuby and JRuby trees write the read
-/// `ActiveModel::ErrorAttributes.<read>(errors, ...)` over what each push
-/// records (`emit::ruby::expr::error_attribute_push`, runtime/spinel/
-/// active_model_errors.rb); `project` refuses it where the finished tree
-/// lacks the port (`analyze::runtime_reads`).
-pub const ERRORS_HASH_READ: u64 = 1 << 23;
+/// A call on a receiver typed as Rails' `ActiveModel::Errors` that the
+/// models' `Array[String]` accumulator cannot answer by itself
+/// ([`errors_port_call`]: `to_hash`, `as_json`, `messages`, `merge!`):
+/// the messages by attribute, or another collection's errors. The CRuby
+/// and JRuby trees write it `ActiveModel::ErrorAttributes.<method>(errors,
+/// ...)` over what each push records (`emit::ruby::expr::
+/// error_attribute_push`, runtime/spinel/active_model_errors.rb), which
+/// hands any other receiver the call itself; `project` refuses it where
+/// the finished tree lacks the port (`analyze::runtime_reads`).
+pub const ERRORS_PORT_CALL: u64 = 1 << 23;
+
+/// Whether `errors.<method>(<args> args)[ { block }]` is one of the calls
+/// [`ERRORS_PORT_CALL`] routes, with the arguments Rails' method takes.
+pub fn errors_port_call(method: &str, args: usize, block: bool) -> bool {
+    match method {
+        "to_hash" | "as_json" => args <= 1 && !block,
+        "messages" => args == 0 && !block,
+        "merge!" => args == 1 && !block,
+        _ => false,
+    }
+}
 
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without

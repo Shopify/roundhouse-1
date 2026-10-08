@@ -98,6 +98,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // `lower::errors_index` does not ground the read.
         ("to_hash", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
         ("as_json", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
+        // `merge!(other)`: another collection's errors, each with its
+        // attribute; answers `other`'s Error objects.
+        ("merge!", Ty::Array { elem: Box::new(error_ty.clone()) }),
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }
