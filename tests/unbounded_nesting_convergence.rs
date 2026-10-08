@@ -90,6 +90,19 @@ end
 "#,
     ),
     (
+        "app/models/mailbox_sanitizer.rb",
+        r#"class MailboxSanitizer
+  def sanitize(value)
+    case value
+    when Array then value.map { |v| sanitize(v) }
+    when Hash then value.transform_values { |v| sanitize(v) }
+    else value.to_s
+    end
+  end
+end
+"#,
+    ),
+    (
         "app/models/report.rb",
         r#"class Report
   def fields
@@ -98,6 +111,10 @@ end
 
   def risks
     Risk::Service.new(1).recommendations_for_orders([10, 20])
+  end
+
+  def sanitized
+    MailboxSanitizer.new.sanitize({ "a" => [1, { "b" => "x" }] })
   end
 end
 "#,
@@ -108,6 +125,7 @@ struct Analyzed {
     app: App,
     rounds: roundhouse::analyze::FixpointRounds,
     serialize_return: Option<Ty>,
+    sanitize_return: Option<Ty>,
 }
 
 fn analyzed() -> Analyzed {
@@ -124,7 +142,12 @@ fn analyzed() -> Analyzed {
         .get(&ClassId(Symbol::from("NestedFieldSet")))
         .and_then(|c| c.instance_methods.get(&Symbol::from("serialize!")))
         .cloned();
-    Analyzed { app, rounds, serialize_return }
+    let sanitize_return = analyzer
+        .class_registry()
+        .get(&ClassId(Symbol::from("MailboxSanitizer")))
+        .and_then(|c| c.instance_methods.get(&Symbol::from("sanitize")))
+        .cloned();
+    Analyzed { app, rounds, serialize_return, sanitize_return }
 }
 
 /// Container nesting, as depth limiting counts it.
@@ -167,6 +190,16 @@ fn a_return_nesting_itself_through_another_instance_is_depth_limited() {
         variants.iter().any(|v| matches!(v, Ty::Hash { value, .. } if matches!(**value, Ty::Array { .. }))),
         "{ret:?}"
     );
+}
+
+/// Upstream's chatwoot case (`MailboxSanitizer#sanitize_mailbox_value`):
+/// a self-recursive method mapping arrays and hash values back through
+/// itself doubles its harvested return every round unless it is cut.
+#[test]
+fn a_self_recursive_return_over_arrays_and_hashes_is_depth_limited() {
+    let ret = analyzed().sanitize_return.expect("MailboxSanitizer#sanitize registered");
+    // The self-call recursion widening settles it before either limit.
+    assert!(depth(&ret) <= 4, "{ret:?}");
 }
 
 #[test]

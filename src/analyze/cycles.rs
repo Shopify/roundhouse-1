@@ -79,8 +79,10 @@ const GROWTH_ROUNDS: usize = 3;
 /// returns, which are that parameter, take it the next.
 const GROWTH_GAP: usize = 2;
 
-/// The least nesting depth a limited slot keeps precise.
-const DEPTH_FLOOR: usize = 4;
+/// The least nesting depth a limited slot keeps precise. A harvested
+/// return that nests its previous round's is cut at the same depth
+/// (`harvest_return::untie_recursive_return`).
+pub(super) const DEPTH_FLOOR: usize = 4;
 
 /// One slot's growth over a loop.
 #[derive(Clone, Copy)]
@@ -180,7 +182,8 @@ fn slot_depth(slot: &Slot, t: &Ty) -> usize {
     }
 }
 
-fn depth(t: &Ty) -> usize {
+/// Container nesting depth: a union counts as its deepest variant.
+pub(super) fn depth(t: &Ty) -> usize {
     match t {
         Ty::Array { elem } => 1 + depth(elem),
         Ty::Hash { key, value } => 1 + depth(key).max(depth(value)),
@@ -203,7 +206,9 @@ fn limit_slot(slot: &Slot, t: Ty, keep: usize) -> Ty {
     }
 }
 
-fn limit(t: Ty, keep: usize) -> Ty {
+/// `t` with every container below the first `keep` levels replaced by
+/// `Untyped`; a union keeps its variants' levels.
+pub(super) fn limit(t: Ty, keep: usize) -> Ty {
     let is_container = match &t {
         Ty::Array { .. } | Ty::Hash { .. } | Ty::Tuple { .. } | Ty::Record { .. } => true,
         Ty::Class { args, .. } => !args.is_empty(),
