@@ -58,8 +58,14 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             out.push(d);
             continue;
         }
+        // Name the configuration a routed model reaches: without a
+        // manifest, which schema that database loads is not known here.
+        let on = match app.model_databases.get(&model.name) {
+            Some(ModelDatabase::Named { writing, .. }) => format!(" on database `{writing}`"),
+            _ => String::new(),
+        };
         out.push(Diagnostic::unsupported(model.span, None, "model_table_not_in_schema", format!(
-            "`{}` reads table `{}`, which the schema does not declare; every query it makes names a relation that does not exist",
+            "`{}` reads table `{}`{on}, which the schema does not declare; every query it makes names a relation that does not exist",
             model.name.0, model.table.0
         )));
     }
