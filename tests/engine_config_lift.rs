@@ -119,6 +119,23 @@ const FILES: &[(&str, &str)] = &[
 const PATH_GEMS: &str = "PATH\n  remote: engines/widgets\n  specs:\n    widgets (0.1.0)\n\n\
 PATH\n  remote: gems/kit\n  specs:\n    kit (0.1.0)\n\n";
 
+/// The blog with the two path gems: in its Gemfile, so its
+/// `Bundler.require(*Rails.groups)` loads the engine's entry
+/// (`widgets.rb` requires `widgets/engine`, as a Core component's
+/// `banking.rb` requires `banking/engine`), and the engine's own
+/// `require "widgets/config"` defines `Widgets::Config` before its body
+/// builds the config. A plain gem's constants are defined where its
+/// files are required, never autoloaded.
+fn bundled_blog() -> emit_and_run::Overlay {
+    let blog = roundhouse::fixtures::real_blog();
+    let lock = std::fs::read_to_string(blog.join("Gemfile.lock")).unwrap();
+    let gemfile = std::fs::read_to_string(blog.join("Gemfile")).unwrap();
+    emit_and_run::real_blog()
+        .write("Gemfile.lock", &format!("{PATH_GEMS}{lock}"))
+        .write("Gemfile", &format!("{gemfile}\ngem \"kit\", path: \"gems/kit\"\ngem \"widgets\", path: \"engines/widgets\"\n"))
+        .write("engines/widgets/lib/widgets.rb", "require \"widgets/engine\"\n")
+}
+
 #[test]
 fn native_ruby_builds_the_environment_config() {
     let root = std::env::temp_dir().join(format!("roundhouse-engine-config-{}", std::process::id()));
@@ -145,8 +162,7 @@ fn native_ruby_builds_the_environment_config() {
 
 #[test]
 fn emitted_ruby_reads_the_engine_config_through_rails_configuration() {
-    let lock = std::fs::read_to_string(roundhouse::fixtures::real_blog().join("Gemfile.lock")).unwrap();
-    let mut fixture = emit_and_run::real_blog().write("Gemfile.lock", &format!("{PATH_GEMS}{lock}"));
+    let mut fixture = bundled_blog();
     for (path, text) in FILES {
         fixture = fixture.write(path, text);
     }
@@ -238,8 +254,7 @@ fn an_empty_environment_config_keeps_its_own_file() {
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
     assert_eq!(String::from_utf8_lossy(&native.stdout), EXPECTED_EMPTY);
 
-    let lock = std::fs::read_to_string(roundhouse::fixtures::real_blog().join("Gemfile.lock")).unwrap();
-    let mut fixture = emit_and_run::real_blog().write("Gemfile.lock", &format!("{PATH_GEMS}{lock}"));
+    let mut fixture = bundled_blog();
     for (path, text) in &files {
         fixture = fixture.write(path, text);
     }

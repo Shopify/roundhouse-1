@@ -86,7 +86,12 @@ fn emitted(lib: &Path) -> (emit_and_run::Run, String) {
             "roundhouse.yml",
             &format!("gem_home: {}\ngem_sources:\n  paquito: vendor/gems/paquito-1.0.2\n", core_gem_home().display()),
         )
-        .write("Gemfile.lock", LOCK);
+        .write("Gemfile.lock", LOCK)
+        // The native control's `-rpaquito/types`: the app requires the
+        // file, as Core's boot reaches it through paquito.rb. A plain
+        // gem's constants are defined where its files are required,
+        // never autoloaded.
+        .write("config/application.rb", "require \"paquito/types\"\n");
     for file in PAQUITO_FILES {
         let source = std::fs::read_to_string(lib.join(file)).expect("read paquito source");
         app = app.write(&format!("vendor/gems/paquito-1.0.2/lib/{file}"), &source);
