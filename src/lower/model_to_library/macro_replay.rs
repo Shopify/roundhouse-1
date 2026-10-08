@@ -1029,6 +1029,20 @@ pub fn replay_model_macros(app: &mut crate::App) {
                 _ => {}
             }
         }
+        // A subclass's own declarations (`lower::subclass_macros`) run
+        // after the model's body; a setting in the subclass before one
+        // is refused (`sti_macro_verdicts`).
+        for (_, items) in &mut model.subclass_declarations {
+            for item in items {
+                if let ModelBodyItem::Association {
+                    assoc: crate::dialect::Association::BelongsTo { optional, declared_optional: None, .. },
+                    ..
+                } = item
+                {
+                    *optional = !required;
+                }
+            }
+        }
     }
 }
 

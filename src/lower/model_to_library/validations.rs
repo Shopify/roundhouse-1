@@ -135,6 +135,46 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
 }
 
 /// `def validate; <stmts>; end` on `owner`.
+/// A model subclass's own required `belongs_to` checks
+/// (`lower::subclass_macros`) in its `validate`: after the inherited
+/// ones (`super`), among the subclass's other checks in declaration
+/// order, as Rails runs the presence validation `belongs_to` declares.
+pub(crate) fn push_subclass_belongs_to_checks(methods: &mut Vec<MethodDef>, view: &Model) {
+    let mut checks = Vec::new();
+    for (span, assoc) in view.spanned_associations() {
+        if let Association::BelongsTo { name, target, foreign_key, optional: false, polymorphic, .. } = assoc {
+            let mut check = inline_belongs_to_check(name, foreign_key, target, *polymorphic);
+            check.inherit_span(span);
+            tag_error_detail(&mut check, name, &typed_detail("blank", vec![]));
+            checks.push(check);
+        }
+    }
+    if checks.is_empty() {
+        return;
+    }
+    let existing =
+        methods.iter_mut().find(|m| m.name.as_str() == "validate" && m.receiver == MethodReceiver::Instance);
+    let Some(existing) = existing else {
+        let mut stmts = vec![Expr::new(Span::synthetic(), ExprNode::Super { args: Some(Vec::new()), block: None })];
+        stmts.extend(checks);
+        methods.push(validate_method_def(&view.name, stmts));
+        return;
+    };
+    let mut stmts = match &*existing.body.node {
+        ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![existing.body.clone()],
+    };
+    let after_super = stmts.iter().position(|s| matches!(&*s.node, ExprNode::Super { .. })).map_or(0, |i| i + 1);
+    for check in checks {
+        let at = stmts[after_super..]
+            .iter()
+            .position(|s| !s.span.is_synthetic() && s.span.file == check.span.file && s.span.start > check.span.start)
+            .map_or(stmts.len(), |i| after_super + i);
+        stmts.insert(at, check);
+    }
+    existing.body = seq(stmts);
+}
+
 pub(crate) fn validate_method_def(owner: &ClassId, stmts: Vec<Expr>) -> MethodDef {
     MethodDef {
         visibility: crate::dialect::MethodVisibility::Public,

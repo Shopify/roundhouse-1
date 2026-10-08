@@ -2112,15 +2112,40 @@ fn push_user_methods(
     }
 }
 
-/// A model subclass's view model's association methods
-/// (`lower::subclass_macros`); a method the subclass defines wins.
-pub(crate) fn push_subclass_association_methods(methods: &mut Vec<MethodDef>, view: &Model, models: &[Model]) {
+/// A model subclass's view model's synthesized methods
+/// (`lower::subclass_macros`): its associations, the `dependent:
+/// :destroy` cascade, its lifecycle hooks, its required `belongs_to`
+/// checks and its transaction-callback chains (`lineage` the classes
+/// above it, `subclass_macros::lineage`). A hook starts with `super`:
+/// Rails' subclass chain is a copy of its model's with the subclass's
+/// callbacks appended. A method the subclass defines wins.
+pub(crate) fn push_subclass_model_methods(methods: &mut Vec<MethodDef>, view: &Model, lineage: &[Model], models: &[Model]) {
     let mut synthesized = Vec::new();
     associations::push_association_methods(&mut synthesized, view, models);
+    let mut hooks = Vec::new();
+    push_dependent_destroy(&mut hooks, view);
+    push_callback_methods(&mut hooks, view);
+    for hook in &mut hooks {
+        if hook.receiver != MethodReceiver::Instance || !hook.params.is_empty() {
+            continue;
+        }
+        let own = match &*hook.body.node {
+            ExprNode::Seq { exprs } => exprs.clone(),
+            _ => vec![hook.body.clone()],
+        };
+        let mut stmts = vec![Expr::new(Span::synthetic(), ExprNode::Super { args: Some(Vec::new()), block: None })];
+        stmts.extend(own);
+        hook.body = seq(stmts);
+    }
+    synthesized.extend(hooks);
     for m in synthesized {
         if !methods.iter().any(|o| o.name == m.name && o.receiver == m.receiver) {
             methods.push(m);
         }
+    }
+    validations::push_subclass_belongs_to_checks(methods, view);
+    if !lineage.is_empty() {
+        self::transaction_callbacks::push_transaction_callback_methods(methods, view, lineage);
     }
 }
 
