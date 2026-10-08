@@ -24,7 +24,7 @@ const SPINEL_TEST_HELPER: &str =
 mod attribute_api;
 pub(crate) mod expr;
 mod library;
-pub(crate) use library::install_lookup_indexes;
+pub(crate) use library::{install_lookup_indexes, modelled_class_body_calls};
 mod rbs;
 pub mod shake;
 mod shared;

@@ -426,7 +426,7 @@ pub(crate) fn lower_models_inner_for_dialect(
             }
             type_method_body(method, &classes, table, Some(model));
         }
-        out.push(model_class(model, methods, table));
+        out.push(model_class(model, models, methods, table));
     }
     // Type-check Row class method bodies too so the strict typing residual
     // check doesn't blow up. The Row class shares its column shape with
@@ -577,12 +577,33 @@ pub fn lower_model_to_library_class(model: &Model, schema: &Schema) -> LibraryCl
     for method in &mut methods {
         type_method_body(method, &classes, table, Some(model));
     }
-    model_class(model, methods, table)
+    model_class(model, std::slice::from_ref(model), methods, table)
 }
 
 /// Canonical class envelope for both production lowering and ownership
 /// observation. Typing and method selection remain the caller's job.
-fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
+fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: Option<&Table>) -> LibraryClass {
+    // ActiveRecord::Base includes ActiveSupport::Callbacks; the runtime
+    // base does not, so a model that runs the module's class side
+    // (`callback_dsl_calls`) includes the port itself, ahead of its own
+    // mixins as the base's include is, and keeps those calls in body
+    // order beside its prepends.
+    let callbacks = callback_dsl_calls(model, models);
+    let mut includes = crate::analyze::model_includes(model);
+    let module = ClassId(Symbol::from("ActiveSupport::Callbacks"));
+    if !callbacks.is_empty() && !includes.contains(&module) {
+        includes.insert(0, module);
+    }
+    let unknown_calls = model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .filter(|expr| is_constant_prepend(expr) || callbacks.iter().any(|c| std::ptr::eq(*c, *expr)))
+        .cloned()
+        .collect();
     LibraryClass {
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
@@ -592,30 +613,24 @@ fn model_class(model: &Model, methods: Vec<MethodDef>, table: Option<&Table>) ->
         parent: model.parent.clone(),
         parent_span: Default::default(),
         // Mixins and constants must survive in every model projection.
-        includes: crate::analyze::model_includes(model),
+        includes,
         methods,
         nullable_columns: nullable_column_names(table),
         origin: None,
         constants: collect_model_constants(model),
-        unknown_calls: class_body_prepends(model.body.iter().filter_map(|item| match item {
-            crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
-            _ => None,
-        })),
+        unknown_calls,
         class_ivar_initializers: collect_class_attr_initializers(model),
         visibility_overrides: model.visibility_overrides.clone(),
     }
 }
 
-/// A class body's `prepend M, ...` statements naming constants, as the
+/// A class body's `prepend M, ...` statements naming constants go to the
 /// lowered class's `unknown_calls`: the Ruby family replays one whose
 /// modules the app defines (`emit::ruby::library::app_prepend_calls`)
 /// and reports the rest; a target outside it refuses each
 /// (`project::report_class_body_prepends`). Dropped here, the module's
 /// wrappers silently never ran around the class's methods.
-pub(crate) fn class_body_prepends<'a>(body: impl Iterator<Item = &'a Expr>) -> Vec<Expr> {
-    body.filter(|expr| is_constant_prepend(expr)).cloned().collect()
-}
-
+///
 /// `prepend A, B` (bare or `self.`) whose every argument is a constant.
 pub(crate) fn is_constant_prepend(expr: &Expr) -> bool {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return false };
@@ -676,25 +691,6 @@ pub(crate) fn collect_model_constants(model: &Model) -> Vec<(Symbol, Expr)> {
     out
 }
 
-/// Untyped-body method synthesis — shared by the single-model and
-/// bulk entry points. Body-typing is the caller's responsibility (it
-/// needs the cross-model registry).
-/// Report model-body statements that no lowering pass claims.
-///
-/// `ModelBodyItem::Unknown` is a holding pen, not a verdict: broadcasts
-/// (`broadcasts_to`), markers (`primary_abstract_class`), block-form
-/// callbacks, and class-scope constants are all fished out of it by
-/// later recognizers. Whatever nobody claims simply never reaches the
-/// lowered output — and before this report, that drop was silent:
-/// `has_one_attached :audio` vanished and the user's first signal was a
-/// dispatch failure at some call site three files away. Pushing a
-/// *spanned* diagnostic at the declaration names the actual gap.
-///
-/// Warning, not Error: plenty of unclaimed DSL is tolerable per app
-/// (`include`, concerns the app never calls through typed paths), and
-/// dynamic targets often run fine without it. The skip-list below must
-/// stay in sync with the claiming passes — each entry names the pass
-/// that consumes the shape.
 /// A short spelling of a receiver for a diagnostic: `Registry`,
 /// `relation_delegate_class(…)`, `<expression>`.
 pub(crate) fn receiver_label(recv: &Expr) -> String {
@@ -735,12 +731,50 @@ pub(crate) fn dropped_statement_name(call: &Expr) -> String {
     }
 }
 
-fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
-    use crate::diagnostic::{Diagnostic, Severity};
+/// Every model's [`unclaimed_unknowns`], for `analyze::diagnose`: `check`
+/// and the emit gate report the same refusals.
+pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out: Vec<_> =
+        app.models.iter().flat_map(|model| unclaimed_unknowns(model, &app.models, &app.schema)).collect();
+    out.extend(unclaimed_sti_subclass_calls(app));
+    out
+}
+
+/// The model-body statements no lowering pass claims, each an
+/// `unsupported` error at its declaration.
+///
+/// `ModelBodyItem::Unknown` is a holding pen, not a verdict: broadcasts
+/// (`broadcasts_to`), markers (`primary_abstract_class`), block-form
+/// callbacks, and class-scope constants are all fished out of it by
+/// later recognizers. Whatever nobody claims never reaches the lowered
+/// output: `has_one_attached :audio` vanished and the user's first signal
+/// was a dispatch failure at some call site three files away, and Core's
+/// `define_callbacks :revocation` vanished with `check` clean, so the
+/// emitted `run_callbacks` ran no chain. Each such drop removes behavior
+/// Rails runs at class load, so it is an error (a coverage gap), not a
+/// warning. What carries no runtime behavior is skipped by name (sorbet's
+/// annotations, visibility markers, `include` of a spliced concern). The
+/// skip-list below must stay in sync with the claiming passes — each
+/// entry names the pass that consumes the shape.
+pub(crate) fn unclaimed_unknowns(
+    model: &Model,
+    models: &[Model],
+    schema: &Schema,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    use crate::diagnostic::Diagnostic;
     use crate::expr::LValue;
 
+    let callbacks = callback_dsl_calls(model, models);
+    let mut out = Vec::new();
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        // ActiveSupport::Callbacks' class side (`define_callbacks`,
+        // `set_callback`, a macro that calls it) — carried into the
+        // lowered class by `model_class` and replayed through the
+        // runtime port (`emit::ruby::library::model_callback_calls`).
+        if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
+            continue;
+        }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;
@@ -756,14 +790,13 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
         };
         if attr_write {
             let written = dropped_statement_name(expr);
-            let mut d = Diagnostic::unsupported(
+            let d = Diagnostic::unsupported(
                 expr.span,
                 None,
                 written.as_str(),
                 format!("model class-body write on `{}` not lowered; it is dropped", model.name.0.as_str()),
             );
-            d.severity = Severity::Warning;
-            crate::emit::diagnostics::push(d);
+            out.push(d);
             continue;
         }
         let ExprNode::Send { recv, method, args, block, .. } = &*expr.node else {
@@ -786,9 +819,8 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
                 } else {
                     format!("model class-body call on `{}` not lowered; it is dropped", model.name.0.as_str())
                 };
-                let mut d = Diagnostic::unsupported(expr.span, None, construct.as_str(), detail);
-                d.severity = Severity::Warning;
-                crate::emit::diagnostics::push(d);
+                let d = Diagnostic::unsupported(expr.span, None, construct.as_str(), detail);
+                out.push(d);
                 continue;
             }
             // Class-body writes are sends too, and dropping an unclaimed
@@ -939,7 +971,7 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
             continue;
         }
         // `prepend Guard` — carried to the lowered class
-        // (`class_body_prepends`); the emit replays or refuses it.
+        // (`model_class`); the emit replays or refuses it.
         if is_constant_prepend(expr) {
             continue;
         }
@@ -982,15 +1014,239 @@ fn report_unclaimed_unknowns(model: &Model, schema: &Schema) {
                 }
             }
         }
-        let mut d = Diagnostic::unsupported(
+        let d = Diagnostic::unsupported(
             expr.span,
             None,
             name,
-            format!("model DSL call on `{}` not lowered", model.name.0.as_str()),
+            format!("model DSL call on `{}` not lowered; the class does not run it", model.name.0.as_str()),
         );
-        d.severity = Severity::Warning;
-        crate::emit::diagnostics::push(d);
+        out.push(d);
     }
+    out
+}
+
+/// ActiveSupport::Callbacks' class-side surface as the Ruby-family runtime
+/// port declares it (`define_callbacks`, `set_callback`, `skip_callback`,
+/// `reset_callbacks`, …).
+fn callbacks_port_methods() -> &'static [String] {
+    crate::analyze::runtime_reads::mixed_in_class_methods("ActiveSupport::Callbacks").unwrap_or(&[])
+}
+
+/// An STI subclass (a library class whose superclass is a model) that
+/// runs ActiveSupport::Callbacks' class side includes the port itself
+/// when no model ancestor's lowered class does (`model_class`), as each
+/// inherits ActiveRecord::Base's include natively.
+pub fn include_callbacks_in_sti_subclasses(app: &mut crate::App) {
+    let module = ClassId(Symbol::from("ActiveSupport::Callbacks"));
+    let models = &app.models;
+    fn ancestor_includes<'a>(mut parent: Option<&'a ClassId>, models: &'a [Model], module: &ClassId) -> bool {
+        let mut seen: Vec<&ClassId> = Vec::new();
+        while let Some(model) = parent.and_then(|p| models.iter().find(|m| &m.name == p)) {
+            if seen.contains(&&model.name) {
+                break;
+            }
+            seen.push(&model.name);
+            if crate::analyze::model_includes(model).contains(module) || !callback_dsl_calls(model, models).is_empty() {
+                return true;
+            }
+            parent = model.parent.as_ref();
+        }
+        false
+    }
+    let mut adds: Vec<usize> = Vec::new();
+    for (i, lc) in app.library_classes.iter().enumerate() {
+        if lc.includes.contains(&module) || !lc.parent.as_ref().is_some_and(|p| models.iter().any(|m| &m.name == p)) {
+            continue;
+        }
+        let own: Vec<&MethodDef> = lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).collect();
+        if !callback_calls(lc.unknown_calls.iter(), &own, lc.parent.as_ref(), models).is_empty()
+            && !ancestor_includes(lc.parent.as_ref(), models, &module)
+        {
+            adds.push(i);
+        }
+    }
+    for i in adds {
+        app.library_classes[i].includes.insert(0, module.clone());
+    }
+}
+
+/// The class-body calls an STI subclass's Ruby-family emit drops
+/// (`emit::ruby::library::modelled_class_body_calls`), each refused like
+/// a model's [`unclaimed_unknowns`]. An STI subclass is a model to Rails
+/// and a library class to ingest (`lower::sti_subclass_callbacks`); the
+/// lifecycle declarations that pass folds into hooks are claimed.
+fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut out = Vec::new();
+    for lc in &app.library_classes {
+        if !lc.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p)) {
+            continue;
+        }
+        let kept = crate::emit::ruby::modelled_class_body_calls(lc, app);
+        for call in &lc.unknown_calls {
+            if kept.iter().any(|k| std::ptr::eq(*k, call))
+                || crate::analyze::is_include_refusal(call)
+                || crate::lower::sti_subclass_callbacks::folds(call)
+            {
+                continue;
+            }
+            out.push(crate::diagnostic::Diagnostic::unsupported(
+                call.span,
+                None,
+                dropped_statement_name(call).as_str(),
+                format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
+            ));
+        }
+    }
+    out
+}
+
+/// The model's class-body calls that run on ActiveSupport::Callbacks,
+/// which every ActiveRecord::Base includes: a bare or `self.` call of the
+/// module's class side (`define_callbacks :revocation`, `set_callback
+/// :revocation, :after, :notify`, `skip_callback`), or of a class method the
+/// model or an app model ancestor defines whose body reaches one (Core's
+/// Payments::Vault concerns' `after_revocation :notify` and
+/// `around_redaction :capture`, `class_methods` macros over
+/// `set_callback`). A concern's `included do` statements are spliced
+/// into the includer's body where the include is, so they count as its
+/// own. In body order.
+///
+/// A call that addresses one of ActiveRecord's own chains
+/// ([`ACTIVE_RECORD_CALLBACK_CHAINS`], `skip_callback :save, :before,
+/// :x`) is not one: the lowered model runs its lifecycle callbacks
+/// without the port, so replaying it there would not reach them.
+///
+/// `model_class` carries these into the lowered class with the module
+/// included; the Ruby family replays them through the runtime port
+/// (`emit::ruby::library::model_callback_calls`) and a tree without the
+/// port refuses them (`runtime_reads::ruby_family_runtime_includes`).
+pub(crate) fn callback_dsl_calls<'a>(model: &'a Model, models: &[Model]) -> Vec<&'a Expr> {
+    let own: Vec<&MethodDef> = model.methods().filter(|d| d.receiver == MethodReceiver::Class).collect();
+    let calls = model.body.iter().filter_map(|item| match item {
+        crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
+        _ => None,
+    });
+    callback_calls(calls, &own, model.parent.as_ref(), models)
+}
+
+/// [`callback_dsl_calls`] over any class body: `calls` the body's
+/// statements, `own` its class methods, and `parent` its superclass,
+/// whose model ancestors' class methods it answers too (an STI subclass,
+/// which ingest keeps as a library class, passes its own).
+pub(crate) fn callback_calls<'a>(
+    calls: impl Iterator<Item = &'a Expr>,
+    own: &[&MethodDef],
+    parent: Option<&ClassId>,
+    models: &[Model],
+) -> Vec<&'a Expr> {
+    let port = callbacks_port_methods();
+    if port.is_empty() {
+        return Vec::new();
+    }
+    let port: &[String] = port;
+    // The class methods the class answers from its own body or an app
+    // model ancestor's, nearest first.
+    let mut chain: Vec<&Model> = Vec::new();
+    let mut next = parent;
+    while let Some(name) = next {
+        match models.iter().find(|m| &m.name == name) {
+            Some(model) if !chain.iter().any(|seen| seen.name == model.name) => {
+                chain.push(model);
+                next = model.parent.as_ref();
+            }
+            _ => break,
+        }
+    }
+    let class_method = |name: &str| -> Option<&MethodDef> {
+        own.iter().rev().find(|d| d.name.as_str() == name).copied().or_else(|| {
+            chain.iter().find_map(|m| {
+                m.methods().filter(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == name).last()
+            })
+        })
+    };
+    fn on_self(recv: &Option<Expr>) -> bool {
+        recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    }
+    // Does a bare or `self.` call in `expr` reach the port, directly or
+    // through another such class method?
+    fn reaches<'m>(
+        expr: &Expr,
+        port: &[String],
+        class_method: &dyn Fn(&str) -> Option<&'m MethodDef>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        if let ExprNode::Send { recv, method, .. } = &*expr.node {
+            if on_self(recv) {
+                let name = method.as_str();
+                if port.iter().any(|p| p == name) {
+                    return !addresses_model_chain(expr);
+                }
+                if !seen.iter().any(|s| s == name) {
+                    if let Some(def) = class_method(name) {
+                        seen.push(name.to_string());
+                        if reaches(&def.body, port, class_method, seen) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        let mut found = false;
+        expr.node.for_each_child(&mut |child| {
+            if !found {
+                found = reaches(child, port, class_method, seen);
+            }
+        });
+        found
+    }
+    calls
+        .filter(|expr| {
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { return false };
+            if !on_self(recv) {
+                return false;
+            }
+            let name = method.as_str();
+            if port.iter().any(|p| p == name) {
+                return !addresses_model_chain(expr);
+            }
+            class_method(name).is_some_and(|def| {
+                reaches(&def.body, port, &class_method, &mut vec![name.to_string()])
+            })
+        })
+        .collect()
+}
+
+/// The callback chains ActiveRecord::Base defines on itself (and
+/// ActiveModel::Validations'), which a lowered model runs through its
+/// own lifecycle rather than ActiveSupport::Callbacks.
+const ACTIVE_RECORD_CALLBACK_CHAINS: &[&str] = &[
+    "before_commit",
+    "commit",
+    "create",
+    "destroy",
+    "find",
+    "initialize",
+    "rollback",
+    "save",
+    "touch",
+    "update",
+    "validate",
+    "validation",
+];
+
+/// Does a port call name one of [`ACTIVE_RECORD_CALLBACK_CHAINS`] as a
+/// literal chain (`set_callback :save, ...`, `define_callbacks :create`)?
+fn addresses_model_chain(call: &Expr) -> bool {
+    let ExprNode::Send { method, args, .. } = &*call.node else { return false };
+    let chain_args = if method.as_str() == "define_callbacks" { &args[..] } else { &args[..args.len().min(1)] };
+    chain_args.iter().any(|arg| {
+        let name = match &*arg.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
+            ExprNode::Lit { value: Literal::Str { value } } => value.as_str(),
+            _ => return false,
+        };
+        ACTIVE_RECORD_CALLBACK_CHAINS.contains(&name)
+    })
 }
 
 /// Filter a controller's permitted-fields list down to the names this
@@ -1258,10 +1514,6 @@ fn build_methods_for_dialect(
     finder_inputs: FinderInputs,
     dialect: crate::lower::arel::SqlDialect,
 ) -> Vec<MethodDef> {
-    // No-op outside an emit diagnostics scope, so the many direct
-    // test callers of the lowering entries are unaffected.
-    report_unclaimed_unknowns(model, schema);
-
     let mut methods: Vec<MethodDef> = Vec::new();
 
     if let Some(table) = schema.tables.get(&model.table.0) {

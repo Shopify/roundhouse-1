@@ -7062,20 +7062,7 @@ fn emit_library_class_decl_inner(
     let replayed: Vec<&Expr> = if railtie || replays_foreign_class_body(lc, app) {
         lc.unknown_calls.iter().filter(|c| !crate::analyze::is_include_refusal(c)).collect()
     } else {
-        // sorbet's `mixes_in_class_methods`, lowered by the ingest
-        // (`sorbet_check::mixes_in_class_methods`), is behavior every
-        // body runs, whatever its base; kept in source order.
-        let extensions = app_extension_calls(lc, app);
-        let prepends = app_prepend_calls(lc, app);
-        let own: Vec<&Expr> = lc
-            .unknown_calls
-            .iter()
-            .filter(|c| {
-                crate::ingest::sorbet_check::is_mixes_in(c)
-                    || extensions.iter().any(|e| std::ptr::eq(*e, *c))
-                    || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
-            })
-            .collect();
+        let own = modelled_class_body_calls(lc, app);
         for call in &lc.unknown_calls {
             if !own.iter().any(|c| std::ptr::eq(*c, call)) && !crate::analyze::is_include_refusal(call) {
                 report_dropped_class_body_call(lc, call);
@@ -8331,13 +8318,63 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     };
     let gem = gem_mixin_macro_calls(lc, app);
     let carried = carried_class_macro_calls(lc, app);
-    let runtime = runtime_mixin_macro_calls(lc, app);
+    let mut runtime = runtime_mixin_macro_calls(lc, app);
+    runtime.extend(model_callback_calls(lc, app));
     if gem.is_empty() && carried.is_empty() && runtime.is_empty() {
         return own;
     }
     lc.unknown_calls
         .iter()
         .filter(|call| own.iter().chain(gem.iter()).chain(carried.iter()).chain(runtime.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .collect()
+}
+
+/// A lowered model's ActiveSupport::Callbacks class-body calls
+/// (`model_to_library::callback_dsl_calls`: `define_callbacks
+/// :revocation`, `set_callback`, and an app macro over them such as
+/// Core's `after_revocation :notify`), which `model_class` carries with
+/// the module included. ActiveRecord::Base includes the module natively;
+/// the runtime port answers the calls, and one that calls the class's
+/// own macro runs after its defs (`OwnClassCalls`), as Ruby defines the
+/// macro before the body reaches it.
+///
+/// So are an STI subclass's (a library class whose superclass is a
+/// model, `sti_subclass_callbacks`): Core's
+/// `Credential::Shop::ShopPayBillingAgreement < Shop` calls
+/// `after_revocation :disable_in_external_systems_async`, the macro its
+/// model ancestor's concern defines.
+fn model_callback_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    use crate::lower::model_to_library::{callback_calls, callback_dsl_calls};
+    if let Some(model) = app.models.iter().find(|m| m.name == lc.name) {
+        let calls = callback_dsl_calls(model, &app.models);
+        return lc.unknown_calls.iter().filter(|call| calls.iter().any(|c| c.span == call.span)).collect();
+    }
+    if !lc.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p)) {
+        return Vec::new();
+    }
+    let own: Vec<&crate::dialect::MethodDef> =
+        lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).collect();
+    callback_calls(lc.unknown_calls.iter(), &own, lc.parent.as_ref(), &app.models)
+}
+
+/// The class-body calls the Ruby-family emit of `lc` writes when it
+/// replays only what it models (not a railtie's or a foreign base's whole
+/// body): sorbet's `mixes_in_class_methods`, lowered by the ingest
+/// (`sorbet_check::mixes_in_class_methods`), which every body runs
+/// whatever its base, the `app_extension_calls` and the app prepends, in
+/// source order. The rest is dropped (`report_dropped_class_body_call`);
+/// `model_to_library::diagnose_unclaimed_model_dsl` refuses what an STI
+/// subclass drops.
+pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let extensions = app_extension_calls(lc, app);
+    let prepends = app_prepend_calls(lc, app);
+    lc.unknown_calls
+        .iter()
+        .filter(|c| {
+            crate::ingest::sorbet_check::is_mixes_in(c)
+                || extensions.iter().any(|e| std::ptr::eq(*e, *c))
+                || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
+        })
         .collect()
 }
 
