@@ -98,6 +98,10 @@ struct Delegation {
     /// it can't; callers fall back to the pass's own `"<delegate>"`
     /// label for a synthesis-failure report rather than misattribute.
     file: String,
+    /// Where the declaration names this forwarder (the `:sku` of
+    /// `delegate :sku, to: :helper`; the whole call for Forwardable's
+    /// definers): what the forwarder's body reports against.
+    at: crate::span::Span,
 }
 
 /// Expand every `delegate … to: …` the app's library classes declare.
@@ -365,7 +369,14 @@ fn parse_forwarders(src: &str, delegates: &[Delegation]) -> Vec<MethodDef> {
     });
     match parsed {
         Ok(classes) if diags.is_empty() => {
-            classes.into_iter().flat_map(|c| c.methods).collect()
+            let mut methods: Vec<MethodDef> = classes.into_iter().flat_map(|c| c.methods).collect();
+            for method in &mut methods {
+                let class_side = method.receiver == MethodReceiver::Class;
+                if let Some(d) = delegates.iter().find(|d| d.name == method.name.as_str() && d.class_side == class_side) {
+                    anchor(method, d.at);
+                }
+            }
+            methods
         }
         Ok(_) => {
             record_synthesis_failure(delegates, &diags);
@@ -374,6 +385,33 @@ fn parse_forwarders(src: &str, delegates: &[Delegation]) -> Vec<MethodDef> {
         Err(err) => {
             super::survey::record(&err);
             Vec::new()
+        }
+    }
+}
+
+/// Place a forwarder parsed from the synthesized source where its
+/// declaration names it, so what analysis reports about its body (a
+/// target that has no such method) points at the `delegate` line rather
+/// than at no file. The synthesized source is no registered file, so
+/// every span in it is replaced; a constant read there is marked as
+/// generated, as `Expr::inherit_span` marks one.
+fn anchor(method: &mut MethodDef, at: crate::span::Span) {
+    fn walk(e: &mut Expr, at: crate::span::Span) {
+        if e.span.file == crate::span::FileId(0) {
+            if matches!(&*e.node, ExprNode::Const { .. }) {
+                e.decisions |= crate::expr::GENERATED_CONST_REF;
+            }
+            e.span = at;
+        }
+        e.node.for_each_child_mut(&mut |c| walk(c, at));
+    }
+    if method.name_span.file == crate::span::FileId(0) {
+        method.name_span = at;
+    }
+    walk(&mut method.body, at);
+    for param in &mut method.params {
+        if let Some(default) = param.default.as_mut() {
+            walk(default, at);
         }
     }
 }
@@ -417,16 +455,16 @@ fn take_delegate_decls(
             let file = super::sources::path_of(call.span.file).unwrap_or_default();
             let into = if needs_forwarding { &mut *declined } else { &mut out };
             for (target, method, name) in delegations {
-                into.push(Delegation { method, target, name, allow_nil: false, class_side, file: file.clone() });
+                into.push(Delegation { method, target, name, allow_nil: false, class_side, file: file.clone(), at: call.span });
             }
             return needs_forwarding;
         }
-        let mut names: Vec<Symbol> = Vec::new();
+        let mut names: Vec<(Symbol, crate::span::Span)> = Vec::new();
         let (mut to, mut prefix, mut allow_nil) = (None, false, false);
         let mut unknown_option = false;
         for a in args {
             match &*a.node {
-                ExprNode::Lit { value: Literal::Sym { value } } => names.push(value.clone()),
+                ExprNode::Lit { value: Literal::Sym { value } } => names.push((value.clone(), a.span)),
                 ExprNode::Hash { entries, .. } => {
                     for (k, v) in entries {
                         let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
@@ -470,17 +508,18 @@ fn take_delegate_decls(
         // not evidence this pass can't cover it — it's what every
         // setter call looks like, delegated or not.
         let needs_forwarding = !class_side
-            && (names.iter().any(|n| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str()))
-                || names.iter().any(|n| decline.contains(n.as_str())));
+            && (names.iter().any(|(n, _)| !n.as_str().ends_with('=') && called_with_args.contains(n.as_str()))
+                || names.iter().any(|(n, _)| decline.contains(n.as_str())));
         let file = super::sources::path_of(call.span.file).unwrap_or_default();
         let into = if needs_forwarding { &mut *declined } else { &mut out };
-        for m in names {
+        for (m, at) in names {
             let name = if prefix {
                 format!("{}_{}", target.as_str(), m.as_str())
             } else {
                 m.as_str().to_string()
             };
-            into.push(Delegation { method: m, target: target.clone(), name, allow_nil, class_side, file: file.clone() });
+            let at = if at.is_synthetic() { call.span } else { at };
+            into.push(Delegation { method: m, target: target.clone(), name, allow_nil, class_side, file: file.clone(), at });
         }
         needs_forwarding
     });

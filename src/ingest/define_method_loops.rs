@@ -63,12 +63,30 @@
 //! the evaluator does not know, `super` without arguments, `yield`,
 //! `block_given?`, `binding`, a constant whose lexical binding differs
 //! between the macro's module and the class, parameters other than
-//! required positionals, a name the class (or another expansion)
+//! required positionals, a rest and keywords (required, or with a
+//! default known statically), a name the class (or another expansion)
 //! already defines, and a library class's non-definition side effects.
 //! The diagnostic is reported where the emitted class drops the
 //! statement; a library class that replays its body (a gem's base) or a
 //! macro of an `extend`ed module (the emit runs those natively) keeps
 //! the statement as before, unreported.
+//!
+//! INHERITED MACROS. A library class's call to a class macro its app
+//! superclass defines (Core's `Sales::OrderEditing::StagedChanges::Base`
+//! has `class << self; def data_accessor(*keys)`, and each subclass
+//! calls it with its own keys: `ReverseWriteOff` has
+//! `data_accessor(:write_off_id)`) is expanded for that subclass alone:
+//! the methods are the ones Ruby defines on the class whose body makes
+//! the call. The emitted subclass replays the call itself, which runs
+//! the inherited macro natively, so the call stays and the copies are
+//! analysis's and the other targets' (`App::class_eval_macro_expansions`
+//! tells the Ruby emit to drop them). Because the replay runs the
+//! macro's other statements, a call statement that cannot affect what
+//! the evaluator tracks (`data_attributes.concat(keys)`, see
+//! `passes_over`) and the class-body effects are passed over rather
+//! than refused; a `define_singleton_method` there is still refused.
+//! Two such calls defining one name keep the later one, as the replay
+//! does (`shadow_replayed`).
 
 use crate::App;
 use crate::det::{HashMap, HashSet};
@@ -99,28 +117,48 @@ enum Owner {
     Model(usize),
 }
 
+/// How a macro call reaches the macro it runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The class's own class method, or an eval block in its body.
+    Own,
+    /// An instance method of a module the class `extend`s.
+    Extended,
+    /// A class method of an app library superclass (or of a module it
+    /// `extend`s): the emitted subclass replays the call natively.
+    Inherited,
+}
+
 struct Expansion {
     methods: Vec<MethodDef>,
     residual: Vec<Expr>,
+    /// Names a later replayed call on the same class redefines: this
+    /// call still defines them when the emit replays it, so the emitted
+    /// class drops their copies too, but analysis keeps the later ones.
+    shadowed: Vec<Symbol>,
 }
 
 pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
     let constants = app_constants(app);
     let mut library: Vec<(usize, usize, Result<Expansion, String>)> = Vec::new();
     // Calls the emitted class replays when they stay: a library class
-    // runs a macro of a module it `extend`s natively
-    // (`emit::ruby::library`'s `app_extension_calls`).
+    // runs a macro of a module it `extend`s, or one an app superclass
+    // defines, natively (`emit::ruby::library`'s `app_extension_calls`).
     let mut replayed: HashSet<(usize, usize)> = HashSet::default();
+    let mut inherited: HashSet<(usize, usize)> = HashSet::default();
     for (i, lc) in app.library_classes.iter().enumerate() {
         if lc.origin.is_some() {
             continue;
         }
         for (j, call) in lc.unknown_calls.iter().enumerate() {
-            if let Some((outcome, extended)) =
+            if let Some((outcome, reach)) =
                 plan(app, sources, &constants, Owner::Library(i), call)
             {
-                if extended {
+                if reach != Reach::Own {
                     replayed.insert((i, j));
+                }
+                if reach == Reach::Inherited {
+                    inherited.insert((i, j));
                 }
                 library.push((i, j, outcome));
             }
@@ -137,6 +175,7 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
             }
         }
     }
+    shadow_replayed(app, &mut library, &inherited);
     settle_collisions(app, &mut library, Owner::Library);
     settle_collisions(app, &mut models, Owner::Model);
 
@@ -148,6 +187,21 @@ pub(super) fn expand(app: &mut App, sources: &[SourceFile]) {
     for (i, j, outcome) in library {
         let lc = &mut app.library_classes[i];
         match outcome {
+            Ok(expansion) if inherited.contains(&(i, j)) => {
+                // The emitted subclass replays the call, which runs the
+                // inherited macro as Ruby does; these copies are what
+                // analysis and the other targets see of it, and the
+                // Ruby emit writes the class without them.
+                let call = lc.unknown_calls[j].span;
+                let mut names: Vec<Symbol> = expansion.methods.iter().map(|m| m.name.clone()).collect();
+                names.extend(expansion.shadowed);
+                lc.methods.extend(expansion.methods);
+                let name = lc.name.clone();
+                app.class_eval_macro_expansions
+                    .entry(name)
+                    .or_default()
+                    .push(crate::app::ClassEvalExpansion { call, methods: names, hook: false });
+            }
             Ok(expansion) => {
                 lc.unknown_calls.remove(j);
                 lc.methods.extend(expansion.methods);
@@ -242,6 +296,53 @@ fn refuse(call: &mut Expr, reason: String) {
         construct: Symbol::from(REFUSAL_CONSTRUCT),
         detail: reason,
     });
+}
+
+/// Two replayed calls on one class body that define the same name
+/// (Core's `AddManualDiscount` calls `data_accessor(:fixed_amount, …)`
+/// then `money_data_accessor(:fixed_amount)`): the emitted class runs
+/// both, in order, so the later definition is the one Ruby keeps. The
+/// earlier expansion gives that name up (its call still defines it when
+/// replayed, so the emit drops its copy too). Calls in different files
+/// (a reopened class) have no order here and stay collisions.
+fn shadow_replayed(
+    app: &App,
+    planned: &mut [(usize, usize, Result<Expansion, String>)],
+    inherited: &HashSet<(usize, usize)>,
+) {
+    let spans: Vec<Option<(String, Span)>> = planned
+        .iter()
+        .map(|(i, j, outcome)| {
+            (outcome.is_ok() && inherited.contains(&(*i, *j))).then(|| {
+                let lc = &app.library_classes[*i];
+                (lc.name.0.to_string(), lc.unknown_calls[*j].span)
+            })
+        })
+        .collect();
+    let defined: Vec<Vec<Symbol>> = planned
+        .iter()
+        .map(|(_, _, outcome)| match outcome {
+            Ok(e) => e.methods.iter().map(|m| m.name.clone()).collect(),
+            Err(_) => Vec::new(),
+        })
+        .collect();
+    for (k, entry) in planned.iter_mut().enumerate() {
+        let Some((class, span)) = &spans[k] else { continue };
+        let later: HashSet<&Symbol> = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| {
+                other.as_ref().is_some_and(|(c, s)| c == class && s.file == span.file && s.start > span.start)
+            })
+            .flat_map(|(l, _)| defined[l].iter())
+            .collect();
+        let Ok(expansion) = &mut entry.2 else { continue };
+        let (gone, kept): (Vec<MethodDef>, Vec<MethodDef>) = std::mem::take(&mut expansion.methods)
+            .into_iter()
+            .partition(|m| m.receiver == MethodReceiver::Instance && later.contains(&m.name));
+        expansion.methods = kept;
+        expansion.shadowed.extend(gone.into_iter().map(|m| m.name));
+    }
 }
 
 /// Ruby keeps the last definition of a name; an expansion that would
@@ -373,15 +474,15 @@ fn source_of<'a>(sources: &'a [SourceFile], span: Span) -> Option<&'a SourceFile
 }
 
 /// `None` when `call` is not a define_method statement at all; otherwise
-/// the expansion, or why there is none, and whether the call reaches
-/// its macro through a module the class `extend`s.
+/// the expansion, or why there is none, and how the call reaches its
+/// macro.
 fn plan(
     app: &App,
     sources: &[SourceFile],
     constants: &HashSet<String>,
     owner: Owner,
     call: &Expr,
-) -> Option<(Result<Expansion, String>, bool)> {
+) -> Option<(Result<Expansion, String>, Reach)> {
     let ExprNode::Send {
         recv,
         method,
@@ -403,7 +504,7 @@ fn plan(
         if !args.is_empty() || !defines(block) {
             return None;
         }
-        return Some((plan_eval(app, sources, constants, owner, call), false));
+        return Some((plan_eval(app, sources, constants, owner, call), Reach::Own));
     }
     if block.is_some() {
         return None;
@@ -415,14 +516,20 @@ fn plan(
     {
         return None;
     }
-    let (def, via) = macro_for(app, owner, method, call.span)?;
+    let (def, via, inherited) = macro_for(app, owner, method, call.span)?;
     if !defines(&def.body) {
         return None;
     }
-    let extended = via != owner_name(app, owner).0.as_str();
+    let reach = if inherited {
+        Reach::Inherited
+    } else if via != owner_name(app, owner).0.as_str() {
+        Reach::Extended
+    } else {
+        Reach::Own
+    };
     Some((
-        plan_macro(app, sources, constants, owner, call, def, via),
-        extended,
+        plan_macro(app, sources, constants, owner, call, def, via, reach == Reach::Inherited),
+        reach,
     ))
 }
 
@@ -439,18 +546,21 @@ fn defines(expr: &Expr) -> bool {
     found
 }
 
-/// The app macro a bare class-body call `name` reaches, and where it
-/// lives: the class's own class-side method (a concern's `class_methods`
-/// arrive spliced as such), or an instance method of a module the class
-/// `extend`s before the call. A model's concern macros are
-/// `model_macros`' to expand. A `def self.x` written after the call in
-/// the same file is not there yet when the class body calls it.
+/// The app macro a bare class-body call `name` reaches, where it lives,
+/// and whether the class inherits it: the class's own class-side method
+/// (a concern's `class_methods` arrive spliced as such), an instance
+/// method of a module the class `extend`s before the call, or (a
+/// library class) a class method of an app library superclass or of a
+/// module that superclass `extend`s (`inherited_macro`). A model's
+/// concern macros are `model_macros`' to expand. A `def self.x` written
+/// after the call in the same file is not there yet when the class body
+/// calls it.
 fn macro_for<'a>(
     app: &'a App,
     owner: Owner,
     name: &Symbol,
     at: Span,
-) -> Option<(&'a MethodDef, String)> {
+) -> Option<(&'a MethodDef, String, bool)> {
     let before = |span: Span| span.file == at.file && span.end <= at.start;
     let (scope, extends): (&ClassId, Vec<&Expr>) = match owner {
         Owner::Library(i) => {
@@ -462,7 +572,7 @@ fn macro_for<'a>(
                 .collect();
             match own.as_slice() {
                 [def] if def.name_span.file == at.file && !before(def.name_span) => return None,
-                [def] => return Some((def, lc.name.0.to_string())),
+                [def] => return Some((def, lc.name.0.to_string(), false)),
                 [] => {}
                 _ => return None,
             }
@@ -512,11 +622,102 @@ fn macro_for<'a>(
                 continue;
             };
             if let Some(def) = module_method(app, module, name, &mut Vec::new()) {
-                return Some((def, module.name.0.to_string()));
+                return Some((def, module.name.0.to_string(), false));
             }
         }
     }
+    match owner {
+        Owner::Library(i) => inherited_macro(app, &app.library_classes[i], name)
+            .map(|(def, via)| (def, via, true)),
+        Owner::Model(_) => None,
+    }
+}
+
+/// The class macro `name` a library class inherits: Ruby looks it up on
+/// the singleton classes of its superclass chain, nearest first, each
+/// with the modules it `extend`s. Only app library classes count (the
+/// superclass as Ruby reads it from the subclass's namespace outwards;
+/// the ingest has not resolved it yet), as the Ruby emit replays exactly
+/// those calls (`emit::ruby::library`'s `inherited_class_macro_calls`);
+/// a model, a gem class or a cycle ends the chain. A name an ancestor
+/// defines more than once (a reopened class) is not guessed at.
+fn inherited_macro<'a>(
+    app: &'a App,
+    lc: &'a crate::dialect::LibraryClass,
+    name: &Symbol,
+) -> Option<(&'a MethodDef, String)> {
+    if lc.is_module {
+        return None;
+    }
+    let mut seen: Vec<&ClassId> = vec![&lc.name];
+    let mut at = lc;
+    while let Some(parent) = at.parent.as_ref() {
+        let ancestor = resolve_class(app, &at.name, parent.0.as_str())?;
+        if seen.contains(&ancestor) || app.models.iter().any(|m| &m.name == ancestor) {
+            return None;
+        }
+        seen.push(ancestor);
+        let parts: Vec<&crate::dialect::LibraryClass> = app
+            .library_classes
+            .iter()
+            .filter(|c| !c.is_module && c.origin.is_none() && &c.name == ancestor)
+            .collect();
+        let own: Vec<&MethodDef> = parts
+            .iter()
+            .flat_map(|c| c.methods.iter())
+            .filter(|m| m.receiver == MethodReceiver::Class && &m.name == name)
+            .collect();
+        match own.as_slice() {
+            [def] => return Some((def, ancestor.0.to_string())),
+            [] => {}
+            _ => return None,
+        }
+        for part in &parts {
+            for call in part.unknown_calls.iter().rev() {
+                let ExprNode::Send { recv: None, method, args, .. } = &*call.node else {
+                    continue;
+                };
+                if method.as_str() != "extend" {
+                    continue;
+                }
+                for arg in args.iter().rev() {
+                    let ExprNode::Const { path } = &*arg.node else {
+                        continue;
+                    };
+                    let Some(module) = resolve_module(app, ancestor, path) else {
+                        continue;
+                    };
+                    if let Some(def) = module_method(app, module, name, &mut Vec::new()) {
+                        return Some((def, module.name.0.to_string()));
+                    }
+                }
+            }
+        }
+        at = parts.iter().copied().find(|c| c.parent.is_some()).unwrap_or(parts[0]);
+    }
     None
+}
+
+/// The app library class (not a module) `written` names, read from
+/// `scope`'s namespace outwards.
+fn resolve_class<'a>(app: &'a App, scope: &ClassId, written: &str) -> Option<&'a ClassId> {
+    let find = |name: &str| {
+        app.library_classes
+            .iter()
+            .find(|c| !c.is_module && c.origin.is_none() && c.name.0.as_str() == name)
+            .map(|c| &c.name)
+    };
+    if let Some(rooted) = written.strip_prefix("::") {
+        return find(rooted);
+    }
+    let segments: Vec<&str> = scope.0.as_str().split("::").collect();
+    (0..segments.len()).rev().find_map(|n| {
+        if n == 0 {
+            find(written)
+        } else {
+            find(&format!("{}::{written}", segments[..n].join("::")))
+        }
+    })
 }
 
 fn resolve_module<'a>(
@@ -713,6 +914,93 @@ fn node_at<'pr>(
     find.found
 }
 
+/// Methods that read their argument without changing it, as a call
+/// statement's outermost send (`data_attributes.concat(keys)`).
+const READS_ARGUMENTS: &[&str] = &["concat", "push", "append", "<<", "unshift", "merge!", "update", "add"];
+
+/// Whether a replayed macro's call statement can be passed over: it
+/// takes no block, sends to `self` (a chain of blockless sends rooted
+/// at an implicit or explicit `self`), writes no local, and reads the
+/// macro's locals only as direct arguments of an outermost method that
+/// does not change its argument. Nothing it does can then change the
+/// locals the evaluator tracks or a value a later `define_method` reads;
+/// the replay runs it as Ruby does (Core's `data_accessor(*keys)` starts
+/// with `data_attributes.concat(keys)`).
+fn passes_over(call: &ruby_prism::CallNode<'_>, env: &Env) -> bool {
+    if call.block().is_some() {
+        return false;
+    }
+    let mut receiver = call.receiver();
+    while let Some(node) = receiver {
+        if node.as_self_node().is_some() {
+            break;
+        }
+        let Some(inner) = node.as_call_node() else { return false };
+        if inner.block().is_some() {
+            return false;
+        }
+        receiver = inner.receiver();
+    }
+    struct Locals {
+        reads: usize,
+        writes: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Locals {
+        fn visit_branch_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            self.check(&node);
+        }
+        fn visit_leaf_node_enter(&mut self, node: ruby_prism::Node<'pr>) {
+            self.check(&node);
+        }
+    }
+    impl Locals {
+        fn check(&mut self, node: &ruby_prism::Node<'_>) {
+            if node.as_local_variable_read_node().is_some() {
+                self.reads += 1;
+            }
+            if node.as_local_variable_write_node().is_some()
+                || node.as_local_variable_operator_write_node().is_some()
+                || node.as_local_variable_or_write_node().is_some()
+                || node.as_local_variable_and_write_node().is_some()
+                || node.as_local_variable_target_node().is_some()
+                || node.as_block_node().is_some()
+                || node.as_lambda_node().is_some()
+            {
+                self.writes = true;
+            }
+        }
+    }
+    let mut locals = Locals { reads: 0, writes: false };
+    ruby_prism::Visit::visit(&mut locals, &call.as_node());
+    if locals.writes {
+        return false;
+    }
+    if locals.reads == 0 {
+        return true;
+    }
+    if !READS_ARGUMENTS.contains(&constant_id_str(&call.name())) {
+        return false;
+    }
+    let direct = call
+        .arguments()
+        .map(|a| {
+            a.arguments()
+                .iter()
+                .filter(|arg| {
+                    let known = |read: Option<ruby_prism::LocalVariableReadNode<'_>>| {
+                        read.is_some_and(|r| env.get(constant_id_str(&r.name())).is_some())
+                    };
+                    match arg.as_splat_node().and_then(|s| s.expression()) {
+                        Some(inner) => known(inner.as_local_variable_read_node()),
+                        None => known(arg.as_local_variable_read_node()),
+                    }
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    direct == locals.reads
+}
+
 /// The IR node a source location was ingested to, anywhere under `root`.
 fn ir_at<'a>(root: &'a Expr, start: usize, end: usize) -> Option<&'a Expr> {
     if root.span.start as usize == start && root.span.end as usize == end {
@@ -743,6 +1031,12 @@ struct Scope<'a> {
     site_nesting: Vec<String>,
     /// The IR of the evaluated statements (the call, or the macro body).
     ir: &'a Expr,
+    /// The emitted class replays the call natively (an inherited macro),
+    /// so the statements besides the definitions run there: a call
+    /// statement that cannot change what the evaluator tracks is passed
+    /// over (`passes_over`) instead of refused, and no class-body effect
+    /// is carried.
+    replayed: bool,
     out: Expansion,
 }
 
@@ -783,9 +1077,11 @@ fn plan_eval(
         site_offset: start,
         site_nesting: located.nesting,
         ir: call,
+        replayed: false,
         out: Expansion {
             methods: Vec::new(),
             residual: Vec::new(),
+            shadowed: Vec::new(),
         },
     };
     let statements: Vec<ruby_prism::Node<'_>> = block
@@ -808,6 +1104,7 @@ fn plan_macro(
     call: &Expr,
     def: &MethodDef,
     via: String,
+    replayed: bool,
 ) -> Result<Expansion, String> {
     let method = match &*call.node {
         ExprNode::Send { method, .. } => method.clone(),
@@ -844,9 +1141,11 @@ fn plan_macro(
         site_offset: start,
         site_nesting: site.nesting,
         ir: &def.body,
+        replayed,
         out: Expansion {
             methods: Vec::new(),
             residual: Vec::new(),
+            shadowed: Vec::new(),
         },
     };
     let mut env = scope.bind(&def_node, &site_node, &method)?;
@@ -998,7 +1297,12 @@ fn utf8(bytes: &[u8]) -> Result<String, String> {
 }
 
 impl<'a> Scope<'a> {
-    /// The macro's parameters bound to the call's literal arguments.
+    /// The macro's parameters bound to the call's literal arguments:
+    /// required positionals, a rest, and keywords (a required one, or an
+    /// optional one whose default is known statically), as Ruby binds
+    /// them. A braceless trailing hash is the keywords only when the
+    /// macro takes keywords; otherwise it is a positional hash, which is
+    /// refused.
     fn bind(
         &self,
         def: &ruby_prism::DefNode<'_>,
@@ -1008,31 +1312,54 @@ impl<'a> Scope<'a> {
         if call.block().is_some() {
             return Err(format!("`{method}` is called with a block"));
         }
+        let params = def.parameters();
+        let takes_keywords = params
+            .as_ref()
+            .is_some_and(|p| p.keywords().iter().next().is_some());
         let mut args = Vec::new();
+        let mut keywords: Vec<(Symbol, Val)> = Vec::new();
         if let Some(list) = call.arguments() {
-            for arg in list.arguments().iter() {
+            let all: Vec<ruby_prism::Node<'_>> = list.arguments().iter().collect();
+            for (k, arg) in all.iter().enumerate() {
+                if let Some(hash) = arg.as_keyword_hash_node()
+                    && takes_keywords
+                    && k + 1 == all.len()
+                {
+                    for element in hash.elements().iter() {
+                        let assoc = element
+                            .as_assoc_node()
+                            .ok_or(format!("`{method}` is called with a keyword splat"))?;
+                        let Val::Sym(key) = self.literal(&assoc.key(), &Env::default())? else {
+                            return Err(format!("`{method}` is called with a non-Symbol keyword"));
+                        };
+                        let value = self
+                            .literal(&assoc.value(), &Env::default())
+                            .map_err(|e| format!("keyword `{key}` of `{method}`: {e}"))?;
+                        keywords.push((key, value));
+                    }
+                    continue;
+                }
                 if arg.as_keyword_hash_node().is_some() || arg.as_splat_node().is_some() {
                     return Err(format!(
                         "`{method}` is called with splatted or keyword arguments"
                     ));
                 }
                 args.push(
-                    self.literal(&arg, &Env::default())
+                    self.literal(arg, &Env::default())
                         .map_err(|e| format!("an argument of `{method}`: {e}"))?,
                 );
             }
         }
         let mut env = Env::default();
         let mut args = args.into_iter();
-        if let Some(params) = def.parameters() {
+        if let Some(params) = params {
             if params.optionals().iter().next().is_some()
                 || params.posts().iter().next().is_some()
-                || params.keywords().iter().next().is_some()
                 || params.keyword_rest().is_some()
                 || params.block().is_some()
             {
                 return Err(format!(
-                    "`{method}` takes parameters other than required positionals and a rest"
+                    "`{method}` takes parameters other than required positionals, a rest and keywords"
                 ));
             }
             for param in params.requireds().iter() {
@@ -1054,6 +1381,28 @@ impl<'a> Scope<'a> {
                     Val::Array(args.by_ref().collect()),
                 );
             }
+            for keyword in params.keywords().iter() {
+                let (name, default) = if let Some(required) = keyword.as_required_keyword_parameter_node() {
+                    (Symbol::from(constant_id_str(&required.name())), None)
+                } else if let Some(optional) = keyword.as_optional_keyword_parameter_node() {
+                    (Symbol::from(constant_id_str(&optional.name())), Some(optional.value()))
+                } else {
+                    return Err(format!("`{method}` takes an unrecognized keyword"));
+                };
+                let value = match keywords.iter().position(|(k, _)| *k == name) {
+                    Some(at) => keywords.remove(at).1,
+                    None => match default {
+                        Some(node) => self
+                            .literal(&node, &env)
+                            .map_err(|e| format!("the default of `{method}`'s `{name}:`: {e}"))?,
+                        None => return Err(format!("`{method}` is called without its keyword `{name}:`")),
+                    },
+                };
+                env.set(name, value);
+            }
+        }
+        if let Some((key, _)) = keywords.first() {
+            return Err(format!("`{method}` is called with the unknown keyword `{key}:`"));
         }
         if args.next().is_some() {
             return Err(format!("`{method}` is called with too many arguments"));
@@ -1100,6 +1449,7 @@ impl<'a> Scope<'a> {
                     self.residual(node, env)?;
                     return Ok(Flow::Normal);
                 }
+                _ if self.replayed && passes_over(&call, env) => return Ok(Flow::Normal),
                 _ => {
                     return Err(format!(
                         "`{}` is not evaluated statically",
@@ -1227,6 +1577,11 @@ impl<'a> Scope<'a> {
         } else {
             "define_method"
         };
+        if singleton && self.replayed {
+            // The emitted class drops only instance-side copies of a
+            // replayed call (`App::class_eval_macro_expansions`).
+            return Err(format!("`{what}` in a replayed inherited macro"));
+        }
         let args: Vec<ruby_prism::Node<'_>> = call
             .arguments()
             .map(|a| a.arguments().iter().collect())
@@ -1310,6 +1665,9 @@ impl<'a> Scope<'a> {
     /// A class-body effect besides the definitions: kept, for a model, as
     /// a class-body statement with the captured locals substituted.
     fn residual(&mut self, node: &ruby_prism::Node<'_>, env: &Env) -> Result<(), String> {
+        if self.replayed {
+            return Ok(());
+        }
         if matches!(self.owner, Owner::Library(_)) {
             return Err(format!(
                 "`{}` is a class-body effect a library class does not carry",
