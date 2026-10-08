@@ -134,7 +134,7 @@ end
 end
 "##,
     ),
-    ("app/models/memo.rb", "class Memo < Note\n  metadata_accessor :size, default: 0\n  audit_with :strict\nend\n"),
+    ("app/models/memo.rb", "class Memo < Note\n  extend(OptionalBelongsTo)\n  metadata_accessor :size, default: 0\n  audit_with :strict\nend\n"),
     (
         "app/models/optional_record.rb",
         "class OptionalRecord < ApplicationRecord\n  self.abstract_class = true\n  extend(OptionalBelongsTo)\nend\n",
@@ -182,6 +182,7 @@ p [:audit, Note.audit_level, Post.audit_level, Memo.audit_level]
 p [:marked, ApplicationRecord.marked?, Note.marked?]
 memo = Memo.new
 p [:memo, memo.size, Memo.metadata_names, memo.draft_tag]
+p [:memo_without_author, Memo.new(reviewer_id: a.id).valid?]
 written = Post.new(author_id: a.id)
 p [:delegate, written.author_name, Post.new.author_name, written.hello, written.greet("yo")]
 "#;
@@ -199,6 +200,7 @@ const EXPECTED: &str = r#"[:post_without_author, false]
 [:audit, :default, nil, :strict]
 [:marked, true, false]
 [:memo, 0, ["size"], "memo:draft"]
+[:memo_without_author, false]
 [:delegate, "a", nil, "hi, a", "yo, a"]
 "#;
 
@@ -256,6 +258,8 @@ fn app_class_macros_replay_like_activerecord() {
     assert!(!note.contains("OptionalBelongsTo"), "{note}");
     assert!(read("app/models/application_record.rb").contains("extend Marking"));
     assert!(read("app/models/memo.rb").contains("metadata_accessor :size, default: 0"));
+    // An STI subclass's setting with no `belongs_to` to apply to is not run.
+    assert!(!read("app/models/memo.rb").contains("OptionalBelongsTo"));
 
     let script = format!("require File.expand_path('main', Dir.pwd)\nMain.configure_default_adapter!\n{OBSERVE}");
     let out = emit_and_run::ruby().current_dir(&*dir).args(["-W0", "-e", &script]).env("BLOG_DB", ":memory:").output().expect("ruby");
@@ -277,15 +281,18 @@ fn macros_the_lowered_model_cannot_run_are_refused_with_the_reason() {
             "app/models/concerns/attributed.rb",
             "module Attributed\n  def self.extended(base)\n    base.class_attribute(:attributed, default: {})\n  end\n\n  def attribute_flag(name)\n    self.attributed = attributed.merge(name => true)\n  end\nend\n",
         )
-        .edit("app/models/author.rb", "class Author < ApplicationRecord\n", "class Author < ApplicationRecord\n  extend Attributed\n  attribute_flag :name\n");
+        .edit("app/models/author.rb", "class Author < ApplicationRecord\n", "class Author < ApplicationRecord\n  extend Attributed\n  attribute_flag :name\n")
+        .edit("app/models/memo.rb", "  extend(OptionalBelongsTo)\n", "  extend(OptionalBelongsTo)\n  belongs_to :owner, class_name: \"Author\"\n");
     let (_dir, errors) = app.emit(BuildTarget::Ruby);
     for expected in [
         "readonly_ref not supported (all targets): model macro call on `Post` not lowered; `readonly_ref` reaches `belongs_to`, which the lowered model declares statically from its body, not at class-body run time",
         "keyed_by not supported (all targets): model macro call on `Post` not lowered; `keyed_by` reaches `query_constraints`, which the lowered model declares statically from its body, not at class-body run time",
         "extend not supported (all targets): model macro call on `Author` not lowered; `extend Attributed`: `Attributed.extended` calls `class_attribute`, which the lowered `Author` does not define",
+        "extend not supported (all targets): model macro call on `Memo` not lowered; it sets `belongs_to_required_by_default`, which is applied to a lowered model's `belongs_to` declarations, and an STI subclass's are not lowered as a model's",
+        "belongs_to not supported (all targets): STI subclass body call on `Memo` not lowered",
         "attribute_flag not supported (all targets): model macro call on `Author` not lowered; `attribute_flag` comes from `Attributed`, whose extend is not replayed",
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "{expected}: {errors:#?}");
     }
-    assert_eq!(errors.len(), 4, "{errors:#?}");
+    assert_eq!(errors.len(), 6, "{errors:#?}");
 }

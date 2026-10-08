@@ -722,8 +722,13 @@ pub fn replay_model_macros(app: &mut crate::App) {
 /// The verdicts on an STI subclass's body calls (a library class whose
 /// superclass is a model, which ingest does not lower as one): the same
 /// gate, over its own class methods and its model ancestors'. A
-/// `belongs_to_required_by_default` setting there is refused: the
-/// subclass's declarations are not lowered as a model's.
+/// `belongs_to_required_by_default` setting there is refused when a
+/// `belongs_to` follows it in the subclass or appears in one of its
+/// subclasses (their declarations are not lowered as a model's). With
+/// none, the setting has nothing to apply to (Rails reads it only when
+/// `belongs_to` declares an association), and its verdict stays
+/// [`MacroVerdict::BelongsToRequiredByDefault`]: neither replayed nor
+/// refused.
 pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> Vec<(&'a Expr, MacroVerdict)> {
     if !lc.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p)) {
         return Vec::new();
@@ -736,6 +741,9 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
         .filter(|expr| !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_elsewhere(expr))
         .filter_map(|expr| {
             side.verdict(expr).map(|v| match v {
+                MacroVerdict::BelongsToRequiredByDefault(value) if !declares_belongs_to_after(lc, expr, app) => {
+                    (expr, MacroVerdict::BelongsToRequiredByDefault(value))
+                }
                 MacroVerdict::BelongsToRequiredByDefault(_) => (
                     expr,
                     MacroVerdict::Refuse(
@@ -746,4 +754,28 @@ pub(crate) fn sti_macro_verdicts<'a>(lc: &'a LibraryClass, app: &crate::App) -> 
             })
         })
         .collect()
+}
+
+/// Does a `belongs_to` declaration follow `setting` in STI subclass `lc`'s
+/// body, or appear in the body of a library class below `lc`?
+fn declares_belongs_to_after(lc: &LibraryClass, setting: &Expr, app: &crate::App) -> bool {
+    let is_belongs_to = |c: &Expr| matches!(&*c.node, ExprNode::Send { method, .. } if method.as_str() == "belongs_to");
+    if lc.unknown_calls.iter().any(|c| (c.span.file != setting.span.file || c.span.start > setting.span.start) && is_belongs_to(c)) {
+        return true;
+    }
+    let mut below = vec![&lc.name];
+    let mut i = 0;
+    while i < below.len() {
+        let parent = below[i];
+        for sub in app.library_classes.iter().filter(|c| c.parent.as_ref() == Some(parent)) {
+            if sub.unknown_calls.iter().any(|c| is_belongs_to(c)) {
+                return true;
+            }
+            if !below.contains(&&sub.name) {
+                below.push(&sub.name);
+            }
+        }
+        i += 1;
+    }
+    false
 }

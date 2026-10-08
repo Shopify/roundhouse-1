@@ -1185,6 +1185,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
                 Some((_, macro_replay::MacroVerdict::Refuse(reason))) => {
                     format!("model macro call on `{}` not lowered; {reason}", lc.name.0.as_str())
                 }
+                Some((_, macro_replay::MacroVerdict::BelongsToRequiredByDefault(_))) => continue,
                 _ => format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
             };
             out.push(crate::diagnostic::Diagnostic::unsupported(call.span, None, dropped_statement_name(call).as_str(), detail));
