@@ -68,6 +68,9 @@ end
 "#;
 
 const BIG_ASSET: &str = r#"class BigAsset < Asset
+  def label
+    "big #{name}"
+  end
 end
 "#;
 
@@ -96,9 +99,11 @@ const PROBE: &str = r##"class InheritanceColumnProbe
     Asset.create!(name: "a", type: "png")
     BigAsset.create!(name: "b", type: "jpg")
     out << "nil: #{Asset.count} #{BigAsset.count} #{Asset.find_by(name: "a").type} #{BigAsset.new.type.inspect} #{Asset.inheritance_column.inspect} #{Asset.order(:id).map { |a| a.class.name }.join(",")} #{Asset.first.serializable_hash.key?("type")}"
+    big = BigAsset.find_by(name: "b")
+    out << "plain-class: #{BigAsset.first.class.name} #{big.class.name} #{BigAsset.find(big.id).class.name} #{BigAsset.where(name: "a").to_a.first.class.name} #{BigAsset.where(name: "b").select(:id, :name).first.class.name} #{BigAsset.where(name: "b").last.label} #{Asset.find(big.id).class.name} #{BigAsset.all.map(&:label).join(",")}"
     Tile.create!(name: "t", type: "x")
     WideTile.create!(name: "w")
-    out << "disabled: #{Tile.count} #{WideTile.count} #{WideTile.new.type.inspect} #{Tile.inheritance_column} #{Tile.order(:id).map { |t| t.class.name }.join(",")}"
+    out << "disabled: #{Tile.count} #{WideTile.count} #{WideTile.new.type.inspect} #{Tile.inheritance_column} #{Tile.order(:id).map { |t| t.class.name }.join(",")} #{WideTile.all.order(:id).map { |t| t.class.name }.join(",")}"
     out
   end
 end
@@ -106,13 +111,14 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 6] = [
+const EXPECTED: [&str; 7] = [
     "custom: 2 1 3 TitleCondition data TitleCondition attribute_name attribute_name",
     "hydrate: TitleCondition,PriceCondition,TitleCondition true false TitleCondition",
     "validates: true false",
     "serialize: id,type,value",
     "nil: 2 2 png nil \"\" Asset,Asset true",
-    "disabled: 2 2 nil _type_disabled Tile,Tile",
+    "plain-class: BigAsset BigAsset BigAsset BigAsset BigAsset big b Asset big a,big b",
+    "disabled: 2 2 nil _type_disabled Tile,Tile WideTile,WideTile",
 ];
 
 /// What native Rails requires, in order.

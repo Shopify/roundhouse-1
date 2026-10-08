@@ -188,7 +188,7 @@ const PROBE: &str = r##"class DefaultScopeProbe
     out << "named: #{Badge.new.archived.inspect} #{Badge.count} #{Badge.unscoped.count} #{Badge.all.map(&:title).join(",")} #{Badge.where(title: "b").exists?}"
     Rule.create!(title: "r", rule_type: 1)
     MarkdownRule.create!(title: "m")
-    out << "plain: #{MarkdownRule.new.rule_type} #{MarkdownRule.count} #{Rule.count} #{MarkdownRule.all.map(&:title).join(",")} #{MarkdownRule.first.title} #{Rule.order(:id).last.title} #{MarkdownRule.unscoped.count} #{MarkdownRule.where(title: "r").exists?}"
+    out << "plain: #{MarkdownRule.new.rule_type} #{MarkdownRule.count} #{Rule.count} #{MarkdownRule.all.map(&:title).join(",")} #{MarkdownRule.first.class.name} #{Rule.order(:id).last.class.name} #{MarkdownRule.unscoped.count} #{MarkdownRule.where(title: "r").exists?}"
     out
   end
 end
@@ -227,7 +227,7 @@ const EXPECTED: [&str; 18] = [
     "where-new: q true true r nil nil false nil s nil",
     "left-joins: 1 5 0",
     "named: false 1 3 a false",
-    "plain: 2 1 2 m m m 2 false",
+    "plain: 2 1 2 m MarkdownRule Rule 2 false",
 ];
 
 /// What native Rails requires, in order.

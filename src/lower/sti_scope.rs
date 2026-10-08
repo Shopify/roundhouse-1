@@ -183,6 +183,67 @@ pub(crate) fn push_inheritance_column_method(methods: &mut Vec<MethodDef>, model
     });
 }
 
+/// A model's subclass on a table with no inheritance column (no STI)
+/// loads as the relation's class, as Rails' `instantiate` does on its
+/// receiver: `MarkdownRule.first` is a `MarkdownRule`, with its methods.
+/// The model's synthesized loaders name the model (`Rule.from_stmt`,
+/// `Rule.new`); for a model with such subclasses they call through the
+/// receiver class instead, which a subclass's inherited loader is.
+/// Ruby family (`emit::ruby`, beside `apply_sti_hydration`): a strict
+/// target's subclass is no subtype to return. Models without plain
+/// subclasses are left byte-identical.
+pub(crate) fn apply_plain_subclass_hydration(lcs: &mut [crate::dialect::LibraryClass], app: &App) {
+    let sti = sti_bases(app);
+    let models: HashSet<&ClassId> = app.models.iter().map(|m| &m.name).collect();
+    let mut plain: HashSet<ClassId> = HashSet::default();
+    // The subclasses are the app's library classes (as `sti_bases`
+    // reads them); `lcs` are the lowered models.
+    for lc in &app.library_classes {
+        if sti.contains_key(&lc.name) {
+            continue;
+        }
+        if let Some(parent) = lc.parent.as_ref().filter(|p| models.contains(p)) {
+            plain.insert(parent.clone());
+        }
+    }
+    if plain.is_empty() {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        if !plain.contains(&lc.name) {
+            continue;
+        }
+        let owner = lc.name.clone();
+        for m in &mut lc.methods {
+            if m.receiver != MethodReceiver::Class || !m.name_span.is_synthetic() {
+                continue;
+            }
+            let factory = matches!(m.name.as_str(), "from_stmt" | "from_row");
+            through_receiver(&mut m.body, &owner, factory);
+        }
+    }
+}
+
+/// `Owner.from_stmt(..)` / `Owner.from_row(..)` / `Owner.instantiate(..)`
+/// (and, inside a factory, `Owner.new(..)`) -> the implicit-self call.
+fn through_receiver(expr: &mut Expr, owner: &ClassId, factory: bool) {
+    expr.node.for_each_child_mut(&mut |c| through_receiver(c, owner, factory));
+    let ExprNode::Send { recv, method, .. } = &mut *expr.node else { return };
+    let loader = matches!(method.as_str(), "from_stmt" | "from_row" | "instantiate") || (factory && method.as_str() == "new");
+    if !loader {
+        return;
+    }
+    let names_owner = recv.as_ref().is_some_and(|r| match &*r.node {
+        ExprNode::Const { path } => {
+            path.iter().map(|s| s.as_str().trim_start_matches("::")).collect::<Vec<_>>().join("::") == owner.0.as_str()
+        }
+        _ => false,
+    });
+    if names_owner {
+        *recv = None;
+    }
+}
+
 /// Each STI class's inheritance column, keyed by the subclasses
 /// ([`sti_bases`]) and by their base models.
 pub(crate) fn sti_columns(app: &App) -> HashMap<ClassId, Symbol> {
