@@ -1622,7 +1622,15 @@ impl<'a> BodyTyper<'a> {
                         construct: Symbol::from("constant"),
                         detail: match local {
                             Some(local) => format!("class-body local `{local}` holds a value with no inferred type"),
-                            None => written_class_id(path).0.as_str().to_string(),
+                            // A Rails class no tree carries says why
+                            // (`registry::refused_constants`).
+                            None => {
+                                let name = written_class_id(path).0.as_str().to_string();
+                                match crate::analyze::registry::refused_constants::refusal(&name) {
+                                    Some(reason) => format!("{name} — {reason}"),
+                                    None => name,
+                                }
+                            }
                         },
                     });
                 }

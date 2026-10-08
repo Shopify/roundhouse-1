@@ -96,6 +96,78 @@ pub(in crate::analyze) fn connection_switches() -> impl Iterator<Item = (&'stati
         .chain(sym.into_iter().map(|m| (m, Ty::Sym)))
 }
 
+/// `ActiveRecord::Base.configurations` and the configuration classes it
+/// hands out, under Rails' names: the CRuby PostgreSQL runtime carries
+/// them where boot resolves config/database.yml (project.rs
+/// `apply_postgres_bootstrap`, runtime/spinel/cruby/database_configurations.rb).
+/// Elsewhere the read stays a named gap.
+pub(in crate::analyze) fn carries_database_configurations(app: &crate::App) -> bool {
+    app.database_yml.is_some() && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+}
+
+pub(in crate::analyze) fn register_database_configurations(classes: &mut HashMap<ClassId, ClassInfo>) {
+    let id = |name: &str| ClassId(Symbol::from(name));
+    let class = |name: &str| Ty::Class { id: id(name), args: vec![] };
+    let optional = |ty: Ty| Ty::Union { variants: vec![ty, Ty::Nil] };
+    const CONFIGURATIONS: &str = "ActiveRecord::DatabaseConfigurations";
+    const HASH_CONFIG: &str = "ActiveRecord::DatabaseConfigurations::HashConfig";
+    let hash_config = class(HASH_CONFIG);
+    let configurations = classes.entry(id(CONFIGURATIONS)).or_default();
+    for (name, ty) in [
+        ("configurations", Ty::Array { elem: Box::new(hash_config.clone()) }),
+        // An Array of configurations, or with `name:` one configuration
+        // or nil: one signature cannot say which.
+        ("configs_for", Ty::Untyped),
+        ("find_db_config", optional(hash_config.clone())),
+        ("resolve", hash_config.clone()),
+        ("primary?", Ty::Bool),
+        ("empty?", Ty::Bool),
+        ("blank?", Ty::Bool),
+        ("any?", Ty::Bool),
+    ] {
+        configurations.instance_methods.entry(Symbol::from(name)).or_insert(ty);
+    }
+    let config = classes.entry(id(HASH_CONFIG)).or_default();
+    for (name, ty) in [
+        ("env_name", Ty::Str),
+        ("name", Ty::Str),
+        ("configuration_hash", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+        ("adapter", optional(Ty::Str)),
+        // Values of the configuration hash, as database.yml wrote them.
+        ("replica?", Ty::Untyped),
+        ("migrations_paths", Ty::Untyped),
+        ("host", Ty::Untyped),
+        ("socket", Ty::Untyped),
+        ("database", Ty::Untyped),
+        ("query_cache", Ty::Untyped),
+        ("database_tasks?", Ty::Bool),
+        ("for_current_env?", Ty::Bool),
+        ("primary?", Ty::Bool),
+        ("max_connections", optional(Ty::Int)),
+        ("min_connections", Ty::Int),
+        ("min_threads", Ty::Int),
+        ("max_threads", Ty::Int),
+        ("max_queue", Ty::Int),
+        ("max_age", Ty::Union { variants: vec![Ty::Int, Ty::Float] }),
+        ("checkout_timeout", Ty::Float),
+        ("reaping_frequency", optional(Ty::Float)),
+        ("idle_timeout", optional(Ty::Float)),
+        ("keepalive", optional(Ty::Float)),
+    ] {
+        config.instance_methods.entry(Symbol::from(name)).or_insert(ty);
+    }
+    let url_config = classes.entry(id("ActiveRecord::DatabaseConfigurations::UrlConfig")).or_default();
+    url_config.parent = Some(id(HASH_CONFIG));
+    url_config.instance_methods.entry(Symbol::from("url")).or_insert(Ty::Str);
+    classes
+        .entry(id("ActiveRecord::DatabaseConfigurations::InvalidConfigurationError"))
+        .or_default()
+        .parent = Some(id("StandardError"));
+    let base = classes.entry(id("ActiveRecord::Base")).or_default();
+    base.class_methods.entry(Symbol::from("configurations")).or_insert_with(|| class(CONFIGURATIONS));
+    base.class_methods.entry(Symbol::from("configurations=")).or_insert(Ty::Untyped);
+}
+
 pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_connection_surface(classes);
     // `ActiveRecord::Base` itself — the literal base class, called

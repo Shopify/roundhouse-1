@@ -3078,6 +3078,14 @@ module DatabaseConfiguration
     Schema.statements.each {{ |sql| Db.exec(sql) }} if maintain_test_schema
   end
 end
+
+# Rails' names for the resolver's classes: ActiveRecord::Base.configurations
+# is an ActiveRecord::DatabaseConfigurations, holding
+# ActiveRecord::DatabaseConfigurations::HashConfig and UrlConfig. Only this
+# tree carries them (analyze::registry::ar::register_database_configurations).
+module ActiveRecord
+  DatabaseConfigurations = ::DatabaseConfigurations::Configurations
+end
 "#)
 }
 

@@ -667,7 +667,11 @@ module ActiveRecord
       end
 
       # core.rb: `configurations` (Base's alone; a subclass reads Base's).
+      # Rails wraps what it is given (`DatabaseConfigurations.new(config)`,
+      # which takes another instance's configurations as they are); boot
+      # assigns the resolved instance itself.
       def configurations=(config)
+        config = ActiveRecord::DatabaseConfigurations.new(config) unless config.is_a?(ActiveRecord::DatabaseConfigurations)
         ActiveRecord::Base.instance_variable_set(:@configurations, config)
       end
 

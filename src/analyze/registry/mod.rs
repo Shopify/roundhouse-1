@@ -10,6 +10,7 @@ pub(super) mod controllers;
 pub(super) mod gem_boundary;
 pub(super) mod library;
 pub(super) mod load_hook_mixins;
+pub(super) mod refused_constants;
 pub(super) mod routes;
 pub(super) mod stdlib;
 pub(super) mod view;
