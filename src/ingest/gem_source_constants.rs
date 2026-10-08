@@ -129,6 +129,67 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
     out
 }
 
+/// How deep under a require path [`engine_isolated_prefixes`] looks for
+/// an `engine.rb`: Rails' engine generator writes `lib/<name>/engine.rb`
+/// (depth 1), a namespaced one `lib/<org>/<name>/engine.rb`.
+const MAX_ENGINE_DEPTH: usize = 3;
+
+/// The `isolate_namespace` table prefixes the installed engines of
+/// `gems` (lockfile spec names the boot's `Bundler.require` loads)
+/// define, read from each gem's `engine.rb` files under its require
+/// paths at the locked version: maintenance_tasks 2.17.0's
+/// `lib/maintenance_tasks/engine.rb` runs `isolate_namespace
+/// MaintenanceTasks` when Bundler requires the gem, and Rails then
+/// defines `MaintenanceTasks.table_name_prefix` as `maintenance_tasks_`,
+/// which an app model in the namespace (Core's
+/// `MaintenanceTasks::CrossPodRun < ::ApplicationRecord`) reads too. The
+/// gem is read, not carried. A gem the app carries as source is read with
+/// the app's own files.
+pub fn engine_isolated_prefixes<V: Vfs + ?Sized>(
+    vfs: &V,
+    home: &Path,
+    lock: &Lockfile,
+    gems: &BTreeSet<String>,
+) -> super::model::TablePrefixes {
+    let mut out = super::model::TablePrefixes::default();
+    let mut installed: Option<Vec<PathBuf>> = None;
+    for gem in gems {
+        if lock.is_in_repo(gem) {
+            continue;
+        }
+        let Some(version) = lock.version_of(gem) else { continue };
+        let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
+        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let mut engines = Vec::new();
+        for path in &require_paths {
+            engine_files(vfs, &dir.join(path), 0, &mut engines);
+        }
+        engines.sort();
+        engines.dedup();
+        for file in engines {
+            let Ok(source) = vfs.read(&file) else { continue };
+            for (module, prefix) in super::model::ingest_isolated_namespace_prefixes(&source, &file.display().to_string()) {
+                out.entry(module).or_insert(prefix);
+            }
+        }
+    }
+    out
+}
+
+fn engine_files<V: Vfs + ?Sized>(vfs: &V, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(mut entries) = vfs.read_dir(dir) else { return };
+    entries.sort();
+    for entry in entries {
+        if vfs.is_dir(&entry) {
+            if depth < MAX_ENGINE_DEPTH {
+                engine_files(vfs, &entry, depth + 1, out);
+            }
+        } else if entry.file_name().is_some_and(|f| f == "engine.rb") {
+            out.push(entry);
+        }
+    }
+}
+
 /// The Rails gems the boot's gem-source dependency block refuses a
 /// feature for depending on (`project::gem_source_dependency_block`,
 /// `__rh_rails_gems`).
