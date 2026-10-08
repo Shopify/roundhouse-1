@@ -5,13 +5,13 @@
 //! factory's name suffixes, so a call to a key the table has resolves
 //! and a call to one it lacks is still a dispatch failure.
 //!
-//! The factory is Core's `WebUrlHelpersFactory` shape: blocks with
+//! The factory is Core's `WebUrlHelpersFactory`, unchanged: blocks with
 //! keyword parameters (`do |params: {}, anchor: nil, **args|`) calling a
 //! `protected` `def replace_named_args` written inside the `Class.new`
-//! block. Emitted for Ruby, the helpers it defines answer as native
-//! Ruby's do, and the def keeps its visibility. (Core builds the
-//! string with `ActionDispatch::Http::URL.path_for`/`full_url_for`,
-//! which the runtime does not port yet; the probe builds it itself.)
+//! block, and building each string with `ActionDispatch::Http::URL.
+//! path_for` / `full_url_for` (runtime/spinel/action_dispatch_http_url.rb).
+//! Emitted for Ruby, the helpers it defines answer as they do natively
+//! under the pinned actionpack, and the def keeps its visibility.
 
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -22,23 +22,36 @@ use std::path::PathBuf;
 use roundhouse::analyze::{Analyzer, DiagnosticKind, diagnose};
 use roundhouse::ingest::ingest_app_from_tree;
 
-const FACTORY: &str = r###"class PathsFactory
+/// Core's components/platform/essentials/app/models/web_url_helpers_factory.rb,
+/// verbatim.
+const FACTORY: &str = r###"# typed: true
+# frozen_string_literal: true
+
+# Add new paths on components/platform/essentials/config/web_paths.yml
+class WebUrlHelpersFactory
   class << self
     def create(paths)
       Class.new do
         paths.each do |config_name, path|
           define_method "#{config_name}_path" do |params: {}, anchor: nil, **args|
+            #: self as singleton(WebUrlHelpersFactory)
             finalized_path = replace_named_args(path, **args)
-            query = params.map { |key, value| "#{key}=#{value}" }.join("&")
-            finalized_path += "?#{query}" unless query.empty?
-            finalized_path += "##{anchor}" if anchor
-            finalized_path
+            ActionDispatch::Http::URL.path_for(path: finalized_path, params: params, anchor: anchor)
           end
 
           define_method(
             "#{config_name}_url"
-          ) do |params: {}, host: nil, protocol: "https", **args|
-            "#{protocol}://#{host}#{replace_named_args(path, **args)}"
+          ) do |params: {}, anchor: nil, host: nil, protocol: "https", port: nil, **args|
+            #: self as singleton(WebUrlHelpersFactory)
+            finalized_path = replace_named_args(path, **args)
+            ActionDispatch::Http::URL.full_url_for(
+              path: finalized_path,
+              params: params,
+              anchor: anchor,
+              host: host,
+              protocol: protocol,
+              port: port
+            )
           end
         end
 
@@ -48,7 +61,7 @@ const FACTORY: &str = r###"class PathsFactory
           named_args = path.scan(/(?<=:)[a-z_]+/)
           named_args.each do |named_arg|
             unless args.key?(named_arg.to_sym)
-              raise ArgumentError, "[PathsFactory] Named arg <#{named_arg}> is not provided."
+              raise ArgumentError, "[WebUrlHelpersFactory] Named arg <#{named_arg}> is not provided."
             end
 
             path = path.gsub(":" + named_arg, args[named_arg.to_sym].to_s.tr(" ", "+"))
@@ -69,10 +82,10 @@ fn app(controller_body: &str) -> roundhouse::App {
             "app/controllers/application_controller.rb",
             "class ApplicationController < ActionController::Base\nend\n".to_string(),
         ),
-        ("app/models/paths_factory.rb", FACTORY.to_string()),
+        ("app/models/web_url_helpers_factory.rb", FACTORY.to_string()),
         (
             "app/models/web_paths.rb",
-            "WebPaths = PathsFactory.create(YAML.load_file(File.join(Rails.root, \"config/web_paths.yml\"))[\"paths\"])\n"
+            "WebPaths = WebUrlHelpersFactory.create(YAML.load_file(File.join(Rails.root, \"config/web_paths.yml\"))[\"paths\"])\n"
                 .to_string(),
         ),
         (
@@ -133,23 +146,72 @@ fn a_call_the_table_lacks_still_fails() {
     assert_eq!(failed, vec!["admin_nothing_path"]);
 }
 
+/// Core's WebUrlHelpersFactoryTest observations, and more: query
+/// params with nesting and escaping, escaped anchors, explicit and
+/// default ports and protocols, named args with spaces, the missing
+/// named arg's ArgumentError and full_url_for's missing host.
+const OBSERVE: &str = r###"helpers = WebUrlHelpersFactory.create("home" => "/admin", "payments_settings_index" => "/admin/settings/payments")
+p helpers.home_path
+p helpers.home_path(params: { search: "search value" }, anchor: "anchor")
+p helpers.payments_settings_index_url(params: { search: "search value" }, anchor: "anchor", host: "www.shop1.com", protocol: "https", port: "80")
+p helpers.home_url(params: { search: "search value" }, anchor: "anchor", host: "www.shop1.com", port: "80")
+p helpers.home_url(host: "www.shop1.com", port: 443)
+p helpers.home_url(host: "http://shop.test:3000", protocol: nil)
+p helpers.home_path(params: { b: [2, 1], a: { y: nil, x: "1 2" }, c: nil, d: [] }, anchor: "a b#c")
+p helpers.home_path(params: "raw", anchor: :top)
+named = WebUrlHelpersFactory.create("admin_discounts_code_show" => "/admin/discounts/:discount_id/codes/:code_id")
+p named.admin_discounts_code_show_path(discount_id: 123, code_id: 456)
+p named.admin_discounts_code_show_url(discount_id: 123, code_id: 456, host: "example.org")
+spaces = WebUrlHelpersFactory.create("admin_discounts_code_show" => "/admin/discounts/:discount_id?code=:code_id")
+p spaces.admin_discounts_code_show_path(discount_id: 123, code_id: "My Code")
+p [helpers.respond_to?(:home_path), helpers.respond_to?(:home_url), helpers.class.protected_method_defined?(:replace_named_args)]
+begin
+  helpers.replace_named_args("/x")
+rescue NoMethodError => e
+  p e.class
+end
+begin
+  named.admin_discounts_code_show_path(discount_id: 123)
+rescue ArgumentError => e
+  p e.message
+end
+begin
+  helpers.home_url
+rescue ArgumentError => e
+  p e.message
+end
+"###;
+
 #[test]
-fn keyword_block_helpers_run_as_native() {
-    let observe = "helpers = PathsFactory.create(\"admin_orders\" => \"/admin/orders\", \"admin_order_show\" => \"/admin/orders/:id\")\n\
-         p helpers.admin_orders_path\n\
-         p helpers.admin_orders_path(params: { search: \"x\" }, anchor: \"top\")\n\
-         p helpers.admin_order_show_path(id: 7)\n\
-         p helpers.admin_order_show_url(id: 7, host: \"shop.test\")\n\
-         p helpers.admin_orders_url(host: \"shop.test\", protocol: \"http\", params: { ignored: 1 })\n\
-         p helpers.admin_order_show_path(id: \"a b\")\n\
-         p [helpers.respond_to?(:admin_orders_path), helpers.class.protected_method_defined?(:replace_named_args)]\n\
-         begin\n  helpers.replace_named_args(\"/x\")\nrescue NoMethodError => e\n  p e.class\nend\n\
-         begin\n  helpers.admin_order_show_path\nrescue ArgumentError => e\n  p e.message\nend\n";
-    let native = emit_and_run::ruby().arg("-e").arg(format!("{FACTORY}\n{observe}")).output().expect("spawn ruby");
+fn core_factory_helpers_run_as_native_actionpack() {
+    // Native: the factory under the pinned actionpack and activesupport's
+    // core_ext (tests/support/rails_oracle.rb), as Core runs it.
+    let scratch = std::env::temp_dir().join(format!("rh_web_url_native_{}.rb", std::process::id()));
+    let oracle = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/rails_oracle");
+    std::fs::write(
+        &scratch,
+        format!(
+            "require_relative {oracle:?}\nRailsOracle.activate(\"activesupport\", \"actionpack\")\n\
+             require \"active_support\"\nrequire \"active_support/core_ext\"\nrequire \"action_dispatch\"\n\
+             {FACTORY}\n{OBSERVE}"
+        ),
+    )
+    .expect("write native script");
+    let native = emit_and_run::ruby().arg(&scratch).output().expect("spawn ruby");
+    let _ = std::fs::remove_file(&scratch);
     assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let native = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(native.contains("\"https://www.shop1.com:80/admin?search=search+value#anchor\""), "{native}");
     let run = emit_and_run::real_blog()
-        .write("app/lib/paths_factory.rb", FACTORY)
-        .run_ruby(&format!("require_relative \"app/models/paths_factory\"\n{observe}"));
+        .write("app/lib/web_url_helpers_factory.rb", FACTORY)
+        .run_ruby(&format!(
+            "require_relative \"app/models/web_url_helpers_factory\"\n{OBSERVE}\n\
+             $stderr.puts ActionDispatch::Http::URL.method(:path_for).source_location.first\n"
+        ));
     run.assert_passes();
-    assert_eq!(run.stdout, String::from_utf8_lossy(&native.stdout));
+    assert_eq!(run.stdout, native);
+    // The port answered, not a native actionpack.
+    assert!(run.stderr.trim_end().ends_with("runtime/action_dispatch_http_url.rb"), "{}", run.stderr);
+    let tree = std::fs::read_to_string(run.emitted.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
+    assert!(tree.contains("require_relative \"action_dispatch_http_url\""), "{tree}");
 }
