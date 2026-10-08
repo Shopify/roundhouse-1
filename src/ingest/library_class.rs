@@ -2402,10 +2402,15 @@ struct DeclBody {
     /// Which `methods` a load-time conditional defines (see
     /// `ConditionalDefinitions`).
     conditional_definitions: Vec<crate::dialect::ConditionalDefinitions>,
-    /// An include, constant or captured class-body call came AFTER a
+    /// An include or captured class-body call came AFTER a
     /// class-variable initializer in source. The emitted body puts every
     /// initializer after those buckets, so it cannot keep that order.
     declaration_after_class_initializer: bool,
+    /// The constants written AFTER a class-variable initializer in
+    /// source. The emitted body writes them above every initializer,
+    /// which `finalize_classvars` accepts only when that cannot be
+    /// observed (`constant_moves_unobserved`).
+    constants_after_class_initializer: Vec<Symbol>,
     /// `class_attribute` (`ingest::class_attribute`): the names declared
     /// so far, and the class-body statements on its storage in source
     /// order, its seeds and `self.x = v` writes through its writers.
@@ -2540,6 +2545,7 @@ impl DeclBody {
         self.method_aliases.extend(other.method_aliases);
         self.conditional_definitions.extend(other.conditional_definitions);
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
+        self.constants_after_class_initializer.extend(other.constants_after_class_initializer);
         self.class_attribute_names.extend(other.class_attribute_names);
         self.class_attribute_effects.extend(other.class_attribute_effects);
         self.class_attr_seeds.extend(other.class_attr_seeds);
@@ -2574,11 +2580,20 @@ impl DeclBody {
         // The emitted body runs includes, constants and replayed calls,
         // then every initializer in source order, then the defs. That is
         // the source order exactly when nothing of the first kind follows
-        // an initializer and no initializer needs a def written above it.
+        // an initializer (save a constant whose move is unobserved) and no
+        // initializer needs a def written above it.
         if self.declaration_after_class_initializer {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "native class-variable initialization followed by other class-body declarations requires source ordering".into(),
+            });
+        }
+        if let Some(name) = self.constants_after_class_initializer.iter().find(|name| !self.constant_moves_unobserved(name)) {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "native class-variable initialization followed by constant `{name}`, whose value or readers make the order observable, requires source ordering"
+                ),
             });
         }
         let own = OwnClassCalls::new(owner, &self.methods);
@@ -2599,6 +2614,67 @@ impl DeclBody {
         }
         Ok(())
     }
+}
+
+impl DeclBody {
+    /// Can the emitted body write constant `name` above the class-variable
+    /// initializers it follows in source without that being seen? Yes when
+    /// its value is inert (`inert_value`: it runs no code and reads
+    /// nothing, so no initializer's effect reaches it) and nothing the
+    /// class body runs in its stead reads it (an initializer, a
+    /// `class_attribute`/`cattr` effect: none names `name` or reflects on
+    /// constants), so no reader finds it earlier than the source did.
+    fn constant_moves_unobserved(&self, name: &Symbol) -> bool {
+        self.constants.iter().filter(|(n, _)| n == name).all(|(_, value)| inert_value(value))
+            && !self
+                .class_initializers
+                .iter()
+                .chain(&self.class_attribute_effects)
+                .chain(&self.class_attr_seeds)
+                .any(|e| reads_constant(e, name))
+    }
+}
+
+/// A literal, or an array, hash or range of them, optionally `.freeze`d:
+/// a value whose evaluation runs no code and reads nothing.
+fn inert_value(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(inert_value),
+        ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| inert_value(k) && inert_value(v)),
+        ExprNode::Range { begin, end, .. } => begin.iter().chain(end.iter()).all(inert_value),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+            method.as_str() == "freeze" && args.is_empty() && inert_value(recv)
+        }
+        _ => false,
+    }
+}
+
+/// Might `e` read (or write) constant `name`: a constant path ending in
+/// it, or reflection over constants (`const_get`, `const_set`, ...).
+fn reads_constant(e: &Expr, name: &Symbol) -> bool {
+    let here = match &*e.node {
+        ExprNode::Const { path } => path.last() == Some(name),
+        ExprNode::Send { method, .. } => matches!(
+            method.as_str(),
+            "const_get"
+                | "const_set"
+                | "const_defined?"
+                | "constants"
+                | "const_source_location"
+                | "const_missing"
+                | "remove_const"
+        ),
+        _ => false,
+    };
+    let mut found = here;
+    // `defined?(NAME)` asks without reading; `for_each_child` treats
+    // the operand as a leaf.
+    if let ExprNode::Defined { operand } = &*e.node {
+        found |= reads_constant(operand, name);
+    }
+    e.node.for_each_child(&mut |child| found |= reads_constant(child, name));
+    found
 }
 
 /// Does a class-body expression run code this class body defines? A
@@ -2695,20 +2771,26 @@ impl<'a> OwnClassCalls<'a> {
 /// earlier statement recorded an initializer marks the body. Within one
 /// statement (a merged `class << self` walk) the nested body's own flag
 /// carries that statement's internal order.
+/// The constants such a statement wrote are recorded by name instead
+/// (`constants_after_class_initializer`).
 #[derive(Default)]
 struct InitializerOrder {
-    previous: Option<(bool, usize)>,
+    previous: Option<(bool, usize, usize)>,
 }
 
 impl InitializerOrder {
     fn observe(&mut self, out: &mut DeclBody) {
-        let now = out.ordered_declaration_count();
-        if let Some((had_initializer, before)) = self.previous {
-            if had_initializer && now > before {
+        let constants = out.constants.len();
+        let others = out.ordered_declaration_count() - constants;
+        if let Some((true, before_others, before_constants)) = self.previous {
+            if others > before_others {
                 out.declaration_after_class_initializer = true;
             }
+            let late: Vec<Symbol> =
+                out.constants.get(before_constants..).into_iter().flatten().map(|(n, _)| n.clone()).collect();
+            out.constants_after_class_initializer.extend(late);
         }
-        self.previous = Some((!out.class_initializers.is_empty(), now));
+        self.previous = Some((!out.class_initializers.is_empty(), others, constants));
     }
 }
 

@@ -132,3 +132,51 @@ fn a_respond_to_guarded_hook_declaration_is_its_branch_as_native() {
     assert!(!run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
+
+/// activemerchant's `PaypalCommonAPI`: `base.cattr_accessor :pem_file`
+/// in the hook. ActiveSupport's `mattr_*` define the accessors on
+/// `base` over `@@pem_file`, one class variable for `base`, its
+/// subclasses and their instances, seeded on `base` (a default once,
+/// shared by every name; nil only when unset).
+const CREDS: &str = r##"module Creds
+  def self.included(base)
+    base.cattr_accessor :pem_file
+    base.cattr_accessor :signature
+    base.mattr_reader :mode, :fallback, default: [:live]
+    base.cattr_writer :secret, instance_writer: false
+    base.live = "live"
+  end
+end
+"##;
+const PAY: &str = "class Pay\n  class_attribute :live\n  include Creds\n\n  def self.secret_value = @@secret\nend\n";
+const SUB_PAY: &str = "class SubPay < Pay\nend\n";
+/// A class variable the includer already sees (here its superclass's)
+/// keeps its value: an unset name is seeded nil only when undefined.
+const PRESET: &str = "class Preset\n  @@signature = :preset\nend\n";
+const OTHER_PAY: &str = "class OtherPay < Preset\n  class_attribute :live\n  include Creds\nend\n";
+
+#[test]
+fn an_included_hook_s_cattr_is_the_includer_s_class_variable_as_native() {
+    let script = "SubPay.pem_file = \"cert\"\n\
+                  p [Pay.pem_file, SubPay.pem_file, Pay.new.pem_file, OtherPay.pem_file, OtherPay.signature]\n\
+                  Pay.new.signature = :sig\n\
+                  p [SubPay.signature, Pay.mode, Pay.fallback.equal?(Pay.mode), SubPay.new.mode]\n\
+                  Pay.secret = 1\n\
+                  p [Pay.secret_value, Pay.new.respond_to?(:secret=), Pay.respond_to?(:mode=), Pay.class_variables.sort]\n\
+                  p [Pay.live, OtherPay.class_variables.sort, Preset.class_variables]\n";
+    let prelude = format!("{PRELUDE}require \"active_support/core_ext/module/attribute_accessors\"\n");
+    let classes = [("lib/creds.rb", CREDS), ("lib/pay.rb", PAY), ("lib/sub_pay.rb", SUB_PAY), ("lib/preset.rb", PRESET), ("lib/other_pay.rb", OTHER_PAY)];
+    let program: String = classes.iter().map(|(_, source)| *source).collect();
+    let expected = native(&format!("{prelude}{program}{script}"));
+    assert_eq!(
+        expected,
+        "[\"cert\", \"cert\", \"cert\", nil, :preset]\n\
+         [:sig, [:live], true, [:live]]\n\
+         [1, false, false, [:@@fallback, :@@mode, :@@pem_file, :@@secret, :@@signature]]\n\
+         [\"live\", [:@@fallback, :@@mode, :@@pem_file, :@@secret, :@@signature], [:@@signature]]\n",
+        "native control"
+    );
+    let run = classes.iter().fold(emit_and_run::empty_app(), |overlay, (path, source)| overlay.write(path, source)).run_ruby(script);
+    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
+}
