@@ -61,6 +61,12 @@ const PROBE: &str = r##"class NewRecordIdProbe
     out << "saved: #{o.id.is_a?(Integer)} #{o.id > 0} #{o.to_param == o.id.to_s}"
     p.save!
     out << "autosaved fk: #{p.reload.owner_id == o.id}"
+    o3 = Owner.create!(name: "o3")
+    q = Pet.new(name: "q")
+    q.owner = o
+    q.owner_id = o3.id
+    q.save!
+    out << "stale target: #{q.reload.owner_id == o3.id}"
     o2 = Owner.create!(name: "o2")
     id = o2.id
     o2.destroy
@@ -73,13 +79,14 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 8] = [
+const EXPECTED: [&str; 9] = [
     r#"new: nil nil nil true"#,
     r#"given: 5 6 nil"#,
     r#"equality: false true 2 false"#,
     r#"fk from unsaved: nil true"#,
     r#"saved: true true true"#,
     r#"autosaved fk: true"#,
+    r#"stale target: true"#,
     r#"destroyed: true true"#,
     r#"pets of new: []"#,
 ];
