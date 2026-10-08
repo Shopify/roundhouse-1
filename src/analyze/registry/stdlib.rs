@@ -18,7 +18,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // `Rails.env` is the one we can type concretely as Str.
     let mut rails_cls = ClassInfo::default();
     // `Rails.app` is railties' alias of `application`.
-    for m in ["application", "app", "logger", "cache", "configuration", "root", "gem_version"] {
+    // `Rails.autoloaders` is runtime/spinel/rails_autoloaders.rb's, gated
+    // (`analyze::runtime_reads`) to the trees that carry it.
+    for m in ["application", "app", "logger", "cache", "configuration", "autoloaders", "root", "gem_version"] {
         rails_cls.class_methods.insert(Symbol::from(m), Ty::Untyped);
     }
     // `Rails.env` is an ActiveSupport::StringInquirer (a String

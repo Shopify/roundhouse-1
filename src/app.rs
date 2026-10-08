@@ -428,6 +428,12 @@ pub struct App {
     /// (`ingest::on_load_hooks`); the emitted boot registers each one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub load_hooks: Vec<LoadHook>,
+    /// `Rails.autoloaders.main.on_load("Model") { Model.include(M) }`
+    /// callbacks of boot initializers whose includes ingest appended to
+    /// the model's body (`ingest::load_hook_includes::
+    /// lift_autoload_includes`); the boot registers each one empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifted_autoload_callbacks: Vec<LiftedAutoloadCallback>,
     /// Source files whose library-class ingest failed and that ingest
     /// went on without (the isolate-tolerant support-dir walk; in survey
     /// mode, every per-file class ingest): none of their classes,
@@ -1125,6 +1131,18 @@ pub struct ClassLoadHook {
     pub span: crate::span::Span,
 }
 
+/// A main-autoloader `on_load(cpath)` callback whose includes were
+/// appended to the model `cpath` names.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LiftedAutoloadCallback {
+    /// The constant path the callback names (`ApplicationRecord`).
+    pub cpath: String,
+    /// The initializer it came from, as the ingest read it.
+    pub file: String,
+    /// The statement's start offset in `file`.
+    pub start: u32,
+}
+
 /// One `ActiveSupport.on_load(:hook)` block of a boot initializer, lifted
 /// to `Rails.application.<method>(base)`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1324,6 +1342,7 @@ impl App {
             file_statement_gaps: Vec::new(),
             library_class_reopens: HashMap::default(),
             load_hooks: Vec::new(),
+            lifted_autoload_callbacks: Vec::new(),
             ingest_drops: Vec::new(),
             railties: Vec::new(),
             file_programs: Vec::new(),

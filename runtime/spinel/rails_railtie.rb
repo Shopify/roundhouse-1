@@ -390,6 +390,16 @@ module Rails
           bootstrap_hook: -> { ActiveSupport.run_load_hooks(:before_initialize, app) },
           build_middleware_stack: -> { Configuration.refuse_app_middleware! },
           run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
+          # Finisher's `eager_load!` (railties finisher.rb): with
+          # `config.eager_load`, the `:before_eager_load` hooks, then every
+          # file, after the app's initializers registered their Zeitwerk
+          # `on_load` callbacks (runtime/rails_autoloaders.rb). The emitted
+          # autoloader is app/models.rb's.
+          eager_load!: lambda do
+            next unless defined?(::RoundhouseAutoload) && ::RoundhouseAutoload.eager_load?
+            ActiveSupport.run_load_hooks(:before_eager_load, app)
+            ::RoundhouseAutoload.eager_load!
+          end,
           finisher_hook: -> { ActiveSupport.run_load_hooks(:after_initialize, app) },
         }
         collection = Initializable::Collection.new

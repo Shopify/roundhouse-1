@@ -3272,6 +3272,15 @@ fn ruby_family_files(
         crate::runtime_files::read_to_string("runtime/spinel/rails_configuration.rb")
             .map_err(|e| format!("read runtime/spinel/rails_configuration.rb: {e}"))?,
     ));
+    // `Rails.autoloaders` with Zeitwerk's `on_load(cpath)` callbacks over
+    // the compiled autoloader (see the file's header): blocks kept per
+    // computed constant path, so ruby-family only, required beside
+    // rails_configuration below.
+    files.push((
+        "runtime/rails_autoloaders.rb".to_string(),
+        crate::runtime_files::read_to_string("runtime/spinel/rails_autoloaders.rb")
+            .map_err(|e| format!("read runtime/spinel/rails_autoloaders.rb: {e}"))?,
+    ));
     // ActiveSupport::Cache (Store, Entry, Coder, LocalCache, MemoryStore,
     // NullStore) with IsolatedExecutionState and Digest, ported from
     // activesupport 8.1.4 (see the file's header; tests/cache_runtime.rb
@@ -3521,6 +3530,7 @@ fn ruby_family_files(
              # one name.)\n\
              require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
+             require_relative \"rails_autoloaders\"\n\
              {}{}{}",
             // Before the Bundler.require list: a gem source's own
             // dependencies load where Bundler requires the gem, and Core's
@@ -3555,6 +3565,7 @@ fn ruby_family_files(
                  {}\
                  require_relative \"module_delegate\"\n\
              require_relative \"rails_configuration\"\n\
+             require_relative \"rails_autoloaders\"\n\
                  {}{}",
                 markly_require,
                 gem_require_block(&jruby_excluded, app.gem_lock.as_ref()),
@@ -4150,6 +4161,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // at the end of boot.rb.
             let eager = "RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?\n";
             let at = content.rfind(eager).ok_or("PostgreSQL bootstrap: missing eager load in app/models.rb")?;
+            // Eager loading is Finisher's `eager_load!`, after the app's
+            // initializers (runtime/rails_railtie.rb): their Zeitwerk
+            // `on_load` callbacks are registered by then.
+            content.replace_range(
+                at..at + eager.len(),
+                "# `config.eager_load`: Finisher's `eager_load!`, at the end of boot.rb.\n",
+            );
             content.insert_str(at, &environment);
             let at = at + environment.len();
             content.insert_str(at, &deprecation_behavior);
@@ -6701,6 +6719,43 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         body.push_str("    }.freeze,\n");
     }
     body.push_str("  }.freeze\n");
+    // The constants a Zeitwerk `on_load("Cpath")` callback of the app
+    // names (`initializer_programs` carries it for
+    // runtime/spinel/rails_autoloaders.rb), each with the emitted file
+    // whose autoload it is: that file reports its load at its end, where
+    // Zeitwerk runs the callbacks (loader/callbacks.rb:9). A constant no
+    // file autoloads is not listed, and its callback is named at
+    // registration.
+    let callback_cpaths: std::collections::BTreeSet<String> = {
+        const CALLS: &[&str] = &["Rails.autoloaders.main.on_load(\"", "Rails.autoloaders.once.on_load(\""];
+        let mut found = std::collections::BTreeSet::new();
+        for (_, content) in files.iter().filter(|(p, _)| p.ends_with(".rb") && !p.starts_with("runtime/")) {
+            for call in CALLS {
+                let mut rest = content.as_str();
+                while let Some(at) = rest.find(call) {
+                    let tail = &rest[at + call.len()..];
+                    let Some(end) = tail.find('"') else { break };
+                    found.insert(tail[..end].trim_start_matches("::").to_string());
+                    rest = &tail[end..];
+                }
+            }
+        }
+        found
+    };
+    let mut callback_files: Vec<(String, String)> = Vec::new();
+    for cpath in &callback_cpaths {
+        let (namespace, name) = cpath.rsplit_once("::").unwrap_or(("Object", cpath.as_str()));
+        if let Some(file) = namespaces.get(namespace).and_then(|c| c.get(name)).and_then(|c| c.file.as_ref()) {
+            callback_files.push((as_loaded(file), cpath.clone()));
+        }
+    }
+    if !callback_files.is_empty() {
+        body.push_str("  # constants a Zeitwerk `on_load(\"Cpath\")` callback names whose file reports its load\n  AUTOLOAD_CALLBACK_CPATHS = [\n");
+        for (_, cpath) in &callback_files {
+            writeln!(body, "    {cpath:?},").unwrap();
+        }
+        body.push_str("  ].freeze\n");
+    }
     body.push_str(AUTOLOAD_RUNTIME);
 
     // The environment's `config.eager_load`, as the app wrote it. Rails'
@@ -6811,6 +6866,20 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             let header: usize = comments[..header_lines].iter().map(|l| l.len()).sum();
             // An initializer's constant file loads before app/models.rb.
             content.insert_str(header, &format!("RoundhouseAutoload.entering_program({program:?}) if defined?(RoundhouseAutoload)\n"));
+        }
+    }
+    for (anchor, cpath) in &callback_files {
+        let file = format!("app/{anchor}.rb");
+        if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            writeln!(
+                content,
+                "# Zeitwerk runs {cpath}'s on_load callbacks here, its file loaded (runtime/rails_autoloaders.rb).\n\
+                 RoundhouseAutoload.autoloaded({cpath:?}, __FILE__) if defined?(RoundhouseAutoload)"
+            )
+            .unwrap();
         }
     }
 }
@@ -7226,6 +7295,17 @@ const AUTOLOAD_RUNTIME: &str = r##"
 
   def self.eager_load!
     ALL_FILES.each { |file| require path(file) }
+  end
+
+  # The trailer of the file a constant's autoload loads, for a constant a
+  # Zeitwerk `on_load("Cpath")` callback names (AUTOLOAD_CALLBACK_CPATHS):
+  # the loaders run its callbacks with its value and the file, as
+  # Zeitwerk's `on_file_autoloaded` does (runtime/rails_autoloaders.rb).
+  def self.autoloaded(cpath, file)
+    return unless defined?(Rails) && Rails.respond_to?(:autoloaders)
+    value = Object.const_get(cpath, false)
+    Rails.autoloaders.each { |loader| loader.__on_file_autoloaded(cpath, value, file) }
+    nil
   end
 
   # A Zeitwerk loader the app creates (`Zeitwerk::Loader.for_gem`),
@@ -8943,6 +9023,8 @@ fn spinel_files_with_assertions(
     // ruby-family forks only. A tree without it refuses the read
     // (`report_unsupported_runtime_reads`).
     files.retain(|(p, _)| p != "runtime/rails_configuration.rb");
+    // And `rails_autoloaders.rb` (`Rails.autoloaders`), likewise.
+    files.retain(|(p, _)| p != "runtime/rails_autoloaders.rb");
     // And for `active_support_cache.rb` (ActiveSupport::Cache): Marshal,
     // Monitor and computed-name dispatch, pushed back by the two
     // ruby-family forks where the app names it.

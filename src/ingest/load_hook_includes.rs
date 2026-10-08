@@ -197,3 +197,187 @@ fn include_call<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
     let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
     (!args.is_empty() && args.iter().all(|arg| constant_path_of(arg).is_some())).then_some(call)
 }
+
+/// A boot initializer's include into a model through the main
+/// autoloader's load callback:
+///
+/// ```ruby
+/// # components/shop_identity/config/initializers/application_record.rb
+/// Rails.autoloaders.main.on_load("ApplicationRecord") do
+///   ApplicationRecord.include(BelongsToShopThroughAssociation)
+/// end
+/// ```
+///
+/// Zeitwerk 2.7 runs an `on_load(cpath)` callback right after the file
+/// that defines the constant is autoloaded (`Loader::Callbacks#
+/// on_file_autoloaded` → `run_on_load_callbacks(cref.path, cref.get,
+/// file)`), so the include lands on ApplicationRecord after its body and
+/// before any subclass body runs: a subclass's `class X <
+/// ApplicationRecord` is what autoloads it. The pass appends the include
+/// to the model's body after the items of the file that declares it,
+/// where the concern splice and the emit treat it like one written last
+/// in the body. `initializer_programs` carries the statement as
+/// `Rails.autoloaders.main.on_load_lifted(cpath, site)`, which registers
+/// nothing and names a constant already loaded when it runs, which
+/// Zeitwerk would not call the callback for
+/// (runtime/spinel/rails_autoloaders.rb).
+///
+/// It lifts only when the initializer is one the boot runs, the callback
+/// names a model by a literal path, and every statement of the block is
+/// `<Cpath>.include(M, …)` or `.send(:include, M, …)` (or the same on the
+/// block's first parameter, the constant's value) whose constants read
+/// the same from the initializer's top level as from the class body
+/// (`top_level_only`). Anything else is left to `initializer_programs`,
+/// which registers the block with the ported loader.
+pub(super) fn lift_autoload_includes<V: Vfs + ?Sized>(app: &mut App, vfs: &V, boot_initializers: &[PathBuf]) {
+    let known: Known =
+        app.library_classes.iter().map(|lc| lc.name.clone()).chain(app.concern_model_items.keys().cloned()).collect();
+    // How many includes each model got so far: Zeitwerk runs a
+    // constant's callbacks in registration order.
+    let mut appended: crate::det::HashMap<String, usize> = crate::det::HashMap::default();
+    for entry in boot_initializers {
+        let Ok(bytes) = vfs.read(entry) else { continue };
+        if !bytes.windows(11).any(|w| w == b"autoloaders") {
+            continue;
+        }
+        let file = entry.display().to_string();
+        let result = ruby_prism::parse(&bytes);
+        let root = result.node();
+        let Some(program) = root.as_program_node() else { continue };
+        for stmt in program.statements().body().iter() {
+            let Some((cpath, param, body)) = autoload_on_load_block(&stmt) else { continue };
+            let Some(index) = app.models.iter().position(|m| m.name.0.as_str() == cpath) else { continue };
+            let Some(includes) = receiver_includes(&body, &cpath, param.as_deref(), &known) else { continue };
+            let mut exprs = Vec::new();
+            for (call, args) in &includes {
+                let Ok(args) = args.iter().map(|a| super::expr::ingest_expr(a, &file)).collect::<Result<Vec<_>, _>>() else {
+                    break;
+                };
+                let loc = call.location();
+                let span = crate::span::Span {
+                    file: super::sources::file_id(&file),
+                    start: loc.start_offset() as u32,
+                    end: loc.end_offset() as u32,
+                };
+                exprs.push(crate::expr::Expr::new(
+                    span,
+                    crate::expr::ExprNode::Send {
+                        recv: None,
+                        method: crate::ident::Symbol::from("include"),
+                        args,
+                        block: None,
+                        parenthesized: false,
+                    },
+                ));
+            }
+            if exprs.len() != includes.len() {
+                continue;
+            }
+            let model = &mut app.models[index];
+            let own = model.span.file;
+            let end = model.body.iter().rposition(|item| item.span().file == own).map_or(model.body.len(), |i| i + 1);
+            let done = appended.entry(cpath.clone()).or_default();
+            let at = (end + *done).min(model.body.len());
+            *done += exprs.len();
+            let items = exprs
+                .into_iter()
+                .map(|expr| ModelBodyItem::Unknown { expr, leading_comments: Vec::new(), leading_blank_line: false });
+            model.body.splice(at..at, items);
+            app.lifted_autoload_callbacks.push(crate::app::LiftedAutoloadCallback {
+                cpath: cpath.clone(),
+                file: file.clone(),
+                start: stmt.location().start_offset() as u32,
+            });
+        }
+    }
+}
+
+/// `Rails.autoloaders.main.on_load("Cpath") do |value, abspath| … end`
+/// (or `.once`'s):
+/// the constant path, the block's first parameter and its statements.
+pub(super) fn autoload_on_load_block<'pr>(stmt: &Node<'pr>) -> Option<(String, Option<String>, Vec<Node<'pr>>)> {
+    let call = stmt.as_call_node()?;
+    if constant_id_str(&call.name()) != "on_load" || rails_autoloader(&call.receiver()?).is_none() {
+        return None;
+    }
+    let args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+    let [name] = args.as_slice() else { return None };
+    let cpath = String::from_utf8_lossy(name.as_string_node()?.unescaped()).into_owned();
+    let block = call.block()?.as_block_node()?;
+    let param = block
+        .parameters()
+        .and_then(|p| p.as_block_parameters_node())
+        .and_then(|p| p.parameters())
+        .and_then(|p| p.requireds().iter().next())
+        .and_then(|p| p.as_required_parameter_node())
+        .map(|p| constant_id_str(&p.name()).to_string());
+    let body = block.body().map(flatten_statements).unwrap_or_default();
+    Some((cpath, param, body))
+}
+
+/// `Rails.autoloaders.main` or `Rails.autoloaders.once`: which.
+pub(super) fn rails_autoloader(node: &Node<'_>) -> Option<&'static str> {
+    let loader = node.as_call_node()?;
+    let which = match constant_id_str(&loader.name()) {
+        "main" => "main",
+        "once" => "once",
+        _ => return None,
+    };
+    if loader.arguments().is_some() || loader.block().is_some() {
+        return None;
+    }
+    let loaders = loader.receiver()?;
+    let loaders = loaders.as_call_node()?;
+    (constant_id_str(&loaders.name()) == "autoloaders"
+        && loaders.arguments().is_none()
+        && loaders.block().is_none()
+        && loaders.receiver().and_then(|r| constant_path_of(&r)).is_some_and(|p| p.join("::") == "Rails"))
+    .then_some(which)
+}
+
+/// Each statement's call and module arguments, when every statement is
+/// `<recv>.include(M, …)` or `<recv>.send(:include, M, …)` on the constant
+/// `cpath` or the block parameter, naming modules the class body reads
+/// the same; `None` otherwise.
+fn receiver_includes<'pr>(
+    body: &[Node<'pr>],
+    cpath: &str,
+    param: Option<&str>,
+    known: &Known,
+) -> Option<Vec<(CallNode<'pr>, Vec<Node<'pr>>)>> {
+    let mut out = Vec::new();
+    for stmt in body {
+        let call = stmt.as_call_node()?;
+        if call.block().is_some() {
+            return None;
+        }
+        let recv = call.receiver()?;
+        let on_class = constant_path_of(&recv).is_some_and(|p| p.join("::").trim_start_matches("::") == cpath)
+            || recv.as_local_variable_read_node().is_some_and(|v| Some(constant_id_str(&v.name())) == param);
+        if !on_class {
+            return None;
+        }
+        let mut args: Vec<Node<'pr>> = call.arguments()?.arguments().iter().collect();
+        match constant_id_str(&call.name()) {
+            "include" => {}
+            "send" | "__send__" => {
+                if args.first()?.as_symbol_node()?.unescaped() != b"include" {
+                    return None;
+                }
+                args.remove(0);
+            }
+            _ => return None,
+        }
+        if args.is_empty() {
+            return None;
+        }
+        for arg in &args {
+            let path = constant_path_of(arg)?;
+            if !top_level_only(&path, cpath, known) {
+                return None;
+            }
+        }
+        out.push((call, args));
+    }
+    (!out.is_empty()).then_some(out)
+}

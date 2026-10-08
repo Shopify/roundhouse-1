@@ -33,6 +33,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_notifications.rb", "runtime/active_support_notifications.rb"),
     ("runtime/ruby/active_support_reporters.rb", "runtime/active_support_reporters.rb"),
     ("runtime/spinel/rails_configuration.rb", "runtime/rails_configuration.rb"),
+    ("runtime/spinel/rails_autoloaders.rb", "runtime/rails_autoloaders.rb"),
     ("runtime/spinel/active_support_cache.rb", "runtime/active_support_cache.rb"),
     ("runtime/spinel/active_support_isolated_execution_state.rb", "runtime/active_support_isolated_execution_state.rb"),
     ("runtime/spinel/active_support_logger.rb", "runtime/active_support_logger.rb"),
@@ -474,6 +475,9 @@ const UNTYPED_SINGLETONS: &[(&str, &str, &str)] = &[
     ("ActiveSupport", "filter_parameters", "ActiveSupport::ParameterFilter"),
     ("ActiveSupport", "filter_parameters=", "ActiveSupport::ParameterFilter"),
     ("Rails", "configuration", "Rails::Configuration"),
+    // `Rails.autoloaders` (Untyped: the loaders' `on_load` blocks type
+    // gradually): rails_autoloaders.rb's Zeitwerk port.
+    ("Rails", "autoloaders", "Rails::Autoloaders"),
     // `lower::as_json_residue`'s route for an `as_json` no static method
     // answers (`expr::OBJECT_AS_JSON`): active_support_json.rb's table.
     ("ActiveSupport::JSON::Encoding", "as_json", "ActiveSupport::JSON::Encoding"),
@@ -742,6 +746,8 @@ mod tests {
             ("ActiveSupport::ParameterFilter", "runtime/active_support_reporters.rb"),
             ("ActiveSupport::ExecutionContext", "runtime/active_support_reporters.rb"),
             ("Rails::Configuration", "runtime/rails_configuration.rb"),
+            ("Rails::Autoloaders", "runtime/rails_autoloaders.rb"),
+            ("Rails::Autoloaders::Loader", "runtime/rails_autoloaders.rb"),
             ("ActiveSupport::Cache::MemoryStore", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::Strategy::LocalCache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::IsolatedExecutionState", "runtime/active_support_isolated_execution_state.rb"),
