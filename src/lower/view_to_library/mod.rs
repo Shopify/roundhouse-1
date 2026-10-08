@@ -3635,6 +3635,7 @@ fn rewrite_defined_to_nil_check(expr: &mut Expr) {
             rewrite_defined_to_nil_check(body);
         }
         ExprNode::Lambda { body, .. } => rewrite_defined_to_nil_check(body),
+        ExprNode::MethodDefExpr { def } => rewrite_defined_to_nil_check(&mut def.body),
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 rewrite_defined_to_nil_check(r);

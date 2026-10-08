@@ -8978,13 +8978,13 @@ fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pa
         (MethodReceiver::Class, MethodVisibility::Public) => None,
         (MethodReceiver::Class, MethodVisibility::Protected) => {
             writeln!(s, "{body_pad}class << self").unwrap();
-            writeln!(s, "{body_pad}  protected :{}", m.name).unwrap();
+            writeln!(s, "{body_pad}  protected {}", super::expr::ruby_sym_literal(m.name.as_str())).unwrap();
             writeln!(s, "{body_pad}end").unwrap();
             None
         }
     };
     if let Some(directive) = directive {
-        writeln!(s, "{body_pad}{directive} :{}", m.name).unwrap();
+        writeln!(s, "{body_pad}{directive} {}", super::expr::ruby_sym_literal(m.name.as_str())).unwrap();
     }
 }
 
@@ -11623,7 +11623,7 @@ fn modelled_elsewhere(lc: &LibraryClass, call: &Expr) -> bool {
 
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
     let name = crate::lower::model_to_library::dropped_statement_name(call);
-    crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
+    let mut diagnostic = crate::lower::residue_diagnostic(
         "library_class_body",
         &name,
         call.span,
@@ -11635,7 +11635,23 @@ fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
             name,
             lc.name.0.as_str(),
         ),
-    ));
+    );
+    // A `define_method` the ingest could not take as the method it
+    // defines (`library_class::class_body_define_method`: its block
+    // reaches the class body, or takes formals a method cannot) drops a
+    // method its callers need: refused, not a warning.
+    if let ExprNode::Send { recv: None, method, block: Some(_), .. } = &*call.node
+        && method.as_str() == "define_method"
+    {
+        diagnostic.severity = crate::diagnostic::Severity::Error;
+        diagnostic.message = format!(
+            "`{name}` in the body of `{}` defines a method from a block that reads the class \
+             body (one of its locals, `block_given?`, a bare `super`) or takes formals a method \
+             cannot (post, anonymous or numbered parameters); it is not modelled and is dropped",
+            lc.name.0.as_str(),
+        );
+    }
+    crate::emit::diagnostics::push(diagnostic);
 }
 
 /// Is this name one of the app's own CLASSES (not a module)? Namespace

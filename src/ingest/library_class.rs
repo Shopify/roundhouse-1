@@ -3481,17 +3481,26 @@ fn walk_decl_body_in<'pr>(
             }
             continue;
         }
-        if let Some(def) = stmt.as_def_node() {
-            // `def self.included(klass); class << klass ... end; end` —
-            // see `included_hook_class_methods_body`. Folds into the
-            // same class-receiver-methods bucket as `class_methods do`
-            // / `module ClassMethods`, and (like those) contributes no
-            // `included` method of its own.
-            if let Some(singleton_body) = included_hook_class_methods_body(&def) {
-                out.extend(walk_decl_body_with_visibility(Some(singleton_body), owner, file, true, visibility)?);
-                continue;
-            }
-            let mut m = ingest_library_method(&def, owner, file)?;
+        // `define_method(:name) do … end` is the method it defines, kept
+        // as a `def` is (`class_body_define_method`).
+        let defined = class_body_define_method(stmt, owner, file)?;
+        if stmt.as_def_node().is_some() || defined.is_some() {
+            let mut m = match (defined, stmt.as_def_node()) {
+                (Some(m), _) => m,
+                (None, Some(def)) => {
+                    // `def self.included(klass); class << klass ... end; end` —
+                    // see `included_hook_class_methods_body`. Folds into the
+                    // same class-receiver-methods bucket as `class_methods do`
+                    // / `module ClassMethods`, and (like those) contributes no
+                    // `included` method of its own.
+                    if let Some(singleton_body) = included_hook_class_methods_body(&def) {
+                        out.extend(walk_decl_body_with_visibility(Some(singleton_body), owner, file, true, visibility)?);
+                        continue;
+                    }
+                    ingest_library_method(&def, owner, file)?
+                }
+                (None, None) => unreachable!(),
+            };
             visibility.apply(&statement, &mut m);
             if module_function_active && m.receiver == MethodReceiver::Instance {
                 // The retained singleton copy is public even if the original
@@ -4554,6 +4563,146 @@ pub(crate) fn synth_attr_writer(owner: &ClassId, name: &Symbol, receiver: Method
             mutates_self: false,
             block_param: None,
     }
+}
+
+/// A class-body `define_method(:name) do |…| … end` (a String name too;
+/// `visibility::define_method_name`) as the method it defines. Ruby runs
+/// the block as that method's body with lambda arity, `self` the
+/// receiver and the visibility in effect, which is what a `def` of the
+/// same name and formals does — unless the block reaches the class body
+/// it was written in: a local of that body (a closure, where a `def` is
+/// a new scope), `block_given?` (the class body's block, never the
+/// caller's), or a bare `super` (which Ruby refuses in a
+/// `define_method`). Those, and formals a method cannot take as written
+/// (post parameters, anonymous `*`/`**`/`&`, numbered and `it`
+/// parameters), are not taken: the call stays a class-body call, replayed
+/// verbatim where the body is (a foreign base's) and refused by name
+/// where it is not (`report_dropped_class_body_call`).
+///
+/// Ingest used to leave every such call to that path, so in a class the
+/// emit does not replay (every app library class) the method was
+/// dropped and only a warning said so. The Ruby family writes a name a
+/// `def` can spell as that `def`, and any other (`define_method("a b")`)
+/// as the `define_method` it was (`emit::ruby::emit_method`); the other
+/// targets refuse such a name (`project::reject_block_signatures`).
+fn class_body_define_method(
+    stmt: &ruby_prism::Node<'_>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<Option<crate::dialect::MethodDef>> {
+    use crate::dialect::{MethodDef, MethodReceiver};
+    let Some(name) = super::visibility::define_method_name(stmt) else { return Ok(None) };
+    let call = stmt.as_call_node().expect("define_method_name matched a call");
+    let block = call.block().and_then(|b| b.as_block_node()).expect("define_method_name matched a block");
+    if let Some(params) = block.parameters() {
+        let Some(bpn) = params.as_block_parameters_node() else { return Ok(None) };
+        if let Some(pn) = bpn.parameters() {
+            let anonymous = pn.posts().iter().next().is_some()
+                || pn.requireds().iter().any(|r| r.as_required_parameter_node().is_none())
+                || pn.rest().is_some_and(|r| r.as_rest_parameter_node().is_none_or(|r| r.name().is_none()))
+                || pn.keyword_rest().is_some_and(|k| k.as_keyword_rest_parameter_node().is_none_or(|k| k.name().is_none()))
+                || pn.block().is_some_and(|b| b.name().is_none());
+            if anonymous {
+                return Ok(None);
+            }
+        }
+    }
+    struct ReachesBody {
+        depth: u32,
+        found: bool,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for ReachesBody {
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+        }
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.found |= node.depth() >= self.depth;
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.found |= node.receiver().is_none()
+                && matches!(constant_id_str(&node.name()), "block_given?" | "iterator?" | "binding");
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_forwarding_super_node(&mut self, _node: &ruby_prism::ForwardingSuperNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_yield_node(&mut self, _node: &ruby_prism::YieldNode<'pr>) {
+            self.found = true;
+        }
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.depth += 1;
+            ruby_prism::visit_block_node(self, node);
+            self.depth -= 1;
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.depth += 1;
+            ruby_prism::visit_lambda_node(self, node);
+            self.depth -= 1;
+        }
+        // A new scope: nothing in it reaches the class body's locals.
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut reaches = ReachesBody { depth: 0, found: false };
+    ruby_prism::Visit::visit(&mut reaches, &block.as_node());
+    if reaches.found {
+        return Ok(None);
+    }
+    let e = ingest_expr(stmt, file)?;
+    let ExprNode::Send { block: Some(lambda), .. } = &*e.node else { return Ok(None) };
+    let ExprNode::Lambda { params: positional, rest_param, block_param, body, signature, .. } = &*lambda.node else {
+        return Ok(None);
+    };
+    let mut params: Vec<Param> = positional.iter().cloned().map(Param::positional).collect();
+    params.extend(signature.optionals.iter().map(|(n, d)| Param::with_default(n.clone(), d.clone())));
+    params.extend(rest_param.iter().cloned().map(Param::rest));
+    params.extend(signature.keywords.iter().map(|(n, d)| Param::keyword(n.clone(), d.clone())));
+    params.extend(signature.kwrest.iter().map(|n| {
+        let mut p = Param::keyword(n.clone(), None);
+        p.rest = true;
+        p
+    }));
+    let name_node = call.arguments().and_then(|a| a.arguments().iter().next()).expect("one name argument");
+    let at = name_node.location();
+    Ok(Some(MethodDef {
+        name_span: Span {
+            file: super::sources::file_id(file),
+            start: at.start_offset() as u32,
+            end: at.end_offset() as u32,
+        },
+        name: Symbol::from(name),
+        receiver: MethodReceiver::Instance,
+        visibility: crate::dialect::MethodVisibility::Public,
+        params,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: body.clone(),
+        signature: None,
+        effects: crate::effect::EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: block_param.clone().map(Param::positional),
+    }))
 }
 
 pub(super) fn ingest_library_method(

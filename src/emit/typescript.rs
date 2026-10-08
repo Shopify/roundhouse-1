@@ -2635,6 +2635,8 @@ fn collect_ivar_assignments(
             collect_ivar_assignments(body, out);
         }
         ExprNode::Lambda { body, .. } => collect_ivar_assignments(body, out),
+        // Its ivars are the other class's (`Class.new`'s instance's).
+        ExprNode::MethodDefExpr { .. } => {}
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 collect_ivar_assignments(r, out);

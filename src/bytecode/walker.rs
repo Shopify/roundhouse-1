@@ -512,6 +512,7 @@ fn node_kind(node: &ExprNode) -> &'static str {
         ExprNode::BoolOp { .. } => "BoolOp",
         ExprNode::Let { .. } => "Let",
         ExprNode::Lambda { .. } => "Lambda",
+        ExprNode::MethodDefExpr { .. } => "MethodDefExpr",
         ExprNode::MethodRef { .. } => "MethodRef",
         ExprNode::Apply { .. } => "Apply",
         ExprNode::Send { .. } => "Send",

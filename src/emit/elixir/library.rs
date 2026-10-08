@@ -467,6 +467,8 @@ pub(super) fn references_var(e: &Expr, name: &str) -> bool {
             references_var(value, name) || references_var(body, name)
         }
         ExprNode::Lambda { body, .. } => references_var(body, name),
+        // A `def` is a scope gate: no outer local reaches its body.
+        ExprNode::MethodDefExpr { .. } => false,
         ExprNode::MethodRef { recv, .. } => opt(recv, name),
         ExprNode::If { cond, then_branch, else_branch } => {
             references_var(cond, name)

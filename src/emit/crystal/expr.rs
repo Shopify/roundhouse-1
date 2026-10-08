@@ -307,6 +307,12 @@ fn emit_node(n: &ExprNode) -> String {
             n.kind_str(),
             "native Ruby syntax has no implementation on this target",
         ),
+        ExprNode::MethodDefExpr { .. } => crate::emit::diagnostics::report_unsupported(
+            crate::span::Span::synthetic(),
+            "crystal",
+            n.kind_str(),
+            "a `def` inside a block (`Class.new do … end`) has no carrier on this target",
+        ),
         ExprNode::KeywordSplat { .. } => crate::emit::diagnostics::report_unsupported(
             crate::span::Span::synthetic(),
             "crystal",

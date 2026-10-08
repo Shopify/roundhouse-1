@@ -204,6 +204,7 @@ fn count_gradual_recurse(e: &Expr, total: &mut Vec<(u32, String)>) {
             count_gradual_recurse(body, total);
         }
         N::Lambda { body, .. } => count_gradual_recurse(body, total),
+        N::MethodDefExpr { def } => count_gradual_recurse(&def.body, total),
         N::MethodRef { recv, .. } => {
             if let Some(r) = recv {
                 count_gradual_recurse(r, total);
@@ -332,6 +333,9 @@ fn collect_untyped(e: &Expr, path: &str, out: &mut Vec<String>) {
         }
         ExprNode::Lambda { body, .. } => {
             collect_untyped(body, &format!("{path}/lambda.body"), out)
+        }
+        ExprNode::MethodDefExpr { def } => {
+            collect_untyped(&def.body, &format!("{path}/lambda.body"), out)
         }
         ExprNode::MethodRef { recv, .. } => {
             if let Some(r) = recv {

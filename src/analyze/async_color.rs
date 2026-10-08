@@ -609,6 +609,10 @@ fn walk_expr<F: FnMut(&Expr) -> bool>(expr: &Expr, pred: &mut F) -> bool {
         ExprNode::BoolOp { left, right, .. } => walk_expr(left, pred) || walk_expr(right, pred),
         ExprNode::Let { value, body, .. } => walk_expr(value, pred) || walk_expr(body, pred),
         ExprNode::Lambda { body, .. } => walk_expr(body, pred),
+        ExprNode::MethodDefExpr { def } => {
+            def.params.iter().filter_map(|p| p.default.as_ref()).any(|d| walk_expr(d, pred))
+                || walk_expr(&def.body, pred)
+        }
         ExprNode::MethodRef { recv, .. } => {
             recv.as_ref().map_or(false, |r| walk_expr(r, pred))
         }

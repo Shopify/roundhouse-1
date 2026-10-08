@@ -150,6 +150,24 @@ impl ConditionalDefinition<'_> {
     }
 }
 
+/// The method a class-body `define_method(:name) do … end` (or
+/// `define_method("name") { … }`) defines: a receiverless call with one
+/// literal Symbol or String name and a literal block. Ruby gives it the
+/// visibility in effect, as it does a `def` there (`private` then
+/// `define_method(:x) {}` is private), and so does this pass. The
+/// library walk carries it as the method it defines
+/// (`library_class::class_body_define_method`).
+pub(super) fn define_method_name(stmt: &Node<'_>) -> Option<String> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || constant_id_str(&call.name()) != "define_method" {
+        return None;
+    }
+    call.block()?.as_block_node()?;
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [name] = args.as_slice() else { return None };
+    symbol_or_string_value(name)
+}
+
 pub(super) fn marker(call: &CallNode<'_>) -> bool {
     matches!(
         constant_id_str(&call.name()),
@@ -1001,6 +1019,25 @@ impl Visibility {
                         MethodVisibility::Public,
                         file,
                     )?;
+                }
+                continue;
+            }
+            // `define_method(:name) do … end` defines `name` with the
+            // visibility in effect, as a `def` does.
+            if let Some(name) = define_method_name(node) {
+                Self::reject_dynamic_declarations(node, file)?;
+                let key = (class_side, name.clone());
+                if self.accessors.remove(&key) && !self.changed.contains(&key) {
+                    self.known.remove(&key);
+                }
+                let visibility = if !class_side && PRIVATE_HOOKS.contains(&name.as_str()) {
+                    MethodVisibility::Private
+                } else {
+                    default
+                };
+                self.define(offset, name.clone(), class_side, visibility, file)?;
+                if module_function && !class_side {
+                    self.define(offset.wrapping_add(1), name, true, MethodVisibility::Public, file)?;
                 }
                 continue;
             }

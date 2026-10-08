@@ -1539,7 +1539,21 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
         let ExprNode::Lambda { body: lambda_body, signature, .. } = &*callback.node else {
             return;
         };
+        // Refused by name: the diagnose pass claims every block-form
+        // hook, so returning quietly dropped the callback.
         if !signature.is_empty() {
+            let names: Vec<String> = signature.names().map(|n| format!("`{n}`")).collect();
+            crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                expr.span,
+                None,
+                "block_callback_signature",
+                format!(
+                    "`{hook} {{ |…| … }}` on `{}` takes {}, which a hook method has no caller to bind; \
+                     the callback is not lowered",
+                    model.name.0.as_str(),
+                    names.join(", "),
+                ),
+            ));
             return;
         }
 

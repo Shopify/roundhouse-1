@@ -210,6 +210,8 @@ impl super::Analyzer {
                 self.visit_effects(value, ctx, out);
                 self.visit_effects(body, ctx, out);
             }
+            // Defining a method runs none of its body.
+            ExprNode::MethodDefExpr { .. } => {}
             ExprNode::Lambda { body, .. } => {
                 // Lambda creation is pure; only invocation has effects. A
                 // proper treatment requires first-class Fn types. Skip for now.
