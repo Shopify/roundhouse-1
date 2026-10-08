@@ -92,3 +92,66 @@ fn a_runtime_without_them_refuses_them() {
         assert!(errors.iter().any(|e| e.contains(&needle)), "{name}: {errors:#?}");
     }
 }
+
+/// A core module Roundhouse models with a constant table (`Process`, for
+/// the four clock ids Spinel lowers) is still the module Ruby's
+/// signatures declare: `Process::WNOHANG` and `Process::WUNTRACED`
+/// (`rbs/core/process.rbs`) are its Integers on CRuby, as in Core's
+/// ci-queue executor reaping its forked workers. The expected values are
+/// the native interpreter's (`ruby -e 'p [Process::WNOHANG, ...]'`), and
+/// the reap counts real exited children.
+const REAPER: &str = r#"class Reaper
+  def reap
+    total = 0
+    while (result = Process.wait2(-1, Process::WNOHANG))
+      total += result[1].exitstatus
+    end
+    total
+  rescue Errno::ECHILD
+    total
+  end
+
+  def flags
+    [Process::WNOHANG, Process::WUNTRACED, Process::CLOCK_MONOTONIC]
+  end
+end
+"#;
+
+fn reaper_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\n")
+        .write("test/test_helper.rb", "require \"active_support/test_case\"\n")
+        .write("lib/reaper.rb", REAPER)
+        .write("test/reaper_test.rb", r#"require "test_helper"
+require "reaper"
+class ReaperTest < ActiveSupport::TestCase
+  test "process constants the signatures declare" do
+    assert_equal [1, 2, 1], Reaper.new.flags
+    fork { exit!(3) }
+    fork { exit!(4) }
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    total = 0
+    while total < 7 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      total += Reaper.new.reap
+      sleep 0.01
+    end
+    assert_equal 7, total
+  end
+end
+"#)
+}
+
+#[test]
+fn signature_declared_process_constants_run_in_emitted_ruby() {
+    reaper_app().run_test("test/models/reaper_test.rb").assert_passes();
+}
+
+#[test]
+fn a_runtime_without_process_constants_refuses_them_by_name() {
+    let (_, errors) = reaper_app().emit(BuildTarget::Rust);
+    for name in ["Process::WNOHANG", "Process::WUNTRACED"] {
+        let needle = format!("{name} is CRuby's own");
+        assert!(errors.iter().any(|e| e.contains(&needle)), "{name}: {errors:#?}");
+    }
+    assert!(!errors.iter().any(|e| e.contains("constant not supported (all targets)")), "{errors:#?}");
+}
