@@ -57,6 +57,9 @@ struct DirScan {
     /// Module -> what its bodies give it as a mixin (`SourceMixin`),
     /// names resolved once the whole gem is read.
     mixins: BTreeMap<String, SourceMixin>,
+    /// Constants a namespace body makes private (`private_constant :X`),
+    /// fully qualified.
+    private: BTreeSet<String>,
     /// The mixin references the walk saw, resolved by `resolve_mixins`.
     pending: Vec<PendingMixin>,
     files: usize,
@@ -114,6 +117,7 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
         for (name, mixin) in &read.mixins {
             out.mixins.entry(name.clone()).or_default().insert(gem.clone(), mixin.clone());
         }
+        out.private.extend(read.private.iter().cloned());
         out.scans.insert(
             gem.clone(),
             GemSourceScan {
@@ -218,6 +222,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, app: &mut
     for (name, gems) in read.mixins {
         sources.mixins.entry(name).or_default().extend(gems);
     }
+    sources.private.extend(read.private);
     sources.scans.extend(read.scans);
 }
 
@@ -642,6 +647,18 @@ impl<'pr> ruby_prism::Visit<'pr> for Walker<'_> {
                 }
             }
         }
+        // `private_constant :X, :Y` in a namespace body: `X` is read only
+        // lexically, never as `Owner::X`.
+        if method == b"private_constant" && self.singleton == 0 && self.in_def == 0 {
+            let on_self = node.receiver().is_none_or(|r| r.as_self_node().is_some());
+            if let (true, Some(namespace)) = (on_self, self.current().map(str::to_string)) {
+                for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                    if let Some(name) = literal_name(&arg).filter(|n| is_constant_name(n)) {
+                        self.out.private.insert(format!("{namespace}::{name}"));
+                    }
+                }
+            }
+        }
         if (method == b"autoload" || method == b"const_set") && self.singleton == 0 {
             let first = node.arguments().and_then(|a| a.arguments().iter().next());
             if let (Some(first), Some(namespace)) = (first, self.receiver_namespace(node.receiver())) {
@@ -711,6 +728,12 @@ mod tests {
         let class_methods = &out.mixins["SmartProperties::ClassMethods"];
         assert_eq!(class_methods.instance_methods.iter().collect::<Vec<_>>(), ["property", "property!", "props"]);
         assert_eq!(out.mixins["Other"].mixes_in_class_methods, ["SmartProperties::ClassMethods"]);
+    }
+
+    #[test]
+    fn private_constant_marks_the_namespace_s_constant_private() {
+        let out = read("module Timeout\n  class State; end\n  Error = 1\n  private_constant :State, 'Error'\n  def self.x; private_constant :Hidden; end\nend\nprivate_constant :Top\n");
+        assert_eq!(out.private.iter().collect::<Vec<_>>(), ["Timeout::Error", "Timeout::State"]);
     }
 
     #[test]

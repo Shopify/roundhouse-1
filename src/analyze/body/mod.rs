@@ -1359,7 +1359,13 @@ impl<'a> BodyTyper<'a> {
                         };
                         match sources.provider(written.0.as_str(), scope) {
                             Some(crate::gem_boundary::SourceProvider::Declared { name, .. }) => {
-                                qualify_resolved_path(path, &ClassId(Symbol::from(name.as_str())));
+                                // A private constant (`private_constant
+                                // :AbstractMessage` in `Google::Protobuf`)
+                                // reached from a lexical scope is readable
+                                // only so: qualified, it raises NameError.
+                                if !sources.private.contains(name.as_str()) {
+                                    qualify_resolved_path(path, &ClassId(Symbol::from(name.as_str())));
+                                }
                                 expr.decisions |= crate::expr::GEM_CONSTANT_REF;
                                 Ty::Untyped
                             }

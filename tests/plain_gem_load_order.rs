@@ -32,17 +32,26 @@ type Gem<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 /// `entry` required from config/application.rb); both must print
 /// `expected`.
 fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) -> emit_and_run::Run {
-    same_as_native_from(case, gems, entry, script, expected, false)
+    same_as_native_from(case, gems, entry, script, expected, false, &[])
 }
 
 /// [`same_as_native`], the gems carried in the repository instead: each
 /// under `gems/<name>`, a lockfile `PATH` source whose spec Core's
 /// Gemfile names `in_repo-<name>` (`in_repo_gem("graphql-cardinal")`).
 fn same_as_native_in_repo(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) -> emit_and_run::Run {
-    same_as_native_from(case, gems, entry, script, expected, true)
+    same_as_native_from(case, gems, entry, script, expected, true, &[])
 }
 
-fn same_as_native_from(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str, in_repo: bool) -> emit_and_run::Run {
+/// `extra`: more app files for the emitted tree only (a gem RBI).
+fn same_as_native_from(
+    case: &str,
+    gems: &[Gem],
+    entry: &str,
+    script: &str,
+    expected: &str,
+    in_repo: bool,
+    extra: &[(&str, &str)],
+) -> emit_and_run::Run {
     let root = std::env::temp_dir().join(format!("roundhouse-plain-gem-load-order-{case}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mut native = emit_and_run::ruby();
@@ -81,6 +90,9 @@ fn same_as_native_from(case: &str, gems: &[Gem], entry: &str, script: &str, expe
         .write("config/boot.rb", "require_relative \"../lib/strict\"\n")
         .write("config/application.rb", &format!("require_relative \"boot\"\nrequire {entry:?}\n"))
         .write("lib/strict.rb", STRICT);
+    for (path, text) in extra {
+        overlay = overlay.write(path, text);
+    }
     for (name, files) in gems {
         for (path, text) in *files {
             let at = if in_repo { format!("gems/{name}/lib/{path}") } else { format!("vendor/gems/{name}-1.0.0/lib/{path}") };
@@ -345,4 +357,47 @@ fn an_in_repo_gems_files_load_where_its_requires_give() {
         ("cd/executor/hot_paths.rb", "module Cd\n  class Executor\n    module HotPaths\n      def hot\n        :hot\n      end\n    end\n  end\nend\n"),
     ];
     let _ = same_as_native_in_repo("in-repo", &[("cd", CD)], "cd", "p Cd::Executor.new.run\n", "[:hot, \"Cd::Executor::Field\"]\n");
+}
+
+/// kafka-shopify 5.2.3's types/google/protobuf/abstract_message_public.rb
+/// reopens google-protobuf's `module Google; module Protobuf` and writes
+/// `AbstractMessagePublic = AbstractMessage`: google-protobuf 3.25.8's
+/// message_exts.rb declares `AbstractMessage` and makes it
+/// `private_constant`. Lexical lookup reaches a private constant, a
+/// scoped path does not. The read resolved to the gem's declaration and
+/// was emitted `Google::Protobuf::AbstractMessage`, which raised
+/// NameError (private constant referenced) at boot. Ruby's timeout gem
+/// has the same shape: `Timeout::State` is private.
+#[test]
+fn a_bare_read_of_a_gems_private_constant_stays_lexical() {
+    const TP: &[(&str, &str)] = &[
+        ("tp.rb", "require \"tp/timeout_state\"\n\nmodule Tp\n  def self.state\n    Timeout::StatePublic.name\n  end\nend\n"),
+        ("tp/timeout_state.rb", "require \"timeout\"\n\nmodule Timeout\n  StatePublic = State\nend\n"),
+    ];
+    // The installed timeout gem, as the gem home the tree names has it
+    // (only what the read needs: the declaration and its privacy).
+    let ruby = emit_and_run::ruby().args(["-e", "print Gem::Specification.find_by_name('timeout').version"]).output().expect("ruby");
+    let version = String::from_utf8_lossy(&ruby.stdout).to_string();
+    assert!(!version.is_empty(), "the timeout gem is installed");
+    let home = std::env::temp_dir().join(format!("roundhouse-plain-gem-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(format!("gems/timeout-{version}/lib"))).unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join(format!("gems/timeout-{version}/lib/timeout.rb")),
+        "module Timeout\n  class State\n  end\n  private_constant :State\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(format!("specifications/timeout-{version}.gemspec")),
+        format!("Gem::Specification.new do |s|\n  s.name = \"timeout\".freeze\n  s.version = \"{version}\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n"),
+    )
+    .unwrap();
+    let config = format!("gem_home: {}\ngem_sources:\n  tp: vendor/gems/tp-1.0.0\n", home.display());
+    let lock = format!(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    timeout ({version})\n    tp (1.0.0)\n      timeout\n\nDEPENDENCIES\n  timeout\n  tp\n"
+    );
+    let extra = [("roundhouse.yml", config.as_str()), ("Gemfile.lock", lock.as_str())];
+    let _ = same_as_native_from("lexical", &[("tp", TP)], "tp", "p Tp.state\n", "\"Timeout::State\"\n", false, &extra);
+    let _ = std::fs::remove_dir_all(&home);
 }

@@ -111,6 +111,11 @@ pub struct GemSourceConstants {
     /// includes and `mixes_in_class_methods`.
     #[serde(default)]
     pub mixins: std::collections::BTreeMap<String, std::collections::BTreeMap<String, SourceMixin>>,
+    /// Fully qualified constants a gem's namespace body makes private
+    /// (`private_constant :State` in `module Timeout`): Ruby reads one only
+    /// lexically, so a read reached through a lexical scope stays written.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub private: BTreeSet<String>,
 }
 
 /// What a gem's installed source says about one of its modules as a
