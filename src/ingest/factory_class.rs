@@ -570,12 +570,19 @@ fn factory_body(
             ),
         ));
     }
-    let body = super::library_class::factory_class_body(
+    let mut body = super::library_class::factory_class_body(
         block.and_then(|block| block.body()),
         &owner,
         &carried,
         &singleton_written,
         file,
     )?;
+    // Rubydex leaves a file-level factory block's `class << self`
+    // unindexed, so no read of its constants is known to reach the
+    // singleton class: they stay hoisted onto the class, writes and
+    // reads alike (`SINGLETON_CONSTANT_WRITE` unset).
+    for (_, value) in &mut body.constants {
+        value.decisions &= !crate::expr::SINGLETON_CONSTANT_WRITE;
+    }
     Ok((owner, body))
 }

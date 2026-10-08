@@ -1364,7 +1364,7 @@ impl<'a> BodyTyper<'a> {
                             modeled => modeled,
                         }
                     }
-                    Some(Some(ResolvedConstant::Value { declaration, name, runtime, .. })) => {
+                    Some(Some(ResolvedConstant::Value { declaration, name, runtime, singleton, .. })) => {
                         // Concern splices retain the resolved value owner.
                         // Test-helper splice lifts a foreign module's
                         // constant onto the test class as a bare name
@@ -1392,6 +1392,12 @@ impl<'a> BodyTyper<'a> {
                                 .is_some_and(|(enc, owner)| enc != owner);
                         if !keep_bare_splice {
                             qualify_resolved_path(path, name);
+                            // A class ingest built from it (`X =
+                            // Struct.new do … end`, `factory_class`) is
+                            // emitted hoisted, as its own class file.
+                            if *singleton && !self.classes().contains_key(name.as_ref()) {
+                                expr.decisions |= crate::expr::SINGLETON_CONSTANT_REF;
+                            }
                         }
                         // A runtime port's own value (`Rails::VERSION::STRING`)
                         // runs only where the finished tree loads the port.

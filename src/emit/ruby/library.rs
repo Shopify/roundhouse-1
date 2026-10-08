@@ -8354,7 +8354,18 @@ fn emit_library_class_decl_inner(
                 (Some(guard), false) => rendered = format!("{} {guard}", rendered.trim_end()),
                 (None, _) => {}
             }
-            let pad = body_pad.as_str();
+            // One the source wrote in `class << self` lives on the
+            // singleton class (`SINGLETON_CONSTANT_WRITE`): written back
+            // there, one line indented under it (a value over several
+            // keeps its lines as below).
+            let singleton = value.decisions & crate::expr::SINGLETON_CONSTANT_WRITE != 0
+                && !factory_class
+                && super::expr::native_keywords();
+            if singleton {
+                writeln!(s, "{body_pad}class << self").unwrap();
+            }
+            let nested_pad = format!("{body_pad}  ");
+            let pad = if singleton && !multi_line { nested_pad.as_str() } else { body_pad.as_str() };
             let mut lines = rendered.lines();
             // A factory class's body is a block, which keeps the cref
             // of the scope around it: a bare `NAME =` there writes that
@@ -8373,6 +8384,9 @@ fn emit_library_class_decl_inner(
                 }
             }
             if guard.is_some() && multi_line {
+                writeln!(s, "{body_pad}end").unwrap();
+            }
+            if singleton {
                 writeln!(s, "{body_pad}end").unwrap();
             }
             // A stored class-body local stays out of `constants` and
