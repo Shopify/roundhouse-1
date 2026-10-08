@@ -292,14 +292,16 @@ module ActiveRecord
     # in order; a missing one raises.
     def self._find_composite_primary_key(id)
       columns = composite_query_constraints_list
-      unless id.is_a?(Array) && !id.empty?
+      values = [] #: Array[untyped]
+      values.concat(id) if id.is_a?(Array)
+      if values.empty?
         raise ArgumentError, "Expected an Array of #{columns.inspect} values, got #{id.inspect}"
       end
-      return id.map { |key| _find_composite_primary_key(key) } if id.first.is_a?(Array)
+      return values.map { |key| _find_composite_primary_key(key) } if values.first.is_a?(Array)
       conditions = {}
-      columns.each_with_index { |column, i| conditions[column.to_sym] = id[i] }
+      columns.each_with_index { |column, i| conditions[column.to_sym] = values[i] }
       record = where(conditions).take
-      raise RecordNotFound, "Couldn't find #{name} with #{columns.inspect}=#{id.inspect}" if record.nil?
+      raise RecordNotFound, "Couldn't find #{name} with #{columns.inspect}=#{values.inspect}" if record.nil?
       record
     end
 
@@ -635,8 +637,9 @@ module ActiveRecord
     # emitted per model) and use it when this list is set; any other list
     # raises rather than being recorded and ignored.
     def self.query_constraints(*columns_list)
-      raise ArgumentError, "You must specify at least one column to be used in querying" if columns_list.empty?
-      list = columns_list.map(&:to_s)
+      list = []
+      columns_list.each { |column| list << column.to_s }
+      raise ArgumentError, "You must specify at least one column to be used in querying" if list.empty?
       unless list == _compiled_query_constraints
         raise NotImplementedError, "#{name}.query_constraints(#{list.join(", ")}): the compiled update, destroy and reload key on #{(_compiled_query_constraints || [primary_key]).join(", ")}"
       end
@@ -685,7 +688,9 @@ module ActiveRecord
     end
 
     def self.ignored_columns=(columns)
-      list = columns.map(&:to_s).freeze
+      list = []
+      columns.each { |column| list << column.to_s }
+      list.freeze
       unknown = list - _compiled_ignored_columns
       unless unknown.empty?
         raise NotImplementedError, "#{name}.ignored_columns = #{list.inspect}: the compiled table leaves out only #{_compiled_ignored_columns.inspect}"
@@ -761,10 +766,16 @@ module ActiveRecord
     # literal itself. Only string and text columns take the text; any
     # other keeps the value its compiled escape expects.
     def self._bind_type_cast(name, value)
-      return value unless value == true || value == false || value.is_a?(Integer) || value.is_a?(Float)
-      return value unless %i[string text].include?(schema_column_types.dig(name, 0))
-      return value.to_s unless value == true || value == false
-      literal = Db.escape_bool_opt(value)
+      text = case value
+             when true then _bind_bool_text(true)
+             when false then _bind_bool_text(false)
+             when Integer, Float then value.to_s
+             end
+      text && %i[string text].include?(schema_column_types.dig(name, 0)) ? text : value
+    end
+
+    def self._bind_bool_text(flag)
+      literal = Db.escape_bool_opt(flag).to_s
       return "t" if literal == "TRUE"
       return "f" if literal == "FALSE"
       literal

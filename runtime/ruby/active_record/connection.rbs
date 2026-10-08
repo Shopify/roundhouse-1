@@ -82,6 +82,7 @@ module ActiveRecord
     def self._attribute_cast: (String name, untyped value) -> untyped
     def self._attribute_deserialize: (String name, untyped value) -> untyped
     def self._bind_type_cast: (String name, untyped value) -> untyped
+    def self._bind_bool_text: (bool flag) -> String
     def self._attribute_serialize: (String name, untyped value) -> untyped
     def self._attribute_for_database: (String name, untyped value) -> untyped
     def self._primary_key_from_database: (untyped value) -> untyped
