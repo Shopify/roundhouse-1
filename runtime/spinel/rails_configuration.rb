@@ -18,10 +18,13 @@
 # This object is for the reads it cannot see: a configuration passed
 # around as a value, or a read in code the lowering never walks. It
 # answers exactly the lifted keys, through the same readers, so both
-# spellings share the one built-once value. Any other name — a framework
-# key the emitted app does not model, or a key nothing carried writes —
-# is a NoMethodError, as it would be on a config object that has no such
-# key, rather than a nil nobody set.
+# spellings share the one built-once value. Where the tree carries the
+# Railtie port, any other name is the options store every railtie's
+# configuration shares (`config.i18n`, which I18n::Railtie sets): a write
+# stores it, a read of a key nothing set is a NoMethodError, as in Rails.
+# Without the port, any other name — a framework key the emitted app does
+# not model, or a key nothing carried writes — is a NoMethodError, rather
+# than a nil nobody set.
 #
 # `Rails.application.config` is added with `class_eval` on the runtime's
 # own class (rails.rb, required first), not a `class Application`
@@ -66,13 +69,37 @@ module Rails
     end
 
     def respond_to_missing?(name, include_private = false)
-      lifted?(name) || super
+      lifted?(name) || railtie_option?(name) || super
     end
 
+    # A lifted key answers from the application reopen. Any other key is
+    # the one options store every railtie's configuration shares
+    # (Rails::Railtie::Configuration's `@@options`, which
+    # Application::Configuration inherits): `config.i18n`, which
+    # I18n::Railtie's body sets (runtime/active_support_i18n_railtie.rb),
+    # read and written by a gem's railtie through `app.config` (phonelib
+    # 0.10.27: `app.config.i18n.load_path = ...`). A read of a key nothing
+    # set is still a NoMethodError there, as in Rails; a write stores it.
+    # Without the Railtie port, only the lifted keys.
     def method_missing(name, *args, &block)
-      return super unless lifted?(name)
+      if lifted?(name)
+        @application.public_send(name, *args, &block)
+      elsif defined?(::Rails::Railtie::Configuration)
+        ::Rails::Railtie::Configuration.new.public_send(name, *args, &block)
+      else
+        super
+      end
+    end
 
-      @application.public_send(name, *args, &block)
+    # Application::Configuration#reloading_enabled? is `enable_reloading`.
+    # This tree never reloads code (ingest: `cache_classes`, "no code
+    # reloading in the emitted app"), so it answers false whatever the
+    # environment writes, and nothing a railtie installs under it (the I18n
+    # railtie's file watcher) runs. Without the Railtie port, no such key.
+    def reloading_enabled?
+      return method_missing(:reloading_enabled?) unless defined?(::Rails::Railtie::Configuration)
+
+      false
     end
 
     # Two framework keys (railties 8.2.0.alpha
@@ -102,8 +129,8 @@ module Rails
     # `@@eager_load_namespaces`; Application::Configuration inherits it).
     # worldwide 1.29.0's `worldwide.setup` initializer appends Worldwide
     # through `application.config`. Rails' Finisher calls `eager_load!` on
-    # each entry only under `config.eager_load`. Without the Railtie port,
-    # no such key.
+    # each entry only under `config.eager_load` (Railtie.eager_load_step).
+    # Without the Railtie port, no such key.
     def eager_load_namespaces
       return method_missing(:eager_load_namespaces) unless defined?(::Rails::Railtie::Configuration)
 
@@ -129,6 +156,10 @@ module Rails
 
     def lifted?(name)
       @application.respond_to?("#{name.to_s.delete_suffix("=")}__build")
+    end
+
+    def railtie_option?(name)
+      defined?(::Rails::Railtie::Configuration) && ::Rails::Railtie::Configuration.new.respond_to?(name)
     end
   end
 end

@@ -390,6 +390,7 @@ module Rails
           bootstrap_hook: -> { ActiveSupport.run_load_hooks(:before_initialize, app) },
           build_middleware_stack: -> { Configuration.refuse_app_middleware! },
           run_prepare_callbacks: -> { Configuration.new.to_prepare_blocks.each(&:call) },
+          eager_load!: -> { eager_load_step(app) },
           finisher_hook: -> { ActiveSupport.run_load_hooks(:after_initialize, app) },
         }
         collection = Initializable::Collection.new
@@ -406,9 +407,30 @@ module Rails
         subclasses.each { |railtie| collection.concat(railtie.instance.initializers) }
         if defined?(::Rails::Engine)
           ::Rails::Engine.subclasses.each { |engine| collection.concat(engine.instance.initializers) }
+          # The application is itself an engine, the last in
+          # Engine::Railties order (Application#ordered_railties).
+          collection.concat(::Rails::Engine.application_initializers(app))
         end
         add.(FINISHER_INITIALIZERS)
         collection.tsort
+      end
+
+      # Finisher's `:eager_load!` (railties application/finisher.rb):
+      # when the environment eager loads, the `:before_eager_load` hooks
+      # (I18n::Railtie initializes I18n there), then every
+      # `config.eager_load_namespaces` member's `eager_load!` (I18n,
+      # each engine, a gem's: phonelib loads its phone data). Rails
+      # eager loads the app's own code (`Zeitwerk::Loader.eager_load_all`,
+      # `Rails.eager_load!`) between the two; this tree has loaded it
+      # already, in app/models.rb before the app's initializers, as it
+      # loads every app file before them, so here the hooks run after
+      # the app's code rather than before it. The reloader part runs only
+      # under `config.reloading_enabled?`, false in this tree.
+      def eager_load_step(app) # :nodoc:
+        return unless defined?(::RoundhouseAutoload) && ::RoundhouseAutoload.eager_load?
+
+        ActiveSupport.run_load_hooks(:before_eager_load, app)
+        Configuration.eager_load_namespaces.each(&:eager_load!)
       end
 
       # A railtie's initializer or hook that needs Rails this tree does

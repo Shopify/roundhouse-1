@@ -8429,7 +8429,21 @@ pub(crate) const APPLIED_FRAMEWORK_CONFIG_KEYS: &[(&str, &str)] = &[
         "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior",
     ),
     ("active_support.report_deprecations", "runtime/active_support_deprecation.rb Rails::Application.apply_deprecation_behavior"),
+    ("i18n.available_locales", I18N_APPLIED_BY),
+    ("i18n.default_locale", I18N_APPLIED_BY),
+    ("i18n.enforce_available_locales", I18N_APPLIED_BY),
+    ("i18n.fallbacks", I18N_APPLIED_BY),
+    ("i18n.load_path", I18N_APPLIED_BY),
+    ("i18n.locale", I18N_APPLIED_BY),
+    ("i18n.raise_on_missing_translations", I18N_APPLIED_BY),
 ];
+
+/// `i18n.*` (`project::I18N_CONFIG_KEYS`): activesupport 8.2.0.alpha
+/// i18n_railtie.rb's `initialize_i18n` applies `config.i18n` to I18n once
+/// the app has initialized. Boot writes the app's values into the
+/// railtie's `config.i18n` before the railties' initializers run
+/// (`project::i18n_config_block`).
+const I18N_APPLIED_BY: &str = "runtime/active_support_i18n_railtie.rb I18n::Railtie.initialize_i18n";
 
 /// The `Rails::Application` reader ingest lifts for an applied
 /// framework key (`active_record.maintain_test_schema` →
