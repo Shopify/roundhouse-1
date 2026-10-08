@@ -44,17 +44,27 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    billing-
 /// The app's model files, in the order the native control loads them.
 const MODELS: &[(&str, &str)] = &[
     ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+    (
+        "app/models/core_general_2_record.rb",
+        "class CoreGeneral2Record < ApplicationRecord\n  self.abstract_class = true\nend\n",
+    ),
     ("app/models/billing.rb", "module Billing\n  def self.table_name_prefix\n    \"bill_\"\n  end\nend\n"),
     ("app/models/pod_tasks/cross_pod_run.rb", "module PodTasks\n  class CrossPodRun < ::ApplicationRecord\n  end\nend\n"),
+    // Core's `MaintenanceTasks::CoreGeneral2Run < CoreGeneral2Record`:
+    // through an abstract base, and `2` stays on its word.
+    (
+        "app/models/pod_tasks/core_general_2_run.rb",
+        "module PodTasks\n  class CoreGeneral2Run < CoreGeneral2Record\n  end\nend\n",
+    ),
     ("app/models/quiet_engine/note.rb", "module QuietEngine\n  class Note < ::ApplicationRecord\n  end\nend\n"),
     ("app/models/billing/invoice.rb", "module Billing\n  class Invoice < ::ApplicationRecord\n  end\nend\n"),
 ];
 
 const READER: &str = "class Reader\n  #: (PodTasks::CrossPodRun) -> String\n  def self.task(run) = run.task_name\nend\n";
 
-const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table :pod_tasks_cross_pod_runs do |t|\n    t.string :task_name, null: false\n  end\n  create_table :notes do |t|\n  end\n  create_table :bill_invoices do |t|\n  end\nend\n";
+const SCHEMA: &str = "ActiveRecord::Schema.define do\n  create_table :pod_tasks_cross_pod_runs do |t|\n    t.string :task_name, null: false\n  end\n  create_table :pod_tasks_core_general2_runs do |t|\n  end\n  create_table :notes do |t|\n  end\n  create_table :bill_invoices do |t|\n  end\nend\n";
 
-const NAMES: &[&str] = &["PodTasks::CrossPodRun", "QuietEngine::Note", "Billing::Invoice"];
+const NAMES: &[&str] = &["PodTasks::CrossPodRun", "PodTasks::CoreGeneral2Run", "QuietEngine::Note", "Billing::Invoice"];
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -111,7 +121,7 @@ fn native_tables(home: &Path) -> Vec<String> {
 fn a_required_gem_engines_isolated_namespace_prefixes_app_models() {
     let home = gem_home();
     let native = native_tables(&home);
-    assert_eq!(native, ["pod_tasks_cross_pod_runs", "notes", "bill_invoices"]);
+    assert_eq!(native, ["pod_tasks_cross_pod_runs", "pod_tasks_core_general2_runs", "notes", "bill_invoices"]);
 
     let app_dir = scratch("app");
     for (rel, source) in MODELS {
