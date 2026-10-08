@@ -105,7 +105,13 @@ pub fn try_build_arel_with_assocs(
         // `Room.where(type: "Rooms::Open").pluck(:id)` from `sti_scope`.
         "pluck" | "ids" => {
             let (op, owner) = try_chain_recv(recv, schema, registry, assocs)?;
-            return apply_pluck(op, method, args, schema).map(|op| (op, owner));
+            let op = apply_pluck(op, method, args, schema)?;
+            if let ArelOp::Select(Select { columns: ColumnSpec::Pluck(col), .. }) = &op {
+                if declared_type_column(registry.get(&owner), schema, col) {
+                    return None;
+                }
+            }
+            return Some((op, owner));
         }
         // `count` LAYERED on a chain. The base arm already answers
         // `Model.count`; without this arm `Model.where(…).count`
@@ -135,8 +141,13 @@ pub fn try_build_arel_with_assocs(
                 }
                 let base = grouped.base?;
                 let (op, owner) = try_chain_recv(base, schema, registry, assocs)?;
-                return apply_group_count(op, grouped.group_args, schema)
-                    .map(|op| (op, owner));
+                let op = apply_group_count(op, grouped.group_args, schema)?;
+                if let ArelOp::Select(Select { columns: ColumnSpec::GroupCount(col), .. }) = &op {
+                    if declared_type_column(registry.get(&owner), schema, col) {
+                        return None;
+                    }
+                }
+                return Some((op, owner));
             }
             if method.as_str() == "group_count" {
                 // The renamed terminal with no `group` under it is not a
@@ -163,6 +174,15 @@ pub fn try_build_arel_with_assocs(
     let info = registry.get(&class_id)?;
     let table_ref = info.table.as_ref()?.clone();
     let table = schema.tables.get(&table_ref.0)?;
+    if let Some(entries) = single_kwargs_hash(args) {
+        let bound = entries.iter().filter_map(|(k, _)| key_as_column_symbol(k));
+        if bound
+            .map(|column| super::ir::ColRef { table: table_ref.clone(), column })
+            .any(|col| declared_type_column(Some(info), schema, &col))
+        {
+            return None;
+        }
+    }
 
     let op = match method.as_str() {
         "all" => Some(ArelOp::Select(build_all(&table_ref))),
@@ -173,6 +193,24 @@ pub fn try_build_arel_with_assocs(
         _ => None,
     }?;
     Some((op, class_id))
+}
+
+/// A column whose type a declared type object decides when the app
+/// loads (`Model.retypable_attributes`, typed gradually as `Untyped` in
+/// the class's attribute row). Rails casts and serializes its binds and
+/// reads through that object; the runtime Relation does the same
+/// (`_attribute_for_database`, `_attribute_deserialize`), while a fold
+/// here would bind and read the raw column. Such chains stay on the
+/// runtime Relation. A JSON column is untyped too but has no declared
+/// type, so it keeps the static path.
+fn declared_type_column(info: Option<&ClassInfo>, schema: &Schema, col: &super::ir::ColRef) -> bool {
+    let Some(info) = info else { return false };
+    let is_json = schema
+        .tables
+        .get(&col.table.0)
+        .and_then(|t| t.columns.iter().find(|c| c.name == col.column))
+        .is_some_and(|c| matches!(c.col_type, ColumnType::Json));
+    !is_json && matches!(info.attributes.fields.get(&col.column), Some(crate::ty::Ty::Untyped))
 }
 
 /// Treat the recv of a chain modifier as a recognizable Arel base.
@@ -706,7 +744,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
-                virtual_module: None,
+                virtual_module: None, primary_key_columns: Vec::new(),
             },
         );
         let schema = Schema { tables };

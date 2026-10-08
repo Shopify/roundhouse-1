@@ -112,6 +112,14 @@ pub struct Model {
     /// `Rooms::Open` rows say `rooms_open`, not `room`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sti_subclass_names: Vec<ClassId>,
+    /// Columns an app class macro in the body (or an ancestor's) can
+    /// retype at load through `attribute` (stamped at the end of ingest
+    /// by `analyze::retypable_attributes`). Their compiled accessors,
+    /// hydration and binds consult the declared type at run time, and the
+    /// analyzer types them gradually. Empty for nearly every model, which
+    /// then lowers exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retypable_attributes: Vec<Symbol>,
     /// Named visibility for methods the body does not define as a local
     /// `MethodDef`: inherited ones, schema/association readers, and
     /// accessors the lowering synthesizes. See [`VisibilityOverride`].

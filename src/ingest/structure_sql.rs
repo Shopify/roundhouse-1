@@ -285,6 +285,7 @@ fn handle_create_table(
     let mut columns: Vec<Column> = Vec::new();
     let mut keys: Vec<Index> = Vec::new();
     let mut inline_fks: Vec<String> = Vec::new();
+    let mut primary_key_columns: Vec<Symbol> = Vec::new();
     for seg in top_level_split(body, b',') {
         let seg = seg.trim();
         if seg.is_empty() {
@@ -306,7 +307,7 @@ fn handle_create_table(
             continue;
         }
         if is_table_level_constraint(seg) {
-            handle_inline_table_constraint(seg, &table_name, &mut columns, gaps, file);
+            handle_inline_table_constraint(seg, &mut columns, &mut primary_key_columns);
             continue;
         }
         match parse_column_def(seg, &table_name, file, enum_types) {
@@ -342,6 +343,7 @@ fn handle_create_table(
             indexes: keys,
             foreign_keys: Vec::new(),
             virtual_module: None,
+            primary_key_columns,
         },
     );
     // MySQL declares foreign keys in the table body; read them as the
@@ -427,28 +429,20 @@ fn mysql_inline_index(seg: &str, unique: bool) -> Option<Index> {
 }
 
 /// `[CONSTRAINT name] PRIMARY KEY (cols)` inside the column-list parens
-/// sets the primary-key flag on the matching column(s); every other
+/// flags the key column, or records a composite key in
+/// `Table.primary_key_columns` (`handle_add_primary_key`); every other
 /// table-level constraint form (`UNIQUE`, `CHECK`, `EXCLUDE`) is
 /// recognized and skipped — it costs the DDL nothing schema.rb would
 /// have captured either. (An inline `FOREIGN KEY` never reaches here:
 /// `handle_create_table` reads it once the table exists.)
-fn handle_inline_table_constraint(
-    seg: &str,
-    table_name: &str,
-    columns: &mut [Column],
-    gaps: &mut Vec<IngestError>,
-    file: &str,
-) {
+fn handle_inline_table_constraint(seg: &str, columns: &mut [Column], composite: &mut Vec<Symbol>) {
     let words = top_level_words(seg);
     // From the first word: a bare `PRIMARY KEY (…)` (MySQL's only
     // spelling) starts the entry at byte 0.
     let Some(pos) = word_seq_pos(&words, &["PRIMARY", "KEY"]) else { return };
     let Some(open) = find_first_open_paren(seg, pos) else { return };
     let Some(close) = matching_close_paren(seg, open) else { return };
-    let cols: Vec<String> = top_level_split(&seg[open + 1..close], b',')
-        .iter()
-        .filter_map(|c| read_ident(c.trim(), 0).map(|(n, _)| n))
-        .collect();
+    let cols = primary_key_list(&seg[open + 1..close]);
     match cols.len() {
         0 => {}
         1 => {
@@ -456,14 +450,26 @@ fn handle_inline_table_constraint(
                 col.primary_key = true;
             }
         }
-        _ => gaps.push(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "primary key dropped: composite key ({table_name}({}))",
-                cols.join(", ")
-            ),
-        }),
+        _ => *composite = cols.iter().map(|c| Symbol::from(c.as_str())).collect(),
     }
+}
+
+/// The columns of a `PRIMARY KEY (…)` list, in key order. Yugabyte's
+/// `PRIMARY KEY((shop_id) HASH, id ASC, island ASC)` groups the hash
+/// columns in parentheses; each column inside counts, in order.
+fn primary_key_list(list: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in top_level_split(list, b',') {
+        let entry = entry.trim();
+        if entry.starts_with('(') {
+            if let Some(close) = matching_close_paren(entry, 0) {
+                out.extend(primary_key_list(&entry[1..close]));
+            }
+        } else if let Some((name, _)) = read_ident(entry, 0) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// One column-definition entry from inside `CREATE TABLE (...)`.
@@ -693,6 +699,31 @@ fn maybe_register_enum(stmt: &str, enum_types: &mut HashSet<String>) {
 // CREATE INDEX
 // ---------------------------------------------------------------------
 
+/// One entry of an index's column list: a column with the order words
+/// pg_dump may write after it (`ASC`, `DESC`, `NULLS FIRST|LAST`, and
+/// Yugabyte's `HASH`), or Yugabyte's parenthesized hash group `(shop_id,
+/// id) HASH`, each column in order. `None` for anything else: an
+/// expression, an operator class, a collation.
+fn index_entry_columns(entry: &str) -> Option<Vec<Symbol>> {
+    let (cols, tail) = if entry.starts_with('(') {
+        let close = matching_close_paren(entry, 0)?;
+        let mut cols = Vec::new();
+        for inner in top_level_split(&entry[1..close], b',') {
+            let inner = inner.trim();
+            match read_ident(inner, 0) {
+                Some((name, n)) if inner[n..].trim().is_empty() => cols.push(Symbol::from(name)),
+                _ => return None,
+            }
+        }
+        (cols, &entry[close + 1..])
+    } else {
+        let (name, n) = read_ident(entry, 0)?;
+        (vec![Symbol::from(name)], &entry[n..])
+    };
+    const ORDER_WORDS: [&str; 6] = ["ASC", "DESC", "HASH", "NULLS", "FIRST", "LAST"];
+    tail.split_whitespace().all(|w| ORDER_WORDS.iter().any(|o| w.eq_ignore_ascii_case(o))).then_some(cols)
+}
+
 /// `CREATE [UNIQUE] INDEX [name] ON table [USING method] (cols) [WHERE
 /// …]`. The `WHERE` predicate is kept as written, as schema.rb's
 /// `where:` is: on a unique index it limits which rows must be
@@ -739,9 +770,9 @@ fn handle_create_index(stmt: &str, schema: &mut Schema) {
         if e.is_empty() {
             continue;
         }
-        match read_ident(e, 0) {
-            Some((name, consumed3)) if e[consumed3..].trim().is_empty() => cols.push(Symbol::from(name)),
-            _ => return, // expression column — see doc comment above
+        match index_entry_columns(e) {
+            Some(entry_cols) => cols.extend(entry_cols),
+            None => return, // expression column — see doc comment above
         }
     }
     if cols.is_empty() {
@@ -807,7 +838,7 @@ fn handle_alter_table(
     let words = top_level_words(after);
 
     if let Some(pos) = word_seq_pos_after(&words, 0, &["PRIMARY", "KEY"]) {
-        handle_add_primary_key(after, pos, &table_name, table_sym, schema, gaps, file);
+        handle_add_primary_key(after, pos, table_sym, schema);
         return;
     }
     if let Some(pos) = word_seq_pos_after(&words, 0, &["FOREIGN", "KEY"]) {
@@ -832,21 +863,14 @@ fn handle_alter_table(
 
 /// `ADD CONSTRAINT [name] PRIMARY KEY (cols)`. A composite key is a
 /// real shape in this dialect (Postgres partitioned tables routinely
-/// key on `(id, partition_key)`) that the single-column `Column.
-/// primary_key` flag cannot hold — ledgered rather than narrowed to
-/// one column, which would silently misrepresent the table's key.
-fn handle_add_primary_key(
-    after: &str,
-    pk_pos: usize,
-    table_name: &str,
-    table_sym: Symbol,
-    schema: &mut Schema,
-    gaps: &mut Vec<IngestError>,
-    file: &str,
-) {
+/// key on `(id, partition_key)`; Core keys on `(shop_id, id, island)`)
+/// that the single-column `Column.primary_key` flag cannot hold — kept
+/// whole in `Table.primary_key_columns` rather than narrowed to one
+/// column, which would silently misrepresent the table's key.
+fn handle_add_primary_key(after: &str, pk_pos: usize, table_sym: Symbol, schema: &mut Schema) {
     // A retracted partition shard (see `handle_attach_partition`) has
     // no table entry left to set a pk flag on — and, just as
-    // importantly, no business ledgering a composite-key gap for a
+    // importantly, no business recording a composite key for a
     // table this Schema no longer models at all. Its own `ADD
     // CONSTRAINT ... PRIMARY KEY` statement always comes AFTER its
     // `ATTACH PARTITION` in a real dump (pg_dump orders constraints
@@ -857,10 +881,7 @@ fn handle_add_primary_key(
     }
     let Some(open) = find_first_open_paren(after, pk_pos) else { return };
     let Some(close) = matching_close_paren(after, open) else { return };
-    let cols: Vec<String> = top_level_split(&after[open + 1..close], b',')
-        .iter()
-        .filter_map(|c| read_ident(c.trim(), 0).map(|(n, _)| n))
-        .collect();
+    let cols = primary_key_list(&after[open + 1..close]);
     match cols.len() {
         0 => {}
         1 => {
@@ -870,13 +891,11 @@ fn handle_add_primary_key(
                 }
             }
         }
-        _ => gaps.push(IngestError::Unsupported {
-            file: file.into(),
-            message: format!(
-                "primary key dropped: composite key ({table_name}({}))",
-                cols.join(", ")
-            ),
-        }),
+        _ => {
+            if let Some(table) = schema.tables.get_mut(&table_sym) {
+                table.primary_key_columns = cols.iter().map(|c| Symbol::from(c.as_str())).collect();
+            }
+        }
     }
 }
 

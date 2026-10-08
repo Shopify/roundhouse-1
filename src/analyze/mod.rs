@@ -40,6 +40,7 @@ pub(crate) mod runtime_reads;
 pub(crate) mod test_assertion_jumps;
 pub(crate) mod test_harness_calls;
 pub(crate) mod association_surface;
+pub(crate) mod retypable_attributes;
 pub mod test_helper_connection;
 mod database_identity;
 mod initializer_coverage;

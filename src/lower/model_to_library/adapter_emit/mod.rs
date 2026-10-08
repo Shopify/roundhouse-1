@@ -35,7 +35,7 @@
 //!   `_columns_sql` — the schema columns as a qualified SELECT list
 //!   `_hydrate_all(sql)` — run a SELECT over `_columns_sql`, typed rows
 
-use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Param};
+use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::{ClassId, Symbol, TableRef, VarId};
@@ -54,23 +54,24 @@ use exists::{synth_adapter_any, synth_adapter_exists_by_id};
 
 pub(super) fn push_adapter_methods(
     methods: &mut Vec<MethodDef>,
-    owner: &ClassId,
+    model: &Model,
     table: &Table,
     schema: &Schema,
     dialect: SqlDialect,
 ) {
-    methods.push(synth_adapter_find_by_id(owner, table, schema, dialect));
+    let owner = &model.name;
+    methods.push(synth_adapter_find_by_id(model, table, schema, dialect));
     methods.push(synth_adapter_all(owner, table, schema, dialect));
-    methods.push(synth_adapter_last(owner, table, schema, dialect));
-    methods.push(synth_adapter_insert(owner, table, schema, dialect));
-    methods.push(synth_adapter_update(owner, table, schema, dialect));
-    methods.push(synth_adapter_delete(owner, table, schema, dialect));
+    methods.push(synth_adapter_last(model, table, schema, dialect));
+    methods.push(synth_adapter_insert(model, table, schema, dialect));
+    methods.push(synth_adapter_update(model, table, schema, dialect));
+    methods.push(synth_adapter_delete(model, table, schema, dialect));
     methods.push(synth_adapter_count(owner, table, schema, dialect));
     methods.push(synth_adapter_any(owner, table, schema, dialect));
-    methods.push(synth_adapter_exists_by_id(owner, table, schema, dialect));
+    methods.push(synth_adapter_exists_by_id(model, table, schema, dialect));
     methods.push(synth_adapter_truncate(owner, table, schema, dialect));
     methods.push(synth_delete_all(owner, table, dialect));
-    methods.push(synth_adapter_reload(owner, table, dialect));
+    methods.push(synth_adapter_reload(model, table, dialect));
     methods.push(synth_columns_sql(owner, table, dialect));
     methods.push(synth_hydrate_all(owner));
 }
@@ -86,9 +87,10 @@ pub(super) fn push_adapter_methods(
 /// Select shared normalization using the schema before the scalar adapter.
 /// This is dispatch only: all prefix/range rules stay in IntegerKeyCast.
 /// A runtime branch would compile both incompatible scalar adapter calls.
-pub(super) fn synth_find_primary_key_input(owner: &ClassId, table: &Table) -> MethodDef {
+pub(super) fn synth_find_primary_key_input(model: &Model, table: &Table) -> MethodDef {
+    let owner = &model.name;
     synth_primary_key_input(
-        owner,
+        model,
         table,
         "_find_primary_key_input",
         "_adapter_find_by_id",
@@ -104,13 +106,13 @@ pub(super) fn synth_find_primary_key_input(owner: &ClassId, table: &Table) -> Me
 
 /// Same schema-selected dispatch as find, but invalid keys answer false
 /// (Rails `exists?`) instead of nil / RecordNotFound.
-pub(super) fn synth_exists_primary_key_input(owner: &ClassId, table: &Table) -> MethodDef {
+pub(super) fn synth_exists_primary_key_input(model: &Model, table: &Table) -> MethodDef {
     let false_lit = Expr::new(
         Span::synthetic(),
         ExprNode::Lit { value: Literal::Bool { value: false } },
     );
     synth_primary_key_input(
-        owner,
+        model,
         table,
         "_exists_primary_key_input",
         "_adapter_exists_by_id?",
@@ -120,15 +122,16 @@ pub(super) fn synth_exists_primary_key_input(owner: &ClassId, table: &Table) -> 
 }
 
 fn synth_primary_key_input(
-    owner: &ClassId,
+    model: &Model,
     table: &Table,
     name: &str,
     adapter: &str,
     ret: Ty,
     invalid: Expr,
 ) -> MethodDef {
+    let owner = &model.name;
     let id = Symbol::from("id");
-    let key = key_ty(table);
+    let key = key_ty(model, table);
     let caster = ClassId(Symbol::from("ActiveRecord::IntegerKeyCast"));
     let adapter_call = |value| Expr::new(Span::synthetic(), ExprNode::Send {
         recv: None, method: Symbol::from(adapter),
@@ -180,9 +183,10 @@ fn synth_primary_key_input(
     }
 }
 
-fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_find_by_id(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     let id = Symbol::from("id");
-    let key_ty = key_ty(table);
+    let key_ty = key_ty(model, table);
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
 
@@ -190,7 +194,7 @@ fn synth_adapter_find_by_id(owner: &ClassId, table: &Table, schema: &Schema, dia
         single_record: true, // _adapter_find_by_id — one record or nil
         table: TableRef(table.name.clone()),
         columns: ColumnSpec::All,
-        conditions: Some(eq_id_param(table, &id)),
+        conditions: Some(eq_id_param(model, table, &id)),
         orders: vec![],
         limit: Some(LimitSpec(1)),
         joins: vec![],
@@ -255,7 +259,8 @@ fn synth_adapter_all(owner: &ClassId, table: &Table, schema: &Schema, dialect: S
 /// full-table scan; goes through the same `Db.prepare`/`from_stmt` path
 /// as `_adapter_find_by_id`, so it works for every app (the raw
 /// `ActiveRecord.adapter` is not wired under the Level-3 architecture).
-fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_last(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     let owner_ty = Ty::Class { id: owner.clone(), args: vec![] };
     let nilable_owner = Ty::Union { variants: vec![owner_ty, Ty::Nil] };
 
@@ -267,7 +272,7 @@ fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema, dialect: 
         orders: vec![Order {
             column: ColRef {
                 table: TableRef(table.name.clone()),
-                column: key_column_name(table),
+                column: key_column_name(model, table),
             },
             direction: Direction::Desc,
         }],
@@ -302,7 +307,8 @@ fn synth_adapter_last(owner: &ClassId, table: &Table, schema: &Schema, dialect: 
 /// `await` on the call result rather than the receiver. See the
 /// reload comment for the underlying emit issue with
 /// `self.class.<async_method>`.
-fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_insert(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     use crate::expr::{LValue, Literal};
     use crate::schema::ColumnType;
 
@@ -312,7 +318,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect
     // set by the app, or minted just below — so it is written like any
     // other column and answered from the ivar; the rowid says nothing
     // about it (#90).
-    let key = key_column(table);
+    let key = key_column(model, table);
     let supplied_key =
         key.filter(|c| !matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt));
 
@@ -325,8 +331,8 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
-                expr: ivar_ref(&super::schema::col_storage_name(c)),
-                ty: value_type_for_column(c),
+                expr: column_bind_expr(model, c),
+                ty: bind_type(model, c),
             },
         })
         .collect();
@@ -347,7 +353,9 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect
             // would have on insert — SQLite has no such default. A
             // string key (`id: :string`) is the app's to supply, as in
             // Rails, where a NULL one fails the NOT NULL constraint.
-            if matches!(k.col_type, ColumnType::Uuid) {
+            // A retypable key holds the declared type's value, which the
+            // app assigns (Core's ids come from GenerateOid before create).
+            if matches!(k.col_type, ColumnType::Uuid) && !super::schema::is_retypable(model, k) {
                 let blank = Expr::new(
                     Span::synthetic(),
                     ExprNode::Send {
@@ -385,7 +393,7 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect
             }
             exprs.push(dialect.visit(&op, schema, owner));
             exprs.push(key_ivar());
-            (Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), ty_of_column(&k.col_type))
+            (Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), key_ty(model, table))
         }
     };
 
@@ -410,7 +418,8 @@ fn synth_adapter_insert(owner: &ClassId, table: &Table, schema: &Schema, dialect
 
 /// `def _adapter_update` — instance method; reads ivars + @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
-fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_update(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     // Same storage-ivar convention as `synth_adapter_insert`.
     let assignments: Vec<Assignment> = table
         .columns
@@ -419,8 +428,8 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, dialect
         .map(|c| Assignment {
             column: c.name.clone(),
             value: Value::Runtime {
-                expr: ivar_ref(&super::schema::col_storage_name(c)),
-                ty: value_type_for_column(c),
+                expr: column_bind_expr(model, c),
+                ty: bind_type(model, c),
             },
         })
         .collect();
@@ -428,7 +437,7 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, dialect
     let op = ArelOp::Update(Update {
         table: TableRef(table.name.clone()),
         assignments,
-        conditions: Some(eq_id_ivar(table)),
+        conditions: Some(eq_id_ivar(model, table)),
     });
 
     MethodDef {
@@ -452,10 +461,11 @@ fn synth_adapter_update(owner: &ClassId, table: &Table, schema: &Schema, dialect
 
 /// `def _adapter_delete` — instance method; reads @id.
 /// See `synth_adapter_insert` for the receiver-rationale.
-fn synth_adapter_delete(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_delete(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     let op = ArelOp::Delete(Delete {
         table: TableRef(table.name.clone()),
-        conditions: Some(eq_id_ivar(table)),
+        conditions: Some(eq_id_ivar(model, table)),
     });
 
     MethodDef {
@@ -615,7 +625,8 @@ fn synth_adapter_truncate(owner: &ClassId, table: &Table, schema: &Schema, diale
 /// reload needs to write into self. Generalizing the visitor with
 /// a "hydrate target = bare ivar / passed-in symbol" option is the
 /// right cleanup once a second use surfaces.
-fn synth_adapter_reload(owner: &ClassId, table: &Table, dialect: SqlDialect) -> MethodDef {
+fn synth_adapter_reload(model: &Model, table: &Table, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     use crate::expr::{ExprNode, LValue, Literal};
     use crate::span::Span;
 
@@ -639,12 +650,17 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table, dialect: SqlDialect) -> 
     let param = dialect == SqlDialect::Postgres || crate::lower::arel::visitor::param_binds_enabled();
     // The key column and its ivar, bound with the key's type — the same
     // column the visitor-emitted find/exists paths compare.
-    let key = key_column_name(table);
-    let (bind_method, escape_method) = match key_value_type(table) {
+    let key = key_column_name(model, table);
+    let (bind_method, escape_method) = match key_value_type(model, table) {
         ValueType::Str => ("bind_text", "escape_string"),
+        ValueType::StrOpt => ("bind_text_opt", "escape_string_opt"),
+        ValueType::IntOpt => ("bind_int_opt", "escape_int_opt"),
         _ => ("bind_int", "escape_int"),
     };
-    let id_ivar = Expr::new(Span::synthetic(), ExprNode::Ivar { name: key.clone() });
+    let id_ivar = match key_column(model, table) {
+        Some(c) => column_bind_expr(model, c),
+        None => Expr::new(Span::synthetic(), ExprNode::Ivar { name: key.clone() }),
+    };
     let (sql_concat, bind_id) = if param {
         // SQL: "SELECT <cols> FROM <table> WHERE <key> = ?" + " LIMIT 1"
         let sql = arel_concat(vec![
@@ -709,6 +725,20 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table, dialect: SqlDialect) -> 
             read_method,
             vec![var_ref(&stmt), arel_lit_int(i as i64)],
         );
+        // A retypable column rehydrates through its deserializing writer.
+        if super::schema::is_retypable(model, col) {
+            if_body.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                    method: super::schema::retypable_storage_writer(col),
+                    args: vec![read_call],
+                    block: None,
+                    parenthesized: true,
+                },
+            ));
+            continue;
+        }
         if_body.push(Expr::new(
             Span::synthetic(),
             ExprNode::Assign {
@@ -716,6 +746,7 @@ fn synth_adapter_reload(owner: &ClassId, table: &Table, dialect: SqlDialect) -> 
                 value: read_call,
             },
         ));
+
     }
     if_body.push(Expr::new(
         Span::synthetic(),
@@ -974,28 +1005,55 @@ use crate::lower::arel::visitor::concat_chain as arel_concat;
 /// is `WHERE id = <str>`, not an integer compare against text (#90).
 /// A table with no key column (a join table) keeps `id`/Int, the
 /// shape the primitives always assumed.
-fn key_column(table: &Table) -> Option<&crate::schema::Column> {
-    super::primary_key_column(table)
+/// The key the adapter binds: the schema column flagged primary key,
+/// else the column `self.primary_key =` names when the schema flags
+/// none (a composite key, `Table.primary_key_columns`, as Core's
+/// `PRIMARY KEY((shop_id) HASH, id ASC, island ASC)` with
+/// `self.primary_key = :id`) — the column Rails' find / update /
+/// destroy use. A model on a composite key that declares none is
+/// reported (`composite_primary_key`).
+fn key_column<'a>(model: &Model, table: &'a Table) -> Option<&'a crate::schema::Column> {
+    super::primary_key_column(table).or_else(|| {
+        let named = model.primary_key.as_ref()?;
+        table.columns.iter().find(|c| &c.name == named)
+    })
 }
 
-fn key_column_name(table: &Table) -> Symbol {
-    key_column(table).map(|c| c.name.clone()).unwrap_or_else(|| Symbol::from("id"))
+fn key_column_name(model: &Model, table: &Table) -> Symbol {
+    key_column(model, table).map(|c| c.name.clone()).unwrap_or_else(|| Symbol::from("id"))
 }
 
-pub(super) fn key_ty(table: &Table) -> Ty {
-    key_column(table).map(|c| ty_of_column(&c.col_type)).unwrap_or(Ty::Int)
+/// A retypable key (`Model::retypable_attributes`) holds the declared
+/// type's cast value, so it is typed gradually.
+pub(super) fn key_ty(model: &Model, table: &Table) -> Ty {
+    match key_column(model, table) {
+        Some(c) if super::schema::is_retypable(model, c) => Ty::Untyped,
+        Some(c) => ty_of_column(&c.col_type),
+        None => Ty::Int,
+    }
 }
 
-fn key_value_type(table: &Table) -> ValueType {
-    key_column(table).map(value_type_for_column).unwrap_or(ValueType::Int)
+fn key_value_type(model: &Model, table: &Table) -> ValueType {
+    key_column(model, table).map(|c| bind_type(model, c)).unwrap_or(ValueType::Int)
 }
 
 /// `Eq(<table>.<key>, Runtime(<id-param>, <key type>))` — find_by_id /
-/// exists_by_id? shape (id arrives as a method param).
-pub(super) fn eq_id_param(table: &Table, id_param: &Symbol) -> Predicate {
+/// exists_by_id? shape (id arrives as a method param). A retypable key
+/// binds what its declared type makes of the argument (cast, then
+/// serialized), as a where predicate does.
+pub(super) fn eq_id_param(model: &Model, table: &Table, id_param: &Symbol) -> Predicate {
+    let id = match key_column(model, table) {
+        Some(c) if super::schema::is_retypable(model, c) => declared_type_send(
+            Expr::new(Span::synthetic(), ExprNode::SelfRef),
+            "_attribute_for_database",
+            c,
+            var_ref(id_param),
+        ),
+        _ => var_ref(id_param),
+    };
     Predicate::Eq(
-        ColRef { table: TableRef(table.name.clone()), column: key_column_name(table) },
-        Value::Runtime { expr: var_ref(id_param), ty: key_value_type(table) },
+        ColRef { table: TableRef(table.name.clone()), column: key_column_name(model, table) },
+        Value::Runtime { expr: id, ty: key_value_type(model, table) },
     )
 }
 
@@ -1005,11 +1063,69 @@ pub(super) fn eq_id_param(table: &Table, id_param: &Symbol) -> Predicate {
 /// `_adapter_delete` via implicit-self (`_adapter_update`) instead of
 /// the `self.class._adapter_update(@id, self)` chain that the TS
 /// emitter mishandles under the libsql async profile.
-fn eq_id_ivar(table: &Table) -> Predicate {
+fn eq_id_ivar(model: &Model, table: &Table) -> Predicate {
+    let key = key_column_name(model, table);
+    let expr = match key_column(model, table) {
+        Some(c) => column_bind_expr(model, c),
+        None => ivar_ref(&key),
+    };
     Predicate::Eq(
-        ColRef { table: TableRef(table.name.clone()), column: key_column_name(table) },
-        Value::Runtime { expr: ivar_ref(&key_column_name(table)), ty: key_value_type(table) },
+        ColRef { table: TableRef(table.name.clone()), column: key },
+        Value::Runtime { expr, ty: key_value_type(model, table) },
     )
+}
+
+/// The value an instance method binds for a column: its storage ivar,
+/// or for a retypable column what the declared type serializes it to.
+fn column_bind_expr(model: &Model, col: &crate::schema::Column) -> Expr {
+    let ivar = ivar_ref(&super::schema::col_storage_name(col));
+    if super::schema::is_retypable(model, col) {
+        let self_class = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(Expr::new(Span::synthetic(), ExprNode::SelfRef)),
+                method: Symbol::from("class"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        declared_type_send(self_class, "_attribute_serialize", col, ivar)
+    } else {
+        ivar
+    }
+}
+
+/// `<recv>.<method>("<col>", value)` — a runtime Base declared-type
+/// conversion.
+fn declared_type_send(recv: Expr, method: &str, col: &crate::schema::Column, value: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from(method),
+            args: vec![arel_lit_str(col.name.as_str().to_string()), value],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// The escape/bind primitive for a column. A serialized value can be
+/// nil whatever the column's nullability (an uncastable input), so a
+/// retypable column binds through the `_opt` primitive and NULL reaches
+/// the database, as in Rails.
+fn bind_type(model: &Model, col: &crate::schema::Column) -> ValueType {
+    let ty = value_type_for_column(col);
+    if !super::schema::is_retypable(model, col) {
+        return ty;
+    }
+    match ty {
+        ValueType::Int => ValueType::IntOpt,
+        ValueType::Str => ValueType::StrOpt,
+        ValueType::Bool => ValueType::BoolOpt,
+        other => other,
+    }
 }
 
 fn ivar_ref(name: &Symbol) -> Expr {

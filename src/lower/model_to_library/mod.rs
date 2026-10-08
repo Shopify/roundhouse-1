@@ -1579,10 +1579,10 @@ fn build_methods_for_dialect(
         // model instances over the `Sqlite` primitive surface. See
         // project_level_3_adapter_emit.md.
         if finder_inputs == FinderInputs::Request {
-            methods.push(adapter_emit::synth_find_primary_key_input(&model.name, table));
-            methods.push(adapter_emit::synth_exists_primary_key_input(&model.name, table));
+            methods.push(adapter_emit::synth_find_primary_key_input(model, table));
+            methods.push(adapter_emit::synth_exists_primary_key_input(model, table));
         }
-        push_adapter_methods(&mut methods, &model.name, table, schema, dialect);
+        push_adapter_methods(&mut methods, model, table, schema, dialect);
         // `from_params(p: <Resource>Params)` — typed factory matching the
         // (resource, fields) tuple a controller's `permit(...)` declared.
         // Skipped silently when the model isn't permitted by any
@@ -2100,8 +2100,9 @@ fn build_class_info_with_finder_inputs(
             // that in the attributes row: Crystal's auto-`.not_nil!`
             // ivar bridge, for one, keys off this type and would
             // otherwise assert non-nil on a column that is routinely
-            // NULL.
-            row.fields.insert(col.name.clone(), ty_of_column_slot(col));
+            // NULL. A retypable column is typed gradually (`schema::is_retypable`).
+            let ty = if schema::is_retypable(model, col) { Ty::Untyped } else { ty_of_column_slot(col) };
+            row.fields.insert(col.name.clone(), ty);
         }
         info.attributes = row;
     }

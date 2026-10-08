@@ -67,7 +67,7 @@ fn shared_lowering_executes_postgresql_sql_in_emitted_ruby() {
             Column { name: Symbol::from("enabled"), col_type: ColumnType::Boolean,
                 nullable: false, default: None, primary_key: false },
         ],
-        indexes: vec![], foreign_keys: vec![], virtual_module: None,
+        indexes: vec![], foreign_keys: vec![], virtual_module: None, primary_key_columns: Vec::new(),
     });
     let owner = ClassId(Symbol::from("Entry"));
     let title_var = Expr::new(Span::synthetic(), ExprNode::Var { name: Symbol::from("title"), id: VarId(0) });
@@ -184,7 +184,7 @@ fn postgres_model_app_with(application_rb: Option<&str>) -> roundhouse::app::App
                 nullable: false, default: None, primary_key: false },
             Column { name: Symbol::from("enabled"), col_type: ColumnType::Boolean,
                 nullable: false, default: None, primary_key: false },
-        ], indexes: vec![], foreign_keys: vec![], virtual_module: None,
+        ], indexes: vec![], foreign_keys: vec![], virtual_module: None, primary_key_columns: Vec::new(),
     });
     let model = roundhouse::ingest::model::ingest_model(
         b"class Entry < ActiveRecord::Base\n def self.named(title)\n where(Title: title).count\n end\n def matching\n Entry.where(Title: @Title).count\n end\nend\n",

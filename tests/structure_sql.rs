@@ -221,11 +221,55 @@ ALTER TABLE ONLY public.assignments
 
     let assignments = &schema.tables[&Symbol::from("assignments")];
     assert!(assignments.columns.iter().all(|c| !c.primary_key), "composite pk never narrowed to one column");
+    assert_eq!(assignments.primary_key_columns, [Symbol::from("project_id"), Symbol::from("user_id")]);
     assert!(assignments.foreign_keys.is_empty(), "composite fk never narrowed to one column pair");
 
     let messages: Vec<String> = gaps.iter().map(|g| format!("{g}")).collect();
-    assert!(messages.iter().any(|m| m.contains("primary key dropped") && m.contains("composite")), "{messages:?}");
+    assert!(!messages.iter().any(|m| m.contains("primary key dropped")), "the composite pk is kept: {messages:?}");
     assert!(messages.iter().any(|m| m.contains("foreign key dropped") && m.contains("composite")), "{messages:?}");
+}
+
+/// Yugabyte groups a key's hash columns in parentheses (Core's
+/// `PRIMARY KEY((shop_id) HASH, id ASC, island ASC)`); each column
+/// counts, in key order.
+#[test]
+fn a_yugabyte_hash_key_keeps_every_column_in_order() {
+    let sql = r#"
+CREATE TABLE public.products (
+    id uuid NOT NULL,
+    shop_id uuid NOT NULL,
+    island smallint DEFAULT 0 NOT NULL,
+    CONSTRAINT products_pkey PRIMARY KEY((shop_id) HASH, id ASC, island ASC)
+);
+"#;
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("ingests");
+    let products = &schema.tables[&Symbol::from("products")];
+    assert!(products.columns.iter().all(|c| !c.primary_key));
+    assert_eq!(products.primary_key_columns, [Symbol::from("shop_id"), Symbol::from("id"), Symbol::from("island")]);
+}
+
+#[test]
+fn a_yugabyte_index_keeps_its_hash_and_ordered_columns() {
+    let sql = r#"
+CREATE TABLE public.products (
+    id uuid NOT NULL,
+    shop_id uuid NOT NULL,
+    handle character varying(255) NOT NULL,
+    island smallint DEFAULT 0 NOT NULL
+);
+CREATE UNIQUE INDEX index_products_on_handle ON public.products USING lsm (shop_id HASH, handle ASC, island ASC) WHERE (island = 0);
+CREATE INDEX index_products_on_pair ON public.products USING lsm ((shop_id, id) HASH, handle DESC NULLS LAST);
+CREATE INDEX index_products_on_lower_handle ON public.products USING lsm (lower((handle)::text) HASH);
+"#;
+    let schema = ingest_structure_sql(sql.as_bytes(), "db/structure.sql").expect("ingests");
+    let indexes = &schema.tables[&Symbol::from("products")].indexes;
+    let cols = |name: &str| {
+        indexes.iter().find(|i| i.name.as_str() == name).map(|i| i.columns.iter().map(|c| c.as_str().to_string()).collect::<Vec<_>>())
+    };
+    assert_eq!(cols("index_products_on_handle").unwrap(), ["shop_id", "handle", "island"]);
+    assert!(indexes[0].unique && indexes[0].predicate.is_some());
+    assert_eq!(cols("index_products_on_pair").unwrap(), ["shop_id", "id", "handle"]);
+    assert_eq!(cols("index_products_on_lower_handle"), None, "an expression entry has no column to keep");
 }
 
 #[test]
@@ -321,9 +365,6 @@ CREATE VIEW public.view_two AS SELECT memberships.org_id FROM public.memberships
             .collect()
     };
 
-    let pk_keys = keys_for("primary key dropped");
-    assert_eq!(pk_keys.len(), 1, "both composite PKs should bucket together: {pk_keys:?}");
-
     let fk_keys = keys_for("foreign key dropped");
     assert_eq!(fk_keys.len(), 1, "both composite FKs should bucket together: {fk_keys:?}");
 
@@ -368,12 +409,12 @@ ALTER TABLE ONLY shard.readings_p0
         !schema.tables.contains_key(&Symbol::from("readings_p0")),
         "the attached shard is retracted, not modeled as its own table"
     );
-    // Exactly one composite-pk gap (the parent's), not two — the
-    // shard's own later `ADD CONSTRAINT ... PRIMARY KEY` targets a
-    // table this Schema no longer has, and is silently skipped rather
-    // than ledgering a gap for a table nobody will ever see.
-    let pk_gaps = gaps.iter().filter(|g| format!("{g}").contains("primary key dropped")).count();
-    assert_eq!(pk_gaps, 1, "{gaps:?}");
+    // The parent keeps its composite key; the shard's own later `ADD
+    // CONSTRAINT ... PRIMARY KEY` targets a table this Schema no longer
+    // has, and is skipped.
+    let readings = &schema.tables[&Symbol::from("readings")];
+    assert_eq!(readings.primary_key_columns, [Symbol::from("id"), Symbol::from("shard_key")]);
+    assert!(gaps.is_empty(), "{gaps:?}");
 }
 
 /// `CREATE … INDEX … WHERE (…)` keeps its predicate, as `where:` in

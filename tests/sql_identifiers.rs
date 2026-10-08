@@ -217,6 +217,7 @@ fn virtual_table_name_is_quoted_without_rewriting_module_arguments() {
                 module: "fts5".into(),
                 args: vec!["body".into(), "tokenize=porter".into()],
             }),
+            primary_key_columns: Vec::new(),
         },
     );
     let ddl = render_schema_sql(&app.schema);

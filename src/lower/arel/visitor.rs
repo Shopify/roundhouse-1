@@ -1476,7 +1476,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 foreign_keys: vec![],
-                virtual_module: None,
+                virtual_module: None, primary_key_columns: Vec::new(),
             },
         );
         (Schema { tables }, ClassId(Symbol::from("Article")))

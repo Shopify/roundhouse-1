@@ -299,6 +299,8 @@ module ActiveRecord
     # The integer parser never converts an out-of-range decimal string.
     def self._cast_primary_key(id)
       return nil if id.nil?
+      key_type = _declared_attribute_types[primary_key]
+      return key_type.cast(id) if key_type
       return IntegerKeyCast.input_text(id) if _string_primary_key
       cast = IntegerKeyCast.parse(id)
       cast.valid ? cast.value : nil
@@ -565,8 +567,11 @@ module ActiveRecord
     # **options)`, for a call the class body makes at load: an app macro
     # replayed there (Core's model_uuid_attributes runs `attribute name,
     # :model_uuid_as_integer`). A Symbol type is looked up in
-    # ActiveRecord::Type's registry with the class's adapter, as
-    # attributes.rb's `resolve_type_name` does; later declarations win,
+    # ActiveRecord::Type's registry with the class's adapter when the
+    # types are first read, not at the call: the class body runs before a
+    # connection is configured, and Rails too keeps the declaration
+    # pending until the schema loads (attributes.rb's PendingType,
+    # `resolve_type_name`). Later declarations win,
     # and a subclass sees its superclasses' (Rails applies the pending
     # types superclass first).
     #
@@ -577,14 +582,13 @@ module ActiveRecord
     # the compiled accessors would ignore. `default:` is not ported.
     def self.attribute(name, type = nil, default: (no_default = true), **options)
       name = name.to_s
-      type = ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) if type.is_a?(Symbol)
       unless no_default
         raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, default: ...): attribute defaults are not ported"
       end
       unless _retypable_attribute_names.include?(name)
         raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
       end
-      @__declared_attribute_types = (@__declared_attribute_types || {}).merge(name => type) if type
+      @__declared_attribute_types = (@__declared_attribute_types || {}).merge(name => [type, options]) if type
       _reset_attribute_types
       nil
     end
@@ -595,14 +599,56 @@ module ActiveRecord
       []
     end
     
+    # Read on every retypable accessor and bind, so memoized; a later
+    # `attribute` here or in a superclass clears it.
     def self._declared_attribute_types
-      inherited = superclass.respond_to?(:_declared_attribute_types) ? superclass._declared_attribute_types : {}
-      @__declared_attribute_types ? inherited.merge(@__declared_attribute_types) : inherited
+      @__declared_types_memo ||= begin
+        inherited = superclass.respond_to?(:_declared_attribute_types) ? superclass._declared_attribute_types : {}
+        own = {}
+        (@__declared_attribute_types || {}).each do |n, (type, options)|
+          own[n] = type.is_a?(Symbol) ? ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) : type
+        end
+        inherited.merge(own)
+      end
     end
     
     def self._reset_attribute_types
       @__attribute_types = nil
+      @__declared_types_memo = nil
       subclasses.each(&:_reset_attribute_types)
+    end
+    
+    # The compiled path of a retypable column (`_retypable_attribute_names`):
+    # its writer casts, hydration deserializes and every bind serializes
+    # through the declared type, as attribute.rb's FromUser / FromDatabase
+    # and value_for_database do. With no type declared (the macro chose
+    # not to retype the column) the value passes through as it did before.
+    def self._attribute_cast(name, value)
+      type = _declared_attribute_types[name]
+      type ? type.cast(value) : value
+    end
+    
+    def self._attribute_deserialize(name, value)
+      type = _declared_attribute_types[name]
+      type ? type.deserialize(value) : value
+    end
+    
+    def self._attribute_serialize(name, value)
+      type = _declared_attribute_types[name]
+      type ? type.serialize(value) : value
+    end
+    
+    # A value from outside (a where/update_all/exists? argument): cast,
+    # then serialized, as QueryAttribute#value_for_database does.
+    def self._attribute_for_database(name, value)
+      type = _declared_attribute_types[name]
+      type ? type.serialize(type.cast(value)) : value
+    end
+    
+    # A key read back from a row (`ids`).
+    def self._primary_key_from_database(value)
+      type = _declared_attribute_types[primary_key]
+      type ? type.deserialize(value) : _cast_primary_key(value)
     end
     
     def self._cast_type_for_spec(name, spec)

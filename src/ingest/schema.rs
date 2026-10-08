@@ -334,11 +334,20 @@ fn apply_migration_verb(
             }
         }
         "add_index" => {
-            if let (Some(t), Some(columns)) = (arg_name(0), args.get(1).map(column_name_list)) {
+            // `add_index(:t, hash: [...], cluster_by: [...], unique: true)`
+            // names its columns in the options, which start right after
+            // the table.
+            let keyword_only = args.get(1).is_some_and(|a| a.as_keyword_hash_node().is_some());
+            let options_at = if keyword_only { 1 } else { 2 };
+            let columns = match keyword_only {
+                true => Some(yugabyte_key_columns(args.iter().skip(1))),
+                false => args.get(1).map(column_name_list),
+            };
+            if let (Some(t), Some(columns)) = (arg_name(0), columns) {
                 if !columns.is_empty() {
                     if let Some(table) = schema.tables.get_mut(&Symbol::from(t.clone())) {
                         if columns.iter().all(|c| table.columns.iter().any(|col| col.name == *c)) {
-                            table.indexes.push(build_index(&t, columns, args.iter().skip(2)));
+                            table.indexes.push(build_index(&t, columns, args.iter().skip(options_at)));
                         }
                     }
                 }
@@ -552,6 +561,45 @@ fn column_name_list(node: &Node<'_>) -> Vec<Symbol> {
     }
 }
 
+/// The key the Yugabyte adapter's `hash:` and `cluster_by:` options name,
+/// hash columns first: `create_table(:t, id: false, hash: [:shop_id],
+/// cluster_by: [:id, { island: :asc }])` is `PRIMARY KEY((shop_id) HASH,
+/// id ASC, island ASC)`, and `add_index(:t, hash: [:a], cluster_by: [:b])`
+/// an index on `(a HASH, b ASC)`. Empty when neither is given.
+fn yugabyte_key_columns<'pr>(kwarg_nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Vec<Symbol> {
+    let (mut hash, mut cluster) = (Vec::new(), Vec::new());
+    for node in kwarg_nodes {
+        let Some(kh) = node.as_keyword_hash_node() else { continue };
+        for el in kh.elements().iter() {
+            let Some(assoc) = el.as_assoc_node() else { continue };
+            match symbol_value(&assoc.key()).as_deref() {
+                Some("hash") => hash = ordered_column_list(&assoc.value()),
+                Some("cluster_by") => cluster = ordered_column_list(&assoc.value()),
+                _ => {}
+            }
+        }
+    }
+    hash.extend(cluster);
+    hash
+}
+
+/// `[:id, { island: :asc }]`: the columns in order, a hash entry naming
+/// its column with that column's sort order.
+fn ordered_column_list(node: &Node<'_>) -> Vec<Symbol> {
+    let Some(arr) = node.as_array_node() else { return column_name_list(node) };
+    let mut out = Vec::new();
+    for el in arr.elements().iter() {
+        let entries = el.as_hash_node().map(|h| h.elements()).or_else(|| el.as_keyword_hash_node().map(|h| h.elements()));
+        match entries {
+            Some(entries) => out.extend(
+                entries.iter().filter_map(|e| e.as_assoc_node()).filter_map(|a| name_value(&a.key())).map(Symbol::from),
+            ),
+            None => out.extend(name_value(&el).map(Symbol::from)),
+        }
+    }
+    out
+}
+
 fn build_index<'pr>(
     table_name: &str,
     columns: Vec<Symbol>,
@@ -618,6 +666,7 @@ fn table_from_create_table(
     let mut hash_limit: Option<Option<u32>> = None;
     let mut id_default = false;
     let mut id_name = "id".to_string();
+    let mut key_columns: Vec<Symbol> = Vec::new();
     let limit_of = |node: &Node<'_>| integer_value(node).and_then(|n| u32::try_from(n).ok());
     for arg in args.arguments().iter().skip(1) {
         let Some(kh) = arg.as_keyword_hash_node() else { continue };
@@ -648,11 +697,22 @@ fn table_from_create_table(
                 "primary_key" => {
                     if let Some(n) = name_value(&assoc.value()) {
                         id_name = n;
+                    } else if assoc.value().as_array_node().is_some() {
+                        // `primary_key: [:a, :b]`: a composite key and,
+                        // as in Rails, no implicit `id`.
+                        key_columns = column_name_list(&assoc.value());
+                        has_id = false;
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    let rest: Vec<Node<'_>> = args.arguments().iter().skip(1).collect();
+    let yugabyte_key = yugabyte_key_columns(rest.iter());
+    if !yugabyte_key.is_empty() {
+        key_columns = yugabyte_key;
     }
 
     let mut columns = Vec::new();
@@ -740,6 +800,23 @@ fn table_from_create_table(
         }
     }
 
+    // A key the options name replaces the implicit one: one column is
+    // flagged, as `PRIMARY KEY (col)` is, and a composite key is kept
+    // whole (`Table.primary_key_columns`), as `structure_sql` keeps it.
+    let mut primary_key_columns = Vec::new();
+    if !key_columns.is_empty() {
+        for col in &mut columns {
+            col.primary_key = false;
+        }
+        if let [only] = key_columns.as_slice() {
+            if let Some(col) = columns.iter_mut().find(|c| c.name == *only) {
+                col.primary_key = true;
+            }
+        } else {
+            primary_key_columns = key_columns;
+        }
+    }
+
     // An index over a column the walk dropped (unsupported type,
     // ledgered above) cannot apply: sqlite refuses the seed at `no such
     // column`. The index goes with the column.
@@ -752,6 +829,7 @@ fn table_from_create_table(
             indexes,
             foreign_keys: vec![],
             virtual_module: None,
+            primary_key_columns,
         },
     ))
 }
@@ -797,6 +875,7 @@ fn virtual_table_from_call(call: &ruby_prism::CallNode<'_>) -> Option<(Symbol, T
             indexes: vec![],
             foreign_keys: vec![],
             virtual_module: Some(crate::schema::VirtualModule { module, args: module_args }),
+            primary_key_columns: Vec::new(),
         },
     ))
 }
@@ -837,7 +916,7 @@ fn view_from_create_view(
             columns,
             indexes: vec![],
             foreign_keys: vec![],
-            virtual_module: None,
+            virtual_module: None, primary_key_columns: Vec::new(),
         },
     ))
 }
@@ -1182,6 +1261,51 @@ mod tests {
             .iter()
             .map(|c| c.name.as_str().to_string())
             .collect()
+    }
+
+    #[test]
+    fn yugabyte_hash_and_cluster_by_name_the_key_and_index_columns() {
+        let schema = fold(&[r#"
+            class CreateHoldouts < ActiveRecord::Migration[8.2]
+              def change
+                create_table(
+                  :holdouts,
+                  id: false,
+                  hash: [:shop_id],
+                  cluster_by: [:reason, :id, { island: :asc }],
+                  tablet_split: 4,
+                ) do |t|
+                  t.uuid(:id, null: false)
+                  t.uuid(:shop_id, null: false)
+                  t.string(:reason, limit: 64, null: false)
+                  t.column(:island, :smallint, null: false)
+                end
+                add_index(:holdouts, hash: [:shop_id], cluster_by: [{ reason: :asc }], unique: true, where: "reason <> ''", name: "by_reason")
+                create_table(:pairs, primary_key: [:a_id, :b_id]) do |t|
+                  t.bigint :a_id
+                  t.bigint :b_id
+                end
+                create_table(:tokens, id: false, hash: [:token]) do |t|
+                  t.string :token
+                end
+              end
+            end
+        "#]);
+        let holdouts = &schema.tables[&Symbol::from("holdouts")];
+        assert_eq!(holdouts.primary_key_columns, ["shop_id", "reason", "id", "island"].map(Symbol::from));
+        assert!(holdouts.columns.iter().all(|c| !c.primary_key), "a composite key flags no single column");
+        assert_eq!(holdouts.indexes.len(), 1);
+        let index = &holdouts.indexes[0];
+        assert_eq!(index.columns, ["shop_id", "reason"].map(Symbol::from));
+        assert!(index.unique);
+        assert_eq!(index.predicate.as_deref(), Some("reason <> ''"));
+
+        assert_eq!(col_names(&schema, "pairs"), ["a_id", "b_id"], "a composite primary_key: has no implicit id");
+        assert_eq!(schema.tables[&Symbol::from("pairs")].primary_key_columns, ["a_id", "b_id"].map(Symbol::from));
+
+        let tokens = &schema.tables[&Symbol::from("tokens")];
+        assert!(tokens.primary_key_columns.is_empty());
+        assert!(tokens.columns.iter().find(|c| c.name.as_str() == "token").is_some_and(|c| c.primary_key));
     }
 
     #[test]

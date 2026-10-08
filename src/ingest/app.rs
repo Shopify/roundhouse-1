@@ -2620,6 +2620,20 @@ end
         let span = crate::span::Span { file, start: dropped.start as u32, end: dropped.end as u32 };
         app.ingest_drops.push(crate::app::IngestDrop { span, message: dropped.message.clone(), construct: None });
     }
+    // Columns an app class macro can retype at load through `attribute`;
+    // their accessors and binds consult the declared type, and the
+    // attribute row types them gradually (`attribute_type_unevaluated`):
+    // what the type casts to is decided when the class loads.
+    let retypable: Vec<Vec<crate::ident::Symbol>> =
+        app.models.iter().map(|m| crate::analyze::retypable_attributes::retypable_attributes(m, &app)).collect();
+    for (model, cols) in app.models.iter_mut().zip(retypable) {
+        for col in &cols {
+            if let Some(ty) = model.attributes.fields.get_mut(col) {
+                *ty = crate::ty::Ty::Untyped;
+            }
+        }
+        model.retypable_attributes = cols;
+    }
     Ok(app)
 }
 

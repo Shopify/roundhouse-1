@@ -691,6 +691,7 @@ pub(super) fn ingest_model_with_enum_constants(
         parent,
         parent_span,
         sti_subclass_names: Vec::new(),
+        retypable_attributes: Vec::new(),
         table: TableRef(Symbol::from(table_name)),
         primary_key,
         attributes,

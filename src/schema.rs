@@ -32,6 +32,13 @@ pub struct Table {
     /// why it lives here rather than in a parallel collection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_module: Option<VirtualModule>,
+    /// A composite primary key's columns in key order (structure.sql's
+    /// `PRIMARY KEY (shop_id, id)`). No column is flagged `primary_key`
+    /// then: a model keys its records on its declared `self.primary_key`,
+    /// and one that declares none is reported (`composite_primary_key`),
+    /// since Rails keys it on every column here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primary_key_columns: Vec<Symbol>,
 }
 
 /// The module and argument list of a `create_virtual_table`. Rendered

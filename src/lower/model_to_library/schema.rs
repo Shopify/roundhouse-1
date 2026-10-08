@@ -100,7 +100,9 @@ pub(super) fn push_schema_methods(
         if model.enums.contains_key(&col.name) {
             methods.push(synth_enum_storage_writer(owner, col));
         }
-        if is_generic_json_col(col, model) {
+        if is_retypable(model, col) {
+            methods.push(synth_retypable_storage_writer(owner, col));
+        } else if is_generic_json_col(col, model) {
             // Hydration writes stored JSON text without dump; the public
             // `<col>=` writer always goes through RoundhouseJsonColumn.dump.
             methods.push(synth_json_storage_writer(owner, col));
@@ -222,6 +224,44 @@ pub(super) fn push_schema_methods(
             params: Vec::new(),
             body: lit_str(value),
             signature: Some(fn_sig(vec![], Ty::Str)),
+            effects: EffectSet::default(),
+            enclosing_class: Some(owner.0.clone()),
+            kind: AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+
+    // def self._retypable_attribute_names — the columns whose compiled
+    // accessors and binds consult a declared type, so the runtime's
+    // `attribute` accepts them (and raises for any other). Only for a
+    // model that has some; Base answers [] for everyone else.
+    if !model.retypable_attributes.is_empty() {
+        let names_ty = Ty::Array { elem: Box::new(Ty::Str) };
+        methods.push(MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            name_span: Span::synthetic(),
+            name: Symbol::from("_retypable_attribute_names"),
+            receiver: MethodReceiver::Class,
+            params: Vec::new(),
+            body: with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Array {
+                        elements: model
+                            .retypable_attributes
+                            .iter()
+                            .map(|c| lit_str(c.as_str().to_string()))
+                            .collect(),
+                        style: ArrayStyle::Brackets,
+                    },
+                ),
+                names_ty.clone(),
+            ),
+            signature: Some(fn_sig(vec![], names_ty)),
             effects: EffectSet::default(),
             enclosing_class: Some(owner.0.clone()),
             kind: AccessorKind::Method,
@@ -779,12 +819,82 @@ fn col_storage_setter(col: &Column) -> Symbol {
 /// Unknown stored enum values remain intact; JSON text skips dump so
 /// already-serialized DB bytes are not double-encoded.
 fn hydration_setter(model: &Model, col: &Column) -> Symbol {
-    if model.enums.contains_key(&col.name) {
+    if is_retypable(model, col) {
+        retypable_storage_writer(col)
+    } else if model.enums.contains_key(&col.name) {
         enum_storage_writer(col)
     } else if is_generic_json_col(col, model) {
         json_storage_writer(col)
     } else {
         col_storage_setter(col)
+    }
+}
+
+/// A column an app macro can retype at load (`Model::retypable_attributes`):
+/// its slot holds the declared type's cast value, so the writer casts,
+/// hydration deserializes and binds serialize through the class's
+/// declared type (`_attribute_cast` / `_attribute_deserialize` /
+/// `_attribute_serialize` in the runtime Base), and it is typed
+/// gradually.
+pub(crate) fn is_retypable(model: &Model, col: &Column) -> bool {
+    model.retypable_attributes.contains(&col.name)
+}
+
+pub(crate) fn retypable_storage_writer(col: &Column) -> Symbol {
+    Symbol::from(format!("_write_{}_from_database", col.name.as_str()))
+}
+
+/// `self.class.<method>("<col>", value)` — one of the runtime Base's
+/// declared-type conversions, typed gradually.
+pub(crate) fn declared_type_call(method: &str, col: &Column, value: Expr) -> Expr {
+    let self_class = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(self_ref()),
+            method: Symbol::from("class"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    );
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(self_class),
+                method: Symbol::from(method),
+                args: vec![lit_str(col.name.as_str().to_string()), value],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        Ty::Untyped,
+    )
+}
+
+/// Hydration of a retypable column: the stored value, deserialized.
+fn synth_retypable_storage_writer(owner: &ClassId, col: &Column) -> MethodDef {
+    let value = Symbol::from("value");
+    let assign = Expr::new(Span::synthetic(), ExprNode::Assign {
+        target: LValue::Ivar { name: col_storage_name(col) },
+        value: declared_type_call("_attribute_deserialize", col, with_ty(var_ref(value.clone()), Ty::Untyped)),
+    });
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: Span::synthetic(),
+        name: retypable_storage_writer(col),
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(value.clone())],
+        body: seq(vec![assign, nil_lit()]),
+        signature: Some(fn_sig(vec![(value, Ty::Untyped)], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: true,
+        block_param: None,
     }
 }
 
@@ -951,7 +1061,13 @@ fn synth_attr_reader(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
     // read back as Date or Time. This shared lowering selects the
     // native seam; the target boundary rejects unsupported Date seams
     // before an emitter can silently substitute a timestamp carrier.
-    let (body, ret_ty) = if let Some(label) = enum_label_read(model, col) {
+    let (body, ret_ty) = if is_retypable(model, col) {
+        // The slot already holds the declared type's cast value.
+        (
+            with_ty(Expr::new(Span::synthetic(), ExprNode::Ivar { name: col.name.clone() }), Ty::Untyped),
+            Ty::Untyped,
+        )
+    } else if let Some(label) = enum_label_read(model, col) {
         (label, Ty::Union { variants: vec![Ty::Str, Ty::Nil] })
     } else if is_temporal_col(col) {
         // Nilable: a stored value can be absent (NULL / unset), so the
@@ -1288,10 +1404,16 @@ fn synth_attr_writer(owner: &ClassId, col: &Column, model: &Model) -> MethodDef 
     // for a temporal column. Schema-less JSON is the exception: its public
     // writer takes the decoded value and serializes it into the String slot.
     // Hydration uses `_write_<col>_json_raw` so DB text never goes through dump.
-    let col_ty = super::ty_of_column_slot(col);
+    // A retypable column's writer casts through the declared type (which
+    // `normalizes` then applies to, as its decorated type does).
+    let retypable = is_retypable(model, col);
+    let col_ty = if retypable { Ty::Untyped } else { super::ty_of_column_slot(col) };
     let value_ty = if is_generic_json_col(col, model) { Ty::Untyped } else { col_ty.clone() };
     let value = with_ty(var_ref(value_param.clone()), value_ty.clone());
-    let rhs = if is_generic_json_col(col, model) {
+    let rhs = if retypable {
+        let cast = declared_type_call("_attribute_cast", col, value);
+        crate::lower::normalizes::normalized_write(model, &col.name, cast.clone()).unwrap_or(cast)
+    } else if is_generic_json_col(col, model) {
         json_dump_value(col, value)
     } else {
         let value = crate::lower::normalizes::normalized_write(model, &col.name, value.clone())
@@ -2410,6 +2532,21 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
             stmts.push(given_value_assign(col, &attrs, enum_label_cast(model, col, lookup.clone()).unwrap_or_else(|| Expr::new(Span::synthetic(), ExprNode::Cast { value: lookup, target_ty: super::ty_of_column_slot(col) }))));
             continue;
         }
+        // A retypable column starts from its schema default as stored
+        // (deserialized, as Rails' FromDatabase default is) or nil, and a
+        // given value goes through the casting writer.
+        if is_retypable(model, col) {
+            let stored = column_default_literal(model, col).unwrap_or_else(nil_lit);
+            stmts.push(Expr::new(Span::synthetic(), ExprNode::Send {
+                recv: Some(self_ref()),
+                method: retypable_storage_writer(col),
+                args: vec![stored],
+                block: None,
+                parenthesized: true,
+            }));
+            stmts.push(given_value_assign(col, &attrs, with_ty(lookup, Ty::Untyped)));
+            continue;
+        }
         // is_id_column reference retained as a feature flag for
         // future per-column override hooks; today every column flows
         // through the same default-lookup shape.
@@ -3307,12 +3444,14 @@ fn synth_index_write(owner: &ClassId, table: &Table, model: &Model) -> MethodDef
             // `self[:role] = "administrator"` — same label problem the
             // attrs-hash writers have, same answer. `self[:settings] =
             // { … }` likewise routes through the has_json seam.
-            let casted_value = crate::lower::has_json::column_assign(
+            let casted_value = is_retypable(model, c)
+                .then(|| declared_type_call("_attribute_cast", c, with_ty(var_ref(value.clone()), Ty::Untyped)))
+                .or_else(|| crate::lower::has_json::column_assign(
                 model,
                 &c.name,
                 var_ref(value.clone()),
                 col_ty.clone(),
-            )
+            ))
             .or_else(|| enum_label_cast(model, c, var_ref(value.clone())))
             .or_else(|| {
                 is_generic_json_col(c, model)
@@ -3772,12 +3911,15 @@ fn synth_update_hash(
         // zero. See `enum_label_cast`.
         // A has_json column takes a whole Hash here (`update!(settings:
         // { … })`) — Rails' per-key cast-and-merge, through the seam.
-        let slot_value = crate::lower::has_json::column_assign(
+        // A retypable column's writer casts through the declared type.
+        let slot_value = is_retypable(model, col)
+            .then(|| with_ty(lookup(&col.name), Ty::Untyped))
+            .or_else(|| crate::lower::has_json::column_assign(
             model,
             &col.name,
             lookup(&col.name),
             slot_ty.clone(),
-        )
+        ))
         .or_else(|| enum_label_cast(model, col, lookup(&col.name)))
         .or_else(|| is_generic_json_col(col, model).then(|| lookup(&col.name)))
         .unwrap_or_else(|| {

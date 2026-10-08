@@ -104,6 +104,12 @@ pub(super) fn through_writer_join(
 /// so a uuid foreign key is never compared with, or reset to, an
 /// integer it can't hold (#90).
 fn fk_sentinel(model: &Model, foreign_key: &Symbol) -> Expr {
+    // A key whose type a declared type object decides (a uuid held as
+    // an Integer) holds nil for "no row", as in Rails: a `0` or `""`
+    // would be serialized through that type into a real key.
+    if model.retypable_attributes.contains(foreign_key) {
+        return nil_lit();
+    }
     let ty = model.attributes.fields.get(foreign_key);
     let is_str = match ty {
         Some(Ty::Str) => true,

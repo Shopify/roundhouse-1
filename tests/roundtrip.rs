@@ -41,7 +41,7 @@ fn tiny_blog_round_trips() {
             ],
             indexes: vec![],
             foreign_keys: vec![],
-            virtual_module: None,
+            virtual_module: None, primary_key_columns: Vec::new(),
         },
     );
     let schema = Schema { tables };
@@ -63,6 +63,7 @@ fn tiny_blog_round_trips() {
         class_attr_defaults: Default::default(),
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
+        retypable_attributes: Vec::new(),
         span: Span::synthetic(),
         visibility_overrides: Vec::new(),
     };

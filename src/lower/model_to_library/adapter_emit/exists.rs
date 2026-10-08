@@ -1,7 +1,7 @@
 //! Exists probes (`_adapter_any?`, `_adapter_exists_by_id?`) — shared
 //! `SELECT 1 … LIMIT 1` MethodDef shell so `adapter_emit` stays under 1k.
 
-use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Param};
+use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, Model, Param};
 use crate::effect::EffectSet;
 use crate::ident::{ClassId, Symbol, TableRef};
 use crate::lower::arel::{
@@ -61,16 +61,17 @@ pub(super) fn synth_adapter_any(owner: &ClassId, table: &Table, schema: &Schema,
     synth_exists_probe(owner, table, schema, dialect, "_adapter_any?", None, vec![], vec![])
 }
 
-pub(super) fn synth_adapter_exists_by_id(owner: &ClassId, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+pub(super) fn synth_adapter_exists_by_id(model: &Model, table: &Table, schema: &Schema, dialect: SqlDialect) -> MethodDef {
+    let owner = &model.name;
     let id = Symbol::from("id");
-    let key = key_ty(table);
+    let key = key_ty(model, table);
     synth_exists_probe(
         owner,
         table,
         schema,
         dialect,
         "_adapter_exists_by_id?",
-        Some(eq_id_param(table, &id)),
+        Some(eq_id_param(model, table, &id)),
         vec![Param::positional(id.clone())],
         vec![(id, key)],
     )

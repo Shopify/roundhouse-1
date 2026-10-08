@@ -1322,7 +1322,12 @@ module ActiveRecord
       end
       h = {}
       rows = ActiveRecord.adapter.select_rows(sql)
-      rows.each { |row| h[row["k"]] = row["n"].to_i }
+      # One own column groups by values read through its declared type.
+      own = @groups.length == 1 && key.start_with?("#{@table}.") ? key.delete_prefix("#{@table}.") : nil
+      rows.each do |row|
+        k = own.nil? ? row["k"] : @model._attribute_deserialize(own, row["k"])
+        h[k] = row["n"].to_i
+      end
       h
     end
 
@@ -1390,7 +1395,7 @@ module ActiveRecord
         return probe_existence(1) > 0
       end
       own_lists
-      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(id)}"
+      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(@model.primary_key, id))}"
       found = probe_existence(1) > 0
       @wheres.pop
       found
@@ -1487,7 +1492,7 @@ module ActiveRecord
       set_sql = if updates.is_a?(Hash)
         parts = []
         updates.each do |key, val|
-          parts.push("#{key} = #{ActiveRecord.adapter.escape_value(val)}")
+          parts.push("#{key} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(key.to_s, val))}")
         end
         parts.join(", ")
       else
@@ -1563,7 +1568,9 @@ module ActiveRecord
       @select_sql = "#{@table}.#{col} AS v"
       rows = ActiveRecord.adapter.select_rows(to_sql)
       @select_sql = prior
-      rows.map { |row| row["v"] }
+      # A column with a declared type reads through it, as Rails' does.
+      name = col.to_s
+      rows.map { |row| @model._attribute_deserialize(name, row["v"]) }
     end
 
     # `pick(col)` — Rails' `limit(1).pluck(col).first`: the single value
@@ -1586,7 +1593,7 @@ module ActiveRecord
       @select_sql = "#{@table}.#{key} AS v"
       rows = ActiveRecord.adapter.select_rows(to_sql)
       @select_sql = prior
-      rows.map { |row| @model._cast_primary_key(row["v"]) }
+      rows.map { |row| @model._primary_key_from_database(row["v"]) }
     end
 
     # `find(id)` — the row with that primary key, RAISING
@@ -1610,7 +1617,7 @@ module ActiveRecord
       key = @model._cast_primary_key(id)
       prior_limit = @limit
       own_lists
-      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(key)}"
+      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(@model._attribute_serialize(@model.primary_key, key))}"
       begin
         @limit = 1
         rows = load_records
@@ -1646,7 +1653,7 @@ module ActiveRecord
         expected = ids.length - prior_offset if !prior_offset.nil? && ids.length - prior_offset < expected
       end
       keys = ids.map { |id| @model._cast_primary_key(id) }
-      sql_ids = keys.map { |key| ActiveRecord.adapter.escape_value(key) }.join(", ")
+      sql_ids = keys.map { |key| ActiveRecord.adapter.escape_value(@model._attribute_serialize(@model.primary_key, key)) }.join(", ")
       own_lists
       @wheres << (keys.empty? ? "1=0" : "#{@table}.#{@model.primary_key} IN (#{sql_ids})")
       begin
@@ -1910,6 +1917,9 @@ module ActiveRecord
 
     def column_predicate(col, val)
       qcol = col.include?(".") ? quote_column_path(col) : "#{@table}.#{quote_column_path(col)}"
+      # A column of this model with a declared type (`attribute`) binds
+      # what the type serializes, as Rails' QueryAttribute does.
+      own = col.include?(".") ? nil : col
       if val.is_a?(Relation)
         # A relation value is Rails' subquery form —
         # `where(story_id: Tagging.where(...).select(:story_id))` →
@@ -1924,6 +1934,7 @@ module ActiveRecord
         # (`where(comment: comments)`, lobsters Vote.comments_flags);
         # scalar elements escape as-is.
         ids = val.map { |x| x.is_a?(Base) ? x.id : x }
+        ids = ids.map { |x| @model._attribute_for_database(own, x) } unless own.nil?
         "#{qcol} IN (#{escape_list(ids)})"
       elsif val.nil?
         "#{qcol} IS NULL"
@@ -1933,9 +1944,9 @@ module ActiveRecord
         # static `v && v.id` narrowing was dropped in favor of this
         # runtime dispatch: hash values from untyped scope params can
         # be a record OR a collection, and only the runtime knows.
-        "#{qcol} = #{ActiveRecord.adapter.escape_value(val.id)}"
+        "#{qcol} = #{ActiveRecord.adapter.escape_value(own.nil? ? val.id : @model._attribute_for_database(own, val.id))}"
       else
-        "#{qcol} = #{ActiveRecord.adapter.escape_value(val)}"
+        "#{qcol} = #{ActiveRecord.adapter.escape_value(own.nil? ? val : @model._attribute_for_database(own, val))}"
       end
     end
 
