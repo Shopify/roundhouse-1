@@ -93,6 +93,7 @@ fn app_inflections_override_the_defaults() {
         singular: vec![("data".into(), "data".into()), ("quotas".into(), "quota".into())],
         plural: vec![("quota".into(), "quotas".into())],
         regex_rules: 0,
+        calls: vec![],
     });
     assert_eq!(naming::singularize("data"), "data", "Mastodon's string rule beats datum");
     assert_eq!(naming::singularize("quotas"), "quota");

@@ -162,6 +162,7 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
                 let mut words = Vec::new();
                 args.iter().for_each(|a| strings(a, &mut words));
                 let literal = args.iter().all(all_literal);
+                let call = (method.as_str().to_string(), words.clone());
                 let applied = match method.as_str() {
                     "irregular" if words.len() == 2 => {
                         out.irregular.push((words[0].clone(), words[1].clone()));
@@ -193,6 +194,7 @@ fn ingest_inflections_file(source: &str, file: &str, out: &mut crate::naming::Ap
                 // What is applied is consumed; a regex rule (or a
                 // declaration with a non-literal word) stays a gap.
                 if applied {
+                    out.calls.push(call);
                     super::initializers::consume(file, e.span.start as usize, e.span.end as usize);
                 }
             }

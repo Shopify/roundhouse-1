@@ -149,6 +149,42 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     ]);
     register_stdlib_class(classes, "Rails", &[("deprecator", deprecation.clone())], &[]);
     register_stdlib_class(classes, "ActiveSupport", &[("deprecator", deprecation.clone())], &[]);
+    // ActiveSupport::Inflector and its Inflections, answered by
+    // runtime/spinel/active_support_inflector.rb (Rails 8.2.0.alpha),
+    // which only the PostgreSQL CRuby tree carries (`runtime_reads`
+    // refuses the read elsewhere). The module `extend self`s, which the
+    // runtime index does not follow, so its methods answer on both sides.
+    // `inflections` with a block answers the block's value.
+    let inflections = class("ActiveSupport::Inflector::Inflections");
+    let uncountables = class("ActiveSupport::Inflector::Inflections::Uncountables");
+    let inflector: Vec<(&str, Ty)> = [
+        "pluralize", "singularize", "camelize", "underscore", "humanize", "upcase_first",
+        "downcase_first", "titleize", "tableize", "classify", "dasherize", "demodulize",
+        "deconstantize", "foreign_key", "parameterize", "transliterate", "ordinal", "ordinalize",
+    ]
+    .into_iter()
+    .map(|m| (m, Ty::Str))
+    .chain([("constantize", Ty::Untyped), ("safe_constantize", Ty::Untyped), ("inflections", Ty::Untyped)])
+    .collect();
+    register_stdlib_class(classes, "ActiveSupport::Inflector", &inflector, &inflector);
+    register_stdlib_class(classes, "ActiveSupport::Inflector::Inflections", &[
+        ("new", inflections.clone()), ("instance", inflections.clone()),
+        ("instance_or_fallback", inflections.clone()), ("all_instances", untyped_arr()),
+    ], &[
+        ("plurals", untyped_arr()), ("singulars", untyped_arr()), ("humans", untyped_arr()),
+        ("uncountables", uncountables.clone()),
+        ("acronyms", Ty::Hash { key: Box::new(Ty::Str), value: Box::new(Ty::Str) }),
+        ("acronym", Ty::Untyped), ("plural", Ty::Untyped), ("singular", Ty::Untyped),
+        ("irregular", Ty::Untyped), ("uncountable", Ty::Untyped), ("human", Ty::Untyped),
+        ("clear", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::Inflector::Inflections::Uncountables", &[
+        ("new", uncountables.clone()),
+    ], &[
+        ("uncountable?", Ty::Bool), ("to_a", Ty::Array { elem: Box::new(Ty::Str) }),
+        ("<<", uncountables.clone()), ("add", uncountables.clone()), ("delete", Ty::Untyped),
+        ("empty?", Ty::Bool), ("each", Ty::Untyped),
+    ]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");

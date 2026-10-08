@@ -38,8 +38,11 @@ class Module
       name = :"#{location}#{method}"
       define_method(name) do |*args, **kwargs, &block|
         # `send`, not `public_send`: Rails delegates to private readers
-        # routinely, and platform_agent's `user_agent` IS private.
-        target = send(to)
+        # routinely, and platform_agent's `user_agent` IS private. An
+        # instance-variable target (`to: :@members`, Inflections'
+        # Uncountables) reads the variable, as Rails' generated
+        # `_ = @members` does.
+        target = to.to_s.start_with?("@") ? instance_variable_get(to) : send(to)
         if target.nil? && allow_nil
           nil
         else

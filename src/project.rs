@@ -3671,6 +3671,34 @@ fn ruby_family_files(
     Ok(files)
 }
 
+/// The app's applied `inflect.*` declarations as the Ruby Rails runs,
+/// against the runtime's ActiveSupport::Inflector; empty when there are
+/// none. A regex rule is not read at ingest (it is reported there as a
+/// gap) and so is not replayed.
+fn inflection_replay(inflections: &crate::naming::AppInflections) -> String {
+    use crate::emit::ruby::expr::ruby_str_literal;
+    if inflections.calls.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# The app's config/initializers inflections, which Rails runs at boot.\n\
+         ActiveSupport::Inflector.inflections(:en) do |inflect|\n",
+    );
+    for (method, words) in &inflections.calls {
+        let words: Vec<String> = words.iter().map(|w| ruby_str_literal(w)).collect();
+        if method == "acronym" {
+            // `acronym` takes one word; ingest flattens a literal list.
+            for word in &words {
+                out.push_str(&format!("  inflect.acronym({word})\n"));
+            }
+        } else {
+            out.push_str(&format!("  inflect.{method}({})\n", words.join(", ")));
+        }
+    }
+    out.push_str("end\n");
+    out
+}
+
 /// Define the constants boot initializers assign at their top level
 /// (`ingest::initializer_constants`) where Rails does: each engine's,
 /// then the app's `config/initializers` run in `load_config_initializers`
@@ -3861,6 +3889,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let tryable = crate::runtime_files::read_to_string("runtime/spinel/active_support_tryable.rb")
         .map_err(|e| format!("read tryable runtime: {e}"))?;
     files.push(("runtime/active_support_tryable.rb".into(), tryable));
+    // ActiveSupport::Inflector (8.2.0.alpha inflector/inflections.rb,
+    // transliterate.rb, methods.rb and the default English rules).
+    let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
+        .map_err(|e| format!("read inflector runtime: {e}"))?;
+    files.push(("runtime/active_support_inflector.rb".into(), inflector));
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
     // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
     for port in ["action_dispatch_session_store", "action_dispatch_show_exceptions"] {
@@ -3938,6 +3971,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # `require \"active_support/core_ext\"` mixes ActiveSupport::Tryable\n\
                  # into Object before any app code: `Object#try`, ported.\n\
                  require_relative \"runtime/active_support_tryable\"\n\
+                 # `require \"active_support\"` loads active_support/inflector and its\n\
+                 # default English rules before any app code.\n\
+                 require_relative \"runtime/active_support_inflector\"\n\
                  # `require \"action_dispatch\"` defines its session stores, constants\n\
                  # and ShowExceptions before any app code.\n\
                  require_relative \"runtime/action_dispatch_session_store\"\n\
@@ -3956,6 +3992,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  require_relative \"runtime/rails_railtie\"\n\
                  require_relative \"runtime/rails_engine\"\n",
             );
+            // The app's `inflect.*` declarations (config/initializers), which
+            // Rails runs at boot: replayed into the port right after it
+            // loads, in registration order, so no caller (nor Core's
+            // memoizing prepend) sees the bare defaults.
+            let inflector = "require_relative \"runtime/active_support_inflector\"\n";
+            let replay = inflection_replay(&crate::naming::app_inflections());
+            if !replay.is_empty() {
+                let at = content.find(inflector).ok_or("PostgreSQL bootstrap: missing inflector require in boot.rb")? + inflector.len();
+                content.insert_str(at, &replay);
+            }
             content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");
             content.push_str(&registrations);
             content.push_str(&programs);
@@ -8576,6 +8622,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_deprecation.rb"
         && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_support_tryable.rb"
+        && p != "runtime/active_support_inflector.rb"
         && p != "runtime/action_dispatch_session_store.rb"
         && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb");
