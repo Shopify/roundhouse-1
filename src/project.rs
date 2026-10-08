@@ -3130,6 +3130,11 @@ fn ruby_family_files(
     // emit and the autoload table each scanned every library class per
     // question, quadratic on the full Core closure.
     let _indexes = emit::ruby::install_lookup_indexes(app);
+    // Each model's GeneratedAttributeMethods split
+    // (`emit::ruby::library::generated_attribute_methods`) synthesizes
+    // its columns' methods over `app.models`; one demand set of their
+    // bodies serves them all, as in the model lowering.
+    let _body_names = crate::lower::model_to_library::schema::share_model_body_names(&app.models, &Default::default());
     let (mut files, test_stems) = spinel_files_with_assertions(app, fixture, assertion_mode)?;
     crate::timings::lap_start();
     if matches!(flavor, RubyFlavor::CRuby) {
