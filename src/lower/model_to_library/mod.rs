@@ -33,6 +33,7 @@ pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub(crate) mod macro_replay;
 pub(crate) mod transaction_callbacks;
+pub(crate) mod private_constant;
 pub use macro_replay::replay_model_macros;
 pub mod row;
 
@@ -748,6 +749,7 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
         app.models.iter().flat_map(|model| unclaimed_unknowns(model, app)).collect();
     all.extend(unclaimed_sti_subclass_calls(app));
     all.extend(app.models.iter().filter_map(|model| user_validate_conflict(model, &app.models)));
+    all.extend(private_constant::scoped_reads(app));
     // A concern's statement is spliced into every includer: one row per
     // statement, naming the first includer and counting the rest.
     let mut first: std::collections::BTreeMap<(u32, u32, u32), (usize, usize)> = Default::default();
@@ -884,6 +886,28 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // lowered class by `model_class` and replayed through the
         // runtime port (`emit::ruby::library::model_callback_calls`).
         if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
+            continue;
+        }
+        // `private_constant :NAME` of a constant the body defines: not
+        // run (the lowered program reads constants through the class);
+        // each scoped read Ruby would refuse is an error instead
+        // (`private_constant::scoped_reads`). One naming a constant the
+        // body lacks raises NameError at load.
+        if let Some(names) = private_constant::marked_names(expr) {
+            let missing = private_constant::undefined(model, app, &names);
+            if missing.is_empty() {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "private_constant",
+                format!(
+                    "on `{}`: {} not defined in the class body, so Ruby raises NameError when the class loads",
+                    model.name.0.as_str(),
+                    missing.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                ),
+            ));
             continue;
         }
         // A class macro a gem runtime port's mixin gives the model
