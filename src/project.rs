@@ -4089,6 +4089,11 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let active_model = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_active_model.rb")
         .map_err(|e| format!("read Active Record ActiveModel runtime: {e}"))?;
     files.push(("runtime/active_record_active_model.rb".into(), active_model));
+    // ActiveSupport::StringInquirer (activesupport 8.2.0.alpha
+    // string_inquirer.rb), verbatim.
+    let inquirer = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inquirer.rb")
+        .map_err(|e| format!("read ActiveSupport::StringInquirer runtime: {e}"))?;
+    files.push(("runtime/active_support_string_inquirer.rb".into(), inquirer));
     // ActiveModel::Validations builds on ActiveSupport::Callbacks (with
     // its DescendantsTracker), the Validator bases and OptionMerger
     // (`with_options`), which it requires, and translates its messages
@@ -4220,12 +4225,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // Inflector: before any app file or gem source names them.
             let at = at + "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n".len();
             let i18n = if carries_i18n { "require_relative \"active_support_i18n\"\n" } else { "" };
-            // Then ActiveRecord::Base's ActiveModel ancestry over them.
+            // Then ActiveRecord::Base's ActiveModel ancestry over them, and
+            // ActiveSupport::StringInquirer.
             let ports: String = std::iter::once(i18n.to_string())
                 .chain(
                     std::iter::once("active_support_string_inflections")
                         .chain(active_model_ports.iter().copied())
-                        .chain(std::iter::once("active_record_active_model"))
+                        .chain(["active_record_active_model", "active_support_string_inquirer"])
                         .map(|port| format!("require_relative \"{port}\"\n")),
                 )
                 .collect();

@@ -50,6 +50,9 @@ native_script = <<~RUBY
   require #{File.join(__dir__, "rails_oracle").inspect}
   RailsOracle.activate("activesupport", "activemodel", "activerecord")
   require "active_record"
+  # Rails puts the app's lib/ on $LOAD_PATH (railties engine.rb, paths["lib"]),
+  # so an initializer's `require "x/y"` reads lib/x/y.rb.
+  $LOAD_PATH.unshift(#{File.join(app_root, "lib").inspect})
   ActiveRecord::Base.establish_connection(#{{ adapter: "postgresql" }.merge(endpoint.compact).inspect})
   #{LOADS.map { |m| "require #{File.join(app_root, m).inspect}" }.join("\n")}
   puts #{PROBE}.lines
