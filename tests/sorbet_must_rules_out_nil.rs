@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use roundhouse::analyze::{diagnose, Analyzer, DiagnosticKind};
 use roundhouse::ingest::ingest_app_from_tree;
 
-fn failed_sends(body: &str) -> Vec<(String, String)> {
+fn analyzed(body: &str) -> roundhouse::App {
     let files: [(&str, &str); 5] = [
         (
             "db/schema.rb",
@@ -28,6 +28,11 @@ fn failed_sends(body: &str) -> Vec<(String, String)> {
         .collect();
     let mut app = ingest_app_from_tree(tree).expect("ingest");
     Analyzer::new(&app).analyze(&mut app);
+    app
+}
+
+fn failed_sends(body: &str) -> Vec<(String, String)> {
+    let app = analyzed(body);
     let mut out: Vec<(String, String)> = diagnose(&app)
         .into_iter()
         .filter_map(|d| match d.kind {
@@ -40,6 +45,28 @@ fn failed_sends(body: &str) -> Vec<(String, String)> {
         .collect();
     out.sort();
     out
+}
+
+/// The type of the value a refused `T.must_because` checks: the receiver
+/// of the `not_nil!` that stands for it in the action body.
+fn refused_check_receiver(app: &roundhouse::App) -> String {
+    fn find(expr: &roundhouse::Expr) -> Option<String> {
+        if let roundhouse::expr::ExprNode::Send { recv: Some(recv), method, .. } = &*expr.node {
+            if method.as_str() == "not_nil!" {
+                return Some(format!("{:?}", recv.ty));
+            }
+        }
+        let mut found = None;
+        expr.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = find(child);
+            }
+        });
+        found
+    }
+    let controller = app.controllers.iter().find(|c| c.name.0.as_str() == "CartController").expect("CartController");
+    let show = controller.actions().find(|a| a.name.as_str() == "show").expect("show");
+    find(&show.body).expect("not_nil!")
 }
 
 /// The receiver type each failure names.
@@ -87,7 +114,12 @@ fn t_must_because_without_a_plain_reason_block_is_refused() {
     ] {
         let failed = failed_sends(&action(line));
         assert!(failed.iter().any(|(construct, detail)| construct == "non-nil assertion" && detail.contains("parameterless literal block")), "{line}: {failed:?}");
-        assert!(failed.iter().any(|(_, ty)| ty.contains("Nil")), "{line}: {failed:?}");
+        // The refusal is the site's one row: the `not_nil!` standing for
+        // the refused check is no second "no known method" failure.
+        assert_eq!(failed.len(), 1, "{line}: {failed:?}");
+        // Nil is not ruled out: the refused check's value still admits it.
+        let receiver = refused_check_receiver(&analyzed(&action(line)));
+        assert!(receiver.contains("Nil"), "{line}: {receiver}");
     }
 }
 
