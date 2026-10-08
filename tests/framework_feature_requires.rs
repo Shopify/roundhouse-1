@@ -179,10 +179,12 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
         let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
-    for method in ["draw", "url_helpers", "recognize_path", "url_helpers"] {
-        let line = format!("routes: NotImplementedError: roundhouse: error[engine_routes_not_drawn]: Refused::Engine.routes.{method}: an engine's route set is recorded, never drawn");
+    assert!(out.contains("routes: NotImplementedError: error[route_set_not_drawn]: the routes block at "), "{out}");
+    for method in ["url_helpers", "recognize_path"] {
+        let line = format!("routes: NotImplementedError: error[route_set_not_drawn]: ActionDispatch::Routing::RouteSet#{method} needs a drawn route set");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
+    assert_eq!(out.matches("RouteSet#url_helpers needs a drawn route set").count(), 2, "{out}");
     assert_eq!(out.matches("routes: ").count(), 4, "{out}");
     let features = tree.join("runtime/features");
     let read = |feature: &str| std::fs::read_to_string(features.join(format!("{feature}.rb"))).unwrap_or_else(|e| panic!("{feature}: {e}"));

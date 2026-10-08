@@ -147,3 +147,83 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
     );
     assert!(stderr.contains("roundhouse: 1 railtie and engine initializer(s), hook(s) and body statement(s) did not run"), "{stderr}");
 }
+
+/// An engine's `routes do … end` in its class body (graphql 2.6.11's
+/// `Graphql::Dashboard`, which Core loads through `require "graphql"`):
+/// railties' `Engine#routes` appends the block to the engine's
+/// ActionDispatch RouteSet, as native Rails 8.2 does (the lines below are
+/// what it prints for the same engine). The tree's routes are compiled,
+/// so `add_routing_paths`, where Rails would draw the set, names each
+/// block instead, and boot goes on.
+const ROUTED_ENGINE: &str = r#"require "rails"
+
+module Dash
+  class Engine < Rails::Engine
+    engine_name "dash"
+    routes do
+      root "landings#show"
+    end
+    routes { get "x", to: "y#z" }
+  end
+end
+"#;
+
+#[test]
+fn an_engine_body_appends_its_routes_blocks_as_rails_does_and_boot_names_them() {
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "database_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_engine_routes\n")
+        .write("lib/dash/engine.rb", ROUTED_ENGINE)
+        .emit(BuildTarget::Ruby);
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args([
+            "-e",
+            "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
+             require_relative 'runtime/rails'\n\
+             Rails.env_name = 'test'\n\
+             require_relative 'runtime/rails_railtie'\n\
+             require_relative 'runtime/rails_engine'\n\
+             require_relative 'runtime/active_support_deprecation'\n\
+             require_relative 'app/models'\n\
+             Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n\
+             r = Dash::Engine.routes\n\
+             puts r.class.name\n\
+             puts r.instance_variable_get(:@append).size\n\
+             puts Dash::Engine.instance.routes?.equal?(r)\n\
+             puts [r.relative_url_root.inspect, r.api_only?.inspect, r.default_scope.inspect, r.draw_paths.inspect, r.default_url_options.inspect].join(' ')\n\
+             puts Dash::Engine.config.route_set_class.name\n\
+             puts Dash::Engine.routes.equal?(r)\n\
+             begin\n\
+               ActionDispatch::Routing::RouteSet.new.draw { root 'a#b' }\n\
+             rescue NotImplementedError => e\n\
+               puts e.message[/\\Aerror\\[route_set_not_drawn\\]/]\n\
+             end\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout,
+        "ActionDispatch::Routing::RouteSet\n\
+         2\n\
+         true\n\
+         nil false nil [] {}\n\
+         ActionDispatch::Routing::RouteSet\n\
+         true\n\
+         error[route_set_not_drawn]\n",
+        "{stderr}"
+    );
+    assert!(!stderr.contains("error[railtie_body_statement_not_run]: "), "{stderr}");
+    let named = stderr
+        .lines()
+        .find(|l| l.contains("Dash::Engine initializer :add_routing_paths did not run: NotImplementedError: error[route_set_not_drawn]: the routes block at "))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(named.contains("app/models/dash/engine.rb:"), "{named}");
+    assert!(stderr.contains("roundhouse: 1 railtie and engine initializer(s), hook(s) and body statement(s) did not run"), "{stderr}");
+}

@@ -200,6 +200,11 @@ pub(crate) struct ClassSide<'a> {
     /// The body calls whose `attribute`/`query_constraints` the model's
     /// compiled columns answer (`Model::claimed_body_calls`).
     claimed: &'a [crate::span::Span],
+    /// The class-method modules every model inherits from
+    /// ActiveRecord::Base's boot includes, with the include
+    /// ([`base_include_class_modules`]); read when a call is not
+    /// answered nearer.
+    base: std::cell::OnceCell<Vec<(&'a LibraryClass, &'a LibraryClass)>>,
 }
 
 /// The body statements of a class, whatever the pass has made of them.
@@ -277,7 +282,7 @@ impl<'a> ClassSide<'a> {
                 _ => break,
             }
         }
-        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[] };
+        let mut side = Self { owner, app, own, chain, extended: Vec::new(), claimed: &[], base: std::cell::OnceCell::new() };
         let mut extended = Vec::new();
         let ancestor_bodies: Vec<&Expr> = side.chain.iter().flat_map(|m| body_statements(m)).collect();
         for call in body.into_iter().chain(ancestor_bodies) {
@@ -346,6 +351,19 @@ impl<'a> ClassSide<'a> {
             .or_else(|| {
                 self.extended.iter().find_map(|m| self.module_method(m, name, &mut Vec::new()).map(|d| (d, Some(*m))))
             })
+            .or_else(|| {
+                self.base_modules().iter().find_map(|(m, _)| self.module_method(m, name, &mut Vec::new()).map(|d| (d, Some(*m))))
+            })
+    }
+
+    fn base_modules(&self) -> &[(&'a LibraryClass, &'a LibraryClass)] {
+        self.base.get_or_init(|| base_include_class_modules(self.app))
+    }
+
+    /// The boot include of ActiveRecord::Base that gives class-method
+    /// module `m` to every model, if one does.
+    fn base_include_of(&self, m: &LibraryClass) -> Option<&'a LibraryClass> {
+        self.base_modules().iter().find(|(provider, _)| provider.name == m.name).map(|(_, include)| *include)
     }
 
     /// The verdict on `call`, a body statement, when it is a bare or
@@ -426,6 +444,147 @@ impl<'a> ClassSide<'a> {
     }
 }
 
+/// The class-method modules every model inherits from ActiveRecord::Base's
+/// boot includes (`App::framework_base_includes`), each with its include,
+/// in include order: what the include's `self.included(base)` hook
+/// extends onto the base (`base.extend(ClassMethods)`, shopify-money's
+/// MoneyColumn::ActiveRecordHooks), and an ActiveSupport::Concern's
+/// `ClassMethods`. A constant resolves from the include's namespace
+/// outwards; gem modules count, as the tree carries their source.
+pub(crate) fn base_include_class_modules(app: &crate::App) -> Vec<(&LibraryClass, &LibraryClass)> {
+    if app.framework_base_includes.is_empty() {
+        return Vec::new();
+    }
+    let includes: Vec<&LibraryClass> = app
+        .framework_base_includes
+        .iter()
+        .filter_map(|id| app.library_classes.iter().find(|c| c.is_module && &c.name == id))
+        .collect();
+    // Per include, the candidate names of each module it gives, nearest
+    // scope first.
+    let mut wanted: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, m) in includes.iter().enumerate() {
+        let scope: Vec<&str> = m.name.0.as_str().split("::").collect();
+        let candidates = |written: &str| -> Vec<String> {
+            if let Some(rooted) = written.strip_prefix("::") {
+                return vec![rooted.to_string()];
+            }
+            (0..=scope.len()).rev().map(|n| if n == 0 { written.to_string() } else { format!("{}::{written}", scope[..n].join("::")) }).collect()
+        };
+        for written in included_hook_extends(m) {
+            wanted.push((i, candidates(&written)));
+        }
+        let concern = m.unknown_calls.iter().any(|c| {
+            extend_args(c).is_some_and(|args| {
+                args.iter().any(|a| matches!(&*a.node, ExprNode::Const { path } if path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).eq(["ActiveSupport", "Concern"])))
+            })
+        });
+        if concern {
+            wanted.push((i, vec![format!("{}::ClassMethods", m.name.0.as_str())]));
+        }
+    }
+    let mut out: Vec<(&LibraryClass, &LibraryClass)> = Vec::new();
+    for (i, names) in wanted {
+        let found = names.iter().find_map(|n| app.library_classes.iter().find(|c| c.is_module && c.name.0.as_str() == n));
+        if let Some(provider) = found {
+            if !out.iter().any(|(p, _)| p.name == provider.name) {
+                out.push((provider, includes[i]));
+            }
+        }
+    }
+    out
+}
+
+/// The modules `m`'s `self.included(base)` hook extends onto `base`, as
+/// written.
+fn included_hook_extends(m: &LibraryClass) -> Vec<String> {
+    let Some(hook) = m.methods.iter().find(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == "included") else {
+        return Vec::new();
+    };
+    let Some(base) = hook.params.first().map(|p| p.name.as_str().to_string()) else { return Vec::new() };
+    let mut out = Vec::new();
+    fn walk(e: &Expr, base: &str, out: &mut Vec<String>) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node {
+            if method.as_str() == "extend" && matches!(&*r.node, ExprNode::Var { name, .. } if name.as_str() == base) {
+                for a in args {
+                    if let ExprNode::Const { path } = &*a.node {
+                        let rooted = path.first().is_some_and(|s| s.as_str().is_empty());
+                        let joined = path.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("::");
+                        out.push(if rooted { format!("::{joined}") } else { joined });
+                    }
+                }
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, base, out));
+    }
+    walk(&hook.body, &base, &mut out);
+    out
+}
+
+/// Ruby's own instance methods Ruby itself calls (`dup` runs
+/// `initialize_dup`): an include's override of one runs on the emitted
+/// records as it does natively.
+const RUBY_OBJECT_HOOKS: &[&str] = &[
+    "initialize_dup", "initialize_clone", "initialize_copy", "inspect", "to_s", "==", "eql?", "hash",
+    "respond_to_missing?", "method_missing", "freeze", "dup", "clone", "instance_variables",
+];
+
+/// The runtime base's own instance methods (runtime/ruby/active_record/base.rb).
+fn runtime_base_methods() -> &'static crate::det::HashSet<String> {
+    static METHODS: std::sync::OnceLock<crate::det::HashSet<String>> = std::sync::OnceLock::new();
+    METHODS.get_or_init(|| {
+        crate::runtime_src::parse_methods(include_str!("../../../runtime/ruby/active_record/base.rb"))
+            .expect("framework Base method bodies must ingest")
+            .into_iter()
+            .filter(|m| m.receiver == MethodReceiver::Instance)
+            .map(|m| m.name.as_str().to_string())
+            .collect()
+    })
+}
+
+/// What a boot include of ActiveRecord::Base overrides that the runtime
+/// base does not run: each instance method of `include` that calls
+/// `super` (so it wraps a framework method) and that the runtime base
+/// either defines in the class itself, ahead of any included module, so
+/// the override never runs, or neither defines nor calls, so nothing
+/// runs it and its `super` has no target. Ruby's own hooks
+/// ([`RUBY_OBJECT_HOOKS`]) run as natively.
+pub(crate) fn base_include_gaps(include: &LibraryClass) -> Vec<String> {
+    fn calls_super(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Super { .. }) {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || calls_super(c));
+        found
+    }
+    let base = runtime_base_methods();
+    let (mut shadowed, mut never) = (Vec::new(), Vec::new());
+    for def in include.methods.iter().filter(|d| d.receiver == MethodReceiver::Instance && calls_super(&d.body)) {
+        let name = def.name.as_str();
+        if RUBY_OBJECT_HOOKS.contains(&name) {
+            continue;
+        }
+        let list = if base.contains(name) { &mut shadowed } else { &mut never };
+        if !list.iter().any(|n: &String| n == name) {
+            list.push(name.to_string());
+        }
+    }
+    let quote = |names: &[String]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+    let mut out = Vec::new();
+    if !never.is_empty() {
+        out.push(format!("{} (the runtime base neither defines nor calls them, so they never run)", quote(&never)));
+    }
+    if !shadowed.is_empty() {
+        out.push(format!(
+            "{} (the runtime base defines its own in the class, ahead of an included module, so the override never runs)",
+            quote(&shadowed)
+        ));
+    }
+    out
+}
+
 struct Walk<'s, 'a> {
     side: &'s ClassSide<'a>,
     /// Macros already entered (recursion stops there).
@@ -463,6 +622,17 @@ impl<'s, 'a> Walk<'s, 'a> {
     /// A macro given by an extended module runs only if the `extend` is
     /// replayed.
     fn module_extended(&mut self, m: &'a LibraryClass, name: &str) -> Result<(), String> {
+        if let Some(include) = self.side.base_include_of(m) {
+            let gaps = base_include_gaps(include);
+            if !gaps.is_empty() {
+                return Err(format!(
+                    "`{name}` comes from `{}`, which `{}` extends onto ActiveRecord::Base when boot includes it there, and the runtime base does not run what that include overrides: {}",
+                    m.name.0.as_str(),
+                    include.name.0.as_str(),
+                    gaps.join("; ")
+                ));
+            }
+        }
         match self.side.extend_verdict(m, &mut self.in_progress.clone()) {
             MacroVerdict::Replay => Ok(()),
             MacroVerdict::Refuse(reason) => Err(format!(

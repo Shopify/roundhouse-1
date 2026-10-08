@@ -48,6 +48,7 @@ use super::util::{class_name_path, constant_id_str, flatten_statements, module_n
 thread_local! {
     static CONSUMED: RefCell<HashMap<String, Vec<(usize, usize)>>> = RefCell::new(HashMap::default());
     static REFUSED: RefCell<Vec<Refusal>> = const { RefCell::new(Vec::new()) };
+    static DEFINED: RefCell<Vec<(String, usize, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A statement a reader recognized and did not apply, with the reason.
@@ -63,6 +64,20 @@ struct Refusal {
 pub fn reset() {
     CONSUMED.with(|c| c.borrow_mut().clear());
     REFUSED.with(|r| r.borrow_mut().clear());
+    DEFINED.with(|d| d.borrow_mut().clear());
+}
+
+/// Record that the top-level `module`/`class` statement at `start` of
+/// `file` defines `name`, a library class the tree carries
+/// (`app::keep_initializer_defined`): `initializer_programs` loads it
+/// there, where Rails runs the definition.
+pub(super) fn define(file: &str, start: usize, name: &str) {
+    DEFINED.with(|d| d.borrow_mut().push((file.to_string(), start, name.to_string())));
+}
+
+/// The constant [`define`] recorded for the statement at `start` of `file`.
+pub(super) fn defined_at(file: &str, start: usize) -> Option<String> {
+    DEFINED.with(|d| d.borrow().iter().find(|(f, s, _)| f == file && *s == start).map(|(_, _, n)| n.clone()))
 }
 
 /// Record that a reader recognized the statement at `start..end` of
