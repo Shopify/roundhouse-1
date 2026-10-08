@@ -5838,6 +5838,7 @@ impl Analyzer {
         let module_ids: crate::det::HashSet<&ClassId> =
             app.library_classes.iter().filter(|lc| lc.is_module).map(|lc| &lc.name).collect();
         for (id, modules) in wanted {
+            self.classes.entry(id.clone()).or_default().extends = modules.clone();
             let mut queue = modules;
             let mut seen: BTreeSet<ClassId> = queue.iter().cloned().collect();
             let mut qi = 0;

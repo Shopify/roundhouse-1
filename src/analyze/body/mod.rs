@@ -248,6 +248,10 @@ pub struct ClassInfo {
     /// class's own methods and before walking the parent. Empty for
     /// most classes.
     pub includes: Vec<crate::ident::ClassId>,
+    /// Modeled modules the class body `extend`s, in source order: its
+    /// singleton's ancestors, where a `class << self` body looks a
+    /// constant up after its lexical scopes.
+    pub extends: Vec<crate::ident::ClassId>,
     /// Declared by a gem's RBI rather than by the app or the catalog
     /// (`crate::gem_boundary`). Its own table is the gem's whole
     /// declared surface, so a miss on the class itself is a real miss --
@@ -526,6 +530,55 @@ impl<'a> BodyTyper<'a> {
             }
         }
         None
+    }
+
+    /// In a `class << self` body (Rubydex's innermost scope is the
+    /// singleton, `Contact::<Contact>`) Ruby looks a constant up in the
+    /// singleton's ancestors: the modules the class extends, the last
+    /// first. Core's `CustomerApiSimulatedResponse::CompanyContact` reads
+    /// `TIME_BEFORE` from `extend Checkouts::One::SimulatedCheckoutService`
+    /// in a singleton that also includes a module Rubydex cannot see.
+    /// The full name found, and the source declaration when it is a value
+    /// (a class nested in the module has none).
+    fn extended_constant(&self, span: crate::span::Span, path: &[Symbol]) -> Option<(ClassId, Option<DeclarationId>)> {
+        let resolver = self.const_resolver.as_ref()?;
+        let innermost = resolver.unresolved_nesting(span, path).first()?;
+        if !innermost.rsplit("::").next()?.starts_with('<') {
+            return None;
+        }
+        let attached = innermost.split("::").filter(|s| !s.starts_with('<')).collect::<Vec<_>>().join("::");
+        let info = self.classes().get(&ClassId(Symbol::from(attached.as_str())))?;
+        let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
+        let mut seen = crate::det::HashSet::default();
+        info.extends.iter().rev().find_map(|module| self.module_constant(resolver, module, &written, &mut seen))
+    }
+
+    /// `written` under `module` or, Ruby's order, the modules it includes
+    /// (the last first).
+    fn module_constant(
+        &self,
+        resolver: &ConstResolver,
+        module: &ClassId,
+        written: &str,
+        seen: &mut crate::det::HashSet<ClassId>,
+    ) -> Option<(ClassId, Option<DeclarationId>)> {
+        if !seen.insert(module.clone()) {
+            return None;
+        }
+        // A later pass reads the path this one qualified.
+        let full = match written.strip_prefix(module.0.as_str()) {
+            Some(rest) if rest.starts_with("::") => written.to_string(),
+            _ => format!("{}::{written}", module.0),
+        };
+        if let Some(declaration) = resolver.source_constant(&full) {
+            return Some((ClassId(Symbol::from(full.as_str())), Some(declaration)));
+        }
+        let id = ClassId(Symbol::from(full.as_str()));
+        if self.classes().contains_key(&id) {
+            return Some((id, None));
+        }
+        let includes = self.classes().get(module)?.includes.clone();
+        includes.iter().rev().find_map(|inner| self.module_constant(resolver, inner, written, seen))
     }
 
     fn included_constant_owner(&self, includes: &[ClassId], name: &Symbol, depth: u8) -> Option<ClassId> {
@@ -1224,7 +1277,16 @@ impl<'a> BodyTyper<'a> {
                     // `RequestMetrics`, `Result` beside `include
                     // Shopify::Adt`). Read at its full name.
                     Some(None) => {
-                        let full = self.lexical_external_constant(expr_span, path).or_else(|| {
+                        let lexical = self.lexical_external_constant(expr_span, path);
+                        let extended = if lexical.is_none() { self.extended_constant(expr_span, path) } else { None };
+                        if let Some((full, declaration)) = extended {
+                            qualify_resolved_path(path, &full);
+                            match declaration {
+                                Some(declaration) => self.typed_constant(&declaration).cloned().unwrap_or_else(unknown),
+                                None => exact_modeled_class(path),
+                            }
+                        } else {
+                        let full = lexical.or_else(|| {
                             let written = path.iter().map(Symbol::as_str).collect::<Vec<_>>().join("::");
                             self.inherited_constant_owner(ctx, path.first()?)
                                 .map(|owner| ClassId(Symbol::from(format!("{}::{written}", owner.0).as_str())))
@@ -1233,6 +1295,7 @@ impl<'a> BodyTyper<'a> {
                             qualify_resolved_path(path, &full);
                         }
                         exact_modeled_class(path)
+                        }
                     }
                     // A borrowed span is not evidence of a written constant
                     // only when the producer marked its generated origin.
