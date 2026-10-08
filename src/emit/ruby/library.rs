@@ -1648,6 +1648,16 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             || crate::lower::scope_chain::mentions_model_chain_start(body, &models)
             || crate::lower::scope_chain::mentions_plain_subclass_chain_start(body, &plain_subclasses);
     });
+    // …and so does a bare chain root in a plain subclass's own class
+    // method (`def self.recent; order(:id); end` in `BigAsset < Asset`).
+    wants_model_chain = wants_model_chain
+        || lcs.iter().any(|lc| {
+            plain_subclasses.contains_key(&lc.name)
+                && lc.methods.iter().any(|m| {
+                    m.receiver == MethodReceiver::Class
+                        && crate::lower::scope_chain::mentions_bare_chain_start(&m.body)
+                })
+        });
     // …and an association read continuing into relation surface
     // (`@user.notifications.offset(n)`) needs the seed whether or not
     // the app declares a single scope: without this the whole pass was
@@ -1860,8 +1870,19 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             if m.name.as_str().starts_with("__scope_") {
                 continue;
             }
+            // A plain (non-STI) model subclass's own class methods root
+            // on the subclass itself: `def self.recent; order(:id); end`
+            // in `BigAsset < Asset` is `BigAsset.order(:id)`, rows
+            // hydrated as BigAsset. scope_chain maps it to the parent
+            // model for scopes and columns.
             let class_self = (m.receiver == MethodReceiver::Class)
-                .then(|| if is_model { Some(lc.name.clone()) } else { concern_owner.clone() })
+                .then(|| {
+                    if is_model || plain_subclasses.contains_key(&lc.name) {
+                        Some(lc.name.clone())
+                    } else {
+                        concern_owner.clone()
+                    }
+                })
                 .flatten();
             // A model's own INSTANCE methods know their self model too —
             // `self.<has_many>.<scope>` there seeds a Relation from the

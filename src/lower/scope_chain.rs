@@ -2702,6 +2702,11 @@ fn guard_on_unique_keys(
 }
 
 fn relation_new(span: crate::span::Span, model: &ClassId) -> Expr {
+    relation_new_of(span, const_expr(span, model))
+}
+
+/// `ActiveRecord::Relation.new(<klass>)` for any class expression.
+fn relation_new_of(span: crate::span::Span, klass: Expr) -> Expr {
     let recv = syn(
         span,
         ExprNode::Const { path: vec![Symbol::from("ActiveRecord"), Symbol::from("Relation")] },
@@ -2711,7 +2716,7 @@ fn relation_new(span: crate::span::Span, model: &ClassId) -> Expr {
         ExprNode::Send {
             recv: Some(recv),
             method: Symbol::from("new"),
-            args: vec![const_expr(span, model)],
+            args: vec![klass],
             block: None,
             parenthesized: true,
         },
@@ -3291,8 +3296,12 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
     // `self.where(key: key)` seeds exactly like `where(key: key)`).
     let recv = match recv {
         Some(r) if matches!(&*r.node, ExprNode::SelfRef) => {
-            let self_model =
-                ctx.scope_body.as_ref().map(|(m, _)| m).or(ctx.class_self.as_ref());
+            // A plain subclass's own class method asks its model's
+            // scopes (`BigAsset` declares none; `Asset` does).
+            let self_model = ctx.scope_body.as_ref().map(|(m, _)| m).or(ctx
+                .class_self
+                .as_ref()
+                .map(|c| ctx.plain_subclasses.get(c).unwrap_or(c)));
             match self_model {
                 Some(m)
                     if is_relation_chain_method(method.as_str())
@@ -3386,30 +3395,49 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                     return None;
                 }
             }
-            if let Some(self_model) = ctx.class_self.clone() {
+            if let Some(self_class) = ctx.class_self.clone() {
                 // Implicit-self query root in a model's own class method:
                 // `all` IS a fresh relation; a bare scope call is the
                 // class-level form; a bare chain method seeds a new
                 // relation (there's no `__rel` param here to thread).
+                // In a plain subclass's own class method (`BigAsset <
+                // Asset; def self.recent; order(:id); end`) the relation
+                // is on the receiving class — `self`, so `HugeAsset <
+                // BigAsset` inheriting `recent` loads HugeAssets, as
+                // Rails' `Querying` does — while scopes, columns and the
+                // returned chain model stay the parent model's.
+                let subclass_model = ctx.plain_subclasses.get(&self_class).cloned();
+                let on_self = subclass_model.is_some();
+                let self_model = subclass_model.unwrap_or(self_class.clone());
+                let seed = || {
+                    if on_self {
+                        relation_new_of(span, syn(span, ExprNode::SelfRef))
+                    } else {
+                        relation_new(span, &self_class)
+                    }
+                };
                 if method.as_str() == "all" && args.is_empty() && block.is_none() {
-                    *expr = relation_new(span, &self_model);
+                    *expr = seed();
                     return Some(self_model);
                 }
                 if ctx.scope_of(&self_model, &method) {
-                    *expr =
-                        put(span, Some(const_expr(span, &self_model)), method, args, block, true);
+                    let recv = if on_self {
+                        syn(span, ExprNode::SelfRef)
+                    } else {
+                        const_expr(span, &self_class)
+                    };
+                    *expr = put(span, Some(recv), method, args, block, true);
                     return Some(self_model);
                 }
                 if is_relation_chain_method(method.as_str()) {
                     let _ = lower_relation_args(&self_model, &method, &mut args, ctx);
-                    let seed = relation_new(span, &self_model);
-                    *expr = put(span, Some(seed), method, args, block, parenthesized);
+                    *expr = put(span, Some(seed()), method, args, block, parenthesized);
                     return Some(self_model);
                 }
                 // A bare `first(n)` / `last(n)` there: the same counted
                 // terminal as `Model.first(n)` below.
                 if let Some(counted) = counted_terminal(&method, &args, block.as_ref()) {
-                    let seed = relation_new(span, &self_model);
+                    let seed = seed();
                     *expr = put(span, Some(seed), counted, args, block, parenthesized);
                     return None;
                 }
