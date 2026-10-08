@@ -114,6 +114,41 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     register_stdlib_class(classes, "Rails", &[
         ("backtrace_cleaner", class("Rails::BacktraceCleaner")),
     ], &[]);
+    // ActiveSupport::Deprecation and its Deprecators collection,
+    // `ActiveSupport.deprecator` and `Rails.deprecator`, answered by
+    // runtime/spinel/active_support_deprecation.rb (Rails 8.2.0.alpha),
+    // which only the PostgreSQL CRuby tree carries (`runtime_reads`
+    // refuses the read elsewhere). The instance methods come from the
+    // Behavior/Reporting/Disallowed modules the class includes, which
+    // the runtime index does not follow. `warn` answers the full message
+    // or nil when silenced; a block-taking method answers its block.
+    let deprecation = class("ActiveSupport::Deprecation");
+    let deprecators = class("ActiveSupport::Deprecation::Deprecators");
+    register_stdlib_class(classes, "ActiveSupport::Deprecation", &[
+        ("new", deprecation.clone()), ("_instance", deprecation.clone()),
+    ], &[
+        ("warn", Ty::Union { variants: vec![Ty::Str, Ty::Nil] }),
+        ("deprecation_warning", Ty::Str),
+        ("silence", Ty::Untyped), ("allow", Ty::Untyped),
+        ("begin_silence", Ty::Int), ("end_silence", Ty::Int),
+        ("silenced", Ty::Untyped), ("silenced=", Ty::Untyped),
+        ("behavior", untyped_arr()), ("behavior=", Ty::Untyped),
+        ("disallowed_behavior", untyped_arr()), ("disallowed_behavior=", Ty::Untyped),
+        ("disallowed_warnings", Ty::Untyped), ("disallowed_warnings=", Ty::Untyped),
+        ("debug", Ty::Untyped), ("debug=", Ty::Untyped),
+        ("gem_name", Ty::Untyped), ("gem_name=", Ty::Untyped),
+        ("deprecation_horizon", Ty::Untyped), ("deprecation_horizon=", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "ActiveSupport::Deprecation::Deprecators", &[
+        ("new", deprecators.clone()),
+    ], &[
+        ("[]", Ty::Union { variants: vec![deprecation.clone(), Ty::Nil] }), ("[]=", deprecation.clone()),
+        ("each", Ty::Untyped), ("silence", Ty::Untyped),
+        ("silenced=", Ty::Untyped), ("debug=", Ty::Untyped), ("behavior=", Ty::Untyped),
+        ("disallowed_behavior=", Ty::Untyped), ("disallowed_warnings=", Ty::Untyped),
+    ]);
+    register_stdlib_class(classes, "Rails", &[("deprecator", deprecation.clone())], &[]);
+    register_stdlib_class(classes, "ActiveSupport", &[("deprecator", deprecation.clone())], &[]);
     // activerecord log_subscriber.rb:9, `class_attribute :backtrace_cleaner`
     // (runtime/spinel/active_record_log_subscriber.rb, PostgreSQL tree only).
     let as_cleaner = class("ActiveSupport::BacktraceCleaner");

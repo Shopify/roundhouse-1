@@ -3846,6 +3846,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let programs = initializer_program_block(app);
     let environment = environment_program_block(app);
     apply_class_load_hooks(files, app);
+    // ActiveSupport::Deprecation, Rails.deprecator and
+    // Rails.application.deprecators (8.2.0.alpha).
+    let deprecation = crate::runtime_files::read_to_string("runtime/spinel/active_support_deprecation.rb")
+        .map_err(|e| format!("read deprecation runtime: {e}"))?;
+    files.push(("runtime/active_support_deprecation.rb".into(), deprecation));
+    let deprecation_behavior = deprecation_behavior_block(app);
     // ActiveSupport::BacktraceCleaner and Rails.backtrace_cleaner (8.2.0.alpha).
     let cleaner = crate::runtime_files::read_to_string("runtime/spinel/active_support_backtrace_cleaner.rb")
         .map_err(|e| format!("read backtrace cleaner runtime: {e}"))?;
@@ -3910,7 +3916,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
             content.insert_str(
                 at,
-                "# `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
+                "# `require \"active_support\"` loads active_support/deprecation and\n\
+                 # deprecator before any app code: ActiveSupport::Deprecation, ported.\n\
+                 require_relative \"runtime/active_support_deprecation\"\n\
+                 # `require \"rails\"` loads rails/backtrace_cleaner before any app code\n\
                  # (railties rails.rb:13): `Rails.backtrace_cleaner`, ported.\n\
                  require_relative \"runtime/active_support_backtrace_cleaner\"\n\
                  # Active Record's railtie: LogSubscriber.backtrace_cleaner and its\n\
@@ -3942,6 +3951,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let at = content.rfind(eager).ok_or("PostgreSQL bootstrap: missing eager load in app/models.rb")?;
             content.insert_str(at, &environment);
             let at = at + environment.len();
+            content.insert_str(at, &deprecation_behavior);
+            let at = at + deprecation_behavior.len();
             content.insert_str(
                 at,
                 "# Application#initialize!: the railties' and engines' initializers, in\n\
@@ -4585,6 +4596,41 @@ fn environment_program_block(app: &App) -> String {
         "else\n  raise \"Rails environment has been set to #{Rails.env} but config/environments/#{Rails.env}.rb does not exist.\"\nend\n",
     );
     out
+}
+
+/// The `config.active_support` keys activesupport's
+/// `active_support.deprecation_behavior` initializer reads, by the
+/// keyword `Rails::Application.apply_deprecation_behavior` takes
+/// (runtime/active_support_deprecation.rb).
+const DEPRECATION_BEHAVIOR_KEYS: &[&str] =
+    &["report_deprecations", "deprecation", "disallowed_deprecation", "disallowed_deprecation_warnings"];
+
+/// activesupport 8.2.0.alpha railtie.rb:92-110: after the environment
+/// program, first of the railties' initializers (ActiveSupport's railtie
+/// loads first), configure `Rails.application.deprecators` from the
+/// app's `config.active_support` deprecation keys. A key the app writes
+/// is read through the reader ingest lifts onto the Application reopen
+/// (`ingest::app::APPLIED_FRAMEWORK_CONFIG_KEYS`); one it never writes
+/// is nil, as Rails' OrderedOptions answers.
+fn deprecation_behavior_block(app: &App) -> String {
+    let lifted = |reader: &str| {
+        app.rails_application.as_ref().is_some_and(|lc| lc.methods.iter().any(|m| m.name.as_str() == reader))
+    };
+    let args: Vec<String> = DEPRECATION_BEHAVIOR_KEYS
+        .iter()
+        .map(|key| {
+            let reader = crate::ingest::app::applied_framework_config_reader(&format!("active_support.{key}"));
+            let value = if lifted(&reader) { format!("Rails.application.{reader}") } else { "nil".to_string() };
+            format!("{key}: {value}")
+        })
+        .collect();
+    format!(
+        "# activesupport's `active_support.deprecation_behavior` initializer\n\
+         # (railtie.rb:92): the app's config.active_support deprecation keys\n\
+         # configure every registered deprecator (runtime/active_support_deprecation.rb).\n\
+         Rails::Application.apply_deprecation_behavior({})\n",
+        args.join(", ")
+    )
 }
 
 /// End each emitted class file with the `ActiveSupport.run_load_hooks`
@@ -8502,6 +8548,7 @@ fn spinel_files_with_assertions(
         && p != "runtime/semian_adapter.rb" && p != "runtime/semian_net_http.rb"
         && p != "runtime/active_support_lazy_load_hooks.rb"
         && p != "runtime/active_support_backtrace_cleaner.rb"
+        && p != "runtime/active_support_deprecation.rb"
         && p != "runtime/active_record_log_subscriber.rb");
 
     // Same story for `markly_jruby.rb` — the JRuby implementation of the

@@ -44,6 +44,7 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_type.rb", "runtime/active_model_type.rb"),
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
+    ("runtime/spinel/active_support_deprecation.rb", "runtime/active_support_deprecation.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
     ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
     ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
@@ -665,6 +666,10 @@ mod tests {
             ("ActiveModel::RangeError", "runtime/active_model_type.rb"),
             ("ActiveSupport::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
             ("Rails::BacktraceCleaner", "runtime/active_support_backtrace_cleaner.rb"),
+            ("ActiveSupport::Deprecation", "runtime/active_support_deprecation.rb"),
+            ("ActiveSupport::Deprecation::Deprecators", "runtime/active_support_deprecation.rb"),
+            ("ActiveSupport::Deprecation::Reporting", "runtime/active_support_deprecation.rb"),
+            ("ActiveSupport::DeprecationException", "runtime/active_support_deprecation.rb"),
             ("ActiveRecord::LogSubscriber", "runtime/active_record_log_subscriber.rb"),
             ("UserAgent::Version", "runtime/user_agent_version.rb"),
         ] {
