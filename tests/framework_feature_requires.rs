@@ -43,6 +43,15 @@ module ProbeGem
     thread_mattr_accessor :level, default: :info
   end
 
+  # tailwindcss-rails 4.1.0's and sassc-rails 2.1.2's generator defaults.
+  class Railtie < Rails::Railtie
+    config.app_generators do |g|
+      g.template_engine :tailwindcss
+    end
+    config.app_generators.stylesheet_engine :sass
+    config.app_generators.test_unit fixture: false, aliases: { f: :fixture }
+  end
+
   def self.report
     unicode = ActiveSupport::Multibyte::Unicode
     latin1 = "caf\xE9".dup.force_encoding(Encoding::UTF_8)
@@ -59,7 +68,13 @@ module ProbeGem
       transliterate: ActiveSupport::Inflector.transliterate(latin1),
       parameterize: "Ærøskøbing Straße".parameterize,
       per_thread: per_thread,
+      app_generators: generators,
     }
+  end
+
+  def self.generators
+    g = Rails::Railtie::Configuration.new.app_generators
+    [g.class.name, g.options[:rails].slice(:template_engine, :stylesheet_engine), g.options[:test_unit], g.aliases[:test_unit], g.template_engine]
   end
 
   def self.per_thread
@@ -120,6 +135,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         "transliterate: \"cafe\"",
         // String#parameterize through the Inflector (not the ASCII overlay).
         "parameterize: \"aeroskobing-strasse\"",
+        "app_generators: [\"Rails::Configuration::Generators\", {template_engine: :tailwindcss, stylesheet_engine: :sass}, {fixture: false}, {f: :fixture}, :tailwindcss]",
         // Per thread, with the default seeded in each thread.
         "per_thread: [\"main\", \"main\", :info, [nil, :info, \"t\", \"t\"], \"invalid attribute name: bad-name\"]",
     ] {
