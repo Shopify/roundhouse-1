@@ -542,8 +542,11 @@ module ActiveRecord
     # `schema_column_types`, built once per class and name. An entry the
     # type port does not carry raises NotImplementedError when asked for,
     # rather than answering some other type.
+    # A type declared with `attribute` (below) answers before the schema's.
     def self.type_for_attribute(attribute_name, &block)
       name = attribute_name.to_s
+      declared = _declared_attribute_types[name]
+      return declared if declared
       spec = schema_column_types[name]
       if spec.nil?
         return block ? block.call(name) : ActiveModel::Type.default_value
@@ -555,7 +558,51 @@ module ActiveRecord
     def self.attribute_types
       types = Hash.new(ActiveModel::Type.default_value)
       schema_column_types.each_key { |name| types[name] = type_for_attribute(name) }
-      types
+      types.merge(_declared_attribute_types)
+    end
+    
+    # attribute_registration.rb's `attribute(name, type = nil, default:,
+    # **options)`, for a call the class body makes at load: an app macro
+    # replayed there (Core's model_uuid_attributes runs `attribute name,
+    # :model_uuid_as_integer`). A Symbol type is looked up in
+    # ActiveRecord::Type's registry with the class's adapter, as
+    # attributes.rb's `resolve_type_name` does; later declarations win,
+    # and a subclass sees its superclasses' (Rails applies the pending
+    # types superclass first).
+    #
+    # The compiled readers, writers, hydration and binds follow a declared
+    # type only for the names the compiler gave the dynamic path
+    # (`_retypable_attribute_names`, emitted per model). For any other
+    # name the call raises NotImplementedError instead of recording a type
+    # the compiled accessors would ignore. `default:` is not ported.
+    def self.attribute(name, type = nil, default: (no_default = true), **options)
+      name = name.to_s
+      type = ActiveRecord::Type.lookup(type, **options, adapter: ActiveRecord::Type.adapter_name_from(self)) if type.is_a?(Symbol)
+      unless no_default
+        raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, default: ...): attribute defaults are not ported"
+      end
+      unless _retypable_attribute_names.include?(name)
+        raise NotImplementedError, "#{self.name}.attribute(#{name.inspect}, ...): the compiled accessors for `#{name}` do not consult a declared type"
+      end
+      @__declared_attribute_types = (@__declared_attribute_types || {}).merge(name => type) if type
+      _reset_attribute_types
+      nil
+    end
+    
+    # The attribute names whose compiled accessors consult
+    # `type_for_attribute`. Emitted models override it.
+    def self._retypable_attribute_names
+      []
+    end
+    
+    def self._declared_attribute_types
+      inherited = superclass.respond_to?(:_declared_attribute_types) ? superclass._declared_attribute_types : {}
+      @__declared_attribute_types ? inherited.merge(@__declared_attribute_types) : inherited
+    end
+    
+    def self._reset_attribute_types
+      @__attribute_types = nil
+      subclasses.each(&:_reset_attribute_types)
     end
     
     def self._cast_type_for_spec(name, spec)

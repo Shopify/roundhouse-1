@@ -32,12 +32,11 @@
 # - `ActiveRecord.default_timezone` and `Time.zone_default` are read when
 #   the tree defines them; otherwise they are their native defaults (:utc,
 #   no zone), so every time casts in UTC.
-# - The type registries (`ActiveModel::Type.lookup` / `register`,
-#   ActiveRecord's AdapterSpecificRegistry) and the other types (Date,
-#   Time, Float, Json, Serialized) are not ported; type.rb's
-#   `default_value` is. No code the tree carries reaches them yet: the
-#   runtime's `type_for_attribute` raises NotImplementedError for a
-#   column whose type is not here.
+# - The other types (Date, Time, Float, Json, Serialized) are not
+#   ported. The registries are (see the end of this file); a built-in
+#   name whose class is missing raises NotImplementedError on lookup,
+#   and the runtime's `type_for_attribute` raises it for a column whose
+#   type is not here.
 # - Binary::Data#as_json answers String#as_json's value (the string
 #   itself) where the tree does not define String#as_json.
 # - SerializeCastValue extends its ClassMethods in `included`, which is
@@ -45,7 +44,7 @@
 #   computed in place: `ActiveSupport::Ractors.on_main` does exactly that
 #   on the main Ractor, and dispatches there only from another Ractor.
 # - ActiveRecord's `Type::DEFAULT_TYPE` (`Value.new.freeze`, the
-#   registry's fallback) is not ported with the registries.
+#   registry's fallback) is not ported; `default_value` is.
 # - Type::QueryPredicates (type/query_predicates.rb) is ported as the
 #   module a type includes (Core's Shopify::NormalizedStringType does):
 #   `query_predicates?`, `comparison_expression`, the Decorator modules
@@ -973,5 +972,258 @@ module ActiveRecord
         self === type && type.query_predicates?
       end
     end
+  end
+end
+
+# The type registries: activemodel type/registry.rb with type.rb's
+# `ActiveModel::Type.register` / `lookup`, and activerecord
+# type/adapter_specific_registry.rb with type.rb's
+# `ActiveRecord::Type.register` / `lookup` / `add_modifier`, so an app's
+# initializer can register its own type class (Core's uuid_config.rb:
+# `ActiveRecord::Type.register(:model_uuid_as_integer,
+# Shopify::ModelUuidAsInteger, adapter: :postgresql)`) and `attribute
+# name, :sym` finds it. The built-in names are registered as in type.rb.
+# A built-in whose class this file does not port (Date, Float, Time,
+# Json) is registered with a block that raises NotImplementedError
+# naming the class, so looking it up never answers a different type.
+module ActiveModel
+  module Type
+    class Registry # :nodoc:
+      def initialize
+        @registrations = {}
+      end
+
+      def initialize_copy(other)
+        @registrations = @registrations.dup
+        super
+      end
+
+      def register(type_name, klass = nil, &block)
+        block ||= proc { |_, *args, **kwargs| klass.new(*args, **kwargs) }
+        registrations[type_name] = block
+      end
+
+      def lookup(symbol, ...)
+        registration = registrations[symbol]
+
+        if registration
+          registration.call(symbol, ...)
+        else
+          raise ArgumentError, "Unknown type #{symbol.inspect}"
+        end
+      end
+
+      private
+        attr_reader :registrations
+    end
+
+    # A registration for a built-in type this file does not port.
+    def self.unported_registration(class_name) # :nodoc:
+      proc { |symbol, *| raise NotImplementedError, "type #{symbol.inspect}: #{class_name} is not ported" }
+    end
+
+    @registry = Registry.new
+
+    class << self
+      attr_accessor :registry # :nodoc:
+
+      def register(type_name, klass = nil, &block)
+        registry.register(type_name, klass, &block)
+      end
+
+      def lookup(...) # :nodoc:
+        registry.lookup(...)
+      end
+    end
+
+    register(:big_integer, Type::BigInteger)
+    register(:binary, Type::Binary)
+    register(:boolean, Type::Boolean)
+    register(:date, &unported_registration("ActiveModel::Type::Date"))
+    register(:datetime, Type::DateTime)
+    register(:decimal, Type::Decimal)
+    register(:float, &unported_registration("ActiveModel::Type::Float"))
+    register(:immutable_string, Type::ImmutableString)
+    register(:integer, Type::Integer)
+    register(:string, Type::String)
+    register(:time, &unported_registration("ActiveModel::Type::Time"))
+  end
+end
+
+module ActiveRecord
+  module Type
+    class AdapterSpecificRegistry # :nodoc:
+      def initialize
+        @registrations = []
+      end
+
+      def initialize_copy(other)
+        @registrations = @registrations.dup
+      end
+
+      def add_modifier(options, klass, **args)
+        registrations << DecorationRegistration.new(options, klass, **args)
+      end
+
+      def register(type_name, klass = nil, **options, &block)
+        block ||= proc { |_, *args, **kwargs| klass.new(*args, **kwargs) }
+        registrations << Registration.new(type_name, block, **options)
+      end
+
+      def lookup(symbol, *args, **kwargs)
+        registration = find_registration(symbol, *args, **kwargs)
+
+        if registration
+          registration.call(self, symbol, *args, **kwargs)
+        else
+          raise ArgumentError, "Unknown type #{symbol.inspect}"
+        end
+      end
+
+      private
+        attr_reader :registrations
+
+        def find_registration(symbol, *args, **kwargs)
+          registrations
+            .select { |registration| registration.matches?(symbol, *args, **kwargs) }
+            .max
+        end
+    end
+
+    class Registration # :nodoc:
+      def initialize(name, block, adapter: nil, override: nil)
+        @name = name
+        @block = block
+        @adapter = adapter
+        @override = override
+      end
+
+      def call(_registry, *args, adapter: nil, **kwargs)
+        block.call(*args, **kwargs)
+      end
+
+      def matches?(type_name, *args, **kwargs)
+        type_name == name && matches_adapter?(**kwargs)
+      end
+
+      # The message is the source's heredoc-like literal after `squish`.
+      def <=>(other)
+        if conflicts_with?(other)
+          raise TypeConflictError.new("Type #{name} was registered for all adapters, but shadows a native type with the same name for #{other.adapter}")
+        end
+        priority <=> other.priority
+      end
+
+      protected
+        attr_reader :name, :block, :adapter, :override
+
+        def priority
+          result = 0
+          if adapter
+            result |= 1
+          end
+          if override
+            result |= 2
+          end
+          result
+        end
+
+        def priority_except_adapter
+          priority & 0b111111100
+        end
+
+      private
+        def matches_adapter?(adapter: nil, **)
+          (self.adapter.nil? || adapter == self.adapter)
+        end
+
+        def conflicts_with?(other)
+          same_priority_except_adapter?(other) &&
+            has_adapter_conflict?(other)
+        end
+
+        def same_priority_except_adapter?(other)
+          priority_except_adapter == other.priority_except_adapter
+        end
+
+        def has_adapter_conflict?(other)
+          (override.nil? && other.adapter) ||
+            (adapter && other.override.nil?)
+        end
+    end
+
+    class DecorationRegistration < Registration # :nodoc:
+      def initialize(options, klass, adapter: nil)
+        @options = options
+        @klass = klass
+        @adapter = adapter
+      end
+
+      def call(registry, *args, **kwargs)
+        subtype = registry.lookup(*args, **kwargs.except(*options.keys))
+        klass.new(subtype)
+      end
+
+      def matches?(*args, **kwargs)
+        matches_adapter?(**kwargs) && matches_options?(**kwargs)
+      end
+
+      def priority
+        super | 4
+      end
+
+      private
+        attr_reader :options, :klass
+
+        def matches_options?(**kwargs)
+          options.all? do |key, value|
+            kwargs[key] == value
+          end
+        end
+    end
+
+    @registry = AdapterSpecificRegistry.new
+
+    class << self
+      attr_accessor :registry # :nodoc:
+
+      def add_modifier(...)
+        registry.add_modifier(...)
+      end
+
+      def register(type_name, klass = nil, **options, &block)
+        registry.register(type_name, klass, **options, &block)
+      end
+
+      def lookup(*args, adapter: current_adapter_name, **kwargs) # :nodoc:
+        registry.lookup(*args, adapter: adapter, **kwargs)
+      end
+
+      def adapter_name_from(model) # :nodoc:
+        model.connection_db_config.adapter.to_sym
+      end
+
+      private
+        def current_adapter_name
+          adapter_name_from(ActiveRecord::Base)
+        end
+    end
+
+    register(:big_integer, Type::BigInteger, override: false)
+    register(:binary, Type::Binary, override: false)
+    register(:boolean, Type::Boolean, override: false)
+    register(:date, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Date"))
+    register(:datetime, Type::DateTime, override: false)
+    register(:decimal, Type::Decimal, override: false)
+    register(:float, override: false, &ActiveModel::Type.unported_registration("ActiveModel::Type::Float"))
+    register(:integer, Type::Integer, override: false)
+    register(:immutable_string, Type::ImmutableString, override: false)
+    register(:json, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Json"))
+    register(:string, Type::String, override: false)
+    register(:text, Type::Text, override: false)
+    register(:time, override: false, &ActiveModel::Type.unported_registration("ActiveRecord::Type::Time"))
+  end
+
+  class TypeConflictError < StandardError # :nodoc:
   end
 end
