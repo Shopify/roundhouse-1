@@ -788,6 +788,14 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
     let mut out = Vec::new();
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        // A statement another path decides on: the model's database
+        // (`connects_to`, `establish_connection`: ingest::database_ownership,
+        // which replays it at boot or refuses it as a database refusal), a
+        // reproducible `normalizes` (lower::normalizes), a call ingest
+        // lowered and claimed on the model.
+        if claimed_in_model(model, expr) {
+            continue;
+        }
         // A call of an app class macro: replayed in the class body
         // (`replay_model_macros`), or refused with the reason.
         match macros.iter().find(|(m, _)| std::ptr::eq(*m, expr)) {
@@ -810,13 +818,6 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // lowered class by `model_class` and replayed through the
         // runtime port (`emit::ruby::library::model_callback_calls`).
         if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
-            continue;
-        }
-        // A statement another path decides on: the model's database
-        // (`connects_to`, `establish_connection`: ingest::database_ownership,
-        // which replays it at boot or refuses it as a database refusal), a
-        // reproducible `normalizes` (lower::normalizes).
-        if claimed_elsewhere(expr) {
             continue;
         }
         // A `delegate` ingest left because its names are called with
@@ -1113,6 +1114,15 @@ fn declined_delegate_forwarded(model: &Model, expr: &Expr, app: &crate::App) -> 
 /// Whether some path in [`MODEL_STATEMENT_CLAIMS`] consumes `expr`.
 pub(crate) fn claimed_elsewhere(expr: &Expr) -> bool {
     MODEL_STATEMENT_CLAIMS.iter().any(|claims| claims(expr))
+}
+
+/// Whether a pass consumes `model`'s body statement `expr`: the one
+/// check both the unclaimed-DSL report and the macro verdicts (hence the
+/// replay) consult, so a claimed statement is neither reported, refused
+/// nor replayed. Claims recorded on the model itself by ingest (the
+/// spans of calls lowered there) belong here too.
+pub(crate) fn claimed_in_model(_model: &Model, expr: &Expr) -> bool {
+    claimed_elsewhere(expr)
 }
 
 /// ActiveSupport::Callbacks' class-side surface as the Ruby-family runtime

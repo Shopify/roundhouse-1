@@ -634,7 +634,7 @@ pub(crate) fn model_macro_verdicts<'a>(model: &'a Model, app: &'a crate::App) ->
             ModelBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
         })
-        .filter(|expr| !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_elsewhere(expr))
+        .filter(|expr| !callbacks.iter().any(|c| std::ptr::eq(*c, *expr)) && !super::claimed_in_model(model, expr))
         .filter_map(|expr| side.verdict(expr).map(|v| (expr, v)))
         .collect()
 }
