@@ -63,9 +63,27 @@ pub fn ingest_table_name_prefixes(source: &[u8], file: &str) -> TablePrefixes {
         let mut full = scope;
         full.extend(name_path);
         let Some(body) = module.body() else { continue };
-        for stmt in flatten_statements(body) {
+        let stmts = flatten_statements(body);
+        // `extend self` makes every instance method a singleton one too:
+        // Core's `Payments::PaymentFlexibility` overrides `Payments`'
+        // `payments_` with a plain `def table_name_prefix = ""`.
+        let extends_self = stmts.iter().any(|s| {
+            s.as_call_node().is_some_and(|c| {
+                c.receiver().is_none()
+                    && constant_id_str(&c.name()) == "extend"
+                    && c.arguments().is_some_and(|a| {
+                        let args: Vec<_> = a.arguments().iter().collect();
+                        args.len() == 1 && args[0].as_self_node().is_some()
+                    })
+            })
+        });
+        for stmt in stmts {
             if let Some(def) = stmt.as_def_node() {
-                if def.receiver().and_then(|r| r.as_self_node()).is_none() {
+                let singleton = match def.receiver() {
+                    Some(r) => r.as_self_node().is_some(),
+                    None => extends_self,
+                };
+                if !singleton {
                     continue;
                 }
                 if let Some(prefix) = literal_prefix(&def) {
@@ -320,16 +338,19 @@ pub(super) fn ingest_model_with_enum_constants(
         let mut segments: Vec<&str> = class_name.as_str().split("::").collect();
         segments.pop();
         let mut prefix = class.body().and_then(explicit_table_prefix).unwrap_or_default();
+        let mut from_module = false;
         while prefix.is_empty() && !segments.is_empty() {
             if let Some(p) = prefixes.get(&segments.join("::")) {
                 prefix = p.clone();
+                from_module = true;
                 break;
             }
             segments.pop();
         }
-        // No module parent declares one: the class attribute its
-        // abstract base set.
+        // No module parent declares one (an empty one still counts): the
+        // class attribute its abstract base set.
         if prefix.is_empty()
+            && !from_module
             && let Some(parent) = class.superclass().and_then(|n| constant_path_of(&n))
             && let Some(inherited) = base_prefixes.get(&model_bases.resolve_superclass(&scope, &parent))
         {

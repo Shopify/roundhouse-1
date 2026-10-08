@@ -39,6 +39,27 @@ fn both_singleton_spellings_prefix_the_table() {
 }
 
 #[test]
+fn an_extend_self_prefix_overrides_the_outer_one() {
+    // Core's `Payments::PaymentFlexibility`: `extend self` and a plain
+    // `def table_name_prefix` returning "", so `PaymentSchedule` reads
+    // `payment_schedules`, not `payments_payment_schedules`.
+    let tree: roundhouse::det::HashMap<std::path::PathBuf, Vec<u8>> = [
+        ("db/structure.sql", "CREATE TABLE core.payment_schedules (\n    id bigint NOT NULL,\n    label character varying NOT NULL\n);\n"),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
+        ("app/models/payments.rb", "module Payments\n  class << self\n    def table_name_prefix\n      \"payments_\"\n    end\n  end\nend\n"),
+        ("app/services/payments/flex.rb", "module Payments\n  module Flex\n    extend self\n\n    def table_name_prefix\n      \"\" # override Payments\n    end\n  end\nend\n"),
+        ("app/models/payments/flex/payment_schedule.rb", "module Payments\n  module Flex\n    class PaymentSchedule < ApplicationRecord\n    end\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (std::path::PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest tree");
+    let table = app.models.iter().find(|m| m.name.0.as_str() == "Payments::Flex::PaymentSchedule").map(|m| m.table.0.to_string());
+    assert_eq!(table.as_deref(), Some("payment_schedules"));
+}
+
+#[test]
 fn a_nested_empty_prefix_overrides_the_outer_one() {
     let root = std::env::temp_dir().join(format!("rh_table_name_prefix_singleton_{}_empty", std::process::id()));
     let files = [
