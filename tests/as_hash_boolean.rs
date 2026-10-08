@@ -56,6 +56,10 @@ fn array_wrap_folds_one_shape_and_branches_a_union() {
         !mixed.contains("Array.wrap"),
         "the union is folded, not left as a call the ruby emit cannot run; got: {mixed}"
     );
+    // An untyped argument may be an Array (Core's SerializationOptions'
+    // `Array.wrap(options[:only])`): one shape would nest it, so the
+    // call stays for the runtime's `Array.wrap`.
+    assert_eq!(emit("Array.wrap(flag)"), "Array.wrap(flag)");
 }
 
 #[test]
