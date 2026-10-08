@@ -2539,6 +2539,16 @@ impl<'a> BodyTyper<'a> {
                         };
                     }
                 }
+                // `errors.to_hash([full])` / `as_json([options])` /
+                // `messages` on Rails' collection: the CRuby and JRuby
+                // trees answer them from what each grounded push records
+                // (`expr::ERRORS_HASH_READ`).
+                if matches!(method.as_str(), "to_hash" | "as_json" | "messages") && block.is_none()
+                    && args.len() <= usize::from(method.as_str() != "messages")
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                {
+                    expr.decisions |= crate::expr::ERRORS_HASH_READ;
+                }
                 // A record's serialization beyond `only:`: gated to the
                 // tree whose ActiveRecord::Base carries it (`send::
                 // record_serialization`, `analyze::runtime_reads`).

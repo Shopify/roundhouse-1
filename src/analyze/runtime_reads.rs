@@ -493,10 +493,12 @@ const UNTYPED_SINGLETONS: &[(&str, &str, &str)] = &[
 /// Instance methods only a gated port answers, though the registry types
 /// them on a class every tree has: by method, the class the receiver
 /// (`Receiver`) or the result (`Result`) is typed as, and the namespace
-/// the finished tree must declare. `errors.attribute_names` needs the
-/// attribute each message was added for, which only the CRuby and JRuby
-/// trees record (`ActiveModel::ErrorAttributes`); `record.association(
-/// :name)` is the association object, which only they carry.
+/// the finished tree must declare. `errors.attribute_names`, `to_hash`,
+/// `as_json` and `messages` need the attribute each message was added
+/// for (and its short message), which only the CRuby and JRuby trees
+/// record (`ActiveModel::ErrorAttributes`); `record.association(:name)`
+/// is the association object, which only they carry. A `messages` read
+/// `lower::errors_index` grounded is gone by the time this looks.
 pub(crate) enum Typed {
     Receiver(&'static str),
     Result(&'static str),
@@ -504,6 +506,9 @@ pub(crate) enum Typed {
 
 pub(crate) const GATED_METHODS: &[(&str, Typed, &str)] = &[
     ("attribute_names", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
+    ("to_hash", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
+    ("as_json", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
+    ("messages", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
     ("association", Typed::Result("ActiveRecord::Associations::Association"), "ActiveRecord::Associations::Association"),
 ];
 
@@ -530,8 +535,9 @@ fn gated_method(expr: &Expr) -> Option<(&'static str, String)> {
 }
 
 /// Whether the app's emit-bound code or its tests read
-/// `errors.attribute_names`: the CRuby and JRuby trees then record each
-/// error message's attribute (`emit::ruby::with_error_attributes`).
+/// `errors.attribute_names`, `to_hash`, `as_json` or `messages`: the CRuby
+/// and JRuby trees then record each error message's attribute and short
+/// message (`emit::ruby::with_error_attributes`).
 pub(crate) fn reads_error_attribute_names(app: &App) -> bool {
     fn walk(e: &Expr, found: &mut bool) {
         if *found {

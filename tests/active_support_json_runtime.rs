@@ -9,8 +9,10 @@
 // (`expr::OBJECT_AS_JSON`) and `lower::as_json_residue` writes it as
 // `ActiveSupport::JSON::Encoding.as_json(value, options)`. The PostgreSQL
 // CRuby tree carries the port wherever emitted app code names it; a tree
-// without it refuses the read by name. `errors.as_json` stays refused:
-// it answers ActiveModel::Errors, which the runtime does not model. A
+// without it refuses the read by name. `errors.as_json` on a record
+// answers ActiveModel::Errors, which the Ruby trees port over what each
+// error push records (runtime/spinel/active_model_errors.rb) and every
+// other tree refuses (tests/errors_hash_port.rs). A
 // record's `as_json(options)` other than `only:` answers
 // ActiveModel::Serializers::JSON, which only the PostgreSQL CRuby tree's
 // ActiveRecord::Base includes; every other tree refuses it by name.
@@ -77,7 +79,7 @@ const SNAPSHOT: &str = r##"class Snapshot
 end
 "##;
 
-/// ActiveModel's surface, which the runtime does not model.
+/// ActiveModel's surface, which only the Ruby trees' ports answer.
 const REFUSED: &str = r##"class Probe < ApplicationRecord
   def errors_json
     errors.as_json
@@ -151,24 +153,31 @@ fn as_json_routes_and_is_refused_where_the_tree_lacks_the_port() {
 }
 
 #[test]
-fn active_model_as_json_stays_refused() {
+fn active_model_as_json_is_gated_to_its_ports() {
     let dir = probe_app(false, true);
     let (ok, text) = run(&dir, &["check"]);
-    assert!(!ok, "check accepted ActiveModel's as_json: {text}");
-    // Snapshot's sends route; only `errors.as_json` is refused by every
-    // tree.
-    let errors: Vec<&str> = text.lines().filter(|l| l.contains("error[")).collect();
-    assert_eq!(errors.len(), 1, "{text}");
-    assert!(errors.iter().any(|l| l.contains("probe.rb:3:") && l.contains("ActiveModel::Errors not supported")
-        && l.contains("runtime's Array of full messages")), "{text}");
+    assert!(ok, "check refused ActiveModel's as_json: {text}");
     // A module's `as_json(except:)` may be a record's: the SQLite tree's
-    // Base has no Serializers::JSON, so its emit refuses it by name.
-    let (ok, text) = run(&dir, &["--target", "ruby"]);
-    assert!(!ok, "ruby accepted a record's as_json(except:): {text}");
+    // Base has no Serializers::JSON, so its emit refuses it by name. The
+    // record's `errors.as_json` is ActiveModel::Errors', which the Ruby
+    // trees answer from the attributes their pushes record.
+    let (ok, text) = run(&dir, &["--target", "ruby", "--allow-unsupported"]);
+    assert!(ok, "{text}");
     assert!(
         text.lines().any(|l| l.contains("runtime_constant") && l.contains("`ActiveRecord::Base#as_json(options)` answers ActiveModel::Serializers::JSON")
             && l.contains("runtime/active_model_serialization.rb")),
         "ruby lost the named refusal: {text}"
+    );
+    assert!(!text.contains("ActiveModel::Errors"), "{text}");
+    let probe = std::fs::read_to_string(dir.join("emitted-ruby/app/models/probe.rb")).unwrap();
+    assert!(probe.contains("ActiveModel::ErrorAttributes.as_json(errors)"), "{probe}");
+    // The strict targets carry neither port.
+    let (ok, text) = run(&dir, &["--target", "rust"]);
+    assert!(!ok, "rust accepted ActiveModel::Errors#as_json: {text}");
+    assert!(
+        text.lines().any(|l| l.contains("ActiveModel::Errors#as_json")
+            && l.contains("declared by the Ruby-family runtime (runtime/active_model_errors.rb), which rust does not emit")),
+        "rust lost the named refusal: {text}"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

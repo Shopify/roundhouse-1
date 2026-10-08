@@ -92,6 +92,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // the read is refused where that port is absent
         // (`analyze::runtime_reads::GATED_METHODS`).
         ("attribute_names", Ty::Array { elem: Box::new(Ty::Sym) }),
+        // `to_hash(full_messages = false)` and `as_json(options = nil)`:
+        // the messages (short, or full) grouped by attribute. Recorded
+        // and refused as `attribute_names` is; `messages` too, where
+        // `lower::errors_index` does not ground the read.
+        ("to_hash", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
+        ("as_json", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(str_arr()) }),
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }

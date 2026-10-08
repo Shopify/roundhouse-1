@@ -222,46 +222,70 @@ fn rails_string_blank(e: &Expr) -> Option<String> {
 }
 
 /// The error accumulator is an `Array[String]` of full messages, which
-/// drops the attribute each was added for; Rails'
-/// `errors.attribute_names` answers it. Where the app reads it (the
-/// project sets `with_error_attributes`), the CRuby and JRuby trees
-/// record the attribute beside the message:
+/// drops the attribute each was added for and its short message; Rails'
+/// `errors.attribute_names`, `to_hash`, `as_json` and `messages` answer
+/// them. Where the app reads one (the project sets
+/// `with_error_attributes`), the CRuby and JRuby trees record both beside
+/// the message (runtime/spinel/active_model_errors.rb):
 ///
 /// - a push the lowering tagged (`IrHint::ErrorAttribute`, from
 ///   `errors.add(:attr, ...)` or a `validates :attr` check) is written
-///   `ActiveModel::ErrorAttributes.add(errors, :attr, msg)`, which
-///   appends the message as `errors << msg` did and records the pair;
-/// - `errors.attribute_names` is written
-///   `ActiveModel::ErrorAttributes.attribute_names(errors)`.
+///   `ActiveModel::ErrorAttributes.add(errors, :attr, msg, "Attr ")`,
+///   which appends the message as `errors << msg` did and records the
+///   attribute and the text its short message follows (no text when the
+///   lowering could not say: `expr::ErrorShort::Unknown`);
+///   `add_humanized(errors, attribute, msg)` for an attribute in a local;
+/// - `errors.attribute_names`, `errors.to_hash([full])`,
+///   `errors.as_json([options])` and `errors.messages` are written
+///   `ActiveModel::ErrorAttributes.<read>(errors, ...)`.
 ///
 /// Every other tree, and these trees for an app that never asks, keep
 /// the plain `<<`.
 fn error_attribute_push(e: &Expr) -> Option<String> {
+    use crate::expr::{ErrorShort, ErrorTag, IrHint};
     if !ERROR_ATTRIBUTES.with(Cell::get) {
         return None;
     }
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { return None };
+    let push = |attribute: String, msg: &Expr, short: &ErrorShort| match short {
+        ErrorShort::After(prefix) => format!(
+            "ActiveModel::ErrorAttributes.add({}, {attribute}, {}, {})",
+            emit_expr(recv),
+            emit_expr(msg),
+            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Str { value: prefix.clone() } })
+        ),
+        ErrorShort::AfterHumanized => {
+            format!("ActiveModel::ErrorAttributes.add_humanized({}, {attribute}, {})", emit_expr(recv), emit_expr(msg))
+        }
+        ErrorShort::Unknown => format!("ActiveModel::ErrorAttributes.add({}, {attribute}, {})", emit_expr(recv), emit_expr(msg)),
+    };
+    // The analyzer types `attribute_names` on ActiveModel::Errors; a
+    // lowered test body may carry the runtime reader's Array type instead,
+    // so an `errors` reader receiver counts too (an object that is not the
+    // accumulator answers its own).
+    let errors_typed = matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors");
+    let errors_reader = matches!(&*recv.node, ExprNode::Send { method, args, .. } if method.as_str() == "errors" && args.is_empty());
+    let read = |name: &str| {
+        let mut written = vec![emit_expr(recv)];
+        written.extend(args.iter().map(emit_expr));
+        format!("ActiveModel::ErrorAttributes.{name}({})", written.join(", "))
+    };
     match (e.hint.as_ref(), method.as_str(), args.as_slice()) {
-        (Some(crate::expr::IrHint::ErrorAttribute(attr)), "<<", [msg]) => Some(format!(
-            "ActiveModel::ErrorAttributes.add({}, {}, {})",
-            emit_expr(recv),
-            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: attr.clone() } }),
-            emit_expr(msg)
+        (Some(IrHint::ErrorAttribute(ErrorTag { attribute, short })), "<<", [msg]) => Some(push(
+            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: attribute.clone() } }),
+            msg,
+            short,
         )),
-        (Some(crate::expr::IrHint::ErrorAttributeLocal(local)), "<<", [msg]) => Some(format!(
-            "ActiveModel::ErrorAttributes.add({}, {}, {})",
-            emit_expr(recv),
-            local.as_str(),
-            emit_expr(msg)
-        )),
-        // The analyzer types the read on ActiveModel::Errors; a lowered
-        // test body may carry the runtime reader's Array type instead, so
-        // an `errors` reader receiver counts too.
-        (_, "attribute_names", [])
-            if matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
-                || matches!(&*recv.node, ExprNode::Send { method, args, .. } if method.as_str() == "errors" && args.is_empty()) =>
-        {
-            Some(format!("ActiveModel::ErrorAttributes.attribute_names({})", emit_expr(recv)))
+        (Some(IrHint::ErrorAttributeLocal(ErrorTag { attribute, short })), "<<", [msg]) => {
+            Some(push(attribute.as_str().to_string(), msg, short))
+        }
+        (_, "attribute_names", []) if errors_typed || errors_reader => Some(read("attribute_names")),
+        // Rails' `to_hash(full_messages = false)`, `as_json(options =
+        // nil)` and `messages`, where the analyzer typed the receiver as
+        // Rails' collection (`expr::ERRORS_HASH_READ`): an `errors` of
+        // another type (a GraphQL result's) keeps its own.
+        (_, "to_hash" | "as_json" | "messages", _) if e.decisions & crate::expr::ERRORS_HASH_READ != 0 => {
+            Some(read(method.as_str()))
         }
         _ => None,
     }

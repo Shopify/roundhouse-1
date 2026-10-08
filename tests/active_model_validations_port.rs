@@ -81,7 +81,8 @@ const PROBE: &str = r##"class AvProbe
     bad = Probe::ApiVersion.new("handle" => "20x1", "fully_inaccessible" => "soon")
     blank = Probe::ApiVersion.new("handle" => "")
     [bad.valid?, bad.errors.full_messages, bad.errors.attribute_names, bad.invalid?, blank.valid?, blank.errors.full_messages,
-     begin; blank.validate!; rescue ActiveModel::ValidationError => e; e.message; end]
+     begin; blank.validate!; rescue ActiveModel::ValidationError => e; e.message; end,
+     bad.errors.to_hash, bad.errors.as_json(full_messages: true), bad.errors.messages]
   end
 
   def self.lines

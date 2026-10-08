@@ -82,6 +82,16 @@ pub const OBJECT_AS_JSON: u64 = 1 << 21;
 /// `only:`.
 pub const RECORD_SERIALIZATION: u64 = 1 << 22;
 
+/// `errors.to_hash([full_messages])`, `errors.as_json([options])` or
+/// `errors.messages` on a receiver typed as Rails' `ActiveModel::Errors`:
+/// the messages by attribute, which the models' `Array[String]`
+/// accumulator does not keep. The CRuby and JRuby trees write the read
+/// `ActiveModel::ErrorAttributes.<read>(errors, ...)` over what each push
+/// records (`emit::ruby::expr::error_attribute_push`, runtime/spinel/
+/// active_model_errors.rb); `project` refuses it where the finished tree
+/// lacks the port (`analyze::runtime_reads`).
+pub const ERRORS_HASH_READ: u64 = 1 << 23;
+
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
 /// keyword arguments, or a `yield(**value)` argument, which ingest takes
@@ -219,14 +229,16 @@ pub enum IrHint {
     /// On the `errors << msg` push an `errors.add(:attr, ...)` or a
     /// `validates :attr` check grounded to (`lower::errors_add`,
     /// `lower::model_to_library::validations`): the attribute the
-    /// message is for, which the `Array[String]` accumulator drops. The
-    /// CRuby and JRuby trees record it beside the message where the app
-    /// reads `errors.attribute_names` (runtime/spinel/
-    /// active_model_errors.rb); every other emit ignores it.
-    ErrorAttribute(crate::ident::Symbol),
+    /// message is for and where its short message starts, both of which
+    /// the `Array[String]` accumulator of full messages drops. The CRuby
+    /// and JRuby trees record them beside the message where the app
+    /// reads `errors.attribute_names`, `to_hash`, `as_json` or
+    /// `messages` (runtime/spinel/active_model_errors.rb); every other
+    /// emit ignores it.
+    ErrorAttribute(ErrorTag),
     /// As `ErrorAttribute`, for an attribute held in the named local
     /// or parameter (an EachValidator's `errors.add(attribute, ...)`).
-    ErrorAttributeLocal(crate::ident::Symbol),
+    ErrorAttributeLocal(ErrorTag),
     /// On the message `lower::errors_add` grounded `errors.add(:attr)`
     /// or `errors.add(:attr, :invalid)` to: Rails' default error type
     /// with no options, the same Error a has_many adds for an invalid
@@ -249,6 +261,33 @@ pub enum IrHint {
     /// (`ActiveRecord::Associations::Association.proxy`); the others
     /// keep the plain send.
     AssociationProxy,
+}
+
+/// The attribute an error push is for (`IrHint::ErrorAttribute`: the
+/// attribute; `IrHint::ErrorAttributeLocal`: the local holding it), and
+/// how its full message holds Rails' short one (`Error#message`, what
+/// `errors.to_hash` and `as_json` answer).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorTag {
+    pub attribute: Symbol,
+    pub short: ErrorShort,
+}
+
+/// Where a pushed full message's short message starts. The lowering that
+/// built the message says so; it is never read back off the text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorShort {
+    /// After this text: the humanized attribute and a space, or nothing
+    /// on `:base` (`"%{attribute} %{message}"`).
+    After(String),
+    /// After `ActiveSupport.humanize(attribute.to_s)` and a space, or
+    /// nothing when the attribute is `base`: the run-time prefix
+    /// `lower::errors_add` writes for an attribute held in a local.
+    AfterHumanized,
+    /// Not known: the push records its full message alone, and the
+    /// short-message reads refuse it.
+    Unknown,
 }
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
