@@ -1120,6 +1120,24 @@ impl Analyzer {
             // so the concern fold (harvest_returns_to_registry) can copy
             // the module's instance and `class_methods do` surfaces onto
             // this model.
+            //
+            // A module a gem runtime port declares extends its includer
+            // with the port's `ClassMethods` (database_documentation's
+            // `annotation`, `database_documentation`, ...). The port is
+            // plain Ruby with no signatures, so each answers untyped (a
+            // gradual escape), not "no known method"; a declared method of
+            // the model's own wins.
+            for module in &includes {
+                if app.models.iter().any(|m| &m.name == module)
+                    || app.library_classes.iter().any(|c| &c.name == module)
+                    || crate::project::gem_port_declaring(module.0.as_str()).is_none()
+                {
+                    continue;
+                }
+                for name in runtime_reads::mixed_in_class_methods(module.0.as_str()).unwrap_or(&[]) {
+                    cls.class_methods.entry(Symbol::from(name.as_str())).or_insert(Ty::Untyped);
+                }
+            }
             if !includes.is_empty() {
                 cls.includes = includes;
             }

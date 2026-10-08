@@ -32,6 +32,8 @@ mod composite_key;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
 pub(crate) mod macro_replay;
+pub(crate) mod transaction_callbacks;
+pub(crate) mod private_constant;
 pub use macro_replay::replay_model_macros;
 pub mod row;
 
@@ -593,6 +595,7 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
     // mixins as the base's include is, and keeps those calls in body
     // order beside its prepends.
     let callbacks = callback_dsl_calls(model, models);
+    let port_macros = gem_port_macro_calls(model, models);
     let mut includes = crate::analyze::model_includes(model);
     let module = ClassId(Symbol::from("ActiveSupport::Callbacks"));
     if !callbacks.is_empty() && !includes.contains(&module) {
@@ -605,7 +608,11 @@ fn model_class(model: &Model, models: &[Model], methods: Vec<MethodDef>, table: 
             crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
             _ => None,
         })
-        .filter(|expr| is_constant_prepend(expr) || callbacks.iter().any(|c| std::ptr::eq(*c, *expr)))
+        .filter(|expr| {
+            is_constant_prepend(expr)
+                || callbacks.iter().any(|c| std::ptr::eq(*c, *expr))
+                || port_macros.iter().any(|c| std::ptr::eq(*c, *expr))
+        })
         .cloned()
         .collect();
     LibraryClass {
@@ -741,6 +748,8 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
     let mut all: Vec<_> =
         app.models.iter().flat_map(|model| unclaimed_unknowns(model, app)).collect();
     all.extend(unclaimed_sti_subclass_calls(app));
+    all.extend(app.models.iter().filter_map(|model| user_validate_conflict(model, &app.models)));
+    all.extend(private_constant::scoped_reads(app));
     // A concern's statement is spliced into every includer: one row per
     // statement, naming the first includer and counting the rest.
     let mut first: std::collections::BTreeMap<(u32, u32, u32), (usize, usize)> = Default::default();
@@ -762,6 +771,62 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
         }
     }
     out
+}
+
+/// A model's own instance `def validate` that the lowered validation
+/// path would drop or call.
+///
+/// ActiveModel's instance `validate` is an alias of `valid?`, so in Rails
+/// a model's `def validate` replaces the alias and is a plain method:
+/// `valid?` and `save` run the `validates` / `validate :m` rules and never
+/// call it (pinned natively in tests/user_validate_method.rs). The
+/// lowered runtime runs the rules through a method of that name (`valid?`
+/// calls `validate`, in runtime/ruby/active_record/connection.rb, base.rb
+/// and the ActiveModel surface `validations.rs` synthesizes). So a model
+/// with rules lost its method to the synthesized one (`push_user_methods`
+/// keeps the first), and a model under a `valid?` that calls `validate`
+/// had it run on every `valid?` and `save`. Refused at the `def` until
+/// `valid?` runs the rules through a hook of its own. A class outside any
+/// hierarchy that declares no rules keeps its method: nothing synthesized
+/// calls it.
+fn user_validate_conflict(model: &Model, models: &[Model]) -> Option<crate::diagnostic::Diagnostic> {
+    let method = model.body.iter().find_map(|item| match item {
+        crate::dialect::ModelBodyItem::Method { method, .. }
+            if method.name.as_str() == "validate"
+                && method.receiver == MethodReceiver::Instance
+                && matches!(method.kind, crate::dialect::AccessorKind::Method) =>
+        {
+            Some(method)
+        }
+        _ => None,
+    })?;
+    // The rules the lowering would put under `validate`.
+    let mut synthesized = Vec::new();
+    push_validate_method(&mut synthesized, model);
+    let has_rules = synthesized.iter().any(|m| m.name.as_str() == "validate");
+    // A parent whose `valid?` calls `validate`: ActiveRecord's, or an app
+    // model's (the AR hierarchy, or a tableless class's synthesized one).
+    let under_valid = model.parent.as_ref().is_some_and(|parent| {
+        parent.0.as_str() == "ActiveRecord::Base" || models.iter().any(|m| &m.name == parent)
+    });
+    if !has_rules && !under_valid {
+        return None;
+    }
+    let why = if has_rules {
+        "the lowered `valid?` runs its rules through a method named `validate`, which would replace this one"
+    } else {
+        "the inherited lowered `valid?` calls `validate` to run the rules, so it would run this method on every `valid?` and `save`"
+    };
+    let span = if method.name_span.is_synthetic() { model.span } else { method.name_span };
+    Some(crate::diagnostic::Diagnostic::unsupported(
+        span,
+        None,
+        "`def validate`",
+        format!(
+            "on `{}`: in Rails it replaces ActiveModel's `validate` alias of `valid?` and is a plain method that validation never calls; {why}",
+            model.name.0.as_str()
+        ),
+    ))
 }
 
 /// The model-body statements no lowering pass claims, each an
@@ -786,6 +851,7 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
 
     let (models, schema) = (&app.models, &app.schema);
     let callbacks = callback_dsl_calls(model, models);
+    let port_macros = gem_port_macro_calls(model, models);
     let macros = macro_replay::model_macro_verdicts(model, app);
     let mut out = Vec::new();
     for item in &model.body {
@@ -820,6 +886,34 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // lowered class by `model_class` and replayed through the
         // runtime port (`emit::ruby::library::model_callback_calls`).
         if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
+            continue;
+        }
+        // `private_constant :NAME` of a constant the body defines: not
+        // run (the lowered program reads constants through the class);
+        // each scoped read Ruby would refuse is an error instead
+        // (`private_constant::scoped_reads`). One naming a constant the
+        // body lacks raises NameError at load.
+        if let Some(names) = private_constant::marked_names(expr) {
+            let missing = private_constant::undefined(model, app, expr, &names);
+            if missing.is_empty() {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                expr.span,
+                None,
+                "private_constant",
+                format!(
+                    "on `{}`: {} not defined in the class body, so Ruby raises NameError when the class loads",
+                    model.name.0.as_str(),
+                    missing.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                ),
+            ));
+            continue;
+        }
+        // A class macro a gem runtime port's mixin gives the model
+        // (`database_documentation do ... end`): carried by `model_class`
+        // and replayed through the port.
+        if port_macros.iter().any(|c| std::ptr::eq(*c, expr)) {
             continue;
         }
         // A `delegate` ingest left because its names are called with
@@ -1032,7 +1126,13 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         // (`before_create -> { … }`) — both claimed by
         // markers::push_block_callback, on the shape it reads: a block,
         // or a parameterless lambda as the first argument.
-        if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
+        // The transaction callbacks' block forms, on the shapes
+        // `transaction_callbacks` lowers.
+        if self::transaction_callbacks::is_transaction_hook(name) {
+            if self::transaction_callbacks::claims(model, expr) {
+                continue;
+            }
+        } else if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
             if block.is_some() {
                 continue;
             }
@@ -1077,11 +1177,42 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
             expr.span,
             None,
             name,
-            format!("model DSL call on `{}` not lowered; the class does not run it", model.name.0.as_str()),
+            format!("model DSL call on `{}` not lowered; {}", model.name.0.as_str(), unlowered_dsl_reason(name)),
         );
         out.push(d);
     }
     out
+}
+
+/// Why the lowered class cannot run a framework DSL call nothing claims,
+/// where the call's Rails behavior is known to reach past the class body
+/// (tests/model_dsl_refusal_reasons.rs pins it natively); the generic
+/// reason otherwise.
+fn unlowered_dsl_reason(name: &str) -> &'static str {
+    match name {
+        // Rails merges the scope into every relation of the class
+        // (`all`, `find`, `count`, associations) and seeds new records
+        // with its `where` values; `unscoped` drops it. The compiled
+        // finders and the runtime relation build their SQL without it,
+        // so every read would return rows Rails filters out.
+        "default_scope" => {
+            "Rails applies a default_scope to every query of the class and to new records' \
+             attributes, and the lowered finders and relations do not apply it"
+        }
+        // Rails defines the attribute methods under the new name
+        // (`title`, `title=`, `title_changed?`, ...) and translates the
+        // name to the column in `new`, `where`, `order`, `pluck`. The
+        // lowered model compiles that for literal names over a column
+        // (`analyze::retypable_attributes::alias_attribute_decl`); any
+        // other alias (of an association, another alias, a computed
+        // name) gets neither the methods nor the key translation.
+        "alias_attribute" => {
+            "Rails answers the alias's attribute methods and translates the alias to its target in \
+             `new`, `where`, `order` and `pluck`, and the lowered model compiles that only for a literal \
+             new name over a literal column"
+        }
+        _ => "the class does not run it",
+    }
 }
 
 /// The passes other than model lowering that consume a model-body
@@ -1132,6 +1263,56 @@ pub(crate) fn claimed_in_model(_model: &Model, expr: &Expr) -> bool {
 /// `reset_callbacks`, …).
 fn callbacks_port_methods() -> &'static [String] {
     crate::analyze::runtime_reads::mixed_in_class_methods("ActiveSupport::Callbacks").unwrap_or(&[])
+}
+
+/// The body calls (bare or `self.`) of a class method that a module a
+/// gem runtime port declares gives the model through its `ClassMethods`
+/// (`runtime_reads::mixed_in_class_methods`), where the model or an app
+/// model ancestor includes that module: Core's 230 `database_documentation
+/// do |dd| ... end` under `include
+/// DatabaseDocumentation::ModelMetadata::Metadata`. `model_class` carries
+/// them into the lowered class beside the include, and the Ruby family
+/// replays them through the port (`emit::ruby::library::
+/// runtime_mixin_macro_calls`) in body order; a tree without the port
+/// file refuses the include. A class method of the model's own, or an
+/// ancestor's, of the same name answers instead, so its call is not one.
+pub(crate) fn gem_port_macro_calls<'a>(model: &'a Model, models: &[Model]) -> Vec<&'a Expr> {
+    let mut chain: Vec<&Model> = vec![model];
+    while let Some(parent) = chain.last().and_then(|m| m.parent.as_ref()) {
+        match models.iter().find(|m| &m.name == parent) {
+            Some(next) if !chain.iter().any(|seen| seen.name == next.name) => chain.push(next),
+            _ => break,
+        }
+    }
+    let app_module = |name: &ClassId| models.iter().any(|m| &m.name == name);
+    let provided: Vec<&str> = chain
+        .iter()
+        .flat_map(|m| crate::analyze::model_includes(m))
+        .filter(|module| !app_module(module) && crate::project::gem_port_declaring(module.0.as_str()).is_some())
+        .filter_map(|module| crate::analyze::runtime_reads::mixed_in_class_methods(module.0.as_str()))
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    if provided.is_empty() {
+        return Vec::new();
+    }
+    let own_class_method = |name: &str| {
+        chain.iter().any(|m| m.methods().any(|d| d.receiver == MethodReceiver::Class && d.name.as_str() == name))
+    };
+    model
+        .body
+        .iter()
+        .filter_map(|item| match item {
+            crate::dialect::ModelBodyItem::Unknown { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .filter(|expr| {
+            let ExprNode::Send { recv, method, .. } = &*expr.node else { return false };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+                && provided.contains(&method.as_str())
+                && !own_class_method(method.as_str())
+        })
+        .collect()
 }
 
 /// An STI subclass (a library class whose superclass is a model) that
@@ -1198,7 +1379,11 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
                     format!("model macro call on `{}` not lowered; {reason}", lc.name.0.as_str())
                 }
                 Some((_, macro_replay::MacroVerdict::BelongsToRequiredByDefault(_))) => continue,
-                _ => format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
+                _ => format!(
+                    "STI subclass body call on `{}` not lowered; {}",
+                    lc.name.0.as_str(),
+                    unlowered_dsl_reason(dropped_statement_name(call).as_str())
+                ),
             };
             out.push(crate::diagnostic::Diagnostic::unsupported(call.span, None, dropped_statement_name(call).as_str(), detail));
         }
@@ -1785,6 +1970,7 @@ fn build_methods_for_dialect(
     // `generate_token_for` wins.
     crate::lower::generates_token_for::push_token_for_methods(&mut methods, model);
     push_callback_methods(&mut methods, model);
+    self::transaction_callbacks::push_transaction_callback_methods(&mut methods, model, models);
 
     // File-grain catch-all (mirrors view_to_library's
     // build_library_class): whatever the synthesizers left span-less —

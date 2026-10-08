@@ -735,7 +735,7 @@ pub(super) fn push_unknown_marker_methods(methods: &mut Vec<MethodDef>, model: &
 /// `push_block_callback`. Recursive over the whole body; only fires
 /// for `LValue::Attr` targets on `self` naming a schema string
 /// column.
-fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
+pub(super) fn rewrite_column_or_assign(e: &mut Expr, model: &Model) {
     use crate::expr::{LValue, OpAssignOp};
     let hit = match &*e.node {
         ExprNode::OpAssign {
@@ -1276,6 +1276,7 @@ pub(crate) const BLOCK_CALLBACK_HOOKS: &[&str] = &[
     "after_update_commit",
     "after_destroy_commit",
     "after_save_commit",
+    "before_commit",
 ];
 
 /// Lower lifecycle callbacks — both the symbol-form declarations
@@ -1318,14 +1319,14 @@ fn push_symbol_callback(
     cb: &crate::dialect::Callback,
     span: Span,
 ) {
-    use crate::dialect::{CallbackHook as Hook, CallbackOn as On};
+    use crate::dialect::CallbackHook as Hook;
 
-    let hook_name = match (cb.hook, cb.on) {
-        (Hook::AfterCommit, Some(On::Create)) => "after_create_commit",
-        (Hook::AfterCommit, Some(On::Update)) => "after_update_commit",
-        (Hook::AfterCommit, Some(On::Destroy)) => "after_destroy_commit",
-        (hook, _) => hook_method_name(hook),
-    };
+    // The transaction callbacks build their chains in
+    // `transaction_callbacks`.
+    if cb.hook.is_transaction() {
+        return;
+    }
+    let hook_name = hook_method_name(cb.hook);
     let self_call = |name: &Symbol| {
         Expr::new(
             span,
@@ -1432,6 +1433,7 @@ fn hook_method_name(hook: crate::dialect::CallbackHook) -> &'static str {
         Hook::AfterCommit => "after_commit",
         Hook::AfterSaveCommit => "after_save_commit",
         Hook::AfterRollback => "after_rollback",
+        Hook::BeforeCommit => "before_commit",
     }
 }
 
@@ -1517,7 +1519,7 @@ fn push_block_callback(methods: &mut Vec<MethodDef>, model: &Model, expr: &Expr)
             _ => return,
         };
         let hook = method.as_str();
-        if !BLOCK_CALLBACK_HOOKS.contains(&hook) {
+        if !BLOCK_CALLBACK_HOOKS.contains(&hook) || super::transaction_callbacks::is_transaction_hook(hook) {
             return;
         }
         // Same structural lowering as the symbol form: after_commit

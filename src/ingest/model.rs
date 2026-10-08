@@ -704,6 +704,7 @@ pub(super) fn ingest_model_with_enum_constants(
         attribute_aliases: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
+        after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key,
         table: TableRef(Symbol::from(table_name)),
@@ -2393,6 +2394,9 @@ fn parse_callback(
 ) -> Option<crate::dialect::Callback> {
     use crate::dialect::{Callback, CallbackHook, CallbackOn};
 
+    if let Some(callback) = transaction_callback(call, method, file) {
+        return callback;
+    }
     let hook = match method {
         "before_validation" => CallbackHook::BeforeValidation,
         "after_validation" => CallbackHook::AfterValidation,
@@ -2404,35 +2408,8 @@ fn parse_callback(
         "after_update" => CallbackHook::AfterUpdate,
         "before_destroy" => CallbackHook::BeforeDestroy,
         "after_destroy" => CallbackHook::AfterDestroy,
-        "after_commit" => CallbackHook::AfterCommit,
-        // Rails' per-lifecycle SUGAR for `after_commit … on: <event>`.
-        // Only the block form of these was ever recognized
-        // (`BLOCK_CALLBACK_HOOKS`); the symbol form fell through to
-        // Unknown, so campfire's `after_create_commit
-        // :grant_membership_to_open_rooms` and `Rooms::Open`'s
-        // `after_save_commit :grant_access_to_all_users` were DROPPED —
-        // the method emitted and nothing ever called it.
-        //
-        // Each maps to the runtime hook of the same name, which
-        // `save_after_validation` / `destroy` already fire in Rails'
-        // order. `on:` is not accepted alongside them, exactly as Rails
-        // refuses it ("You can't specify on with after_create_commit").
-        "after_create_commit" => CallbackHook::AfterCommit,
-        "after_update_commit" => CallbackHook::AfterCommit,
-        "after_destroy_commit" => CallbackHook::AfterCommit,
-        "after_save_commit" => CallbackHook::AfterSaveCommit,
-        "after_rollback" => CallbackHook::AfterRollback,
         _ => return None,
     };
-    // The lifecycle the sugar spelling pins, which `push_symbol_callback`
-    // reads back off `on:` to pick the hook method.
-    let sugar_on = match method {
-        "after_create_commit" => Some(CallbackOn::Create),
-        "after_update_commit" => Some(CallbackOn::Update),
-        "after_destroy_commit" => Some(CallbackOn::Destroy),
-        _ => None,
-    };
-
     let args = call.arguments()?;
     let mut targets: Vec<Symbol> = Vec::new();
     let mut on: Option<CallbackOn> = None;
@@ -2480,28 +2457,13 @@ fn parse_callback(
     if targets.is_empty() {
         return None;
     }
-    // A sugar spelling pins its own lifecycle; an explicit `on:` beside
-    // it is not Rails and is not guessed at.
-    if sugar_on.is_some() {
-        if on.is_some() {
-            return None;
-        }
-        on = sugar_on;
-    }
     // `on:` is only expressible where the runtime hook surface can
-    // carry it — validation hooks (new_record? guard) and after_commit
-    // (mapped onto the per-lifecycle `after_*_commit` hooks). Rails
+    // carry it — the validation hooks (new_record? guard). Rails
     // doesn't accept `on:` for the save/create/update/destroy hooks,
     // so anything else here is either source that doesn't run in
-    // Rails or a shape we can't lower faithfully.
-    if on.is_some()
-        && !matches!(
-            hook,
-            CallbackHook::BeforeValidation
-                | CallbackHook::AfterValidation
-                | CallbackHook::AfterCommit
-        )
-    {
+    // Rails or a shape we can't lower faithfully. (The transaction
+    // hooks take theirs in `transaction_callback`.)
+    if on.is_some() && !matches!(hook, CallbackHook::BeforeValidation | CallbackHook::AfterValidation) {
         return None;
     }
 
@@ -2512,7 +2474,191 @@ fn parse_callback(
         (Some(a), Some(b)) => Some(and_condition(a, negate_condition(b))),
     };
 
-    Some(Callback { hook, targets, on, condition })
+    Some(Callback { hook, targets, on, condition, on_any: Vec::new(), object: None, prepend: false })
+}
+
+/// The transaction callbacks (activerecord transactions.rb, the Rails
+/// native Core runs): `after_commit` and its `after_{create,update,
+/// destroy,save}_commit` sugar, `after_rollback`, `before_commit`.
+/// `None` for any other name; `Some(None)` for a declaration of one this
+/// does not model, which stays an Unknown item (and is reported).
+///
+/// What Rails' `set_options_for_callbacks!` and `set_callback` accept:
+/// - symbol targets (`after_commit :a, :b`), or one callback object (a
+///   constant, `Foo.new(...)`, any non-symbol expression that is not a
+///   lambda), which Rails calls as `<hook>(record)`. A lambda or block
+///   target is the block form (`markers::push_block_callback`);
+/// - `on:` a symbol or an array of `:create`/`:update`/`:destroy`; the
+///   sugar spellings enforce theirs over any written one, as
+///   `options.merge!(enforced_options)` does;
+/// - `if:`/`unless:` a symbol, a lambda (no parameter, or one: Rails
+///   `instance_exec`s it with the record as `self` and as the argument),
+///   or an array of those, all of which must hold;
+/// - `prepend:` a literal boolean;
+/// - any other key, which ActiveSupport::Callbacks ignores: Core writes
+///   `only: :create` six times, and native Rails runs those callbacks on
+///   every action (checked on the pinned Rails, tests/transaction_callbacks_pg_runtime.rs).
+fn transaction_callback(
+    call: &ruby_prism::CallNode<'_>,
+    method: &str,
+    file: &str,
+) -> Option<Option<crate::dialect::Callback>> {
+    use crate::dialect::{Callback, CallbackHook, CallbackOn};
+
+    let (hook, enforced): (CallbackHook, &[CallbackOn]) = match method {
+        "after_commit" => (CallbackHook::AfterCommit, &[]),
+        "after_create_commit" => (CallbackHook::AfterCommit, &[CallbackOn::Create]),
+        "after_update_commit" => (CallbackHook::AfterCommit, &[CallbackOn::Update]),
+        "after_destroy_commit" => (CallbackHook::AfterCommit, &[CallbackOn::Destroy]),
+        "after_save_commit" => (CallbackHook::AfterCommit, &[CallbackOn::Create, CallbackOn::Update]),
+        "after_rollback" => (CallbackHook::AfterRollback, &[]),
+        "before_commit" => (CallbackHook::BeforeCommit, &[]),
+        _ => return None,
+    };
+    let parsed = (|| {
+        if call.block().is_some() {
+            return None;
+        }
+        let args = call.arguments()?;
+        let mut targets: Vec<Symbol> = Vec::new();
+        let mut object: Option<Expr> = None;
+        let mut on_any: Vec<CallbackOn> = Vec::new();
+        // ActiveSupport::Callbacks evaluates every `if:` and then every
+        // `unless:`, whichever key is written first.
+        let mut conditions: Vec<Expr> = Vec::new();
+        let mut unless_conditions: Vec<Expr> = Vec::new();
+        let mut prepend = false;
+        for arg in args.arguments().iter() {
+            if let Some(sym) = symbol_value(&arg) {
+                targets.push(Symbol::from(sym.as_str()));
+            } else if let Some(kh) = arg.as_keyword_hash_node() {
+                for el in kh.elements().iter() {
+                    let assoc = el.as_assoc_node()?;
+                    let key = symbol_value(&assoc.key())?;
+                    let value = assoc.value();
+                    match key.as_str() {
+                        "on" => {
+                            on_any.clear();
+                            let values: Vec<ruby_prism::Node<'_>> = match value.as_array_node() {
+                                Some(array) => array.elements().iter().collect(),
+                                None => vec![value],
+                            };
+                            for v in values {
+                                let action = match symbol_value(&v)?.as_str() {
+                                    "create" => CallbackOn::Create,
+                                    "update" => CallbackOn::Update,
+                                    "destroy" => CallbackOn::Destroy,
+                                    // Rails raises ArgumentError at class load.
+                                    _ => return None,
+                                };
+                                on_any.push(action);
+                            }
+                        }
+                        "if" | "unless" => {
+                            let values: Vec<ruby_prism::Node<'_>> = match value.as_array_node() {
+                                Some(array) => array.elements().iter().collect(),
+                                None => vec![value],
+                            };
+                            for v in values {
+                                let cond = transaction_callback_condition(&v, file)?;
+                                if key == "if" {
+                                    conditions.push(cond);
+                                } else {
+                                    unless_conditions.push(negate_condition(cond));
+                                }
+                            }
+                        }
+                        "prepend" => {
+                            prepend = if value.as_true_node().is_some() {
+                                true
+                            } else if value.as_false_node().is_some() {
+                                false
+                            } else {
+                                return None;
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            } else if arg.as_lambda_node().is_some()
+                || arg.as_block_argument_node().is_some()
+                || spelled_lambda_parts(&arg).is_some()
+                || object.is_some()
+            {
+                return None;
+            } else {
+                object = Some(ingest_expr(&arg, file).ok()?);
+            }
+        }
+        if targets.is_empty() == object.is_none() {
+            return None;
+        }
+        if !enforced.is_empty() {
+            on_any = enforced.to_vec();
+        }
+        let condition = conditions.into_iter().chain(unless_conditions).reduce(and_condition);
+        Some(Callback { hook, targets, on: None, condition, on_any, object, prepend })
+    })();
+    Some(parsed)
+}
+
+/// One `if:`/`unless:` condition of a transaction callback: a symbol (the
+/// predicate method), or a lambda/proc whose one expression is the guard
+/// (`simple_condition_body`). A one-parameter lambda is
+/// `instance_exec(record, &block)` in ActiveSupport::Callbacks, so its
+/// parameter is the record, as `self` is: its reads become `self`.
+fn transaction_callback_condition(value: &ruby_prism::Node<'_>, file: &str) -> Option<Expr> {
+    let (params, body) = if let Some(lambda) = value.as_lambda_node() {
+        (lambda.parameters(), lambda.body())
+    } else if let Some(parts) = spelled_lambda_parts(value) {
+        parts
+    } else {
+        return callback_condition(value, file);
+    };
+    let record = params.as_ref().and_then(single_required_param);
+    let params = if record.is_some() { None } else { params };
+    let body = simple_condition_body(params, body)?;
+    let mut cond = ingest_expr(&body, file).ok()?;
+    if let Some(name) = record {
+        let mut bound = false;
+        rebind_local_to_self(&mut cond, &name, &mut bound);
+    }
+    Some(cond)
+}
+
+/// The name of a block's single required parameter (`|r|`, `(r)`), or
+/// None for any other parameter list.
+fn single_required_param(params: &ruby_prism::Node<'_>) -> Option<String> {
+    let bp = params.as_block_parameters_node()?;
+    if bp.locals().iter().next().is_some() {
+        return None;
+    }
+    let p = bp.parameters()?;
+    if p.optionals().iter().next().is_some()
+        || p.rest().is_some()
+        || p.posts().iter().next().is_some()
+        || p.keywords().iter().next().is_some()
+        || p.keyword_rest().is_some()
+        || p.block().is_some()
+    {
+        return None;
+    }
+    let mut reqs = p.requireds().iter();
+    let only = reqs.next()?.as_required_parameter_node()?;
+    if reqs.next().is_some() {
+        return None;
+    }
+    Some(constant_id_str(&only.name()).to_string())
+}
+
+/// Every read of the local `name` in `expr` becomes `self`.
+fn rebind_local_to_self(expr: &mut Expr, name: &str, bound: &mut bool) {
+    if matches!(&*expr.node, ExprNode::Var { name: n, .. } if n.as_str() == name) {
+        *expr = Expr::new(expr.span, ExprNode::SelfRef);
+        *bound = true;
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |child| rebind_local_to_self(child, name, bound));
 }
 
 /// A callback's `if:`/`unless:` value → the condition expression that

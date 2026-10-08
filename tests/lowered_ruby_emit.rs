@@ -425,26 +425,34 @@ fn comment_emits_view_require_for_own_partial_and_parent() {
 fn comment_broadcasts_compose_with_block_form_callback() {
     // Comment has both `broadcasts_to` AND
     // `after_create_commit { article.broadcast_replace_to(...) rescue nil }`.
-    // The two sources fold into one method body; broadcasts_to runs
-    // first (source order in the lowering), block-form follows.
-    // The block-form's Rails-API call is rewritten to spinel-shape.
+    // In Rails both are callbacks of the one commit chain, which runs
+    // from its last callback to its first: the block (declared after
+    // `broadcasts_to`) runs before the broadcast's append. The block
+    // is the model's commit chain (`_run_commit_callbacks`), which the
+    // runtime runs ahead of the `after_create_commit` hook broadcasts_to
+    // folds into. The block-form's Rails-API call is rewritten to
+    // spinel-shape.
     let files = lowered_real_blog();
     let src = find(&files, "comment.rb");
-    let create_block = src
+    let create_hook = src
         .split("def after_create_commit").nth(1).unwrap()
         .split("def ").next().unwrap();
+    assert!(create_hook.contains("Broadcasts.append"), "expected the broadcast; got:\n{create_hook}");
+    let chain = src
+        .split("def _run_commit_callbacks").nth(1).unwrap()
+        .split("def ").next().unwrap();
     assert!(
-        create_block.contains("Broadcasts.append")
-            && create_block.contains("parent = self.article")
-            && create_block.contains("Broadcasts.replace(stream: \"articles\""),
-        "expected composed body; got:\n{create_block}",
+        chain.contains("_comment_transaction_callback_4 if self._transaction_include_create?")
+            && chain.contains("_comment_transaction_callback_5 if self._transaction_include_destroy?"),
+        "expected the block callbacks in the chain; got:\n{chain}",
     );
-    // The original broadcasts_to-derived Broadcasts.append appears
-    // BEFORE the rewritten parent-cascade — composition order matches
-    // source-order semantics.
-    let pos_append = create_block.find("Broadcasts.append").unwrap();
-    let pos_parent = create_block.find("parent = self.article").unwrap();
-    assert!(pos_append < pos_parent, "{create_block}");
+    let block = src
+        .split("def _comment_transaction_callback_4").nth(1).unwrap()
+        .split("def ").next().unwrap();
+    assert!(
+        block.contains("parent = self.article") && block.contains("Broadcasts.replace(stream: \"articles\""),
+        "expected the rewritten parent cascade; got:\n{block}",
+    );
 }
 
 #[test]

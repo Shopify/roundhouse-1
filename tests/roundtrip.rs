@@ -68,6 +68,7 @@ fn tiny_blog_round_trips() {
         attribute_aliases: Vec::new(),
         query_constraints: Vec::new(),
         claimed_body_calls: Vec::new(),
+        after_transaction_callbacks_in_order: false,
         ignored_columns: Vec::new(),
         composite_primary_key: Vec::new(),
         span: Span::synthetic(),

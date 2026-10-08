@@ -1095,6 +1095,9 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     // (`environments::collect_programs`).
     let mut initializer_config_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
+    // `ActiveRecord.run_after_transaction_callbacks_in_order_defined`:
+    // Rails' default without an application.rb that sets it.
+    let mut transaction_callbacks_in_order = false;
     let app_config_path = dir.join("config/application.rb");
     if let Ok(source) = vfs.read(&app_config_path) {
         let file = app_config_path.display().to_string();
@@ -1205,6 +1208,38 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
         // Application reopen, the same shape as `session_cookie_key`
         // above; the namespace itself is dropped at ingest, so without
         // this the name is gone by emit time.
+        // The transaction-callback settings (activerecord 8.2.0.alpha
+        // transactions.rb / transaction.rb): the order the after_commit
+        // and after_rollback chains are declared in is applied where the
+        // models are lowered; the other two are read by the runtime's
+        // transaction port, synthesized on the reopen.
+        let txn = extract_transaction_callback_config(&source);
+        for unsupported in &txn.unsupported {
+            push_ingest_drop(&mut app, &file, &IngestError::Unsupported {
+                file: file.clone(),
+                message: format!(
+                    "`config.active_record.{unsupported}` is not a literal true/false; the emitted runtime \
+                     applies only a literal value of it"
+                ),
+            });
+        }
+        transaction_callbacks_in_order = txn.in_order;
+        // Only a setting that differs from the framework default is
+        // synthesized; the runtime falls back to the default otherwise.
+        let mut overrides = String::new();
+        if txn.before_committed_on_all_records {
+            overrides.push_str("def active_record_before_committed_on_all_records\n  true\nend\n");
+        }
+        if !txn.first_saved_instances {
+            overrides.push_str(
+                "def active_record_run_commit_callbacks_on_first_saved_instances_in_transaction\n  false\nend\n",
+            );
+        }
+        if !overrides.is_empty() {
+            if let Ok(mut synth) = crate::runtime_src::parse_methods(&overrides) {
+                methods.append(&mut synth);
+            }
+        }
         if let Some(name) = extract_app_namespace(&source) {
             let app_name = crate::naming::underscore(&name);
             if let Ok(mut synth) = crate::runtime_src::parse_methods(&format!(
@@ -2625,6 +2660,9 @@ end
     // `app.models` before anything downstream enumerates models.
     crate::lower::rich_text::synthesize_record_model(&mut app);
     crate::lower::plain_text_attr::synthesize_record_model(&mut app);
+    for model in &mut app.models {
+        model.after_transaction_callbacks_in_order = transaction_callbacks_in_order;
+    }
     app.const_resolver = crate::timings::phase("rubydex: wait", || const_resolver.finish());
     super::test::resolve_test_parents(&mut app);
     super::library_class::resolve_library_parents(&mut app);
@@ -9581,6 +9619,67 @@ fn extract_active_support_cache_config(source: &[u8]) -> (Option<String>, Option
         }
     }
     (format, digest)
+}
+
+/// The Active Record settings the transaction callbacks read, as
+/// config/application.rb leaves them.
+#[derive(Debug, PartialEq)]
+struct TransactionCallbackConfig {
+    /// `run_after_transaction_callbacks_in_order_defined`.
+    in_order: bool,
+    /// `before_committed_on_all_records`.
+    before_committed_on_all_records: bool,
+    /// `run_commit_callbacks_on_first_saved_instances_in_transaction`.
+    first_saved_instances: bool,
+    /// The keys written with a value other than a literal boolean.
+    unsupported: Vec<&'static str>,
+}
+
+/// activerecord 8.2.0.alpha: `ActiveRecord.run_after_transaction_callbacks_in_order_defined`
+/// and `ActiveRecord.before_committed_on_all_records` default to false
+/// and `Base.run_commit_callbacks_on_first_saved_instances_in_transaction`
+/// to true; `load_defaults` 7.1 and later (railties
+/// application/configuration.rb) flip all three; a later
+/// `config.active_record.<key> = true|false` wins. Shopify Core loads 8.1
+/// defaults and sets the first two back to false.
+fn extract_transaction_callback_config(source: &[u8]) -> TransactionCallbackConfig {
+    const KEYS: [&str; 3] = [
+        "run_after_transaction_callbacks_in_order_defined",
+        "before_committed_on_all_records",
+        "run_commit_callbacks_on_first_saved_instances_in_transaction",
+    ];
+    let source = String::from_utf8_lossy(source);
+    let mut values = [false, false, true];
+    let mut unsupported = Vec::new();
+    for line in source.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("config.load_defaults") {
+            let v = rest.trim().trim_start_matches('(').trim_end_matches(')').trim().trim_matches(['"', '\'']);
+            if v.parse::<f64>().is_ok_and(|version| version >= 7.1) {
+                values = [true, true, false];
+            }
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("config.active_record.") else { continue };
+        for (i, key) in KEYS.iter().enumerate() {
+            let Some(value) = rest.strip_prefix(key).and_then(|r| r.trim_start().strip_prefix('=')) else { continue };
+            let value = value.split('#').next().unwrap_or("").trim();
+            match value {
+                "true" => values[i] = true,
+                "false" => values[i] = false,
+                _ => unsupported.push(*key),
+            }
+        }
+    }
+    TransactionCallbackConfig {
+        in_order: values[0],
+        before_committed_on_all_records: values[1],
+        first_saved_instances: values[2],
+        unsupported,
+    }
 }
 
 fn extract_config_time_zone(source: &[u8]) -> Option<String> {

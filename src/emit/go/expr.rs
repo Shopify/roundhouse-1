@@ -3128,6 +3128,12 @@ fn is_modeler_member(name: &str) -> bool {
             | "after_create_commit"
             | "after_update_commit"
             | "after_destroy_commit"
+            // The lowered transaction-callback chains: Base's commit
+            // and rollback paths call them; models that declare
+            // after_commit / after_rollback / before_commit override.
+            | "_run_commit_callbacks"
+            | "_run_rollback_callbacks"
+            | "_run_before_commit_callbacks"
     )
 }
 
@@ -3233,6 +3239,11 @@ fn is_known_class_method(name: &str) -> bool {
         // `instance.mark_persisted!` defaults to bare-field-read
         // shape; force parens so Go method-call promotion fires.
         | "mark_persisted!"
+        // Base's transaction-action predicates, read by the lowered
+        // commit chains' `on:` guards (`self._transaction_include_create?`).
+        | "_transaction_include_create?"
+        | "_transaction_include_update?"
+        | "_transaction_include_destroy?"
         // `has_many` / `belongs_to` relation methods. The lowerer
         // synthesizes per-model accessor methods (`Article#comments`
         // returns `[]*Comment`, `Comment#article` returns `*Article`)

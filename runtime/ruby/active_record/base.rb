@@ -253,6 +253,10 @@ module ActiveRecord
       @id_previously_changed = false
       @persisted = false
       @destroyed = false
+      @_new_record_before_last_commit = false
+      @_trigger_update_callback = false
+      @_trigger_destroy_callback = false
+      @_committed_already_called = false
     end
 
     # `Model.connection` / `Model.transaction` — the raw-SQL surface —
@@ -685,7 +689,15 @@ module ActiveRecord
     # ruby-family connection.rb reopen) can enter here directly:
     # validations and their callbacks skipped, save callbacks run —
     # Rails' documented contract for those writes.
+    #
+    # The transaction callbacks (after_commit and its sugar,
+    # after_rollback, before_commit) run once the write is committed:
+    # `_transaction_write_begin` / `_transaction_write_end` below. Rails
+    # sets `@_trigger_update_callback` from the UPDATE's affected-row
+    # count; `_adapter_update` does not report one, so an update always
+    # counts as one row.
     def save_after_validation
+      _transaction_write_begin
       before_save
       was_new = new_record?
       if was_new
@@ -695,19 +707,92 @@ module ActiveRecord
         @persisted = true
         __track_saved_changes(was_new)
         after_create
-        after_create_commit
       else
         before_update
         fill_timestamps(false)
         _adapter_update
+        @_trigger_update_callback = true
         __track_saved_changes(was_new)
         after_update
-        after_update_commit
       end
       after_save
-      after_save_commit
-      after_commit
+      _transaction_write_end
       true
+    end
+
+    # ---- Transaction callbacks (activerecord transactions.rb) -------
+    # A model's after_commit / after_rollback / before_commit
+    # declarations are lowered into the three `_run_*_callbacks`
+    # methods below, each one Rails' callback chain for the model in the
+    # order Rails runs it, with each callback's `on:` as a guard on the
+    # `_transaction_include_*?` predicates. Without a transaction port
+    # (this file on every target) a write commits as it happens, so the
+    # callbacks run at the end of the write: before_commit, then the
+    # commit chain when the write triggers it. The CRuby PostgreSQL
+    # runtime (active_record_transactions.rb) overrides the begin/end
+    # pair and runs them when the outermost transaction commits or
+    # rolls back, as Rails does.
+    def _run_commit_callbacks; end
+    def _run_rollback_callbacks; end
+    def _run_before_commit_callbacks; end
+
+    # transactions.rb `remember_transaction_record_state`'s half that
+    # the callbacks read: a save inside a commit callback is not a
+    # create for the callbacks.
+    def _transaction_write_begin
+      @_new_record_before_last_commit = new_record? && !@_committed_already_called
+    end
+
+    def _transaction_write_end
+      _run_before_commit_callbacks
+      _transaction_committed
+    end
+
+    # transactions.rb `committed!`. The commit-hook overrides a model
+    # can still carry (broadcasts_to, an STI subclass's symbol
+    # callbacks) run after the lowered chain.
+    def _transaction_committed
+      if _trigger_transactional_callbacks?
+        @_committed_already_called = true
+        _run_commit_hooks
+      end
+      @_committed_already_called = false
+      @_trigger_update_callback = false
+      @_trigger_destroy_callback = false
+    end
+
+    def _run_commit_hooks
+      _run_commit_callbacks
+      after_create_commit if _transaction_include_create?
+      after_update_commit if _transaction_include_update?
+      after_destroy_commit if _transaction_include_destroy?
+      after_save_commit if _transaction_include_create? || _transaction_include_update?
+      after_commit
+    end
+
+    # transactions.rb `rolledback!`'s callbacks.
+    def _transaction_rolled_back
+      _run_rollback_callbacks
+      after_rollback
+    end
+
+    # transactions.rb `trigger_transactional_callbacks?`.
+    def _trigger_transactional_callbacks?
+      ((@_new_record_before_last_commit || @_trigger_update_callback) && persisted?) ||
+        (@_trigger_destroy_callback && destroyed?)
+    end
+
+    # transactions.rb `transaction_include_any_action?`, one action each.
+    def _transaction_include_create?
+      persisted? && @_new_record_before_last_commit
+    end
+
+    def _transaction_include_update?
+      !(@_new_record_before_last_commit || destroyed?) && @_trigger_update_callback
+    end
+
+    def _transaction_include_destroy?
+      @_trigger_destroy_callback
     end
 
     # ---- Saved-change tracking (ActiveModel::Dirty subset) ----------
@@ -905,12 +990,15 @@ module ActiveRecord
     # its Message, and Message's own `belongs_to :room, touch: true`
     # is registered on `after_touch` — so without this call the
     # cascade stops one level short and a room's `updated_at` never
-    # moves. (Rails also fires the commit callbacks here; this runtime
-    # still does not, and that half of the divergence stands.)
+    # moves. The commit callbacks run as Rails runs them: an update
+    # when the model has an `updated_at` to touch.
     def touch
+      _transaction_write_begin
       fill_timestamps(false)
       _adapter_update
+      @_trigger_update_callback = true if self.class.schema_columns.include?(:updated_at)
       after_touch
+      _transaction_write_end
       true
     end
 
@@ -927,13 +1015,14 @@ module ActiveRecord
 
     def destroy
       return self unless persisted?
+      _transaction_write_begin
       before_destroy
       _adapter_delete
+      @_trigger_destroy_callback = true
       @persisted = false
       @destroyed = true
       after_destroy
-      after_destroy_commit
-      after_commit
+      _transaction_write_end
       self
     end
 
@@ -982,6 +1071,7 @@ module ActiveRecord
     def after_update_commit;  end
     def after_destroy_commit; end
     def after_save_commit;    end
+    def after_rollback;       end
     def after_touch;          end
 
     # Subclasses define their own `validate` if they need any.

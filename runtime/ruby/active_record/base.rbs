@@ -250,7 +250,26 @@ module ActiveRecord
     def after_update_commit: () -> void
     def after_destroy_commit: () -> void
     def after_save_commit: () -> void
+    def after_rollback: () -> void
     def after_touch: () -> void
+
+    # Transaction callbacks: the lowered chains and the state they read.
+    @_new_record_before_last_commit: bool
+    @_trigger_update_callback: bool
+    @_trigger_destroy_callback: bool
+    @_committed_already_called: bool
+    def _run_commit_callbacks: () -> void
+    def _run_rollback_callbacks: () -> void
+    def _run_before_commit_callbacks: () -> void
+    def _transaction_write_begin: () -> void
+    def _transaction_write_end: () -> void
+    def _transaction_committed: () -> void
+    def _run_commit_hooks: () -> void
+    def _transaction_rolled_back: () -> void
+    def _trigger_transactional_callbacks?: () -> bool
+    def _transaction_include_create?: () -> bool
+    def _transaction_include_update?: () -> bool
+    def _transaction_include_destroy?: () -> bool
 
     def validate: () -> void
 

@@ -136,14 +136,17 @@ fn is_lifecycle_callback(name: &str) -> bool {
 /// `Base.attribute` retypes a column the model compiled with the path
 /// that consults a declared type (`Model::retypable_attributes`), and
 /// raises with the name for any other; `Base.query_constraints` takes
-/// the model's compiled list (`Model::query_constraints`). Ingest records
+/// the model's compiled list (`Model::query_constraints`);
+/// `Base.alias_attribute` checks the alias against the compiled ones
+/// (`Model::attribute_aliases`, which counts a macro's top-level
+/// `alias_attribute` statements over its parameters). Ingest records
 /// the macro calls whose literal columns those answer
 /// (`Model::claimed_body_calls`, `analyze::retypable_attributes`); for
 /// such a call (`answered`, decided per call in [`ClassSide::verdict`])
 /// the walk lets both through and judges the rest of what the macro does.
 fn runtime_answers_at_class_body(name: &str, answered: bool) -> bool {
     match name {
-        "attribute" | "query_constraints" => answered,
+        "attribute" | "query_constraints" | "alias_attribute" => answered,
         _ => false,
     }
 }
@@ -653,7 +656,8 @@ impl<'s, 'a> Walk<'s, 'a> {
 /// The verdicts on `model`'s body statements that call app class macros,
 /// extend app modules or write `belongs_to_required_by_default`, by item.
 pub(crate) fn model_macro_verdicts<'a>(model: &'a Model, app: &'a crate::App) -> Vec<(&'a Expr, MacroVerdict)> {
-    let callbacks = super::callback_dsl_calls(model, &app.models);
+    let mut callbacks = super::callback_dsl_calls(model, &app.models);
+    callbacks.extend(super::gem_port_macro_calls(model, &app.models));
     let side = ClassSide::of_model(model, app);
     model
         .body
