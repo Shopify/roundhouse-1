@@ -68,6 +68,7 @@ module ActiveRecord
     def self.attribute_types: () -> Hash[String, ActiveModel::Type::Value]
     def self._cast_type_for_spec: (String name, Array[(Symbol | Integer | String)?] spec) -> ActiveModel::Type::Value
     def self.attribute: (String | Symbol name, ?untyped type, ?default: untyped, **untyped options) -> nil
+    def self.serialize: (String | Symbol attr_name, ?coder: untyped, ?type: untyped, ?comparable: bool, ?yaml: Hash[Symbol, untyped], **untyped options) -> nil
     def self._retypable_attribute_names: () -> Array[String]
     def self.query_constraints: (*(String | Symbol) columns_list) -> Array[String]
     def self.has_query_constraints?: () -> Array[String]?
@@ -80,6 +81,7 @@ module ActiveRecord
     def self._declared_attribute_types: () -> Hash[String, untyped]
     def self._reset_attribute_types: () -> untyped
     def self._attribute_cast: (String name, untyped value) -> untyped
+    def self._attribute_force_equality?: (String name, untyped value) -> bool
     def self._attribute_deserialize: (String name, untyped value) -> untyped
     def self._bind_type_cast: (String name, untyped value) -> untyped
     def self._bind_bool_text: (bool flag) -> String

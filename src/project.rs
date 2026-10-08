@@ -11157,16 +11157,19 @@ const ACTIVE_MODEL_TYPE_METHODS: &[&str] = &["type_for_attribute", "attribute_ty
 /// True where the app's own emitted code (not the runtime, not a test
 /// body) names a namespace the type port declares, in any position a
 /// constant takes (`mentions_messages_constant`), or calls a method that
-/// answers its types.
+/// answers its types, or runs a class-body `serialize` (an app coder's,
+/// `analyze::retypable_attributes::serialized_column`; the runtime's
+/// `serialize` builds the port's Type::Serialized).
 fn carries_active_model_type(files: &[(String, String)]) -> bool {
     files.iter().any(|(path, content)| {
         path.ends_with(".rb")
             && !path.starts_with("runtime/")
             && !path.starts_with("test/")
-            && ACTIVE_MODEL_TYPE_NAMES
+            && (ACTIVE_MODEL_TYPE_NAMES
                 .iter()
                 .chain(ACTIVE_MODEL_TYPE_METHODS)
                 .any(|name| mentions_messages_constant(content, name))
+                || content.lines().any(|line| line.trim_start().starts_with("serialize :")))
     })
 }
 
@@ -12955,6 +12958,7 @@ mod tests {
             "TYPES = [ActiveRecord::Type::Text, ActiveModel::Type::Boolean]\n",
             "type = self.class.type_for_attribute(name)\n",
             "Widget.attribute_types.each_key { |k| p k }\n",
+            "  serialize :tags, coder: PipeCoder, type: Array\n",
         ] {
             let mut with = files.clone();
             with.push(("components/x/lib/schema.rb".to_string(), use_site.to_string()));

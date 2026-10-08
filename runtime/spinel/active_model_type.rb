@@ -32,7 +32,11 @@
 # - `ActiveRecord.default_timezone` and `Time.zone_default` are read when
 #   the tree defines them; otherwise they are their native defaults (:utc,
 #   no zone), so every time casts in UTC.
-# - The other types (Date, Time, Float, Json, Serialized) are not
+# - ActiveRecord::Type::Serialized and Coders::ColumnSerializer, the
+#   decorator and the `type:` check `serialize` builds over an app coder,
+#   are ported (type/serialized.rb, coders/column_serializer.rb; see
+#   them below). The JSON and YAML coders are not.
+# - The other types (Date, Time, Float, Json) are not
 #   ported. The registries are (see the end of this file); a built-in
 #   name whose class is missing raises NotImplementedError on lookup,
 #   and the runtime's `type_for_attribute` raises it for a column whose
@@ -970,6 +974,227 @@ module ActiveRecord
 
       def self.type?(type) # :nodoc:
         self === type && type.query_predicates?
+      end
+    end
+  end
+end
+
+module ActiveRecord
+  module Type
+    # ActiveSupport::Delegation::DelegateClass(ActiveModel::Type::Value),
+    # which Serialized is built on: every public method of Value, and
+    # `to_s`, `hash` and `<=>`, answers the wrapped type's, as does any
+    # other method the wrapped type answers. `==`, `!=` and `eql?` are
+    # Delegator's.
+    class SerializedDelegator # :nodoc:
+      def initialize(obj)
+        @delegate_dc_obj = obj
+      end
+
+      def __getobj__
+        @delegate_dc_obj
+      end
+
+      def ==(obj)
+        return true if obj.equal?(self)
+        @delegate_dc_obj == obj
+      end
+
+      def !=(obj)
+        return false if obj.equal?(self)
+        @delegate_dc_obj != obj
+      end
+
+      def eql?(obj)
+        return true if obj.equal?(self)
+        obj.eql?(@delegate_dc_obj)
+      end
+
+      (ActiveModel::Type::Value.public_instance_methods - ::Object.public_instance_methods + %i[to_s hash <=>] - %i[== != eql?]).each do |name|
+        define_method(name) { |*args, **kwargs, &block| @delegate_dc_obj.__send__(name, *args, **kwargs, &block) }
+      end
+
+      def respond_to_missing?(name, include_private = false)
+        @delegate_dc_obj.respond_to?(name, include_private) || super
+      end
+
+      def method_missing(name, *args, **kwargs, &block)
+        return super unless @delegate_dc_obj.respond_to?(name)
+        @delegate_dc_obj.__send__(name, *args, **kwargs, &block)
+      end
+    end
+
+    # type/serialized.rb (8.2.0.alpha): the type `serialize` decorates a
+    # column's type with. Reads load the subtype's value through the
+    # coder, writes dump it; a value equal to the coder's load of nil
+    # (its default) stores nil and reads back as itself. `accessor`
+    # (ActiveRecord::Store's IndifferentHashAccessor) is not ported.
+    class Serialized < SerializedDelegator # :nodoc:
+      include ActiveModel::Type::Helpers::Mutable
+      include QueryPredicates::Decorator
+
+      attr_reader :subtype, :coder
+
+      # What `owner.serialize(attr_name, coder:, type:, comparable:)`
+      # registers (attribute_methods/serialization.rb): the column
+      # serializer, built at the call (`Coders.column_serializer`), and
+      # the `decorate_attributes` block, `call`, which wraps the column's
+      # cast type, unwrapping an inherited serialization first. The
+      # runtime's `serialize` applies it when the model's types are first
+      # read.
+      class Decoration # :nodoc:
+        def initialize(owner, attr_name, coder, type, comparable)
+          @column_serializer = Coders.column_serializer(owner, attr_name, coder, type)
+          @comparable = comparable
+        end
+
+        def call(cast_type)
+          cast_type = cast_type.subtype if Serialized === cast_type
+          Serialized.new(cast_type, @column_serializer, comparable: @comparable)
+        end
+      end
+
+      def initialize(subtype, coder, comparable: false)
+        @subtype = subtype
+        @coder = coder
+        @comparable = comparable
+        super(subtype)
+      end
+
+      def deserialize(value)
+        if default_value?(value)
+          value
+        else
+          coder.load(super)
+        end
+      end
+
+      def serialize(value)
+        return if value.nil?
+        unless default_value?(value)
+          super coder.dump(value)
+        end
+      end
+
+      define_method(:inspect, Kernel.instance_method(:inspect))
+
+      def changed_in_place?(raw_old_value, value)
+        return false if value.nil?
+
+        if @comparable
+          old_value = deserialize(raw_old_value)
+          old_value != value
+        else
+          raw_new_value = encoded(value)
+          raw_old_value.nil? != raw_new_value.nil? ||
+            subtype.changed_in_place?(raw_old_value, raw_new_value)
+        end
+      end
+
+      def assert_valid_value(value)
+        if coder.respond_to?(:assert_valid_value)
+          coder.assert_valid_value(value, action: "serialize")
+        end
+      end
+
+      def force_equality?(value)
+        coder.respond_to?(:object_class) && value.is_a?(coder.object_class)
+      end
+
+      def serialized? # :nodoc:
+        true
+      end
+
+      private
+        def default_value?(value)
+          value == coder.load(nil)
+        end
+
+        def encoded(value)
+          return if default_value?(value)
+          payload = coder.dump(value)
+          if payload && @subtype.binary?
+            ActiveModel::Type::Binary::Data.new(payload)
+          else
+            payload
+          end
+        end
+    end
+  end
+
+  module Coders
+    # coders/column_serializer.rb (8.2.0.alpha): an app coder behind the
+    # `type:` check `serialize` adds when given a class other than Object.
+    class ColumnSerializer # :nodoc:
+      attr_reader :object_class
+      attr_reader :coder
+
+      def initialize(attr_name, coder, object_class = Object)
+        @attr_name = attr_name
+        @object_class = object_class
+        @coder = coder
+        check_arity_of_constructor
+      end
+
+      def init_with(coder) # :nodoc:
+        @attr_name = coder["attr_name"]
+        @object_class = coder["object_class"]
+        @coder = coder["coder"]
+      end
+
+      def dump(object)
+        return if object.nil?
+
+        assert_valid_value(object, action: "dump")
+        coder.dump(object)
+      end
+
+      def load(payload)
+        if payload.nil?
+          if @object_class != ::Object
+            return @object_class.new
+          end
+          return nil
+        end
+
+        object = coder.load(payload)
+
+        assert_valid_value(object, action: "load")
+        object ||= object_class.new if object_class != Object
+
+        object
+      end
+
+      def assert_valid_value(object, action:)
+        unless object.nil? || object_class === object
+          raise SerializationTypeMismatch,
+            "can't #{action} `#{@attr_name}`: was supposed to be a #{object_class}, but was a #{object.class}. -- #{object.inspect}"
+        end
+      end
+
+      private
+        def check_arity_of_constructor
+          load(nil)
+        rescue ArgumentError
+          raise ArgumentError, "Cannot serialize #{object_class}. Classes passed to `serialize` must have a 0 argument constructor."
+        end
+    end
+
+    # attribute_methods/serialization.rb's `build_column_serializer` for
+    # `owner.serialize(attr_name, coder:, type:)`. The JSON and YAML
+    # coders, and the configured default one a call without `coder:`
+    # takes, are not ported: they raise NotImplementedError, naming the
+    # call.
+    def self.column_serializer(owner, attr_name, coder, type)
+      if coder.nil? || coder == ::JSON || (defined?(::YAML) && coder == ::YAML)
+        raise NotImplementedError, "#{owner}.serialize(#{attr_name.inspect}, coder: #{coder.inspect}): the default, JSON and YAML column coders are not ported"
+      end
+      if coder.respond_to?(:new) && !coder.respond_to?(:load)
+        coder.new(attr_name, type)
+      elsif type && type != Object
+        ColumnSerializer.new(attr_name, coder, type)
+      else
+        coder
       end
     end
   end

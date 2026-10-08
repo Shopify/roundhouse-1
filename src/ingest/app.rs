@@ -2696,6 +2696,22 @@ end
             }
         }
         model.retypable_attributes = cols;
+        // A `serialize` with an app coder runs at class load as written;
+        // the runtime's `serialize` decorates the column's type.
+        if let Some(table) = app.schema.tables.get(&model.table.0) {
+            for item in model.body.iter_mut() {
+                let crate::dialect::ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line } = item else {
+                    continue;
+                };
+                if crate::analyze::retypable_attributes::serialized_column(expr, table).is_some() {
+                    *item = crate::dialect::ModelBodyItem::ClassBody {
+                        expr: expr.clone(),
+                        leading_comments: std::mem::take(leading_comments),
+                        leading_blank_line: *leading_blank_line,
+                    };
+                }
+            }
+        }
     }
     // A composite primary key the model declares no `self.primary_key`
     // over: Rails keys the model on every column of it.

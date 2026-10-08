@@ -32,6 +32,11 @@
 //! :shop_id, :id` calls it, through a local bound to `self`, when its
 //! configuration says so. The compiled update, destroy and reload carry
 //! the composite WHERE for those columns and take it when the call ran.
+//!
+//! A direct `serialize :col, coder: Coder` with an app coder
+//! (`serialized_column`) retypes its column too: Rails decorates the
+//! column's type with Type::Serialized when the call runs, so the column
+//! takes the same compiled path and the call runs at class load.
 
 use crate::App;
 use crate::dialect::{LibraryClass, MethodDef, MethodReceiver, Model, ModelBodyItem};
@@ -60,6 +65,7 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
         for (_, call_names) in macro_calls(m, app, "attribute", false) {
             names.extend(call_names);
         }
+        names.extend(body_statements(m).filter_map(|e| serialized_column(e, table)).map(|c| c.as_str().to_string()));
         at = m.parent.as_ref().and_then(|p| app.models.iter().find(|x| &x.name == p));
     }
     for (_, _, call_names) in sti_subclass_macro_calls(model, app, "attribute") {
@@ -220,6 +226,48 @@ pub(crate) fn carries_query_constraints(expr: &Expr, columns: &[Symbol]) -> bool
     !columns.is_empty() && names.iter().map(String::as_str).eq(columns.iter().map(Symbol::as_str))
 }
 
+/// A direct `serialize :col, coder: Coder[, type: Class][, comparable:
+/// true|false]` body statement over a string or text column of `table`,
+/// with an app's coder (not `JSON` or `YAML`: `lower::serialize` lowers
+/// the JSON one, and Rails' own coders are not ported). Rails builds the
+/// column serializer from the coder when the call runs and decorates the
+/// column's type with Type::Serialized, so the column takes the
+/// retypable path and the model carries the call as written
+/// (`ModelBodyItem::ClassBody`) for the runtime's `serialize`. A binary
+/// or json column, `default:` and other options stay unclaimed.
+pub(crate) fn serialized_column(expr: &Expr, table: &crate::schema::Table) -> Option<Symbol> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
+    if method.as_str() != "serialize" || !on_self(recv) {
+        return None;
+    }
+    let [name, options] = args.as_slice() else { return None };
+    let name = match &*name.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Hash { entries, .. } = &*options.node else { return None };
+    let mut coder = false;
+    for (key, value) in entries {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
+        let fits = match key.as_str() {
+            "coder" => {
+                coder = true;
+                !matches!(&*value.node, ExprNode::Const { path } if path.last().is_some_and(|l| matches!(l.as_str(), "JSON" | "YAML")))
+            }
+            "type" => matches!(&*value.node, ExprNode::Const { .. }),
+            "comparable" => matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { .. } }),
+            _ => false,
+        };
+        if !fits {
+            return None;
+        }
+    }
+    let column = table.columns.iter().find(|c| c.name.as_str() == name)?;
+    (coder && matches!(column.col_type, crate::schema::ColumnType::String { .. } | crate::schema::ColumnType::Text))
+        .then(|| column.name.clone())
+}
+
 /// The spans of the body calls the stamped columns answer, every
 /// argument a literal: the model's own app class macro calls that reach
 /// `attribute` naming only `retypable_attributes`, or `query_constraints`
@@ -234,9 +282,13 @@ pub(crate) fn carries_query_constraints(expr: &Expr, columns: &[Symbol]) -> bool
 ///
 /// `model_to_library::unclaimed_unknowns` and the STI subclass check skip
 /// these by span. Needs the model's `retypable_attributes` and
-/// `query_constraints` stamped.
+/// `query_constraints` stamped. The model's own `serialize` calls with an
+/// app coder (`serialized_column`) are claimed too.
 pub(crate) fn claimed_body_calls(model: &Model, app: &App) -> Vec<crate::span::Span> {
     let mut out = Vec::new();
+    if let Some(table) = app.schema.tables.get(&model.table.0) {
+        out.extend(body_statements(model).filter(|e| serialized_column(e, table).is_some()).map(|e| e.span));
+    }
     let side = ClassSide::of(model, app);
     let body: Vec<&Expr> = body_statements(model).collect();
     for (call, names) in calls_reaching(&side, body.iter().copied(), "attribute", false) {
