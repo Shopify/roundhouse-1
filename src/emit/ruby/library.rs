@@ -525,7 +525,21 @@ fn nested_blocks(
 /// class-body call) when that lies below one of the parent's constants
 /// in the same file. `None` (a block spliced after the header) when it
 /// is above them all, has no real span, or spans several files.
+///
+/// A module the parent mixes in keeps its place after the header too:
+/// the emitted body opens with its includes, and a replayed `prepend`
+/// or `extend` stands before the first constant below the call, which
+/// is above the module's own body when ingest made the call from a
+/// block that also defines the module. Ruby cannot mix in a module
+/// before it is defined. `Module#concerning :Summary do … end` below a
+/// constant is such a module: ingest writes it as `module Summary` and
+/// `include Summary` (or `prepend`), and placed among the constants it
+/// was written below the include (NameError: uninitialized constant
+/// `Ledger::Summary`).
 fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::span::Span> {
+    if mixes_in(parent, &kid.name) {
+        return None;
+    }
     let spans = std::iter::once(kid.parent_span)
         .chain(kid.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
         .chain(kid.constants.iter().map(|(_, e)| e.span))
@@ -546,6 +560,24 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::s
         .iter()
         .any(|(_, value)| value.span.file == first.file && value.span != crate::span::Span::synthetic() && value.span.start < first.start)
         .then_some(first)
+}
+
+/// Whether `parent`'s body includes `module`, or prepends or extends it
+/// by a replayed call naming it (relative to `parent` or in full).
+fn mixes_in(parent: &LibraryClass, module: &ClassId) -> bool {
+    let bare = |name: &str| name.trim_start_matches("::").to_string();
+    let target = bare(module.0.as_str());
+    let names = |written: &str| {
+        let written = bare(written);
+        written == target || format!("{}::{written}", bare(parent.name.0.as_str())) == target
+    };
+    parent.includes.iter().any(|inc| names(inc.0.as_str()))
+        || parent.unknown_calls.iter().any(|call| {
+            matches!(&*call.node, ExprNode::Send { recv: None, method, args, .. }
+                if matches!(method.as_str(), "include" | "prepend" | "extend")
+                    && args.iter().any(|arg| matches!(&*arg.node, ExprNode::Const { path }
+                        if names(&path.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("::")))))
+        })
 }
 
 /// Splice what `NestedPlacement` did not place among the constants
