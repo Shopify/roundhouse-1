@@ -415,6 +415,18 @@ fn program_items(
             Err(err) => not_carried(node, format!("the ingest cannot carry this file-level statement: {err}")),
         }
     };
+    // A class or module body statement its walk discarded is named
+    // where the declaration stands (`DeclBody::discarded`).
+    let discarded = |stmt: &ruby_prism::Node<'_>, out: &mut Vec<ProgramItem>| {
+        let mut found = Vec::new();
+        discarded_in(stmt, file, &mut found);
+        for (node, why) in found {
+            out.push(not_carried(
+                &node,
+                format!("{why} in a class or module body is not carried; Ruby runs it when the body loads"),
+            ));
+        }
+    };
     for stmt in statements {
         let declaration = stmt.as_class_node().is_some() || stmt.as_module_node().is_some();
         if declaration && (in_branch || *guarded) {
@@ -442,6 +454,7 @@ fn program_items(
                     // An enclosing namespace before what it nests.
                     all.sort_by_key(|c| c.name.0.as_str().matches("::").count());
                     out.push(ProgramItem::Inline(all));
+                    discarded(stmt, out);
                 }
                 Err(err) => out.push(not_carried(stmt, format!("the ingest cannot carry this conditional definition: {err}"))),
             }
@@ -501,6 +514,7 @@ fn program_items(
             if !names.is_empty() {
                 out.push(ProgramItem::Declared(names));
             }
+            discarded(stmt, out);
             continue;
         }
         // A constant before any guard rides on the file's first class
@@ -1072,7 +1086,7 @@ pub fn ingest_rails_application_singleton_methods(
                 message: "a load-time conditional definition in the Rails application singleton is not modeled".into(),
             });
         }
-        if !body.class_initializers.is_empty() {
+        if !body.class_initializers.is_empty() || !body.class_attr_seeds.is_empty() {
             return Err(IngestError::Unsupported {
                 file: file.into(),
                 message: "Rails application singleton class-variable initialization is not modeled".into(),
@@ -1155,13 +1169,20 @@ pub(super) fn library_class_and_struct_base(
         method_aliases,
         conditional_definitions,
         class_attribute_effects,
+        class_attr_seeds,
+        discarded,
         ..
     } = walk_declaration_body(class.body(), &owner, file)?;
+    // A Railtie's body is carried whole (`railtie_body_statements`).
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
+    } else {
+        note_discarded(file, discarded);
     }
     let class_initializers = with_class_body_ivar_writes(class_initializers, class.body(), file)?;
     let class_initializers = with_class_attribute_effects(class_initializers, class_attribute_effects);
+    // `cattr_*` seeds run in source order with the rest of the body.
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attr_seeds);
 
     // A `T::Struct` is a class GENERATOR, not an annotation: `const
     // :name, String` IS the constructor and the reader. Lower it into
@@ -1284,6 +1305,7 @@ fn railtie_body_statements(
             || statement.as_module_node().is_some()
             || statement.as_singleton_class_node().is_some()
             || statement.as_constant_write_node().is_some()
+            || constant_multi_write(&statement).is_some()
             || statement.as_class_variable_write_node().is_some()
             || statement.as_alias_method_node().is_some();
         if declaration {
@@ -2119,8 +2141,11 @@ pub(super) fn library_class_from_module_node_with_scope(
         method_aliases,
         conditional_definitions,
         class_attribute_effects,
+        class_attr_seeds,
+        discarded,
         ..
-    } = walk_decl_body_of(module.body(), &owner, file, false, &visibility, true, true)?;
+    } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
+    note_discarded(file, discarded);
     admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
@@ -2131,6 +2156,8 @@ pub(super) fn library_class_from_module_node_with_scope(
         });
     }
     let class_initializers = with_class_body_ivar_writes(class_initializers, module.body(), file)?;
+    // `mattr_*` seeds run in source order with the rest of the body.
+    let class_initializers = with_class_attribute_effects(class_initializers, class_attr_seeds);
     Ok(LibraryClass {
         conditional_definitions,
         method_aliases,
@@ -2192,6 +2219,7 @@ fn concerning_modules(
             method_aliases,
             conditional_definitions,
             class_attribute_effects,
+            class_attr_seeds,
             ..
         } = walk_decl_body_with_visibility(concerning.block.body(), &name, file, false, &visibility).map_err(at)?;
         admit_nameless_rest(&mut methods);
@@ -2203,7 +2231,7 @@ fn concerning_modules(
         }
         // `@@x = v` in the block resolves through the block's cref, the
         // enclosing body, not the new module.
-        if !class_initializers.is_empty() {
+        if !class_initializers.is_empty() || !class_attr_seeds.is_empty() {
             return Err(at(IngestError::Unsupported {
                 file: file.into(),
                 message: "class-variable initialization in a `concerning` block is not modeled".into(),
@@ -2304,6 +2332,42 @@ fn with_class_attribute_effects(mut initializers: Vec<Expr>, effects: Vec<Expr>)
     initializers
 }
 
+/// `A, B = x, y` in a class or module body: each target a bare constant,
+/// the value a list of as many plain elements, none naming a target.
+/// Ruby evaluates the elements left to right and then assigns the
+/// targets in order, so the pairs written one by one, in order, are the
+/// same writes. Anything else (a splat, a nested target, a value array
+/// computed as a whole) is not this shape.
+fn constant_multi_write<'a>(stmt: &ruby_prism::Node<'a>) -> Option<Vec<(Symbol, ruby_prism::Node<'a>)>> {
+    let write = stmt.as_multi_write_node()?;
+    if write.rest().is_some() || !write.rights().is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = write
+        .lefts()
+        .iter()
+        .map(|left| left.as_constant_target_node().map(|target| constant_id_str(&target.name())))
+        .collect::<Option<_>>()?;
+    let array = write.value().as_array_node()?;
+    let elements: Vec<ruby_prism::Node<'a>> = array.elements().iter().collect();
+    if elements.len() != names.len() || elements.iter().any(|element| element.as_splat_node().is_some()) {
+        return None;
+    }
+    let names_a_target = |element: &ruby_prism::Node<'_>| {
+        let text = String::from_utf8_lossy(element.location().as_slice()).into_owned();
+        names.iter().any(|name| {
+            text.match_indices(name).any(|(at, _)| {
+                let word = |c: char| c == '_' || c.is_ascii_alphanumeric();
+                !text[..at].ends_with(word) && !text[at + name.len()..].starts_with(word)
+            })
+        })
+    };
+    if elements.iter().any(names_a_target) {
+        return None;
+    }
+    Some(names.into_iter().map(Symbol::from).zip(elements).collect())
+}
+
 fn reads_instance_variable(expr: &Expr) -> bool {
     if matches!(&*expr.node, ExprNode::Ivar { .. }) {
         return true;
@@ -2349,6 +2413,120 @@ struct DeclBody {
     /// `with_class_attribute_effects` merges them by source position.
     class_attribute_names: Vec<Symbol>,
     class_attribute_effects: Vec<Expr>,
+    /// `cattr_*` / `mattr_*` (`ingest::cattr`): the class-body writes of
+    /// their `@@x` storage, the declarations' seeds and authored
+    /// `@@x = v` beside them, by source position. Kept apart from
+    /// `class_initializers` so the ordering checks for native class
+    /// variables do not count them; a top-level body merges them in.
+    class_attr_seeds: Vec<Expr>,
+    /// The body statements the walk carries nowhere, which a top-level
+    /// class or module body names in its file's program
+    /// (`note_discarded`).
+    discarded: Vec<Discarded>,
+}
+
+/// A class or module body statement the walk does not carry.
+#[derive(Clone)]
+struct Discarded {
+    start: usize,
+    end: usize,
+    text: String,
+    why: &'static str,
+}
+
+impl Discarded {
+    fn of(node: &ruby_prism::Node<'_>, why: &'static str) -> Self {
+        let loc = node.location();
+        Discarded {
+            start: loc.start_offset(),
+            end: loc.end_offset(),
+            text: String::from_utf8_lossy(loc.as_slice()).into_owned(),
+            why,
+        }
+    }
+}
+
+thread_local! {
+    /// Per file, the statements its top-level class and module bodies
+    /// discard. The file's program (`program_items`) reads them back by
+    /// span and text, so a body walked from other text under the same
+    /// name (a synthesized reopen) names nothing.
+    static DISCARDED: std::cell::RefCell<HashMap<String, Vec<Discarded>>> = std::cell::RefCell::new(HashMap::default());
+}
+
+fn note_discarded(file: &str, discarded: Vec<Discarded>) {
+    if discarded.is_empty() {
+        return;
+    }
+    DISCARDED.with(|ledger| {
+        let mut ledger = ledger.borrow_mut();
+        let entries = ledger.entry(file.to_string()).or_default();
+        for d in discarded {
+            if !entries.iter().any(|e| e.start == d.start && e.end == d.end && e.text == d.text) {
+                entries.push(d);
+            }
+        }
+    });
+}
+
+/// Why `node`, a statement of a class or module body the walk visited,
+/// was discarded, if the walk noted it.
+fn discarded_why(file: &str, node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    let loc = node.location();
+    DISCARDED.with(|ledger| {
+        ledger.borrow().get(file)?.iter().find(|d| {
+            d.start == loc.start_offset() && d.end == loc.end_offset() && d.text.as_bytes() == loc.as_slice()
+        }).map(|d| d.why)
+    })
+}
+
+/// The statements of `node`'s class, module and `class << self` bodies,
+/// nested ones too, that their walk discarded, with why.
+fn discarded_in<'pr>(node: &ruby_prism::Node<'pr>, file: &str, out: &mut Vec<(ruby_prism::Node<'pr>, &'static str)>) {
+    let body = if let Some(class) = node.as_class_node() {
+        class.body()
+    } else if let Some(module) = node.as_module_node() {
+        module.body()
+    } else if let Some(singleton) = node.as_singleton_class_node() {
+        singleton.body()
+    } else {
+        return;
+    };
+    for statement in body.map(flatten_statements).unwrap_or_default() {
+        if let Some(why) = discarded_why(file, &statement) {
+            out.push((statement, why));
+        } else {
+            discarded_in(&statement, file, out);
+        }
+    }
+}
+
+/// A body statement of a kind the walk has no carrier for. Declarations,
+/// calls, constant, class-variable, instance-variable and local writes
+/// are the walk's (or the passes after it); a literal does nothing.
+fn discarded_kind(node: &ruby_prism::Node<'_>) -> Option<&'static str> {
+    use ruby_prism::Node as N;
+    Some(match node {
+        N::WhileNode { .. } | N::UntilNode { .. } | N::ForNode { .. } => "a loop",
+        N::BeginNode { .. } => "a `begin` block",
+        N::CaseNode { .. } | N::CaseMatchNode { .. } => "a `case` statement",
+        N::MultiWriteNode { .. } => "a multiple assignment",
+        N::GlobalVariableWriteNode { .. }
+        | N::GlobalVariableOrWriteNode { .. }
+        | N::GlobalVariableOperatorWriteNode { .. }
+        | N::GlobalVariableAndWriteNode { .. } => "a global variable write",
+        N::InstanceVariableOperatorWriteNode { .. } | N::InstanceVariableAndWriteNode { .. } => {
+            "an instance variable operator write"
+        }
+        N::ClassVariableOrWriteNode { .. }
+        | N::ClassVariableOperatorWriteNode { .. }
+        | N::ClassVariableAndWriteNode { .. } => "a class variable operator write",
+        N::LocalVariableOperatorWriteNode { .. }
+        | N::LocalVariableOrWriteNode { .. }
+        | N::LocalVariableAndWriteNode { .. } => "a local variable operator write",
+        N::YieldNode { .. } | N::SuperNode { .. } | N::ForwardingSuperNode { .. } => "a `yield` or `super`",
+        _ => return None,
+    })
 }
 
 impl DeclBody {
@@ -2364,6 +2542,8 @@ impl DeclBody {
         self.declaration_after_class_initializer |= other.declaration_after_class_initializer;
         self.class_attribute_names.extend(other.class_attribute_names);
         self.class_attribute_effects.extend(other.class_attribute_effects);
+        self.class_attr_seeds.extend(other.class_attr_seeds);
+        self.discarded.extend(other.discarded);
     }
 
     /// The class-body declarations an initializer must not precede.
@@ -2371,82 +2551,22 @@ impl DeclBody {
         self.includes.len() + self.constants.len() + self.unknown_calls.len()
     }
 
-    fn finalize_classvars(
-        &mut self,
-        owner: &ClassId,
-        class_attributes: &HashSet<Symbol>,
-        has_class_attr_default: bool,
-        module_body: bool,
-        file: &str,
-    ) -> IngestResult<()> {
-        fn writes_classvar(expr: &Expr, class_attributes: Option<&HashSet<Symbol>>) -> bool {
-            if let ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                | ExprNode::OpAssign { target: LValue::Var { name, .. }, .. } = &*expr.node
-                && let Some(bare) = name.as_str().strip_prefix("@@")
-                && class_attributes.is_none_or(|attrs| attrs.iter().any(|attr| attr.as_str() == bare))
-            {
-                return true;
-            }
-            let mut found = false;
-            expr.node.for_each_child(&mut |child| found |= writes_classvar(child, class_attributes));
-            found
-        }
-        for m in &mut self.methods {
-            // In a module's singleton method `self` is the module, whose
-            // own ivar is the cattr/mattr storage: activemerchant
-            // 1.137.0's `Billing::Base.gateway_mode=` writes `@@mode`,
-            // which `mattr_accessor :mode` reads. A class's would be the
-            // subclass's when a subclass calls it, not the shared storage.
-            if module_body && m.receiver == MethodReceiver::Class {
-                normalize_classvar_writes_to_ivars(&mut m.body, class_attributes);
-            }
-            if writes_classvar(&m.body, Some(class_attributes)) {
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: "native class-variable writes alongside cattr/mattr storage are not modeled".into(),
-                });
-            }
-            // A native `@@x` (one no cattr/mattr declares) stays a native
-            // class variable in class and instance methods alike. The Ruby
-            // family emits it verbatim inside the same lexical class, so
-            // CRuby's own storage applies: shared by the class and every
-            // subclass, NameError when unset, RuntimeError when overtaken.
-            // Only declared cattr/mattr names keep the class-ivar
-            // approximation; their writes were refused just above.
-            if m.receiver == MethodReceiver::Class {
-                normalize_classvars_to_ivars(&mut m.body, class_attributes);
-            }
-        }
-        // Preserve standalone cattr/mattr approximation, but never erase
-        // initialization across a default: these effects depend on order.
-        if has_class_attr_default && !self.class_initializers.is_empty() {
+    fn finalize_classvars(&mut self, owner: &ClassId, file: &str) -> IngestResult<()> {
+        // A native `@@x` stays a native class variable in class and
+        // instance methods alike, a `cattr_*`/`mattr_*` one included
+        // (`ingest::cattr`): the Ruby family emits it verbatim inside the
+        // same lexical class, so CRuby's own storage applies: shared by
+        // the class and every subclass, NameError when unset,
+        // RuntimeError when overtaken.
+        //
+        // A cattr seed runs before the defs, as its declaration does
+        // before the defs below it.
+        let own = OwnClassCalls::new(owner, &self.methods);
+        if self.class_attr_seeds.iter().any(|seed| own.runs(seed)) {
             return Err(IngestError::Unsupported {
                 file: file.into(),
-                message: "cattr/mattr defaults require source-order initialization".into(),
+                message: "a cattr/mattr default calling a method of its own class requires source ordering against the defs".into(),
             });
-        }
-        // A class-body `@@x = value` of a declared cattr/mattr name
-        // initializes the storage the lowered accessors read, the
-        // class-side `@x` (activemerchant 1.137.0's `Gateway`:
-        // `cattr_reader :implementations; @@implementations = []`, which
-        // its `inherited` hook appends to). It is that ivar's write, in
-        // place, and keeps the ordering checks below. A nil one is the
-        // unset ivar's own value and is dropped.
-        let storage = |name: &Symbol| {
-            name.as_str().strip_prefix("@@").is_some_and(|bare| class_attributes.iter().any(|attr| attr.as_str() == bare))
-        };
-        self.class_initializers.retain(|expr| !matches!(&*expr.node,
-            ExprNode::Assign { target: LValue::Var { name, .. }, value }
-                if storage(name) && matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })));
-        for init in &mut self.class_initializers {
-            if let ExprNode::Assign { target, value } = &mut *init.node
-                && let LValue::Var { name, .. } = target
-                && let Some(bare) = name.as_str().strip_prefix("@@")
-                && class_attributes.iter().any(|attr| attr.as_str() == bare)
-            {
-                let name = Symbol::from(bare);
-                *init.node = ExprNode::Assign { target: LValue::Ivar { name }, value: value.clone() };
-            }
         }
         if self.class_initializers.is_empty() {
             return Ok(());
@@ -2993,6 +3113,7 @@ pub(super) fn factory_class_body(
         class_initializers,
         visibility_overrides,
         conditional_definitions,
+        class_attr_seeds,
         ..
     } = walk_decl_body(body, owner, file, false)?;
     if !conditional_definitions.is_empty() {
@@ -3007,7 +3128,7 @@ pub(super) fn factory_class_body(
     let (own, enclosing): (Vec<_>, Vec<_>) =
         constants.into_iter().partition(|(name, _)| singleton_written.contains(name));
     if singleton_written.iter().any(|name| carried.contains(name))
-        || enclosing.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
+        || enclosing.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() || !class_attr_seeds.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
             message: "constant or class variable assigned inside a Struct.new/Data.define/Class.new body block \
@@ -3069,24 +3190,8 @@ fn walk_decl_body_in<'pr>(
     visibility: &Visibility,
     declaration_body: bool,
 ) -> IngestResult<DeclBody> {
-    walk_decl_body_of(body, owner, file, force_class_receiver, visibility, declaration_body, false)
-}
-
-/// [`walk_decl_body_in`]; `module_body`: `body` is a `module`'s own body,
-/// whose singleton methods only run with the module as `self`
-/// (`DeclBody::finalize_classvars`).
-fn walk_decl_body_of<'pr>(
-    body: Option<ruby_prism::Node<'pr>>,
-    owner: &ClassId,
-    file: &str,
-    force_class_receiver: bool,
-    visibility: &Visibility,
-    declaration_body: bool,
-    module_body: bool,
-) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
-    let mut has_class_attr_default = false;
     // `module_function` (called bare inside a module body) marks every
     // subsequent direct `def` as a module-function — both an instance
     // method AND a class method. For our targets (which call these as
@@ -3110,6 +3215,8 @@ fn walk_decl_body_of<'pr>(
     };
 
     let statements = flatten_statements(b);
+    let glob_autoload_loops: Vec<usize> =
+        super::autoload_glob::body_loops(&statements, file, None).into_iter().map(|found| found.start).collect();
     let mut body_locals: Vec<BodyLocal> = Vec::new();
     let mut order_mark = InitializerOrder::default();
     for statement in statements {
@@ -3158,6 +3265,7 @@ fn walk_decl_body_of<'pr>(
             }
             Visibility::reject_conditional_declaration(&statement, file)?;
             reject_conditional_accessor(&statement, file)?;
+            out.discarded.push(Discarded::of(&statement, "a conditional statement"));
             continue;
         }
         // A call on a literal list (`%w(month year).each do |m| … end`)
@@ -3318,6 +3426,18 @@ fn walk_decl_body_of<'pr>(
             out.constants.push((name, value));
             continue;
         }
+        // `APPROVED, DECLINED, ERROR = 1, 2, 3` (activemerchant 1.137.0's
+        // response codes): one constant per target, in order, as below.
+        if let Some(writes) = constant_multi_write(stmt) {
+            for (name, value) in writes {
+                let mut value = ingest_expr(&value, file)?;
+                if guarded {
+                    value.decisions |= crate::expr::GUARDED_CONSTANT_WRITE;
+                }
+                out.constants.push((name, value));
+            }
+            continue;
+        }
         // `Ref::Obj = Struct.new(:b)`: a write through a constant path.
         // Generated protobuf `_pb.rb` files nest every message this way
         // (`CustomFields::Field = …lookup("….CustomFields.Field").msgclass`
@@ -3340,13 +3460,20 @@ fn walk_decl_body_of<'pr>(
             out.unknown_calls.extend(applied);
             continue;
         }
-        // Retain native initialization, with any value, in source order.
-        // Only a declared cattr/mattr storage approximation may drop a nil
-        // one, after the whole body has been walked; `finalize_classvars`
-        // refuses an order the emitted body cannot reproduce.
-        if stmt.as_class_variable_write_node().is_some() {
+        // Retain native initialization, with any value, in source order;
+        // `finalize_classvars` refuses an order the emitted body cannot
+        // reproduce. One of a `cattr_*`/`mattr_*` declared above is a write
+        // of that declaration's storage, kept with its seed
+        // (activemerchant 1.137.0's `Gateway`: `cattr_reader
+        // :implementations; @@implementations = []`).
+        if let Some(write) = stmt.as_class_variable_write_node() {
             let initializer = ingest_expr(&stmt, file)?;
-            out.class_initializers.push(initializer);
+            let name = constant_id_str(&write.name());
+            if name.strip_prefix("@@").is_some_and(|bare| class_attributes.iter().any(|attr| attr.as_str() == bare)) {
+                out.class_attr_seeds.push(initializer);
+            } else {
+                out.class_initializers.push(initializer);
+            }
             continue;
         }
         if let Some(def) = stmt.as_def_node() {
@@ -3738,26 +3865,24 @@ fn walk_decl_body_of<'pr>(
                         // instance-level copies, not needed by the corpus).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
-                        let mut has_default = is_class_attr && call.block().is_some();
-                        let mut names: Vec<Symbol> = Vec::new();
-                        if let Some(args) = call.arguments() {
-                            for arg in args.arguments().iter() {
-                                if let Some(s) = symbol_value(&arg) {
-                                    names.push(Symbol::from(s));
-                                }
-                                if is_class_attr && let Some(hash) = arg.as_keyword_hash_node() {
-                                    has_default |= hash.elements().iter().any(|element| {
-                                        // A keyword splat can also carry a default.
-                                        element.as_assoc_node().is_none_or(|assoc|
-                                            symbol_value(&assoc.key()).as_deref() == Some("default"))
-                                    });
+                        if is_class_attr && !force_class_receiver {
+                            let declaration = super::cattr::declaration(&call, kw, file)?;
+                            class_attributes.extend(declaration.names.iter().cloned());
+                            let span = super::util::node_span(&statement, file);
+                            out.class_attr_seeds.extend(declaration.seeds(span));
+                            for method in declaration.methods(owner) {
+                                if !out.methods.iter().any(|e| e.name == method.name && e.receiver == method.receiver) {
+                                    out.methods.push(method);
                                 }
                             }
+                            continue;
                         }
-                        has_class_attr_default |= has_default;
-                        if is_class_attr {
-                            class_attributes.extend(names.iter().cloned());
-                        }
+                        // A `cattr_*` in `class << self` or a `class_methods`
+                        // block keeps the class-side ivar pair it had.
+                        let names: Vec<Symbol> = call
+                            .arguments()
+                            .map(|args| args.arguments().iter().filter_map(|arg| symbol_value(&arg)).map(Symbol::from).collect())
+                            .unwrap_or_default();
                         // Under `extend self` the accessors are module
                         // methods too, as its `def`s are.
                         let recv = if is_class_attr || force_class_receiver || extend_self_active {
@@ -3956,7 +4081,15 @@ fn walk_decl_body_of<'pr>(
                 if let Ok(e) = ingest_expr(&stmt, file) {
                     out.unknown_calls.push(e);
                 }
+            } else if !glob_autoload_loops.contains(&statement.location().start_offset()) {
+                // A call on a computed receiver (`Dir[...].each do … end`)
+                // is not carried; it is named in the file's program
+                // (`DeclBody::discarded`). A glob loop registering
+                // autoloads is the autoloader's (`ingest::autoload_glob`).
+                out.discarded.push(Discarded::of(&statement, "a call on a computed receiver"));
             }
+        } else if let Some(why) = discarded_kind(&statement) {
+            out.discarded.push(Discarded::of(&statement, why));
         }
         // Nested class/module declarations also fall through here; they
         // surface as separate entries via the plural API.
@@ -4025,7 +4158,7 @@ fn walk_decl_body_of<'pr>(
         for call in &mut out.unknown_calls {
             substitute_body_locals(call, &body_locals, file)?;
         }
-        for init in &mut out.class_initializers {
+        for init in out.class_initializers.iter_mut().chain(out.class_attr_seeds.iter_mut()) {
             substitute_body_locals(init, &body_locals, file)?;
         }
         // A conditional definition's condition reads the body's locals
@@ -4039,7 +4172,7 @@ fn walk_decl_body_of<'pr>(
     }
 
     order_mark.observe(&mut out);
-    out.finalize_classvars(owner, &class_attributes, has_class_attr_default, module_body, file)?;
+    out.finalize_classvars(owner, file)?;
     Ok(out)
 }
 
@@ -4302,34 +4435,6 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
         result
     }
     walk(expr, locals, &[], file)
-}
-
-/// Only declared cattr/mattr reads use the existing class-ivar approximation.
-/// Ordinary class-variable reads retain native shared inheritance storage.
-/// [`normalize_classvars_to_ivars`] for writes (`@@x = v`, `@@x op= v`)
-/// of declared cattr/mattr names.
-fn normalize_classvar_writes_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
-    if let ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } = &mut *e.node
-        && let LValue::Var { name, .. } = target
-        && let Some(bare) = name.as_str().strip_prefix("@@")
-        && class_attributes.iter().any(|attr| attr.as_str() == bare)
-    {
-        *target = LValue::Ivar { name: Symbol::from(bare) };
-    }
-    e.node.for_each_child_mut(&mut |c| normalize_classvar_writes_to_ivars(c, class_attributes));
-}
-
-fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
-    match &mut *e.node {
-        ExprNode::Var { name, .. } if name.as_str().starts_with("@@")
-            && class_attributes.iter().any(|attr| attr.as_str() == &name.as_str()[2..]) => {
-            let bare = Symbol::from(&name.as_str()[2..]);
-            *e.node = ExprNode::Ivar { name: bare };
-        }
-        _ => {
-            e.node.for_each_child_mut(&mut |c| normalize_classvars_to_ivars(c, class_attributes));
-        }
-    }
 }
 
 /// For `alias_method :new, :old`: the new name, and the index of the

@@ -19,7 +19,7 @@ fn app(root: &Path) {
     for (path, text) in [
         ("db/schema.rb", "ActiveRecord::Schema.define do\nend\n"),
         ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n"),
-        ("lib/tally.rb", "module Tally\n  def self.sum(xs)\n    total = 0\n    for x in xs\n      total += x\n    end\n    total\n  end\nend\n"),
+        ("lib/tally.rb", "module Tally\n  def self.sum(xs)\n    total = 0\n    for @x in xs\n      total += @x\n    end\n    total\n  end\nend\n"),
         ("lib/counter.rb", "module Counter\n  def self.one\n    1\n  end\nend\n"),
     ] {
         let file = root.join(path);
@@ -45,7 +45,7 @@ fn a_refused_statement_is_an_error_at_the_construct_and_keeps_the_file() {
     let _ = std::fs::remove_dir_all(&root);
     assert!(!ok, "check passed with a refused statement:\n{text}");
     assert!(
-        text.contains("lib/tally.rb:4:5: error[ingest_unsupported]: `for` requires enclosing-scope lowering"),
+        text.contains("lib/tally.rb:4:5: error[ingest_unsupported]: `for` with a loop variable other than plain locals is not modeled"),
         "no ingest_unsupported error at the `for`:\n{text}"
     );
     assert!(text.contains("this statement was not ingested and raises NotImplementedError if reached"), "{text}");
@@ -54,7 +54,7 @@ fn a_refused_statement_is_an_error_at_the_construct_and_keeps_the_file() {
     // Survey mode keeps going through the gap and lists it once, as a
     // gap rather than a second, per-file error.
     assert!(!survey.contains("error[ingest_unsupported]"), "{survey}");
-    assert!(survey.contains("`for` requires enclosing-scope lowering"), "{survey}");
+    assert!(survey.contains("`for` with a loop variable other than plain locals is not modeled"), "{survey}");
 }
 
 /// A nested `module ClassMethods`'s own `class << self; def

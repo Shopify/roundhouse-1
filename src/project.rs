@@ -6830,7 +6830,22 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // `class Parent`, a `Parent.autoload`) writes `autoload :Name` (or
     // `autoload(:Name`) for it. Read from the source text: the
     // statement itself is not ingested.
+    // And the constants a gem body registers by a glob over its own files
+    // (activemerchant 1.137.0's `Dir[File.dirname(__FILE__) +
+    // '/gateways/**/*.rb'].each { … autoload(…) }`), evaluated over the
+    // tree's sources (`ingest::autoload_glob`).
+    let glob_autoloads: std::collections::BTreeSet<String> = {
+        let listing: Vec<String> = app.sources.iter().map(|source| source.path.clone()).collect();
+        app.sources
+            .iter()
+            .filter(|source| required_gem_file(&source.path) && source.text.contains("autoload") && source.text.contains("Dir"))
+            .flat_map(|source| crate::ingest::autoload_glob::file_autoloads(&source.text, &source.path, &listing))
+            .collect()
+    };
     let gem_autoloads = |full: &str| -> bool {
+        if glob_autoloads.contains(full) {
+            return true;
+        }
         let (parent, name) = full.rsplit_once("::").unwrap_or(("", full));
         let parent = parent.rsplit("::").next().unwrap_or("");
         let names = |text: &str, pattern: &str| {
@@ -6859,7 +6874,17 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
     for (anchor, content) in &models {
-        if in_place.contains(anchor) {
+        // A declaration only a file program holds loads in place, with no
+        // autoload, unless the gem's own glob registers its constant
+        // (activemerchant's `gateways/authorize_net.rb`, whose program
+        // requires nokogiri before the class): then the constant's
+        // autoload loads that program, as Ruby's autoload loads the file.
+        if in_place.contains(anchor)
+            && !(in_place_program.contains_key(anchor)
+                && autoload_primary(anchor, content).is_some_and(|chain| {
+                    glob_autoloads.contains(&chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::"))
+                }))
+        {
             continue;
         }
         let gem_file = gem_only(anchor);

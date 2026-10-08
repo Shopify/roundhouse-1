@@ -78,20 +78,40 @@ fn a_module_s_singleton_methods_write_its_mattr_storage_as_native() {
     assert_eq!(run.stdout, expected, "{}", run.stderr);
 }
 
-/// A class's singleton method can run with a subclass as `self`, whose
-/// own ivar is not the shared storage; a module's instance method writes
-/// the class variable `mattr_accessor` stores under its own ivar here.
-/// Both stay refused.
+/// A class's singleton method and a module's instance method writing
+/// the `@@x` a `mattr_accessor` beside them declares. The storage is that
+/// class variable itself (`ingest::cattr`), so both are the native writes
+/// they are: the class's runs with a subclass as `self` and still writes
+/// the one shared variable. (The `@x` approximation refused both.)
+const PROBES: &str = r##"class Probe
+  mattr_accessor :mode
+  def self.set(m)
+    @@mode = m
+  end
+end
+class SubProbe < Probe; end
+module Mod
+  mattr_accessor :mode
+  def set(m)
+    @@mode = m
+  end
+end
+class Host
+  include Mod
+end
+"##;
+
 #[test]
-fn a_class_s_or_an_instance_method_s_write_stays_refused() {
-    for source in [
-        "class Probe\n  mattr_accessor :mode\n  def self.set(m)\n    @@mode = m\n  end\nend\n",
-        "module Probe\n  mattr_accessor :mode\n  def set(m)\n    @@mode = m\n  end\nend\n",
-    ] {
-        let err = roundhouse::ingest::ingest_library_classes(source.as_bytes(), "probe.rb")
-            .expect_err("native and modeled storage cannot silently diverge");
-        assert!(err.to_string().contains("alongside cattr/mattr storage"), "{source}: {err}");
-    }
+fn a_class_s_or_an_instance_method_s_write_is_the_shared_storage_as_native() {
+    let script = "SubProbe.set(:sub)
+Host.new.set(:host)
+p [Probe.mode, SubProbe.mode, Probe.new.mode, Mod.mode, Host.new.mode]
+";
+    let expected = native(&format!("{PRELUDE}{PROBES}{script}"));
+    assert_eq!(expected, "[:sub, :sub, :sub, :host, :host]\n", "native control");
+    let run = emit_and_run::empty_app().write("lib/probe.rb", PROBES).run_ruby(script);
+    assert!(run.success, "emitted tree failed in {}\n{}\n{}", run.emitted.display(), run.stdout, run.stderr);
+    assert_eq!(run.stdout, expected, "{}", run.stderr);
     let classes = roundhouse::ingest::ingest_library_classes(BASE.as_bytes(), "bill.rb").unwrap();
     let base = classes.iter().find(|c| c.name.0.as_str() == "Bill::Base").expect("Bill::Base is carried");
     assert!(base.methods.iter().any(|m| m.name.as_str() == "gateway_mode="), "{:?}", base.methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>());

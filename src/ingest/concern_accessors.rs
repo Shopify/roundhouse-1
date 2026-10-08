@@ -882,6 +882,13 @@ pub(super) fn splice_into_library_includers(
                     _ => None,
                 };
                 let Some(attribute) = attribute else {
+                    // A `cattr_*`'s accessors are reported with its seed,
+                    // by the declaration itself.
+                    if let ModelBodyItem::Method { method, .. } = item
+                        && super::cattr::generated(method)
+                    {
+                        continue;
+                    }
                     let (span, name) = dropped_statement(item, included_call(app, concern), sources);
                     let entry = dropped.entry(span).or_insert_with(|| (name, concern.clone(), Vec::new()));
                     if !entry.2.contains(&lc.name) {
