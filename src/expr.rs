@@ -55,6 +55,13 @@ pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 10;
 /// every other target refuses it at emit unless it models the name.
 pub const STDLIB_CONSTANT_REF: u64 = 1 << 11;
 
+/// The constant read is a value a runtime port's own source defines
+/// (`ActiveModel::Type::Boolean::FALSE_VALUES` in
+/// runtime/spinel/active_model_type.rb), typed from that definition.
+/// Only a tree that loads the runtime file defining it can run the read; `project`
+/// refuses it on every other (`analyze::runtime_reads`).
+pub const RUNTIME_VALUE_REF: u64 = 1 << 20;
+
 /// A source `**value` call argument that the shared keyword lowering made
 /// positional (`lower::forwarding`, legacy policy) for targets without
 /// keyword arguments, or a `yield(**value)` argument, which ingest takes
@@ -1630,7 +1637,8 @@ mod tests {
             RESOLVED_OPERATOR_RECEIVER, SOURCE_TYPE_ASCRIPTION, GEM_CONSTANT_REF, SELF_BINDING,
             SELF_BINDING_CLASS_OBJECT, STDLIB_CONSTANT_REF, ERASED_KEYWORD_SPLAT, SOURCE_FILE_PATH,
             DECLARED_TYPE_INDEXED, DECLARED_TYPE_RUNTIME_CONSTANT,
-            SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT,
+            SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
+            RUNTIME_VALUE_REF,
         ];
         let mut seen = 0u64;
         for bit in bits {

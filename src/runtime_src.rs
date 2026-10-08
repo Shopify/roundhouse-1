@@ -305,7 +305,25 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
                 args: vec![],
             });
         }
+        // A list literal turned into a Set or joined into a String, the
+        // shapes Rails' own tables take: activemodel's
+        // `Boolean::FALSE_VALUES = [false, 0, "0", …].to_set.freeze` and
+        // railties' `VERSION::STRING = [MAJOR, MINOR, TINY, PRE].compact
+        // .join(".").freeze`. Only on a literal list (through the
+        // list-to-list calls), so `Rails.public_path.join(…)` (a Pathname)
+        // stays untyped.
+        if matches!(name, "to_set" | "join") && call.receiver().is_some_and(|recv| is_list_literal(&recv)) {
+            return Some(if name == "to_set" {
+                Ty::Class { id: crate::ident::ClassId(crate::ident::Symbol::new("Set")), args: vec![] }
+            } else {
+                Ty::Str
+            });
+        }
         return None;
+    }
+    // `"#{…}"` is a String whatever it interpolates.
+    if node.as_interpolated_string_node().is_some() {
+        return Some(Ty::Str);
     }
     if let Some(hash) = node.as_hash_node() {
         let first = hash.elements().iter().next();
@@ -318,12 +336,12 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
         let assoc = first.as_assoc_node()?;
         let key_ty = type_of_literal_node(&assoc.key())?;
         // A table of lists or of tables (`OPTION_ALIASES = { expires_in:
-        // [:expire_in, :expired_in] }`) types by the same rules, one
-        // level in.
-        let value = assoc.value();
-        let value_ty = type_of_literal_node(&value).or_else(|| {
-            (value.as_array_node().is_some() || value.as_hash_node().is_some())
-                .then(|| type_of_const_literal(&value))
+        // [:expire_in, :expired_in].freeze }`) types by the same rules, one
+        // level in, frozen or not.
+        let value_ty = type_of_literal_node(&assoc.value()).or_else(|| {
+            let inner = peel_freeze(assoc.value());
+            (inner.as_array_node().is_some() || inner.as_hash_node().is_some())
+                .then(|| type_of_const_literal(&inner))
                 .flatten()
         })?;
         return Some(Ty::Hash {
@@ -361,6 +379,31 @@ fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
     // runtime declaration with no type and was refused as an
     // unsupported constant.
     type_of_literal_node(node)
+}
+
+/// `value.freeze` → `value`, any number of times.
+fn peel_freeze(node: Node<'_>) -> Node<'_> {
+    let receiver = node.as_call_node()
+        .filter(|call| call.name().as_slice() == b"freeze" && call.arguments().is_none() && call.block().is_none())
+        .and_then(|call| call.receiver());
+    match receiver {
+        Some(recv) => peel_freeze(recv),
+        None => node,
+    }
+}
+
+/// An Array literal, possibly through calls that answer another Array of
+/// its elements (`[…].compact`, `.uniq`, `.flatten`, `.sort`, `.freeze`).
+fn is_list_literal(node: &Node<'_>) -> bool {
+    if node.as_array_node().is_some() {
+        return true;
+    }
+    node.as_call_node().is_some_and(|call| {
+        matches!(call.name().as_slice(), b"compact" | b"uniq" | b"flatten" | b"sort" | b"freeze")
+            && call.arguments().is_none()
+            && call.block().is_none()
+            && call.receiver().is_some_and(|recv| is_list_literal(&recv))
+    })
 }
 
 fn type_of_literal_node(node: &Node<'_>) -> Option<Ty> {
@@ -1543,6 +1586,30 @@ mod tests {
             types.get(&Symbol::from("POOL")),
             Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Int) })
         );
+    }
+
+    #[test]
+    fn rails_value_tables_type_from_their_definitions() {
+        let types = parse_module_constants(concat!(
+            "module Rails\n  module VERSION\n    MAJOR = 8\n    PRE = \"alpha\"\n",
+            "    STRING = [MAJOR, MINOR, TINY, PRE].compact.join(\".\").freeze\n  end\nend\n",
+            "module Boolean\n  FALSE_VALUES = [false, 0, \"0\", :off].to_set.freeze\n",
+            "  OPTION_ALIASES = { expires_in: [:expire_in, :expired_in].freeze }.freeze\n",
+            "  LABEL = \"v#{1}\"\n  PATH = Rails.root.join(\"x\")\nend\n",
+        ))
+        .expect("parses");
+        assert_eq!(types.get(&Symbol::from("STRING")), Some(&Ty::Str));
+        assert_eq!(
+            types.get(&Symbol::from("FALSE_VALUES")),
+            Some(&Ty::Class { id: crate::ident::ClassId(Symbol::from("Set")), args: vec![] })
+        );
+        assert_eq!(
+            types.get(&Symbol::from("OPTION_ALIASES")),
+            Some(&Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Array { elem: Box::new(Ty::Sym) }) })
+        );
+        assert_eq!(types.get(&Symbol::from("LABEL")), Some(&Ty::Str));
+        // A `join` off a non-list receiver is not a String by shape.
+        assert_eq!(types.get(&Symbol::from("PATH")), None);
     }
 
     #[test]

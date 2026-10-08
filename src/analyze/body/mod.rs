@@ -1004,7 +1004,8 @@ impl<'a> BodyTyper<'a> {
                 expr.diagnostic = None;
                 expr.decisions &= !(crate::expr::GEM_CONSTANT_REF
                     | crate::expr::STDLIB_CONSTANT_REF
-                    | crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT);
+                    | crate::expr::DECLARED_TYPE_RUNTIME_CONSTANT
+                    | crate::expr::RUNTIME_VALUE_REF);
                 let generated = expr_span.file.0 == 0
                     || expr.decisions & crate::expr::GENERATED_CONST_REF != 0;
                 // A real FileId outside the snapshot is an indexing
@@ -1131,8 +1132,13 @@ impl<'a> BodyTyper<'a> {
                         if !keep_bare_splice {
                             qualify_resolved_path(path, name);
                         }
-                        let value = self.typed_constant(declaration).cloned()
-                            .or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
+                        // A runtime port's own value (`Rails::VERSION::STRING`)
+                        // runs only where the finished tree loads the port.
+                        let typed = self.typed_constant(declaration).cloned();
+                        if typed.is_none() && runtime.is_some() && !keep_bare_splice {
+                            expr.decisions |= crate::expr::RUNTIME_VALUE_REF;
+                        }
+                        let value = typed.or_else(|| runtime.as_ref().map(|ty| (**ty).clone()));
                         match value {
                             Some(ty) => ty,
                             // `Err = Class.new(StandardError)` is a constant to the source
@@ -1189,6 +1195,20 @@ impl<'a> BodyTyper<'a> {
                 // gem's, gradually typed, and other trees refuse it
                 // (`GEM_CONSTANT_REF`).
                 let ty = match (&ty, self.gem_sources.as_deref()) {
+                    // A gem's runtime port declares it exactly (globalid's
+                    // `URI::GID` in runtime/global_id.rb): the read is
+                    // that gem's, and `project` checks each tree for the
+                    // gem or the port's file, before any namespace a
+                    // native gem fills under computed names (uri's
+                    // `const_set` in URI) is taken to provide it.
+                    (Ty::Var { .. }, _)
+                        if indexed_source
+                            && !generated
+                            && crate::project::gem_port_declaring(written_class_id(path).0.as_str()).is_some() =>
+                    {
+                        expr.decisions |= crate::expr::GEM_CONSTANT_REF;
+                        Ty::Untyped
+                    }
                     (Ty::Var { .. }, Some(sources)) if indexed_source && !generated => {
                         let written = written_class_id(path);
                         let scope = match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
