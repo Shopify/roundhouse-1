@@ -113,26 +113,49 @@ pub(super) fn decide(app: &[LibraryClass], held: &[(Vec<LibraryClass>, Vec<Span>
 }
 
 pub(super) fn resolve(app: &mut App) {
-    // (class index, index of the captured call, the copy, the original's name)
-    let mut resolved: Vec<(usize, usize, MethodDef, crate::Symbol)> = Vec::new();
+    // (class index, index of the captured call, the copy, the original's
+    // name, whether the original is an ancestor's)
+    let mut resolved: Vec<(usize, usize, MethodDef, crate::Symbol, bool)> = Vec::new();
     {
         let candidates: Vec<&LibraryClass> = app.library_classes.iter().collect();
         for (i, lc) in app.library_classes.iter().enumerate() {
             for (j, call) in lc.unknown_calls.iter().enumerate() {
                 let Some((receiver, to, from)) = alias_call(call) else { continue };
-                if lc.methods.iter().any(|m| m.name.as_str() == from && m.receiver == receiver) {
+                let own: Vec<&MethodDef> =
+                    lc.methods.iter().filter(|m| m.name.as_str() == from && m.receiver == receiver).collect();
+                if !own.is_empty() {
+                    // The body's own def, where the alias runs after it:
+                    // one a later pass made from a body macro written
+                    // above the alias (frozen_record 0.27.4's Scope
+                    // `delegate ..., :each, to: :to_a` then `alias_method
+                    // :find_each, :each`), or one the walk met in another
+                    // file of the class. The copy is that def, as for an
+                    // alias of a def the walk had already met; the Ruby
+                    // family writes the native alias after it. A def only
+                    // below the alias in its file is not the one it names:
+                    // Ruby aliases the method as it stands there, an
+                    // ancestor's (frozen_record's `alias_method :load,
+                    // :new` above its own `def new`, inside `class <<
+                    // self`), and the call stays captured, which the Ruby
+                    // family replays above the defs
+                    // (`emit::ruby::library::aliases_ancestor_method`).
+                    if let Some(original) = own.iter().rev().find(|m| defined_before(m, call.span)) {
+                        let mut copy = (*original).clone();
+                        copy.name = crate::Symbol::from(to);
+                        resolved.push((i, j, copy, original.name.clone(), false));
+                    }
                     continue;
                 }
                 if let Some(original) = ancestor_method(&candidates, lc, from, receiver) {
                     let mut copy = original.clone();
                     copy.name = crate::Symbol::from(to);
-                    resolved.push((i, j, copy, original.name.clone()));
+                    resolved.push((i, j, copy, original.name.clone(), true));
                 }
             }
         }
     }
     for i in 0..app.library_classes.len() {
-        let mine: Vec<&(usize, usize, MethodDef, crate::Symbol)> = resolved.iter().filter(|r| r.0 == i).collect();
+        let mine: Vec<&(usize, usize, MethodDef, crate::Symbol, bool)> = resolved.iter().filter(|r| r.0 == i).collect();
         if mine.is_empty() {
             continue;
         }
@@ -142,16 +165,23 @@ pub(super) fn resolve(app: &mut App) {
             at += 1;
             !mine.iter().any(|r| r.1 == at - 1)
         });
-        for (_, _, copy, original) in mine {
+        for (_, _, copy, original, inherited) in mine {
             lc.method_aliases.push(MethodAlias {
                 name: copy.name.clone(),
                 receiver: copy.receiver,
                 original: original.clone(),
-                inherited: true,
+                inherited: *inherited,
             });
             lc.methods.push(copy.clone());
         }
     }
+}
+
+/// Whether the body's def `m` runs before the statement at `at`: one a
+/// pass made (no source position: a body macro's), or one written in
+/// another file of the class, or above `at` in its file.
+fn defined_before(m: &MethodDef, at: Span) -> bool {
+    m.name_span.is_synthetic() || at.is_synthetic() || m.name_span.file != at.file || m.name_span.start < at.start
 }
 
 /// `alias_method :to, :from` as the ingest captured it: bare for an

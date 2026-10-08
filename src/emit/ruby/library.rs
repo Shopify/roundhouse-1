@@ -7236,10 +7236,35 @@ fn emit_library_class_decl_inner(
     let declined = app.ruby_declined_delegate_forwarders.get(&lc.name);
     let lc = if full.is_some() || declined.is_some() {
         let mut copy = lc.clone();
+        // An alias copy of a forwarder (frozen_record 0.27.4's Scope
+        // `alias_method :find_each, :each` below its `delegate ...,
+        // :each`) is the same `(...)` forwarder under its name, so it
+        // stays the native alias of the one written above it.
         for m in &mut copy.methods {
-            let Some(f) = full.into_iter().flatten().find(|f| f.name == m.name) else { continue };
+            // The copy keeps the zero-arg forwarder's spans.
+            let original = lc
+                .method_aliases
+                .iter()
+                .find(|a| !a.inherited && a.receiver == MethodReceiver::Instance && a.name == m.name)
+                .map(|a| &a.original)
+                .filter(|o| {
+                    lc.methods.iter().any(|f| {
+                        &&f.name == o
+                            && f.receiver == MethodReceiver::Instance
+                            && f.name_span == m.name_span
+                            && f.body.span == m.body.span
+                    })
+                });
+            let Some(f) = full
+                .into_iter()
+                .flatten()
+                .find(|f| f.name == m.name)
+                .or_else(|| original.and_then(|o| full.into_iter().flatten().find(|f| &f.name == o)))
+            else {
+                continue;
+            };
             if m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.block_param.is_none() {
-                *m = crate::dialect::MethodDef { visibility: m.visibility, ..f.clone() };
+                *m = crate::dialect::MethodDef { visibility: m.visibility, name: m.name.clone(), ..f.clone() };
             }
         }
         for f in declined.into_iter().flatten() {
@@ -9250,12 +9275,50 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
     lc.unknown_calls
         .iter()
         .filter(|c| {
-            crate::ingest::sorbet_check::is_mixes_in(c)
+            aliases_ancestor_method(lc, c)
+                || crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
                 || claimed(c)
         })
         .collect()
+}
+
+/// A captured `alias_method :to, :from` (bare, or on `singleton_class`
+/// for one inside `class << self`) whose class defines `from` on that
+/// side only below it, in the same file: Ruby aliases the method `from`
+/// names where the alias runs, which is an ancestor's (Class#new for
+/// frozen_record 0.27.4's `alias_method :load, :new` above its own `def
+/// new`, inside `class << self`). Replayed as written, above the defs
+/// (where the replayed calls go), the native alias finds the same one;
+/// dropped, `load(record)` reached Kernel#load. Ingest leaves exactly
+/// these captured (`ingest::inherited_alias::resolve` copies the ones
+/// whose def runs first).
+fn aliases_ancestor_method(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+    if method.as_str() != "alias_method" || call.span.is_synthetic() {
+        return false;
+    }
+    let receiver = match recv {
+        None => MethodReceiver::Instance,
+        Some(r) => match &*r.node {
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if method.as_str() == "singleton_class" && args.is_empty() =>
+            {
+                MethodReceiver::Class
+            }
+            _ => return false,
+        },
+    };
+    let symbol = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let [to, from] = args.as_slice() else { return false };
+    let (Some(_), Some(from)) = (symbol(to), symbol(from)) else { return false };
+    let mut own = lc.methods.iter().filter(|m| m.receiver == receiver && m.name == from).peekable();
+    own.peek().is_some()
+        && own.all(|m| !m.name_span.is_synthetic() && m.name_span.file == call.span.file && m.name_span.start > call.span.start)
 }
 
 /// The body calls that name a class method a Ruby-family runtime port
