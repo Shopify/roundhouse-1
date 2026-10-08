@@ -3983,7 +3983,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // `require "semian/activerecord_postgresql_adapter"`, which must
     // compile to `require_relative` of the second file before
     // `DatabaseConfiguration.configure!`.
-    for (_, ports) in GEM_RUNTIME_PORTS {
+    for (gem, ports) in GEM_RUNTIME_PORTS {
+        // A gem the app compiles from source is that gem: its own files
+        // define its constants, so the port would define them twice. The
+        // shared runtime walk carries database_documentation's port too.
+        if gem_compiled_from_source(app, gem) {
+            files.retain(|(p, _)| !ports.iter().any(|(_, emitted)| p == emitted));
+            continue;
+        }
         for (source, emitted) in *ports {
             let text = crate::runtime_files::read_to_string(source)
                 .map_err(|e| format!("read {source} runtime: {e}"))?;
@@ -4010,6 +4017,9 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // `require "database_documentation"` (Core's privacy initializer
     // makes it) answers from the port, whichever gem or file makes it.
     for (gem, stem) in BUNDLER_REQUIRED_GEM_PORTS {
+        if gem_compiled_from_source(app, gem) {
+            continue;
+        }
         files.push((
             format!("runtime/features/{gem}.rb"),
             format!(
@@ -11588,17 +11598,40 @@ const GEM_RUNTIME_PORTS: &[(&str, &[(&str, &str)])] = &[
 const BUNDLER_REQUIRED_GEM_PORTS: &[(&str, &str)] = &[("database_documentation", "database_documentation")];
 
 /// The [`BUNDLER_REQUIRED_GEM_PORTS`] the app's Gemfile Bundler.requires
-/// in the test environment.
+/// in the test environment, less those the app compiles from source
+/// ([`gem_compiled_from_source`]), whose compiled entry file the boot
+/// loads instead.
 fn bundler_required_gem_ports(app: &App) -> Vec<(&'static str, &'static str)> {
     BUNDLER_REQUIRED_GEM_PORTS
         .iter()
         .copied()
+        .filter(|(gem, _)| !gem_compiled_from_source(app, gem))
         .filter(|(gem, _)| {
             app.bundler_gems.iter().any(|g| {
                 g.name == *gem && (g.envs.is_empty() || g.envs.iter().any(|e| e == "test"))
             })
         })
         .collect()
+}
+
+/// Whether the app compiles `gem` from source (roundhouse.yml
+/// `gem_sources:`, `App::gem_source_dirs`): a gem source directory holds
+/// the gem's entry file `lib/<gem>.rb`, which the app carries. Then the
+/// gem's own files are the gem on this tree, as natively one feature load
+/// defines its constants, and a `GEM_RUNTIME_PORTS` port for it is not
+/// carried: Core vendors database_documentation 3.2.0, whose compiled
+/// `DatabaseDocumentation::Constants` reassigned METADATA_PROJECT the
+/// port had already defined (StrictWarning's "already initialized
+/// constant" made that a boot failure).
+fn gem_compiled_from_source(app: &App, gem: &str) -> bool {
+    if app.gem_source_dirs.is_empty() {
+        return false;
+    }
+    let entries: Vec<String> = app.gem_source_dirs.iter().map(|dir| format!("{dir}lib/{gem}.rb")).collect();
+    app.sources.iter().any(|f| {
+        let rel = f.path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(&f.path);
+        entries.iter().any(|entry| entry == rel)
+    })
 }
 
 /// Gem ports the CRuby overlay carries on every CRuby tree
