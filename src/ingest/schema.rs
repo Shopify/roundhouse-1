@@ -214,6 +214,24 @@ fn apply_migration_verb(
                 return Err(gap);
             }
             if let Some((name, table)) = built {
+                // As `db:migrate` does: creating a table that exists
+                // raises unless `force:` replaces it or `if_not_exists:`
+                // keeps it.
+                if schema.tables.contains_key(&name) {
+                    let opt = |k: &str| kwarg_value(args.iter().skip(1), k).is_some_and(|v| bool_value(&v) != Some(false));
+                    if opt("if_not_exists") {
+                        return Ok(());
+                    }
+                    if !opt("force") {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: format!(
+                                "migration creates table `{}`, which the schema already has; `db:migrate` raises here",
+                                name.as_str()
+                            ),
+                        });
+                    }
+                }
                 schema.tables.insert(name, table);
             }
         }
@@ -300,15 +318,18 @@ fn apply_migration_verb(
         }
         "add_reference" | "add_belongs_to" => {
             if let (Some(t), Some(name)) = (arg_name(0), arg_name(1)) {
+                let opts = parse_column_opts(args.iter().skip(2));
+                let cols = reference_columns(&name, &opts, &t, file)?;
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
-                    table.columns.push(reference_column(&name));
+                    table.columns.extend(cols);
                 }
             }
         }
         "remove_reference" | "remove_belongs_to" => {
             if let (Some(t), Some(name)) = (arg_name(0), arg_name(1)) {
+                let (id, kind) = (format!("{name}_id"), format!("{name}_type"));
                 if let Some(table) = schema.tables.get_mut(&Symbol::from(t)) {
-                    table.columns.retain(|x| x.name.as_str() != name);
+                    table.columns.retain(|x| x.name.as_str() != id && x.name.as_str() != kind);
                 }
             }
         }
@@ -654,7 +675,7 @@ fn table_from_create_table(
             Some("integer") if !id_default => (Some("integer"), None),
             other => (other, id_limit),
         };
-        let opts = ColumnOpts { nullable: Some(false), default: None, limit: key_limit };
+        let opts = ColumnOpts { nullable: Some(false), limit: key_limit, ..ColumnOpts::default() };
         let key = match key_type {
             None | Some("bigint") | Some("primary_key") => Ok(Column {
                 name: Symbol::from(id_name.as_str()),
@@ -697,7 +718,7 @@ fn table_from_create_table(
                             columns.extend(timestamp_columns());
                         } else {
                             match column_from_call(&call, &table_name, file) {
-                                Ok(Some(col)) => columns.push(col),
+                                Ok(Some(cols)) => columns.extend(cols),
                                 Ok(None) => {}
                                 Err(gap) => gaps.push(gap),
                             }
@@ -933,19 +954,6 @@ fn timestamp_columns() -> [Column; 2] {
     [col("created_at"), col("updated_at")]
 }
 
-/// A `references`/`belongs_to` column keeps the logical name (the
-/// Reference type carries the target table) — same convention as the
-/// schema.rb `t.references` path.
-fn reference_column(name: &str) -> Column {
-    Column {
-        name: Symbol::from(name),
-        col_type: ColumnType::Reference { table: TableRef(Symbol::from(name)) },
-        nullable: true,
-        default: None,
-        primary_key: false,
-    }
-}
-
 /// Kwarg options shared by `t.<type> NAME, opts` column calls and the
 /// migration-verb forms (`add_column TABLE, NAME, TYPE, opts`).
 #[derive(Default)]
@@ -953,6 +961,9 @@ struct ColumnOpts {
     nullable: Option<bool>,
     default: Option<String>,
     limit: Option<u32>,
+    /// A reference's `polymorphic: true` and `type:`.
+    polymorphic: bool,
+    type_name: Option<String>,
 }
 
 // Not `string_value` alone: schema.rb dumps an integer, float or boolean default unquoted (`default: 0`, `default: true`).
@@ -977,6 +988,8 @@ fn parse_column_opts<'pr>(nodes: impl Iterator<Item = &'pr Node<'pr>>) -> Column
             match key.as_str() {
                 "null" => opts.nullable = bool_value(value),
                 "default" => opts.default = default_value(value),
+                "polymorphic" => opts.polymorphic = bool_value(value) == Some(true),
+                "type" => opts.type_name = name_value(value),
                 "limit" => {
                     if let Some(n) = integer_value(value) {
                         if n >= 0 {
@@ -1054,12 +1067,13 @@ fn column_with_type(
 }
 
 /// `Ok(None)` when the call is not a `t.<type> name` column line at
-/// all; `Err` when it is one whose type has no mapping.
+/// all; `Err` when it is one whose type has no mapping. A reference
+/// line adds one or two columns.
 fn column_from_call(
     call: &ruby_prism::CallNode<'_>,
     table: &str,
     file: &str,
-) -> Result<Option<Column>, IngestError> {
+) -> Result<Option<Vec<Column>>, IngestError> {
     // Expected: t.string "title", null: false  (schema.rb)
     //       or: t.string :title               (migration)
     // Receiver is a LocalVariableReadNode named "t".
@@ -1090,10 +1104,48 @@ fn column_from_call(
             });
         };
         let opts = parse_column_opts(args.iter().skip(2));
-        return column_with_type(&type_name, col_name, &opts, table, file).map(Some);
+        return column_with_type(&type_name, col_name, &opts, table, file).map(|c| Some(vec![c]));
     }
     let opts = parse_column_opts(args.iter().skip(1));
-    column_with_type(&col_type_name, col_name, &opts, table, file).map(Some)
+    if matches!(col_type_name.as_str(), "references" | "belongs_to") {
+        return reference_columns(&col_name, &opts, table, file).map(Some);
+    }
+    column_with_type(&col_type_name, col_name, &opts, table, file).map(|c| Some(vec![c]))
+}
+
+/// The columns `t.references :article` / `add_reference :comments,
+/// :article` add, as Rails' `ReferenceDefinition` builds them:
+/// `article_id` (a bigint, or the `type:` given), plus `article_type`
+/// when `polymorphic: true`. Both take `null:`.
+fn reference_columns(
+    name: &str,
+    opts: &ColumnOpts,
+    table: &str,
+    file: &str,
+) -> Result<Vec<Column>, IngestError> {
+    let id = format!("{name}_id");
+    let mut key = match &opts.type_name {
+        Some(type_name) => column_with_type(type_name, id, opts, table, file)?,
+        None => Column {
+            name: Symbol::from(id),
+            col_type: ColumnType::Reference { table: TableRef(Symbol::from(name)) },
+            nullable: true,
+            default: None,
+            primary_key: false,
+        },
+    };
+    key.nullable = opts.nullable.unwrap_or(true);
+    let mut out = vec![key];
+    if opts.polymorphic {
+        out.push(Column {
+            name: Symbol::from(format!("{name}_type")),
+            col_type: ColumnType::String { limit: None },
+            nullable: opts.nullable.unwrap_or(true),
+            default: None,
+            primary_key: false,
+        });
+    }
+    Ok(out)
 }
 
 fn index_from_call(call: &ruby_prism::CallNode<'_>, table_name: &str) -> Option<Index> {
@@ -1154,6 +1206,50 @@ mod tests {
         let clips = &schema.tables[&Symbol::from("clips")];
         assert!(matches!(clips.columns[3].col_type, ColumnType::Float));
         assert!(!clips.columns[4].nullable, "timestamps are null: false");
+    }
+
+    #[test]
+    fn references_add_the_id_column_rails_builds() {
+        let schema = fold(&[
+            r#"
+            class CreateComments < ActiveRecord::Migration[8.1]
+              def change
+                create_table :comments do |t|
+                  t.references :article, null: false, foreign_key: true
+                  t.belongs_to :owner, polymorphic: true
+                  t.references :token, type: :uuid
+                end
+              end
+            end
+            "#,
+            r#"
+            class Rework < ActiveRecord::Migration[8.1]
+              def change
+                remove_reference :comments, :owner, polymorphic: true
+                add_reference :comments, :author, null: false
+              end
+            end
+            "#,
+        ]);
+        assert_eq!(col_names(&schema, "comments"), ["id", "article_id", "token_id", "author_id"]);
+        let cols = &schema.tables[&Symbol::from("comments")].columns;
+        assert!(matches!(cols[1].col_type, ColumnType::Reference { .. }) && !cols[1].nullable);
+        assert!(matches!(cols[2].col_type, ColumnType::Uuid) && cols[2].nullable);
+        assert!(!cols[3].nullable);
+    }
+
+    #[test]
+    fn creating_an_existing_table_raises_unless_forced() {
+        let create = |opts: &str| {
+            format!("class C < ActiveRecord::Migration[8.1]\n  def change\n    create_table :posts{opts} do |t|\n      t.string :title\n    end\n  end\nend\n")
+        };
+        let mut schema = fold(&["class A < ActiveRecord::Migration[8.1]\n  def change\n    create_table :posts do |t|\n      t.text :body\n    end\n  end\nend\n"]);
+        let err = ingest_migration(create("").as_bytes(), "again.rb", &mut schema).expect_err("db:migrate raises");
+        assert!(err.to_string().contains("creates table `posts`, which the schema already has"), "{err}");
+        ingest_migration(create(", if_not_exists: true").as_bytes(), "keep.rb", &mut schema).unwrap();
+        assert_eq!(col_names(&schema, "posts"), ["id", "body"]);
+        ingest_migration(create(", force: :cascade").as_bytes(), "force.rb", &mut schema).unwrap();
+        assert_eq!(col_names(&schema, "posts"), ["id", "title"]);
     }
 
     #[test]
@@ -1249,7 +1345,7 @@ mod tests {
             end
             "#,
         ]);
-        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "author"]);
+        assert_eq!(col_names(&schema, "posts"), ["id", "title", "body", "author_id"]);
         let posts = &schema.tables[&Symbol::from("posts")];
         assert!(matches!(posts.columns[3].col_type, ColumnType::Reference { .. }));
     }

@@ -46,6 +46,26 @@ fn pending_migrations_fold_onto_the_dump() {
     assert_eq!(columns(&app, "gears"), None, "a pending drop_table removes the dumped table");
 }
 
+/// A dump whose recorded versions are not the app's migrations (the
+/// shape emit_and_run's pg_dump 18 blog once had): every migration is
+/// pending, and replaying `create_table :widgets` over the dump's
+/// `widgets` is what `db:migrate` refuses. Ingest refuses it too, by
+/// name, rather than replacing the dumped table.
+#[test]
+fn a_pending_migration_creating_a_dumped_table_is_refused() {
+    let dump = DUMP.replace("20260101000000", "20990101000000").replace("20260102000000", "20990102000000");
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        ("db/structure.sql", dump.as_str()),
+        ("config/routes.rb", "Rails.application.routes.draw do\nend\n"),
+        ("db/migrate/20260101000000_create_widgets.rb", "class CreateWidgets < ActiveRecord::Migration[7.1]\n  def change\n    create_table :widgets do |t|\n      t.references :gear\n    end\n  end\nend\n"),
+    ]
+    .into_iter()
+    .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let err = roundhouse::ingest::ingest_app_from_tree(tree).err().expect("db:migrate would raise");
+    assert!(err.to_string().contains("creates table `widgets`, which the schema already has"), "{err}");
+}
+
 #[test]
 fn a_dump_without_recorded_versions_is_complete() {
     let dump = DUMP.split("INSERT INTO").next().unwrap();
