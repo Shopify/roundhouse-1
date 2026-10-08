@@ -334,6 +334,10 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let additional_test_paths = additional_test_paths(vfs, dir)?;
     validate_additional_test_paths(vfs, dir, &additional_test_paths)?;
     let mut app = App::new();
+    app.gem_source_dirs = gem_sources
+        .iter()
+        .map(|(_, gem)| format!("{}/", gem.strip_prefix(dir).unwrap_or(gem).display()))
+        .collect();
     // `enum` columns declared inside a concern's `included do`, keyed by
     // the module. Local rather than a field on `App`: they exist only
     // until the splice folds them into each including model's own

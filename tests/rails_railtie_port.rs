@@ -355,6 +355,53 @@ fn a_railtie_s_finisher_hooks_run_after_the_app_s_initializers() {
     assert!(!stderr.contains("gem_railtie_not_run"), "{stderr}");
 }
 
+/// worldwide 1.29.0's railtie, reduced: its `worldwide.setup`
+/// initializer appends the gem's namespace to
+/// `application.config.eager_load_namespaces`, which in railties is the
+/// one `@@eager_load_namespaces` list every Railtie::Configuration
+/// shares (Application::Configuration inherits it; the Finisher's
+/// `eager_load!` walks it). The application config answers that list,
+/// so the initializer runs instead of failing as gem_railtie_not_run.
+#[test]
+fn a_railtie_appends_to_the_application_s_eager_load_namespaces() {
+    let (dir, _) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_rails_railtie_port\n")
+        .write("config/application.rb", "require \"rails\"\n\nmodule RailtieApp\n  class Application < Rails::Application\n  end\nend\n")
+        .write("lib/oracle.rb", "class Oracle\nend\n")
+        .emit(BuildTarget::Ruby);
+    let out = emit_and_run::ruby()
+        .current_dir(&*dir)
+        .args([
+            "-e",
+            "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
+             require_relative 'runtime/rails'\n\
+             require_relative 'runtime/rails_configuration'\n\
+             require_relative 'config/application'\n\
+             require 'rails/railtie'\n\
+             module Worldish\n\
+               class Railtie < ::Rails::Railtie\n\
+                 initializer 'worldish.setup' do |application|\n\
+                   application.config.eager_load_namespaces << Worldish\n\
+                 end\n\
+               end\n\
+             end\n\
+             Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)\n\
+             puts Rails.configuration.eager_load_namespaces.include?(Worldish)\n\
+             puts Rails.application.config.eager_load_namespaces.equal?(Worldish::Railtie.config.eager_load_namespaces)\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout, "true\ntrue\n", "{stderr}");
+    assert!(!stderr.contains("gem_railtie_not_run"), "{stderr}");
+}
+
 /// A native gem's railtie requiring one of the app's own gems never loads
 /// the gem home's copy over the compiled gem. Shopify Core's
 /// shopify_session 7.40 railtie initializer requires shopify_session/rack,

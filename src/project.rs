@@ -3928,6 +3928,32 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let inflector = crate::runtime_files::read_to_string("runtime/spinel/active_support_inflector.rb")
         .map_err(|e| format!("read inflector runtime: {e}"))?;
     files.push(("runtime/active_support_inflector.rb".into(), inflector));
+    // ActiveSupport::Ractors (8.2.0.alpha ractors.rb), and, where the
+    // lockfile has the i18n gem, active_support/i18n.rb with Active
+    // Support's English locale: I18n's load path as `require "rails"`
+    // leaves it (worldwide 1.29.0 reads I18n at load).
+    let ractors = crate::runtime_files::read_to_string("runtime/spinel/active_support_ractors.rb")
+        .map_err(|e| format!("read ractors runtime: {e}"))?;
+    files.push(("runtime/active_support_ractors.rb".into(), ractors));
+    let carries_i18n = app.gem_lock.as_ref().is_some_and(|lock| lock.specs.iter().any(|(name, _)| name == "i18n"));
+    if carries_i18n {
+        for (from, to) in [
+            ("runtime/spinel/active_support_i18n.rb", "runtime/active_support_i18n.rb"),
+            ("runtime/spinel/active_support/locale/en.yml", "runtime/active_support/locale/en.yml"),
+            ("runtime/spinel/active_support/locale/en.rb", "runtime/active_support/locale/en.rb"),
+        ] {
+            let text = crate::runtime_files::read_to_string(from).map_err(|e| format!("read {from}: {e}"))?;
+            files.push((to.into(), text));
+        }
+        files.push((
+            "runtime/features/active_support/i18n.rb".into(),
+            "# `require \"active_support/i18n\"` on this tree: active_support/i18n.rb,\n\
+             # ported (runtime/active_support_i18n.rb). runtime/gem_facades.rb puts\n\
+             # this directory first on the load path.\n\
+             require_relative \"../../active_support_i18n\"\n"
+                .into(),
+        ));
+    }
     // A native gem's `require "active_support/inflector"` (dry-core 1.1.0's
     // inflector backend probe, inflector.rb:9) answers from the port, as
     // the loaded activesupport answers it under Rails; the port is
@@ -4015,6 +4041,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             let delegate = "require_relative \"module_delegate\"\n";
             let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
             content.insert_str(at, "require_relative \"active_support_inflector\"\n");
+            // active_support/i18n.rb, which active_support/railtie loads
+            // with `require "rails"`: after the Inflector, whose
+            // `ordinal` reads the locale it adds.
+            if carries_i18n {
+                let at = at + "require_relative \"active_support_inflector\"\n".len();
+                content.insert_str(at, "require_relative \"active_support_i18n\"\n");
+            }
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -8851,6 +8884,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_job_errors.rb"
         && p != "runtime/active_support_tryable.rb"
         && p != "runtime/active_support_inflector.rb"
+        && p != "runtime/active_support_ractors.rb"
+        && p != "runtime/active_support_i18n.rb"
         && p != "runtime/action_dispatch_session_store.rb"
         && p != "runtime/action_dispatch_show_exceptions.rb"
         && p != "runtime/active_record_log_subscriber.rb");
@@ -12844,16 +12879,25 @@ fn carried_secrets_file(root: &Path, rel: &str) -> bool {
 /// (shopify_spanner 4.9.0's `File.read(File.join(__dir__,
 /// "hydrate_search_query.sql"))`, shopify-i18n's
 /// `data/cldr/likely_subtags.yml`), and the emitted `__dir__` of a gem
-/// file names its directory there. `walk_data_files_into` skips `vendor/`
+/// file names its directory there. Ruby outside `lib/` is data too:
+/// worldwide 1.29.0's `data/cldr/locales/*/plurals.rb`, which
+/// `Plurals.load_locale_rule` evals and I18n's load path reads; the
+/// code under `lib/` is compiled, not copied. `walk_data_files_into` skips `vendor/`
 /// and reads only YAML and JSON. A file [`named_for_secrets`] is not
 /// carried; one that is not UTF-8 is `collect_binary_assets`' to carry.
 fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
-    // A source's path is the root's join (absolute) or root-relative.
+    // A source's path is the root's join (absolute) or root-relative;
+    // a root given relative (`roundhouse ... app -o out`) still has
+    // absolute source paths, under its absolute form.
     let base = format!("{}/", root.display());
+    let absolute = std::path::absolute(root).ok().map(|p| format!("{}/", p.display()));
     let mut dirs: Vec<String> = gem_source_entries(app)
         .into_iter()
         .filter_map(|(_, _, lib)| {
-            let lib = lib.strip_prefix(base.as_str()).unwrap_or(&lib);
+            let lib = lib
+                .strip_prefix(base.as_str())
+                .or_else(|| absolute.as_deref().and_then(|a| lib.strip_prefix(a)))
+                .unwrap_or(&lib);
             (!lib.starts_with('/')).then(|| lib.strip_suffix("lib/").map(str::to_string)).flatten()
         })
         .collect();
@@ -12865,8 +12909,9 @@ fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, Stri
             walk_dir_into(&root.join(&dir), &dir, &mut found)?;
         }
         found.sort();
+        let lib = format!("{dir}lib/");
         for (rel, content) in found {
-            if rel.ends_with(".rb") {
+            if rel.ends_with(".rb") && rel.starts_with(lib.as_str()) {
                 continue;
             }
             if rel.split('/').any(named_for_secrets) {
