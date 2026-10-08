@@ -1,16 +1,17 @@
-//! `default_scope` (Core: 71 statements), and an `alias_attribute` the
-//! lowered model does not compile (anything but literal names over a
-//! column, which `alias_attribute_pg_runtime` covers), are refused with
-//! the Rails behavior the lowered model lacks, not the generic "the
-//! class does not run it".
+//! A `default_scope` the lowered model does not reproduce (anything but
+//! a parameterless block or lambda over a `where` / `where.not` /
+//! `order` / `extending` / `preload` / `includes` chain, which
+//! `default_scope_pg_runtime` covers), and an `alias_attribute` it does
+//! not compile (anything but literal names over a column, which
+//! `alias_attribute_pg_runtime` covers), are refused with the Rails
+//! behavior the lowered model lacks, not the generic "the class does
+//! not run it".
 //!
 //! Rails merges a default_scope into every relation of the class and
 //! seeds new records with its `where` values, and translates an
 //! attribute alias to its column in `new`, `where`, `order` and `pluck`.
-//! The compiled finders and the runtime relation build their SQL with
-//! neither, so both stay check errors until they do; the native run
-//! below pins the behavior the reasons describe, on Core's pinned
-//! activerecord.
+//! The native run below pins the behavior the reasons describe, on
+//! Core's pinned activerecord.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -89,11 +90,20 @@ fn rails_applies_the_default_scope_and_translates_the_alias() {
     assert_eq!(native(), EXPECTED);
 }
 
+/// `default_scope` forms `lower::default_scope` does not reproduce: an
+/// option (Rails' `all_queries: true` also scopes a record's own update,
+/// delete and reload) and a chain link the runtime scope does not apply.
+const WIDGET_UNPORTED: &str =
+    "class Widget < ApplicationRecord\n  default_scope -> { where(live: true) }, all_queries: true\n  alias_attribute :title, :name\nend\n";
+const SPECIAL_UNPORTED: &str = "class Special < Widget\n  default_scope { order(:name).limit(5) }\nend\n";
+
 #[test]
 fn default_scope_and_alias_attribute_are_refused_with_the_reason() {
-    let app = FILES
-        .iter()
-        .fold(emit_and_run::empty_app(), |app, (path, text)| app.write(path, text))
+    let app = emit_and_run::empty_app()
+        .write("app/models/application_record.rb", APPLICATION_RECORD)
+        .write("app/models/widget.rb", WIDGET_UNPORTED)
+        .write("app/models/special.rb", SPECIAL_UNPORTED)
+        .write("app/models/plain.rb", "class Plain < ApplicationRecord\n  self.table_name = \"widgets\"\n  default_scope { where(live: true) }\nend\n")
         .write("db/schema.rb", SCHEMA)
         .write("app/models/gizmo.rb", "class Gizmo < ApplicationRecord\n  self.table_name = \"widgets\"\n  alias_attribute :label, :headline\nend\n")
         .write("config/database.yml", "test:\n  adapter: sqlite3\n  database: \":memory:\"\n");
@@ -114,5 +124,7 @@ fn default_scope_and_alias_attribute_are_refused_with_the_reason() {
         "{errors:#?}"
     );
     assert!(!errors.iter().any(|e| e.contains("on `Widget`") && e.contains("alias_attribute")), "{errors:#?}");
+    // The reproduced form is claimed, not refused.
+    assert!(!errors.iter().any(|e| e.contains("on `Plain`")), "{errors:#?}");
     assert!(!errors.iter().any(|e| e.contains("the class does not run it")), "{errors:#?}");
 }

@@ -282,6 +282,7 @@ module ActiveRecord
     def self.find(id)
       return _find_composite_primary_key(id) if composite_primary_key?
       raise RecordNotFound, "Couldn't find #{name} with id=#{id}" if id.nil?
+      return ActiveRecord::Relation.new(self).find(id) if _default_scope_applies?
       result = _find_primary_key_input(id)
       raise RecordNotFound, "Couldn't find #{name} with id=#{id}" if result.nil?
       result
@@ -341,6 +342,7 @@ module ActiveRecord
     def self.exists?(id = EXISTS_ANY_ROW)
       return false if id.nil?
       return all.exists? if EXISTS_ANY_ROW.equal?(id)
+      return all.exists?(id) if _default_scope_applies?
       _exists_primary_key_input(id)
     end
     EXISTS_ANY_ROW = Object.new.freeze
@@ -1018,6 +1020,71 @@ module ActiveRecord
     # `ActiveRecord::Relation.new(Model)` directly.
     def self.all
       ActiveRecord::Relation.new(self)
+    end
+
+    # ---- default_scope ----------------------------------------------
+    #
+    # Rails merges a class's `default_scope` into every relation of it
+    # (`all`, `where`, `find`, `count`, its associations) and assigns the
+    # scope's `where` equalities to a new record before the given
+    # attributes; `unscoped` drops both. A model that declares one gets
+    # `_default_scoped?`, `_apply_default_scope` (the scope's chain run on
+    # the relation, in place) and `_default_scope_attributes` emitted by
+    # `lower::default_scope`; these are the answers for every other model.
+    # `Relation#initialize` applies the scope, so the compiled roots
+    # (`ActiveRecord::Relation.new(Model)`) take it too.
+    def self._default_scoped?
+      false
+    end
+
+    def self._apply_default_scope(relation)
+      relation
+    end
+
+    def self._default_scope_attributes
+      {}
+    end
+
+    # Declared, and no `unscoped { ... }` block of this class running.
+    def self._default_scope_applies?
+      _default_scoped? && (@_unscoped_depth.nil? || @_unscoped_depth == 0)
+    end
+
+    # `Model.unscoped` is a relation without the default scope;
+    # `Model.unscoped { ... }` runs the block with the class's own finders,
+    # relations and `new` unscoped.
+    def self.unscoped
+      return ActiveRecord::Relation.new(self, false) unless block_given?
+      @_unscoped_depth = (@_unscoped_depth || 0) + 1
+      begin
+        yield
+      ensure
+        @_unscoped_depth -= 1
+      end
+    end
+
+    # Called last by a default-scoped model's `initialize`: Rails' scope
+    # attributes go in through the writers, and a given attribute wins.
+    def _seed_default_scope_attributes(attrs)
+      return unless self.class._default_scope_applies?
+      self.class._default_scope_attributes.each { |name, value| self[name] = value unless attrs.key?(name) }
+    end
+
+    # base.rb's `count` / `last` / `destroy_all` read the table through
+    # the adapter; a default scope reads through the relation.
+    def self.count
+      _default_scope_applies? ? ActiveRecord::Relation.new(self).count : _adapter_count
+    end
+
+    def self.last
+      _default_scope_applies? ? ActiveRecord::Relation.new(self).last : _adapter_last
+    end
+
+    def self.destroy_all
+      return ActiveRecord::Relation.new(self).destroy_all if _default_scope_applies?
+      records = _adapter_all
+      records.each { |r| r.destroy() }
+      records
     end
 
     # SELECT 1 LIMIT 1. Strict targets keep COUNT in base.rb.

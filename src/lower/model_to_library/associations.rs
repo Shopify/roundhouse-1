@@ -147,6 +147,7 @@ pub(super) fn push_association_methods(
                     scope.as_ref(),
                     through.is_some(),
                 ));
+                crate::lower::default_scope::materialize_reader(methods.last_mut(), target, models, through.is_some());
                 methods.push(synth_preload_setter(owner, name, target));
                 // `<name>_loaded?` / `<name>_target`: the eager-load cache
                 // read from outside the record. `scope_chain`'s seed arm

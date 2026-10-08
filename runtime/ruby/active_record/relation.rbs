@@ -24,7 +24,14 @@ module ActiveRecord
     # `untyped` (`spinel_relation_model_handle`): Spinel treats `Base` as
     # an instance (`sp_ActiveRecord__Base *`), so `Relation.new(User)`
     # would otherwise fail campfire AOT.
-    def initialize: (Base model) -> void
+    def initialize: (Base model, ?bool default_scoped) -> void
+    @default_scoped: bool
+    def unscoped: () -> Relation
+    def extending: (*::Module modules) -> Relation
+    def new: (?Hash[Symbol, untyped] attrs) -> Base
+    def build: (?Hash[Symbol, untyped] attrs) -> Base
+    def create: (?Hash[Symbol, untyped] attrs) -> Base
+    def create!: (?Hash[Symbol, untyped] attrs) -> Base
 
     # Rails' Relation#spawn — copy query state onto a fresh Relation so
     # a scope fork cannot mutate its caller's accumulators.

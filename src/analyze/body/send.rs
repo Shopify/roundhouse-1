@@ -1497,10 +1497,11 @@ impl<'a> BodyTyper<'a> {
                 // which masks downstream coercion (e.g. rust's
                 // setter-arg Borrow path keys on `recv: Ty::Class`
                 // to wrap String→&str at `instance.clone().set_body
-                // (row.body())` sites).
+                // (row.body())` sites). `extend` (Kernel#extend) answers
+                // the receiver itself (`Relation#extending`).
                 match method.as_str() {
                     "name" => return Ty::Str,
-                    "clone" | "dup" => return Ty::Class { id: id.clone(), args: args.clone() },
+                    "clone" | "dup" | "extend" => return Ty::Class { id: id.clone(), args: args.clone() },
                     "superclass" => return Ty::Class {
                         id: ClassId(Symbol::from("Class")),
                         args: vec![],

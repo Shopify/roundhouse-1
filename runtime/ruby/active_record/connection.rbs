@@ -109,6 +109,17 @@ module ActiveRecord
     def self.where: (Hash[Symbol, untyped] conditions) -> Relation
     def self.find_by: (Hash[String | Symbol, untyped] conditions) -> Base?
     def self.all: () -> Relation
+    # default_scope (`lower::default_scope` emits the declaring model's).
+    self.@_unscoped_depth: Integer?
+    def self._default_scoped?: () -> bool
+    def self._apply_default_scope: (Relation relation) -> Relation
+    def self._default_scope_attributes: () -> Hash[Symbol, untyped]
+    def self._default_scope_applies?: () -> bool
+    def self.unscoped: () ?{ () -> untyped } -> untyped
+    def _seed_default_scope_attributes: (Hash[Symbol, untyped] attrs) -> void
+    def self.count: () -> Integer
+    def self.last: () -> Base?
+    def self.destroy_all: () -> Array[Base]
     def self.none: () -> Relation
     def self.page: (?(Integer | String | nil) num) -> Relation
     def self.paginate: (?(Integer | String | nil) num, ?page: (Integer | String | nil), ?per_page: (Integer | String | nil)) -> Relation

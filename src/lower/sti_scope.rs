@@ -130,14 +130,26 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
             }
         }
     }
-    // Subclasses with declarations of their own root on themselves.
+    // Subclasses with declarations of their own root on themselves, as
+    // does one with a default scope of its own: its relation runs the
+    // subclass's `_apply_default_scope` (`lower::default_scope`).
     let roots: HashMap<ClassId, ClassId> = bases
         .iter()
         .map(|(sub, base)| {
-            let root = if declares_own_types(app, sub, base) { sub } else { base };
+            let own_scope = app
+                .library_classes
+                .iter()
+                .find(|lc| &lc.name == sub)
+                .is_some_and(super::default_scope::subclass_declares);
+            let root = if own_scope || declares_own_types(app, sub, base) { sub } else { base };
             (sub.clone(), root.clone())
         })
         .collect();
+    for lc in &mut app.library_classes {
+        if bases.contains_key(&lc.name) {
+            super::default_scope::push_subclass_methods(lc);
+        }
+    }
     super::for_each_hook_body(app, &mut |e| rewrite(e, &roots, &types, &mut recast));
     for view in &mut app.views {
         rewrite(&mut view.body, &roots, &types, &mut recast);
@@ -493,9 +505,12 @@ fn rewrite(
     if rewrite_becomes(expr, bases, recast) {
         return;
     }
-    let ExprNode::Send { recv: Some(r), method, .. } = &*expr.node else { return };
+    let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*expr.node else { return };
     let constructing = STI_CONSTRUCTORS.contains(&method.as_str());
-    if !constructing && !STI_RELATION_METHODS.contains(&method.as_str()) {
+    // `Sub.unscoped` drops the default scopes but keeps the type
+    // condition (Rails' `relation`): `Root.unscoped.where(type: "Sub")`.
+    let unscoped = method.as_str() == "unscoped" && args.is_empty() && block.is_none();
+    if !constructing && !unscoped && !STI_RELATION_METHODS.contains(&method.as_str()) {
         return;
     }
     let ExprNode::Const { path } = &*r.node else { return };
@@ -512,15 +527,17 @@ fn rewrite(
     }
     let base = bases.get(&named).expect("checked above");
     let span = expr.span;
+    let mut root = Expr::new(span, ExprNode::Const { path: base.0.as_str().split("::").map(Symbol::from).collect() });
+    if unscoped {
+        root = Expr::new(
+            span,
+            ExprNode::Send { recv: Some(root), method: Symbol::from("unscoped"), args: vec![], block: None, parenthesized: false },
+        );
+    }
     let scoped = Expr::new(
         span,
         ExprNode::Send {
-            recv: Some(Expr::new(
-                span,
-                ExprNode::Const {
-                    path: base.0.as_str().split("::").map(Symbol::from).collect(),
-                },
-            )),
+            recv: Some(root),
             method: Symbol::from("where"),
             args: vec![Expr::new(
                 span,
@@ -545,7 +562,7 @@ fn rewrite(
     // else rides the scoped relation.
     let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
     let ExprNode::Send { method, args, block, parenthesized, .. } = node else { unreachable!() };
-    if method.as_str() == "all" && args.is_empty() && block.is_none() {
+    if (unscoped || method.as_str() == "all") && args.is_empty() && block.is_none() {
         *expr = scoped;
         return;
     }
