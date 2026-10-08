@@ -827,7 +827,10 @@ module ActiveSupport
 end
 
 # activesupport core_ext/big_decimal/conversions.rb: a BigDecimal prints
-# in plain notation unless a format is given.
+# in plain notation unless a format is given. That file requires
+# bigdecimal itself (a bundled gem, activesupport's dependency).
+require "bigdecimal"
+require "bigdecimal/util"
 module ActiveSupport
   module BigDecimalWithDefaultFormat # :nodoc:
     def to_s(format = "F")
