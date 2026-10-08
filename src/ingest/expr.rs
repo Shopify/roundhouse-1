@@ -3455,6 +3455,7 @@ fn ingest_for(node: &ruby_prism::ForNode<'_>, span: Span, file: &str) -> IngestR
             block_param: None,
             body: Expr::new(at, ExprNode::Seq { exprs: body }),
             block_style: crate::expr::BlockStyle::Do,
+            signature: Default::default(),
         },
     );
     let each = Expr::new(
