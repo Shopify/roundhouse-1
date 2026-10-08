@@ -27,25 +27,56 @@ use std::collections::BTreeSet;
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
+use crate::dialect::LibraryClass;
 use crate::expr::{Expr, ExprNode};
 use crate::ident::Symbol;
 use crate::ty::Ty;
 
-pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
+/// A library class's parent, looked up from the class's namespace outward
+/// among `classes` as Ruby binds the written name (`class TrackCreateJob <
+/// TrackJob` in `module ShopEvent` is `ShopEvent::TrackJob`), as
+/// `emit::ruby::library::lexical_parent` does. Ingest records the name as
+/// written and binds it only after the concern splices, which read it
+/// (`library_class::resolve_library_parents`). A name no class in
+/// `classes` (the names of the app's classes, [`class_names`]) has at any
+/// level stays as written (`ActiveJob::Base`).
+pub(crate) fn lexical_parent_name(lc: &LibraryClass, classes: &BTreeSet<&str>) -> Option<String> {
+    let written = lc.parent.as_ref()?.0.as_str();
+    if let Some(absolute) = written.strip_prefix("::") {
+        return Some(absolute.to_string());
+    }
+    let mut scope: Vec<&str> = lc.name.0.as_str().split("::").collect();
+    scope.pop();
+    while !scope.is_empty() {
+        let candidate = format!("{}::{written}", scope.join("::"));
+        if candidate != lc.name.0.as_str() && classes.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+        scope.pop();
+    }
+    Some(written.to_string())
+}
 
-    // Transitive parent-chain closure (ApplicationJob names
-    // ActiveJob::Base; concrete jobs name ApplicationJob).
+/// The names of the classes (not modules) among `classes`.
+pub(crate) fn class_names(classes: &[LibraryClass]) -> BTreeSet<&str> {
+    classes.iter().filter(|c| !c.is_module).map(|c| c.name.0.as_str()).collect()
+}
+
+/// The app's job classes: those whose parent chain (within the ingested
+/// set) reaches ActiveJob::Base (ApplicationJob names ActiveJob::Base;
+/// concrete jobs name ApplicationJob).
+pub(crate) fn job_class_names(classes: &[LibraryClass]) -> BTreeSet<String> {
+    let names = class_names(classes);
+    let parents: Vec<(&str, Option<String>)> =
+        classes.iter().map(|lc| (lc.name.0.as_str(), lexical_parent_name(lc, &names))).collect();
     let mut jobs: BTreeSet<String> = BTreeSet::new();
     loop {
         let mut changed = false;
-        for lc in app.library_classes.iter() {
-            let name = lc.name.0.as_str();
-            if jobs.contains(name) {
+        for (name, parent) in &parents {
+            if jobs.contains(*name) {
                 continue;
             }
-            if let Some(p) = &lc.parent {
-                let ps = p.0.as_str();
+            if let Some(ps) = parent {
                 if ps == "ActiveJob::Base" || jobs.contains(ps) {
                     jobs.insert(name.to_string());
                     changed = true;
@@ -56,9 +87,120 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
             break;
         }
     }
+    jobs
+}
+
+/// The port module a job hierarchy that registers callbacks includes
+/// (runtime/spinel/active_job_callbacks.rb).
+pub(crate) const CALLBACKS_PORT: &str = "ActiveJob::Callbacks";
+
+/// Whether `call` is a bare or `self.` call of a class method the
+/// ActiveJob::Callbacks port gives a job (`before_perform`,
+/// `around_enqueue`, `set_callback`, `rescue_from`, ...): what Rails'
+/// ActiveJob::Base answers in a job's body. The names are the port's own
+/// (`runtime_reads::mixed_in_class_methods`).
+pub(crate) fn is_callbacks_port_call(call: &Expr) -> bool {
+    let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+    recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+        && crate::analyze::runtime_reads::mixed_in_class_methods(CALLBACKS_PORT)
+            .is_some_and(|names| names.iter().any(|n| n == method.as_str()))
+}
+
+/// The statements of a module's `self.included(base)` hook when each one
+/// is a call of an ActiveJob::Callbacks class method on `base`
+/// (`base.around_enqueue do ... end`): Core's BackgroundQueue::WithFallback
+/// and MeasureJobPerformance. Such a hook only registers callbacks on the
+/// includer, whatever else the include carries; `None` for any other hook
+/// or no hook.
+pub(crate) fn callback_registering_hook(module: &LibraryClass) -> Option<Vec<&Expr>> {
+    let hook = module.methods.iter().find(|m| {
+        m.receiver == crate::dialect::MethodReceiver::Class
+            && m.name.as_str() == "included"
+            && m.params.len() == 1
+            && !m.params[0].keyword
+            && m.params[0].default.is_none()
+            && m.block_param.is_none()
+    })?;
+    let base = &hook.params[0].name;
+    let statements: Vec<&Expr> = match &*hook.body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![&hook.body],
+    };
+    let registers = |e: &Expr| {
+        let ExprNode::Send { recv: Some(r), method, .. } = &*e.node else { return false };
+        matches!(&*r.node, ExprNode::Var { name, .. } if name == base)
+            && crate::analyze::runtime_reads::mixed_in_class_methods(CALLBACKS_PORT)
+                .is_some_and(|names| names.iter().any(|n| n == method.as_str()))
+    };
+    (!statements.is_empty() && statements.iter().all(|e| registers(e))).then_some(statements)
+}
+
+/// The jobs that run on the ActiveJob::Callbacks port: every job below
+/// the topmost app job class of a hierarchy one of whose classes
+/// registers a callback or a handler, in its body, through a carried
+/// `included do` statement (`App::included_block_statements`) or through
+/// an included module's hook (`callback_registering_hook`). Each such
+/// topmost class includes the port first, as Rails' ActiveJob::Base
+/// includes ActiveJob::Callbacks ahead of everything an app job class
+/// includes.
+fn adopt_callbacks_port(app: &mut App, jobs: &BTreeSet<String>) -> BTreeSet<String> {
+    let names = class_names(&app.library_classes);
+    let parents: std::collections::BTreeMap<&str, String> = app
+        .library_classes
+        .iter()
+        .filter(|lc| jobs.contains(lc.name.0.as_str()))
+        .filter_map(|lc| Some((lc.name.0.as_str(), lexical_parent_name(lc, &names)?)))
+        .filter(|(_, p)| jobs.contains(p))
+        .collect();
+    let parent_of = |name: &str| -> Option<String> { parents.get(name).cloned() };
+    let top_of = |name: &str| -> String {
+        let mut at = name.to_string();
+        let mut seen = BTreeSet::new();
+        while let Some(parent) = parent_of(&at) {
+            if !seen.insert(at.clone()) {
+                break;
+            }
+            at = parent;
+        }
+        at
+    };
+    let hooked = |inc: &crate::ident::ClassId| {
+        let name = inc.0.as_str().trim_start_matches("::");
+        app.library_classes
+            .iter()
+            .filter(|m| m.is_module && m.name.0.as_str() == name)
+            .any(|m| callback_registering_hook(m).is_some())
+    };
+    let mut tops: BTreeSet<String> = BTreeSet::new();
+    for lc in app.library_classes.iter().filter(|lc| jobs.contains(lc.name.0.as_str())) {
+        let registers = lc.unknown_calls.iter().any(is_callbacks_port_call)
+            || app.included_block_statements.get(&lc.name).is_some_and(|s| !s.is_empty())
+            || lc.includes.iter().any(hooked);
+        if registers {
+            tops.insert(top_of(lc.name.0.as_str()));
+        }
+    }
+    if tops.is_empty() {
+        return BTreeSet::new();
+    }
+    let on_port: BTreeSet<String> = jobs.iter().filter(|job| tops.contains(&top_of(job))).cloned().collect();
+    let port = crate::ident::ClassId(Symbol::from(CALLBACKS_PORT));
+    for lc in app.library_classes.iter_mut().filter(|lc| tops.contains(lc.name.0.as_str())) {
+        if !lc.includes.contains(&port) {
+            lc.includes.insert(0, port.clone());
+        }
+    }
+    on_port
+}
+
+pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    let jobs = job_class_names(&app.library_classes);
     if jobs.is_empty() {
         return diags;
     }
+    let on_port = adopt_callbacks_port(app, &jobs);
 
     // `Job.set(wait:/queue:/priority:).perform_later(args)` folds to
     // `Job.perform_later(args)` at the call site. Inline semantics has
@@ -104,23 +246,30 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
         else {
             continue;
         };
-        if perform.params.iter().any(|p| p.forwarding) {
-            diags.push(Diagnostic::unsupported(perform.name_span, None, "full forwarding job wrapper",
-                "the generated job wrapper cannot preserve a full forwarding packet"));
-            continue;
-        }
-        if perform.params.iter().any(crate::dialect::Param::is_nameless_rest) {
-            diags.push(Diagnostic::unsupported(perform.name_span, None, "anonymous positional rest job wrapper",
-                "the generated job wrapper has no name to forward a nameless rest by"));
-            continue;
-        }
-        if perform.params.iter().any(|p| p.keyword) {
-            diags.push(residue(&perform, "keyword parameters do not forward positionally"));
-            continue;
-        }
-        if perform.block_param.is_some() {
-            diags.push(residue(&perform, "the wrapper cannot forward a block"));
-            continue;
+        // A job on the ActiveJob::Callbacks port takes `perform_now` and
+        // `perform_later` from it, which run its chains around `perform`
+        // and the enqueue, forward every kind of argument and answer what
+        // Rails' do. Only `set` is still this pass's.
+        let port = on_port.contains(lc.name.0.as_str());
+        if !port {
+            if perform.params.iter().any(|p| p.forwarding) {
+                diags.push(Diagnostic::unsupported(perform.name_span, None, "full forwarding job wrapper",
+                    "the generated job wrapper cannot preserve a full forwarding packet"));
+                continue;
+            }
+            if perform.params.iter().any(crate::dialect::Param::is_nameless_rest) {
+                diags.push(Diagnostic::unsupported(perform.name_span, None, "anonymous positional rest job wrapper",
+                    "the generated job wrapper has no name to forward a nameless rest by"));
+                continue;
+            }
+            if perform.params.iter().any(|p| p.keyword) {
+                diags.push(residue(&perform, "keyword parameters do not forward positionally"));
+                continue;
+            }
+            if perform.block_param.is_some() {
+                diags.push(residue(&perform, "the wrapper cannot forward a block"));
+                continue;
+            }
         }
 
         let (param_tys, ret_ty): (Vec<Option<Ty>>, Option<Ty>) = match &perform.signature {
@@ -133,7 +282,8 @@ pub fn apply_job_class_side(app: &mut App) -> Vec<Diagnostic> {
 
         let span = perform.body.span;
         let mut wrappers: Vec<crate::dialect::MethodDef> = Vec::new();
-        for entry in ["perform_later", "perform_now"] {
+        let entries: &[&str] = if port { &[] } else { &["perform_later", "perform_now"] };
+        for &entry in entries {
             if class_side.contains(entry) {
                 continue;
             }

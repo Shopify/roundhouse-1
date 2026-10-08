@@ -165,13 +165,14 @@ fn tree(files: &[(&str, &str)]) -> roundhouse::det::HashMap<std::path::PathBuf, 
         .collect()
 }
 
-/// A statement the job gets nothing for (an ActiveJob callback has no
-/// port on a plain includer) is an error at the statement, naming the
-/// includer; the rest of the block is still supplied.
+/// A statement the job gets nothing for (`after_discard`, which the
+/// ActiveJob::Callbacks port does not carry; the callbacks it does carry
+/// are tests/active_job_callbacks_port.rs) is an error at the statement,
+/// naming the includer; the rest of the block is still supplied.
 #[test]
 fn an_unmodeled_statement_of_such_a_block_is_an_error_not_a_drop() {
     use roundhouse::ingest::{ingest_app_from_tree, survey};
-    let timed = "module Timed\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :budget, default: 5\n    around_perform :time_it\n  end\n\n  def time_it = yield\nend\n";
+    let timed = "module Timed\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :budget, default: 5\n    after_discard :time_it\n  end\n\n  def time_it = yield\nend\n";
     let files = [
         ("app/utils/timed.rb", timed),
         (
@@ -183,7 +184,7 @@ fn an_unmodeled_statement_of_such_a_block_is_an_error_not_a_drop() {
         .expect_err("the statement is refused")
         .to_string();
     assert!(
-        error.contains("`around_perform` in `included do` of Timed is not modeled on a plain")
+        error.contains("`after_discard` in `included do` of Timed is not modeled on a plain")
             && error.contains("TimedJob"),
         "{error}"
     );

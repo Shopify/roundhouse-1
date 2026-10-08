@@ -7610,6 +7610,24 @@ fn emit_library_class_decl_inner(
             return;
         }
         writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
+        // The include's carried `included do` statements, where Ruby runs
+        // them: right after it (`App::included_block_statements`).
+        let root = inc.0.as_str().trim_start_matches("::");
+        for (_, statement) in app
+            .included_block_statements
+            .get(&lc.name)
+            .into_iter()
+            .flatten()
+            .filter(|(after, _)| after.0.as_str().trim_start_matches("::") == root)
+        {
+            for line in super::emit_expr(statement).lines() {
+                if line.is_empty() {
+                    writeln!(s).unwrap();
+                } else {
+                    writeln!(s, "{body_pad}{line}").unwrap();
+                }
+            }
+        }
     };
     // An include whose `self.included(base)` hook calls class methods of
     // this class runs after them, as in the source (see

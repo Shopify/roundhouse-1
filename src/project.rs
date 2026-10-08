@@ -3376,8 +3376,31 @@ fn ruby_family_files(
     // before any app file loads.
     // Its DescendantsTracker rides with it, and on its own where the app
     // names the tracker (Core extends classes with it).
-    let carries_callbacks = carries_named(&files, &["ActiveSupport::Callbacks"]);
+    // ActiveJob::Callbacks (with the Core, Enqueuing and Execution parts
+    // that run its chains), ported from activejob 8.2.0.alpha (see the
+    // file's header; tests/active_job_callbacks_port.rs holds it to
+    // native ActiveJob): carried where an emitted job hierarchy includes
+    // it (`lower::job_class_side`), with the ActiveSupport::Callbacks and
+    // ActiveSupport::Rescuable ports it builds on. Rescuable rides alone
+    // where the app names it.
+    let carries_job_callbacks = carries_named(&files, &["ActiveJob::Callbacks"]);
+    let carries_rescuable = carries_job_callbacks || carries_named(&files, &["ActiveSupport::Rescuable"]);
+    let carries_callbacks = carries_job_callbacks || carries_named(&files, &["ActiveSupport::Callbacks"]);
     let carries_descendants_tracker = carries_callbacks || carries_named(&files, &["ActiveSupport::DescendantsTracker"]);
+    if carries_rescuable {
+        files.push((
+            "runtime/active_support_rescuable.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_rescuable.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_rescuable.rb: {e}"))?,
+        ));
+    }
+    if carries_job_callbacks {
+        files.push((
+            "runtime/active_job_callbacks.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_job_callbacks.rb")
+                .map_err(|e| format!("read runtime/spinel/active_job_callbacks.rb: {e}"))?,
+        ));
+    }
     if carries_callbacks {
         files.push((
             "runtime/active_support_callbacks.rb".to_string(),
@@ -3557,6 +3580,16 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_callbacks {
         format!("{gem_facades}require_relative \"active_support_callbacks\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_rescuable {
+        format!("{gem_facades}require_relative \"active_support_rescuable\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_job_callbacks {
+        format!("{gem_facades}require_relative \"active_job_callbacks\"\n")
     } else {
         gem_facades
     };
@@ -8559,6 +8592,10 @@ fn spinel_files_with_assertions(
     // And for ActiveSupport::Callbacks, pushed back by the two ruby-family
     // forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_callbacks.rb" && p != "runtime/active_support_descendants_tracker.rb");
+    // And for ActiveJob::Callbacks and ActiveSupport::Rescuable, pushed
+    // back by the two ruby-family forks where a job hierarchy includes
+    // the one or the app names the other.
+    files.retain(|(p, _)| p != "runtime/active_job_callbacks.rb" && p != "runtime/active_support_rescuable.rb");
     // And for the association object (computed-name ivar reads),
     // pushed back by the two ruby-family forks where a model dispatches
     // to it.

@@ -38,6 +38,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_logger.rb", "runtime/active_support_logger.rb"),
     ("runtime/spinel/active_support_callbacks.rb", "runtime/active_support_callbacks.rb"),
     ("runtime/spinel/active_support_descendants_tracker.rb", "runtime/active_support_descendants_tracker.rb"),
+    ("runtime/spinel/active_support_rescuable.rb", "runtime/active_support_rescuable.rb"),
+    ("runtime/spinel/active_job_callbacks.rb", "runtime/active_job_callbacks.rb"),
     ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
@@ -248,17 +250,45 @@ pub(crate) fn is_runtime_declared_namespace(name: &str) -> bool {
 /// extends the includer with. `ActiveSupport::Callbacks` gives
 /// `define_callbacks`, `set_callback`, `skip_callback` and the rest, which
 /// an includer's body calls (Core's Plus::Plan::Change).
+///
+/// With the class methods of the port modules its `append_features`
+/// includes in the includer (`base.include M`), and theirs: the
+/// ActiveJob::Callbacks port brings ActiveSupport::Callbacks'
+/// `set_callback` and ActiveSupport::Rescuable's `rescue_from`, as
+/// Rails' ActiveJob::Base does.
 pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> {
     static METHODS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
     METHODS.get_or_init(|| {
-        struct Carriers(Vec<String>, HashMap<String, Vec<String>>);
+        /// The enclosing module path; each module's ClassMethods defs;
+        /// each module's `base.include` arguments as written; every
+        /// module path entered.
+        struct Carriers(Vec<String>, HashMap<String, Vec<String>>, Vec<(String, String)>, HashSet<String>);
         impl Carriers {
             fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
                 self.0.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
+                self.3.insert(self.0.join("::"));
                 if let Some(body) = body {
                     ruby_prism::Visit::visit(self, &body);
                 }
                 self.0.pop();
+            }
+        }
+        /// `base.include M, ...` in an `append_features(base)` body.
+        struct Includes<'a>(&'a [u8], Vec<String>);
+        impl<'pr> ruby_prism::Visit<'pr> for Includes<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                let on_base = node
+                    .receiver()
+                    .and_then(|r| r.as_local_variable_read_node())
+                    .is_some_and(|r| r.name().as_slice() == self.0);
+                if on_base && node.name().as_slice() == b"include" {
+                    for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                        if arg.as_constant_read_node().is_some() || arg.as_constant_path_node().is_some() {
+                            self.1.push(String::from_utf8_lossy(arg.location().as_slice()).into_owned());
+                        }
+                    }
+                }
+                ruby_prism::visit_call_node(self, node);
             }
         }
         impl<'pr> ruby_prism::Visit<'pr> for Carriers {
@@ -270,6 +300,23 @@ pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> 
             }
             fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
             fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+                if node.receiver().is_some_and(|r| r.as_self_node().is_some())
+                    && node.name().as_slice() == b"append_features"
+                    && !self.0.is_empty()
+                {
+                    let base = node
+                        .parameters()
+                        .and_then(|p| p.requireds().iter().next())
+                        .and_then(|p| p.as_required_parameter_node())
+                        .map(|p| p.name().as_slice().to_vec());
+                    if let (Some(base), Some(body)) = (base, node.body()) {
+                        let mut includes = Includes(&base, Vec::new());
+                        ruby_prism::Visit::visit(&mut includes, &body);
+                        let owner = self.0.join("::");
+                        self.2.extend(includes.1.into_iter().map(|written| (owner.clone(), written)));
+                    }
+                    return;
+                }
                 if node.receiver().is_some() || self.0.last().map(String::as_str) != Some("ClassMethods") {
                     return;
                 }
@@ -281,7 +328,7 @@ pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> 
                 self.1.entry(owner).or_default().push(name);
             }
         }
-        let mut carriers = Carriers(Vec::new(), HashMap::default());
+        let mut carriers = Carriers(Vec::new(), HashMap::default(), Vec::new(), HashSet::default());
         for (source, _) in RUBY_FAMILY_RUNTIME {
             let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
             let parsed = ruby_prism::parse(text.as_bytes());
@@ -289,7 +336,51 @@ pub(crate) fn mixed_in_class_methods(module: &str) -> Option<&'static [String]> 
                 ruby_prism::Visit::visit(&mut carriers, &parsed.node());
             }
         }
-        carriers.1
+        let Carriers(_, own, includes, modules) = carriers;
+        // Each written name resolved as Ruby reads it from the owner's
+        // nesting: innermost scope first, then outward, then top level.
+        let resolve = |owner: &str, written: &str| -> Option<String> {
+            if let Some(top) = written.strip_prefix("::") {
+                return modules.contains(top).then(|| top.to_string());
+            }
+            let mut scope = Some(owner);
+            while let Some(prefix) = scope {
+                let candidate = format!("{prefix}::{written}");
+                if modules.contains(&candidate) {
+                    return Some(candidate);
+                }
+                scope = prefix.rsplit_once("::").map(|(prefix, _)| prefix);
+            }
+            modules.contains(written).then(|| written.to_string())
+        };
+        let mut deps: HashMap<String, Vec<String>> = HashMap::default();
+        for (owner, written) in &includes {
+            if let Some(dep) = resolve(owner, written) {
+                deps.entry(owner.clone()).or_default().push(dep);
+            }
+        }
+        let mut owners: Vec<&String> = own.keys().chain(deps.keys()).collect();
+        owners.sort();
+        owners.dedup();
+        let mut methods: HashMap<String, Vec<String>> = HashMap::default();
+        for owner in owners {
+            let mut gathered: Vec<String> = Vec::new();
+            let mut pending = vec![owner.clone()];
+            let mut seen: HashSet<String> = HashSet::default();
+            while let Some(at) = pending.pop() {
+                if !seen.insert(at.clone()) {
+                    continue;
+                }
+                for name in own.get(&at).into_iter().flatten() {
+                    if !gathered.contains(name) {
+                        gathered.push(name.clone());
+                    }
+                }
+                pending.extend(deps.get(&at).into_iter().flatten().rev().cloned());
+            }
+            methods.insert(owner.clone(), gathered);
+        }
+        methods
     }).get(module).map(Vec::as_slice)
 }
 
@@ -644,6 +735,9 @@ mod tests {
             ("ActiveSupport::Callbacks", "runtime/active_support_callbacks.rb"),
             ("ActiveSupport::Callbacks::CallbackChain", "runtime/active_support_callbacks.rb"),
             ("ActiveSupport::DescendantsTracker", "runtime/active_support_descendants_tracker.rb"),
+            ("ActiveSupport::Rescuable", "runtime/active_support_rescuable.rb"),
+            ("ActiveJob::Callbacks", "runtime/active_job_callbacks.rb"),
+            ("ActiveJob::Execution", "runtime/active_job_callbacks.rb"),
             ("ActiveSupport::Cache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
             ("ActiveSupport::Testing::TimeHelpers", "runtime/active_support_testing_time_helpers.rb"),
@@ -673,6 +767,10 @@ mod tests {
         assert!(!names.contains_key("ActiveSupport"), "{names:?}");
         assert!(!names.contains_key("Rails"), "{names:?}");
         assert!(!names.contains_key("Rails::Application"), "{names:?}");
+        // active_job.rb declares these for every target; the callbacks
+        // port adds modules beside Base and does not reopen it.
+        assert!(!names.contains_key("ActiveJob"), "{names:?}");
+        assert!(!names.contains_key("ActiveJob::Base"), "{names:?}");
         // active_support_ext.rb and security_utils.rb declare these for
         // every target.
         assert!(!names.contains_key("ActiveSupport::MessageVerifier"), "{names:?}");
@@ -685,6 +783,17 @@ mod tests {
             assert!(is_runtime_declared_namespace(name), "{name}");
         }
         assert!(!is_runtime_declared_namespace("ActiveSupport::MessageVerifiers"));
+    }
+
+    #[test]
+    fn the_job_callbacks_port_mixes_in_its_includes_class_methods() {
+        let methods = mixed_in_class_methods("ActiveJob::Callbacks").expect("the port's class methods");
+        for name in ["before_perform", "around_enqueue", "set_callback", "skip_callback", "define_callbacks", "rescue_from", "perform_later", "perform_now"] {
+            assert!(methods.iter().any(|m| m == name), "{name}: {methods:?}");
+        }
+        let rescuable = mixed_in_class_methods("ActiveSupport::Rescuable").expect("Rescuable's class methods");
+        assert!(rescuable.iter().any(|m| m == "rescue_from"), "{rescuable:?}");
+        assert!(!rescuable.iter().any(|m| m == "set_callback"), "{rescuable:?}");
     }
 
     #[test]
