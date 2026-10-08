@@ -6,7 +6,12 @@
 //! A new record not given the attribute starts from the declared
 //! default, cast through the attribute's type (`"7"` on an integer
 //! column is 7), and a Proc default is called for each record. A given
-//! value, `nil` included, wins, and a loaded record reads its row. The
+//! value, `nil` included, wins, and a loaded record reads its row and
+//! never calls a Proc default (the counters stay put across find,
+//! where, load, first and reload). One known difference: the compiled
+//! `initialize` calls the Proc when it builds the record, Rails on the
+//! first read, so a new record that never reads the attribute (nor
+//! saves, which reads it) still costs one call here. The
 //! declaration applies to its class and subclasses: `SpecialWidget#kind`
 //! starts at "special", `Widget#kind` at the column's own default. The
 //! model compiles the columns as retypable, its `initialize` asks the
@@ -58,11 +63,12 @@ end
 
 const WIDGET: &str = r#"class Widget < ApplicationRecord
   FRESH = "fresh"
+  TOKENS = []
 
   attribute :state, :string, default: FRESH
   attribute :count, :integer, default: "7"
   attribute :flag, :boolean, default: "1"
-  attribute :token, default: -> { "t-" + name.to_s }
+  attribute :token, default: -> { TOKENS << 1; "t-" + name.to_s }
 end
 "#;
 
@@ -151,6 +157,26 @@ const PROBE: &str = r##"class AttributeDefaultProbe
     found.email = "c"
     found.save!
     out << "pk update: #{Request.find(req.id).email} #{Request.count} #{Request.type_for_attribute(:id).type.inspect}"
+    tokens = Widget::TOKENS.size
+    minted = Request::MINTED.size
+    Widget.find(a.id)
+    Widget.find(c.id)
+    Widget.where(name: "b").to_a
+    Widget.all.load
+    Widget.order(:id).first
+    SpecialWidget.all.to_a
+    a.reload
+    Request.find(req.id)
+    Request.where(email: "c").to_a
+    Request.all.load
+    found.reload
+    out << "proc calls on load: #{Widget::TOKENS.size - tokens} #{Request::MINTED.size - minted}"
+    Widget.new(token: "x")
+    Request.new(id: "0190A3B2-0000-7000-8000-0000000000BB")
+    out << "proc calls on new given: #{Widget::TOKENS.size - tokens} #{Request::MINTED.size - minted}"
+    Widget.new.token
+    Request.new.id
+    out << "proc calls on new: #{Widget::TOKENS.size - tokens} #{Request::MINTED.size - minted}"
     out
   end
 end
@@ -158,7 +184,7 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 14] = [
     r#"new: "fresh" 7 true "t-Widget" nil"#,
     r#"given: "given" 2 false nil"#,
     r#"sti: "special" "fresh" nil"#,
@@ -170,6 +196,9 @@ const EXPECTED: [&str; 11] = [
     "pk find: Probe::Uid true 1 true",
     "pk given: #<Uid 0190a3b2-0000-7000-8000-0000000000aa> b",
     "pk update: c 2 :uid",
+    "proc calls on load: 0 0",
+    "proc calls on new given: 0 0",
+    "proc calls on new: 1 1",
 ];
 
 /// What native Rails requires, in order.

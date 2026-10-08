@@ -618,9 +618,11 @@ module ActiveRecord
     # record, and the value is cast through the attribute's type. The
     # compiled `initialize` asks for it (`_attribute_default?`) for the
     # columns the compiler saw a `default:` call name; for any other name
-    # a default raises like an unconsulted type. One difference: the
-    # compiled hydration builds a loaded record through `new`, so a Proc
-    # default runs for it too before the row's value replaces it.
+    # a default raises like an unconsulted type. A loaded record never
+    # consults it (hydration constructs with HYDRATE_ATTRS). One
+    # difference: `initialize` calls a Proc default as it builds the
+    # record, Rails on the attribute's first read, so a new record that
+    # never reads the attribute (nor saves) still costs one call.
     def self.attribute(name, type = nil, default: (no_default = true), **options)
       name = name.to_s
       unless _retypable_attribute_names.include?(name)
