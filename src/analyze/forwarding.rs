@@ -1957,6 +1957,16 @@ impl<'a> SourceContractIndex<'a> {
         if dynamic.touched.contains(last_segment(namespace)) {
             return Reopened::Unknown;
         }
+        // A file-level mixin into a name with this last segment (it may
+        // be this namespace): its module must hold only its own
+        // declarations, none of them `method`.
+        if dynamic
+            .file_mixins
+            .get(last_segment(namespace))
+            .is_some_and(|modules| !modules.iter().all(|module| self.holds_only_own_without(module.as_ref(), &method)))
+        {
+            return Reopened::Unknown;
+        }
         let mut answer = Reopened::No;
         if self.fragments.contains_key(&id) {
             if !self.verified(&id) || !self.prepends_without(&id, &method) {
@@ -2005,7 +2015,7 @@ impl<'a> SourceContractIndex<'a> {
             || !world.runtime_declares(written)
             || !self.module_without_app_includer(owner)
             || self.dynamic().mixed.contains(last_segment(written))
-            || self.dynamic().touched.contains(last_segment(written))
+            || self.dynamic().touches(last_segment(written))
         {
             return false;
         }
@@ -2064,7 +2074,7 @@ impl<'a> SourceContractIndex<'a> {
         hierarchy.iter().all(|class| {
             !self.synthesized.contains(*class)
                 && !self.mixed_into(class)
-                && !self.dynamic().touched.contains(last_segment(class.0.as_str()))
+                && !self.dynamic().touches(last_segment(class.0.as_str()))
                 && self.prepends_without(class, method)
         })
     }
@@ -2073,17 +2083,24 @@ impl<'a> SourceContractIndex<'a> {
     /// methods, and which the index does not record) is an app module
     /// whose own declarations are all it holds, none of them `method`.
     fn prepends_without(&self, class: &ClassId, method: &Symbol) -> bool {
+        self.dynamic()
+            .prepends
+            .get(class)
+            .is_none_or(|modules| modules.iter().all(|module| self.holds_only_own_without(module.as_ref(), method)))
+    }
+
+    /// `module` is an app module whose own declarations (in verified
+    /// fragments, with no includes, and on no runtime or stdlib name)
+    /// are all it holds, none of them instance method `method`.
+    fn holds_only_own_without(&self, module: Option<&ClassId>, method: &Symbol) -> bool {
         let world = external::world();
-        self.dynamic().prepends.get(class).is_none_or(|modules| {
-            modules.iter().all(|module| {
-                module.as_ref().is_some_and(|module| {
-                    self.verified(module)
-                        && !world.runtime_declares(module.0.as_str())
-                        && !world.stdlib_declares(module.0.as_str())
-                        && self.includes(module).is_empty()
-                        && !self.instance.contains_key(&(module.clone(), method.clone()))
-                })
-            })
+        module.is_some_and(|module| {
+            self.verified(module)
+                && !world.runtime_declares(module.0.as_str())
+                && !world.stdlib_declares(module.0.as_str())
+                && self.includes(module).is_empty()
+                && !self.dynamic().touches(last_segment(module.0.as_str()))
+                && !self.instance.contains_key(&(module.clone(), method.clone()))
         })
     }
 
@@ -2104,7 +2121,7 @@ impl<'a> SourceContractIndex<'a> {
             || self.mixed_into(owner)
             || self.nested_constant(owner, source)
             || self.mixed_into(&id)
-            || self.dynamic().touched.contains(last_segment(source))
+            || self.dynamic().touches(last_segment(source))
             || !world.own_methods_native(source)
         {
             return false;
@@ -2297,6 +2314,11 @@ struct Dynamic {
     /// methods on (`Target.prepend(M)`, `Target.class_eval do … end`), or
     /// a declaration carried only in a file program.
     touched: HashSet<String>,
+    /// A file-level `Target.include(M)` / `Target.prepend(M)` with
+    /// constant arguments, by the target's last segment: each module
+    /// resolved to an app fragment (`None`: not one) and whether it is
+    /// prepended. It also touches the target ([`Dynamic::touches`]).
+    file_mixins: HashMap<String, Vec<Option<ClassId>>>,
     /// Modules some `include`, `prepend` or `extend` anywhere in the app
     /// (a class body, a method body, a file-level statement, an
     /// initializer) names.
@@ -2307,6 +2329,12 @@ struct Dynamic {
 }
 
 impl Dynamic {
+    /// A file-level statement may reopen, mix into or define methods on
+    /// the name.
+    fn touches(&self, last: &str) -> bool {
+        self.touched.contains(last) || self.file_mixins.contains_key(last)
+    }
+
     fn new(index: &SourceContractIndex<'_>) -> Self {
         use crate::app::ProgramItem;
         const TOUCH: [&str; 16] = [
@@ -2338,10 +2366,42 @@ impl Dynamic {
             }
             e.node.for_each_child(&mut |c| touches(c, touched));
         }
-        fn items(list: &[ProgramItem], touched: &mut HashSet<String>, mixed: &mut HashSet<String>) {
+        type Written = (String, Vec<Vec<Symbol>>);
+        /// `Target.include(M, …)` / `Target.prepend(M, …)`, every name
+        /// a constant and no block.
+        fn mixin(e: &Expr) -> Option<Written> {
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else {
+                return None;
+            };
+            if !matches!(method.as_str(), "include" | "prepend") || args.is_empty() {
+                return None;
+            }
+            let target = const_last(recv)?;
+            let modules = args
+                .iter()
+                .map(|arg| match &*arg.node {
+                    ExprNode::Const { path } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((target, modules))
+        }
+        fn items(
+            list: &[ProgramItem],
+            touched: &mut HashSet<String>,
+            mixed: &mut HashSet<String>,
+            written: &mut Vec<Written>,
+        ) {
             for item in list {
                 match item {
-                    ProgramItem::Statement(e) | ProgramItem::Guard(e) => {
+                    ProgramItem::Statement(e) => {
+                        match mixin(e) {
+                            Some(found) => written.push(found),
+                            None => touches(e, touched),
+                        }
+                        mixes(e, mixed);
+                    }
+                    ProgramItem::Guard(e) => {
                         touches(e, touched);
                         mixes(e, mixed);
                     }
@@ -2353,8 +2413,8 @@ impl Dynamic {
                     }
                     ProgramItem::Branch { cond, then_items, else_items, .. } => {
                         touches(cond, touched);
-                        items(then_items, touched, mixed);
-                        items(else_items, touched, mixed);
+                        items(then_items, touched, mixed, written);
+                        items(else_items, touched, mixed, written);
                     }
                     ProgramItem::Declared(_) | ProgramItem::Require { .. } | ProgramItem::NotCarried { .. } => {}
                 }
@@ -2363,8 +2423,9 @@ impl Dynamic {
         let app = index.app;
         let mut touched = HashSet::default();
         let mut mixed: HashSet<String> = HashSet::default();
+        let mut written = Vec::new();
         for program in &app.file_programs {
-            items(&program.items, &mut touched, &mut mixed);
+            items(&program.items, &mut touched, &mut mixed, &mut written);
         }
         mixed.extend(app.module_mixins.iter().map(|m| last_segment(m.module.as_str()).to_string()));
         for (_, method) in methods(app) {
@@ -2382,6 +2443,10 @@ impl Dynamic {
                 _ => None,
             }
         };
+        let mut file_mixins: HashMap<String, Vec<Option<ClassId>>> = HashMap::default();
+        for (target, modules) in written {
+            file_mixins.entry(target).or_default().extend(modules.iter().map(|path| resolve(path)));
+        }
         let mut prepends: HashMap<ClassId, Vec<Option<ClassId>>> = HashMap::default();
         for class in classes(app) {
             for call in &class.unknown_calls {
@@ -2406,7 +2471,7 @@ impl Dynamic {
                 }
             }
         }
-        Dynamic { touched, mixed, prepends }
+        Dynamic { touched, file_mixins, mixed, prepends }
     }
 }
 

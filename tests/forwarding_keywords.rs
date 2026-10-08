@@ -414,6 +414,36 @@ fn native_cache_result(source: &str, script: &str) -> String {
 }
 
 #[test]
+fn ordinary_super_binds_natively_past_a_file_level_prepend_of_an_app_module() {
+    // A file-level `MemoryStore.prepend(ProbeTrace)` puts ProbeTrace
+    // before the store's own methods; it declares no `write_entry`, so
+    // the reopened LocalCache's `super` still reaches the store's own.
+    let local_cache = "module ActiveSupport; module Cache; module Strategy; module LocalCache; def write_entry(key, entry, **options); (@probe_log ||= []) << [:local, key, options.key?(:unless_exist)]; super(key, entry, **options); end; end; end; end; end\n";
+    let trace = |body: &str| format!("{local_cache}module ProbeTrace; {body}; end\nActiveSupport::Cache::MemoryStore.prepend(ProbeTrace)\nclass ProbeStore < ActiveSupport::Cache::MemoryStore; attr_reader :probe_log; end");
+    let source = trace("def probe_traced; :traced; end");
+    let script = "s = ProbeStore.new; s.write('k', 7, unless_exist: true); p s.read('k'); p s.probe_log; p s.probe_traced";
+    let expected = native_cache_result(&source, script);
+    assert_eq!(expected, "7\n[[:local, \"k\", true]]\n:traced\n");
+    let run = emit_and_run::real_blog().write("app/lib/probe_store.rb", &source).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    // Not shown: the prepended module declares the method, or is not an
+    // app module.
+    for source in [
+        trace("def write_entry(key, entry, **options); super; end"),
+        format!("{local_cache}ActiveSupport::Cache::MemoryStore.prepend(Comparable)"),
+    ] {
+        let (_, errors) = emit_and_run::real_blog()
+            .write("app/lib/probe_store.rb", &source)
+            .emit(roundhouse::project::BuildTarget::Ruby);
+        assert!(
+            errors.iter().any(|e| e.contains("ordinary super") && e.contains("argument ABI")),
+            "{source}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn ordinary_super_binds_natively_from_a_reopened_runtime_module_and_a_yielding_block() {
     // The app reopens the runtime's LocalCache, which MemoryStore,
     // NullStore and MemCacheStore prepend: its `super` goes on in each
