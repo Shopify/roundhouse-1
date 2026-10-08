@@ -3933,6 +3933,85 @@ mod tests {
 
 
     #[test]
+    fn time_arithmetic_reads_the_argument() {
+        let classes = empty_classes();
+        let typer = BodyTyper::new(&classes);
+        for (method, arg, want) in [
+            ("+", Ty::Int, Ty::Time),
+            ("+", Ty::Float, Ty::Time),
+            ("-", Ty::Int, Ty::Time),
+            ("-", Ty::Time, Ty::Float),
+            // A Duration (`1.day`) is untyped here, and `Time + Time`
+            // is a TypeError: neither is claimed.
+            ("+", Ty::Untyped, Ty::Untyped),
+            ("+", Ty::Time, Ty::Untyped),
+        ] {
+            let mut ctx = ctx_with_local("t", Ty::Time);
+            ctx.local_bindings.insert(Symbol::from("x"), arg.clone());
+            let mut expr = send(Some(var("t")), method, vec![var("x")]);
+            assert_eq!(typer.analyze_expr(&mut expr, &ctx), want, "Time {method} {arg:?}");
+        }
+    }
+
+    #[test]
+    fn caller_locations_are_backtrace_locations() {
+        // `caller_locations(depth, 1).first.path`, EventReporter#notify's
+        // source location.
+        let mut classes = empty_classes();
+        crate::analyze::register_stdlib_classes(&mut classes);
+        let typer = BodyTyper::new(&classes);
+        let ctx = Ctx::default();
+        let int = |n: i64| synth(ExprNode::Lit { value: Literal::Int { value: n } });
+        let locations = send(None, "caller_locations", vec![int(1), int(1)]);
+        let first = send(Some(locations), "first", vec![]);
+        for (reader, want) in [("path", optional_str()), ("label", optional_str()), ("lineno", Ty::Int)] {
+            let mut expr = send(Some(first.clone()), reader, vec![]);
+            let ty = typer.analyze_expr(&mut expr, &ctx);
+            assert_eq!(ty, want, "{reader}");
+        }
+    }
+
+    #[test]
+    fn invoking_a_proc_answers_its_block_return_or_the_declared_untyped() {
+        // `call` and its aliases (`.()` parses as `call`). A function-typed
+        // receiver answers its return; a bare `Proc` answers core's
+        // `Proc#call: (?) -> untyped`, a declared gradual site rather
+        // than an inference gap (`Var`).
+        let classes = empty_classes();
+        let typer = BodyTyper::new(&classes);
+        let block = Ty::Fn {
+            params: vec![],
+            block: None,
+            ret: Box::new(Ty::Str),
+            effects: crate::effect::EffectSet::default(),
+        };
+        let proc_ty = Ty::Class { id: ClassId(Symbol::from("Proc")), args: vec![] };
+        for method in ["call", "yield", "[]", "==="] {
+            let ctx = ctx_with_local("blk", block.clone());
+            let mut expr = send(Some(var("blk")), method, vec![]);
+            assert_eq!(typer.analyze_expr(&mut expr, &ctx), Ty::Str, "{method} on a block");
+            let ctx = ctx_with_local("value", proc_ty.clone());
+            let mut expr = send(Some(var("value")), method, vec![var("value")]);
+            assert_eq!(typer.analyze_expr(&mut expr, &ctx), Ty::Untyped, "{method} on a Proc");
+        }
+        // `value.is_a?(Proc) ? value.call : value`, the runtime's
+        // `_attribute_default`: the guard narrows an untyped value to Proc.
+        let ctx = ctx_with_local("value", Ty::Untyped);
+        let mut expr = synth(ExprNode::If {
+            cond: send(
+                Some(var("value")),
+                "is_a?",
+                vec![synth(ExprNode::Const { path: vec![Symbol::from("Proc")] })],
+            ),
+            then_branch: send(Some(var("value")), "call", vec![]),
+            else_branch: var("value"),
+        });
+        typer.analyze_expr(&mut expr, &ctx);
+        let ExprNode::If { then_branch, .. } = &*expr.node else { unreachable!() };
+        assert_eq!(then_branch.ty, Some(Ty::Untyped));
+    }
+
+    #[test]
     fn super_in_an_instance_initialize_is_its_void_parent_initialize() {
         // `super(message)` re-sends `initialize`, which RBS declares
         // `-> void` (read as Nil). A class-side `initialize`, any other

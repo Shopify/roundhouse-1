@@ -626,7 +626,15 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("detailed_message", Ty::Str),
         ("inspect", Ty::Str),
         ("backtrace", Ty::Array { elem: Box::new(Ty::Str) }),
-        ("backtrace_locations", Ty::Array { elem: Box::new(Ty::Untyped) }),
+        (
+            "backtrace_locations",
+            Ty::Array {
+                elem: Box::new(Ty::Class {
+                    id: ClassId(Symbol::from("Thread::Backtrace::Location")),
+                    args: vec![],
+                }),
+            },
+        ),
         ("set_backtrace", Ty::Untyped),
         ("exception", Ty::Untyped),
         (
@@ -639,6 +647,18 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
             },
         ),
     ];
+    // One frame of `caller_locations` / `backtrace_locations`, as
+    // rbs/core/thread.rbs declares it.
+    let optional_str = || Ty::Union { variants: vec![Ty::Str, Ty::Nil] };
+    register_stdlib_class(classes, "Thread::Backtrace::Location", &[], &[
+        ("absolute_path", optional_str()),
+        ("base_label", optional_str()),
+        ("label", optional_str()),
+        ("lineno", Ty::Int),
+        ("path", optional_str()),
+        ("to_s", Ty::Str),
+        ("inspect", Ty::Str),
+    ]);
     for exc in [
         "Exception", "StandardError", "RuntimeError", "ArgumentError",
         "TypeError", "NameError", "NoMethodError", "IndexError",
