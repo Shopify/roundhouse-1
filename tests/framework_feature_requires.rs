@@ -45,6 +45,14 @@ require "active_support/notifications"
 require "active_support/logger"
 require "action_controller/metal/exceptions"
 require "action_view"
+require "active_support/core_ext/string/strip"
+require "active_support/core_ext/module/attribute_accessors.rb"
+require "active_support/core_ext/class/attribute_accessors"
+require "active_support/core_ext/class"
+require "active_support/core_ext/class/attribute"
+require "active_support/core_ext/module/redefine_method"
+require "active_support/core_ext/numeric"
+require "active_support/number_helper"
 
 require "rails/engine"
 
@@ -160,6 +168,108 @@ module ProbeGem
      h.deep_transform_keys(&:to_s), { a: 1 }.assert_valid_keys(:a, :b), invalid]
   end
 
+  # state_machines-activemodel's and Core's component gems' module
+  # attributes.
+  module Settings
+    mattr_accessor :level, default: :info
+    mattr_reader(:built) { [:block] }
+    mattr_writer :sink, instance_writer: false
+    cattr_accessor :hidden, instance_accessor: false
+  end
+
+  class Holder
+    include Settings
+    cattr_accessor :count, default: 0
+  end
+
+  def self.mattr
+    Settings.level = :warn
+    Holder.count += 2
+    h = Holder.new
+    invalid = begin
+      Module.new { mattr_accessor :"bad-name" }
+    rescue NameError => e
+      e.message
+    end
+    singleton = begin
+      Class.new.singleton_class.mattr_accessor(:x)
+    rescue TypeError => e
+      e.message
+    end
+    Settings.sink = :io
+    [Settings.level, h.level, Settings.built, h.built, Settings.class_variable_get(:@@sink), h.respond_to?(:sink=),
+     Settings.respond_to?(:hidden), h.respond_to?(:hidden), Holder.count, h.count, (h.count = 5; Holder.count), invalid, singleton,
+     File.basename(Settings.instance_method(:level).source_location.first), File.basename(Holder.method(:count).source_location.first)]
+  end
+
+  # activerecord-rescue_from_duplicate's and app_profiler's class
+  # attributes.
+  class AttrBase
+    class_attribute :setting, default: :base
+    class_attribute :tags, instance_writer: false, default: []
+    class_attribute :secret, instance_accessor: false, instance_predicate: false
+  end
+
+  class AttrChild < AttrBase; end
+
+  class AttrGrandChild < AttrChild; end
+
+  def self.class_ext
+    AttrChild.setting = :child
+    b = AttrBase.new
+    c = AttrChild.new
+    c.setting = :instance
+    invalid = begin
+      Class.new { class_attribute 1 }
+    rescue TypeError => e
+      e.message
+    end
+    single = Object.new
+    single.singleton_class.class_attribute :solo, default: :s
+    redefined = Class.new do
+      def x = 1
+      private def y = 2
+    end
+    redefined.redefine_method(:x) { 10 }
+    redefined.redefine_method(:y) { 20 }
+    [AttrBase.setting, AttrChild.setting, AttrGrandChild.setting, b.setting, c.setting, AttrChild.new.setting, AttrBase.setting?, b.setting?,
+     b.respond_to?(:tags=), AttrBase.tags, AttrBase.respond_to?(:secret), b.respond_to?(:secret), b.respond_to?(:secret?), AttrBase.respond_to?(:secret?),
+     invalid, single.solo, AttrBase.descendants.map(&:name).sort, AttrBase.subclasses.map(&:name), AttrGrandChild.descendants,
+     redefined.new.x, redefined.private_method_defined?(:y), redefined.new.send(:y), redefined.method_visibility(:y),
+     ActiveSupport::DescendantsTracker.descendants(AttrBase).size]
+  end
+
+  # polaris' and database_documentation's Numeric extensions, and the
+  # number helpers Numeric#to_fs formats through.
+  def self.numeric
+    nh = ActiveSupport::NumberHelper
+    [12.kilobytes, 1.megabyte, 2.5.gigabytes, 3.bytes, Numeric::PETABYTE,
+     2.days.to_i, 1.5.hours.to_i, 3.weeks.to_i, 1.fortnight.to_i, 90.seconds.to_i, 2.minutes.to_i, 2.days == 172_800, 2.days.class.name,
+     5.in_milliseconds, (Time.at(0).utc + 1.day).to_i, 1.hour.from_now > Time.now,
+     1234567.to_fs(:delimited), 1234567.891.to_fs(:rounded, precision: 2), 0.5.to_fs(:percentage), 1234.5.to_fs(:currency),
+     1234567.to_fs(:human), 12.kilobytes.to_fs(:human_size), 5551234.to_fs(:phone, area_code: true), 42.to_fs, 255.to_fs(16),
+     3.to_fs(:unknown), 1.5.to_formatted_s(:rounded), BigDecimal("1.50").to_s, BigDecimal("1.50").to_fs(:currency),
+     nh.number_to_currency(-1234.5, unit: "EUR", format: "%n %u"), nh.number_to_human(1_500_000, precision: 2),
+     nh.number_to_human(0.001, units: { unit: "m", mili: "mm" }), nh.number_to_delimited("12345678.05", delimiter: "."),
+     nh.number_to_rounded(111.2345, significant: true, precision: 2), nh.number_to_human_size(1_234_567_890),
+     nh.number_to_phone(1235551234, country_code: 1, extension: 55), nh.number_to_percentage(302.24398923423, precision: 5, strip_insignificant_zeros: true),
+     nh.number_to_currency("abc"), nh.number_to_rounded(nil), nh.number_to_delimited(Float::INFINITY)]
+  end
+
+  # typed_parameters' deprecation warning shape.
+  def self.strip
+    usage = <<-EOM
+      This command does such and such.
+
+      Supported options are:
+        -h         This message
+    EOM
+    frozen = "  a\n    b\n".freeze
+    [usage.strip_heredoc, "x\n  y".strip_heredoc, "".strip_heredoc, "  a\n\n  b\r\n".strip_heredoc,
+     frozen.strip_heredoc, frozen.strip_heredoc.frozen?, "  a".dup.strip_heredoc.frozen?, "\t\tq\n\t r".strip_heredoc,
+     "  \n    z".strip_heredoc]
+  end
+
   def self.notifications
     events = []
     subscriber = ActiveSupport::Notifications.subscribe("probe_gem.ran") { |event| events << [event.name, event.payload] }
@@ -215,6 +325,10 @@ module ProbeGem
       concern: concern,
       try: try,
       hash_keys: hash_keys,
+      strip: strip,
+      mattr: mattr,
+      class_ext: class_ext,
+      numeric: numeric,
       load_hooks: (ActiveSupport.run_load_hooks(:probe_gem_hook, :base); HOOKS),
       notifications: notifications,
       logger: logger,
@@ -299,6 +413,10 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // `included`/`prepended` blocks, a second `included` refused.
         "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
         "try: [nil, 3, nil, \"ABC\", nil, :nope]",
+        "numeric: [12288, 1048576, 2684354560.0, 3, 1125899906842624, 172800, 5400, 1814400, 1209600, 90, 120, true, \"ActiveSupport::Duration\", 5000, 86400, true, \"1,234,567\", \"1234567.89\", \"0.500%\", \"$1,234.50\", \"1.23 Million\", \"12 KB\", \"5551234\", \"42\", \"ff\", \"3\", \"1.500\", \"1.5\", \"$1.50\", \"-1,234.50 EUR\", \"1.5 Million\", \"1 mm\", \"12.345.678.05\", \"110\", \"1.15 GB\", \"+1-123-555-1234 x 55\", \"302.24399%\", \"$abc\", nil, \"Infinity\"]",
+        "class_ext: [:base, :child, :child, :base, :instance, :child, true, true, false, [], true, false, false, false, \"1 is not a symbol nor a string\", :s, [\"ProbeGem::AttrChild\", \"ProbeGem::AttrGrandChild\"], [\"ProbeGem::AttrChild\"], [], 10, true, 20, :private, 2]",
+        "mattr: [:warn, :warn, [:block], [:block], :io, false, true, false, 2, 2, 5, \"invalid attribute name: bad-name\", \"module attributes should be defined directly on class, not singleton\", \"probe_gem.rb\", \"probe_gem.rb\"]",
+        "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
         "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",
         "Unknown key: :z. Valid keys are: :a, :b",
         "load_hooks: [[:ran, :base]]",
@@ -323,10 +441,10 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
         let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
-    // Every other Rails feature with no port (polaris' Numeric
-    // extensions, the whole core_ext set): by name, not as a plain
+    // Every other Rails feature with no port (Integer#months, the whole
+    // core_ext set): by name, not as a plain
     // `cannot load such file`, which is left to everything else.
-    for feature in ["active_support/core_ext/numeric", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
+    for feature in ["active_support/core_ext/integer/time", "active_support/core_ext", "action_dispatch/testing/integration", "rails/no_such_feature.rb"] {
         let line = format!(
             "{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`: this tree has no port of this Rails feature (project.rs::FRAMEWORK_FEATURE_PORTS), and never loads the gem home's Rails; not loaded\n"
         );
@@ -355,4 +473,29 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     assert!(read("active_support/multibyte/unicode").contains("require_relative \"../../../active_support_multibyte_unicode\"\n"));
     let facades = std::fs::read_to_string(tree.join("runtime/gem_facades.rb")).unwrap();
     assert!(facades.contains("require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n"), "{facades}");
+}
+
+/// The number helpers translate through I18n: with no i18n in the lock
+/// the tree carries neither them nor core_ext/numeric (all three Numeric
+/// extensions), which the refusal then names, while the byte and
+/// Duration builders still answer their own features.
+#[test]
+fn core_ext_numeric_needs_i18n_for_its_number_helpers() {
+    let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    concurrent-ruby (1.3.5)\n\nDEPENDENCIES\n  concurrent-ruby\n";
+    let (tree, errors) = probe()
+        .write("Gemfile", "source \"https://rubygems.org\"\ngem \"rails\"\n")
+        .write("Gemfile.lock", lock)
+        .emit(BuildTarget::Ruby);
+    // The probe's own diagnostics (its postgresql declaration), no more:
+    // dropping i18n adds none.
+    let (_, base) = probe().emit(BuildTarget::Ruby);
+    assert_eq!(format!("{errors:?}"), format!("{base:?}"));
+    let features = tree.join("runtime/features/active_support/core_ext");
+    for absent in ["numeric.rb", "numeric/conversions.rb"] {
+        assert!(!features.join(absent).exists(), "{absent} without i18n");
+    }
+    assert!(!tree.join("runtime/active_support_number_helper.rb").exists());
+    for present in ["numeric/bytes.rb", "numeric/time.rb", "class.rb", "string/strip.rb", "module/attribute_accessors.rb"] {
+        assert!(features.join(present).exists(), "{present}");
+    }
 }

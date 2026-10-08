@@ -4283,12 +4283,38 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     }
     // ActiveSupport::Concern, Hash's key extensions and Action Controller's
     // errors (8.2.0.alpha concern.rb, core_ext/hash/keys.rb,
-    // metal/exceptions.rb), which Rails loads before any gem: a native
-    // gem's require of one answers from runtime/features.
-    for port in ["active_support_concern", "active_support_hash_keys", "action_controller_exceptions"] {
+    // metal/exceptions.rb), which Rails loads before any gem,
+    // String#strip_heredoc (core_ext/string/strip.rb), Module#mattr_*
+    // (core_ext/module/attribute_accessors.rb), and Class#class_attribute
+    // and #descendants (core_ext/class/attribute.rb, subclasses.rb) over
+    // the descendants tracker, which an app may already carry, and
+    // Numeric's byte and Duration builders (core_ext/numeric/bytes.rb,
+    // time.rb) and BigDecimal#to_s (core_ext/big_decimal/conversions.rb):
+    // a native gem's require of one answers from runtime/features.
+    for port in [
+        "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
+        "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
+        "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
+        "active_support_numeric_time", "active_support_big_decimal_conversions",
+    ] {
+        let to = format!("runtime/{port}.rb");
+        if files.iter().any(|(p, _)| *p == to) {
+            continue;
+        }
         let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
             .map_err(|e| format!("read {port} runtime: {e}"))?;
-        files.push((format!("runtime/{port}.rb"), text));
+        files.push((to, text));
+    }
+    // ActiveSupport::NumberHelper and Numeric#to_fs over it
+    // (number_helper.rb, core_ext/numeric/conversions.rb), which translate
+    // through I18n; core_ext/numeric is all three Numeric extensions, so
+    // without i18n it has no file and is refused by name.
+    if carries_i18n {
+        for port in ["active_support_number_helper", "active_support_numeric_conversions", "active_support_numeric"] {
+            let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+                .map_err(|e| format!("read {port} runtime: {e}"))?;
+            files.push((format!("runtime/{port}.rb"), text));
+        }
     }
     framework_feature_files(files);
     files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
@@ -4953,6 +4979,20 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/blank", &["active_support_core_ext"]),
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
+    ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    ("active_support/core_ext/module/attribute_accessors", &["active_support_module_attribute_accessors"]),
+    ("active_support/core_ext/class/attribute_accessors", &["active_support_module_attribute_accessors"]),
+    ("active_support/core_ext/module/redefine_method", &["active_support_redefine_method"]),
+    ("active_support/core_ext/class", &["active_support_class_attribute", "active_support_class_subclasses"]),
+    ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
+    ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
+    ("active_support/descendants_tracker", &["active_support_descendants_tracker"]),
+    ("active_support/core_ext/numeric", &["active_support_numeric"]),
+    ("active_support/core_ext/numeric/bytes", &["active_support_numeric_bytes"]),
+    ("active_support/core_ext/numeric/time", &["active_support_numeric_time"]),
+    ("active_support/core_ext/numeric/conversions", &["active_support_numeric_conversions"]),
+    ("active_support/core_ext/big_decimal/conversions", &["active_support_big_decimal_conversions"]),
+    ("active_support/number_helper", &["active_support_number_helper"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
@@ -9786,6 +9826,17 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_tryable.rb"
         && p != "runtime/active_support_concern.rb"
         && p != "runtime/active_support_hash_keys.rb"
+        && p != "runtime/active_support_string_strip.rb"
+        && p != "runtime/active_support_module_attribute_accessors.rb"
+        && p != "runtime/active_support_redefine_method.rb"
+        && p != "runtime/active_support_class_attribute.rb"
+        && p != "runtime/active_support_class_subclasses.rb"
+        && p != "runtime/active_support_numeric_bytes.rb"
+        && p != "runtime/active_support_numeric_time.rb"
+        && p != "runtime/active_support_big_decimal_conversions.rb"
+        && p != "runtime/active_support_number_helper.rb"
+        && p != "runtime/active_support_numeric_conversions.rb"
+        && p != "runtime/active_support_numeric.rb"
         && p != "runtime/action_controller_exceptions.rb"
         && p != "runtime/active_support_attribute_accessors_per_thread.rb"
         && p != "runtime/active_support_inflector.rb"
@@ -10446,7 +10497,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         for (_, entry) in &needed {
             let line = format!("require {entry:?}");
             if !helper.contains(&line) {
-                helper.insert_str(0, &format!("{line}\n"));
+                insert_require_line(helper, &line);
             }
         }
         let with_mocha = needed.iter().any(|(gem, _)| *gem == "mocha");
@@ -12756,7 +12807,7 @@ fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, Strin
         // Several constants of one library (`Net::HTTP`, `Net::HTTPOK`)
         // can name the same feature in one file.
         if written.insert((i, require_line.clone())) {
-            files[i].1.insert_str(0, &format!("{require_line}\n"));
+            insert_require_line(&mut files[i].1, &require_line);
         }
     }
     let stdlib_gems: Vec<(&str, &str)> = crate::stdlib_rbs::requires()
@@ -12978,8 +13029,49 @@ fn write_bundled_requires(files: &mut [(String, String)]) {
 
 fn write_bundled_require_lines(files: &mut [(String, String)]) {
     for (i, require_line) in bundled_require_gaps(files) {
-        files[i].1.insert_str(0, &format!("{require_line}\n"));
+        insert_require_line(&mut files[i].1, &require_line);
     }
+}
+
+/// Write `line` (a `require`) at the top of a Ruby file, after its
+/// leading magic comments: Ruby reads `# frozen_string_literal: true`
+/// (and `encoding`, `warn_indent`, `shareable_constant_value`) only
+/// before the first token, so a require written above one switches it
+/// off and warns "'frozen_string_literal' is ignored after any tokens",
+/// which Core's StrictWarning (components/platform/essentials/lib/
+/// strict_warnings.rb) raises as an offense when the file loads after
+/// boot. A shebang stays the first line.
+fn insert_require_line(content: &mut String, line: &str) {
+    let mut at = 0;
+    for (n, text) in content.split_inclusive('\n').enumerate() {
+        let trimmed = text.trim_end();
+        let magic = (n == 0 && trimmed.starts_with("#!")) || ruby_magic_comment(trimmed);
+        if !magic {
+            break;
+        }
+        at += text.len();
+    }
+    if at > 0 && !content[..at].ends_with('\n') {
+        content.push('\n');
+        at = content.len();
+    }
+    content.insert_str(at, &format!("{line}\n"));
+}
+
+/// A comment line Ruby reads as a magic comment (parse.y
+/// `magic_comments`, and the emacs `-*- ... -*-` form of `coding`).
+fn ruby_magic_comment(line: &str) -> bool {
+    let Some(body) = line.strip_prefix('#') else { return false };
+    let body = body.trim();
+    if body.starts_with("-*-") {
+        return true;
+    }
+    let Some((key, _)) = body.split_once(':') else { return false };
+    let key = key.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        key.as_str(),
+        "frozen_string_literal" | "encoding" | "coding" | "warn_indent" | "shareable_constant_value" | "warn_past_scope"
+    )
 }
 
 /// The emitted call every declared variant lowers to (`lower::attached
@@ -14222,6 +14314,23 @@ fn walk_ruby(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_written_require_stays_below_the_files_magic_comments() {
+        let cases = [
+            ("# frozen_string_literal: true\n\n# doc\nx = 1\n", "# frozen_string_literal: true\nrequire \"bigdecimal\"\n\n# doc\nx = 1\n"),
+            ("#!/usr/bin/env ruby\n# encoding: utf-8\n# frozen_string_literal: true\nx\n", "#!/usr/bin/env ruby\n# encoding: utf-8\n# frozen_string_literal: true\nrequire \"bigdecimal\"\nx\n"),
+            ("# -*- coding: utf-8 -*-\nx\n", "# -*- coding: utf-8 -*-\nrequire \"bigdecimal\"\nx\n"),
+            ("# A doc comment: not magic\nx\n", "require \"bigdecimal\"\n# A doc comment: not magic\nx\n"),
+            ("x = 1\n", "require \"bigdecimal\"\nx = 1\n"),
+            ("# frozen_string_literal: true", "# frozen_string_literal: true\nrequire \"bigdecimal\"\n"),
+        ];
+        for (before, after) in cases {
+            let mut content = before.to_string();
+            super::insert_require_line(&mut content, "require \"bigdecimal\"");
+            assert_eq!(content, after, "{before:?}");
+        }
+    }
+
     #[test]
     fn a_framework_feature_is_a_rails_framework_or_a_file_under_one() {
         for feature in ["rails", "rails/railtie", "active_support", "active_support/core_ext/object/blank", "active_model", "action_controller", "action_dispatch/routing", "active_job"] {

@@ -125,9 +125,106 @@ fn indexed_text(source: &SourceFile) -> std::borrow::Cow<'_, str> {
         crate::erb::stdlib_code_projection(&source.text)
             .map(std::borrow::Cow::Owned)
             .unwrap_or_else(|| std::borrow::Cow::Owned(" ".repeat(source.text.len())))
+    } else if let Some(projected) = dynamic_mixin_projection(&source.text) {
+        std::borrow::Cow::Owned(projected)
     } else {
         std::borrow::Cow::Borrowed(&source.text)
     }
+}
+
+/// The mixin methods Rubydex records as ancestors (`ruby_indexer.rs`
+/// `handle_mixin`), each with a same-length name it does not treat
+/// specially.
+const MIXIN_RENAMES: [(&str, &str); 3] = [("include", "includ_"), ("extend", "exten_"), ("prepend", "prepen_")];
+
+/// `text` with each receiverless `include`/`extend`/`prepend` whose
+/// arguments are all dynamic (`include(Module.new do … end)`, `extend
+/// Builder.module_for(X)`) renamed to a plain call of the same length,
+/// or `None` when the file has none.
+///
+/// Rubydex's `handle_mixin` keeps the constant arguments of a mixin call
+/// and skips every other argument (a `DynamicAncestor` diagnostic), its
+/// subtree and a `do` block bound to the call unvisited, so no constant
+/// written inside had a source answer: Core's StoreLocalization::
+/// TranslatableContent reads `Verdict::Flag`, `LocalizableContentTypes`
+/// and `NoMethodError` in the `define_method` bodies of an `include(
+/// Module.new do … end)`. Renamed, Rubydex indexes the call as any other,
+/// and each constant inside resolves from the lexical scope around it, as
+/// Ruby's does (a block keeps its cref). A dynamic mixin records no
+/// ancestor either way. A call with a constant argument keeps its name,
+/// and with it the ancestor that argument records.
+fn dynamic_mixin_projection(text: &str) -> Option<String> {
+    if !may_have_dynamic_mixin(text) {
+        return None;
+    }
+    struct Renames {
+        at: Vec<(usize, &'static str)>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Renames {
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            let receiverless = call.receiver().is_none_or(|receiver| receiver.as_self_node().is_some());
+            let name = call.name();
+            let renamed = MIXIN_RENAMES.iter().find(|(from, _)| name.as_slice() == from.as_bytes()).map(|(_, to)| *to);
+            if let (true, Some(to), Some(arguments), Some(message)) =
+                (receiverless, renamed, call.arguments(), call.message_loc())
+            {
+                let dynamic = arguments.arguments().iter().all(|arg| {
+                    arg.as_constant_read_node().is_none()
+                        && arg.as_constant_path_node().is_none()
+                        && arg.as_self_node().is_none()
+                });
+                if dynamic && message.as_slice() == name.as_slice() {
+                    self.at.push((message.start_offset(), to));
+                }
+            }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let result = ruby_prism::parse(text.as_bytes());
+    let mut renames = Renames { at: Vec::new() };
+    ruby_prism::Visit::visit(&mut renames, &result.node());
+    if renames.at.is_empty() {
+        return None;
+    }
+    let mut projected = text.to_string();
+    for (start, to) in renames.at {
+        projected.replace_range(start..start + to.len(), to);
+    }
+    Some(projected)
+}
+
+/// Whether some `include`/`extend`/`prepend` in `text` is followed by an
+/// argument that is not a bare constant path or `self`: the cheap filter
+/// before [`dynamic_mixin_projection`] parses the file.
+fn may_have_dynamic_mixin(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    MIXIN_RENAMES.iter().any(|(word, _)| {
+        text.match_indices(word).any(|(at, _)| {
+            let before = at.checked_sub(1).map(|i| bytes[i]);
+            if before.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'@' || b == b'$') {
+                return false;
+            }
+            let rest = &text[at + word.len()..];
+            // `include(` may break the line before its argument.
+            let argument = if let Some(inner) = rest.strip_prefix('(') {
+                inner.trim_start()
+            } else if rest.starts_with(' ') {
+                rest.trim_start_matches(' ')
+            } else {
+                return false;
+            };
+            let Some(c) = argument.chars().next() else { return false };
+            if c == '\n' || c == '#' || argument.starts_with("self") && !argument[4..].starts_with(['.', '_']) {
+                return false;
+            }
+            if !(c.is_ascii_uppercase() || argument.starts_with("::")) {
+                return true;
+            }
+            // A constant path, then a call on it (`Module.new`).
+            let after = argument.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+            after.starts_with(['.', '(', '{', '['])
+        })
+    })
 }
 
 fn source_fingerprint(sources: &[SourceFile]) -> u64 {
@@ -1127,7 +1224,198 @@ fn answer_file(
     }
     answers.constants.sort_unstable_by_key(|(end, ..)| *end);
     reresolve_own_value_reads(graph, &text, UriId::from(source.path.as_str()), &bare_values, &mut answers, class_cache);
+    answer_multi_write_targets(graph, &text, document, &mut answers, class_cache);
     answers
+}
+
+/// Rubydex's `visit_multi_write_node` indexes a multiple assignment's
+/// constant, variable and `recv.attr` targets and its value, and skips the
+/// rest: an index target (`old, ENV["VERBOSE"] = ENV["VERBOSE"], "false"`
+/// in Core's lib/development_support/local_datastores.rb), a nested `(a,
+/// b)` target, the `*rest` and every target after it. A constant written
+/// there had no reference, so no source answer. Each is looked up here as
+/// Ruby looks it up from the lexical scope it is written in (Rubydex's own
+/// nesting: the innermost class, module or `class << self` around it; a
+/// block keeps its scope), with the same chains `lookup_without` walks for
+/// a reference Rubydex did index. A scope or ancestor Rubydex left
+/// unresolved leaves the constant without an answer, as before.
+fn answer_multi_write_targets(
+    graph: &Graph,
+    text: &str,
+    document: &RubydexDocument,
+    answers: &mut FileAnswers,
+    class_cache: &mut IdentityHashMap<DeclarationId, (Arc<ClassId>, bool, bool)>,
+) {
+    if !may_have_skipped_multi_write_target(text) {
+        return;
+    }
+    let constants = skipped_multi_write_constants(text);
+    if constants.is_empty() {
+        return;
+    }
+    // Each lexical scope this file opens, by byte range.
+    let scopes: Vec<(u32, u32, NameId)> = document
+        .definitions()
+        .iter()
+        .filter_map(|id| match graph.definitions().get(id)? {
+            Definition::Class(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            Definition::Module(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            Definition::SingletonClass(it) => Some((it.offset().start(), it.offset().end(), *it.name_id())),
+            _ => None,
+        })
+        .collect();
+    let no_skip = DeclarationId::from("<no declaration>");
+    for (start, path) in constants {
+        if answers.references.contains_key(&start) {
+            continue;
+        }
+        let (rooted, names) = path;
+        let nesting = scopes
+            .iter()
+            .filter(|(from, to, _)| *from <= start && start < *to)
+            .min_by_key(|(from, to, _)| to - from)
+            .map(|(.., name)| *name);
+        let Some((first, rest)) = names.split_first() else { continue };
+        let first_id = StringId::from(first.as_str());
+        let mut found = match if rooted { lookup_without(graph, &first_id, None, no_skip) } else { lookup_without(graph, &first_id, nesting, no_skip) } {
+            Lookup::Found(id) => Some(id),
+            Lookup::Missing => None,
+            Lookup::Unknown => continue,
+        };
+        for name in rest {
+            let Some(owner) = found else { break };
+            let owner = graph.resolve_alias(&owner).unwrap_or(owner);
+            found = graph
+                .declarations()
+                .get(&owner)
+                .and_then(Declaration::as_namespace)
+                .and_then(|namespace| namespace.member(&StringId::from(name.as_str())))
+                .copied();
+        }
+        answers.references.insert(start, found.and_then(|id| resolved_constant(graph, id, class_cache)));
+    }
+}
+
+/// Whether a line of `text` assigns to several targets, one of them of a
+/// kind Rubydex's multi-write skips (`x[i]`, `*rest`, `(a, b)`): the cheap
+/// filter before [`skipped_multi_write_constants`] parses the file.
+fn may_have_skipped_multi_write_target(text: &str) -> bool {
+    text.lines().any(|line| {
+        let Some(at) = line.find(" = ") else { return false };
+        let left = &line[..at];
+        left.contains(',') && (left.contains('[') || left.contains('*') || left.contains('('))
+    })
+}
+
+/// The constants written inside the multi-write targets Rubydex skips, as
+/// (offset of the final name, (rooted, names)), outermost paths only.
+fn skipped_multi_write_constants(text: &str) -> Vec<(u32, (bool, Vec<String>))> {
+    #[derive(Default)]
+    struct Constants {
+        found: Vec<(u32, (bool, Vec<String>))>,
+    }
+    impl Constants {
+        fn path(node: &ruby_prism::Node<'_>) -> Option<(bool, Vec<String>, u32)> {
+            if let Some(read) = node.as_constant_read_node() {
+                let name = String::from_utf8_lossy(read.name().as_slice()).into_owned();
+                return Some((false, vec![name], read.location().start_offset() as u32));
+            }
+            let path = node.as_constant_path_node()?;
+            let name = String::from_utf8_lossy(path.name()?.as_slice()).into_owned();
+            let start = path.name_loc().start_offset() as u32;
+            match path.parent() {
+                None => Some((true, vec![name], start)),
+                Some(parent) => {
+                    let (rooted, mut names, _) = Self::path(&parent)?;
+                    names.push(name);
+                    Some((rooted, names, start))
+                }
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Constants {
+        fn visit_constant_read_node(&mut self, node: &ruby_prism::ConstantReadNode<'pr>) {
+            if let Some((rooted, names, start)) = Self::path(&node.as_node()) {
+                self.found.push((start, (rooted, names)));
+            }
+        }
+        fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+            if let Some((rooted, names, start)) = Self::path(&node.as_node()) {
+                self.found.push((start, (rooted, names)));
+            } else {
+                ruby_prism::visit_constant_path_node(self, node);
+            }
+        }
+        // A scope opened inside a target is not the target's.
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    struct Writes {
+        skipped: Constants,
+    }
+    impl Writes {
+        fn target(&mut self, node: &ruby_prism::Node<'_>) {
+            if let Some(index) = node.as_index_target_node() {
+                ruby_prism::Visit::visit(&mut self.skipped, &index.receiver());
+                if let Some(arguments) = index.arguments() {
+                    ruby_prism::Visit::visit_arguments_node(&mut self.skipped, &arguments);
+                }
+                if let Some(block) = index.block() {
+                    ruby_prism::Visit::visit_block_argument_node(&mut self.skipped, &block);
+                }
+            } else if let Some(nested) = node.as_multi_target_node() {
+                // Rubydex indexes none of a nested target's parts.
+                for left in &nested.lefts() {
+                    self.skipped_target(&left);
+                }
+                if let Some(rest) = nested.rest() {
+                    self.skipped_target(&rest);
+                }
+                for right in &nested.rights() {
+                    self.skipped_target(&right);
+                }
+            }
+        }
+        /// A target in a position Rubydex skips entirely: every constant
+        /// it reads (a constant target is a definition, not a read).
+        fn skipped_target(&mut self, node: &ruby_prism::Node<'_>) {
+            if let Some(splat) = node.as_splat_node() {
+                if let Some(expression) = splat.expression() {
+                    self.skipped_target(&expression);
+                }
+            } else if let Some(call) = node.as_call_target_node() {
+                ruby_prism::Visit::visit(&mut self.skipped, &call.receiver());
+            } else if let Some(path) = node.as_constant_path_target_node() {
+                if let Some(parent) = path.parent() {
+                    ruby_prism::Visit::visit(&mut self.skipped, &parent);
+                }
+            } else if node.as_index_target_node().is_some() || node.as_multi_target_node().is_some() {
+                self.target(node);
+            }
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Writes {
+        fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+            for left in &node.lefts() {
+                self.target(&left);
+            }
+            if let Some(rest) = node.rest() {
+                self.skipped_target(&rest);
+            }
+            for right in &node.rights() {
+                self.skipped_target(&right);
+            }
+            ruby_prism::visit_multi_write_node(self, node);
+        }
+    }
+    let result = ruby_prism::parse(text.as_bytes());
+    let mut writes = Writes { skipped: Constants::default() };
+    ruby_prism::Visit::visit(&mut writes, &result.node());
+    let mut found = writes.skipped.found;
+    found.sort_by_key(|(start, _)| *start);
+    found.dedup_by_key(|(start, _)| *start);
+    found
 }
 
 /// Ruby evaluates a constant write's value before it binds the name, so
@@ -1375,6 +1663,22 @@ fn delegator_const_missing(graph: &Graph, name_id: NameId, depth: u8) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dynamic_mixin_call_is_indexed_as_a_plain_call() {
+        let text = "class Probe\n  include Comparable\n  def self.multi\n    include(\n      Module.new { V }\n    )\n  end\n  extend self\n  def self.build(fields)\n    include(Module.new do\n      def z = Probe.name\n    end)\n    include Module.new do\n      X\n    end\n    extend(Kernel.then { Widgetable })\n    prepend Mixins.for(Y)\n    include Comparable, Module.new { Z }\n    other.include(Module.new { W })\n    [1].include?(1)\n  end\nend\n";
+        let projected = dynamic_mixin_projection(text).expect("projected");
+        assert_eq!(projected.len(), text.len());
+        assert_eq!(
+            projected,
+            text.replace("    include(Module", "    includ_(Module")
+                .replace("    include(\n", "    includ_(\n")
+                .replace("include Module.new do", "includ_ Module.new do")
+                .replace("extend(Kernel", "exten_(Kernel")
+                .replace("prepend Mixins", "prepen_ Mixins")
+        );
+        assert!(dynamic_mixin_projection("class A\n  include B\n  extend C::D\n  extend self\nend\n").is_none());
+    }
 
     #[test]
     fn prepared_answers_require_the_same_paths_text_and_file_order() {
