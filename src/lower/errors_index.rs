@@ -215,7 +215,8 @@ fn ledger_messages(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>
             expr.span,
             "whole_hash",
             "`errors.messages` grounds only as `[]`, `key?`, `blank?`/`empty?` or `present?`/`any?`; the error \
-             accumulator keeps no attribute column to build the Hash from"
+             accumulator keeps no attribute column to build the Hash from, which the CRuby and JRuby trees \
+             record (`ActiveModel::ErrorAttributes.messages`) and every other tree refuses"
                 .to_string(),
         ));
     }

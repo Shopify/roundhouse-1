@@ -49,10 +49,14 @@ impl<'a> BodyTyper<'a> {
             if matches!(id.0.as_str(), "ActiveModel::Errors" | "ActiveModel::Error"));
         let errors_read = recv.is_some_and(|r| matches!(&*r.node,
             ExprNode::Send { method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty()));
+        // `ActiveModel::Errors#as_json` itself is typed (registry::
+        // activemodel) and answered from the attributes the CRuby and
+        // JRuby trees record (`ActiveModel::ErrorAttributes`); what is
+        // left is an `errors` read of unknown type, or an Error's.
         if errors_typed || errors_read {
             return AsJsonResidue::Refuse(
                 "ActiveModel::Errors",
-                "as_json: the emitted `errors` is the runtime's Array of full messages, not ActiveModel::Errors' attribute-keyed collection",
+                "as_json: the emitted `errors` is the runtime's Array of full messages, not ActiveModel::Errors' attribute-keyed collection; a receiver typed as a record answers it on the CRuby and JRuby trees",
             );
         }
         AsJsonResidue::Route

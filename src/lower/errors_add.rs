@@ -309,11 +309,19 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // dispatching — leaving `ty = None` here makes it false-positive a
     // `send_dispatch_failed` on a receiver it can see the type of.
     let recv_ty = recv.as_ref().and_then(|r| r.ty.clone());
-    // The attribute the message is for, which the accumulator drops: the
-    // CRuby and JRuby trees record it for `errors.attribute_names`.
+    // The attribute the message is for and where its short message
+    // starts, which the accumulator drops: the CRuby and JRuby trees
+    // record them for `errors.attribute_names`, `to_hash`, `as_json` and
+    // `messages`. A local's message is the one built just above, the bare
+    // message on `base` and the run-time humanized prefix otherwise.
     let attribute = match &*field_expr.node {
-        ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(value.clone())),
-        ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(name.clone())),
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(
+            super::model_to_library::validations::error_tag(value, &message),
+        )),
+        ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(crate::expr::ErrorTag {
+            attribute: name.clone(),
+            short: crate::expr::ErrorShort::AfterHumanized,
+        })),
         _ => None,
     };
     expr.hint = attribute;

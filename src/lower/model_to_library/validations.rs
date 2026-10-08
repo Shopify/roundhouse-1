@@ -413,13 +413,53 @@ pub(crate) fn bind_class_scope(rule: &mut ValidationRule, class: &ClassId) {
 
 /// Tag each `errors << msg` push in `check` that carries no attribute yet
 /// with the one it is for (`IrHint::ErrorAttribute`): the accumulator
-/// keeps only the message, and `errors.attribute_names` needs the
-/// attribute on the trees that record it.
+/// keeps only the message, and `errors.attribute_names`, `to_hash`,
+/// `as_json` and `messages` need the attribute (and the short message,
+/// `error_tag`) on the trees that record them.
 pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
     if is_errors_push(check) && check.hint.is_none() {
-        check.hint = Some(crate::expr::IrHint::ErrorAttribute(attr.clone()));
+        let ExprNode::Send { args, .. } = &*check.node else { unreachable!() };
+        check.hint = Some(crate::expr::IrHint::ErrorAttribute(error_tag(attr, &args[0])));
     }
     check.node.for_each_child_mut(&mut |c| tag_error_attribute(c, attr));
+}
+
+/// `message` pushed for `attr`, with where its short message starts:
+/// Rails' full message is `"%{attribute} %{message}"` (the bare message
+/// on `:base`), and every check here and in `lower::errors_add` builds it
+/// that way, from `humanize`. The prefix is confirmed on the message's
+/// own shape (`after_prefix`); a message that does not show it is
+/// `ErrorShort::Unknown`, which the short-message reads refuse rather
+/// than key a wrong text.
+pub(crate) fn error_tag(attr: &Symbol, message: &Expr) -> crate::expr::ErrorTag {
+    let prefix = if attr.as_str() == "base" { String::new() } else { format!("{} ", humanize(attr.as_str())) };
+    let short = if after_prefix(message, &prefix) {
+        crate::expr::ErrorShort::After(prefix)
+    } else {
+        crate::expr::ErrorShort::Unknown
+    };
+    crate::expr::ErrorTag { attribute: attr.clone(), short }
+}
+
+/// Whether every value `message` can take starts with `prefix`, as
+/// written: a literal, an interpolation whose first text does, both
+/// branches of a choice, a sequence's last value, or the dedupe's
+/// `_association_error(message)` (`emit::ruby::collection_autosave`,
+/// which answers a copy of its argument).
+fn after_prefix(message: &Expr, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    match &*message.node {
+        ExprNode::Lit { value: Literal::Str { value } } => value.starts_with(prefix),
+        ExprNode::StringInterp { parts } => matches!(parts.first(), Some(InterpPart::Text { value }) if value.starts_with(prefix)),
+        ExprNode::If { then_branch, else_branch, .. } => after_prefix(then_branch, prefix) && after_prefix(else_branch, prefix),
+        ExprNode::Seq { exprs } => exprs.last().is_some_and(|last| after_prefix(last, prefix)),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if method.as_str() == "_association_error" && args.len() == 1 => {
+            after_prefix(&args[0], prefix)
+        }
+        _ => false,
+    }
 }
 
 /// `has_secure_password` without `validations: false`.
