@@ -795,6 +795,13 @@ pub(crate) fn unclaimed_unknowns(
         if callbacks.iter().any(|c| std::ptr::eq(*c, expr)) {
             continue;
         }
+        // A statement another path decides on: the model's database
+        // (`connects_to`, `establish_connection`: ingest::database_ownership,
+        // which replays it at boot or refuses it as a database refusal), a
+        // reproducible `normalizes` (lower::normalizes).
+        if claimed_elsewhere(expr) {
+            continue;
+        }
         // Class-scope constants — claimed by analyze::extract_const_assignments.
         if matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) {
             continue;
@@ -1043,6 +1050,13 @@ pub(crate) fn unclaimed_unknowns(
         out.push(d);
     }
     out
+}
+
+/// Whether a model-body statement is one a path other than model
+/// lowering consumes, each asked through the claiming pass's own
+/// predicate rather than re-derived here.
+fn claimed_elsewhere(expr: &Expr) -> bool {
+    crate::ingest::database_ownership::claims_model_statement(expr) || crate::lower::normalizes::claims(expr)
 }
 
 /// ActiveSupport::Callbacks' class-side surface as the Ruby-family runtime

@@ -46,42 +46,55 @@ pub(crate) fn normalizations(model: &Model) -> HashMap<Symbol, (Symbol, Expr)> {
     let mut out = HashMap::default();
     for item in &model.body {
         let ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { continue };
-        if method.as_str() != "normalizes" {
-            continue;
-        }
-        let mut attrs = Vec::new();
-        let mut with = None;
-        let mut supported = true;
-        for arg in args {
-            match &*arg.node {
-                ExprNode::Lit { value: Literal::Sym { value } } => attrs.push(value.clone()),
-                ExprNode::Hash { entries, .. } => {
-                    for (k, v) in entries {
-                        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
-                            supported = false;
-                            continue;
-                        };
-                        match (key.as_str(), &*v.node) {
-                            ("with", ExprNode::Lambda { params, rest_param: None, body, .. })
-                                if params.len() == 1 =>
-                            {
-                                with = Some((params[0].clone(), body.clone()));
-                            }
-                            ("apply_to_nil", ExprNode::Lit { value: Literal::Bool { value: false } }) => {}
-                            _ => supported = false,
-                        }
-                    }
-                }
-                _ => supported = false,
-            }
-        }
-        let (Some(with), true) = (with, supported) else { continue };
+        let Some((attrs, with)) = declaration(expr) else { continue };
         for attr in attrs {
             out.insert(attr, with.clone());
         }
     }
     out
+}
+
+/// Whether a model-body statement is a `normalizes` declaration this
+/// pass reproduces (`model_to_library::unclaimed_unknowns` skips it).
+pub(crate) fn claims(expr: &Expr) -> bool {
+    declaration(expr).is_some()
+}
+
+/// A reproducible `normalizes :a, :b, with: ->(v) { ... }`: its
+/// attributes, and the lambda's parameter and body.
+fn declaration(expr: &Expr) -> Option<(Vec<Symbol>, (Symbol, Expr))> {
+    let ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+    if method.as_str() != "normalizes" {
+        return None;
+    }
+    let mut attrs = Vec::new();
+    let mut with = None;
+    let mut supported = true;
+    for arg in args {
+        match &*arg.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => attrs.push(value.clone()),
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else {
+                        supported = false;
+                        continue;
+                    };
+                    match (key.as_str(), &*v.node) {
+                        ("with", ExprNode::Lambda { params, rest_param: None, body, .. })
+                            if params.len() == 1 =>
+                        {
+                            with = Some((params[0].clone(), body.clone()));
+                        }
+                        ("apply_to_nil", ExprNode::Lit { value: Literal::Bool { value: false } }) => {}
+                        _ => supported = false,
+                    }
+                }
+            }
+            _ => supported = false,
+        }
+    }
+    let (Some(with), true) = (with, supported) else { return None };
+    Some((attrs, with))
 }
 
 /// `Model._normalize_<attr>(value)` for each normalized attribute that

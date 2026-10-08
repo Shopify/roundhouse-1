@@ -25,7 +25,7 @@ pub mod allow_browser;
 pub mod app;
 mod concern_accessors;
 pub mod database_manifest;
-mod database_ownership;
+pub(crate) mod database_ownership;
 pub mod database_yml;
 pub mod controller;
 pub mod environments;

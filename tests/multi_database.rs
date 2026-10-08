@@ -586,3 +586,50 @@ puts "primary-owned connects_to ran"
         )
         .assert_passes();
 }
+
+/// A class-body `connects_to` / `establish_connection` is decided by the
+/// database ownership path (replayed at boot, or a database refusal at
+/// its span), so model lowering's dropped-DSL check does not also report
+/// it as "not lowered": a primary-owned `connects_to` checks clean, and
+/// each routing shape the runtime does not carry is refused once, by the
+/// database path. A model's reproducible `normalizes` is claimed by its
+/// own pass the same way.
+#[test]
+fn routing_statements_are_decided_by_the_database_path_not_reported_as_dropped_dsl() {
+    let mut files = with_manifest(base_files(), &sqlite_manifest());
+    put(
+        &mut files,
+        "app/models/application_record.rb",
+        "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n  connects_to database: { writing: :primary }\nend\n",
+    );
+    put(
+        &mut files,
+        "app/models/post.rb",
+        "class Post < ApplicationRecord\n  normalizes :title, with: ->(title) { title.strip }\nend\n",
+    );
+    let checked = check(&files);
+    assert!(checked.errors.is_empty(), "{}", checked.errors.join("\n"));
+
+    for (path, source, location) in [
+        (
+            "app/models/post.rb",
+            "class Post < ApplicationRecord\n  establish_connection :archive\nend\n",
+            "app/models/post.rb:2:",
+        ),
+        (
+            "app/models/archive_record.rb",
+            "class ArchiveRecord < ApplicationRecord\n  connects_to database: { writing: :archive }\nend\n",
+            "app/models/archive_record.rb:2:",
+        ),
+    ] {
+        let mut files = with_manifest(base_files(), &sqlite_manifest());
+        put(&mut files, path, source);
+        let checked = check(&files);
+        let at: Vec<&String> = checked.errors.iter().filter(|e| e.starts_with(location)).collect();
+        assert!(
+            at.len() == 1 && !at[0].contains("not lowered"),
+            "{source:?}: expected one database refusal at {location}; errors:\n{}",
+            checked.errors.join("\n")
+        );
+    }
+}
