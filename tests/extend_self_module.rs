@@ -12,6 +12,14 @@
 //! silent the whole fetch chain returned an EMPTY document — and the
 //! tests that asserted on the result passed anyway, because nothing
 //! else checked that the object had been filled in.
+//!
+//! The Ruby family writes the defs as the instance methods the source
+//! has, under the replayed `extend self`, so the module answers them on
+//! itself AND passes them on to whatever `extend`s or `include`s it:
+//! frozen_record 0.27.4's `Backends::Yaml` `extend self`s, and
+//! api_versioning's `FrozenApplicationRecordBackend` `extend`s it and
+//! calls `super` from its own `filename`. Written `def self.filename`,
+//! Yaml had no instance methods and the `super` raised NoMethodError.
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -61,8 +69,9 @@ fn extend_self_makes_every_def_callable_on_the_module() {
 end
 "#,
     );
-    assert!(src.contains("def self.resolve(host)"), "{src}");
-    assert!(src.contains("def self.private?(ip)"), "{src}");
+    assert!(src.contains("extend self"), "{src}");
+    assert!(src.contains("def resolve(host)") && !src.contains("def self.resolve"), "{src}");
+    assert!(src.contains("def private?(ip)"), "{src}");
 }
 
 #[test]
@@ -79,10 +88,10 @@ fn extend_self_retains_private_visibility_and_survives_a_public_marker() {
 end
 "#,
     );
-    assert!(src.contains("private_class_method :helper"), "{src}");
+    assert!(src.contains("private :helper"), "{src}");
     assert!(src.contains("protected :guarded"), "{src}");
-    assert!(src.contains("def self.later"), "{src}");
-    assert!(!src.contains("private_class_method :later"), "{src}");
+    assert!(src.contains("def later"), "{src}");
+    assert!(!src.contains(":later"), "{src}");
 }
 
 /// Without it the methods stay instance-only — the behaviour every
@@ -115,4 +124,81 @@ end
 "#,
     );
     assert!(!src.contains("def self.resolve"), "{src}");
+}
+
+/// The module's source and its emitted file, run by CRuby, answer the
+/// same: on the module itself, through a module that `extend`s it and
+/// calls `super`, through a class that `include`s it, with private and
+/// protected copies refused alike. A `def self.` stays on the singleton
+/// only, and `module_function` copies keep their own form.
+#[test]
+fn extend_self_modules_answer_like_ruby_when_extended_and_included() {
+    let source = r##"module Guard
+  extend self
+
+  def filename(name)
+    "#{name.downcase}s.yml"
+  end
+
+  def self.only_module
+    :module
+  end
+
+  def load(path)
+    [read(path), path]
+  end
+
+  private
+
+  def read(path)
+    path.size
+  end
+end
+"##;
+    let src = emitted(source);
+    let probe = r##"
+module Backend
+  extend Guard
+  extend self
+
+  def filename(name)
+    super(name.split("::").last)
+  end
+end
+
+class Includer
+  include Guard
+end
+
+def answer
+  yield.inspect
+rescue NoMethodError => e
+  e.class.name
+end
+
+puts answer { Guard.filename("Api::Version") }
+puts answer { Guard.load("x/y") }
+puts answer { Guard.read("x") }
+puts answer { Guard.only_module }
+puts answer { Backend.filename("Api::Version") }
+puts answer { Backend.load("a") }
+puts answer { Backend.respond_to?(:only_module) }
+puts answer { Includer.new.filename("Thing") }
+puts answer { Includer.new.respond_to?(:read, true) }
+puts answer { Guard.instance_methods(false).sort }
+puts answer { Guard.private_instance_methods(false).sort }
+"##;
+    let run = |module: &str| {
+        let dir = std::env::temp_dir().join(format!("rh_extend_self_{}_{}", std::process::id(), module.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.rb");
+        std::fs::write(&file, format!("{module}\n{probe}")).unwrap();
+        let out = std::process::Command::new("ruby").arg(&file).output().expect("ruby");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let native = run(source);
+    assert!(native.contains("\"versions.yml\""), "{native}");
+    assert_eq!(native, run(&src), "emitted:\n{src}");
 }
