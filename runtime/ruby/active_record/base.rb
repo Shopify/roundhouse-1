@@ -215,8 +215,11 @@ module ActiveRecord
     # without running `initialize`, so the hook sees a loaded record
     # exactly once; before this it also ran on the empty shell, where
     # `new_record?` is true and every column is blank. A distinct object
-    # from EMPTY_ATTRS, which is also what a bare `Model.new` receives.
-    HYDRATE_ATTRS = {}.freeze
+    # from EMPTY_ATTRS, which is also what a bare `Model.new` receives:
+    # `Hash.new`, not a `{}.freeze` literal, which Ruby 3.4+ folds into
+    # one shared frozen Hash, so the two constants were the same object
+    # and every bare `new` passed for a hydration.
+    HYDRATE_ATTRS = Hash.new.freeze
 
     # `attrs = {}` keeps Base's constructor signature compatible
     # with subclasses that take attrs (`def initialize(attrs = {})`).

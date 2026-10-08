@@ -1858,10 +1858,19 @@ fn hydrate_attrs_const() -> Expr {
 }
 
 /// The hydration factories' `new` arguments: the sentinel when the
-/// model has a hook for it to suppress, else none — hook-free models
-/// (the whole blog fixture) keep their bare `new()`.
-fn hydrate_new_args(fire_after_initialize: bool) -> Vec<Expr> {
-    if fire_after_initialize { vec![hydrate_attrs_const()] } else { Vec::new() }
+/// model's `initialize` has something for it to suppress, else none —
+/// models with neither (the whole blog fixture) keep their bare `new()`.
+fn hydrate_new_args(model: &Model) -> Vec<Expr> {
+    if constructs_with_hydrate_attrs(model) { vec![hydrate_attrs_const()] } else { Vec::new() }
+}
+
+/// Whether the model's `initialize` tells a record being loaded from one
+/// being built: it skips `after_initialize` (the factory fires it once
+/// the columns are set) and the declared `attribute ..., default:`
+/// values (`declared_default_assign`), which Rails evaluates only for a
+/// new record — a loaded one never calls a Proc default.
+fn constructs_with_hydrate_attrs(model: &Model) -> bool {
+    model_declares_after_initialize(model) || !model.defaulted_attributes.is_empty()
 }
 
 fn synth_from_row(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {
@@ -1874,7 +1883,7 @@ fn synth_from_row(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {
         ExprNode::Send {
             recv: Some(class_const(owner)),
             method: Symbol::from("new"),
-            args: hydrate_new_args(model_declares_after_initialize(model)),
+            args: hydrate_new_args(model),
             block: None,
             parenthesized: true,
         },
@@ -2006,7 +2015,7 @@ fn synth_from_stmt(owner: &ClassId, table: &Table, model: &Model) -> MethodDef {
         ExprNode::Send {
             recv: Some(class_const(owner)),
             method: Symbol::from("new"),
-            args: hydrate_new_args(fire_after_initialize),
+            args: hydrate_new_args(model),
             block: None,
             parenthesized: true,
         },
@@ -3609,7 +3618,11 @@ fn overrides_schema_default(model: &Model, col: &Column) -> bool {
 // Not a new shape: the same `attrs.key?` guarded write `synth_update_hash` emits, which every target already compiles.
 /// `given` (`self.<col> = attrs[:<col>] if attrs.key?(:<col>)`) with an
 /// else branch: `self.<col> = self.class._attribute_default("<col>") if
-/// self.class._attribute_default?("<col>")`.
+/// !attrs.equal?(HYDRATE_ATTRS) && self.class._attribute_default?("<col>")`.
+/// A hydration factory constructs with the sentinel
+/// (`constructs_with_hydrate_attrs`) and sets the column from the row, so
+/// a loaded record never evaluates the default — Rails calls a Proc
+/// default only for a new record that leaves the attribute unset.
 fn declared_default_assign(col: &Column, given: Expr) -> Expr {
     let ExprNode::If { cond, then_branch, .. } = &*given.node else { return given };
     let class_call = |method: &str| {
@@ -3635,8 +3648,12 @@ fn declared_default_assign(col: &Column, given: Expr) -> Expr {
         block: None,
         parenthesized: false,
     });
+    let building = with_ty(
+        no_arg_send(bool_send(var_ref(Symbol::from("attrs")), "equal?", hydrate_attrs_const()), "!"),
+        Ty::Bool,
+    );
     let declared = Expr::new(Span::synthetic(), ExprNode::If {
-        cond: class_call("_attribute_default?"),
+        cond: and_bool(building, class_call("_attribute_default?")),
         then_branch: assign,
         else_branch: nil_lit(),
     });

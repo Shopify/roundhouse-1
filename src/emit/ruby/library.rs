@@ -2450,6 +2450,14 @@ fn invalidate_on_fk_write(lc: &mut LibraryClass, name: &Symbol, fk: &Symbol, sta
 /// `Db.column_text(stmt, 4)` and `from_row` reads `row.type`, and the
 /// column INDEX in the first is a fact only that body knows.
 ///
+/// Each arm passes the base `new`'s arguments on: a factory that
+/// constructs with `ActiveRecord::Base::HYDRATE_ATTRS` (an
+/// `after_initialize` hook or an `attribute ..., default:`; see
+/// `constructs_with_hydrate_attrs`) must hand the sentinel to the
+/// subclass too, or the record would run the hook or the default as if
+/// it were new. Matching only an argument-free `new` left those models
+/// hydrating the base class.
+///
 /// Ruby-family only, like its neighbours. A strict target's `Rooms::
 /// Open` is not a subtype of `Room` — there is no inheritance to make
 /// the case arms share a return type — so this is not expressible
@@ -2504,16 +2512,17 @@ pub(crate) fn apply_sti_hydration(lcs: &mut [LibraryClass], app: &App) {
                 let ExprNode::Assign { target: LValue::Var { .. }, value } = &mut *e.node else {
                     continue;
                 };
-                let is_base_new = matches!(&*value.node,
+                let new_args = match &*value.node {
                     ExprNode::Send { recv: Some(r), method, args, .. }
                         if method.as_str() == "new"
-                            && args.is_empty()
                             && matches!(&*r.node, ExprNode::Const { path }
-                                if const_path_is(path, &base)));
-                if !is_base_new {
-                    continue;
-                }
-                *value = sti_dispatch(value.clone(), &type_read, subs, value.span);
+                                if const_path_is(path, &base)) =>
+                    {
+                        args.clone()
+                    }
+                    _ => continue,
+                };
+                *value = sti_dispatch(value.clone(), &type_read, subs, &new_args, value.span);
                 break;
             }
         }
@@ -2525,8 +2534,8 @@ fn const_path_is(path: &[Symbol], id: &ClassId) -> bool {
     joined.join("::") == id.0.as_str()
 }
 
-/// `case <type_read> when "<Sub>" then <Sub>.new … else <base_new> end`
-fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) -> Expr {
+/// `case <type_read> when "<Sub>" then <Sub>.new(<args>) … else <base_new> end`
+fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], args: &[Expr], span: Span) -> Expr {
     let mut arms: Vec<crate::expr::Arm> = subs
         .iter()
         .map(|sub| crate::expr::Arm {
@@ -2544,7 +2553,7 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], span: Span) 
                         },
                     )),
                     method: Symbol::from("new"),
-                    args: vec![],
+                    args: args.to_vec(),
                     block: None,
                     parenthesized: true,
                 },
