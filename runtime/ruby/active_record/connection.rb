@@ -735,14 +735,32 @@ module ActiveRecord
     
     def self._attribute_serialize(name, value)
       type = _declared_attribute_types[name]
-      type ? type.serialize(value) : value
+      type ? _bind_type_cast(name, type.serialize(value)) : value
     end
     
     # A value from outside (a where/update_all/exists? argument): cast,
     # then serialized, as QueryAttribute#value_for_database does.
     def self._attribute_for_database(name, value)
       type = _declared_attribute_types[name]
-      type ? type.serialize(type.cast(value)) : value
+      type ? _bind_type_cast(name, type.serialize(type.cast(value))) : value
+    end
+    
+    # How the adapter sends a declared type's serialized value as a bind
+    # (quoting.rb's `type_cast`): as text the column's own type then reads,
+    # so a boolean or number declared over a varchar column stores and
+    # compares as text, as in Rails, where the inlined literal would not
+    # compare at all. A number is its digits; a boolean is PostgreSQL's
+    # text encoding 't'/'f' of its TRUE/FALSE literal, or SQLite's 1/0
+    # literal itself. Only string and text columns take the text; any
+    # other keeps the value its compiled escape expects.
+    def self._bind_type_cast(name, value)
+      return value unless value == true || value == false || value.is_a?(Integer) || value.is_a?(Float)
+      return value unless %i[string text].include?(schema_column_types.dig(name, 0))
+      return value.to_s unless value == true || value == false
+      literal = Db.escape_bool_opt(value)
+      return "t" if literal == "TRUE"
+      return "f" if literal == "FALSE"
+      literal
     end
     
     # A key read back from a row (`ids`).

@@ -70,7 +70,9 @@ pub(crate) fn retypable_attributes(model: &Model, app: &App) -> Vec<Symbol> {
 
 /// The body calls of the model's STI subclasses (library classes whose
 /// superclass is the model) of an app class macro reaching `target`,
-/// each with its class and the literal names it passes.
+/// each with its class and the literal names it passes; and their direct
+/// `target name, :type` calls, with no options, each with its name (the
+/// runtime's `attribute` ports neither `default:` nor options).
 fn sti_subclass_macro_calls<'a>(
     model: &'a Model,
     app: &'a App,
@@ -81,6 +83,19 @@ fn sti_subclass_macro_calls<'a>(
         let side = ClassSide::of_sti_subclass(lc, model, app);
         for (call, names) in calls_reaching(&side, lc.unknown_calls.iter(), target, false) {
             out.push((lc, call, names));
+        }
+        for call in &lc.unknown_calls {
+            let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { continue };
+            if method.as_str() != target || !on_self(recv) {
+                continue;
+            }
+            let [name, ty] = args.as_slice() else { continue };
+            let ExprNode::Lit { value: Literal::Sym { .. } } = &*ty.node else { continue };
+            let mut names = Vec::new();
+            literal_names(name, &mut names);
+            if names.len() == 1 && matches!(&*name.node, ExprNode::Lit { .. }) {
+                out.push((lc, call, names));
+            }
         }
     }
     out
