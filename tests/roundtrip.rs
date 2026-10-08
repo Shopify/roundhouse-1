@@ -147,6 +147,7 @@ fn tiny_blog_round_trips() {
         current_attribute_classes: vec![],
         carried_included_blocks: vec![],
         included_block_statements: Default::default(),
+        gem_source_dirs: Vec::new(),
         initializer_filters: Vec::new(),
         initializer_files: Vec::new(),
         initializer_gaps: Vec::new(),
