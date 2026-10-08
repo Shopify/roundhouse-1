@@ -482,6 +482,13 @@ pub struct App {
     /// the emitted boot does not evaluate: named, not loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_conditional_loads: Vec<BootLoad>,
+    /// config/boot.rb's own top-level, unconditional `require "lit"` of a
+    /// feature no file of the tree answers (a gem from the gem home:
+    /// Core's `require "shopify/types/setup"`, which configures
+    /// sorbet-runtime before any typed code loads), as `(feature, site)`
+    /// in source order (`ingest::boot_requires::boot_native_requires`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boot_native_requires: Vec<(String, String)>,
     /// The Gemfile gems the boot's `Bundler.require` requires, by
     /// environment (`ingest::boot_requires::bundler_required_gems`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1371,6 +1378,7 @@ impl App {
             file_programs: Vec::new(),
             boot_loads: Vec::new(),
             boot_conditional_loads: Vec::new(),
+            boot_native_requires: Vec::new(),
             bundler_gems: Vec::new(),
             gem_source_dirs: Vec::new(),
             library_class_files: Vec::new(),

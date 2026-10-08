@@ -3853,6 +3853,33 @@ fn apply_initializer_constants(files: &mut [(String, String)], app: &App) -> Res
 
 /// Configure the selected PostgreSQL backend at both ordinary Ruby entry
 /// points. Endpoints are explicit runtime inputs, never manifest credentials.
+/// config/boot.rb features that are process machinery, not app
+/// behavior: Bundler's load path (the tree runs on the harness's
+/// GEM_PATH) and Bootsnap's compile cache.
+fn boot_require_is_process_machinery(feature: &str) -> bool {
+    ["bundler", "bootsnap"].iter().any(|gem| feature == *gem || feature.starts_with(&format!("{gem}/")))
+}
+
+/// gem_facades.rb's requires of [`App::boot_native_requires`], in
+/// config/boot.rb order. A feature that fails to load raises, naming
+/// its config/boot.rb site, as native boot would abort.
+fn boot_native_requires_text(app: &App) -> String {
+    let mut out = String::new();
+    for (feature, site) in &app.boot_native_requires {
+        if boot_require_is_process_machinery(feature) || is_framework_feature(feature) {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str("# config/boot.rb's requires of gem features, before `require \"rails\"`\n# and Bundler.require, as native boot makes them.\n");
+        }
+        out.push_str(&format!(
+            "begin\n  require {feature:?} # {site}\nrescue LoadError => e\n  raise LoadError, \"roundhouse: error[boot_require_failed]: {site}: `require {}` failed: #{{e.message}}\"\nend\n",
+            format!("{feature:?}").replace('"', "\\\""),
+        ));
+    }
+    out
+}
+
 fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Result<(), String> {
     // Boot resolves the app's own config/database.yml (ingest::database_yml);
     // a manifest, when present, is the cross-check, never the source.
@@ -4208,6 +4235,16 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
+            // config/boot.rb's own requires of gem-home features, which
+            // native boot makes before `require "rails"` and
+            // Bundler.require: Core's `require "shopify/types/setup"`
+            // sets sorbet-runtime's default checked level, which must
+            // precede the first `sig` a gem or app file evaluates.
+            let boot_requires = boot_native_requires_text(app);
+            let at = content.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n")
+                .ok_or("PostgreSQL bootstrap: missing features load path in gem_facades.rb")?
+                + "$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n".len();
+            content.insert_str(at, &boot_requires);
             // `require "active_support"` (config/boot's `require "rails"`)
             // loads active_support/inflector and its default English rules
             // before Bundler.require: a gem's railtie or engine names
