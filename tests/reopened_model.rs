@@ -40,8 +40,12 @@ const NESTS_A_SERVICE: &str = "class Thing < ApplicationRecord\n  class Helper\n
 #[test]
 fn the_first_files_serialize_survives_the_reopening() {
     let model = "class Thing < ApplicationRecord\n  serialize :payload, type: Hash, coder: JSON\n\n  #: -> void\n  def stamp\n    payload.merge!(\"at\" => 1)\n  end\nend\n";
-    let (ok, text) = check(model, NESTS_A_SERVICE);
-    assert!(ok, "{text}");
+    let (_ok, text) = check(model, NESTS_A_SERVICE);
+    // `payload` types as the serialized Hash. The declaration itself is a
+    // check error: `serialize` with `type:` is not lowered (only the
+    // plain JSON coder is, `lower::serialize`), so the class does not run it.
+    assert!(!text.contains("merge!"), "{text}");
+    assert!(text.contains(" 1 error(s)") && text.contains("serialize not supported (all targets): model DSL call on `Thing`"), "{text}");
 }
 
 #[test]

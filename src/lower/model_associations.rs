@@ -300,6 +300,7 @@ mod tests {
             target: cid(target),
             foreign_key: sym(fk),
             optional: false,
+            declared_optional: Some(false),
             polymorphic: false,
             polymorphic_targets: vec![],
             default: None,

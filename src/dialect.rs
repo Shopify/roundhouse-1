@@ -373,7 +373,18 @@ pub enum Association {
         name: Symbol,
         target: ClassId,
         foreign_key: Symbol,
+        /// Whether the association may be absent: no presence validation.
+        /// The effective value — the declaration's own `optional:` /
+        /// `required:` when it names one (`declared_optional`), otherwise
+        /// the class's `belongs_to_required_by_default` where the
+        /// declaration ran (required unless a setting before it or in an
+        /// ancestor says otherwise; `model_to_library::replay_model_macros`).
         optional: bool,
+        /// What the declaration itself said: `optional: x` is `Some(x)`,
+        /// `required: x` is `Some(!x)`, neither is `None` (the class default
+        /// decides). Synthesized declarations say it explicitly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared_optional: Option<bool>,
         /// `belongs_to :notifiable, polymorphic: true` — the target
         /// above is the assoc-name phantom; the real target set is
         /// resolved at ingest assembly from the inverse `as:` decls

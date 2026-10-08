@@ -9519,6 +9519,7 @@ fn register_wrapped_belongs_to(body: &[ModelBodyItem], wrappers: &BTreeSet<Symbo
             target,
             foreign_key: Symbol::from(format!("{}_id", name.as_str())),
             optional: true,
+            declared_optional: Some(true),
             polymorphic: false,
             polymorphic_targets: Vec::new(),
             default: None,

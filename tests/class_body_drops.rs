@@ -68,7 +68,11 @@ fn dropped_class_body_statements_are_named_at_their_site() {
         let path = (d.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)).map(|f| f.path.as_str());
         format!("{}: {d:?}", path.unwrap_or("<synthetic>"))
     };
-    let messages: Vec<String> = diags.iter().map(site).collect();
+    // A model's dropped statement is a check error (`analyze::diagnose`,
+    // which `check` and the emit gate both run); a plain class's is a
+    // lowering residue the emit reports.
+    let checked = roundhouse::analyze::diagnose(&app);
+    let messages: Vec<String> = diags.iter().chain(&checked).map(site).collect();
     let expect = |file: &str, needles: &[&str]| {
         assert!(
             messages.iter().any(|m| m.contains(file) && needles.iter().all(|n| m.contains(n))),

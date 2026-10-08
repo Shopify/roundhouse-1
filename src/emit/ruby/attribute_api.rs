@@ -23,14 +23,12 @@
 //!   asking for that attribute's type raises NotImplementedError naming
 //!   the missing class rather than answering a different type.
 //!
-//! - A class-body call to a class method the model inherits from an app
-//!   class (`model_uuid_attributes :id, :shop_id`, defined in a concern's
-//!   `class_methods` and so on ApplicationRecord) is replayed in the class
-//!   body, where Rails runs it at load. No lowering claims such a call
-//!   (it is app code, not framework DSL), and the model lowering used to
-//!   drop it: the readers it defines and the registrations it makes never
-//!   happened. A call to a method only the model itself defines is not
-//!   replayed: the emitted body runs these calls before its own `def`s.
+//! A class-body call to an app class macro is replayed by the shared
+//! lowering (`model_to_library::replay_model_macros`, a `ClassBody`
+//! statement) when everything it does at load is something the lowered
+//! class answers, and refused otherwise; it is no longer replayed here
+//! unguarded, which crashed the class at load when the macro reached
+//! model DSL (`attribute`, `query_constraints`, `belongs_to`).
 //!
 //! Ruby-family only: the strict targets keep the Symbol-typed `[]`, have
 //! no runtime for `abstract_class` or `type_for_attribute`, and cannot
@@ -48,36 +46,18 @@ use crate::ty::Ty;
 
 pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
     let adapter = app.primary_database_adapter();
-    let replays: Vec<Vec<(usize, Expr)>> =
-        app.models.iter().map(|model| inherited_class_method_calls(model, lcs, app)).collect();
-    for (model, replay) in app.models.iter().zip(replays) {
+    for model in &app.models {
         let Some(lc) = lcs.iter_mut().find(|lc| lc.name == model.name) else {
             continue;
         };
         // The lowering wrote the mattr seeds, then the body's ClassBody
-        // statements; a replayed call joins those in source order.
-        let seeds = model.class_attr_defaults.len();
-        let statements = crate::lower::model_to_library::class_body_statements(model).count();
-        let in_order = lc.class_ivar_initializers.len() == seeds + statements;
-        let mut carried = if in_order {
-            lc.class_ivar_initializers.split_off(seeds).into_iter()
-        } else {
-            Vec::new().into_iter()
-        };
+        // statements (a replayed class macro among them,
+        // `model_to_library::replay_model_macros`); the abstract-class
+        // write runs between the two.
         if let Some(value) = crate::lower::model_to_library::markers::abstract_class_setting(model) {
-            lc.class_ivar_initializers.push(abstract_class_write(value));
+            let seeds = model.class_attr_defaults.len().min(lc.class_ivar_initializers.len());
+            lc.class_ivar_initializers.insert(seeds, abstract_class_write(value));
         }
-        let mut replay = replay.into_iter().peekable();
-        for (index, item) in model.body.iter().enumerate() {
-            if in_order && matches!(item, crate::dialect::ModelBodyItem::ClassBody { .. }) {
-                lc.class_ivar_initializers.extend(carried.next());
-            }
-            while let Some((_, call)) = replay.next_if(|(at, _)| *at == index) {
-                lc.class_ivar_initializers.push(call);
-            }
-        }
-        lc.class_ivar_initializers.extend(carried);
-        lc.class_ivar_initializers.extend(replay.map(|(_, call)| call));
         let Some(table) = app.schema.tables.get(&model.table.0) else {
             continue;
         };
@@ -95,38 +75,6 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
     }
 }
 
-/// The model body's receiverless (or `self.`) calls to a class method
-/// an ancestor defines, in source order.
-fn inherited_class_method_calls(model: &Model, lcs: &[LibraryClass], app: &App) -> Vec<(usize, Expr)> {
-    let mut out = Vec::new();
-    for (index, item) in model.body.iter().enumerate() {
-        let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
-        let ExprNode::Send { recv, method, .. } = &*expr.node else { continue };
-        if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
-            continue;
-        }
-        if defines_class_method(model.parent.as_ref(), method, lcs, app) {
-            out.push((index, expr.clone()));
-        }
-    }
-    out
-}
-
-/// Whether `start` or one of its ancestors is an app class (a lowered
-/// model, or a library class) defining the class method `name`.
-fn defines_class_method(start: Option<&crate::ident::ClassId>, name: &Symbol, lcs: &[LibraryClass], app: &App) -> bool {
-    let mut current = start.cloned();
-    for _ in 0..32 {
-        let Some(id) = current else { return false };
-        let found = lcs.iter().find(|lc| lc.name == id).or_else(|| app.library_classes.iter().find(|lc| lc.name == id));
-        let Some(lc) = found else { return false };
-        if lc.methods.iter().any(|m| m.receiver == MethodReceiver::Class && m.name == *name) {
-            return true;
-        }
-        current = lc.parent.clone();
-    }
-    false
-}
 
 fn sp(node: ExprNode) -> Expr {
     Expr::new(Span::synthetic(), node)

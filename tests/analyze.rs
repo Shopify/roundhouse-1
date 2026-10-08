@@ -4422,7 +4422,11 @@ end
 "#,
         ),
     ]);
-    let errors = errors_of(&app);
+    // The declined `generates_token_for` is also a check error where it
+    // is written: the lowered class does not run it.
+    let all = errors_of(&app);
+    let (dropped, errors): (Vec<_>, Vec<_>) = all.iter().partition(|e| e.starts_with("generates_token_for not supported"));
+    assert!(dropped.len() == 1 && dropped[0].contains("`Invite`"), "got {all:?}");
     assert_eq!(errors.len(), 1, "only the uuid model's finder errors; got {errors:?}");
     assert!(errors[0].contains("find_by_token_for") && errors[0].contains("Invite"), "got {errors:?}");
 }
@@ -4473,7 +4477,12 @@ end
 "#,
         ),
     ]);
-    let errors = errors_of(&app);
+    // Each declaration the lowering leaves is also a check error where it
+    // is written, the declined models' (and Superseded's first, which
+    // Rails' last declaration replaces).
+    let all = errors_of(&app);
+    let (dropped, errors): (Vec<_>, Vec<_>) = all.iter().partition(|e| e.starts_with("generates_token_for not supported"));
+    assert!(["`Redeclared`", "`Quoted`"].iter().all(|m| dropped.iter().filter(|e| e.contains(m)).count() == 2), "got {all:?}");
     assert_eq!(errors.len(), 2, "the two declined models' finders error; got {errors:?}");
     assert!(errors.iter().any(|e| e.contains("Redeclared")), "got {errors:?}");
     assert!(errors.iter().any(|e| e.contains("Quoted")), "got {errors:?}");

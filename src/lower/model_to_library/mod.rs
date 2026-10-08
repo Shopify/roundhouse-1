@@ -29,6 +29,8 @@ pub(crate) mod validations;
 mod associations;
 pub(crate) mod broadcasts;
 pub(crate) mod markers;
+pub(crate) mod macro_replay;
+pub use macro_replay::replay_model_macros;
 pub mod row;
 
 use crate::det::{HashMap, HashSet};
@@ -735,7 +737,7 @@ pub(crate) fn dropped_statement_name(call: &Expr) -> String {
 /// and the emit gate report the same refusals.
 pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut all: Vec<_> =
-        app.models.iter().flat_map(|model| unclaimed_unknowns(model, &app.models, &app.schema)).collect();
+        app.models.iter().flat_map(|model| unclaimed_unknowns(model, app)).collect();
     all.extend(unclaimed_sti_subclass_calls(app));
     // A concern's statement is spliced into every includer: one row per
     // statement, naming the first includer and counting the rest.
@@ -776,18 +778,33 @@ pub fn diagnose_unclaimed_model_dsl(app: &crate::App) -> Vec<crate::diagnostic::
 /// annotations, visibility markers, `include` of a spliced concern). The
 /// skip-list below must stay in sync with the claiming passes — each
 /// entry names the pass that consumes the shape.
-pub(crate) fn unclaimed_unknowns(
-    model: &Model,
-    models: &[Model],
-    schema: &Schema,
-) -> Vec<crate::diagnostic::Diagnostic> {
+pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     use crate::diagnostic::Diagnostic;
     use crate::expr::LValue;
 
+    let (models, schema) = (&app.models, &app.schema);
     let callbacks = callback_dsl_calls(model, models);
+    let macros = macro_replay::model_macro_verdicts(model, app);
     let mut out = Vec::new();
     for item in &model.body {
         let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+        // A call of an app class macro: replayed in the class body
+        // (`replay_model_macros`), or refused with the reason.
+        match macros.iter().find(|(m, _)| std::ptr::eq(*m, expr)) {
+            // `belongs_to_required_by_default` settings are applied to the
+            // `belongs_to` declarations they decide.
+            Some((_, macro_replay::MacroVerdict::Replay | macro_replay::MacroVerdict::BelongsToRequiredByDefault(_))) => continue,
+            Some((_, macro_replay::MacroVerdict::Refuse(reason))) => {
+                out.push(Diagnostic::unsupported(
+                    expr.span,
+                    None,
+                    dropped_statement_name(expr).as_str(),
+                    format!("model macro call on `{}` not lowered; {reason}", model.name.0.as_str()),
+                ));
+                continue;
+            }
+            None => {}
+        }
         // ActiveSupport::Callbacks' class side (`define_callbacks`,
         // `set_callback`, a macro that calls it) — carried into the
         // lowered class by `model_class` and replayed through the
@@ -1058,11 +1075,21 @@ pub(crate) fn unclaimed_unknowns(
     out
 }
 
-/// Whether a model-body statement is one a path other than model
-/// lowering consumes, each asked through the claiming pass's own
-/// predicate rather than re-derived here.
-fn claimed_elsewhere(expr: &Expr) -> bool {
-    crate::ingest::database_ownership::claims_model_statement(expr) || crate::lower::normalizes::claims(expr)
+/// The passes other than model lowering that consume a model-body
+/// statement, each asked through its own predicate rather than
+/// re-derived here. A claimed statement is neither reported as dropped
+/// DSL nor replayed or refused as a macro call (`macro_replay`). A pass
+/// that lowers a model macro (one file per macro) adds its `claims` here.
+pub(crate) const MODEL_STATEMENT_CLAIMS: &[fn(&Expr) -> bool] = &[
+    // `connects_to`, `establish_connection`, ...: the database manifest.
+    crate::ingest::database_ownership::claims_model_statement,
+    // A reproducible `normalizes`.
+    crate::lower::normalizes::claims,
+];
+
+/// Whether some path in [`MODEL_STATEMENT_CLAIMS`] consumes `expr`.
+pub(crate) fn claimed_elsewhere(expr: &Expr) -> bool {
+    MODEL_STATEMENT_CLAIMS.iter().any(|claims| claims(expr))
 }
 
 /// ActiveSupport::Callbacks' class-side surface as the Ruby-family runtime
@@ -1122,6 +1149,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
             continue;
         }
         let kept = crate::emit::ruby::modelled_class_body_calls(lc, app);
+        let macros = macro_replay::sti_macro_verdicts(lc, app);
         for call in &lc.unknown_calls {
             if kept.iter().any(|k| std::ptr::eq(*k, call))
                 || crate::analyze::is_include_refusal(call)
@@ -1130,12 +1158,13 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
             {
                 continue;
             }
-            out.push(crate::diagnostic::Diagnostic::unsupported(
-                call.span,
-                None,
-                dropped_statement_name(call).as_str(),
-                format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
-            ));
+            let detail = match macros.iter().find(|(m, _)| std::ptr::eq(*m, call)) {
+                Some((_, macro_replay::MacroVerdict::Refuse(reason))) => {
+                    format!("model macro call on `{}` not lowered; {reason}", lc.name.0.as_str())
+                }
+                _ => format!("STI subclass body call on `{}` not lowered; the class does not run it", lc.name.0.as_str()),
+            };
+            out.push(crate::diagnostic::Diagnostic::unsupported(call.span, None, dropped_statement_name(call).as_str(), detail));
         }
     }
     out

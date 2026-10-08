@@ -130,6 +130,7 @@ pub fn lower_persistence(model: &Model, app: &App) -> LoweredPersistence {
                 foreign_key,
                 target,
                 optional: false,
+                declared_optional: Some(false),
                 ..
             } => Some(BelongsToCheck {
                 foreign_key: foreign_key.clone(),

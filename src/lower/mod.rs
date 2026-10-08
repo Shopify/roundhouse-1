@@ -405,6 +405,12 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // `sti_scope` because both exist for the same reason — an STI
     // subclass is not a Model, so the model-keyed machinery skips it.
     ("sti_subclass_callbacks", &[]),
+    // A model body's calls of app class macros that pass the reach gate
+    // become `ClassBody` statements, and `belongs_to_required_by_default`
+    // settings decide the `belongs_to` declarations after them
+    // (`model_to_library::macro_replay`). Reads the model bodies as ingest
+    // and analysis left them, as `check` does, so the two agree.
+    ("model_macro_replay", &[]),
     // Independent rewrites after the STI predecessor cluster, before
     // `tag_builder`: one fused walk in `fused::apply_fused_pre_tag_rewrites`.
     // `record.read_attribute(:x)` → `record[:x]`; a rename of a name no other pass produces or consumes.
@@ -832,6 +838,8 @@ pub fn apply_post_analyze_lowerings(
     sti_subclass_validations::apply_sti_subclass_validations(app);
     model_to_library::include_callbacks_in_sti_subclasses(app);
     ran!("sti_subclass_callbacks");
+    model_to_library::replay_model_macros(app);
+    ran!("model_macro_replay");
     crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
         fused::apply_fused_pre_tag_rewrites(app);
     });
