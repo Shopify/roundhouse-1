@@ -1343,6 +1343,18 @@ impl<'a> BodyTyper<'a> {
                     }
                     return Ty::Class { id: id.clone(), args: args.clone() };
                 }
+                // The core containers' own `[]` builds one from its
+                // arguments: `Array[String]` (Core's `params.permit_types(
+                // shop: Array[String])`) and `Hash[pairs]`.
+                if method.as_str() == "[]" {
+                    match id.0.as_str() {
+                        "Hash" => {
+                            return Ty::Hash { key: Box::new(unknown()), value: Box::new(unknown()) };
+                        }
+                        "Array" => return Ty::Array { elem: Box::new(unknown()) },
+                        _ => {}
+                    }
+                }
                 // Module/Class introspection built-ins — fall through
                 // when no user-defined method shadows them. `name` on
                 // a class returns the class's name as String;
