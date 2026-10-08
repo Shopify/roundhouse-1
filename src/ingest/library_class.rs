@@ -4880,10 +4880,30 @@ pub fn ingest_concern_class_method_spans(
                                 })
                             }) {
                                 concern_extensions.push(span);
+                            } else if call.block().is_none() && call.arguments().is_some_and(|args| {
+                                args.arguments().len() == 1 && args.arguments().iter().all(|arg| {
+                                    constant_path_of(&arg)
+                                        .is_some_and(|p| matches!(p.join("::").as_str(), "T::Sig" | "T::Helpers"))
+                                })
+                            }) {
+                                // sorbet-runtime's `T::Sig` (`sig`) and
+                                // `T::Helpers` (the declarations below) define
+                                // no `extended`, `included` or
+                                // `append_features`: extending them leaves the
+                                // Concern protocol as it is. `T` resolving to
+                                // the gem is `framework_shadow_scopes`' part.
                             } else {
                                 has_other_extensions = true;
                             }
                         }
+                        // `T::Helpers` declarations that do change what an
+                        // include does: `mixes_in_class_methods` extends the
+                        // includer, `sealed!` checks the including file,
+                        // `final!` freezes the module's methods. `abstract!`
+                        // and `interface!` only record the includer (their
+                        // `append_features` calls `super`) and
+                        // `requires_ancestor` is a no-op at runtime.
+                        "mixes_in_class_methods" | "sealed!" | "final!" => has_other_extensions = true,
                         "class_methods" | "include" | "prepend" => concern_calls.push(span),
                         _ => {}
                     }
@@ -4956,6 +4976,16 @@ fn framework_shadow_scopes(
     node: &ruby_prism::Node<'_>,
     out: &mut HashSet<Vec<String>>,
 ) {
+    // The framework modules a verified Concern may extend
+    // (`ingest_concern_class_method_spans`): ActiveSupport::Concern and
+    // sorbet-runtime's T::Sig and T::Helpers. Rebinding one, or the
+    // namespace a literal path resolves it through, is a barrier.
+    fn framework_root(name: &str) -> bool {
+        matches!(name, "ActiveSupport" | "T")
+    }
+    fn framework_module(namespace: &str, name: &str) -> bool {
+        matches!((namespace, name), ("ActiveSupport", "Concern") | ("T", "Sig" | "Helpers"))
+    }
     struct Shadows<'a> {
         scope: Vec<String>,
         out: &'a mut HashSet<Vec<String>>,
@@ -4977,11 +5007,13 @@ fn framework_shadow_scopes(
                 .or_else(|| node.as_constant_operator_write_node().map(|n| n.name()))
                 .or_else(|| node.as_constant_target_node().map(|n| n.name()));
             if let Some(name) = name {
-                if constant_id_str(&name) == "ActiveSupport" {
+                if framework_root(constant_id_str(&name)) {
                     self.out.insert(self.scope.clone());
                 }
-                if self.scope == ["ActiveSupport"] && constant_id_str(&name) == "Concern" {
-                    self.out.insert(Vec::new());
+                if let [namespace] = self.scope.as_slice() {
+                    if framework_module(namespace, constant_id_str(&name)) {
+                        self.out.insert(Vec::new());
+                    }
                 }
             }
             let target = node.as_constant_path_write_node().map(|n| n.target().as_node())
@@ -5000,14 +5032,16 @@ fn framework_shadow_scopes(
                 return;
             };
             let Some(path) = path else {
-                if name.is_some_and(|n| matches!(constant_id_str(&n), "ActiveSupport" | "Concern")) {
+                if name.is_some_and(|n| {
+                    matches!(constant_id_str(&n), "ActiveSupport" | "Concern" | "T" | "Sig" | "Helpers")
+                }) {
                     self.out.insert(Vec::new());
                 }
                 return;
             };
             let parent = match path.as_slice() {
-                [parent @ .., name] if name == "ActiveSupport" => Some(parent),
-                [parent @ .., namespace, name] if namespace == "ActiveSupport" && name == "Concern" => Some(parent),
+                [parent @ .., name] if framework_root(name) => Some(parent),
+                [parent @ .., namespace, name] if framework_module(namespace, name) => Some(parent),
                 _ => None,
             };
             if let Some(parent) = parent {
@@ -5031,13 +5065,15 @@ fn framework_shadow_scopes(
             self.scope.extend(names);
             // Only a root module reopening preserves the framework identity;
             // nested declarations and class declarations remain barriers.
-            if self.scope.last().is_some_and(|name| name == "ActiveSupport")
+            if self.scope.last().is_some_and(|name| framework_root(name))
                 && (self.scope.len() > 1 || class)
             {
                 self.out.insert(self.scope[..self.scope.len() - 1].to_vec());
             }
-            if self.scope.as_slice() == ["ActiveSupport", "Concern"] {
-                self.out.insert(Vec::new());
+            if let [namespace, name] = self.scope.as_slice() {
+                if framework_module(namespace, name) {
+                    self.out.insert(Vec::new());
+                }
             }
             if let Some(body) = body {
                 ruby_prism::Visit::visit(self, &body);
