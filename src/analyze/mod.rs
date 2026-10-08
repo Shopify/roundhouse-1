@@ -2329,7 +2329,20 @@ impl Analyzer {
                         let id = declaration_id(&last, value);
                         entries.push((self_ty, last, id, value, false));
                     }
-                    None => entries.push((self_ty, name.clone(), declaration_id(name, value), value, true)),
+                    None => {
+                        // A constant no Rubydex definition declares (one a
+                        // `class << self` it left unindexed writes,
+                        // `ConstResolver::in_unindexed_singleton`) answers
+                        // at the full name ingest carries it under.
+                        let id = declaration_id(name, value).or_else(|| {
+                            (!value.span.is_synthetic()).then(|| {
+                                rubydex::model::ids::declaration_id_from_lookup_name(
+                                    format!("{}::{}", lc.name.0, name).as_str(),
+                                )
+                            })
+                        });
+                        entries.push((self_ty, name.clone(), id, value, true))
+                    }
                 }
             }
         }

@@ -415,7 +415,7 @@ pub(super) fn ingest_model_with_enum_constants(
                 if !super::factory_class::block_constant_writes(stmt).is_empty() {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
-                        message: "constant assigned inside a Struct.new/Data.define body block in a model \
+                        message: "constant assigned inside a Struct.new/Data.define/Class.new body block in a model \
                                   (it is the model's constant) is not modeled"
                             .into(),
                     });

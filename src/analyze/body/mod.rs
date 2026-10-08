@@ -1224,6 +1224,9 @@ impl<'a> BodyTyper<'a> {
                     .filter(|_| !generated)
                     .and_then(|resolver| resolver.reference(expr_span, path));
                 let app_value = matches!(source_reference, Some(Some(ResolvedConstant::Value { stdlib: false, .. })));
+                let unindexed_singleton = indexed_source
+                    && source_reference.is_none()
+                    && self.const_resolver.as_ref().is_some_and(|resolver| resolver.in_unindexed_singleton(expr_span));
                 let ty = match source_reference {
                     Some(Some(ResolvedConstant::Namespace { class, runtime, stdlib, alias })) => {
                         // A modeled class keeps the name it is modeled
@@ -1366,13 +1369,44 @@ impl<'a> BodyTyper<'a> {
                         }
                         _ => exact_modeled_class(path),
                     },
-                    None if indexed_source => unknown(),
+                    None if indexed_source && !unindexed_singleton => unknown(),
                     // Views and generated IR have no Rubydex answer. A
                     // bare name can use the app's bare-name values. A
                     // qualified name `A::B` names its owner, so only the
                     // value declared at that full name answers it.
+                    //
+                    // Nor does a `class << self` Rubydex left unindexed
+                    // (`ConstResolver::in_unindexed_singleton`). Its cref
+                    // is the singleton, whose constants ingest carries on
+                    // the class (`factory_class::factory_class_body`), so
+                    // a bare name is that class's constant first, read at
+                    // its full name, as the emitted body (a block, whose
+                    // own cref is the scope around it) must write it.
                     None => {
-                        let value = if let [name] = path.as_slice() {
+                        let own_singleton = match (path.as_slice(), unindexed_singleton) {
+                            ([name], true) => match ctx.lexical_self.as_ref().or(ctx.self_ty.as_ref()) {
+                                Some(Ty::Class { id, .. }) => {
+                                    let full = ClassId(Symbol::from(format!("{}::{name}", id.0).as_str()));
+                                    self.typed_constant(&declaration_id_from_lookup_name(full.0.as_str()))
+                                        .cloned()
+                                        .map(|ty| (full, ty))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        let value = if let Some((full, ty)) = own_singleton {
+                            qualify_resolved_path(path, &full);
+                            Some(ty)
+                        } else if unindexed_singleton {
+                            // Then the top level, at the exact written name:
+                            // no bare-name value of another scope.
+                            let ty = exact_modeled_class(path);
+                            (!matches!(ty, Ty::Var { .. })).then_some(ty).or_else(|| {
+                                self.typed_constant(&declaration_id_from_lookup_name(written_class_id(path).0.as_str()))
+                                    .cloned()
+                            })
+                        } else if let [name] = path.as_slice() {
                             ctx.constants.get_own(name).cloned()
                                 .or_else(|| {
                                     let ty = exact_modeled_class(path);
@@ -1385,8 +1419,16 @@ impl<'a> BodyTyper<'a> {
                                 .cloned()
                         };
                         // Otherwise retain the written class path, but
-                        // never guess another class by its suffix.
-                        value.unwrap_or_else(|| Ty::Class { id: written_class_id(path), args: vec![] })
+                        // never guess another class by its suffix. Not in
+                        // source Rubydex skipped: there it is unknown, and
+                        // reported.
+                        value.unwrap_or_else(|| {
+                            if unindexed_singleton {
+                                unknown()
+                            } else {
+                                Ty::Class { id: written_class_id(path), args: vec![] }
+                            }
+                        })
                     }
                 };
                 // A constant nothing indexes that a gem the CRuby tree
@@ -3248,7 +3290,7 @@ pub(super) fn lit_ty(lit: &Literal) -> Ty {
     match lit {
         Literal::Nil => Ty::Nil,
         Literal::Bool { .. } => Ty::Bool,
-        Literal::Int { .. } => Ty::Int,
+        Literal::Int { .. } | Literal::BigInt { .. } => Ty::Int,
         Literal::Float { .. } => Ty::Float,
         Literal::Str { .. } => Ty::Str,
         Literal::Sym { .. } => Ty::Sym,

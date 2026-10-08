@@ -230,6 +230,14 @@ struct DroppedDefinitions<'a> {
     held: HashSet<String>,
     /// The library classes in the IR, whose constants `held` lists.
     library: HashSet<&'a str>,
+    /// `Owner::NAME` → the dropped definition its value reads at load,
+    /// and that definition's name. The IR holds the constant, yet its
+    /// value is the gap's: `MAPPING =
+    /// Merchandising::FilterQueryBuilder::FILTER_MAPPING` in Core's
+    /// GraphApi::FilteredCollectionConnectionBuilder, whose every
+    /// `MAPPING[...]` read was an error naming nothing. A value that
+    /// reads such a constant (`B = A`) reads the same gap.
+    aliases: HashMap<String, (DroppedDefinition<'a>, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -307,7 +315,68 @@ impl<'a> DroppedDefinitions<'a> {
                     .map(move |(name, _)| format!("{}::{}", c.name.0, name.as_str()))
             })
             .collect();
-        DroppedDefinitions { resolver, by_name, ingested, held, library }
+        let mut dropped = DroppedDefinitions { resolver, by_name, ingested, held, library, aliases: HashMap::default() };
+        // To a fixpoint, so an alias of an alias reads the gap too; each
+        // round adds at least one name, so the constants bound it.
+        loop {
+            let mut found: Vec<(String, (DroppedDefinition<'a>, String))> = Vec::new();
+            for class in &app.library_classes {
+                for (name, value) in &class.constants {
+                    let full = format!("{}::{}", class.name.0, name.as_str());
+                    if dropped.aliases.contains_key(&full) || found.iter().any(|(n, _)| *n == full) {
+                        continue;
+                    }
+                    if let Some(read) = dropped.uncompiled_read(value) {
+                        found.push((full, read));
+                    }
+                }
+            }
+            if found.is_empty() {
+                break;
+            }
+            dropped.aliases.extend(found);
+        }
+        dropped
+    }
+
+    /// Whether the IR holds `name` (`value`: a constant, not a class or
+    /// module), which `dropped` also defines: compiled from another file,
+    /// or by an ingest that kept the outer class.
+    fn compiled(&self, name: &str, value: bool, dropped: &DroppedDefinition<'_>) -> bool {
+        match (value, name.rsplit_once("::")) {
+            (false, _) => self.ingested.contains(name),
+            (true, Some((owner, _))) => {
+                self.ingested.contains(owner) && (!self.library.contains(owner) || self.held.contains(name))
+            }
+            (true, None) => !dropped.whole_file,
+        }
+    }
+
+    /// The first constant `value` reads outside a lambda or block body
+    /// (which may run later, or never) that names a dropped definition
+    /// the IR lacks, or an alias of one, in source order.
+    fn uncompiled_read(&self, value: &Expr) -> Option<(DroppedDefinition<'a>, String)> {
+        use crate::expr::ExprNode;
+        if let ExprNode::Const { path } = &*value.node {
+            let (name, is_value) = self.resolver.resolved_name(value.span, path)?;
+            let name = name.0.as_str();
+            if let Some(dropped) = self.by_name.get(name) {
+                if !self.compiled(name, is_value, dropped) {
+                    return Some((*dropped, name.to_string()));
+                }
+            }
+            return self.aliases.get(name).cloned();
+        }
+        if matches!(&*value.node, ExprNode::Lambda { .. }) {
+            return None;
+        }
+        let mut found = None;
+        value.node.for_each_child(&mut |child| {
+            if found.is_none() {
+                found = self.uncompiled_read(child);
+            }
+        });
+        found
     }
 
     /// For a `constant` refusal that resolves to a definition a dropped
@@ -326,17 +395,22 @@ impl<'a> DroppedDefinitions<'a> {
         }
         let (name, value) = self.resolver.resolved_name(d.span, &path)?;
         let name = name.0.as_str();
-        let dropped = self.by_name.get(name)?;
+        let Some(dropped) = self.by_name.get(name) else {
+            // A held constant whose value reads a dropped definition.
+            let (dropped, read) = self.aliases.get(name)?;
+            let gap = survey::bucket_message(dropped.message);
+            return Some((
+                format!(
+                    " — likely roundhouse coverage, not an app error (ingest gap in {}: {name} reads {read}, which was not compiled: {gap})",
+                    dropped.path,
+                ),
+                format!("{}: {gap}", dropped.path),
+            ));
+        };
         // A definition the IR holds was compiled — from another file, or
         // by an ingest that kept the outer class — so the refusal has
         // another cause.
-        let compiled = match (value, name.rsplit_once("::")) {
-            (false, _) => self.ingested.contains(name),
-            (true, Some((owner, _))) => {
-                self.ingested.contains(owner) && (!self.library.contains(owner) || self.held.contains(name))
-            }
-            (true, None) => !dropped.whole_file,
-        };
+        let compiled = self.compiled(name, value, dropped);
         let gap = survey::bucket_message(dropped.message);
         (!compiled).then(|| (
             format!(

@@ -3203,6 +3203,7 @@ pub(super) fn js_literal(span: Span, lit: &Literal) -> Js {
         Literal::Nil => Js::new(span, JsExpr::Null),
         Literal::Bool { value } => Js::new(span, JsExpr::Bool(*value)),
         Literal::Int { value } => Js::num(span, value.to_string()),
+        Literal::BigInt { value } => Js::num(span, format!("{value}n")),
         Literal::Float { value } => {
             let s = value.to_string();
             Js::num(span, if s.contains('.') { s } else { format!("{s}.0") })

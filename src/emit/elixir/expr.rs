@@ -3218,6 +3218,7 @@ pub(super) fn emit_literal(lit: &Literal) -> String {
         Literal::Nil => "nil".to_string(),
         Literal::Bool { value } => value.to_string(),
         Literal::Int { value } => value.to_string(),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => format!("{value:?}"),
         Literal::Str { value } => emit_str_literal(value),
         Literal::Sym { value } => format!(":{value}"),

@@ -230,6 +230,7 @@ fn lit_to_inclusion_value(lit: &crate::expr::Literal) -> Option<InclusionValue> 
         Literal::Str { value } => Some(InclusionValue::Str { value: value.clone() }),
         Literal::Sym { value } => Some(InclusionValue::Str { value: value.to_string() }),
         Literal::Int { value } => Some(InclusionValue::Int { value: *value }),
+        Literal::BigInt { .. } => None,
         Literal::Float { value } => Some(InclusionValue::Float { value: *value }),
         Literal::Bool { value } => Some(InclusionValue::Bool { value: *value }),
         Literal::Nil => None,

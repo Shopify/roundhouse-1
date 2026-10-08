@@ -1474,6 +1474,7 @@ fn emit_literal(lit: &Literal) -> String {
         // Plain int literal: Swift adapts the literal to the expected
         // type, and `Int` is already 64-bit — no suffix dance.
         Literal::Int { value } => value.to_string(),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             if value.fract() == 0.0 {
                 format!("{value:.1}")

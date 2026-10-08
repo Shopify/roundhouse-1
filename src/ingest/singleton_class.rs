@@ -97,6 +97,22 @@ fn walk_statement(
         if is_sorbet_type_alias(&cw.value()) {
             return Ok(());
         }
+        // `X = Struct.new(...) do … end` is the class `Owner::X`, which
+        // the library ingest of this file builds
+        // (`factory_class::collect`), as it does for one in the class
+        // body proper. Replayed as a body statement too, it would be
+        // defined twice. The block's own constant writes would be the
+        // class's, which neither walk carries.
+        if super::factory_class::is_factory_class_write(stmt) {
+            if !super::factory_class::block_constant_writes(stmt).is_empty() {
+                return unsupported(
+                    file,
+                    "constant assigned inside a Struct.new/Data.define/Class.new body block in a model or controller \
+                     `class << self` is not modeled",
+                );
+            }
+            return Ok(());
+        }
         return match ingest_expr(stmt, file) {
             Ok(expr) => {
                 out.class_body.push(expr);

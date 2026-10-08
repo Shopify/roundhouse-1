@@ -90,21 +90,27 @@ fn local_and_ambiguous_changes_keep_their_existing_rules() {
 fn a_block_scoped_declaration_names_its_block() {
     // A block whose body Ruby evaluates in another object's scope is
     // named when this walk cannot model it.
-    let source = "class Thing\n  Result = Class.new do\n    private\n    def eligible?; true; end\n  end\nend";
+    let source = "class Thing\n  Result = Module.new do\n    private\n    def eligible?; true; end\n  end\nend";
     let error = ingest_library_class(source.as_bytes(), "thing.rb").unwrap_err().to_string();
-    assert!(error.contains("inside a `Class.new do … end` block are not modeled"), "{error}");
-    // `Data.define(...) do … end` is modeled (`ingest::factory_class`):
-    // the block is `Thing::Result`'s body, its `private` applies there
-    // and does not leak into `Thing`. CRuby agrees: tests/factory_class_blocks.rs
-    // compares `private_method_defined?` on the source with the emitted app.
-    let source = "class Thing\n  Result = Data.define(:status) do\n    private\n    def eligible?; true; end\n  end\n  def open; 1; end\nend";
-    let classes = ingest_library_classes(source.as_bytes(), "thing.rb").unwrap();
-    let result = classes.iter().find(|c| c.name.0.as_str() == "Thing::Result").expect("Thing::Result");
-    let eligible = result.methods.iter().find(|m| m.name.as_str() == "eligible?").expect("eligible?");
-    assert_eq!(eligible.visibility, MethodVisibility::Private);
-    let thing = classes.iter().find(|c| c.name.0.as_str() == "Thing").expect("Thing");
-    let open = thing.methods.iter().find(|m| m.name.as_str() == "open").expect("open");
-    assert_eq!(open.visibility, MethodVisibility::Public);
+    assert!(error.contains("inside a `Module.new do … end` block are not modeled"), "{error}");
+    // `Data.define(...) do … end` and `Class.new do … end` are modeled
+    // (`ingest::factory_class`): the block is `Thing::Result`'s body, its
+    // `private` applies there and does not leak into `Thing`. CRuby
+    // agrees: tests/factory_class_blocks.rs compares
+    // `private_method_defined?` on the source with the emitted app, and
+    // tests/class_new_blocks.rs runs the `Class.new` form.
+    for factory in ["Data.define(:status)", "Class.new"] {
+        let source = format!(
+            "class Thing\n  Result = {factory} do\n    private\n    def eligible?; true; end\n  end\n  def open; 1; end\nend"
+        );
+        let classes = ingest_library_classes(source.as_bytes(), "thing.rb").unwrap();
+        let result = classes.iter().find(|c| c.name.0.as_str() == "Thing::Result").expect("Thing::Result");
+        let eligible = result.methods.iter().find(|m| m.name.as_str() == "eligible?").expect("eligible?");
+        assert_eq!(eligible.visibility, MethodVisibility::Private, "{factory}");
+        let thing = classes.iter().find(|c| c.name.0.as_str() == "Thing").expect("Thing");
+        let open = thing.methods.iter().find(|m| m.name.as_str() == "open").expect("open");
+        assert_eq!(open.visibility, MethodVisibility::Public, "{factory}");
+    }
     // A load-time conditional definition is modeled
     // (tests/conditional_definitions.rs), but not a marker in its branch:
     // the visibility after the statement would depend on the branch.

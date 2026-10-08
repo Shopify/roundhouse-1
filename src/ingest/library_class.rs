@@ -110,8 +110,19 @@ fn library_classes(
     // At file level the constant is Object's, not the first class's.
     let mut file_constants = file_level_constants(&root, file)?;
     let mut top_level = Vec::new();
+    // `A::B = Class.new(C)` (`file_class_new_path_write`): its `C` is
+    // read at the top level, so it takes no lexical resolution below,
+    // and its span is where the parent is written (the Ruby emit roots
+    // it: `ruby::library::written_parent`).
+    let mut path_written: HashSet<ClassId> = HashSet::default();
     file_constants.retain(|(name, value, _)| match class_new_declaration(&[], name, value) {
-        Some(class) => {
+        Some(mut class) => {
+            if name.as_str().contains("::") {
+                path_written.insert(class.name.clone());
+                if let ExprNode::Send { args, .. } = &*value.node {
+                    class.parent_span = args[0].span;
+                }
+            }
             top_level.push(class);
             false
         }
@@ -126,7 +137,11 @@ fn library_classes(
     // Ruby evaluates as another class's body. Before the `Class.new`
     // parent resolution below, so `Sub = Class.new(Point)` finds a
     // factory class `Point` this file declares.
-    out.extend(super::factory_class::factory_classes(&root, file)?);
+    // `Sub = Class.new(Base) do … end` is one (`origin` none: a plain
+    // class), whose parent resolves as the block-less form's does.
+    let factories = super::factory_class::factory_classes(&root, file)?;
+    synthesized.extend(factories.iter().filter(|class| class.origin.is_none()).map(|class| class.name.clone()));
+    out.extend(factories);
     // A file holding nothing but such constants still declares them.
     // Without a class to host the rest, other file-level constants
     // were dropped before this too.
@@ -146,7 +161,10 @@ fn library_classes(
     // first. Written in full, the emitted file can require the class
     // it subclasses. A name this file does not declare stays as written.
     let declared: HashSet<ClassId> = top_level.iter().map(|class| class.name.clone()).collect();
-    for class in top_level.iter_mut().filter(|class| synthesized.contains(&class.name)) {
+    for class in top_level
+        .iter_mut()
+        .filter(|class| synthesized.contains(&class.name) && !path_written.contains(&class.name))
+    {
         let Some(parent) = &class.parent else { continue };
         let name = class.name.0.as_str();
         let mut scope: Vec<&str> = name.split("::").collect();
@@ -248,7 +266,10 @@ fn file_guard_offset(root: &ruby_prism::Node<'_>) -> Option<usize> {
 /// (`return unless ENV["EXFILTRATE_TYPES"]`). Not carried, and named:
 /// a file-level `case` holding declarations, and a statement the
 /// expression ingest refuses. `ActiveSupport.on_load` is
-/// `on_load_reopen`'s and `autoload` the autoloader's.
+/// `on_load_reopen`'s, except a hook carried here as the statement it is
+/// (`on_load_reopen::registered_as_written`), and `autoload` the
+/// autoloader's. A file-level `A::B = Class.new(C)` is a declaration
+/// (`file_class_new_path_write`), not a statement.
 pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) -> Option<crate::app::FileProgram> {
     use crate::app::ProgramItem;
     let result = super::prism::parse(source, file);
@@ -385,7 +406,10 @@ fn program_items(
         // A constant before any guard rides on the file's first class
         // (`carry_file_constants`); after one, or in a branch, it is a
         // statement.
-        if stmt.as_constant_write_node().is_some() && !in_branch && !*guarded {
+        if (stmt.as_constant_write_node().is_some() || file_class_new_path_write(stmt).is_some())
+            && !in_branch
+            && !*guarded
+        {
             continue;
         }
         // A Zeitwerk loader the file holds (`LOADER =` above, or a
@@ -431,7 +455,9 @@ fn program_items(
                 && call.receiver().is_some_and(|r| {
                     r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "ActiveSupport")
                 });
-            if on_load {
+            // A hook this file registers as written falls through to
+            // `statement` (`on_load_reopen::registered_as_written`).
+            if on_load && !super::on_load_reopen::registered_as_written(&call) {
                 continue;
             }
         }
@@ -755,9 +781,10 @@ fn take_class_new_declarations(owner: &mut LibraryClass) -> Vec<LibraryClass> {
 /// (`Error = Class.new(StandardError)`). The parent stays as written,
 /// to resolve lexically like any `class X < Parent`.
 ///
-/// A block body, a parent that is not a constant path, or a missing
-/// parent (`Class.new`) is not this shape and stays a constant, which
-/// analysis reports.
+/// A parent that is not a constant path, or a missing parent
+/// (`Class.new`) is not this shape and stays a constant, which analysis
+/// reports. A block body that defines methods is a class too, which
+/// `factory_class::factory_classes` builds (the body walks skip it).
 fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<LibraryClass> {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
         return None;
@@ -835,6 +862,10 @@ fn file_level_constants(
         if stmt.as_class_node().is_some() || stmt.as_module_node().is_some() {
             after_declarations = true;
         }
+        if let Some((path, write)) = file_class_new_path_write(&stmt) {
+            out.push((Symbol::from(path.join("::")), ingest_expr(&write.value(), file)?, after_declarations));
+            continue;
+        }
         let Some(cw) = stmt.as_constant_write_node() else { continue };
         if is_sorbet_type_alias(&cw.value()) {
             if let Some(value) = super::sorbet_check::alias_value(&cw.value(), file)? {
@@ -861,6 +892,35 @@ fn file_level_constants(
         out.push((Symbol::from(constant_id_str(&cw.name())), value, after_declarations));
     }
     Ok(out)
+}
+
+/// `A::B = Class.new(Parent)` at file level, with the path it writes:
+/// a class declaration like the plain-constant form
+/// ([`class_new_declaration`]). Ruby names the class `A::B` when the
+/// write assigns it, and the statement runs at the top level, so
+/// `Parent` is looked up from there and not from `A`. A target whose
+/// prefix is not a constant path (`klass::B =`) is not this shape.
+fn file_class_new_path_write<'pr>(
+    stmt: &ruby_prism::Node<'pr>,
+) -> Option<(Vec<String>, ruby_prism::ConstantPathWriteNode<'pr>)> {
+    fn static_path(node: &ruby_prism::Node<'_>) -> Option<Vec<String>> {
+        if let Some(c) = node.as_constant_read_node() {
+            return Some(vec![constant_id_str(&c.name()).to_string()]);
+        }
+        let p = node.as_constant_path_node()?;
+        let mut out = match p.parent() {
+            None => Vec::new(),
+            Some(parent) => static_path(&parent)?,
+        };
+        out.push(constant_id_str(&p.name()?).to_string());
+        Some(out)
+    }
+    let write = stmt.as_constant_path_write_node()?;
+    if !super::initializer_constants::is_class_new_declaration(&write.value()) {
+        return None;
+    }
+    let path = static_path(&write.target().as_node())?;
+    Some((path, write))
 }
 
 pub(super) fn library_class_from_node(
@@ -993,7 +1053,7 @@ pub(super) fn library_class_and_struct_base(
         conditional_definitions,
         class_attribute_effects,
         ..
-    } = walk_decl_body(class.body(), &owner, file, false)?;
+    } = walk_declaration_body(class.body(), &owner, file)?;
     if parent.as_ref().is_some_and(|p| is_railtie_base(p.0.as_str())) {
         unknown_calls = railtie_body_statements(class.body(), &unknown_calls, file)?;
     }
@@ -1957,7 +2017,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         conditional_definitions,
         class_attribute_effects,
         ..
-    } = walk_decl_body_with_visibility(module.body(), &owner, file, false, &visibility)?;
+    } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
     admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
@@ -2686,6 +2746,9 @@ fn reject_conditional_accessor(node: &ruby_prism::Node<'_>, file: &str) -> Inges
 pub(super) struct FactoryClassBody {
     pub(super) includes: Vec<ClassId>,
     pub(super) methods: Vec<MethodDef>,
+    /// The constants a `class << self` in the block writes: the class's
+    /// own (see `factory_class_body`).
+    pub(super) constants: Vec<(Symbol, Expr)>,
     pub(super) unknown_calls: Vec<Expr>,
     /// `private :to_h` / `private :member` in the block: visibility of a
     /// method the block does not define (the factory's or an ancestor's).
@@ -2699,13 +2762,13 @@ fn block_constant_value(write: &ruby_prism::ConstantWriteNode<'_>, file: &str) -
     if is_sorbet_type_alias(&write.value()) {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "type alias assigned inside a Struct.new/Data.define body block is not modeled".into(),
+            message: "type alias assigned inside a Struct.new/Data.define/Class.new body block is not modeled".into(),
         });
     }
     if super::factory_class::is_factory_class_write(&write.as_node()) {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "Struct.new/Data.define body block nested in another one is not modeled".into(),
+            message: "Struct.new/Data.define/Class.new body block nested in another one is not modeled".into(),
         });
     }
     ingest_expr(&write.value(), file)
@@ -2717,14 +2780,23 @@ fn block_constant_value(write: &ruby_prism::ConstantWriteNode<'_>, file: &str) -
 /// reach in. Constants and class variables in the block are lexically
 /// the ENCLOSING scope's (`class_eval` with a block keeps the caller's
 /// cref). The enclosing walk carries the constants the block writes
-/// directly (`carried`, `factory_class::block_constant_writes`); any
-/// other constant the walk reports, and every class variable, is refused.
+/// directly (`carried`, `factory_class::block_constant_writes`).
+///
+/// A `class << self` in the block opens the new class's singleton, a
+/// cref of its own, so a constant written there is the singleton's
+/// (CRuby 4.0: `X.singleton_class.const_defined?(:C, false)`, and not
+/// `Object`'s). Like every `class << self` constant (`singleton_class`)
+/// it is carried on the class itself, here the factory class, whose
+/// singleton methods read it by bare name. Any other constant the walk
+/// reports, and every class variable, is refused.
 pub(super) fn factory_class_body(
     body: Option<ruby_prism::Node<'_>>,
     owner: &ClassId,
     carried: &[Symbol],
+    singleton_written: &[Symbol],
     file: &str,
 ) -> IngestResult<FactoryClassBody> {
+
     let DeclBody {
         includes,
         mut methods,
@@ -2738,20 +2810,25 @@ pub(super) fn factory_class_body(
     if !conditional_definitions.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "a load-time conditional definition inside a Struct.new/Data.define body block is not modeled"
+            message: "a load-time conditional definition inside a Struct.new/Data.define/Class.new body block is not modeled"
                 .into(),
         });
     }
-    if constants.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
+    // A name written both in the block and in its `class << self` names
+    // two constants, which one list of the class's cannot hold apart.
+    let (own, enclosing): (Vec<_>, Vec<_>) =
+        constants.into_iter().partition(|(name, _)| singleton_written.contains(name));
+    if singleton_written.iter().any(|name| carried.contains(name))
+        || enclosing.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "constant or class variable assigned inside a Struct.new/Data.define body block \
+            message: "constant or class variable assigned inside a Struct.new/Data.define/Class.new body block \
                       (it belongs to the enclosing scope) is not modeled"
                 .into(),
         });
     }
     admit_nameless_rest(&mut methods);
-    Ok(FactoryClassBody { includes, methods, unknown_calls, visibility_overrides })
+    Ok(FactoryClassBody { includes, methods, constants: own, unknown_calls, visibility_overrides })
 }
 
 fn walk_decl_body<'pr>(
@@ -2766,12 +2843,43 @@ fn walk_decl_body<'pr>(
     Ok(out)
 }
 
+/// [`walk_decl_body`] on a `class`/`module` declaration's own body,
+/// one `factory_class::factory_classes` visits: a factory class written
+/// in a `class << self` directly inside it is claimed there.
+fn walk_declaration_body<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+) -> IngestResult<DeclBody> {
+    let visibility = Visibility::resolve_library(body.as_ref(), file, None)?;
+    let mut out = walk_decl_body_in(body, owner, file, false, &visibility, true)?;
+    out.visibility_overrides = visibility.overrides();
+    Ok(out)
+}
+
 fn walk_decl_body_with_visibility<'pr>(
     body: Option<ruby_prism::Node<'pr>>,
     owner: &ClassId,
     file: &str,
     force_class_receiver: bool,
     visibility: &Visibility,
+) -> IngestResult<DeclBody> {
+    walk_decl_body_in(body, owner, file, force_class_receiver, visibility, false)
+}
+
+/// `declaration_body`: `body` is a `class`/`module` body that
+/// `factory_class::factory_classes` visits, or a `class << self`
+/// directly inside one (which it visits too). A factory class write in
+/// such a body is claimed as a class there; in any other carrier
+/// (`class_methods do`, `class << klass` in an `included` hook, a
+/// `class << self` in a factory block) it is refused.
+fn walk_decl_body_in<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+    force_class_receiver: bool,
+    visibility: &Visibility,
+    declaration_body: bool,
 ) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
@@ -2940,13 +3048,16 @@ fn walk_decl_body_with_visibility<'pr>(
             }
             // `NAME = Struct.new(...) do … end` is a class, which
             // `factory_class::factory_classes` builds from the same
-            // statement. Not in a singleton or class-method carrier:
-            // that constant belongs to a scope no class is emitted for.
+            // statement. In a `class << self` directly in a declaration
+            // body it is carried on the declaration, as every constant
+            // of that `class << self` is (see `factory_class::collect`).
+            // Not in any other singleton or class-method carrier: that
+            // constant belongs to a scope no class is emitted for.
             if super::factory_class::is_factory_class_write(stmt) {
-                if force_class_receiver {
+                if force_class_receiver && !declaration_body {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
-                        message: "Struct.new/Data.define body block in a singleton or class-method \
+                        message: "Struct.new/Data.define/Class.new body block in a singleton or class-method \
                                   carrier is not modeled"
                             .into(),
                     });
@@ -3084,7 +3195,8 @@ fn walk_decl_body_with_visibility<'pr>(
         // `class << self ... end` — singleton class block. Body
         // defines class-level methods on the enclosing scope.
         if let Some(sc) = stmt.as_singleton_class_node() {
-            out.extend(walk_decl_body_with_visibility(sc.body(), owner, file, true, visibility)?);
+            let claimed = declaration_body && !force_class_receiver && sc.expression().as_self_node().is_some();
+            out.extend(walk_decl_body_in(sc.body(), owner, file, true, visibility, claimed)?);
             continue;
         }
         // `module ClassMethods … end` is not folded here: it is its own

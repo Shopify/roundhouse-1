@@ -17,6 +17,10 @@
 //! constructor and value equality stay the runtime's. The Ruby family
 //! emits `X = <factory> do … end` around the class body.
 //!
+//! `X = Class.new(Parent) do … end` evaluates its block the same way
+//! and builds nothing the runtime supplies, so it is a plain class with
+//! that parent, emitted with a `class` header (`class_new_class`).
+//!
 //! The body walks that lower a class body skip these constant writes
 //! (`is_factory_class_write`); `factory_classes` claims them. Both use
 //! `factory_block`, so a block is either a class here or the walk's
@@ -44,21 +48,27 @@ use super::util::{
 };
 use super::{IngestError, IngestResult};
 
-/// `Struct.new(...) do … end` / `Data.define(...) do … end` whose block
-/// defines a method: the call and its block. `None` for every other
-/// value, including the blockless forms (a constant of the enclosing
-/// scope, analysed by `analyze::data`).
+/// The class a factory call builds: `Struct` (`Struct.new`), `Data`
+/// (`Data.define`) or `Class` (`Class.new`).
+fn generator(call: &CallNode<'_>) -> Option<&'static str> {
+    let receiver = call.receiver()?;
+    let receiver = constant_path_of(&receiver)?;
+    match (constant_id_str(&call.name()), receiver.as_slice()) {
+        ("new", [only]) if only == "Struct" => Some("Struct"),
+        ("new", [only]) if only == "Class" => Some("Class"),
+        ("define", [only]) if only == "Data" => Some("Data"),
+        _ => None,
+    }
+}
+
+/// `Struct.new(...) do … end` / `Data.define(...) do … end` / `Class.new(...)
+/// do … end` whose block defines a method: the call and its block. `None`
+/// for every other value, including the blockless forms (a constant of
+/// the enclosing scope, analysed by `analyze::data`, or for `Class.new`
+/// the declaration `library_class::class_new_declaration` reads).
 pub(super) fn factory_block<'pr>(value: &Node<'pr>) -> Option<(CallNode<'pr>, BlockNode<'pr>)> {
     let call = value.as_call_node()?;
-    let generator = match constant_id_str(&call.name()) {
-        "new" => "Struct",
-        "define" => "Data",
-        _ => return None,
-    };
-    let receiver = call.receiver()?;
-    if constant_path_of(&receiver)? != [generator] {
-        return None;
-    }
+    generator(&call)?;
     let block = call.block()?.as_block_node()?;
     // A block with no method definition or visibility marker
     // (`Data.define(:a) { "x" }`, an `include`-only body) adds nothing a
@@ -98,6 +108,21 @@ pub(super) fn block_constant_writes<'pr>(stmt: &Node<'pr>) -> Vec<ConstantWriteN
 fn body_constant_writes<'pr>(block: &BlockNode<'pr>) -> Vec<ConstantWriteNode<'pr>> {
     let Some(body) = block.body() else { return Vec::new() };
     flatten_statements(body).into_iter().filter_map(|stmt| stmt.as_constant_write_node()).collect()
+}
+
+/// The names of the constants a `class << self` directly in `block`
+/// writes.
+fn singleton_constant_writes(block: &BlockNode<'_>) -> Vec<Symbol> {
+    let Some(body) = block.body() else { return Vec::new() };
+    flatten_statements(body)
+        .into_iter()
+        .filter_map(|stmt| stmt.as_singleton_class_node())
+        .filter(|sc| sc.expression().as_self_node().is_some())
+        .filter_map(|sc| sc.body())
+        .flat_map(flatten_statements)
+        .filter_map(|stmt| stmt.as_constant_write_node())
+        .map(|write| Symbol::from(constant_id_str(&write.name())))
+        .collect()
 }
 
 /// A file-level statement `factory_classes` turns into a class: a
@@ -163,14 +188,36 @@ pub(super) fn factory_classes(root: &Node<'_>, file: &str) -> IngestResult<Vec<L
     Ok(out)
 }
 
+/// `singleton`: `body` is a `class << self` directly in the declaration
+/// `scope` names. Ruby binds a constant written there on the singleton
+/// class (CRuby 4.0: `M.singleton_class.const_defined?(:X, false)`),
+/// which no class is emitted for. Every walk that lowers that body
+/// carries its constants on the declaration instead
+/// (`library_class::walk_decl_body_in`, `singleton_class`), which its
+/// methods read by bare name all the same, so the factory class is
+/// `Scope::X` too. Only its constant writes are classes here; a class
+/// or module nested in it is not visited.
 fn collect(
     body: Option<Node<'_>>,
     scope: &[String],
     file: &str,
     out: &mut Vec<LibraryClass>,
 ) -> IngestResult<()> {
+    collect_in(body, scope, file, out, false)
+}
+
+fn collect_in(
+    body: Option<Node<'_>>,
+    scope: &[String],
+    file: &str,
+    out: &mut Vec<LibraryClass>,
+    singleton: bool,
+) -> IngestResult<()> {
     let Some(body) = body else { return Ok(()) };
     for stmt in flatten_statements(body) {
+        if singleton && stmt.as_constant_write_node().is_none() {
+            continue;
+        }
         if let Some(write) = stmt.as_constant_write_node() {
             let value = write.value();
             let factory = match factory_block(&value) {
@@ -195,6 +242,10 @@ fn collect(
                 let mut inner = scope.to_vec();
                 inner.extend(name);
                 collect(module.body(), &inner, file, out)?;
+            }
+        } else if let Some(sc) = stmt.as_singleton_class_node() {
+            if !scope.is_empty() && sc.expression().as_self_node().is_some() {
+                collect_in(sc.body(), scope, file, out, true)?;
             }
         }
     }
@@ -245,8 +296,11 @@ fn factory_class(
     block: Option<&BlockNode<'_>>,
     file: &str,
 ) -> IngestResult<LibraryClass> {
-    let struct_factory = constant_id_str(&call.name()) == "new";
-    let generator = if struct_factory { "Struct" } else { "Data" };
+    let generator = generator(call).expect("factory_block checked the receiver");
+    if generator == "Class" {
+        return class_new_class(path, call, block, file);
+    }
+    let struct_factory = generator == "Struct";
     let receiver = call.receiver().expect("factory_block checked the receiver");
     let mut args = Vec::new();
     if let Some(arguments) = call.arguments() {
@@ -271,26 +325,7 @@ fn factory_class(
             args.push(ingest_expr(arg, file)?);
         }
     }
-    // Ruby passes the new class to the block (`do |klass|`). A single
-    // parameter the block never reads (Core's `do |_klass|`) changes
-    // nothing; any other parameter list is refused.
-    if block.is_some_and(|block| block.parameters().is_some() && !unread_class_parameter(block)) {
-        return Err(unsupported(
-            file,
-            &format!("block parameters on a {generator} factory body are not modeled"),
-        ));
-    }
-    let owner = ClassId(Symbol::from(path.join("::")));
-    // The block's own constant writes are the enclosing scope's, which
-    // its walk carries (`block_constant_writes`).
-    let carried: Vec<Symbol> = block
-        .map(body_constant_writes)
-        .unwrap_or_default()
-        .iter()
-        .map(|write| Symbol::from(constant_id_str(&write.name())))
-        .collect();
-    let body =
-        super::library_class::factory_class_body(block.and_then(|block| block.body()), &owner, &carried, file)?;
+    let (owner, body) = factory_body(path, block, generator, file)?;
     let loc = call.location();
     let span = Span {
         file: super::sources::file_id(file),
@@ -334,9 +369,193 @@ fn factory_class(
         methods,
         nullable_columns: Vec::new(),
         origin: Some(origin),
-        constants: Vec::new(),
+        constants: body.constants,
         unknown_calls: body.unknown_calls,
         class_ivar_initializers: Vec::new(),
         visibility_overrides: body.visibility_overrides,
     })
+}
+
+/// `NAME = Class.new(Parent) do … end` / `NAME = Class.new do … end`:
+/// the class `class NAME < Parent … end` declares. Ruby names the new
+/// class on assignment (`Outer::NAME`), `class_exec`s the block on it, so
+/// its `def`s, `class << self` and markers are that class's, and the
+/// block keeps the enclosing cref, so a constant written directly in it
+/// is the enclosing scope's (`block_constant_writes`), as for
+/// `Struct.new`. (CRuby 4.0: `Outer::G.name == "Outer::G"`, `Outer::C.
+/// superclass == Outer::G`, `Outer.const_defined?(:INNER)` and not
+/// `Outer::G`'s, a `private` in the block makes the following `def`
+/// private on the class, and `Outer.respond_to?(:update)` is false for a
+/// `class << self; def update` in the block.)
+///
+/// Unlike a `Struct.new` body the block builds nothing the runtime must
+/// supply, so it is an ordinary library class with that parent (written,
+/// resolved lexically like the block-less form's,
+/// `library_class::library_classes`), emitted as a `class` header. That
+/// header's one difference from the block, a cref of the class's own,
+/// adds no constant lookup: the block's constants are carried out of it.
+/// A block that reads a local of the scope around it (a closure, which a
+/// class body cannot be) or a parent that is not a constant path is
+/// refused by name.
+fn class_new_class(
+    path: &[String],
+    call: &CallNode<'_>,
+    block: Option<&BlockNode<'_>>,
+    file: &str,
+) -> IngestResult<LibraryClass> {
+    let arguments: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let parent = match arguments.as_slice() {
+        [] => None,
+        [parent] => match constant_path_of(parent) {
+            Some(written) if !written.is_empty() => Some(ClassId(Symbol::from(written.join("::")))),
+            _ => {
+                return Err(unsupported(
+                    file,
+                    "`Class.new(parent) do … end` whose parent is not a constant path is not modeled",
+                ));
+            }
+        },
+        _ => return Err(unsupported(file, "`Class.new` with more than one argument is not modeled")),
+    };
+    if block.is_some_and(reads_enclosing_locals) {
+        return Err(unsupported(
+            file,
+            "a `Class.new do … end` body block that reads a local variable of the enclosing scope is not modeled",
+        ));
+    }
+    let (owner, body) = factory_body(path, block, "Class", file)?;
+    Ok(LibraryClass {
+        conditional_definitions: Vec::new(),
+        method_aliases: Vec::new(),
+        top_level_constants: Vec::new(),
+        name: owner,
+        is_module: false,
+        parent,
+        parent_span: Default::default(),
+        includes: body.includes,
+        methods: body.methods,
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: body.constants,
+        unknown_calls: body.unknown_calls,
+        class_ivar_initializers: Vec::new(),
+        visibility_overrides: body.visibility_overrides,
+    })
+}
+
+/// Whether a statement of `block` reads or writes a local variable of
+/// the scope around the block: a closure, which a class body is not.
+/// Prism counts a local's `depth` in scopes from where it is written;
+/// `def`, `class`, `module` and `class << self` open a scope that sees no
+/// outer local, so they are not entered.
+fn reads_enclosing_locals(block: &BlockNode<'_>) -> bool {
+    struct Locals {
+        blocks: u32,
+        outer: bool,
+    }
+    impl Locals {
+        fn depth(&mut self, depth: u32) {
+            self.outer |= depth > self.blocks;
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Locals {
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.blocks += 1;
+            ruby_prism::visit_block_node(self, node);
+            self.blocks -= 1;
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.blocks += 1;
+            ruby_prism::visit_lambda_node(self, node);
+            self.blocks -= 1;
+        }
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            // `class << expr`: the expression is evaluated outside.
+            ruby_prism::Visit::visit(self, &node.expression());
+        }
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.depth(node.depth());
+        }
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.depth(node.depth());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.depth(node.depth());
+        }
+        fn visit_local_variable_operator_write_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+        ) {
+            self.depth(node.depth());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.depth(node.depth());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.depth(node.depth());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+    }
+    let mut locals = Locals { blocks: 0, outer: false };
+    if let Some(body) = block.body() {
+        ruby_prism::Visit::visit(&mut locals, &body);
+    }
+    locals.outer
+}
+
+/// The class a factory body block builds and what the block gives it.
+fn factory_body(
+    path: &[String],
+    block: Option<&BlockNode<'_>>,
+    generator: &str,
+    file: &str,
+) -> IngestResult<(ClassId, super::library_class::FactoryClassBody)> {
+    // Ruby passes the new class to the block (`do |klass|`). A single
+    // parameter the block never reads (Core's `do |_klass|`) changes
+    // nothing; any other parameter list is refused.
+    if block.is_some_and(|block| block.parameters().is_some() && !unread_class_parameter(block)) {
+        return Err(unsupported(
+            file,
+            &format!("block parameters on a {generator} factory body are not modeled"),
+        ));
+    }
+    let owner = ClassId(Symbol::from(path.join("::")));
+    // The block's own constant writes are the enclosing scope's, which
+    // its walk carries (`block_constant_writes`).
+    let carried: Vec<Symbol> = block
+        .map(body_constant_writes)
+        .unwrap_or_default()
+        .iter()
+        .map(|write| Symbol::from(constant_id_str(&write.name())))
+        .collect();
+    // The constants a `class << self` in the block writes are the
+    // class's own (`factory_class_body`).
+    let singleton_written = block.map(singleton_constant_writes).unwrap_or_default();
+    // Nested in a class or module body, that `class << self` is indexed
+    // as the ENCLOSING scope's singleton (Rubydex reads `self` there as
+    // the lexical scope, not the block's class), so a read of such a
+    // constant would resolve to `Scope::C`, which nothing defines.
+    if path.len() > 1 && !singleton_written.is_empty() {
+        return Err(unsupported(
+            file,
+            &format!(
+                "constant written in a `class << self` of a {generator} factory body inside a class or module \
+                 body is not modeled"
+            ),
+        ));
+    }
+    let body = super::library_class::factory_class_body(
+        block.and_then(|block| block.body()),
+        &owner,
+        &carried,
+        &singleton_written,
+        file,
+    )?;
+    Ok((owner, body))
 }

@@ -186,7 +186,7 @@ pub(super) fn keep(app: &mut App, dir: &std::path::Path, candidates: Vec<Candida
 
 /// `Class.new(Parent)` with no block: a class declaration
 /// (`library_class::class_new_declaration`), not a value.
-fn is_class_new_declaration(value: &Node<'_>) -> bool {
+pub(super) fn is_class_new_declaration(value: &Node<'_>) -> bool {
     let Some(call) = value.as_call_node() else { return false };
     call.block().is_none()
         && constant_id_str(&call.name()) == "new"

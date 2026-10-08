@@ -1022,6 +1022,7 @@ fn emit_literal(lit: &Literal) -> String {
         // hand-written `Db` primitive correspondingly takes `Long`
         // indices.)
         Literal::Int { value } => format!("{value}L"),
+        Literal::BigInt { value } => value.clone(),
         Literal::Float { value } => {
             if value.fract() == 0.0 {
                 format!("{value:.1}")

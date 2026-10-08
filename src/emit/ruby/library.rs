@@ -3185,6 +3185,7 @@ fn literal_key(e: &Expr) -> Option<String> {
             Literal::Nil => "nil".to_string(),
             Literal::Bool { value } => format!("b:{value}"),
             Literal::Int { value } => format!("i:{value}"),
+            Literal::BigInt { value } => format!("i:{value}"),
             Literal::Float { value } => format!("f:{value}"),
             Literal::Str { value } => format!("s:{value:?}"),
             Literal::Sym { value } => format!("y:{}", value.as_str()),
@@ -6754,7 +6755,9 @@ fn emit_library_class_decl_inner(
         eager.iter().map(|&i| resolve_all(&lc.constants[i].1, true)).collect();
     let readers = constant_readers(lc, app, &resolve);
     let mut split: Option<(usize, BTreeSet<String>)> = None;
-    for p in 1..per_const.len() {
+    // A factory class cannot reopen: its header builds the class.
+    let factory_class = matches!(lc.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. }));
+    for p in (1..per_const.len()).filter(|_| !factory_class) {
         let mut before: BTreeSet<String> = body_requires.clone();
         before.extend(requires.iter().cloned());
         for q in &per_const[..p] {
@@ -7051,8 +7054,14 @@ fn emit_library_class_decl_inner(
             }
             let pad = body_pad.as_str();
             let mut lines = rendered.lines();
+            // A factory class's body is a block, which keeps the cref
+            // of the scope around it: a bare `NAME =` there writes that
+            // scope's constant. Its own constants (the ones its source
+            // wrote in `class << self`) are written through `self`, the
+            // class the block runs on.
+            let written = if factory_class { format!("self::{}", cname.as_str()) } else { cname.to_string() };
             if let Some(first_line) = lines.next() {
-                writeln!(s, "{pad}{} = {first_line}", cname.as_str()).unwrap();
+                writeln!(s, "{pad}{written} = {first_line}").unwrap();
                 for line in lines {
                     if line.is_empty() {
                         writeln!(s).unwrap();
@@ -8578,17 +8587,26 @@ fn app_library_ancestors<'a>(lc: &'a LibraryClass, app: &'a App) -> Vec<&'a Libr
 /// different classes: inside `module Delivery`, `::Operation` is the
 /// top-level class and `Operation` is `Delivery::Operation` once that
 /// exists. Core's delivery operations subclass both.
+///
+/// A file-level `A::B = Class.new(Parent)` (the ingest's
+/// `file_class_new_path_write`, whose parent span is the `Class.new`
+/// argument) is rooted too: the write runs at the top level, so Ruby
+/// reads `Parent` there, while the emitted header sits inside `module A`,
+/// where a bare `Parent` would find `A::Parent` first.
 fn written_parent(lc: &LibraryClass, parent: &ClassId, app: &App) -> String {
     let text = parent.0.as_str();
     let span = lc.parent_span;
-    let rooted = !text.starts_with("::")
-        && !span.is_synthetic()
-        && (span.file.0 as usize)
-            .checked_sub(1)
-            .and_then(|i| app.sources.get(i))
-            .and_then(|file| file.text.get(span.start as usize..span.end as usize))
-            .is_some_and(|written| written.trim_start().starts_with("::") && written.trim_start().trim_start_matches("::") == text);
-    if rooted { format!("::{text}") } else { text.to_string() }
+    let source = (!span.is_synthetic())
+        .then(|| (span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)))
+        .flatten();
+    let written = source.and_then(|file| file.text.get(span.start as usize..span.end as usize));
+    let rooted_as_written = written
+        .is_some_and(|written| written.trim_start().starts_with("::") && written.trim_start().trim_start_matches("::") == text);
+    let class_new_argument = lc.name.0.as_str().contains("::")
+        && source
+            .and_then(|file| file.text.get(..span.start as usize))
+            .is_some_and(|before| before.trim_end().ends_with("Class.new("));
+    if !text.starts_with("::") && (rooted_as_written || class_new_argument) { format!("::{text}") } else { text.to_string() }
 }
 
 /// The body calls that name a class-side method a loaded gem's module
@@ -9932,7 +9950,11 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
     }
     if is_model_or_library_class(raw, app) {
         // underscore: namespaced parents nest (see emit_library_class_decls).
-        return Some(format!("app/models/{}", crate::naming::underscore(raw)));
+        // A library class nested in another is written in that class's
+        // file (`file_owner`): `Top < Outer::Guard` requires `outer`,
+        // where no `outer/guard` file exists. A model keeps its own.
+        let file = if is_model_named(raw, app) { raw.to_string() } else { file_owner(raw, app) };
+        return Some(format!("app/models/{}", crate::naming::underscore(&file)));
     }
     if is_controller_named(raw, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(raw)));

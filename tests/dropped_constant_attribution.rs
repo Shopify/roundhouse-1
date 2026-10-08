@@ -133,7 +133,7 @@ fn a_gap_that_kept_the_class_is_not_named() {
     let diags = check(&[
         (
             "app/lib/settings.rb",
-            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def huge\n    99999999999999999999999\n  end\nend\n",
+            "class Settings\n  A = Object.new.frobnicate\n  B = ENV.fetch(\"X\").zork\n\n  def host\n    `hostname`\n  end\nend\n",
         ),
         ("app/lib/user.rb", "class User\n  def go\n    [Settings::A, Settings::B]\n  end\nend\n"),
     ]);
@@ -146,22 +146,22 @@ fn a_gap_that_kept_the_class_is_not_named() {
 }
 
 /// A gap in a constant's own value: ingest kept the module but held the
-/// constant as its `nil` placeholder. Core's
-/// `MetaobjectsInternal::Codec::DoubleLayout::SIGN_BIT =
-/// 0x8000000000000000` is wider than 64 bits. Its references are the
-/// gap's shadow; a sibling constant ingest compiled is not named.
+/// constant as its `nil` placeholder (here a shell command, which no
+/// target runs; Core's wider-than-64-bit `SIGN_BIT` was one before
+/// tests/wide_integer_literals.rs). Its references are the gap's
+/// shadow; a sibling constant ingest compiled is not named.
 #[test]
 fn a_constant_whose_value_was_the_gap_names_it() {
     let diags = check(&[
         (
             "app/lib/codec.rb",
-            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    SIGN_BIT = 0x8000000000000000 #: Integer\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        bits.anybits?(SIGN_BIT) ? TAG : 0\n      end\n    end\n  end\nend\n",
+            "module Codec\n  module DoubleLayout\n    TAG = 0x11 #: Integer\n    HOST = `hostname`\n\n    class << self\n      #: (Integer) -> Integer\n      def pack(bits)\n        HOST.empty? ? TAG : bits\n      end\n    end\n  end\nend\n",
         ),
-        ("app/lib/user.rb", "class User\n  def go\n    [Codec::DoubleLayout::SIGN_BIT, Codec::DoubleLayout::TAG, Codec::Missing]\n  end\nend\n"),
+        ("app/lib/user.rb", "class User\n  def go\n    [Codec::DoubleLayout::HOST, Codec::DoubleLayout::TAG, Codec::Missing]\n  end\nend\n"),
     ]);
-    let d = constant_refusal(&diags, "Codec::DoubleLayout::SIGN_BIT", Severity::Info);
+    let d = constant_refusal(&diags, "Codec::DoubleLayout::HOST", Severity::Info);
     assert!(
-        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::SIGN_BIT was not compiled: integer literal"),
+        d.message.contains("ingest gap in app/lib/codec.rb: Codec::DoubleLayout::HOST was not compiled: shell command"),
         "{}",
         d.message
     );
@@ -170,4 +170,65 @@ fn a_constant_whose_value_was_the_gap_names_it() {
         "{diags:#?}"
     );
     assert_eq!(constant_refusal(&diags, "Codec::Missing", Severity::Error).message, "constant not supported (all targets): Codec::Missing");
+}
+
+/// A constant the IR holds whose value reads a dropped definition is the
+/// gap's shadow too: Core's `MAPPING =
+/// Merchandising::FilterQueryBuilder::FILTER_MAPPING`, read a dozen
+/// times as `MAPPING[...]`. So is an alias of it, and a value that reads
+/// it at load. A held constant whose value reads only compiled
+/// definitions, or reads the dropped one only inside a lambda, is not
+/// named.
+#[test]
+fn a_constant_aliasing_a_dropped_definition_names_its_gap() {
+    let diags = check(&[
+        ("app/lib/base_store.rb", BASE_STORE),
+        (
+            "app/lib/local_store.rb",
+            "class LocalStore < BaseStore\n  MAPPING = { a: 1 }\n\n  name = :reset\n  private name\nend\n",
+        ),
+        (
+            "app/lib/builder.rb",
+            "class Builder\n  MAPPING = LocalStore::MAPPING\n  AGAIN = MAPPING\n  KEYS = [LocalStore::MAPPING, 1].freeze\n  LATER = -> { LocalStore::MAPPING }\n  PLAIN = { b: 2 }\n\n  def go\n    [MAPPING[:a], AGAIN[:a], KEYS.size, LATER.call, PLAIN[:b], Builder::MAPPING]\n  end\nend\n",
+        ),
+    ]);
+    gap_error(&diags);
+    let file = "app/lib/local_store.rb";
+    let named = |written: &str, name: &str| {
+        format!(
+            "constant not supported (all targets): {written} — likely roundhouse coverage, not an app error \
+             (ingest gap in {file}: {name} reads LocalStore::MAPPING, which was not compiled: {VISIBILITY_GAP})"
+        )
+    };
+    // The value itself names the dropped definition directly.
+    assert_eq!(
+        constant_refusal(&diags, "LocalStore::MAPPING", Severity::Info).message,
+        dropped("LocalStore::MAPPING", "LocalStore::MAPPING", file, VISIBILITY_GAP)
+    );
+    let reads = |written: &str| -> Vec<&Diagnostic> {
+        diags.iter().filter(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, detail, .. }
+            if construct.as_str() == "constant" && detail == written)).collect()
+    };
+    // The refusal names the resolved constant, however it is written
+    // (`MAPPING[:a]` and `Builder::MAPPING` alike).
+    for name in ["Builder::MAPPING", "Builder::AGAIN"] {
+        let found = reads(name);
+        assert!(!found.is_empty(), "no refusal for {name}: {diags:#?}");
+        for d in found {
+            assert_eq!(d.severity, Severity::Info, "{}", d.message);
+            assert_eq!(d.message, named(name, name));
+        }
+    }
+    // `AGAIN = MAPPING`, `MAPPING[:a]` and `Builder::MAPPING`.
+    assert_eq!(reads("Builder::MAPPING").len(), 3, "{diags:#?}");
+    // Read at load as an element: any refusal of it is the gap's too.
+    for d in reads("Builder::KEYS") {
+        assert_eq!(d.message, named("Builder::KEYS", "Builder::KEYS"));
+    }
+    for written in ["Builder::LATER", "Builder::PLAIN"] {
+        assert!(
+            reads(written).iter().all(|d| !d.message.contains("ingest gap")),
+            "{written}: {diags:#?}"
+        );
+    }
 }

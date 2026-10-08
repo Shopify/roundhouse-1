@@ -69,6 +69,11 @@ struct FileAnswers {
     /// Each `class X < Y` this file writes: X's full name, and the full
     /// name of the class Ruby's lookup binds `Y` to.
     superclasses: Vec<(Box<str>, Box<str>)>,
+    /// The byte ranges of the `class << self` bodies Rubydex does not
+    /// index (a `DynamicSingletonDefinition`: no class or module
+    /// encloses it, as in `X = Struct.new do class << self … end end`
+    /// at file level). No written constant inside has an answer.
+    unindexed_singletons: Vec<(u32, u32)>,
 }
 
 pub(crate) struct ConstResolver {
@@ -496,6 +501,15 @@ impl ConstResolver {
         file.0
             .checked_sub(1)
             .is_some_and(|index| (index as usize) < self.files.len())
+    }
+
+    /// Whether `span` lies in a `class << self` Rubydex did not index
+    /// (`FileAnswers::unindexed_singletons`), where a written constant
+    /// has no source answer for want of one, not because none exists.
+    pub(super) fn in_unindexed_singleton(&self, span: Span) -> bool {
+        self.file(span.file).is_some_and(|file| {
+            file.unindexed_singletons.iter().any(|&(start, end)| start <= span.start && span.end <= end)
+        })
     }
 
     /// IR spans cover the entire `A::B::C` path. Rubydex records the
@@ -940,6 +954,12 @@ fn answer_file(
     let Some(document) = graph.documents().get(&UriId::from(source.path.as_str())) else {
         return answers;
     };
+    answers.unindexed_singletons = document
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| *diagnostic.rule() == Rule::DynamicSingletonDefinition)
+        .map(|diagnostic| (diagnostic.offset().start(), diagnostic.offset().end()))
+        .collect();
     let text = indexed_text(source);
     let parenthesized_receivers = if document.diagnostics().iter()
         .any(|diagnostic| *diagnostic.rule() == Rule::DynamicSingletonDefinition)
