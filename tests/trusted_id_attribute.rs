@@ -66,7 +66,7 @@ fn trusted_id_attribute_defines_its_reader_and_records_the_class() {
     let dropped: Vec<&String> = diagnostics.iter().filter(|d| d.contains("trusted_id_attribute")).collect();
     // The `attribute: :id` form branches on composite_primary_key?: left alone.
     assert_eq!(dropped.len(), 1, "{dropped:?}");
-    assert!(dropped[0].contains("model DSL call"), "{dropped:?}");
+    assert!(dropped[0].contains("model macro call on `Merch::Product` not lowered"), "{dropped:?}");
     assert!(!diagnostics.iter().any(|d| d.contains("trusted_variant") || d.contains("`db_id`")), "{diagnostics:?}");
 
     let files = roundhouse::emit::ruby::emit_lowered_models(&app);
