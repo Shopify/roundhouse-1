@@ -121,8 +121,7 @@ fn defines(lc: &LibraryClass, name: &str) -> bool {
 /// as real IR, which is what makes this checkable rather than a guess.
 fn declares_validates(lc: &LibraryClass) -> bool {
     lc.unknown_calls.iter().any(|e| {
-        matches!(&*e.node, ExprNode::Send { recv: None, method, .. }
-            if matches!(method.as_str(), "validates" | "validate" | "validates_each"))
+        matches!(&*e.node, ExprNode::Send { recv: None, method, .. } if is_validation_macro(method.as_str()))
     })
 }
 
@@ -233,4 +232,91 @@ fn constant_predicate(owner: &ClassId, name: &str, value: bool) -> MethodDef {
         mutates_self: false,
         block_param: None,
     }
+}
+
+/// Whether `name` is an ActiveModel validation macro: `validates`,
+/// `validates!`, `validate`, `validates_with`, `validates_each`, or a
+/// `validates_<kind>_of` helper.
+pub(crate) fn is_validation_macro(name: &str) -> bool {
+    matches!(name, "validates" | "validates!" | "validate" | "validates_with" | "validates_each")
+        || (name.starts_with("validates_") && name.ends_with("_of"))
+}
+
+/// The validation macros a LIBRARY class's body declares that its
+/// emitted class drops, each an `unsupported` error at the declaration.
+///
+/// A class is lowered as a (tableless) model when ingest classifies it
+/// one: an ActiveRecord descendant, or a superclass-less ActiveModel
+/// class that validates (`ingest::app`'s `validating_active_model`).
+/// Any other class declaring a validation is a library class, and
+/// the emitter replays its body only on a base it does not model
+/// (`emit::ruby::replays_class_body`); otherwise the call is dropped
+/// with a `lower_residue` warning that `check` never saw. Core's
+/// `class Form < BaseForm; include ActiveModel::Validations; validates
+/// …` would answer `valid?` without the rule, so a dropped rule is an
+/// error, as a dropped model DSL call is
+/// (`model_to_library::diagnose_unclaimed_model_dsl`, which also covers
+/// an STI subclass of a model, skipped here).
+pub(crate) fn diagnose_dropped_validations(app: &App) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    // A class below a model, directly or through library classes, is
+    // an STI subclass `lower::sti_subclass_validations` lowers or
+    // refuses (and `diagnose_unclaimed_model_dsl` reports).
+    let below_model = |lc: &LibraryClass| {
+        let mut seen: Vec<&ClassId> = vec![&lc.name];
+        let mut parent = lc.parent.as_ref();
+        while let Some(p) = parent {
+            if app.models.iter().any(|m| &m.name == p) {
+                return true;
+            }
+            if seen.contains(&p) {
+                return false;
+            }
+            seen.push(p);
+            parent = app.library_classes.iter().find(|c| &c.name == p && !c.is_module).and_then(|c| c.parent.as_ref());
+        }
+        false
+    };
+    for lc in &app.library_classes {
+        if below_model(lc)
+            || !lc.unknown_calls.iter().any(|call| validation_call(call).is_some())
+            || crate::emit::ruby::replays_class_body(lc, app)
+        {
+            continue;
+        }
+        let kept = crate::emit::ruby::modelled_class_body_calls(lc, app);
+        let why = if lc.is_module {
+            "it is a module body, which no lowering runs validations from".to_string()
+        } else if let Some(parent) = &lc.parent {
+            format!(
+                "it is a library class (its superclass `{}` is no model the tree lowers), so its `valid?` would not run the rule",
+                parent.0.as_str()
+            )
+        } else {
+            "it is a library class (no `include ActiveModel::Validations` or `ActiveModel::Model` of its own), so its `valid?` would not run the rule"
+                .to_string()
+        };
+        for call in &lc.unknown_calls {
+            let Some(name) = validation_call(call) else { continue };
+            if kept.iter().any(|k| std::ptr::eq(*k, call)) {
+                continue;
+            }
+            out.push(Diagnostic::unsupported(
+                call.span,
+                None,
+                name,
+                format!("validation on `{}` not lowered and dropped: {why}", lc.name.0.as_str()),
+            ));
+        }
+    }
+    out
+}
+
+/// The macro name of a bare (or `self.`) validation call.
+fn validation_call(call: &Expr) -> Option<&str> {
+    let ExprNode::Send { recv, method, .. } = &*call.node else { return None };
+    if recv.as_ref().is_some_and(|r| !matches!(&*r.node, ExprNode::SelfRef)) {
+        return None;
+    }
+    is_validation_macro(method.as_str()).then_some(method.as_str())
 }

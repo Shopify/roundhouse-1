@@ -17,7 +17,7 @@
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
 
-use roundhouse::emit::ruby::emit_library;
+use roundhouse::emit::ruby::{emit_library, emit_lowered_models};
 use roundhouse::ingest::ingest_app_from_tree;
 
 fn emitted(lib_src: &str) -> (String, Vec<String>) {
@@ -29,8 +29,11 @@ fn emitted(lib_src: &str) -> (String, Vec<String>) {
     tree.insert(PathBuf::from("lib/embed.rb"), lib_src.as_bytes().to_vec());
     let mut app = ingest_app_from_tree(tree).expect("ingest");
     let diags = roundhouse::session::analyze_and_lower(&mut app);
+    // A class that validates is a tableless model, emitted with the
+    // models.
     let out = emit_library(&app)
         .into_iter()
+        .chain(emit_lowered_models(&app))
         .filter(|f| f.path.extension().is_some_and(|e| e == "rb"))
         .map(|f| f.content)
         .collect::<Vec<_>>()
@@ -68,11 +71,14 @@ fn the_include_is_replaced_by_what_it_supplies() {
     assert!(residue.is_empty(), "{residue:?}");
 }
 
-/// The one failure mode worth refusing outright: a synthesized
-/// `valid? => true` would answer *yes* for a record the app wrote rules
-/// to reject. The include stays, and the ledger says why.
+/// The one failure mode worth refusing outright is a synthesized
+/// `valid? => true` that answers *yes* for a record the app wrote rules
+/// to reject. A class that declares a validation is therefore not this
+/// pass's: ingest makes it a tableless model wherever it lives
+/// (`ingest::app`'s `validating_active_model`), and the model path runs
+/// the rule in `valid?`.
 #[test]
-fn a_declared_validation_declines_and_says_so() {
+fn a_declared_validation_runs_as_a_tableless_model() {
     let (src, residue) = emitted(
         r#"class OpengraphEmbed
   include ActiveModel::Model
@@ -83,9 +89,11 @@ fn a_declared_validation_declines_and_says_so() {
 end
 "#,
     );
-    assert!(!src.contains("def valid?"), "{src}");
-    assert_eq!(residue.len(), 1, "{residue:?}");
-    assert!(residue[0].contains("declares validations"), "{residue:?}");
+    assert!(!src.contains("include ActiveModel::Model"), "{src}");
+    assert!(src.contains("def valid?"), "{src}");
+    assert!(src.contains("self.errors << \"Href can't be blank\" if @href.nil?"), "{src}");
+    assert!(src.contains("def initialize(attrs = {})"), "{src}");
+    assert!(residue.is_empty(), "{residue:?}");
 }
 
 /// A hand-written constructor is the whole point of the class that
