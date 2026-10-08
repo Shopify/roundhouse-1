@@ -7949,7 +7949,62 @@ fn emit_library_class_decl_inner(
     };
     open_header(&mut s);
 
-    let write_include = |s: &mut String, inc: &ClassId| {
+    let write_extend = |s: &mut String, carrier: &ClassId| {
+        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
+    };
+    let extends_of = |inc: &ClassId| -> Vec<ClassId> {
+        include_extends.iter().filter(|(i, _)| *i == inc).flat_map(|(_, c)| c.iter().cloned()).collect()
+    };
+    // The `class_attribute`s an include's Concern declares in its
+    // `included do` (`App::included_class_attributes`): their defs and
+    // seeds are written right after that `include`, where Ruby runs the
+    // block, so a class-body macro below it (`retries 3` writing
+    // `retry_limit`) finds the writer and writes over the seeded
+    // default. A group whose include this body does not write keeps the
+    // general placement.
+    let root_of = |id: &ClassId| id.0.as_str().trim_start_matches("::").to_string();
+    let carried_attributes: Vec<&crate::app::IncludedClassAttributes> = if railtie {
+        Vec::new()
+    } else {
+        app.included_class_attributes
+            .get(&lc.name)
+            .into_iter()
+            .flatten()
+            .filter(|g| lc.includes.iter().any(|inc| root_of(inc) == root_of(&g.after)))
+            .filter(|g| app.gem_boundary.refused_include(&lc.name, &g.after).is_none())
+            .collect()
+    };
+    let carried_method = |m: &crate::dialect::MethodDef| {
+        carried_attributes.iter().any(|g| g.methods.iter().any(|(receiver, name)| *receiver == m.receiver && *name == m.name))
+    };
+    let carried_seed = |e: &Expr| carried_attributes.iter().any(|g| g.seeds.contains(&e.span));
+    // The Concerns an include runs (itself and, transitively, what its
+    // module includes): their spliced `ClassMethods` extends go right
+    // after an include with carried attributes, ahead of its seeds, which
+    // may call one (`self.jitter = default_jitter`).
+    let reached_by = |root: &str| -> Vec<String> {
+        let mut out = vec![root.to_string()];
+        let mut at = 0;
+        while at < out.len() {
+            let name = out[at].clone();
+            at += 1;
+            for m in app.library_classes.iter().filter(|m| m.is_module && root_of(&m.name) == name) {
+                for inc in &m.includes {
+                    let id = root_of(inc);
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let extended_at_include: std::cell::RefCell<Vec<ClassId>> = std::cell::RefCell::new(Vec::new());
+    // `with_extends`: the include's `ClassMethods` extends follow its
+    // line, ahead of its carried block, as `Concern#append_features` runs
+    // them (`base.extend(ClassMethods)`, then `base.class_eval(&block)`).
+    // A positioned include has them at the top of the body already.
+    let write_include = |s: &mut String, inc: &ClassId, with_extends: bool| {
         // An include analysis refused (error[gem_requires_rails]): the
         // module is only the RBI of a gem no tree loads, so the source's
         // include fails here, by name, as a NotImplementedError (a
@@ -7962,9 +8017,40 @@ fn emit_library_class_decl_inner(
             return;
         }
         writeln!(s, "{body_pad}include {}", lexically_qualified(inc.0.as_str(), &segments, app)).unwrap();
+        if with_extends {
+            extends_of(inc).iter().for_each(|carrier| write_extend(s, carrier));
+        }
+        let root = inc.0.as_str().trim_start_matches("::");
+        let groups = || carried_attributes.iter().filter(|g| root_of(&g.after) == root);
+        if groups().next().is_some() {
+            let reached = reached_by(root);
+            for carrier in &spliced_extends {
+                let owned = crate::app::class_methods_carrier_owner(carrier).is_some_and(|o| reached.contains(&root_of(&o)));
+                if owned && !extended_at_include.borrow().contains(*carrier) {
+                    write_extend(s, carrier);
+                    extended_at_include.borrow_mut().push((*carrier).clone());
+                }
+            }
+        }
+        let mut wrote_def = false;
+        for (index, _) in lc.methods.iter().enumerate().filter(|(_, m)| {
+            groups().any(|g| g.methods.iter().any(|(receiver, name)| *receiver == m.receiver && *name == m.name))
+        }) {
+            writeln!(s).unwrap();
+            // A generated def, never an `extend self` copy (`instance_form`).
+            write_library_method(s, lc, index, &body_pad, &[]);
+            wrote_def = true;
+        }
+        if wrote_def {
+            writeln!(s).unwrap();
+        }
+        for seed in lc.class_ivar_initializers.iter().filter(|e| groups().any(|g| g.seeds.contains(&e.span))) {
+            for line in super::emit_expr(seed).lines() {
+                writeln!(s, "{body_pad}{line}").unwrap();
+            }
+        }
         // The include's carried `included do` statements, where Ruby runs
         // them: right after it (`App::included_block_statements`).
-        let root = inc.0.as_str().trim_start_matches("::");
         for (_, statement) in app
             .included_block_statements
             .get(&lc.name)
@@ -7994,12 +8080,6 @@ fn emit_library_class_decl_inner(
             positioned.push((at, inc));
         }
     }
-    let write_extend = |s: &mut String, carrier: &ClassId| {
-        writeln!(s, "{body_pad}extend {}", lexically_qualified(carrier.0.as_str(), &segments, app)).unwrap();
-    };
-    let extends_of = |inc: &ClassId| -> Vec<ClassId> {
-        include_extends.iter().filter(|(i, _)| *i == inc).flat_map(|(_, c)| c.iter().cloned()).collect()
-    };
     // Includes the source has below a callback registration of the
     // body's own (`late_includes`): written where the body's statements
     // reach them (`flush_late`), not at its top, so an include's carried
@@ -8012,19 +8092,20 @@ fn emit_library_class_decl_inner(
             .take_while(|(at, _)| upto.is_none_or(|u| !u.is_synthetic() && u.file == at.file && at.start < u.start))
             .count();
         for (_, inc) in late.drain(..due) {
-            write_include(s, inc);
-            extends_of(inc).iter().for_each(|carrier| write_extend(s, carrier));
+            write_include(s, inc, true);
         }
     };
     for inc in &lc.includes {
         if positioned.iter().any(|(_, p)| *p == inc) || late.borrow().iter().any(|(_, l)| *l == inc) {
             continue;
         }
-        write_include(&mut s, inc);
-        extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
+        write_include(&mut s, inc, true);
     }
     for carrier in &spliced_extends {
-        write_extend(&mut s, carrier);
+        if !extended_at_include.borrow().contains(*carrier) {
+            write_extend(&mut s, carrier);
+            extended_at_include.borrow_mut().push((*carrier).clone());
+        }
     }
     for (_, inc) in &positioned {
         extends_of(inc).iter().for_each(|carrier| write_extend(&mut s, carrier));
@@ -8300,13 +8381,14 @@ fn emit_library_class_decl_inner(
         .filter(|m| m.receiver == crate::dialect::MethodReceiver::Class)
         .map(|m| &m.name)
         .collect();
-    let late_at = lc
-        .class_ivar_initializers
+    // The seeds written at their include (`carried_seed`) are not here.
+    let own_inits: Vec<&Expr> = lc.class_ivar_initializers.iter().filter(|e| !carried_seed(e)).collect();
+    let late_at = own_inits
         .iter()
         .position(|init| is_self_call(init) || calls_own_class_method(init, &own_class_methods))
-        .unwrap_or(lc.class_ivar_initializers.len());
-    let (early_inits, late_inits) = lc.class_ivar_initializers.split_at(late_at);
-    let mut body_effects: Vec<&Expr> = replayed.iter().copied().chain(early_inits.iter()).collect();
+        .unwrap_or(own_inits.len());
+    let (early_inits, late_inits) = own_inits.split_at(late_at);
+    let mut body_effects: Vec<&Expr> = replayed.iter().copied().chain(early_inits.iter().copied()).collect();
     let real_span = |e: &&Expr| e.span != crate::span::Span::synthetic();
     if !replayed.is_empty()
         && !early_inits.is_empty()
@@ -8435,6 +8517,16 @@ fn emit_library_class_decl_inner(
     };
     for (index, m) in lc.methods.iter().enumerate() {
         write_methodless(&mut s, &mut first, index);
+        // Written at its include (`carried_method`).
+        if carried_method(m) {
+            for (_, inc) in positioned.iter().filter(|(at, _)| *at == index) {
+                if !std::mem::replace(&mut first, false) {
+                    writeln!(s).unwrap();
+                }
+                write_include(&mut s, inc, false);
+            }
+            continue;
+        }
         let conditional = lc.conditional_definitions.iter().position(|c| c.contains(m));
         if let Some(at) = conditional {
             if std::mem::replace(&mut written[at], true) {
@@ -8446,7 +8538,7 @@ fn emit_library_class_decl_inner(
         }
         first = false;
         for (_, inc) in positioned.iter().filter(|(at, _)| *at == index) {
-            write_include(&mut s, inc);
+            write_include(&mut s, inc, false);
             writeln!(s).unwrap();
         }
         for (_, call) in positioned_prepends.iter().filter(|(at, _)| *at == index) {
@@ -8476,7 +8568,7 @@ fn emit_library_class_decl_inner(
 
     for (_, inc) in positioned.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();
-        write_include(&mut s, inc);
+        write_include(&mut s, inc, false);
     }
     for (_, call) in positioned_prepends.iter().filter(|(at, _)| *at >= lc.methods.len()) {
         writeln!(s).unwrap();

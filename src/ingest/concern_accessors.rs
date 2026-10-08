@@ -800,6 +800,7 @@ pub(super) fn splice_into_library_includers(
             initializers: Vec::new(),
             includes: Vec::new(),
             statements: Vec::new(),
+            class_attributes: Vec::new(),
         };
         let mut accessors: Vec<&Expr> = Vec::new();
         for (root, concern) in &reached {
@@ -916,14 +917,37 @@ pub(super) fn splice_into_library_includers(
                     continue;
                 }
                 let class_attributes: &[Symbol] = &declared;
+                // Grouped under the include it runs after, where the
+                // emitted body writes it (`App::included_class_attributes`).
+                let after = top(&lc.includes[*root]);
+                let group = match plan.class_attributes.iter().position(|g| g.after == after) {
+                    Some(group) => group,
+                    None => {
+                        plan.class_attributes.push(crate::app::IncludedClassAttributes {
+                            after,
+                            methods: Vec::new(),
+                            seeds: Vec::new(),
+                        });
+                        plan.class_attributes.len() - 1
+                    }
+                };
                 match super::app::rehome_carried(item.clone(), concern, &lc.name, class_attributes, &defined) {
                     ModelBodyItem::Method { method, .. } => {
                         plan.methods.retain(|m: &crate::dialect::MethodDef| {
                             !(m.name == method.name && m.receiver == method.receiver)
                         });
+                        let key = (method.receiver, method.name.clone());
+                        for g in &mut plan.class_attributes {
+                            g.methods.retain(|k| *k != key);
+                        }
+                        plan.class_attributes[group].methods.push(key);
                         plan.methods.push(method);
                     }
                     ModelBodyItem::ClassBody { expr, .. } | ModelBodyItem::Unknown { expr, .. } => {
+                        // Found again by its span, so only a real one.
+                        if !expr.span.is_synthetic() {
+                            plan.class_attributes[group].seeds.push(expr.span);
+                        }
                         plan.initializers.push(expr)
                     }
                     _ => unreachable!(),
@@ -945,6 +969,10 @@ pub(super) fn splice_into_library_includers(
         if !plan.statements.is_empty() {
             let name = app.library_classes[plan.index].name.clone();
             app.included_block_statements.entry(name).or_default().extend(plan.statements);
+        }
+        if !plan.class_attributes.is_empty() {
+            let name = app.library_classes[plan.index].name.clone();
+            app.included_class_attributes.entry(name).or_default().extend(plan.class_attributes);
         }
         let lc = &mut app.library_classes[plan.index];
         lc.methods.extend(plan.methods);
@@ -1093,6 +1121,9 @@ struct Plan {
     /// (the base's own include it runs after, statement): a job's
     /// callback registrations (`App::included_block_statements`).
     statements: Vec<(ClassId, Expr)>,
+    /// The carried `class_attribute` defs and seeds, by the include they
+    /// run after (`App::included_class_attributes`).
+    class_attributes: Vec<crate::app::IncludedClassAttributes>,
 }
 
 /// The `class_attribute` names a library class body seeds.
