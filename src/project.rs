@@ -3981,6 +3981,28 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 .into(),
         ));
     }
+    // String's inflection methods over the Inflector (8.2.0.alpha
+    // core_ext/string/inflections.rb), which `require "active_support"`
+    // loads with it.
+    let string_inflections = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inflections.rb")
+        .map_err(|e| format!("read string inflections runtime: {e}"))?;
+    files.push(("runtime/active_support_string_inflections.rb".into(), string_inflections));
+    let active_model_ports = active_model_ports_carried(files);
+    for port in &active_model_ports {
+        let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+            .map_err(|e| format!("read {port} runtime: {e}"))?;
+        files.push((format!("runtime/{port}.rb"), text));
+    }
+    // Name#as_json and Serializers::JSON#as_json answer through
+    // ActiveSupport::JSON's `as_json` table (runtime/spinel/
+    // active_support_json.rb), which the naming port requires.
+    if active_model_ports.contains(&"active_model_naming")
+        && !files.iter().any(|(p, _)| p == "runtime/active_support_json.rb")
+    {
+        let text = crate::runtime_files::read_to_string("runtime/spinel/active_support_json.rb")
+            .map_err(|e| format!("read active_support_json runtime: {e}"))?;
+        files.push(("runtime/active_support_json.rb".into(), text));
+    }
     // A native gem's `require "active_support/inflector"` (dry-core 1.1.0's
     // inflector backend probe, inflector.rb:9) answers from the port, as
     // the loaded activesupport answers it under Rails; the port is
@@ -4070,11 +4092,20 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             content.insert_str(at, "require_relative \"active_support_inflector\"\n");
             // active_support/i18n.rb, which active_support/railtie loads
             // with `require "rails"`: after the Inflector, whose
-            // `ordinal` reads the locale it adds.
-            if carries_i18n {
-                let at = at + "require_relative \"active_support_inflector\"\n".len();
-                content.insert_str(at, "require_relative \"active_support_i18n\"\n");
-            }
+            // `ordinal` reads the locale it adds. Then ActiveModel's
+            // naming, conversion, attribute methods and serialization,
+            // which `require "active_model"` autoloads, over the
+            // Inflector: before any app file or gem source names them.
+            let at = at + "require_relative \"active_support_inflector\"\n".len();
+            let i18n = if carries_i18n { "require_relative \"active_support_i18n\"\n" } else { "" };
+            let ports: String = std::iter::once(i18n.to_string())
+                .chain(
+                    std::iter::once("active_support_string_inflections")
+                        .chain(active_model_ports.iter().copied())
+                        .map(|port| format!("require_relative \"{port}\"\n")),
+                )
+                .collect();
+            content.insert_str(at, &ports);
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -8976,6 +9007,16 @@ fn spinel_files_with_assertions(
     // override and mixed Integer/String segments), pushed back by the
     // PostgreSQL CRuby bootstrap beside the user_agent port.
     files.retain(|(p, _)| p != "runtime/user_agent_version.rb");
+    // And for the ActiveModel naming, attribute-method and serialization
+    // ports (computed-name dispatch, `module_eval` of generated source),
+    // pushed back by the PostgreSQL CRuby bootstrap where the app names
+    // one, over the Inflector port it carries.
+    files.retain(|(p, _)| {
+        p != "runtime/active_support_string_inflections.rb"
+            && p != "runtime/active_model_naming.rb"
+            && p != "runtime/active_model_attribute_methods.rb"
+            && p != "runtime/active_model_serialization.rb"
+    });
 
     // The HTTP/WebSocket server (runtime/spinel/tep, over spinel's
     // sp_net; no C of its own) plus its NOTICE. Recursive walk picks
@@ -11483,6 +11524,28 @@ const ACTIVE_SUPPORT_CACHE_NAMES: &[&str] = &[
 /// (`drop_harness_memory_store`), so tests do not count.
 fn carries_active_support_cache(files: &[(String, String)]) -> bool {
     carries_named(files, ACTIVE_SUPPORT_CACHE_NAMES)
+}
+
+/// The ActiveModel ports (runtime/spinel/active_model_naming.rb,
+/// active_model_attribute_methods.rb, active_model_serialization.rb)
+/// the PostgreSQL CRuby tree carries, in load order: each where the
+/// app's code (a gem compiled as source among it) names one of its
+/// modules, and the naming port with the serialization port, whose
+/// Serializers::JSON extends its includer with Naming. frozen_record
+/// 0.27.4's FrozenRecord::Base names all three.
+fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
+    let serialization = carries_named(files, &["ActiveModel::Serialization", "ActiveModel::Serializers::JSON"]);
+    let naming = serialization
+        || carries_named(files, &["ActiveModel::Naming", "ActiveModel::Name", "ActiveModel::Conversion"]);
+    let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
+    [
+        (naming, "active_model_naming"),
+        (attribute_methods, "active_model_attribute_methods"),
+        (serialization, "active_model_serialization"),
+    ]
+    .into_iter()
+    .filter_map(|(carried, port)| carried.then_some(port))
+    .collect()
 }
 
 /// True where app code (not the runtime, not a test body) names one of

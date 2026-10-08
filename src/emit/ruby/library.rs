@@ -7469,10 +7469,35 @@ fn emit_library_class_decl_inner(
     let declined = app.ruby_declined_delegate_forwarders.get(&lc.name);
     let lc = if full.is_some() || declined.is_some() {
         let mut copy = lc.clone();
+        // An alias copy of a forwarder (frozen_record 0.27.4's Scope
+        // `alias_method :find_each, :each` below its `delegate ...,
+        // :each`) is the same `(...)` forwarder under its name, so it
+        // stays the native alias of the one written above it.
         for m in &mut copy.methods {
-            let Some(f) = full.into_iter().flatten().find(|f| f.name == m.name) else { continue };
+            // The copy keeps the zero-arg forwarder's spans.
+            let original = lc
+                .method_aliases
+                .iter()
+                .find(|a| !a.inherited && a.receiver == MethodReceiver::Instance && a.name == m.name)
+                .map(|a| &a.original)
+                .filter(|o| {
+                    lc.methods.iter().any(|f| {
+                        &&f.name == o
+                            && f.receiver == MethodReceiver::Instance
+                            && f.name_span == m.name_span
+                            && f.body.span == m.body.span
+                    })
+                });
+            let Some(f) = full
+                .into_iter()
+                .flatten()
+                .find(|f| f.name == m.name)
+                .or_else(|| original.and_then(|o| full.into_iter().flatten().find(|f| &f.name == o)))
+            else {
+                continue;
+            };
             if m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.block_param.is_none() {
-                *m = crate::dialect::MethodDef { visibility: m.visibility, ..f.clone() };
+                *m = crate::dialect::MethodDef { visibility: m.visibility, name: m.name.clone(), ..f.clone() };
             }
         }
         for f in declined.into_iter().flatten() {
@@ -8024,6 +8049,7 @@ fn emit_library_class_decl_inner(
         }
         own
     };
+    let instance_form = extend_self_instance_defs(lc, app, &replayed);
     // A replayed `prepend` whose module's `self.prepended(base)` hook
     // reaches this class's methods is written after them, the way
     // `hooked_include_position` places an include; the rest stay with
@@ -8379,7 +8405,7 @@ fn emit_library_class_decl_inner(
             if !std::mem::replace(first, false) {
                 writeln!(s).unwrap();
             }
-            write_conditional_definitions(s, lc, &lc.conditional_definitions[at], &body_pad);
+            write_conditional_definitions(s, lc, &lc.conditional_definitions[at], &body_pad, &instance_form);
         }
     };
     for (index, m) in lc.methods.iter().enumerate() {
@@ -8405,8 +8431,8 @@ fn emit_library_class_decl_inner(
         match conditional {
             // After every def (below).
             None if inherited_alias(lc, m).is_some() => {}
-            Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad),
-            None => write_library_method(&mut s, lc, index, &body_pad),
+            Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad, &instance_form),
+            None => write_library_method(&mut s, lc, index, &body_pad, &instance_form),
         }
     }
     // An alias of an ancestor's method (`MethodAlias::inherited`) binds
@@ -8419,7 +8445,7 @@ fn emit_library_class_decl_inner(
     for (index, m) in lc.methods.iter().enumerate() {
         if inherited_alias(lc, m).is_some() {
             writeln!(s).unwrap();
-            write_library_method(&mut s, lc, index, &body_pad);
+            write_library_method(&mut s, lc, index, &body_pad, &instance_form);
         }
     }
 
@@ -8622,9 +8648,86 @@ fn hooked_mixin_position(lc: &LibraryClass, inc: &ClassId, app: &App, hook: &str
         .map(|i| i + 1)
 }
 
+/// Which of `lc`'s class-side methods are `extend self` copies, to be
+/// written as the instance methods the source defines. Ingest gives a
+/// bare `def` below `extend self` its module-side form, the call shape
+/// every target uses; a module that replays the `extend self`
+/// (`plain_extension_calls`) answers its instance methods on itself, so
+/// writing them as instance methods keeps both, as Ruby has them. As
+/// `def self.x` they were lost to whatever `extend`s or `include`s the
+/// module: frozen_record 0.27.4's `Backends::Yaml` `extend self`s, and
+/// api_versioning's `FrozenApplicationRecordBackend` `extend`s it and
+/// calls `super` from its own `filename`, which found no `filename`
+/// above it and raised NoMethodError.
+///
+/// A method defined on the singleton (`def self.x`, `class << self`) stays
+/// one, read off the source (`helper_surface::SingletonOrigins`), and so
+/// does a possible `module_function` copy (any def below a bare
+/// `module_function` in its file), whose two forms differ in visibility.
+/// Without the source text nothing is rewritten.
+fn extend_self_instance_defs(lc: &LibraryClass, app: &App, replayed: &[&Expr]) -> Vec<bool> {
+    let extends_self = lc.is_module
+        && replayed.iter().any(|c| {
+            matches!(&*c.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+                if method.as_str() == "extend"
+                    && matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::SelfRef)))
+        });
+    if !extends_self {
+        return vec![false; lc.methods.len()];
+    }
+    struct Origins {
+        singleton: crate::ingest::helper_surface::SingletonOrigins,
+        module_functions: Vec<usize>,
+    }
+    struct ModuleFunctions(Vec<usize>);
+    impl<'pr> ruby_prism::Visit<'pr> for ModuleFunctions {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none() && node.name().as_slice() == b"module_function" {
+                self.0.push(node.location().start_offset());
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut by_file: BTreeMap<u32, Option<Origins>> = BTreeMap::new();
+    lc.methods
+        .iter()
+        .map(|m| {
+            if m.receiver != MethodReceiver::Class {
+                return false;
+            }
+            let at = if !m.name_span.is_synthetic() { m.name_span } else { m.body.span };
+            if at.is_synthetic() {
+                return false;
+            }
+            let origins = by_file.entry(at.file.0).or_insert_with(|| {
+                let source = (at.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i))?;
+                let mut module_functions = ModuleFunctions(Vec::new());
+                ruby_prism::Visit::visit(&mut module_functions, &ruby_prism::parse(source.text.as_bytes()).node());
+                Some(Origins {
+                    singleton: crate::ingest::helper_surface::SingletonOrigins::of(source.text.as_bytes()),
+                    module_functions: module_functions.0,
+                })
+            });
+            let Some(origins) = origins else { return false };
+            let after_module_function = origins.module_functions.iter().any(|&mf| mf < at.start as usize);
+            !after_module_function && !origins.singleton.is_singleton_defined(m)
+        })
+        .collect()
+}
+
 /// `lc.methods[index]`, then its visibility.
-fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pad: &str) {
-    let m = &lc.methods[index];
+///
+/// An `extend self` copy (`instance_form[index]`) is written as the
+/// instance method the source defines (`extend_self_instance_defs`).
+fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pad: &str, instance_form: &[bool]) {
+    let source = &lc.methods[index];
+    let as_instance;
+    let m = if instance_form.get(index).copied().unwrap_or(false) {
+        as_instance = MethodDef { receiver: MethodReceiver::Instance, ..source.clone() };
+        &as_instance
+    } else {
+        source
+    };
     // An alias copy is written as the native alias, so a `super` in
     // it keeps looking up the original's name, as in the source. The
     // alias takes the original's visibility; a different one on the
@@ -8632,7 +8735,7 @@ fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pa
     // One of an ancestor's method (`MethodAlias::inherited`) is the
     // native alias too: Ruby finds the original through the ancestors,
     // and the alias keeps its visibility.
-    if let Some(alias) = inherited_alias(lc, m) {
+    if let Some(alias) = inherited_alias(lc, source) {
         let (to, from) = (m.name.as_str(), alias.original.as_str());
         match m.receiver {
             MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
@@ -8671,7 +8774,7 @@ fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pa
         }
         return;
     }
-    if lc.method_aliases.iter().any(|a| a.name == m.name && a.receiver == m.receiver)
+    if lc.method_aliases.iter().any(|a| a.name == source.name && a.receiver == source.receiver)
         && contains_super(&m.body)
     {
         crate::emit::diagnostics::report_unsupported(
@@ -8723,6 +8826,7 @@ fn write_conditional_definitions(
     lc: &LibraryClass,
     conditional: &crate::dialect::ConditionalDefinitions,
     body_pad: &str,
+    instance_form: &[bool],
 ) {
     let inner_pad = format!("{body_pad}  ");
     for (at, arm) in conditional.arms.iter().enumerate() {
@@ -8753,7 +8857,7 @@ fn write_conditional_definitions(
             }
             first = false;
             if let Some(index) = index {
-                write_library_method(s, lc, index, &inner_pad);
+                write_library_method(s, lc, index, &inner_pad, instance_form);
             }
             if let Some(declaration) = declaration {
                 NestedPlacement::place_declared(&lc.name, s, declaration.name.0.as_str());
@@ -9770,13 +9874,51 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
     lc.unknown_calls
         .iter()
         .filter(|c| {
-            crate::ingest::sorbet_check::is_mixes_in(c)
+            aliases_ancestor_method(lc, c)
+                || crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))
                 || gem_effects.iter().any(|e| std::ptr::eq(*e, *c))
                 || claimed(c)
         })
         .collect()
+}
+
+/// A captured `alias_method :to, :from` (bare, or on `singleton_class`
+/// for one inside `class << self`) whose class defines `from` on that
+/// side only below it, in the same file: Ruby aliases the method `from`
+/// names where the alias runs, which is an ancestor's (Class#new for
+/// frozen_record 0.27.4's `alias_method :load, :new` above its own `def
+/// new`, inside `class << self`). Replayed as written, above the defs
+/// (where the replayed calls go), the native alias finds the same one;
+/// dropped, `load(record)` reached Kernel#load. Ingest leaves exactly
+/// these captured (`ingest::inherited_alias::resolve` copies the ones
+/// whose def runs first).
+fn aliases_ancestor_method(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*call.node else { return false };
+    if method.as_str() != "alias_method" || call.span.is_synthetic() {
+        return false;
+    }
+    let receiver = match recv {
+        None => MethodReceiver::Instance,
+        Some(r) => match &*r.node {
+            ExprNode::Send { recv: None, method, args, block: None, .. }
+                if method.as_str() == "singleton_class" && args.is_empty() =>
+            {
+                MethodReceiver::Class
+            }
+            _ => return false,
+        },
+    };
+    let symbol = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.clone()),
+        _ => None,
+    };
+    let [to, from] = args.as_slice() else { return false };
+    let (Some(_), Some(from)) = (symbol(to), symbol(from)) else { return false };
+    let mut own = lc.methods.iter().filter(|m| m.receiver == receiver && m.name == from).peekable();
+    own.peek().is_some()
+        && own.all(|m| !m.name_span.is_synthetic() && m.name_span.file == call.span.file && m.name_span.start > call.span.start)
 }
 
 /// The body calls that name a class method a Ruby-family runtime port

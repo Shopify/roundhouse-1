@@ -440,15 +440,45 @@ fn program_items(
             // `module Validation` loads before the `class Local` below it
             // that extends it. An enclosing declaration starts before what
             // it nests, so it still loads first.
-            let classes = find_all_classes_with_scope(stmt).into_iter().filter_map(|(scope, c)| {
-                let start = c.location().start_offset();
-                class_name_path(&c).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
-            });
-            let modules = find_all_module_declarations_with_scope(stmt).into_iter().filter_map(|(scope, m)| {
-                let start = m.location().start_offset();
-                module_name_path(&m).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
-            });
-            let mut found: Vec<(usize, String)> = classes.chain(modules).collect();
+            // With them, the classes a `NAME = Class.new(Parent)` in
+            // their bodies declares (`class_new_declaration`): each has
+            // a file of its own. frozen_record 0.27.4's minimal.rb
+            // writes `RecordNotFound = Class.new(StandardError)` in
+            // `module FrozenRecord`; left out, nothing loaded it, and
+            // `raise RecordNotFound` was a NameError.
+            let class_news = |body: Option<ruby_prism::Node<'_>>, path: &str| -> Vec<(usize, String)> {
+                body.map(flatten_statements)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|statement| {
+                        let write = statement.as_constant_write_node()?;
+                        let call = write.value().as_call_node()?;
+                        let class = call.receiver()?;
+                        let is_class = class.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "Class")
+                            || class.as_constant_path_node().is_some_and(|c| {
+                                c.parent().is_none() && c.name().is_some_and(|n| constant_id_str(&n) == "Class")
+                            });
+                        let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                        let parent_is_constant = matches!(args.as_slice(), [p]
+                            if p.as_constant_read_node().is_some() || p.as_constant_path_node().is_some());
+                        (is_class && constant_id_str(&call.name()) == "new" && call.block().is_none() && parent_is_constant)
+                            .then(|| (statement.location().start_offset(), format!("{path}::{}", constant_id_str(&write.name()))))
+                    })
+                    .collect()
+            };
+            let mut found: Vec<(usize, String)> = Vec::new();
+            for (scope, c) in find_all_classes_with_scope(stmt) {
+                let Some(p) = class_name_path(&c) else { continue };
+                let path = scope.into_iter().chain(p).collect::<Vec<_>>().join("::");
+                found.extend(class_news(c.body(), &path));
+                found.push((c.location().start_offset(), path));
+            }
+            for (scope, m) in find_all_module_declarations_with_scope(stmt) {
+                let Some(p) = module_name_path(&m) else { continue };
+                let path = scope.into_iter().chain(p).collect::<Vec<_>>().join("::");
+                found.extend(class_news(m.body(), &path));
+                found.push((m.location().start_offset(), path));
+            }
             found.sort_by_key(|(start, _)| *start);
             for (_, name) in found {
                 if carried.contains(name.as_str()) && !names.iter().any(|n| n.0.as_str() == name) {
@@ -3014,19 +3044,28 @@ fn walk_decl_body_in<'pr>(
             // every branch's methods, and which branch defines each. The
             // visibility pass admitted only branches of `def`s.
             if let Some(conditional) = visibility::conditional_definition(&statement) {
-                if (module_function_active || extend_self_active) && conditional.defines() {
+                if module_function_active && conditional.defines() {
                     return Err(super::error_site::at(
                         IngestError::Unsupported {
                             file: file.into(),
-                            message: "a load-time conditional definition under `module_function` or `extend self` \
-                                      is not modeled"
+                            message: "a load-time conditional definition under `module_function` is not modeled"
                                 .into(),
                         },
                         &statement,
                     ));
                 }
-                let (methods, record) =
-                    conditional_definitions(&statement, &conditional, owner, file, force_class_receiver, visibility)?;
+                // Under `extend self` each branch's `def`s are module
+                // methods, as the direct ones are (frozen_record 0.27.4's
+                // Backends::Yaml picks its `load_file` by
+                // `YAML.respond_to?(:unsafe_load_file)`).
+                let (methods, record) = conditional_definitions(
+                    &statement,
+                    &conditional,
+                    owner,
+                    file,
+                    force_class_receiver || extend_self_active,
+                    visibility,
+                )?;
                 out.methods.extend(methods);
                 out.conditional_definitions.push(record);
                 continue;
@@ -3878,6 +3917,14 @@ fn walk_decl_body_in<'pr>(
         }
         for init in &mut out.class_initializers {
             substitute_body_locals(init, &body_locals, file)?;
+        }
+        // A conditional definition's condition reads the body's locals
+        // as the body does: frozen_record 0.27.4's Backends::Yaml
+        // `elsif supports_freeze`.
+        for arm in out.conditional_definitions.iter_mut().flat_map(|c| c.arms.iter_mut()) {
+            if let Some(condition) = &mut arm.condition {
+                substitute_body_locals(condition, &body_locals, file)?;
+            }
         }
     }
 
