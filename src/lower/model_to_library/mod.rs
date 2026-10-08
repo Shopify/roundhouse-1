@@ -1263,8 +1263,8 @@ pub(crate) fn claimed_elsewhere(expr: &Expr) -> bool {
 /// replay) consult, so a claimed statement is neither reported, refused
 /// nor replayed. Claims recorded on the model itself by ingest (the
 /// spans of calls lowered there) belong here too.
-pub(crate) fn claimed_in_model(_model: &Model, expr: &Expr) -> bool {
-    claimed_elsewhere(expr)
+pub(crate) fn claimed_in_model(model: &Model, expr: &Expr) -> bool {
+    claimed_elsewhere(expr) || crate::lower::default_scope::claims_in(model, expr)
 }
 
 /// ActiveSupport::Callbacks' class-side surface as the Ruby-family runtime
@@ -1369,9 +1369,8 @@ pub fn include_callbacks_in_sti_subclasses(app: &mut crate::App) {
 /// lifecycle declarations that pass folds into hooks are claimed.
 fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diagnostic> {
     let mut out = Vec::new();
-    // An STI subclass's own default scope is emitted on it
+    // A model subclass's own default scope is emitted on it, STI or not
     // (`lower::sti_scope`, `lower::default_scope::push_subclass_methods`).
-    let sti = crate::lower::sti_scope::sti_bases(app);
     for lc in &app.library_classes {
         if !lc.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p)) {
             continue;
@@ -1382,7 +1381,7 @@ fn unclaimed_sti_subclass_calls(app: &crate::App) -> Vec<crate::diagnostic::Diag
             if kept.iter().any(|k| std::ptr::eq(*k, call))
                 || crate::analyze::is_include_refusal(call)
                 || crate::lower::sti_subclass_callbacks::folds(call)
-                || (sti.contains_key(&lc.name) && crate::lower::default_scope::claims(call))
+                || crate::lower::default_scope::claims(call)
                 || app.models.iter().any(|m| lc.parent.as_ref() == Some(&m.name) && m.claimed_body_calls.contains(&call.span))
             {
                 continue;

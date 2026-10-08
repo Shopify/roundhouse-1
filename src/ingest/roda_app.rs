@@ -137,6 +137,7 @@ pub fn ingest_roda_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestR
         lexical_json_shadow: false,
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
+        subclass_default_scope: false,
         defaulted_attributes: Vec::new(),
         attribute_aliases: Vec::new(),
         query_constraints: Vec::new(),

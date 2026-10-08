@@ -42,9 +42,13 @@
 //! Reproduced: a block or lambda with no parameters whose body is a
 //! chain of `where(...)`, `where.not(...)`, `order(...)`,
 //! `extending(Const, ...)`, `preload(...)` and `includes(...)` on the
-//! implicit self. Any other form (options such as `all_queries:`, a
-//! scope call, a conditional, an explicit receiver) is not claimed and
-//! keeps its named refusal (`model_to_library::unlowered_dsl_reason`).
+//! implicit self. A link may also be an argument-less call of one of the
+//! model's own `scope`s without parameters whose body is such a chain
+//! (`default_scope { active }`): Rails runs the scope on the default
+//! relation, so its links are spliced in. Any other form (options such
+//! as `all_queries:`, a scope with arguments, a conditional, an explicit
+//! receiver) is not claimed and keeps its named refusal
+//! (`model_to_library::unlowered_dsl_reason`).
 
 use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Model, ModelBodyItem, Param};
 use crate::expr::{Expr, ExprNode, Literal};
@@ -62,7 +66,13 @@ struct Link {
 /// Whether a model-body statement is a `default_scope` this pass
 /// reproduces (`model_to_library::MODEL_STATEMENT_CLAIMS`).
 pub(crate) fn claims(expr: &Expr) -> bool {
-    declaration(expr).is_some()
+    declaration(expr, None).is_some()
+}
+
+/// [`claims`] with `model`'s own scopes resolved (`default_scope {
+/// active }`), the claim `model_to_library::claimed_in_model` asks.
+pub(crate) fn claims_in(model: &Model, expr: &Expr) -> bool {
+    declaration(expr, Some(model)).is_some()
 }
 
 /// Whether `model` itself declares a reproduced default scope.
@@ -97,15 +107,16 @@ fn chains(model: &Model) -> Vec<Vec<Link>> {
         .body
         .iter()
         .filter_map(|item| match item {
-            ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => declaration(expr),
+            ModelBodyItem::Unknown { expr, .. } | ModelBodyItem::ClassBody { expr, .. } => declaration(expr, Some(model)),
             _ => None,
         })
         .collect()
 }
 
 /// `default_scope { chain }`, `default_scope -> { chain }` or
-/// `default_scope lambda { chain }`, and nothing else.
-fn declaration(expr: &Expr) -> Option<Vec<Link>> {
+/// `default_scope lambda { chain }`, and nothing else. `model` resolves
+/// the chain's calls of its scopes.
+fn declaration(expr: &Expr, model: Option<&Model>) -> Option<Vec<Link>> {
     let ExprNode::Send { recv: None, method, args, block, .. } = &*expr.node else { return None };
     if method.as_str() != "default_scope" {
         return None;
@@ -122,12 +133,29 @@ fn declaration(expr: &Expr) -> Option<Vec<Link>> {
         })?,
         _ => return None,
     };
-    let body = match &*body.node {
+    let links = chain(single(body), model, 0)?;
+    (!links.is_empty()).then_some(links)
+}
+
+/// A one-statement body's statement.
+fn single(body: &Expr) -> &Expr {
+    match &*body.node {
         ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
         _ => body,
-    };
-    let links = chain(body)?;
-    (!links.is_empty()).then_some(links)
+    }
+}
+
+/// The links of `model`'s parameterless `scope name`, when its body is
+/// itself a reproduced chain (scopes calling scopes, a few deep).
+fn scope_links(model: Option<&Model>, name: &str, depth: u8) -> Option<Vec<Link>> {
+    if depth >= 4 {
+        return None;
+    }
+    let scope = model?.scopes().find(|s| s.name.as_str() == name)?;
+    if !scope.params.is_empty() {
+        return None;
+    }
+    chain(single(&scope.body), model, depth + 1).filter(|links| !links.is_empty())
 }
 
 fn lambda_body(expr: &Expr) -> Option<&Expr> {
@@ -138,7 +166,7 @@ fn lambda_body(expr: &Expr) -> Option<&Expr> {
 }
 
 /// The links of an implicit-self relation chain, root first.
-fn chain(expr: &Expr) -> Option<Vec<Link>> {
+fn chain(expr: &Expr, model: Option<&Model>, depth: u8) -> Option<Vec<Link>> {
     let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return None };
     // `where.not(...)`: a bare `where` receiver, then `not`.
     if method.as_str() == "not" {
@@ -151,7 +179,7 @@ fn chain(expr: &Expr) -> Option<Vec<Link>> {
         }
         let mut links = match inner {
             None => Vec::new(),
-            Some(inner) => chain(inner)?,
+            Some(inner) => chain(inner, model, depth)?,
         };
         links.push(Link { method: "not", args: args.clone() });
         return Some(links);
@@ -162,6 +190,14 @@ fn chain(expr: &Expr) -> Option<Vec<Link>> {
         "extending" => "extending",
         "preload" => "preload",
         "includes" => "includes",
+        scope if args.is_empty() => {
+            let mut links = match recv {
+                None => Vec::new(),
+                Some(recv) => chain(recv, model, depth)?,
+            };
+            links.extend(scope_links(model, scope, depth)?);
+            return Some(links);
+        }
         _ => return None,
     };
     if args.is_empty() || args.iter().any(|a| matches!(&*a.node, ExprNode::Splat { .. } | ExprNode::ForwardArgs)) {
@@ -172,7 +208,7 @@ fn chain(expr: &Expr) -> Option<Vec<Link>> {
     }
     let mut links = match recv {
         None => Vec::new(),
-        Some(recv) => chain(recv)?,
+        Some(recv) => chain(recv, model, depth)?,
     };
     links.push(Link { method: name, args: args.clone() });
     Some(links)
@@ -242,7 +278,7 @@ pub(crate) fn push_methods(methods: &mut Vec<MethodDef>, model: &Model) {
 /// `super` is its model's: Rails applies the parent's default scope,
 /// then the subclass's own.
 pub(crate) fn push_subclass_methods(lc: &mut LibraryClass) {
-    let chains: Vec<Vec<Link>> = lc.unknown_calls.iter().filter_map(declaration).collect();
+    let chains: Vec<Vec<Link>> = lc.unknown_calls.iter().filter_map(|e| declaration(e, None)).collect();
     let name = lc.name.clone();
     push_chain_methods(&mut lc.methods, &name, &chains);
 }

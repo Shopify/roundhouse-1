@@ -2971,6 +2971,24 @@ end
     for (model, spans) in app.models.iter_mut().zip(claimed) {
         model.claimed_body_calls = spans;
     }
+    // The models whose subclasses (STI or not, through library-class
+    // parents) declare a default scope of their own.
+    let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    let mut scoped: crate::det::HashSet<crate::ident::ClassId> = crate::det::HashSet::default();
+    for lc in app.library_classes.iter().filter(|lc| crate::lower::default_scope::subclass_declares(lc)) {
+        let mut cursor = lc.parent.clone();
+        for _ in 0..8 {
+            let Some(parent) = cursor else { break };
+            if models.contains(&parent) {
+                scoped.insert(parent);
+                break;
+            }
+            cursor = app.library_classes.iter().find(|o| o.name == parent).and_then(|o| o.parent.clone());
+        }
+    }
+    for model in &mut app.models {
+        model.subclass_default_scope = scoped.contains(&model.name);
+    }
     Ok(app)
 }
 
