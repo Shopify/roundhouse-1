@@ -135,3 +135,92 @@ fn an_engine_body_loads_the_emitted_files_its_source_requires_relative() {
     assert!(output.status.success(), "emitted program failed in {}:\n{stderr}", emitted.display());
     assert_eq!(stdout, "10\nnil\n", "{stderr}");
 }
+
+/// A required-only file's class whose constants read classes nested in
+/// it, as Core's components/domains/test/support/open_srs_wrapper/
+/// domain_mock.rb has: `MockDomain = Struct.new(:host) do … end` above
+/// `DEFAULT_DOMAINS = [MockDomain.new("localhost.com"), …]`. The
+/// factory class was dropped from the file program (NameError
+/// `OpenSrsWrapper::DomainMock::MockDomain` in the r17-pre2 boot
+/// survey), and a plain nested class was rendered after the enclosing
+/// class, too late for its constants and as a `module`.
+const DOMAIN_MOCK: &str = r#"module Registrar
+  class DomainMock
+    MockDomain = Struct.new(:host) do
+      def to_s
+        self[:host] || ""
+      end
+    end #: singleton(Struct)
+
+    class Lookup
+      def answer
+        "found"
+      end
+    end
+
+    def available?
+      [true, DEFAULT_DOMAINS]
+    end
+
+    DEFAULT_DOMAINS = [
+      MockDomain.new("localhost.com"),
+      MockDomain.new("localhost.net"),
+    ].freeze #: Array[untyped]
+    LOOKUP = Lookup.new
+  end
+end
+"#;
+
+const MOCK_ENGINE: &str = r#"require "rails"
+
+module Widgets
+  class Engine < Rails::Engine
+    if Rails.env.test?
+      require_relative "../../test/support/registrar/domain_mock"
+    end
+  end
+end
+"#;
+
+#[test]
+fn a_required_file_keeps_the_classes_its_class_nests_ahead_of_the_constants_reading_them() {
+    let (emitted, errors) = emit_and_run::empty_app()
+        .write("roundhouse.yml", "test_paths:\n  - test\ndatabase_adapter: postgresql\n")
+        .write("config/database.yml", "test:\n  adapter: postgresql\n  database: rh_engine_required_files\n")
+        .write("Gemfile.lock", PATH_GEMS)
+        .write("engines/widgets/lib/widgets/engine.rb", MOCK_ENGINE)
+        .write("engines/widgets/test/support/registrar/domain_mock.rb", DOMAIN_MOCK)
+        .emit(BuildTarget::Ruby);
+    let own: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
+    assert!(own.is_empty(), "{own:?}");
+    let program = std::fs::read_to_string(
+        emitted.join("app/models/roundhouse_files/engines/widgets/test/support/registrar/domain_mock.rb"),
+    )
+    .expect("the required file is carried as a file program");
+    assert!(!program.contains("module DomainMock"), "the nested class reopens the class, not a module:\n{program}");
+    let output = emit_and_run::ruby()
+        .current_dir(&emitted)
+        .args([
+            "-e",
+            "require_relative 'runtime/active_support_lazy_load_hooks'\n\
+             $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
+             require_relative 'runtime/rails'\n\
+             Rails.env_name = 'test'\n\
+             require_relative 'runtime/rails_railtie'\n\
+             require_relative 'runtime/rails_engine'\n\
+             require_relative 'runtime/active_support_deprecation'\n\
+             require_relative 'app/models'\n\
+             mock = Registrar::DomainMock\n\
+             p mock.new.available?.last.map(&:to_s)\n\
+             p [mock::MockDomain.superclass, mock::LOOKUP.answer, mock::Lookup.instance_of?(Class)]\n",
+        ])
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "emitted program failed in {}:\n{stdout}\n{stderr}\n{program}", emitted.display());
+    // Native Ruby on the source prints the same two lines.
+    assert_eq!(stdout, "[\"localhost.com\", \"localhost.net\"]\n[Struct, \"found\", true]\n", "{stderr}\n{program}");
+}
