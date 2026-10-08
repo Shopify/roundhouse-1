@@ -979,6 +979,13 @@ impl Analyzer {
                 // `select` left out read false), as Rails does. Core's
                 // `OrderTransaction` guards reads of newer columns with it.
                 ("has_attribute?", Ty::Bool),
+                // `record.association(:name)`: the association object,
+                // which each model synthesizes on the CRuby and JRuby
+                // trees (`emit::ruby::library::apply_association_reader`)
+                // and the other trees refuse
+                // (`analyze::runtime_reads::GATED_METHODS`). Core reads
+                // `.loaded?` and `.target` off it.
+                ("association", Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Associations::Association")), args: vec![] }),
                 ("attributes=", Ty::Untyped),
                 ("assign_attributes", Ty::Untyped),
                 ("update_column", Ty::Bool),

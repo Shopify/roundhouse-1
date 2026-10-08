@@ -24,6 +24,10 @@ thread_local! {
     /// True while emitting a ruby-family tree (CRuby, JRuby), whose
     /// interpreter binds keywords natively. See `emit_keyword_forward_arg`.
     static NATIVE_KEYWORD_SPLATS: Cell<bool> = const { Cell::new(false) };
+    /// The tree records each error message's attribute for
+    /// `errors.attribute_names` (runtime/spinel/active_model_errors.rb).
+    /// See `error_attribute_push`.
+    static ERROR_ATTRIBUTES: Cell<bool> = const { Cell::new(false) };
     /// The emitted path (relative to the output root) of the file being
     /// rendered. A `SOURCE_FILE_PATH` literal anchors on it; `None`
     /// outside a per-file emit, where the literal is written as is.
@@ -41,6 +45,15 @@ pub fn with_native_keyword_splats<R>(f: impl FnOnce() -> R) -> R {
     let prev = NATIVE_KEYWORD_SPLATS.with(|c| c.replace(true));
     let r = f();
     NATIVE_KEYWORD_SPLATS.with(|c| c.set(prev));
+    r
+}
+
+/// Run `f` emitting for a tree that records each error message's
+/// attribute (`on`), restoring the previous setting after.
+pub fn with_error_attributes<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let prev = ERROR_ATTRIBUTES.with(|c| c.replace(on));
+    let r = f();
+    ERROR_ATTRIBUTES.with(|c| c.set(prev));
     r
 }
 
@@ -137,6 +150,12 @@ pub fn emit_expr(e: &Expr) -> String {
     if let Some(blank) = rails_string_blank(e) {
         return blank;
     }
+    if let Some(push) = error_attribute_push(e) {
+        return push;
+    }
+    if let Some(target) = association_target(e) {
+        return target;
+    }
     // An AUTHOR-WRITTEN cast (`x #: as Integer`, `T.cast(x, Integer)`,
     // `T.let`, `T.bind`) is the value unchanged on every Ruby tree. The
     // coercion arm of `emit_cast` exists for the casts LOWERINGS build
@@ -176,6 +195,85 @@ fn rails_string_blank(e: &Expr) -> Option<String> {
         return None;
     }
     Some(emit_send_base(Some(value), &Symbol::from("blank?"), &[], false))
+}
+
+/// The error accumulator is an `Array[String]` of full messages, which
+/// drops the attribute each was added for; Rails'
+/// `errors.attribute_names` answers it. Where the app reads it (the
+/// project sets `with_error_attributes`), the CRuby and JRuby trees
+/// record the attribute beside the message:
+///
+/// - a push the lowering tagged (`IrHint::ErrorAttribute`, from
+///   `errors.add(:attr, ...)` or a `validates :attr` check) is written
+///   `ActiveModel::ErrorAttributes.add(errors, :attr, msg)`, which
+///   appends the message as `errors << msg` did and records the pair;
+/// - `errors.attribute_names` is written
+///   `ActiveModel::ErrorAttributes.attribute_names(errors)`.
+///
+/// Every other tree, and these trees for an app that never asks, keep
+/// the plain `<<`.
+fn error_attribute_push(e: &Expr) -> Option<String> {
+    if !ERROR_ATTRIBUTES.with(Cell::get) {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { return None };
+    match (e.hint.as_ref(), method.as_str(), args.as_slice()) {
+        (Some(crate::expr::IrHint::ErrorAttribute(attr)), "<<", [msg]) => Some(format!(
+            "ActiveModel::ErrorAttributes.add({}, {}, {})",
+            emit_expr(recv),
+            emit_node(&ExprNode::Lit { value: crate::expr::Literal::Sym { value: attr.clone() } }),
+            emit_expr(msg)
+        )),
+        (Some(crate::expr::IrHint::ErrorAttributeLocal(local)), "<<", [msg]) => Some(format!(
+            "ActiveModel::ErrorAttributes.add({}, {}, {})",
+            emit_expr(recv),
+            local.as_str(),
+            emit_expr(msg)
+        )),
+        // The analyzer types the read on ActiveModel::Errors; a lowered
+        // test body may carry the runtime reader's Array type instead, so
+        // an `errors` reader receiver counts too.
+        (_, "attribute_names", [])
+            if matches!(&recv.ty, Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                || matches!(&*recv.node, ExprNode::Send { method, args, .. } if method.as_str() == "errors" && args.is_empty()) =>
+        {
+            Some(format!("ActiveModel::ErrorAttributes.attribute_names({})", emit_expr(recv)))
+        }
+        _ => None,
+    }
+}
+
+/// `record.association(:name).target`, which `lower::assoc_loaded`
+/// collapsed onto the reader `record.name` (`IrHint::AssociationTarget`),
+/// written back as authored on the CRuby and JRuby trees: they carry the
+/// association object (runtime/spinel/active_record_associations.rb),
+/// whose `target` answers what has loaded, nil or [] before anything
+/// has, where the reader loads. Each model answers `association` there
+/// (`library::apply_association_reader`, which counts these reads).
+fn association_target(e: &Expr) -> Option<String> {
+    if e.hint != Some(crate::expr::IrHint::AssociationTarget) || !native_keywords() {
+        return None;
+    }
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else { return None };
+    if !args.is_empty() {
+        return None;
+    }
+    let span = e.span;
+    let name = Expr::new(span, ExprNode::Lit { value: crate::expr::Literal::Sym { value: method.clone() } });
+    let association = Expr::new(span, ExprNode::Send {
+        recv: recv.clone(),
+        method: Symbol::from("association"),
+        args: vec![name],
+        block: None,
+        parenthesized: true,
+    });
+    Some(emit_node(&ExprNode::Send {
+        recv: Some(association),
+        method: Symbol::from("target"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    }))
 }
 
 /// A string literal ingested from `+"literal"`. Written back with its

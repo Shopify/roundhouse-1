@@ -1311,6 +1311,16 @@ fn insert_rel_param(m: &mut crate::dialect::MethodDef, rel_param: &Symbol) -> bo
 /// Lower demanded model and association chains to Relations, including
 /// scope-free apps; each body still has its own rewrite demand gate.
 pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
+    // An `association(:x).target` the shared lowering collapsed onto the
+    // reader is written back before anything here reads that reader as
+    // an association read (`lower::assoc_loaded`).
+    if super::expr::native_keywords() {
+        for lc in lcs.iter_mut() {
+            for m in &mut lc.methods {
+                crate::lower::assoc_loaded::materialize_association_targets(&mut m.body);
+            }
+        }
+    }
     // `has_rich_text` / `has_markdown` preload scopes, and
     // `has_one_attached`'s one. Ahead of the `any_scopes` early return
     // below, because an app can declare a rich-text / plain-text
@@ -1705,6 +1715,123 @@ pub(crate) fn apply_belongs_to_memoization(lcs: &mut [LibraryClass], app: &App) 
             invalidate_on_fk_write(lc, &name, &fk);
         }
     }
+}
+
+/// Ruby-family pre-emit pass: each model answers `association(name)`.
+///
+/// Rails' `record.association(:line_items)` is the association object,
+/// which Core asks whether the records are in memory (`.loaded?`) and
+/// reads, seeds or drops them through (`.target`, `.target =`, `.reset`,
+/// `.reload`). The object is ported in
+/// runtime/spinel/active_record_associations.rb as a view over the two
+/// ivars every association already keeps (`@<name>_cache`,
+/// `@<name>_loaded`); this pass gives each model the dispatch from a
+/// name to the right kind:
+///
+/// ```ruby
+/// def association(name)
+///   case name.to_s
+///   when "comments" then ActiveRecord::Associations::HasManyAssociation.new(self, :comments)
+///   when "author" then ActiveRecord::Associations::BelongsToAssociation.new(self, :author)
+///   else raise ActiveRecord::AssociationNotFoundError.new(self, name)
+///   end
+/// end
+/// ```
+///
+/// A name the model does not declare raises AssociationNotFoundError,
+/// as Rails does; an STI subclass hands it to its parent's dispatch
+/// (`super(name)`) instead. Every model gets the method, so a model with
+/// no associations answers the error too, and every tree that calls
+/// `association` carries the port. `name.to_s` because Rails'
+/// `_reflect_on_association` takes a String or a Symbol.
+///
+/// CRuby and JRuby only (the port reads the ivars by computed name), and
+/// only where some body calls `association` with one argument, so an app
+/// that never asks emits nothing new. Spinel refuses the call at the
+/// analyzer's gate (`analyze::runtime_reads`).
+pub(crate) fn apply_association_reader(lcs: &mut [LibraryClass], app: &App) {
+    use crate::dialect::Association;
+
+    if !super::expr::native_keywords() || !app_calls_association(app) {
+        return;
+    }
+    for lc in lcs.iter_mut() {
+        let Some(model) = app.models.iter().find(|m| m.name == lc.name) else { continue };
+        if lc.methods.iter().any(|m| m.name.as_str() == "association" && m.receiver == MethodReceiver::Instance) {
+            continue; // the model's own wins
+        }
+        let mut arms = String::new();
+        for assoc in model.associations() {
+            let (name, kind) = match assoc {
+                Association::BelongsTo { name, .. } => (name, "BelongsToAssociation"),
+                Association::HasOne { name, .. } => (name, "HasOneAssociation"),
+                Association::HasMany { name, through: None, .. } => (name, "HasManyAssociation"),
+                Association::HasMany { name, through: Some(_), .. } => (name, "HasManyThroughAssociation"),
+                // Rails builds a HABTM as a has_many :through its join model.
+                Association::HasAndBelongsToMany { name, .. } => (name, "HasManyThroughAssociation"),
+            };
+            // Only an association whose reader the model carries: the
+            // object runs the reader for its query.
+            if !lc.methods.iter().any(|m| &m.name == name && m.receiver == MethodReceiver::Instance) {
+                continue;
+            }
+            let _ = writeln!(
+                arms,
+                "  when {:?} then ActiveRecord::Associations::{kind}.new(self, :{})",
+                name.as_str(),
+                name.as_str()
+            );
+        }
+        // A subclass of another model (STI) hands the names it does not
+        // declare to its parent's dispatch; a root model raises.
+        let inherits = model.parent.as_ref().is_some_and(|p| app.models.iter().any(|m| &m.name == p));
+        let otherwise = if inherits {
+            "super(name)"
+        } else {
+            "raise ActiveRecord::AssociationNotFoundError.new(self, name)"
+        };
+        let src = if arms.is_empty() {
+            format!("def association(name)\n  {otherwise}\nend\n")
+        } else {
+            format!("def association(name)\n  case name.to_s\n{arms}  else {otherwise}\n  end\nend\n")
+        };
+        let methods = crate::runtime_src::parse_methods(&src)
+            .unwrap_or_else(|e| panic!("apply_association_reader: generated source failed to parse: {e}\n{src}"));
+        for mut m in methods {
+            m.enclosing_class = Some(lc.name.0.clone());
+            lc.methods.push(m);
+        }
+    }
+}
+
+/// Some emit-bound body, view or test calls `association(x)`, on a
+/// receiver or on self, or reads the `association(:x).target` that
+/// `lower::assoc_loaded` collapsed onto a reader (`IrHint::
+/// AssociationTarget`, which the Ruby emit writes back).
+pub(crate) fn app_calls_association(app: &App) -> bool {
+    fn walk(e: &Expr, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if e.hint == Some(crate::expr::IrHint::AssociationTarget) {
+            *found = true;
+            return;
+        }
+        if let ExprNode::Send { method, args, .. } = &*e.node {
+            if method.as_str() == "association" && args.len() == 1 {
+                *found = true;
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, found));
+    }
+    let mut found = false;
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut found));
+    for view in &app.views {
+        walk(&view.body, &mut found);
+    }
+    crate::analyze::runtime_reads::test_roots(app, &mut |root| walk(root, &mut found));
+    found
 }
 
 /// `Seq[guard, query]` -> `Seq[guard, @cache = query, @loaded = true, @cache]`.
@@ -10652,7 +10779,7 @@ fn preload_cache_guard(name: &Symbol) -> Expr {
 
 /// True when any raw app body (controller actions, library-class
 /// methods, model scopes/methods) sends `includes`/`preload`/
-/// `eager_load` to a receiver. Over-approximates (a chain the arel pass
+/// `eager_load` to a receiver, or calls `association(x)`. Over-approximates (a chain the arel pass
 /// later consumes statically still counts) — the cost of a false
 /// positive is inert synthesized methods, not wrong behavior.
 fn app_mentions_includes(app: &App) -> bool {
@@ -10671,6 +10798,9 @@ fn app_mentions_includes(app: &App) -> bool {
                 _ => false,
             })
         })
+        // `record.association(:x)` reads and seeds the same caches a
+        // preload fills, so a belongs_to reader needs the same guard.
+        || app_calls_association(app)
 }
 
 fn expr_mentions_includes(expr: &Expr) -> bool {

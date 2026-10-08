@@ -366,7 +366,7 @@ fn rewrite_mid_node(
     json_map: &super::has_json::HasJsonColumns,
     sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
-    readers: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
+    readers: &super::assoc_loaded::AssociationReaders,
 ) {
     if !helpers.is_empty() {
         super::route_format_suffix::rewrite_node(e, helpers);

@@ -129,7 +129,7 @@ fn rewrite(e: &Expr) -> Expr {
                 target: target.clone(),
                 value: rewrite(value),
             });
-            a.hint = e.hint;
+            a.hint = e.hint.clone();
             a
         }
         ExprNode::Return { value } => syn(ExprNode::Return { value: rewrite(value) }),

@@ -36,7 +36,7 @@ pub mod source_markers;
 pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
-pub use expr::{emit_expr, with_native_keyword_splats};
+pub use expr::{emit_expr, with_error_attributes, with_native_keyword_splats};
 
 /// The `app/models/<stem>` file a library class is emitted into (a
 /// nested class goes in its outermost owner's file), as `<stem>`.
@@ -382,6 +382,11 @@ pub(crate) fn apply_model_lowering(mut lcs: &mut [LibraryClass], app: &App) {
     // first reads an association, not when the rows arrive. After the two
     // passes above, which put the `@<name>_loaded` guard it looks for.
     crate::lower::deferred_preload::apply(&mut lcs, app);
+    // `record.association(:name)` answers the association object, a view
+    // over the `@<name>_cache`/`@<name>_loaded` pair the passes above
+    // settle (no-op unless the app calls `association`). Before
+    // `lazy_model_state`, which renames the cache reads it finds.
+    library::apply_association_reader(&mut lcs, app);
     // A has_many cache is made on first read rather than at construction,
     // and the constructor's `attrs = {}` default is one shared frozen Hash
     // (`lower::lazy_model_state`) — nine Arrays and a Hash per hydrated

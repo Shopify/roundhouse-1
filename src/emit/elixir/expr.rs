@@ -413,9 +413,10 @@ fn emit_stmts(stmts: &[Expr]) -> String {
 /// Safe-by-construction: every `io` reference flows through one of the
 /// three tagged sites, so nothing else observes its iolist shape.
 fn try_string_builder(e: &Expr) -> Option<String> {
-    match e.hint? {
+    match e.hint.as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
+        IrHint::AssociationTarget | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) => None, // CRuby/JRuby-only hints, the plain node elsewhere
         IrHint::StringBuilderInit => match &*e.node {
             ExprNode::Assign { target: LValue::Var { name, .. }, .. } => Some(format!("{name} = []")),
             _ => None,

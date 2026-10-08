@@ -48,15 +48,26 @@ pub(crate) fn has_many_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> 
     out
 }
 
+/// Per-model reader names `association(:x).target` may collapse onto
+/// (`readers`), and which of them the model declares as associations
+/// (`declared`; the rest are rich-text and plain-text readers).
+pub(crate) struct AssociationReaders {
+    pub(crate) readers: HashMap<ClassId, HashSet<Symbol>>,
+    pub(crate) declared: HashMap<ClassId, HashSet<Symbol>>,
+}
+
 /// Per-model association / rich-text reader names `association(:x).target`
 /// may collapse onto. Keyed by owner so `room.association(:boosts).target`
 /// is not rewritten when only `Message` declares `:boosts`.
-pub(crate) fn association_readers_by_model(app: &App) -> HashMap<ClassId, HashSet<Symbol>> {
+pub(crate) fn association_readers_by_model(app: &App) -> AssociationReaders {
     let mut out: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
+    let mut declared: HashMap<ClassId, HashSet<Symbol>> = HashMap::default();
     for model in &app.models {
         let entry = out.entry(model.name.clone()).or_default();
+        let declared = declared.entry(model.name.clone()).or_default();
         for (_, assoc) in model.spanned_associations() {
             entry.insert(assoc.name().clone());
+            declared.insert(assoc.name().clone());
         }
         for (_, attr) in crate::lower::rich_text::rich_text_attrs(model) {
             entry.insert(Symbol::from(format!("rich_text_{}", attr.as_str())));
@@ -67,7 +78,7 @@ pub(crate) fn association_readers_by_model(app: &App) -> HashMap<ClassId, HashSe
             }
         }
     }
-    out
+    AssociationReaders { readers: out, declared }
 }
 
 /// Resolve which model owns the association hop.
@@ -179,7 +190,7 @@ fn rewrite(
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
-    readers: &HashMap<ClassId, HashSet<Symbol>>,
+    readers: &AssociationReaders,
 ) {
     expr.node
         .for_each_child_mut(&mut |c| rewrite(c, enclosing, sole_includer, by_model, readers));
@@ -191,7 +202,7 @@ pub(crate) fn rewrite_node(
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
     by_model: &HashMap<ClassId, HashSet<Symbol>>,
-    readers: &HashMap<ClassId, HashSet<Symbol>>,
+    readers: &AssociationReaders,
 ) {
     if rewrite_association_target(expr, enclosing, sole_includer, readers) {
         return;
@@ -271,7 +282,7 @@ fn rewrite_association_target(
     expr: &mut Expr,
     enclosing: Option<&ClassId>,
     sole_includer: &HashMap<ClassId, ClassId>,
-    readers: &HashMap<ClassId, HashSet<Symbol>>,
+    readers: &AssociationReaders,
 ) -> bool {
     let ExprNode::Send {
         recv: Some(inner),
@@ -301,13 +312,14 @@ fn rewrite_association_target(
         return false;
     };
     let Some(owner_model) =
-        resolve_owner_model(owner.as_ref(), enclosing, sole_includer, readers, &name)
+        resolve_owner_model(owner.as_ref(), enclosing, sole_includer, &readers.readers, &name)
     else {
         return false;
     };
-    let Some(names) = readers.get(&owner_model) else {
+    let Some(names) = readers.readers.get(&owner_model) else {
         return false;
     };
+    let declared = readers.declared.get(&owner_model).is_some_and(|d| d.contains(&name));
     if !names.contains(&name) {
         return false;
     }
@@ -337,8 +349,59 @@ fn rewrite_association_target(
         },
     );
     rewritten.ty = prior_ty;
+    // The CRuby and JRuby trees carry the association object, whose
+    // `target` reads the loaded record(s) without loading
+    // (runtime/spinel/active_record_associations.rb); they write a
+    // declared association's read back (`emit::ruby::expr`). The other
+    // trees keep the reader, which loads.
+    if declared {
+        rewritten.hint = Some(crate::expr::IrHint::AssociationTarget);
+    }
     *expr = rewritten;
     true
+}
+
+/// Write each read `rewrite_association_target` hinted back as Rails
+/// spelled it, `recv.association(:name).target`, for a tree that carries
+/// the association object (the CRuby and JRuby trees; the caller gates).
+/// Run ahead of the Ruby emit's own rewrites: those read a reader call
+/// as an association read (a has_many reader continuing into `length`
+/// seeds a Relation) and rebuild the node without its hint, so left to
+/// the emitter the read would load instead of answering what is in
+/// memory. The emitter writes back any hinted read this does not reach.
+pub(crate) fn materialize_association_targets(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut |c| materialize_association_targets(c));
+    if expr.hint != Some(crate::expr::IrHint::AssociationTarget) {
+        return;
+    }
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*expr.node else { return };
+    if !args.is_empty() {
+        return;
+    }
+    let span = expr.span;
+    let name = Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: method.clone() } });
+    let association = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: recv.clone(),
+            method: Symbol::from("association"),
+            args: vec![name],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let mut target = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(association),
+            method: Symbol::from("target"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    target.ty = expr.ty.clone();
+    *expr = target;
 }
 
 fn sym_lit(expr: &Expr) -> Option<Symbol> {

@@ -89,8 +89,10 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
                 None => checks,
             };
             for mut check in checks {
-                // Each expanded check attributes to its `validates` line.
+                // Each expanded check attributes to its `validates` line,
+                // and each message it adds to the validated attribute.
                 check.inherit_span(span);
+                tag_error_attribute(&mut check, &v.attribute);
                 stmts.push(check);
             }
         }
@@ -109,6 +111,8 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             let mut check =
                 inline_belongs_to_check(name, foreign_key, target, *polymorphic);
             check.inherit_span(span);
+            // Rails adds `:required` to the association's name.
+            tag_error_attribute(&mut check, name);
             stmts.push(check);
         }
     }
@@ -174,6 +178,10 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
             ExprNode::Send { recv: Some(e), method: Symbol::from("!"), args: vec![], block: None, parenthesized: false },
         );
         let present = |e: Expr| not(blank(e));
+        // Rails adds the blank and too-long errors to the attribute and
+        // the mismatch to `<attr>_confirmation` (validates_confirmation_of).
+        let confirmation_attr = Symbol::from(format!("{}_confirmation", attr.as_str()));
+        let start = out.len();
         out.push(if_with_nil_else(blank(digest), errors_push(format!("{human} can't be blank"))));
         out.push(if_with_nil_else(
             bool_op(
@@ -194,8 +202,29 @@ fn secure_password_checks(model: &Model) -> Vec<Expr> {
             ),
             errors_push(format!("{human} confirmation doesn't match {human}")),
         ));
+        for check in &mut out[start..start + 2] {
+            tag_error_attribute(check, &attr);
+        }
+        tag_error_attribute(&mut out[start + 2], &confirmation_attr);
     }
     out
+}
+
+/// Tag each `errors << msg` push in `check` that carries no attribute yet
+/// with the one it is for (`IrHint::ErrorAttribute`): the accumulator
+/// keeps only the message, and `errors.attribute_names` needs the
+/// attribute on the trees that record it.
+pub(crate) fn tag_error_attribute(check: &mut Expr, attr: &Symbol) {
+    let is_push = matches!(
+        &*check.node,
+        ExprNode::Send { recv: Some(r), method, args, .. }
+            if method.as_str() == "<<" && args.len() == 1
+                && matches!(&*r.node, ExprNode::Send { recv: None, method: m, args: a, .. } if m.as_str() == "errors" && a.is_empty())
+    );
+    if is_push && check.hint.is_none() {
+        check.hint = Some(crate::expr::IrHint::ErrorAttribute(attr.clone()));
+    }
+    check.node.for_each_child_mut(&mut |c| tag_error_attribute(c, attr));
 }
 
 /// `has_secure_password` without `validations: false`.

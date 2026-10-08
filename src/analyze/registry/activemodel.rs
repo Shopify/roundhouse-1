@@ -86,6 +86,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("<<", errors_ty.clone()),
         ("add", errors_ty.clone()),
         ("clear", errors_ty.clone()),
+        // The attributes with an error, as Symbols. The accumulator keeps
+        // only messages; the CRuby and JRuby trees record each message's
+        // attribute beside it (runtime/spinel/active_model_errors.rb) and
+        // the read is refused where that port is absent
+        // (`analyze::runtime_reads::GATED_METHODS`).
+        ("attribute_names", Ty::Array { elem: Box::new(Ty::Sym) }),
     ] {
         errors_cls.instance_methods.insert(Symbol::from(m), ty);
     }
@@ -94,6 +100,43 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ClassId(Symbol::from("ActiveModel::Errors")),
         errors_cls,
     );
+
+    // `record.association(:name)`: the association object
+    // (runtime/spinel/active_record_associations.rb, CRuby and JRuby
+    // trees). The kinds share one surface here; `target` is gradual
+    // because it is a record for a singular association and an Array for
+    // a collection.
+    {
+        let assoc_ty = Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Associations::Association")), args: vec![] };
+        let nilable_assoc = Ty::Union { variants: vec![assoc_ty.clone(), Ty::Nil] };
+        let mut assoc = ClassInfo::default();
+        for (m, ty) in [
+            ("owner", Ty::Untyped),
+            ("target", Ty::Untyped),
+            ("target=", Ty::Untyped),
+            ("loaded?", Ty::Bool),
+            ("loaded!", Ty::Nil),
+            ("reset", Ty::Nil),
+            ("reload", nilable_assoc),
+            ("reader", Ty::Untyped),
+            ("load_target", Ty::Untyped),
+        ] {
+            assoc.instance_methods.insert(Symbol::from(m), ty);
+        }
+        for kind in [
+            "Association",
+            "SingularAssociation",
+            "CollectionAssociation",
+            "BelongsToAssociation",
+            "HasOneAssociation",
+            "HasManyAssociation",
+            "HasManyThroughAssociation",
+        ] {
+            classes
+                .entry(ClassId(Symbol::from(format!("ActiveRecord::Associations::{kind}"))))
+                .or_insert(assoc.clone());
+        }
+    }
 
     // Individual Error with its Rails API.
     let mut error_cls = ClassInfo::default();
