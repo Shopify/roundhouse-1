@@ -407,3 +407,56 @@ fn an_include_written_in_another_body_is_the_modules_own() {
         "[:compat, :rails]\n[Compat::Billing::Compatibility::Model, Compat::Billing::Rails::Model]\n[Compat::Billing::Card, Compat::Billing::Compatibility::Model, Compat::Billing::Rails::Model]\n",
     );
 }
+
+/// A class-body `self.x = v` in a gem source whose writer `x=` an
+/// included module's `self.included(base)` hook defines at run time, in
+/// a hook the ingest keeps as text (its names are computed, so
+/// `hook_class_attribute` does not expand it): no app method answers
+/// `x=` statically. The write was dropped as an unmodelled class-body
+/// call, so the class read the hook's default.
+const HOOKED_WRITER: &[(&str, &str)] = &[(
+    "hooked.rb",
+    r##"module Hooked
+  module Settings
+    NAMES = %i[rate limit].freeze
+
+    def self.included(base)
+      base.singleton_class.send(:attr_accessor, *NAMES)
+      NAMES.each { |n| base.public_send("#{n}=", :default) }
+    end
+  end
+
+  module Flags
+    def self.included(base)
+      %w[strict].each do |n|
+        base.singleton_class.class_eval { attr_accessor n }
+      end
+    end
+  end
+
+  class Gateway
+    include Settings
+
+    self.rate = 3
+  end
+
+  class Child < Gateway
+    include Flags
+
+    self.limit = 9
+    self.strict ||= :on
+  end
+end
+"##,
+)];
+
+#[test]
+fn a_class_body_write_through_a_writer_an_included_hook_defines_runs_as_native() {
+    gem_same_as_native(
+        "hooked",
+        HOOKED_WRITER,
+        "hooked",
+        "h = Hooked\np [h::Gateway.rate, h::Gateway.limit, h::Child.rate, h::Child.limit, h::Child.strict]\n",
+        "[3, :default, nil, 9, :on]\n",
+    );
+}
