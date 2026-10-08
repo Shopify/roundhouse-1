@@ -348,7 +348,8 @@ pub fn apply_sti_scope_lowering(app: &mut App) {
                 .library_classes
                 .iter()
                 .find(|lc| &lc.name == sub)
-                .is_some_and(super::default_scope::subclass_declares);
+                .is_some_and(super::default_scope::subclass_declares)
+                || super::subclass_macros::declares_scopes(app, sub);
             let root = if own_scope || declares_own_types(app, sub, base) { sub } else { base };
             (sub.clone(), root.clone())
         })
@@ -782,6 +783,37 @@ fn rewrite(
         span,
         ExprNode::Send { recv: Some(scoped), method, args, block, parenthesized },
     );
+}
+
+/// `ActiveRecord::Relation.new(self).where(type: "Sub")` for an STI
+/// subclass: the relation a bare scope call on it starts from
+/// (`lower::subclass_macros`). None for a class that is no STI subclass.
+pub(crate) fn sti_type_relation(app: &App, sub: &ClassId) -> Option<Expr> {
+    let bases = sti_bases(app);
+    bases.get(sub)?;
+    let types = type_names(app, &bases);
+    let cols = sti_columns(app);
+    let span = Span::synthetic();
+    let column = column_of(&cols, sub).to_string();
+    Some(Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(crate::lower::model_to_library::relation_new_self()),
+            method: Symbol::from("where"),
+            args: vec![Expr::new(
+                span,
+                ExprNode::Hash {
+                    entries: vec![(
+                        Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(column.as_str()) } }),
+                        type_value(span, sub, &types),
+                    )],
+                    kwargs: true,
+                },
+            )],
+            block: None,
+            parenthesized: true,
+        },
+    ))
 }
 
 /// `"Rooms::Open"`, or `["GoldBadge", "PlatinumBadge"]` when STI

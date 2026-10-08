@@ -31,6 +31,13 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // own body wants every one of them applied.
     crate::lower::tag_block_passing::apply_helpers(&mut lcs);
     crate::timings::lap("emit library: tag_block_passing");
+    // A model subclass's own associations (`lower::subclass_macros`).
+    let subclass_views = crate::lower::subclass_macros::views(app);
+    for lc in lcs.iter_mut() {
+        if let Some(view) = subclass_views.get(&lc.name) {
+            crate::lower::model_to_library::push_subclass_association_methods(&mut lc.methods, view, &app.models);
+        }
+    }
     apply_scope_lowering(&mut lcs, app);
     crate::timings::lap("emit library: scope_lowering");
     apply_library_partial_render_lowering(&mut lcs, app);
@@ -1057,6 +1064,22 @@ pub(crate) fn emit_relation_scope_delegates(app: &App) -> Option<EmittedFile> {
                 .push((&model.name, per[n].as_slice()));
         }
     }
+    // A model subclass's own scopes (`lower::subclass_macros`), in name
+    // order after the models'.
+    let model_names: crate::det::HashSet<&crate::ident::ClassId> = app.models.iter().map(|m| &m.name).collect();
+    let mut subclasses: Vec<&crate::ident::ClassId> = scopes.keys().filter(|k| !model_names.contains(k)).collect();
+    subclasses.sort_by_key(|k| k.0.as_str());
+    for sub in subclasses {
+        let per = &scopes[sub];
+        let mut names: Vec<&Symbol> = per.keys().collect();
+        names.sort_by_key(|n| n.as_str());
+        for n in names {
+            if RELATION_BUILTINS.contains(&n.as_str()) {
+                continue;
+            }
+            by_name.entry(n.as_str().to_string()).or_default().push((sub, per[n].as_slice()));
+        }
+    }
     // The SYNTHESIZED preload scopes — `with_attached_<attr>`,
     // `with_rich_text_<attr>`, `with_markdown_<attr>` — which Rails
     // declares beside the attachment / Action Text macros and this
@@ -1704,6 +1727,7 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
     };
     drop(_span);
     let _span = crate::timings::begin("scope lowering: bodies");
+    let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
         // Models gain their scope class methods (already chain-normalized).
         let is_model = model_named.contains_key(&lc.name);
@@ -1757,6 +1781,19 @@ pub(crate) fn apply_scope_lowering(lcs: &mut [LibraryClass], app: &App) {
             );
             crate::lower::default_scope::push_methods(&mut lc.methods, model);
             crate::lower::sti_scope::push_inheritance_column_method(&mut lc.methods, model);
+        } else if let Some(view) = subclass_views.get(&lc.name) {
+            // A model subclass's own scopes (`lower::subclass_macros`).
+            let before = lc.methods.len();
+            crate::lower::model_to_library::push_scope_methods(&mut lc.methods, view, &scopes, &models, &assocs);
+            if let Some(typed) = crate::lower::sti_scope::sti_type_relation(app, &lc.name) {
+                for m in &mut lc.methods[before..] {
+                    for p in &mut m.params {
+                        if p.name.as_str() == "__rel" {
+                            p.default = Some(typed.clone());
+                        }
+                    }
+                }
+            }
         }
         // User-written class methods the registry admitted as
         // relation-taking (`def self.arrange_for_user` with bare

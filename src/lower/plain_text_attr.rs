@@ -151,6 +151,7 @@ pub fn synthesize_record_model(app: &mut App) {
         sti_subclass_names: Vec::new(),
         retypable_attributes: Vec::new(),
         subclass_default_scope: false,
+        subclass_declarations: Vec::new(),
         defaulted_attributes: Vec::new(),
         attribute_aliases: Vec::new(),
         query_constraints: Vec::new(),

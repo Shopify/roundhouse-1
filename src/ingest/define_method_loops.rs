@@ -872,7 +872,7 @@ fn locate(root: &ruby_prism::Node<'_>, start: usize, end: usize, def: bool) -> O
 }
 
 /// The first node under `root` at exactly `start..end` satisfying `pick`.
-fn node_at<'pr>(
+pub(super) fn node_at<'pr>(
     root: &ruby_prism::Node<'pr>,
     start: usize,
     end: usize,

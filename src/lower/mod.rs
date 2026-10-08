@@ -111,6 +111,7 @@ pub mod dirty_predicate_kwargs;
 pub mod job_test_only;
 pub mod test_cookie_jar;
 pub mod sti_scope;
+pub mod subclass_macros;
 mod sti_subclass_callbacks;
 pub(crate) mod sti_subclass_validations;
 pub mod sum_symbol;

@@ -2720,6 +2720,9 @@ end
         super::environments::collect_programs(&mut app, &inputs, &fired, &lifted);
         app.load_hook_bases = fired.bases;
     }
+    // Before the drain: the subclass declarations are re-read from the
+    // registered sources.
+    collect_subclass_declarations(&mut app);
     // The real drain, now that every pass re-ingesting synthesized
     // Ruby has run. A synthesized `"<label>"` re-ingest never takes a
     // slot (`sources::register` refuses a label starting with `<`), so
@@ -2990,6 +2993,77 @@ end
         model.subclass_default_scope = scoped.contains(&model.name);
     }
     Ok(app)
+}
+
+/// The macros a model subclass declares that Rails defines on it: ingest
+/// classes a concrete model's subclass as a library class, whose body
+/// keeps `belongs_to :x` as an unknown call. Each is re-read from its
+/// source as the model body walk reads it (`ingest_model_body_item`)
+/// and stored on the nearest model ancestor
+/// (`Model::subclass_declarations`), for `lower::subclass_macros`.
+fn collect_subclass_declarations(app: &mut App) {
+    const DECLARATIONS: &[&str] = &["belongs_to", "has_many", "has_one", "scope"];
+    let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
+    let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
+        HashMap::default();
+    let mut lc_parent: HashMap<&crate::ident::ClassId, &Option<crate::ident::ClassId>> = HashMap::default();
+    for other in &app.library_classes {
+        lc_parent.entry(&other.name).or_insert(&other.parent);
+    }
+    for lc in &app.library_classes {
+        if models.contains(&lc.name) {
+            continue;
+        }
+        let calls: Vec<&crate::expr::Expr> = lc
+            .unknown_calls
+            .iter()
+            .filter(|c| {
+                matches!(&*c.node, crate::expr::ExprNode::Send { recv: None, method, .. }
+                    if DECLARATIONS.contains(&method.as_str()))
+            })
+            .collect();
+        if calls.is_empty() {
+            continue;
+        }
+        let mut cursor = lc.parent.clone();
+        let mut base = None;
+        for _ in 0..8 {
+            let Some(parent) = cursor else { break };
+            if models.contains(&parent) {
+                base = Some(parent);
+                break;
+            }
+            cursor = lc_parent.get(&parent).and_then(|p| (*p).clone());
+        }
+        let Some(base) = base else { continue };
+        let mut items = Vec::new();
+        for call in calls {
+            let Some(path) = super::sources::path_of(call.span.file) else { continue };
+            let item = super::sources::with_text(&path, |text| {
+                let parsed = ruby_prism::parse(text.as_bytes());
+                let root = parsed.node();
+                let node = super::define_method_loops::node_at(
+                    &root,
+                    call.span.start as usize,
+                    call.span.end as usize,
+                    |n| n.as_call_node().is_some(),
+                )?;
+                super::model::ingest_model_body_item(&node, &lc.name, &path, Vec::new()).ok()
+            })
+            .flatten();
+            if let Some(item @ (crate::dialect::ModelBodyItem::Association { .. } | crate::dialect::ModelBodyItem::Scope { .. })) =
+                item
+            {
+                items.push(item);
+            }
+        }
+        if !items.is_empty() {
+            declared.entry(base).or_default().push((lc.name.clone(), items));
+        }
+    }
+    for model in &mut app.models {
+        model.subclass_declarations = declared.remove(&model.name).unwrap_or_default();
+    }
 }
 
 /// A support file the walk holds back for `inherited_alias::decide`:
