@@ -10459,7 +10459,7 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         for (_, entry) in &needed {
             let line = format!("require {entry:?}");
             if !helper.contains(&line) {
-                helper.insert_str(0, &format!("{line}\n"));
+                insert_require_line(helper, &line);
             }
         }
         let with_mocha = needed.iter().any(|(gem, _)| *gem == "mocha");
@@ -12769,7 +12769,7 @@ fn with_bundled_requires(mut files: Vec<(String, String)>) -> Vec<(String, Strin
         // Several constants of one library (`Net::HTTP`, `Net::HTTPOK`)
         // can name the same feature in one file.
         if written.insert((i, require_line.clone())) {
-            files[i].1.insert_str(0, &format!("{require_line}\n"));
+            insert_require_line(&mut files[i].1, &require_line);
         }
     }
     let stdlib_gems: Vec<(&str, &str)> = crate::stdlib_rbs::requires()
@@ -12991,8 +12991,49 @@ fn write_bundled_requires(files: &mut [(String, String)]) {
 
 fn write_bundled_require_lines(files: &mut [(String, String)]) {
     for (i, require_line) in bundled_require_gaps(files) {
-        files[i].1.insert_str(0, &format!("{require_line}\n"));
+        insert_require_line(&mut files[i].1, &require_line);
     }
+}
+
+/// Write `line` (a `require`) at the top of a Ruby file, after its
+/// leading magic comments: Ruby reads `# frozen_string_literal: true`
+/// (and `encoding`, `warn_indent`, `shareable_constant_value`) only
+/// before the first token, so a require written above one switches it
+/// off and warns "'frozen_string_literal' is ignored after any tokens",
+/// which Core's StrictWarning (components/platform/essentials/lib/
+/// strict_warnings.rb) raises as an offense when the file loads after
+/// boot. A shebang stays the first line.
+fn insert_require_line(content: &mut String, line: &str) {
+    let mut at = 0;
+    for (n, text) in content.split_inclusive('\n').enumerate() {
+        let trimmed = text.trim_end();
+        let magic = (n == 0 && trimmed.starts_with("#!")) || ruby_magic_comment(trimmed);
+        if !magic {
+            break;
+        }
+        at += text.len();
+    }
+    if at > 0 && !content[..at].ends_with('\n') {
+        content.push('\n');
+        at = content.len();
+    }
+    content.insert_str(at, &format!("{line}\n"));
+}
+
+/// A comment line Ruby reads as a magic comment (parse.y
+/// `magic_comments`, and the emacs `-*- ... -*-` form of `coding`).
+fn ruby_magic_comment(line: &str) -> bool {
+    let Some(body) = line.strip_prefix('#') else { return false };
+    let body = body.trim();
+    if body.starts_with("-*-") {
+        return true;
+    }
+    let Some((key, _)) = body.split_once(':') else { return false };
+    let key = key.trim().to_ascii_lowercase().replace('-', "_");
+    matches!(
+        key.as_str(),
+        "frozen_string_literal" | "encoding" | "coding" | "warn_indent" | "shareable_constant_value" | "warn_past_scope"
+    )
 }
 
 /// The emitted call every declared variant lowers to (`lower::attached
@@ -14235,6 +14276,23 @@ fn walk_ruby(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_written_require_stays_below_the_files_magic_comments() {
+        let cases = [
+            ("# frozen_string_literal: true\n\n# doc\nx = 1\n", "# frozen_string_literal: true\nrequire \"bigdecimal\"\n\n# doc\nx = 1\n"),
+            ("#!/usr/bin/env ruby\n# encoding: utf-8\n# frozen_string_literal: true\nx\n", "#!/usr/bin/env ruby\n# encoding: utf-8\n# frozen_string_literal: true\nrequire \"bigdecimal\"\nx\n"),
+            ("# -*- coding: utf-8 -*-\nx\n", "# -*- coding: utf-8 -*-\nrequire \"bigdecimal\"\nx\n"),
+            ("# A doc comment: not magic\nx\n", "require \"bigdecimal\"\n# A doc comment: not magic\nx\n"),
+            ("x = 1\n", "require \"bigdecimal\"\nx = 1\n"),
+            ("# frozen_string_literal: true", "# frozen_string_literal: true\nrequire \"bigdecimal\"\n"),
+        ];
+        for (before, after) in cases {
+            let mut content = before.to_string();
+            super::insert_require_line(&mut content, "require \"bigdecimal\"");
+            assert_eq!(content, after, "{before:?}");
+        }
+    }
+
     #[test]
     fn a_framework_feature_is_a_rails_framework_or_a_file_under_one() {
         for feature in ["rails", "rails/railtie", "active_support", "active_support/core_ext/object/blank", "active_model", "action_controller", "action_dispatch/routing", "active_job"] {
