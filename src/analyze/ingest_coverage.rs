@@ -171,13 +171,13 @@ fn validation_gaps(app: &App) -> Vec<Diagnostic> {
     for model in app.models.iter().filter(|m| m.parent.is_none()) {
         for item in &model.body {
             let ModelBodyItem::Validation { validation, .. } = item else { continue };
-            let tableless_unique = validation.rules.iter().any(|r| {
-                let r = match r {
-                    ValidationRule::Guarded { rule, .. } => &**rule,
+            fn unwrap(r: &ValidationRule) -> &ValidationRule {
+                match r {
+                    ValidationRule::Guarded { rule, .. } => rule,
                     other => other,
-                };
-                matches!(r, ValidationRule::Uniqueness { .. })
-            });
+                }
+            }
+            let tableless_unique = validation.rules.iter().any(|r| matches!(unwrap(r), ValidationRule::Uniqueness { .. }));
             if tableless_unique {
                 out.push(Diagnostic::unsupported(
                     item.span(),
@@ -185,6 +185,18 @@ fn validation_gaps(app: &App) -> Vec<Diagnostic> {
                     "`validates uniqueness:`",
                     format!(
                         "on `{}`, a uniqueness check on a class outside ActiveRecord (ActiveModel has no UniquenessValidator); the emitted model would skip this check",
+                        validation.attribute.as_str()
+                    ),
+                ));
+            }
+            // AssociatedValidator is ActiveRecord's too.
+            if validation.rules.iter().any(|r| matches!(unwrap(r), ValidationRule::Associated)) {
+                out.push(Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    "`validates_associated`",
+                    format!(
+                        "on `{}`, on a class outside ActiveRecord (ActiveModel has no AssociatedValidator); the emitted model would skip this check",
                         validation.attribute.as_str()
                     ),
                 ));

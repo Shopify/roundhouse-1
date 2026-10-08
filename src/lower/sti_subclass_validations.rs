@@ -58,7 +58,8 @@ use crate::lower::model_to_library::validations::{
 use crate::span::Span;
 
 /// Is `call` a validation declaration (`validates`, `validates!`, `validate`,
-/// `validates_with`, `validates_<key>_of`) this pass answers for? `check`
+/// `validates_with`, `validates_<key>_of`, `validates_associated`,
+/// `validates_each`) this pass answers for? `check`
 /// asks before the pass runs; what it cannot lower, [`diagnose`] reports.
 pub(crate) fn claims(call: &Expr) -> bool {
     let ExprNode::Send { recv: None, method, .. } = &*call.node else { return false };
@@ -67,6 +68,8 @@ pub(crate) fn claims(call: &Expr) -> bool {
         || m == "validates!"
         || m == "validate"
         || m == "validates_with"
+        || m == "validates_associated"
+        || m == "validates_each"
         || (m.starts_with("validates_") && m.ends_with("_of"))
 }
 
@@ -167,12 +170,19 @@ fn read(lc: &LibraryClass, app: &App) -> Read {
                 }
             }
         }
-        // `validate do ... end`: the block ingest built (and the passes
-        // before this one rewrote), not the re-read copy.
+        // `validate do ... end` / `validates_each ... do`: the block
+        // ingest built (and the passes before this one rewrote), not the
+        // re-read copy.
         if let ExprNode::Send { block: Some(block), .. } = &*call.node {
-            if let Ok(ValidationRule::Block { callable, .. }) =
-                crate::ingest::validates::block_callable(block.clone())
-            {
+            let callable = if construct_of(call) == "`validates_each`" {
+                crate::ingest::validates::each_callable(block.clone()).ok().map(|(c, _)| c)
+            } else {
+                match crate::ingest::validates::block_callable(block.clone()) {
+                    Ok(ValidationRule::Block { callable, .. }) => Some(callable),
+                    _ => None,
+                }
+            };
+            if let Some(callable) = callable {
                 for v in &mut validations {
                     for rule in &mut v.rules {
                         if let Some(body) = rule.block_body_mut() {

@@ -224,7 +224,9 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
         | ValidationRule::Block { .. }
         | ValidationRule::Object { .. }
         | ValidationRule::Comparison { .. }
-        | ValidationRule::Acceptance { .. } => {}
+        | ValidationRule::Acceptance { .. }
+        | ValidationRule::Associated
+        | ValidationRule::Each { .. } => {}
     }
 }
 

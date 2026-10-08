@@ -47,29 +47,49 @@ use super::IngestResult;
 /// Validators ActiveModel/ActiveRecord ship, by key.
 const BUILT_IN: &[&str] = &[
     "presence", "absence", "length", "size", "inclusion", "exclusion", "numericality", "format",
-    "uniqueness", "acceptance", "confirmation", "comparison",
+    "uniqueness", "acceptance", "confirmation", "comparison", "associated",
 ];
 
 /// The `validates`-level keys that are defaults for every validator.
 const DEFAULT_KEYS: &[&str] = &["if", "unless", "on", "allow_blank", "allow_nil", "strict", "except_on"];
 
-/// `validates ...` / `validates_<key>_of ...`: the Validations it
-/// declares, or `None` for any other call. A declaration whose shape is
+/// `validates ...` / `validates_<key>_of ...` / `validates_associated` /
+/// `validates_each ... do |record, attr, value| ... end`: the
+/// Validations it declares, or `None` for any other call. A declaration whose shape is
 /// not read (a splat attribute list, a non-Symbol key) answers one
 /// `Unsupported` rule rather than nothing.
 pub(super) fn parse_validation_call(
     call: &ruby_prism::CallNode<'_>,
     file: &str,
 ) -> IngestResult<Option<Vec<Validation>>> {
-    if call.receiver().is_some() || call.block().is_some() {
+    let name = constant_id_str(&call.name()).to_string();
+    if call.receiver().is_some() || (call.block().is_some() && name != "validates_each") {
         return Ok(None);
     }
-    let name = constant_id_str(&call.name()).to_string();
-    let family_key = name
-        .strip_prefix("validates_")
-        .and_then(|rest| rest.strip_suffix("_of"))
-        .filter(|key| BUILT_IN.contains(key))
-        .map(str::to_string);
+    // `validates_associated` / `validates_each` are `validates_with
+    // AssociatedValidator` / `BlockValidator` over `_merge_attributes`,
+    // as `validates_<key>_of` is with its validator.
+    let family_key = match name.as_str() {
+        "validates_associated" => Some("associated".to_string()),
+        "validates_each" => Some("each".to_string()),
+        _ => name
+            .strip_prefix("validates_")
+            .and_then(|rest| rest.strip_suffix("_of"))
+            .filter(|key| BUILT_IN.contains(key))
+            .map(str::to_string),
+    };
+    // `validates_each`'s block, the record method each attribute calls.
+    let each_block: Option<Result<(Expr, usize), String>> = if name == "validates_each" {
+        let whole = ingest_expr(&call.as_node(), file)?;
+        Some(match &*whole.node {
+            ExprNode::Send { block: Some(lambda), .. } => each_callable(lambda.clone()),
+            _ if call.block().is_some() => Err("a block that is not a plain block".into()),
+            // Rails' BlockValidator raises ArgumentError without one.
+            _ => Err("no block given (BlockValidator raises ArgumentError at load)".into()),
+        })
+    } else {
+        None
+    };
     // `validates!` is `validates` with `strict: true` over any given.
     // Its span stands for the exception class it implies.
     let bang = (name == "validates!").then(|| super::util::node_span(&call.as_node(), file));
@@ -166,7 +186,17 @@ pub(super) fn parse_validation_call(
             }
         };
         for attr in &attrs {
-            let rule = validator_rule(&key, attr, &defaults, &entries, bang, file)?;
+            let rule = match (&each_block, key.as_str()) {
+                (Some(Ok((callable, arity))), "each") => {
+                    let each = ValidationRule::Each { callable: callable.clone(), arity: *arity };
+                    validator_rule(&key, attr, &defaults, &entries, Some(each), None, file)?
+                }
+                (Some(Err(detail)), "each") => Some(ValidationRule::Unsupported {
+                    construct: construct.clone(),
+                    detail: detail.clone(),
+                }),
+                _ => validator_rule(&key, attr, &defaults, &entries, None, bang, file)?,
+            };
             if let Some(rule) = rule {
                 out.push(Validation { attribute: attr.clone(), rules: vec![rule] });
             }
@@ -250,15 +280,19 @@ fn own_keys(key: &str) -> &'static [&'static str] {
 
 /// One validator on one attribute: its rule under the merged options,
 /// `None` when the rule can never fire (`presence` with `allow_blank`).
+/// `given` is a rule read elsewhere (`validates_each`'s block) that the
+/// options guard.
+#[allow(clippy::too_many_arguments)]
 fn validator_rule(
     key: &str,
     attr: &Symbol,
     defaults: &[(String, Node<'_>)],
     entries: &[(String, Node<'_>)],
+    given: Option<ValidationRule>,
     bang: Option<Span>,
     file: &str,
 ) -> IngestResult<Option<ValidationRule>> {
-    if !BUILT_IN.contains(&key) {
+    if !BUILT_IN.contains(&key) && given.is_none() {
         if bang.is_some() {
             return Ok(Some(unsupported(key, "`validates!` (strict) on a custom validator")));
         }
@@ -331,6 +365,8 @@ fn validator_rule(
         "format" => format_rule(&own, file)?,
         "uniqueness" => uniqueness_rule(&own, file)?,
         "comparison" => comparison_rule(&own, file)?,
+        // AssociatedValidator reads no option of its own.
+        "associated" => Ok(ValidationRule::Associated),
         "acceptance" => {
             // AcceptanceValidator's defaults, under the given options:
             // `{ allow_nil: true, accept: ["1", true] }.merge!(options)`.
@@ -338,6 +374,14 @@ fn validator_rule(
                 options.allow_nil = true;
             }
             acceptance_rule(&own, file)?
+        }
+        _ if given.is_some() => {
+            // The block adds its own errors (`record.errors.add`), so
+            // the `strict:` and `message:` its validator carries reach
+            // no `errors.add`.
+            options.strict = None;
+            options.message = None;
+            Ok(given.expect("given"))
         }
         other => Err(format!("the `{other}` validator is not modeled")),
     };
@@ -594,6 +638,34 @@ pub(crate) fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
         ExprNode::Send { recv: None, method: Symbol::from("lambda"), args: Vec::new(), block: Some(lambda), parenthesized: false },
     );
     Ok(ValidationRule::Block { callable, with_record })
+}
+
+/// `validates_each`'s block as the lambda the record's `validate` calls
+/// with `(self, :attr, value)` truncated to its parameters, and that
+/// count. BlockValidator calls it as a proc, so fewer parameters drop
+/// the trailing arguments and more read nil. Its
+/// `self` is the class where the block was written, which a lambda
+/// inside the record's method is not, so a body that reads `self` is
+/// not modeled either.
+pub(crate) fn each_callable(lambda: Expr) -> Result<(Expr, usize), String> {
+    let ExprNode::Lambda { params, rest_param, block_param, body, .. } = &*lambda.node else {
+        return Err("a block that is not a plain block".into());
+    };
+    if rest_param.is_some() || block_param.is_some() {
+        return Err("a block with a rest or block parameter".into());
+    }
+    if reads_self(body) {
+        return Err(
+            "a block that reads `self` (the class it was written in, not the record the emitted check runs on)".into(),
+        );
+    }
+    let arity = params.len();
+    let s = Span::synthetic();
+    let callable = Expr::new(
+        s,
+        ExprNode::Send { recv: None, method: Symbol::from("lambda"), args: Vec::new(), block: Some(lambda), parenthesized: false },
+    );
+    Ok((callable, arity))
 }
 
 /// `on: :create` / `on: [:create, :publish]`.

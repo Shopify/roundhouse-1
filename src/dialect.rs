@@ -670,6 +670,21 @@ pub enum ValidationRule {
     /// An attribute the class does not otherwise read or write is a
     /// virtual one ActiveModel defines on the declaring class.
     Acceptance { accept: Expr },
+    /// `validates_associated :lines` / `associated: true` (ActiveRecord's
+    /// AssociatedValidator): every record the attribute reads
+    /// (`Array(value)`) must be valid in the record's own context when
+    /// it is a custom one (nil, so each picks its default, for
+    /// `:create` / `:update`), unless it is marked for destruction; one
+    /// that is not adds `:invalid` to the attribute.
+    Associated,
+    /// `validates_each :a, :b do |record, attr, value| ... end`
+    /// (BlockValidator): the block called with the record, the attribute
+    /// and its value, as many of those as it takes (`arity`). Ingest
+    /// writes the attribute parameter as the Symbol each copy is for.
+    Each {
+        callable: Expr,
+        arity: usize,
+    },
     /// A rule under the options every `validates` validator takes:
     /// `allow_nil:` / `allow_blank:` skip it for such a value, `message:`
     /// replaces its error text, and Symbol `if:` / `unless:` guard it.
@@ -690,7 +705,7 @@ impl ValidationRule {
     /// has to reach before the model lowering inlines it.
     pub fn block_body_mut(&mut self) -> Option<&mut Expr> {
         match self {
-            ValidationRule::Block { callable, .. } => Some(callable),
+            ValidationRule::Block { callable, .. } | ValidationRule::Each { callable, .. } => Some(callable),
             ValidationRule::Guarded { rule, .. } => rule.block_body_mut(),
             _ => None,
         }
@@ -699,7 +714,7 @@ impl ValidationRule {
     /// [`Self::block_body_mut`], shared.
     pub fn block_body(&self) -> Option<&Expr> {
         match self {
-            ValidationRule::Block { callable, .. } => Some(callable),
+            ValidationRule::Block { callable, .. } | ValidationRule::Each { callable, .. } => Some(callable),
             ValidationRule::Guarded { rule, .. } => rule.block_body(),
             _ => None,
         }
