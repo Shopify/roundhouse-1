@@ -48,7 +48,40 @@ const ASSET: &str = r#"class Asset < ApplicationRecord
 end
 "#;
 
+/// Its own class methods root bare and `self.` chains on itself.
 const BIG_ASSET: &str = r#"class BigAsset < Asset
+  def self.recent
+    order(:id)
+  end
+
+  def self.newest
+    self.order(id: :desc).first
+  end
+
+  def self.of_type(t)
+    where(type: t).order(:id)
+  end
+
+  def self.labels
+    all.map(&:label)
+  end
+
+  def self.first_two
+    first(2)
+  end
+
+  def self.named_b
+    named("b")
+  end
+
+  def self.selfish
+    self.named("c").order(:id)
+  end
+
+  def self.picked
+    select(:id, :name).limit(2).order(:id)
+  end
+
   def label
     "big #{name}"
   end
@@ -81,6 +114,9 @@ const PROBE: &str = r##"class PlainSubclassProbe
     out << "scope: #{BigAsset.named("b").map(&:label).join(",")} #{BigAsset.named("c").order(:id).first.class.name}"
     out << "limit: #{BigAsset.limit(2).order(:id).map(&:label).join(",")} #{BigAsset.offset(1).order(:id).limit(1).first.label}"
     out << "terminals: #{BigAsset.pluck(:name).sort.join(",")} #{BigAsset.ids.size} #{BigAsset.first(2).map(&:label).join(",")} #{BigAsset.last(1).map(&:class).map(&:name).join(",")}"
+    out << "own: #{BigAsset.recent.map(&:label).join(",")} #{BigAsset.newest.label} #{BigAsset.of_type("jpg").map(&:label).join(",")} #{BigAsset.labels.sort.join(",")} #{BigAsset.first_two.map(&:label).join(",")}"
+    out << "own scope: #{BigAsset.named_b.map(&:label).join(",")} #{BigAsset.selfish.first.class.name} #{BigAsset.picked.map { |a| [a.class.name, a.label] }.inspect} #{BigAsset.recent.where(name: "c").first.label}"
+    out << "inherited own: #{HugeAsset.recent.map { |a| a.class.name }.join(",")} #{HugeAsset.newest.class.name}"
     out << "deeper: #{HugeAsset.order(:id).map { |a| a.class.name }.join(",")} #{HugeAsset.select(:name).order(:name).first.label}"
     out << "parent: #{Asset.order(:id).map { |a| a.class.name }.join(",")} #{Asset.select(:id).order(:id).first.class.name}"
     Tile.create!(name: "t", type: "x")
@@ -93,13 +129,16 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 9] = [
+const EXPECTED: [&str; 12] = [
     r#"select: [["BigAsset", "a"], ["BigAsset", "b"], ["BigAsset", "c"]]"#,
     r#"order: big a,big b,big c big c BigAsset"#,
     r#"chain: big c 3 big b"#,
     r#"scope: big b BigAsset"#,
     r#"limit: big a,big b big b"#,
     r#"terminals: a,b,c 3 big a,big b BigAsset"#,
+    r#"own: big a,big b,big c big c big b big a,big b,big c big a,big b"#,
+    r#"own scope: big b BigAsset [["BigAsset", "big a"], ["BigAsset", "big b"]] big c"#,
+    r#"inherited own: HugeAsset,HugeAsset,HugeAsset HugeAsset"#,
     r#"deeper: HugeAsset,HugeAsset,HugeAsset big a"#,
     r#"parent: Asset,Asset,Asset Asset"#,
     r#"tile: WideTile,WideTile w WideTile"#,
@@ -168,6 +207,19 @@ fn a_plain_subclass_chain_seeds_a_relation_on_the_subclass() {
     }
     // The inherited scope stays a class-method call on the subclass.
     assert!(probe.contains("BigAsset.named(\"b\")"), "{probe}");
+    // The subclass's own class methods seed on `self`, the receiving
+    // class (HugeAsset when it inherits them).
+    let big = std::fs::read_to_string(emitted.join("app/models/big_asset.rb")).unwrap();
+    for seeded in [
+        "ActiveRecord::Relation.new(self).order(:id)",
+        "ActiveRecord::Relation.new(self).order(id: :desc).first",
+        "ActiveRecord::Relation.new(self).where(type: t).order(:id)",
+        "ActiveRecord::Relation.new(self).map { |x| x.label }",
+        "ActiveRecord::Relation.new(self).first_n(2)",
+        "ActiveRecord::Relation.new(self).select(:id, :name).limit(2).order(:id)",
+    ] {
+        assert!(big.contains(seeded), "missing {seeded}:\n{big}");
+    }
 }
 
 /// The model files natively and emitted, same PostgreSQL.
