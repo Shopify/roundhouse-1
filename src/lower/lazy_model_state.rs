@@ -215,21 +215,23 @@ pub fn apply(lcs: &mut [LibraryClass], app: &App) {
             let ivar = cache_ivar(name);
             let g = getter_name(name);
             let mut had_init = false;
-            for m in lc.methods.iter_mut() {
-                if m.name.as_str() == "initialize" {
-                    let before = format!("{:?}", m.body);
-                    init_to_nil(&mut m.body, &ivar);
-                    had_init |= before != format!("{:?}", m.body);
-                } else {
-                    reads_to_getter(&mut m.body, &ivar, &g);
-                }
+            for m in lc.methods.iter_mut().filter(|m| m.name.as_str() == "initialize") {
+                let before = format!("{:?}", m.body);
+                init_to_nil(&mut m.body, &ivar);
+                had_init |= before != format!("{:?}", m.body);
             }
             // Only where the eager init was there to replace: a model
-            // whose initialize never assigned the cache is not one this
-            // pass understands.
-            if had_init {
-                getters.push(getter(&ivar, name));
+            // whose initialize never assigned the cache (an abstract
+            // base, which has none) is not one this pass understands,
+            // and its reads stay ivar reads, not calls to a getter it
+            // would not have.
+            if !had_init {
+                continue;
             }
+            for m in lc.methods.iter_mut().filter(|m| m.name.as_str() != "initialize") {
+                reads_to_getter(&mut m.body, &ivar, &g);
+            }
+            getters.push(getter(&ivar, name));
         }
         lc.methods.extend(getters);
     }

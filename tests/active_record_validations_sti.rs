@@ -566,8 +566,7 @@ const ORDER_PROBE: &str = r##"class OrderProbe
     Line.create!(order: o, sku: "a", qty: 1)
     Line.create!(order: o, sku: "b", qty: 2)
     Receipt.create!(order: o, total: 5)
-    o = Order.includes(:lines, :receipt).find(o.id)
-    o.customer = c
+    o = Order.find(o.id)
     out << line("fresh", o)
     o.customer.name = ""
     out << line("bad customer", o)
@@ -587,7 +586,12 @@ const ORDER_PROBE: &str = r##"class OrderProbe
     out << line("line audit ctx", o, :audit)
     lines[1].qty = 200
     out << line("line create ctx big", o, :create)
+    out << line("line audit ctx big", o, :audit)
     lines[1].qty = 2
+    built = o.lines.build(sku: "")
+    out << line("built bad line", o)
+    built.sku = "n"
+    out << line("built line", o)
     o.receipt.total = nil
     out << line("bad receipt", o)
     o.receipt.total = -1
@@ -601,7 +605,7 @@ const ORDER_PROBE: &str = r##"class OrderProbe
     out << line("bang long", Order.new(name: "n", code: "toolong", status: "s"))
     rush = RushOrder.create!(name: "rush", code: "r", status: "s")
     Receipt.create!(order: rush, total: 1)
-    rush = RushOrder.includes(:receipt).find(rush.id)
+    rush = RushOrder.find(rush.id)
     out << line("rush ok", rush)
     rush.name = "xy"
     rush.receipt.total = nil
@@ -654,17 +658,15 @@ const ORDER_OBSERVE: &str = "puts OrderProbe.lines\n";
 /// called with the record, the attribute and its value, under
 /// `allow_nil:`, on a model and an STI subclass) and `validates!`.
 ///
-/// The records are the ones the association holds: assigned through
-/// the writer or loaded with `includes`. (The emitted readers do not
-/// keep what they load, so `order.customer.name = ""` would change a
-/// copy the next read does not see.)
+/// The records are the ones the association holds: the readers keep
+/// what they load, so `order.customer.name = ""` changes the record the
+/// next read and the validation see.
 ///
 /// Rails' `has_many` also validates its records itself (`validate:
 /// true`, AutosaveAssociation): new ones, and every loaded one in a
-/// custom context, adding a second "is invalid", and then drops equal
-/// errors (`_ensure_no_duplicate_errors`). The emitted runtime has
-/// neither, so no line here has an invalid `has_many` record in a
-/// custom context, a new one, or two equal errors.
+/// custom context, which adds a second "Lines is invalid" beside
+/// `validates_associated`'s (the two errors differ in their options, so
+/// `_ensure_no_duplicate_errors` keeps both).
 const ORDER_EXPECT: &[&str] = &[
     "fresh: true [] []",
     "bad customer: false [\"Customer is invalid\"] [:customer]",
@@ -677,6 +679,9 @@ const ORDER_EXPECT: &[&str] = &[
     "line update ctx: false [\"Lines is invalid\"] [:lines]",
     "line audit ctx: true [] []",
     "line create ctx big: true [] []",
+    "line audit ctx big: false [\"Lines is invalid\", \"Lines is invalid\"] [:lines]",
+    "built bad line: false [\"Lines is invalid\", \"Lines is invalid\"] [:lines]",
+    "built line: true [] []",
     "bad receipt: false [\"Receipt is invalid\"] [:receipt]",
     "receipt marked: true [] []",
     "new without customer: true [] []",
@@ -695,6 +700,26 @@ const ORDER_EXPECT: &[&str] = &[
 fn validates_associated_each_and_bang_run_like_activerecord() {
     let native = native_of("orders", ORDER_FILES, ORDER_SCHEMA, ORDER_OBSERVE);
     compare(app_of(ORDER_FILES, ORDER_SCHEMA), native, ORDER_EXPECT, "app/models/order.rb", ORDER_OBSERVE);
+}
+
+/// The validation context (`on:`, and the one `validates_associated`
+/// validates each record in) is run state only the Ruby-family runtimes
+/// carry for ActiveRecord: on a strict target each declaration reading
+/// it is an error, not an emit naming `validation_context`.
+#[test]
+fn validation_contexts_are_check_errors_on_a_strict_target() {
+    // An ActiveModel class synthesizes its own `valid?(context)`.
+    let form = "class Form\n  include ActiveModel::Model\n  attr_accessor :name\n  validates :name, presence: true, on: :audit\nend\n";
+    let (_dir, errors) = app_of(ORDER_FILES, ORDER_SCHEMA).write("app/models/form.rb", form).emit(BuildTarget::Crystal);
+    let context: Vec<&String> = errors.iter().filter(|e| e.contains("validation_context not supported (crystal)")).collect();
+    assert!(context.iter().all(|e| !e.contains("FileId(0)")), "each at its declaration: {errors:#?}");
+    assert_eq!(
+        context.len(),
+        7,
+        "Customer's `on: :audit`, Line's `on: :update` and `on: :audit`, Order's three `validates_associated`, RushOrder's `associated: true`: {errors:#?}"
+    );
+    let (_dir, errors) = app_of(ORDER_FILES, ORDER_SCHEMA).emit(BuildTarget::Ruby);
+    assert!(!errors.iter().any(|e| e.contains("validation_context not supported")), "{errors:#?}");
 }
 
 /// What `validates_associated` / `validates_each` cannot be lowered to

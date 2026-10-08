@@ -197,6 +197,30 @@ fn validation_gaps(app: &App) -> Vec<Diagnostic> {
     let items = app.models.iter().flat_map(|m| m.body.iter()).chain(concern_items);
     let mut seen = crate::det::HashSet::default();
     for item in items {
+        // `has_many …, autosave: true` validates (and saves) every
+        // changed loaded record, its errors nested under the
+        // association (`lines.sku`); the emitted model validates the
+        // records a plain has_many does.
+        if let ModelBodyItem::Association {
+            assoc: crate::dialect::Association::HasMany { name, autosave: true, skip_validation, .. },
+            ..
+        } = item
+        {
+            if seen.insert((item.span(), "has_many autosave".to_string(), String::new())) {
+                let validates = if *skip_validation { "" } else { "validates and " };
+                out.push(Diagnostic::unsupported(
+                    item.span(),
+                    None,
+                    "`has_many autosave: true`",
+                    format!(
+                        "on `{}`: Rails {validates}saves every changed loaded record with the owner (errors nested under `{}.<attribute>`); the emitted model treats it as a plain has_many",
+                        name.as_str(),
+                        name.as_str()
+                    ),
+                ));
+            }
+            continue;
+        }
         let ModelBodyItem::Validation { validation, .. } = item else { continue };
         for rule in &validation.rules {
             let ValidationRule::Unsupported { construct, detail } = rule else { continue };

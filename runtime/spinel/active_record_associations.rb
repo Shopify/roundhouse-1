@@ -47,11 +47,7 @@
 #   rest raise NotImplementedError, and the analyzer refuses a static
 #   call to them (`analyze::association_surface`), as it does a literal
 #   name the model does not have.
-# - A foreign-key write drops a memoized belongs_to's loaded flag, so
-#   the next read re-queries; Rails re-queries only when the key really
-#   changed. `loaded?`, `target` and `stale_target?` answer as Rails'.
-# - A record built (not created) through an unloaded has_many is not
-#   added to the target.
+# - `loaded?`, `target` and `stale_target?` answer as Rails'.
 module ActiveRecord
   module Associations
     class Association
@@ -62,9 +58,19 @@ module ActiveRecord
       # foreign key preset: the record joins the owner's loaded target,
       # as Rails' `add_to_target` adds it (saved or not). An owner that
       # has not loaded the association reads it from the database later,
-      # which finds the record if it saved.
+      # which finds the record if it saved; an unsaved one (`build`) it
+      # would not find, so the owner loads the association first (its
+      # reader, which keeps what it loads) and the record joins that:
+      # what Rails' next read answers, the rows and the built record.
+      # The record holds the owner through its inverse belongs_to, as
+      # Rails' `set_inverse_instance` sets it, where the owner model
+      # names one (`emit::ruby::collection_autosave`).
       def self.created(owner, name, record)
         owner._await_preload if owner.respond_to?(:_await_preload)
+        owner._set_inverse_instance(name, record) if owner.respond_to?(:_set_inverse_instance)
+        if owner.instance_variable_get(:"@#{name}_loaded") != true && record.new_record?
+          owner.public_send(name)
+        end
         if owner.instance_variable_get(:"@#{name}_loaded") == true
           records = owner.instance_variable_get(:"@#{name}_cache")
           if records.nil?
