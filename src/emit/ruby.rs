@@ -26,7 +26,7 @@ mod attribute_cast;
 mod collection_autosave;
 pub(crate) mod expr;
 mod library;
-pub(crate) use library::{body_statement_classes, carried_body_statement_spans, carries_body_statement, dropped_class_body_calls, includes_active_model_validations, includes_module, install_lookup_indexes, library_classes_named, modelled_class_body_calls, replays_class_body};
+pub(crate) use library::{body_statement_classes, carried_body_statement_spans, carries_body_statement, dropped_class_body_calls, includes_active_model_validations, includes_module, install_lookup_indexes, library_classes_named, modelled_class_body_calls, replays_class_body, singleton_scoped};
 mod rbs;
 pub mod shake;
 mod shared;
@@ -38,7 +38,7 @@ pub mod source_markers;
 pub use rbs::ty_to_rbs;
 
 // External API: the historical surface kept for `tests/` and `bin/`.
-pub use expr::{emit_expr, with_error_attributes, with_native_keyword_splats};
+pub use expr::{emit_expr, with_error_attributes, with_native_keyword_splats, with_singleton_scoped};
 pub(crate) use expr::native_keywords;
 
 /// The `app/models/<stem>` file a library class is emitted into (a

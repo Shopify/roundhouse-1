@@ -304,9 +304,10 @@ fn unwrapped(body: &[&str], depth: usize) -> Option<String> {
 }
 
 /// `content` with `blocks` placed right after the parent's own header
-/// — the `class` line at `header_indent` — or `None` when there is no
-/// such line, since anywhere else would be outside the body.
-fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -> Option<String> {
+/// — the `class` line (`module` line for a module: `keyword`) at
+/// `header_indent` — or `None` when there is no such line, since
+/// anywhere else would be outside the body.
+fn spliced_after_header(content: &str, header_indent: &str, keyword: &str, blocks: &[String]) -> Option<String> {
     let mut out: Vec<&str> = Vec::new();
     let mut inserted = false;
     for line in content.lines() {
@@ -314,7 +315,7 @@ fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -
         if !inserted
             && line
                 .strip_prefix(header_indent)
-                .is_some_and(|rest| rest.starts_with("class "))
+                .is_some_and(|rest| rest.starts_with(keyword))
         {
             out.extend(blocks.iter().map(String::as_str));
             inserted = true;
@@ -512,6 +513,7 @@ fn nested_blocks(
             .filter(|l| !l.starts_with("require"))
             .collect();
         let Some(block) = unwrapped(&body, depth) else { continue };
+        let block = in_singleton_scopes(&block, depth, kid.name.0.as_str());
         blocks.push((nested_position(parent, kid), block));
         names.push(kid.name.0.as_str().to_string());
         if inline.is_some() {
@@ -529,6 +531,63 @@ fn nested_blocks(
         }
     }
     NestedBlocks { blocks, names, sidecar_blocks, hoisted }
+}
+
+/// The classes of `App::singleton_scoped_classes` the Ruby family writes
+/// back inside their owner's `class << self`: each one spliced into a
+/// library owner's file (`file_owner`), as `nested_blocks` writes it.
+/// One a load-time conditional declares, or written in a file of its
+/// own, stays hoisted onto the owner, as on the other targets.
+pub(crate) fn singleton_scoped(app: &App) -> crate::det::HashSet<String> {
+    let library: crate::det::HashSet<&str> = app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+    app.singleton_scoped_classes
+        .iter()
+        .map(|c| c.0.as_str())
+        .filter(|name| {
+            let Some((owner, _)) = name.rsplit_once("::") else { return false };
+            let file = file_owner(name, app);
+            library.contains(owner)
+                && file != *name
+                && library.contains(file.as_str())
+                && conditional_owner(name, app).is_none()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// `block`, the nested class `kid` unwrapped from its `depth` outer
+/// header lines, with a `class << self … end` around each part the
+/// source declared in one (`singleton_scoped`): `class Helper … end`
+/// for `X::Helper` declared in `class X; class << self`. The block opens
+/// with one header line per segment of `kid` below `depth` and closes
+/// with as many `end`s (`unwrapped`), so the singleton class of the
+/// first `k` segments opens after `k` headers and closes before the last
+/// `k` ends.
+fn in_singleton_scopes(block: &str, depth: usize, kid: &str) -> String {
+    let segments: Vec<&str> = kid.split("::").collect();
+    let headers = segments.len().saturating_sub(depth);
+    let mut lines: Vec<String> = block.lines().map(str::to_string).collect();
+    let structural = lines.len() >= 2 * headers
+        && lines[..headers].iter().all(|l| {
+            let t = l.trim_start();
+            t.starts_with("class ") || t.starts_with("module ")
+        })
+        && lines[lines.len() - headers..].iter().all(|l| l.trim() == "end");
+    if !structural {
+        return block.to_string();
+    }
+    // Innermost first: the outer insertions then keep its positions.
+    for n in (depth + 1..=segments.len()).rev() {
+        if !super::expr::is_singleton_scoped(&segments[..n].join("::")) {
+            continue;
+        }
+        let k = n - 1 - depth;
+        let indent: String = lines[k].chars().take_while(|c| c.is_whitespace()).collect();
+        lines.insert(k, format!("{indent}class << self"));
+        let at = lines.len() - k;
+        lines.insert(at, format!("{indent}end"));
+    }
+    lines.join("\n")
 }
 
 /// Where the source wrote `kid` among `parent`'s constants: the first
@@ -609,7 +668,7 @@ fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &Nest
     let spliced = if blocks.is_empty() {
         rb.content.trim_end_matches('\n').to_string()
     } else {
-        let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, &blocks) else {
+        let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, header_keyword(parent), &blocks) else {
             return;
         };
         spliced
@@ -629,16 +688,23 @@ fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &Nest
     // Only once the `.rb` took the body: a sidecar must describe the
     // file beside it, and a child left out of the one stays out of the
     // other.
-    splice_sidecar(files, depth, &nested.sidecar_blocks);
+    splice_sidecar(files, depth, header_keyword(parent), &nested.sidecar_blocks);
 }
 
-fn splice_sidecar(files: &mut [EmittedFile], depth: usize, sidecar_blocks: &[String]) {
+/// The keyword of `parent`'s own header line. Only a module that holds
+/// classes its `class << self` declares (`singleton_scope_owner`) has
+/// nested classes spliced into its file.
+fn header_keyword(parent: &LibraryClass) -> &'static str {
+    if parent.is_module { "module " } else { "class " }
+}
+
+fn splice_sidecar(files: &mut [EmittedFile], depth: usize, keyword: &str, sidecar_blocks: &[String]) {
     let own_header_indent = "  ".repeat(depth - 1);
     let Some(rbs) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rbs"))
     else {
         return;
     };
-    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, sidecar_blocks) {
+    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, keyword, sidecar_blocks) {
         rbs.content = format!("{spliced}\n");
     }
 }
@@ -8058,14 +8124,17 @@ fn emit_library_class_decl_inner(
             return match sibling.parent.as_ref() {
                 Some(p) => format!(
                     "class {seg} < {}",
-                    lexically_qualified(&written_parent(sibling, p, app), &segments[..i], app)
+                    super::expr::singleton_scoped_path(&lexically_qualified(&written_parent(sibling, p, app), &segments[..i], app))
                 ),
                 None => format!("class {seg}"),
             };
         }
         let parent = outer_class_parent(&qualified, app);
         match (is_app_class(&qualified, app), parent) {
-            (true, Some(p)) => format!("class {seg} < {}", lexically_qualified(p.0.as_str(), &segments[..i], app)),
+            (true, Some(p)) => format!(
+                "class {seg} < {}",
+                super::expr::singleton_scoped_path(&lexically_qualified(p.0.as_str(), &segments[..i], app))
+            ),
             (true, None) => format!("class {seg}"),
             (false, _) => format!("module {seg}"),
         }
@@ -8099,7 +8168,9 @@ fn emit_library_class_decl_inner(
                     // As written (`written_parent`: a rooted `::X` stays
                     // rooted), then qualified against the emitted nesting.
                     let written = written_parent(lc, p, app);
-                    let parent = lexically_qualified(&written, &segments[..depth - 1], app);
+                    // A parent declared in a `class << self` is read off
+                    // its owner's singleton class (`singleton_scoped_path`).
+                    let parent = super::expr::singleton_scoped_path(&lexically_qualified(&written, &segments[..depth - 1], app));
                     writeln!(s, "{pad}class {last} < {parent}").unwrap()
                 }
                 (_, None) => writeln!(s, "{pad}class {last}").unwrap(),
@@ -10463,7 +10534,15 @@ const ANY_CLASS_SELF_CALLS: &[&str] = &[
 /// run later on an instance, so its calls are not the class's. A block
 /// that rebinds `self` (`instance_eval`, `class_exec`, …) is not read.
 fn self_calls_answered(lc: &LibraryClass, call: &Expr) -> bool {
-    let own: Vec<&Symbol> = lc.methods.iter().filter(|m| m.receiver == MethodReceiver::Class).map(|m| &m.name).collect();
+    // In `class << self` (`expr::SINGLETON_BODY`) `self` is the
+    // singleton class, which the class's own class methods do not answer.
+    let singleton = call.decisions & crate::expr::SINGLETON_BODY != 0;
+    let own: Vec<&Symbol> = lc
+        .methods
+        .iter()
+        .filter(|m| m.receiver == MethodReceiver::Class && !singleton)
+        .map(|m| &m.name)
+        .collect();
     fn walk(e: &Expr, own: &[&Symbol], ok: &mut bool) {
         if !*ok {
             return;
@@ -12361,6 +12440,13 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
     if let Some(owner) = conditional_owner(name, app) {
         return file_owner(&owner, app);
     }
+    // A class declared in a `class << self` (`App::singleton_scoped_classes`)
+    // is written inside one in its owner's body, a module's too: a file
+    // of its own would have to reopen the singleton class, which no
+    // autoload reaches.
+    if let Some(owner) = singleton_scope_owner(name, app) {
+        return file_owner(&owner, app);
+    }
     let segments: Vec<&str> = name.split("::").collect();
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
@@ -12372,6 +12458,27 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
         }
     }
     name.to_string()
+}
+
+/// The class or module whose `class << self` declares `name` or the
+/// outermost class enclosing it there (`App::singleton_scoped_classes`),
+/// when that owner is a library class with a `class`/`module` body.
+fn singleton_scope_owner(name: &str, app: &App) -> Option<String> {
+    if app.singleton_scoped_classes.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = name.split("::").collect();
+    (2..=segments.len()).find_map(|n| {
+        let scoped = segments[..n].join("::");
+        if !app.singleton_scoped_classes.iter().any(|c| c.0.as_str() == scoped) {
+            return None;
+        }
+        let owner = segments[..n - 1].join("::");
+        let hosts = library_classes_named(&owner, app)
+            .iter()
+            .any(|c| !matches!(c.origin, Some(crate::dialect::LibraryClassOrigin::FactoryClass { .. })));
+        hosts.then_some(owner)
+    })
 }
 
 /// Whether a nested class was written in a source file of its own,

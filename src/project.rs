@@ -3102,7 +3102,10 @@ fn ruby_family_runtime_files(
     // error_attribute_push`, runtime/spinel/active_model_errors.rb).
     let error_attributes = crate::analyze::runtime_reads::reads_error_attribute_names(app);
     emit::ruby::with_native_keyword_splats(|| {
-        emit::ruby::with_error_attributes(error_attributes, || ruby_family_files(app, fixture, flavor))
+        let scoped = emit::ruby::singleton_scoped(app);
+        emit::ruby::with_singleton_scoped(scoped, || {
+            emit::ruby::with_error_attributes(error_attributes, || ruby_family_files(app, fixture, flavor))
+        })
     })
 }
 

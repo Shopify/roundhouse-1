@@ -24,6 +24,10 @@ thread_local! {
     /// True while emitting a ruby-family tree (CRuby, JRuby), whose
     /// interpreter binds keywords natively. See `emit_keyword_forward_arg`.
     static NATIVE_KEYWORD_SPLATS: Cell<bool> = const { Cell::new(false) };
+    /// The classes this tree writes inside their owner's `class << self`
+    /// (`with_singleton_scoped`), read through `X.singleton_class`.
+    static SINGLETON_SCOPED: std::cell::RefCell<crate::det::HashSet<String>> =
+        std::cell::RefCell::new(crate::det::HashSet::default());
     /// The tree records each error message's attribute for
     /// `errors.attribute_names` (runtime/spinel/active_model_errors.rb).
     /// See `error_attribute_push`.
@@ -41,6 +45,36 @@ thread_local! {
 /// Whether the tree being emitted binds keywords natively (ruby family).
 pub(crate) fn native_keywords() -> bool {
     NATIVE_KEYWORD_SPLATS.with(Cell::get)
+}
+
+/// Run `f` with `names` as the classes the tree writes inside their
+/// owner's `class << self` (`App::singleton_scoped_classes`, those the
+/// library emit splices into the owner's file).
+pub fn with_singleton_scoped<R>(names: crate::det::HashSet<String>, f: impl FnOnce() -> R) -> R {
+    let prev = SINGLETON_SCOPED.with(|c| c.replace(names));
+    let r = f();
+    SINGLETON_SCOPED.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+/// Whether the tree writes `name` inside its owner's `class << self`.
+pub(crate) fn is_singleton_scoped(name: &str) -> bool {
+    native_keywords() && SINGLETON_SCOPED.with(|c| c.borrow().contains(name.trim_start_matches("::")))
+}
+
+/// The constant path `written` (`A::B`, rooted `::A::B`) as the tree
+/// reads it: a class declared in `X`'s `class << self` lives on X's
+/// singleton class (`App::singleton_scoped_classes`), so `X::Helper` is
+/// a NameError and `X.singleton_class::Helper` the class. The deepest
+/// such prefix is rewritten; its owner may hold one in turn.
+pub(crate) fn singleton_scoped_path(written: &str) -> String {
+    let rooted = written.starts_with("::");
+    let segments: Vec<&str> = written.trim_start_matches("::").split("::").collect();
+    let deepest = (2..=segments.len()).rev().find(|&n| is_singleton_scoped(&segments[..n].join("::")));
+    let Some(n) = deepest else { return written.to_string() };
+    let root = if rooted { "::" } else { "" };
+    let owner = singleton_scoped_path(&format!("{root}{}", segments[..n - 1].join("::")));
+    format!("{owner}.singleton_class::{}", segments[n - 1..].join("::"))
 }
 
 /// Run `f` emitting for an interpreter with Ruby 3 keyword arguments.
@@ -205,6 +239,20 @@ pub fn emit_expr(e: &Expr) -> String {
         && !owner.is_empty()
     {
         return format!("{}.singleton_class::{name}", emit_const_path(owner));
+    }
+    // A body statement the source wrote in `class << self`
+    // (`SINGLETON_BODY`): it runs there again, with the singleton class
+    // as `self`, definee and lexical scope.
+    if e.decisions & crate::expr::SINGLETON_BODY != 0
+        && e.decisions & crate::expr::BODY_STATEMENT != 0
+        && native_keywords()
+    {
+        // Indented unless it holds a heredoc, whose lines are
+        // whitespace-significant.
+        let text = emit_node(&e.node);
+        let text = text.trim_end();
+        let body = if text.contains("<<") { text.to_string() } else { indent_lines(text, 1) };
+        return format!("class << self\n{body}\nend");
     }
     // A replayed `NAME = value` the source wrote in `class << self`
     // (`SINGLETON_CONSTANT_WRITE`).
@@ -1950,6 +1998,10 @@ fn without_keyword_fills(args: &[Expr]) -> std::borrow::Cow<'_, [Expr]> {
 /// `::File` is stored with an empty first segment. Joining that as
 /// `::File` keeps the rooted spelling; a relative path stays `A::B`.
 fn emit_const_path(path: &[crate::Symbol]) -> String {
+    if path.len() > 1 && native_keywords() && SINGLETON_SCOPED.with(|c| !c.borrow().is_empty()) {
+        let written = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+        return singleton_scoped_path(&written);
+    }
     if path.first().is_some_and(|s| s.as_str().is_empty()) {
         format!("::{}", path[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::"))
     } else {
