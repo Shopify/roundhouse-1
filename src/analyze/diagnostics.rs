@@ -221,6 +221,23 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     (out, coverage)
 }
 
+/// Whether a diagnostic stamped on a send already accounts for its
+/// result having no type: the typer refused the call (`Unsupported`,
+/// ingest's `IngestRefused`), found its operands incompatible, or found
+/// no method itself. A lowering residue or a preload note says nothing
+/// about the call's dispatch, so the fallback still reports beside it.
+fn explains_send(stamped: Option<&DiagnosticKind>) -> bool {
+    matches!(
+        stamped,
+        Some(
+            DiagnosticKind::Unsupported { .. }
+                | DiagnosticKind::IngestRefused { .. }
+                | DiagnosticKind::IncompatibleBinop { .. }
+                | DiagnosticKind::SendDispatchFailed { .. }
+        )
+    )
+}
+
 /// A type is "unknown" if it's `None` or `Ty::Var(n)` (a placeholder the
 /// analyzer set for positions it couldn't resolve). `Ty::Untyped` —
 /// the gradual escape — counts as *known*: the author signed that
@@ -454,7 +471,11 @@ fn diagnose_expr_in(expr: &Expr, out: &mut Vec<Diagnostic>, value_used: bool) {
                 });
             }
         }
-        ExprNode::Send { recv: Some(r), method, .. } => {
+        // The fallback for a send nothing else explains. A send the typer
+        // already refused or rejected (reported above) is one gap with
+        // its specific row: an `as_json` refused as an unported Object
+        // extension is not also a method missing from its receiver.
+        ExprNode::Send { recv: Some(r), method, .. } if !explains_send(expr.diagnostic.as_ref()) => {
             if !is_unknown_ty(r.ty.as_ref()) && is_unknown_ty(expr.ty.as_ref()) {
                 let recv_ty = r.ty.clone().unwrap_or_else(|| Ty::Var { var: crate::ident::TyVar(0) });
                 let kind = DiagnosticKind::SendDispatchFailed {
