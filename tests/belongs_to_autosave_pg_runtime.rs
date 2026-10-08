@@ -196,7 +196,8 @@ fn belongs_to_autosave_keys_on_new_record() {
     let model = std::fs::read_to_string(emitted.join("app/models/product.rb")).unwrap();
     for expected in [
         "if value.new_record?",
-        "if @shop_loaded && !(@shop_cache.nil?) && @shop_cache.new_record?",
+        "if @shop_loaded && !(@shop_cache.nil?) && !(@shop_cache.destroyed?)",
+        "@shop_cache.save if @shop_cache.new_record?",
         "self.shop = attrs[:shop] if !(attrs[:shop].nil?)",
         "@shop_cache.save",
         "@shop_id = @shop_cache.id",

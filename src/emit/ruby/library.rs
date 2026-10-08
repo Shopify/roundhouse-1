@@ -2797,12 +2797,22 @@ fn sti_dispatch(base_new: Expr, type_read: &Expr, subs: &[ClassId], args: &[Expr
 /// end
 ///
 /// def _autosave_creator
-///   if @creator_loaded && !@creator_cache.nil? && @creator_cache.new_record?
-///     @creator_cache.save
+///   if @creator_loaded && !@creator_cache.nil? && !@creator_cache.destroyed?
+///     @creator_cache.save if @creator_cache.new_record?
 ///     @creator_id = @creator_cache.id
 ///   end
 /// end
 /// ```
+///
+/// That is Rails' `save_belongs_to_association` (autosave_association.rb):
+/// a loaded, not-stale, not-destroyed target is saved when it is a new
+/// record, and the key then takes its id (`self[fk] = record.id` when
+/// `association.updated?`), saved here or not. A target assigned new
+/// and saved by hand before its owner (`p.owner = o; o.save!; p.save!`)
+/// gives the owner its id at the owner's save; taking the id only after
+/// saving it here left that key nil. A key written after the target
+/// (`owner_id=`) clears `@creator_loaded`, Rails' stale target, so the
+/// write stands. A target the reader loaded has the key's id already.
 ///
 /// "Unsaved" is Rails' rule (`save_belongs_to_association`: save when
 /// `association.new_record?`), read off the record, not off the key it
@@ -3018,13 +3028,17 @@ fn autosave_method(
             syn(ExprNode::Ivar { name: Symbol::from(format!("{}_loaded", name.as_str())) }),
             send(send(cache(), "nil?"), "!"),
         ),
-        send(cache(), "new_record?"),
+        send(send(cache(), "destroyed?"), "!"),
     );
     let body = syn(ExprNode::If {
         cond,
         then_branch: syn(ExprNode::Seq {
             exprs: vec![
-                send(cache(), "save"),
+                syn(ExprNode::If {
+                    cond: send(cache(), "new_record?"),
+                    then_branch: send(cache(), "save"),
+                    else_branch: syn(ExprNode::Lit { value: Literal::Nil }),
+                }),
                 syn(ExprNode::Assign {
                     target: LValue::Ivar { name: fk.clone() },
                     value: send(cache(), "id"),
