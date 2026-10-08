@@ -13,6 +13,11 @@
 //! family: useragent's `UserAgent::Version` rides only on the PostgreSQL
 //! CRuby tree's copy of the user_agent port. The gate is the finished
 //! tree's files either way.
+//!
+//! A port's values are gated too (`ActiveSupport::Cache::OPTION_ALIASES`,
+//! `Rails::VERSION::STRING`): the analyzer types them from the port's
+//! own definition and marks the read (`expr::RUNTIME_VALUE_REF`), and
+//! `project` refuses it where no file the finished tree loads assigns it.
 
 use crate::det::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -46,6 +51,150 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
 /// `ActiveSupport::SecurityUtils.secure_compare`. A name either declares
 /// stays ungated though a gated port declares it too.
 const SHARED_RUNTIME: &[&str] = &["runtime/ruby/active_support_ext.rb", "runtime/ruby/security_utils.rb"];
+
+/// Runtime files whose VALUES are gated though their namespaces are not:
+/// railties' Rails::Railtie and Rails::Engine are a lowering's concern
+/// (`lower::unported_rails_subclasses`), but `Rails::VERSION::STRING`
+/// is a plain read of rails_railtie.rb, which only the PostgreSQL CRuby
+/// tree carries.
+const VALUE_GATED_RUNTIME: &[(&str, &str)] = &[("runtime/spinel/rails_railtie.rb", "runtime/rails_railtie.rb")];
+
+/// The full names of the constants a runtime file assigns in its class
+/// and module bodies (`ActiveSupport::Cache::OPTION_ALIASES`), not the
+/// namespaces it opens.
+pub(crate) fn declared_constants(text: &str) -> HashSet<String> {
+    struct Declared(Vec<String>, HashSet<String>);
+    impl Declared {
+        fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>) {
+            self.0.push(String::from_utf8_lossy(path).trim_start_matches("::").to_string());
+            if let Some(body) = body {
+                ruby_prism::Visit::visit(self, &body);
+            }
+            self.0.pop();
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Declared {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body());
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body());
+        }
+        // A method body's constant assignment is a SyntaxError; a
+        // singleton class opens no constant path.
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            if !self.0.is_empty() {
+                let mut path = self.0.clone();
+                path.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+                self.1.insert(path.join("::"));
+            }
+        }
+    }
+    let mut declared = Declared(Vec::new(), HashSet::default());
+    let parsed = ruby_prism::parse(text.as_bytes());
+    if parsed.errors().next().is_none() {
+        ruby_prism::Visit::visit(&mut declared, &parsed.node());
+    }
+    declared.1
+}
+
+/// The finished tree's `.rb` files that load: everything outside
+/// runtime/ (boot.rb, main.rb, app/, test/), and each file those reach
+/// by `require_relative`, or by `require` of a feature runtime/features/
+/// answers (runtime/gem_facades.rb puts that directory first on the load
+/// path). The trees chain their runtime by `require_relative`; a carried
+/// file nothing reaches defines nothing. The SQLite CRuby tree carries
+/// runtime/rails_railtie.rb with the rest of runtime/spinel/, but only
+/// the PostgreSQL tree's boot.rb requires it.
+pub(crate) fn loaded_files(files: &[(String, String)]) -> HashSet<String> {
+    struct Requires(Vec<(bool, String)>);
+    impl<'pr> ruby_prism::Visit<'pr> for Requires {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = node.name().as_slice();
+            if node.receiver().is_none() && matches!(name, b"require" | b"require_relative") {
+                let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if let [arg] = args.as_slice() {
+                    if let Some(string) = arg.as_string_node() {
+                        let feature = String::from_utf8_lossy(string.unescaped()).into_owned();
+                        self.0.push((name == b"require_relative", feature));
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    fn normalize(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                part => parts.push(part),
+            }
+        }
+        parts.join("/")
+    }
+    let rb: HashMap<&str, &str> = files.iter()
+        .filter(|(p, _)| p.ends_with(".rb"))
+        .map(|(p, text)| (p.as_str(), text.as_str()))
+        .collect();
+    let mut loaded: HashSet<String> = HashSet::default();
+    let mut queue: Vec<String> = rb.keys().filter(|p| !p.starts_with("runtime/")).map(|p| p.to_string()).collect();
+    while let Some(path) = queue.pop() {
+        if !loaded.insert(path.clone()) {
+            continue;
+        }
+        let Some(text) = rb.get(path.as_str()) else { continue };
+        let parsed = ruby_prism::parse(text.as_bytes());
+        let mut requires = Requires(Vec::new());
+        ruby_prism::Visit::visit(&mut requires, &parsed.node());
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        for (relative, feature) in requires.0 {
+            let feature = feature.trim_end_matches(".rb");
+            let target = if relative {
+                normalize(&format!("{dir}/{feature}.rb"))
+            } else {
+                format!("runtime/features/{feature}.rb")
+            };
+            if rb.contains_key(target.as_str()) && !loaded.contains(&target) {
+                queue.push(target);
+            }
+        }
+    }
+    loaded
+}
+
+/// Each gated runtime value and the finished-tree file that assigns it:
+/// the constants of the gated ports and of [`VALUE_GATED_RUNTIME`],
+/// less any the shared runtime assigns too.
+pub(crate) fn ruby_family_runtime_values() -> &'static HashMap<String, &'static str> {
+    static VALUES: OnceLock<HashMap<String, &'static str>> = OnceLock::new();
+    VALUES.get_or_init(|| {
+        let shared: HashSet<String> = SHARED_RUNTIME.iter()
+            .flat_map(|source| declared_constants(&crate::runtime_files::read_to_string(source).unwrap_or_default()))
+            .collect();
+        let mut values = HashMap::default();
+        for (source, emitted) in RUBY_FAMILY_RUNTIME.iter().chain(VALUE_GATED_RUNTIME) {
+            let text = crate::runtime_files::read_to_string(source).unwrap_or_default();
+            for name in declared_constants(&text) {
+                if !shared.contains(&name) {
+                    values.insert(name, *emitted);
+                }
+            }
+        }
+        values
+    })
+}
+
+/// The finished-tree file that declares a gated namespace or assigns a
+/// gated value.
+pub(crate) fn gated_runtime_file(name: &str) -> Option<&'static str> {
+    ruby_family_runtime_names().get(name).or_else(|| ruby_family_runtime_values().get(name)).copied()
+}
 
 /// Each gated namespace and the finished-tree file that declares it.
 pub(crate) fn ruby_family_runtime_names() -> &'static HashMap<String, &'static str> {
@@ -182,6 +331,12 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
         ExprNode::Const { path } => {
             if let Some(name) = class_name(&expr.ty).filter(|name| gated(name)) {
                 out.push(RuntimeRead { span: expr.span, name: name.to_string(), shown: written(path), in_test, declaration: false });
+            } else if expr.decisions & crate::expr::RUNTIME_VALUE_REF != 0 {
+                // The analyzer qualified the read to the port's own name.
+                let name = written(path);
+                if ruby_family_runtime_values().contains_key(&name) {
+                    out.push(RuntimeRead { span: expr.span, shown: name.clone(), name, in_test, declaration: false });
+                }
             }
         }
         ExprNode::Send { recv: Some(recv), method, .. } => {
@@ -370,6 +525,30 @@ mod tests {
             assert!(is_runtime_declared_namespace(name), "{name}");
         }
         assert!(!is_runtime_declared_namespace("ActiveSupport::MessageVerifiers"));
+    }
+
+    #[test]
+    fn the_gated_values_are_the_ports_own_constants() {
+        let values = ruby_family_runtime_values();
+        for (name, file) in [
+            ("ActiveModel::Type::Boolean::FALSE_VALUES", "runtime/active_model_type.rb"),
+            ("ActiveSupport::Cache::OPTION_ALIASES", "runtime/active_support_cache.rb"),
+            ("ActiveSupport::Cache::DEFAULT_COMPRESS_LIMIT", "runtime/active_support_cache.rb"),
+            ("Rails::VERSION::STRING", "runtime/rails_railtie.rb"),
+            ("Rails::VERSION::MAJOR", "runtime/rails_railtie.rb"),
+        ] {
+            assert_eq!(values.get(name).copied(), Some(file), "{name}: {values:?}");
+            assert_eq!(gated_runtime_file(name), Some(file), "{name}");
+        }
+        // Namespaces are not values; a method body assigns none.
+        assert!(!values.contains_key("ActiveSupport::Cache"), "{values:?}");
+        assert!(!values.contains_key("Rails::VERSION"), "{values:?}");
+        let declared = declared_constants(
+            "module A\n  X = 1\n  class B\n    Y = [1].freeze\n  end\n  def m; end\nend\nTOP = 1\nmodule C::D\n  Z = 2\nend\n",
+        );
+        let mut declared: Vec<_> = declared.into_iter().collect();
+        declared.sort();
+        assert_eq!(declared, ["A::B::Y", "A::X", "C::D::Z"]);
     }
 
     #[test]

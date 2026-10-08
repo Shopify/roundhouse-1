@@ -7140,7 +7140,8 @@ fn report_unloaded_gem_constants(app: &App, target: BuildTarget, files: &[(Strin
         if expr.decisions & crate::expr::GEM_CONSTANT_REF != 0 {
             if let crate::expr::ExprNode::Const { path } = &*expr.node {
                 let name = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
-                let gem = app.gem_boundary.gem_of(&name)
+                let gem = gem_port_declaring(&name).map(|(gem, _)| gem)
+                    .or_else(|| app.gem_boundary.gem_of(&name))
                     .or_else(|| app.gem_boundary.source_constants.gem_of(&name))
                     .unwrap_or("its");
                 if target != BuildTarget::Ruby {
@@ -7227,6 +7228,19 @@ fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(St
         .filter(|(p, _)| p.starts_with("runtime/") && p.ends_with(".rb"))
         .flat_map(|(_, text)| crate::analyze::test_constants::declared_namespaces(text))
         .collect();
+    // A port's value (`Rails::VERSION::STRING`) is there only where the
+    // tree loads the file that assigns it, not merely carries it.
+    let values = crate::analyze::runtime_reads::ruby_family_runtime_values();
+    let value_reads = reads.iter().any(|read| !read.declaration && values.contains_key(&read.name));
+    let loaded = if value_reads {
+        crate::analyze::runtime_reads::loaded_files(files)
+    } else {
+        Default::default()
+    };
+    let assigned: crate::det::HashSet<String> = files.iter()
+        .filter(|(p, _)| loaded.contains(p) && p.starts_with("runtime/"))
+        .flat_map(|(_, text)| crate::analyze::runtime_reads::declared_constants(text))
+        .collect();
     let names = crate::analyze::runtime_reads::ruby_family_runtime_names();
     // `include M` of a runtime module: the analyzer resolved it, and the
     // class body raises at load wherever the finished tree lacks M.
@@ -7244,11 +7258,18 @@ fn report_unsupported_runtime_reads(app: &App, target: BuildTarget, files: &[(St
         .unwrap_or_default();
     for read in reads {
         let harness_name = read.in_test && crate::analyze::test_constants::is_harness_namespace(&read.name);
-        if runtime.contains(&read.name) || harness_name && harness.contains(&read.name) {
+        if runtime.contains(&read.name) || assigned.contains(&read.name) || harness_name && harness.contains(&read.name) {
             continue;
         }
-        let file = names.get(&read.name).copied().unwrap_or("the Ruby-family runtime");
-        let (construct, detail) = if read.declaration {
+        let file = crate::analyze::runtime_reads::gated_runtime_file(&read.name).unwrap_or("the Ruby-family runtime");
+        let (construct, detail) = if !read.declaration && values.contains_key(&read.name) {
+            let carried = files.iter().any(|(p, _)| p == file);
+            ("runtime_constant", format!(
+                "{} is assigned by the Ruby-family runtime ({file}), which {} {}",
+                if read.shown == read.name { read.name.clone() } else { format!("`{}` answers {}", read.shown, read.name) },
+                target.as_str(),
+                if carried { "carries but does not load" } else { "does not emit" }))
+        } else if read.declaration {
             ("runtime_constant", format!(
                 "`{}`: {} is declared by the Ruby-family runtime ({file}), which {} does not emit",
                 read.shown, read.name, target.as_str()))
