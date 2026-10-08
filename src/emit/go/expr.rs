@@ -649,7 +649,7 @@ fn try_string_builder(ctx: &EmitCtx, e: &Expr) -> Option<String> {
     match e.hint.as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
-        IrHint::AssociationTarget | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) => None, // CRuby/JRuby-only hints, the plain node elsewhere
+        IrHint::AssociationTarget | IrHint::AssociationProxy | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) => None, // CRuby/JRuby-only hints, the plain node elsewhere
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign {
                 target: LValue::Var { name, .. }, ..

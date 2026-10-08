@@ -156,6 +156,11 @@ pub fn emit_expr(e: &Expr) -> String {
     if let Some(target) = association_target(e) {
         return target;
     }
+    if native_keywords() {
+        if let Some(call) = crate::lower::assoc_loaded::association_proxy_call(e) {
+            return emit_expr(&call);
+        }
+    }
     // An AUTHOR-WRITTEN cast (`x #: as Integer`, `T.cast(x, Integer)`,
     // `T.let`, `T.bind`) is the value unchanged on every Ruby tree. The
     // coercion arm of `emit_cast` exists for the casts LOWERINGS build

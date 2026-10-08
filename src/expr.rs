@@ -214,6 +214,14 @@ pub enum IrHint {
     /// the association object, write the read back as written; the
     /// others keep the reader.
     AssociationTarget,
+    /// On `record.<has_many>.reload` / `.reset`, which `lower::
+    /// assoc_loaded` resolved to a collection reader. Rails' reader is
+    /// the CollectionProxy, which reloads or resets its association; the
+    /// emitted reader answers an Array, which has neither. The CRuby and
+    /// JRuby trees run it on the association object
+    /// (`ActiveRecord::Associations::Association.proxy`); the others
+    /// keep the plain send.
+    AssociationProxy,
 }
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;

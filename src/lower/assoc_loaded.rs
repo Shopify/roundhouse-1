@@ -216,13 +216,15 @@ pub(crate) fn rewrite_node(
     else {
         return;
     };
-    if method.as_str() != "loaded?" || !args.is_empty() {
+    let proxy_call = matches!(method.as_str(), "reload" | "reset");
+    if (method.as_str() != "loaded?" && !proxy_call) || !args.is_empty() {
         return;
     }
     let ExprNode::Send {
         recv: owner,
         method: assoc,
         args: assoc_args,
+        block: None,
         ..
     } = &*inner.node
     else {
@@ -243,6 +245,25 @@ pub(crate) fn rewrite_node(
         return;
     };
     if !names.contains(assoc) {
+        return;
+    }
+    if proxy_call {
+        // `record.comments.reload` / `.reset`: Rails' CollectionProxy
+        // runs it on the association. Marked for the trees that carry
+        // the association object (`IrHint::AssociationProxy`), with an
+        // implicit-self owner spelled out so the call can pass it.
+        if owner.is_none() {
+            let mut s = Expr::new(inner.span, ExprNode::SelfRef);
+            s.ty = Some(Ty::Class { id: owner_model, args: vec![] });
+            let mut read = inner.clone();
+            if let ExprNode::Send { recv, .. } = &mut *read.node {
+                *recv = Some(s);
+            }
+            if let ExprNode::Send { recv: Some(r), .. } = &mut *expr.node {
+                *r = read;
+            }
+        }
+        expr.hint = Some(crate::expr::IrHint::AssociationProxy);
         return;
     }
     let flat = Symbol::from(format!("{}_loaded?", assoc.as_str()));
@@ -371,6 +392,12 @@ fn rewrite_association_target(
 /// memory. The emitter writes back any hinted read this does not reach.
 pub(crate) fn materialize_association_targets(expr: &mut Expr) {
     expr.node.for_each_child_mut(&mut |c| materialize_association_targets(c));
+    if let Some(call) = association_proxy_call(expr) {
+        let ty = expr.ty.clone();
+        *expr = call;
+        expr.ty = ty;
+        return;
+    }
     if expr.hint != Some(crate::expr::IrHint::AssociationTarget) {
         return;
     }
@@ -402,6 +429,47 @@ pub(crate) fn materialize_association_targets(expr: &mut Expr) {
     );
     target.ty = expr.ty.clone();
     *expr = target;
+}
+
+/// `owner.<has_many>.reload` / `.reset` marked `IrHint::AssociationProxy`
+/// → `ActiveRecord::Associations::Association.proxy(owner, :<has_many>,
+/// :reload)` (runtime/spinel/active_record_associations.rb), for a tree
+/// that carries the association object (the caller gates).
+pub(crate) fn association_proxy_call(expr: &Expr) -> Option<Expr> {
+    if expr.hint != Some(crate::expr::IrHint::AssociationProxy) {
+        return None;
+    }
+    let ExprNode::Send { recv: Some(inner), method: call, args, block: None, .. } = &*expr.node else {
+        return None;
+    };
+    let ExprNode::Send { recv: Some(owner), method: name, args: read_args, block: None, .. } = &*inner.node
+    else {
+        return None;
+    };
+    if !args.is_empty() || !read_args.is_empty() {
+        return None;
+    }
+    let span = expr.span;
+    let sym = |s: &Symbol| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: s.clone() } });
+    Some(Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                span,
+                ExprNode::Const {
+                    path: vec![
+                        Symbol::from("ActiveRecord"),
+                        Symbol::from("Associations"),
+                        Symbol::from("Association"),
+                    ],
+                },
+            )),
+            method: Symbol::from("proxy"),
+            args: vec![owner.clone(), sym(name), sym(call)],
+            block: None,
+            parenthesized: true,
+        },
+    ))
 }
 
 fn sym_lit(expr: &Expr) -> Option<Symbol> {

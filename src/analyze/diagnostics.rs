@@ -61,6 +61,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     out.extend(super::test_constants::diagnose(app));
     out.extend(super::test_harness_calls::diagnose(app));
     out.extend(super::test_assertion_jumps::diagnose(app));
+    // `association(:x)` calls the emitted association object cannot
+    // answer as Rails does.
+    out.extend(super::association_surface::diagnose(app));
     // Model class-body statements no lowering claims: each is dropped
     // from the emitted class, with whatever it did at load.
     out.extend(crate::lower::model_to_library::diagnose_unclaimed_model_dsl(app));
