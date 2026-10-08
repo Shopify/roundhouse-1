@@ -62,7 +62,7 @@ impl<'a> BodyTyper<'a> {
         {
             return AsJsonResidue::Refuse(
                 "ActiveModel::Serializers::JSON",
-                "a record's as_json(options) is serializable_hash; the runtime's ActiveRecord::Base#as_json honors only:",
+                "self may be a record (a module, an ActiveModel ancestor or a superclass outside the app); a record's as_json(options) is serializable_hash, and the runtime's ActiveRecord::Base#as_json honors only:",
             );
         }
         AsJsonResidue::Route
