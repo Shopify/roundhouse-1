@@ -9602,6 +9602,14 @@ fn calls_own_class_method(expr: &Expr, own: &crate::det::HashSet<&Symbol>) -> bo
     found
 }
 
+/// Whether the emitted class replays its unmodelled class-body calls
+/// verbatim (a railtie the tree carries, or [`replays_foreign_class_body`])
+/// rather than dropping them: `check` asks before it calls a dropped
+/// validation an error (`lower::active_model_model::diagnose_dropped_validations`).
+pub(crate) fn replays_class_body(lc: &LibraryClass, app: &App) -> bool {
+    carried_railtie(lc, app) || replays_foreign_class_body(lc, app)
+}
+
 /// Whether this class's captured `unknown_calls` should be replayed
 /// into the emitted class body.
 ///

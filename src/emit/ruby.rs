@@ -26,7 +26,7 @@ mod attribute_cast;
 mod collection_autosave;
 pub(crate) mod expr;
 mod library;
-pub(crate) use library::{install_lookup_indexes, modelled_class_body_calls};
+pub(crate) use library::{install_lookup_indexes, modelled_class_body_calls, replays_class_body};
 mod rbs;
 pub mod shake;
 mod shared;

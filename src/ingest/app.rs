@@ -791,7 +791,17 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
             // `None` — a file with no class, a bare module — stays a
             // library class here, unlike under `app/models` where the
             // directory itself is the app saying what the file is.
-            if super::library_class::has_active_record_base(&source, &model_bases) {
+            //
+            // So does a superclass-less class that validates as an
+            // ActiveModel class (`validating_active_model`): Core's
+            // `Media::ImageProcessor` in `app/services` includes
+            // ActiveModel::Validations and declares `validates`, which
+            // the library path dropped with a warning, its `valid?`
+            // gone with them.
+            if super::library_class::has_active_record_base(&source, &model_bases)
+                || (classify_class_file(&source, &model_bases) == Some(ClassKind::Model)
+                    && validating_active_model(&source))
+            {
                 match ingest_model_with_enum_constants(
                     &source, &path_str, &app.schema, &table_prefixes, &base_prefixes, &enum_constants,
                     &model_bases,
@@ -8650,6 +8660,41 @@ fn first_block_param(block: &ruby_prism::BlockNode<'_>) -> Option<String> {
     let first = params.requireds().iter().next()?;
     let param = first.as_required_parameter_node()?;
     Some(super::util::constant_id_str(&param.name()).to_string())
+}
+
+/// Whether the file's primary class (which [`classify_class_file`] has
+/// found to be a superclass-less ActiveModel includer) validates: it
+/// includes `ActiveModel::Validations`, or its body declares a
+/// validation (`validates`, `validate`, `validates_with`,
+/// `validates_each`, `validates_<kind>_of`). Such a class is a tableless
+/// model wherever it lives, as Rails sees it: the model path lowers its
+/// rules into `valid?`/`errors`, and an `included do validates …` of a
+/// Concern it includes runs on it. A support-tree class that only
+/// includes `ActiveModel::Model` for its attribute constructor stays a
+/// library class (`lower::active_model_model` supplies that surface,
+/// `persisted?` with it).
+fn validating_active_model(source: &[u8]) -> bool {
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let Some((_, class)) = super::util::primary_class_with_scope(&root) else { return false };
+    let Some(body) = class.body() else { return false };
+    let Some(stmts) = body.as_statements_node() else { return false };
+    stmts.body().iter().any(|stmt| {
+        let Some(call) = stmt.as_call_node() else { return false };
+        if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+            return false;
+        }
+        let name = call.name().as_slice();
+        let validates = matches!(name, b"validates" | b"validate" | b"validates_with" | b"validates_each" | b"validates!")
+            || (name.starts_with(b"validates_") && name.ends_with(b"_of"));
+        let includes_validations = name == b"include"
+            && call.arguments().is_some_and(|args| {
+                args.arguments().iter().any(|arg| {
+                    super::util::constant_path_of(&arg).is_some_and(|path| path.join("::") == "ActiveModel::Validations")
+                })
+            });
+        validates || includes_validations
+    })
 }
 
 /// Whether every top-level statement of `source` is a class or module

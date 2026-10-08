@@ -70,6 +70,9 @@ pub fn diagnose_with_coverage(app: &App) -> (Vec<Diagnostic>, PreloadCoverage) {
     // Model class-body statements no lowering claims: each is dropped
     // from the emitted class, with whatever it did at load.
     out.extend(crate::lower::model_to_library::diagnose_unclaimed_model_dsl(app));
+    // Validation macros in a library class's body, which its emitted
+    // class drops.
+    out.extend(crate::lower::active_model_model::diagnose_dropped_validations(app));
     // Rubydex's unresolved constants emit refusal stubs. Collect those
     // annotations from support methods/defaults/constants as well, so
     // an emitted raise cannot be hidden by the library diagnostic policy.
