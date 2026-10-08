@@ -18,7 +18,8 @@ require_relative "support/rails_oracle"
 app_root, out_root = File.expand_path(ARGV.fetch(0)), File.expand_path(ARGV.fetch(1))
 admin_options = PG::Connection.conninfo_parse(ENV.fetch("ROUNDHOUSE_PG_TEST_URL"))
   .each_with_object({}) { |o, h| h[o[:keyword].to_sym] = o[:val] if o[:val] }
-DATABASE = "rh_e2e_validates_uniq"
+# The pid keeps a concurrent run on the shared server from dropping it.
+DATABASE = "rh_e2e_validates_uniq_#{Process.pid}"
 DDL = [
   'CREATE TABLE "shops" ("id" bigserial PRIMARY KEY, "name" character varying)',
   'CREATE TABLE "handles" ("id" bigserial PRIMARY KEY, "handle" character varying, "code" character varying, ' \

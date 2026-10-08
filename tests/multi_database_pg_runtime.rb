@@ -13,7 +13,14 @@ require_relative "support/rails_oracle"
 app_root, out_root = ARGV.fetch(0), ARGV.fetch(1)
 admin_options = PG::Connection.conninfo_parse(ENV.fetch("ROUNDHOUSE_PG_TEST_URL"))
   .each_with_object({}) { |o, h| h[o[:keyword].to_sym] = o[:val] if o[:val] }
-DATABASES = { "primary" => "rh_e2e_mdb_primary", "animals" => "rh_e2e_mdb_animals" }.freeze
+# The server is shared with other lanes' runs: this driver's pid keeps
+# their `DROP DATABASE ... WITH (FORCE)` off ours. The app's
+# database.yml (written for this run) names the databases, so it is
+# pointed at the same names.
+SUFFIX = "_#{Process.pid}"
+DATABASES = { "primary" => "rh_e2e_mdb_primary#{SUFFIX}", "animals" => "rh_e2e_mdb_animals#{SUFFIX}" }.freeze
+database_yml = File.join(app_root, "config/database.yml")
+File.write(database_yml, File.read(database_yml).gsub(/\b(rh_e2e_mdb_(?:primary|animals))\b/) { "#{$1}#{SUFFIX}" })
 DDL = [
   'CREATE TABLE "posts" ("id" bigserial PRIMARY KEY, "title" character varying NOT NULL)',
   'CREATE TABLE "comments" ("id" bigserial PRIMARY KEY, "body" text NOT NULL, "post_id" bigint NOT NULL)',
@@ -106,7 +113,7 @@ expected_storage = {
 }
 failures << "native storage #{native[3].to_json}" unless native[3] == expected_storage
 answers = native[0].to_h
-failures << "native databases #{answers["databases"]}" unless answers["databases"] == %w[rh_e2e_mdb_primary rh_e2e_mdb_primary rh_e2e_mdb_animals]
+failures << "native databases #{answers["databases"]}" unless answers["databases"] == %w[rh_e2e_mdb_primary rh_e2e_mdb_primary rh_e2e_mdb_animals].map { |n| "#{n}#{SUFFIX}" }
 failures << "native reading role #{answers["reading"]}" unless answers.dig("reading", 1) == "primary_replica"
 
 puts "native: #{native[0].size} answers, emitted: #{emitted[0].size} answers"

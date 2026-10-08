@@ -24,7 +24,14 @@ require_relative "support/rails_oracle"
 app_root, out_root = File.expand_path(ARGV.fetch(0)), File.expand_path(ARGV.fetch(1))
 admin_options = PG::Connection.conninfo_parse(ENV.fetch("ROUNDHOUSE_PG_TEST_URL"))
   .each_with_object({}) { |o, h| h[o[:keyword].to_sym] = o[:val] if o[:val] }
-DATABASES = { "primary" => "rh_e2e_txf_primary", "animals" => "rh_e2e_txf_animals", "extra" => "rh_e2e_txf_extra" }.freeze
+# The server is shared with other lanes' runs: this driver's pid keeps
+# their `DROP DATABASE ... WITH (FORCE)` off ours. The app's
+# database.yml (written for this run) names the databases, so it is
+# pointed at the same names.
+SUFFIX = "_#{Process.pid}"
+DATABASES = { "primary" => "rh_e2e_txf_primary#{SUFFIX}", "animals" => "rh_e2e_txf_animals#{SUFFIX}", "extra" => "rh_e2e_txf_extra#{SUFFIX}" }.freeze
+database_yml = File.join(app_root, "config/database.yml")
+File.write(database_yml, File.read(database_yml).gsub(/\b(rh_e2e_txf_(?:primary|animals|extra))\b/) { "#{$1}#{SUFFIX}" })
 DDL = [
   'CREATE TABLE "posts" ("id" bigserial PRIMARY KEY, "title" character varying NOT NULL)',
   'CREATE TABLE "comments" ("id" bigserial PRIMARY KEY, "body" text NOT NULL, "post_id" bigint NOT NULL)',
