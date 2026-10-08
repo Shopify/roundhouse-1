@@ -115,6 +115,11 @@ fn uncertain_visibility(expr: &Expr, name: &Symbol, writer: &Symbol, nested: boo
 /// callbacks/defaults after block registration are inert; overriding the
 /// rest of the framework protocol can prevent that registration/execution.
 fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<crate::ClassId> {
+    unconsumed_hook_from(crate::analyze::model_includes(model), app)
+}
+
+/// [`unconsumed_included_hook`] from an includer's direct includes.
+fn unconsumed_hook_from(includes: Vec<ClassId>, app: &App) -> Option<crate::ClassId> {
     fn inert(expr: &Expr) -> bool {
         match &*expr.node {
             ExprNode::Lit { .. } => true,
@@ -124,7 +129,7 @@ fn unconsumed_included_hook(model: &crate::dialect::Model, app: &App) -> Option<
         }
     }
 
-    let mut pending = crate::analyze::model_includes(model);
+    let mut pending = includes;
     let mut seen = HashSet::default();
     while let Some(id) = pending.pop() {
         if !seen.insert(id.clone()) {
@@ -165,6 +170,7 @@ fn validate_activation(
     spans: &HashSet<crate::span::Span>,
     carriers: &[super::library_class::ConcernClassMethodSpans],
     framework_shadows: &HashSet<crate::ClassId>,
+    settled: &HashSet<(ClassId, Span)>,
 ) -> IngestResult<()> {
     use std::collections::BTreeMap;
     use super::util::{class_name_path, constant_id_str, constant_path_of,
@@ -274,6 +280,10 @@ fn validate_activation(
             if let Some(items) = app.concern_model_items.get(&id) {
                 for item in items.iter().filter(|item| is_candidate(item)) {
                     let ModelBodyItem::Unknown { expr, .. } = item else { unreachable!() };
+                    // `splice_into_library_includers` supplied or refused it.
+                    if model.is_none() && settled.contains(&(owner.clone(), expr.span)) {
+                        continue;
+                    }
                     let supplied = direct.contains(&id) && model.as_ref().is_some_and(|m| m.body.iter().any(|item| {
                         matches!(item, ModelBodyItem::Unknown { expr: carried, .. } if carried.span == expr.span)
                     }));
@@ -292,12 +302,19 @@ fn validate_activation(
                     if reported.insert(expr.span) {
                         unwrap_or_record::<()>(Err(IngestError::Unsupported {
                             file: app.sources[(expr.span.file.0 - 1) as usize].path.clone(),
-                            message: format!("concern attr_accessor on {}: only direct model inclusion is supported", owner.0),
+                            message: format!(
+                                "concern attr_accessor on {}: only direct model inclusion and plain library-class inclusion are supported",
+                                owner.0
+                            ),
                         }))?;
                     }
                 }
             }
-            if let Some(nested) = includes.get(&id) {
+            // A plain module's own includes ran on that module (itself an
+            // owner here); a Concern's are deferred to this includer.
+            if let Some(nested) = includes.get(&id)
+                && (model.is_some() || deferred.contains(&id))
+            {
                 pending.extend(nested.iter().cloned());
             }
         }
@@ -311,6 +328,7 @@ pub(super) fn validate(
     app: &mut App,
     carriers: &[super::library_class::ConcernClassMethodSpans],
     framework_shadows: &HashSet<crate::ClassId>,
+    settled: &HashSet<(ClassId, Span)>,
 ) -> IngestResult<()> {
     // Include splicing retains the original declaration's file/range,
     // just as ConcernClassMethodSpans identifies consumed carriers.
@@ -331,7 +349,7 @@ pub(super) fn validate(
             Some(expr.span)
         })
         .collect();
-    validate_activation(app, &spans, carriers, framework_shadows)?;
+    validate_activation(app, &spans, carriers, framework_shadows, settled)?;
     let candidates: HashSet<_> = app
         .models
         .iter()
@@ -523,4 +541,176 @@ fn refusals(
         out.push((model_index, refused));
     }
     out
+}
+
+/// The model-only shape refusal [`is_supported`] records. Context
+/// refusals (with_options, unmodeled block statements) are recorded
+/// first, so a candidate carrying only this one is a plain declaration.
+pub(super) const SHAPE_DETAIL: &str =
+    "unsupported accessor shape: only direct, nonempty, literal-Symbol attr_accessor is modeled";
+
+/// A Concern's `included` block runs in the class body of each plain
+/// (non-model) includer: `ActiveSupport::Concern#append_features` is
+/// `base.class_eval(&@_included_block)`. Its literal `attr_reader` /
+/// `attr_writer` / `attr_accessor` declarations therefore define public
+/// ivar accessors on that includer, which is what this supplies.
+///
+/// The base is whoever performed the include: a Concern defers its own
+/// includes to its includer (`@_dependencies`), so they are followed; a
+/// plain module performed its includes on itself, so the accessors land
+/// on that module (an owner here in its own right) and reach its
+/// includers through Ruby's include. A Concern runs once per base.
+///
+/// Returns every (includer, declaration) this settled, supplied or
+/// refused, so the activation check does not report it again; whatever
+/// it did not reach is still refused there.
+pub(super) fn splice_into_library_includers(
+    app: &mut App,
+    sources: &[crate::span::SourceFile],
+    carriers: &[super::library_class::ConcernClassMethodSpans],
+    framework_shadows: &HashSet<ClassId>,
+) -> IngestResult<HashSet<(ClassId, Span)>> {
+    use crate::dialect::{AccessorKind, MethodVisibility};
+
+    let mut settled = HashSet::default();
+    if app.concern_model_items.values().flatten().all(|item| !is_candidate(item)) {
+        return Ok(settled);
+    }
+    // A kept root (`include ::A::B`, where `Owner::A` also exists)
+    // names the same top-level module.
+    let top = |id: &ClassId| ClassId(Symbol::from(id.0.as_str().trim_start_matches("::")));
+    let mut module_includes: HashMap<ClassId, Vec<ClassId>> = HashMap::default();
+    for lc in &app.library_classes {
+        module_includes.entry(lc.name.clone()).or_default().extend(lc.includes.iter().map(top));
+    }
+    let verified =
+        super::class_configuration::verified_framework_concerns(carriers, &module_includes, framework_shadows);
+    let models: HashSet<&ClassId> = app.models.iter().map(|m| &m.name).collect();
+    let mut planned: Vec<(usize, Vec<crate::dialect::MethodDef>)> = Vec::new();
+    let mut refusals: Vec<(Span, String)> = Vec::new();
+    for (index, lc) in app.library_classes.iter().enumerate() {
+        if verified.contains(&lc.name) || models.contains(&lc.name) {
+            continue;
+        }
+        // The Concerns whose blocks run on this base, each once. Their
+        // order is immaterial: every one defines the same ivar accessor.
+        let mut pending: Vec<ClassId> = lc.includes.iter().rev().map(top).collect();
+        let mut seen = HashSet::default();
+        let mut reached = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) || !verified.contains(&id) {
+                continue;
+            }
+            pending.extend(module_includes.get(&id).into_iter().flatten().rev().cloned());
+            reached.push(id);
+        }
+        let candidates: Vec<&Expr> = reached
+            .iter()
+            .filter_map(|id| app.concern_model_items.get(id))
+            .flatten()
+            .filter(|item| is_candidate(item))
+            .map(|item| {
+                let ModelBodyItem::Unknown { expr, .. } = item else { unreachable!() };
+                expr
+            })
+            .filter(|expr| settled.insert((lc.name.clone(), expr.span)))
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let owner = lc.name.0.as_str();
+        let hook = unconsumed_hook_from(lc.includes.iter().map(top).collect(), app);
+        let mut methods: Vec<crate::dialect::MethodDef> = Vec::new();
+        for expr in candidates {
+            let refuse = |detail: String| (expr.span, format!("concern attr_accessor on {owner}: {detail}"));
+            if let Some(DiagnosticKind::Unsupported { construct, detail, .. }) = &expr.diagnostic
+                && detail != SHAPE_DETAIL
+            {
+                refusals.push((expr.span, format!("{construct} on {owner} {detail}")));
+                continue;
+            }
+            if let Some(hook) = &hook {
+                refusals.push(refuse(format!(
+                    "cannot be carried alongside an unconsumed included hook or overridden framework API on {}",
+                    hook.0
+                )));
+                continue;
+            }
+            let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node else {
+                refusals.push(refuse("unsupported accessor shape: only a direct literal-Symbol attr_* call is modeled".into()));
+                continue;
+            };
+            let names: Option<Vec<&Symbol>> = args
+                .iter()
+                .map(|arg| match &*arg.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            let Some(names) = names.filter(|names| !names.is_empty()) else {
+                refusals.push(refuse("unsupported accessor shape: only a direct literal-Symbol attr_* call is modeled".into()));
+                continue;
+            };
+            let (reader, writer) = match method.as_str() {
+                "attr_reader" => (true, false),
+                "attr_writer" => (false, true),
+                _ => (true, true),
+            };
+            for name in names {
+                let mut defs = Vec::new();
+                if reader {
+                    defs.push(super::library_class::synth_attr_reader(&lc.name, name, MethodReceiver::Instance));
+                }
+                if writer {
+                    defs.push(super::library_class::synth_attr_writer(&lc.name, name, MethodReceiver::Instance));
+                }
+                for def in defs {
+                    if methods.iter().any(|m| m.name == def.name) {
+                        continue;
+                    }
+                    // The includer's own definition of the name, or a
+                    // visibility statement naming it, is ordered against
+                    // the `include` in a body this IR no longer keeps in
+                    // sequence. Only an identical public accessor is
+                    // indifferent to that order.
+                    let own = lc.methods.iter().find(|m| m.receiver == MethodReceiver::Instance && m.name == def.name);
+                    let restated = own.is_some_and(|m| {
+                        m.visibility == MethodVisibility::Public
+                            && m.kind == def.kind
+                            && matches!(m.kind, AccessorKind::AttributeReader | AccessorKind::AttributeWriter)
+                            && m.body == def.body
+                    });
+                    let overridden = lc
+                        .visibility_overrides
+                        .iter()
+                        .any(|o| o.receiver == MethodReceiver::Instance && o.name == def.name);
+                    if overridden || (own.is_some() && !restated) {
+                        refusals.push(refuse(format!(
+                            "`{}` is also defined or given a visibility by the includer, which the include's position orders",
+                            def.name.as_str()
+                        )));
+                        continue;
+                    }
+                    if !restated {
+                        methods.push(def);
+                    }
+                }
+            }
+        }
+        if !methods.is_empty() {
+            planned.push((index, methods));
+        }
+    }
+    for (index, methods) in planned {
+        app.library_classes[index].methods.extend(methods);
+    }
+    refusals.sort_by_key(|(span, _)| (span.file.0, span.start));
+    // Before the drain `app.sources` is empty; the snapshot has the
+    // same FileIds.
+    for (span, message) in refusals {
+        let file = span.file.0.checked_sub(1).and_then(|i| sources.get(i as usize))
+            .map_or_else(String::new, |source| source.path.clone());
+        unwrap_or_record::<()>(Err(IngestError::Unsupported { file, message }))?;
+    }
+    Ok(settled)
 }

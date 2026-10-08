@@ -511,13 +511,29 @@ fn unused_accessor_contexts_do_not_reject_an_app() {
     }
 }
 
-/// Accessors are supplied only by direct model splicing. Neither a plain
-/// module nor a non-model class has that replacement for Concern execution.
+/// Accessors reach a model only by direct splicing, and a plain library
+/// class or module (`concern_accessors::splice_into_library_includers`)
+/// as the base that runs the block. A controller, a test class or a
+/// model through a gathering Concern has neither.
 #[test]
 fn non_model_and_indirect_accessor_activations_are_errors() {
     use roundhouse::ingest::survey;
     for body in ["attr_accessor :scratch", "attr_accessor :scratch; private :helper"] {
         let concern = format!("module DraftState\n  extend ActiveSupport::Concern\n  def helper; 'helper'; end\n  included {{ {body} }}\nend\n");
+        // A literal block on a plain base: Ruby defines the accessors on
+        // that base (native check), and so does the ingest.
+        let supplied = |path: &str, owner: &str, source: &str| {
+            if body.contains("private") || path.contains("controllers") || path.starts_with("test/") {
+                return false;
+            }
+            !source.contains("ApplicationRecord") && {
+                let native = std::process::Command::new("ruby").args(["-e", &format!(
+                    "require 'active_support/concern'\n{concern}\n{source}\nabort 'not on {owner}' unless {owner}.instance_method(:scratch=).owner == {owner}"
+                )]).output().unwrap();
+                assert!(native.status.success(), "{source}: {}", String::from_utf8_lossy(&native.stderr));
+                true
+            }
+        };
         for (path, owner, source) in [
             ("app/models/support.rb", "Support", "class Support; include DraftState; end"),
             ("app/models/support.rb", "Support", "module Support; include DraftState; end"),
@@ -540,6 +556,14 @@ fn non_model_and_indirect_accessor_activations_are_errors() {
                 ("app/models/message.rb", "class Message < ApplicationRecord; include SafeDraft; end"),
                 (path, source),
             ]);
+            if supplied(path, owner, source) {
+                let app = ingest_app_from_tree(files).unwrap_or_else(|e| panic!("{source}: {e}"));
+                let lc = app.library_classes.iter().find(|lc| lc.name.0.as_str() == owner).expect(owner);
+                for name in ["scratch", "scratch="] {
+                    assert!(lc.methods.iter().any(|m| m.name.as_str() == name), "{source}: {name} on {owner}");
+                }
+                continue;
+            }
             let error = ingest_app_from_tree(files.clone()).unwrap_err().to_string();
             assert!(error.contains("concern attr_accessor") && error.contains(&format!("on {owner}")), "{source}: {error}");
             survey::activate();
@@ -648,10 +672,13 @@ fn deferred_concern_dependencies_stay_dormant_and_use_lexical_names() {
     assert_eq!(included, ["Scope::DraftState"], "{:?}", model.body);
     let lowered = roundhouse::lower::lower_model_to_library_class(model, &app.schema);
     assert!(!lowered.methods.iter().any(|m| ["scratch", "scratch="].contains(&m.name.as_str())));
+    // The rooted include names the real Concern, whose block defines the
+    // accessor on the plain class that runs it.
     let mut files = files;
     files.insert("app/models/support.rb".into(), b"module Scope; class Support; include ::DraftState; end; end".to_vec());
-    let error = ingest_app_from_tree(files).unwrap_err().to_string();
-    assert!(error.contains("on Scope::Support") && error.contains("concern attr_accessor"), "{error}");
+    let app = ingest_app_from_tree(files).unwrap();
+    let support = app.library_classes.iter().find(|lc| lc.name.0.as_str() == "Scope::Support").unwrap();
+    assert!(support.methods.iter().any(|m| m.name.as_str() == "scratch="), "{:?}", support.methods);
 }
 
 #[test]
