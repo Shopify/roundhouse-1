@@ -202,7 +202,8 @@ const PROBE: &str = r##"class SurfaceProbe
       [post.errors.first.attribute, post.errors.find { |error| error.attribute == :author_id }.full_message,
        post.errors.any? { |error| error.attribute == :base }, post.errors.none? { |error| error.type == :blank },
        post.errors.count { |error| error.attribute == :base }, post.errors.one? { |error| error.attribute == :base },
-       post.errors.all? { |error| error.match?(error.attribute) }, post.errors.find_index { |error| error.attribute == :author_id }]
+       post.errors.all? { |error| error.match?(error.attribute) }, post.errors.find_index { |error| error.attribute == :author_id },
+       post.errors.one?, invalid("").errors.one?, post.errors.all?]
     end
     show(out, "collections of the errors") do
       post = invalid("LOUD")
@@ -276,7 +277,7 @@ const EXPECTED: &[&str] = &[
     r#"details after merge: {title: [{error: :blank}], base: [{error: "no shouting"}], author_id: [{error: "must be set"}]}"#,
     r#"each over the errors: [[:post, :blank, "must exist"], [:title, :too_short, "is too short (minimum is 2 characters)"], [:code, :invalid, "is invalid"], [:kind, :exclusion, "is reserved"], [:pages, :not_a_number, "is not a number"], [:terms, :accepted, "must be accepted"], [:rank, :greater_than, "must be greater than 2"]]"#,
     r#"map over the errors: [["no shouting", "Author must be set"], [[:base, "no shouting"], [:author_id, "must be set"]], [{error: "no shouting"}, {error: "must be set"}], [:base, "no shouting", :author_id, "must be set"]]"#,
-    r#"queries over the errors: [:base, "Author must be set", true, true, 1, true, true, 1]"#,
+    r#"queries over the errors: [:base, "Author must be set", true, true, 1, true, true, 1, false, true, true]"#,
     r#"collections of the errors: [["no shouting"], ["must be set"], ["must be set"], {base: ["no shouting"], author_id: ["must be set"]}, {base: "no shouting", author_id: "must be set"}, [:author_id, :base], 2, [:base, :author_id], ["no shouting", "must be set"]]"#,
     r#"queries by attribute: [true, false, true, true, false, true, false, true, true, false, true, [:too_short], 1, 0, ["is reserved"], ["Code is invalid"], true, "Post is odd", "is odd"]"#,
     r#"queries on text messages: [true, true, false, ["no shouting"]]"#,
