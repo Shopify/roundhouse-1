@@ -2061,11 +2061,19 @@ impl<'a> BodyTyper<'a> {
             // reach in, and `self` is the anonymous class's instance,
             // which nothing types. Params are Untyped except where a
             // non-nil literal default types one. Its value is the name.
+            // The ivars it reads are that untyped instance's, so they are
+            // Untyped too (Core's `fo.instance_exec do def destroyed?;
+            // @destroyed; end end`), unless the body assigns one first.
             ExprNode::MethodDefExpr { def } => {
                 let mut inner = ctx.clone();
                 inner.local_bindings.clear();
                 inner.class_objects.clear();
                 inner.ivar_bindings.clear();
+                let mut ivars = Vec::new();
+                ivars_of_untyped_self(&def.body, &mut ivars);
+                for name in ivars {
+                    inner.ivar_bindings.insert(name, Ty::Untyped);
+                }
                 inner.self_ty = Some(Ty::Untyped);
                 inner.lexical_self = None;
                 inner.annotate_self_dispatch = false;
@@ -6028,4 +6036,19 @@ fn block_default_ty(default: &Expr, ty: Ty) -> Ty {
         ExprNode::Lit { value } if !matches!(value, crate::expr::Literal::Nil) => ty,
         _ => Ty::Untyped,
     }
+}
+
+/// The ivars `expr` reads or writes, short of a nested expression-position
+/// `def`, whose own self they would be.
+fn ivars_of_untyped_self(expr: &Expr, out: &mut Vec<crate::ident::Symbol>) {
+    match &*expr.node {
+        ExprNode::MethodDefExpr { .. } => return,
+        ExprNode::Ivar { name } | ExprNode::Assign { target: LValue::Ivar { name }, .. } => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        _ => {}
+    }
+    expr.node.for_each_child(&mut |child| ivars_of_untyped_self(child, out));
 }
