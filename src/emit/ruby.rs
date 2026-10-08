@@ -135,7 +135,20 @@ pub fn emit_method(m: &MethodDef) -> String {
     if let Some(mk) = source_markers::marker_for(&m.name_span).or_else(|| body_marker.clone()) {
         writeln!(out, "{mk}").unwrap();
     }
-    writeln!(out, "def {prefix}{}{}", m.name, params).unwrap();
+    // A name no `def` can spell (`define_method("tag:unit") do … end`,
+    // `class_body_define_method`) is defined the way the source did:
+    // the block is the body, with the same formals and lambda arity.
+    let spelled = def_spellable(m.name.as_str());
+    if spelled {
+        writeln!(out, "def {prefix}{}{}", m.name, params).unwrap();
+    } else {
+        let definer = match m.receiver {
+            MethodReceiver::Instance => "define_method",
+            MethodReceiver::Class => "define_singleton_method",
+        };
+        let block_params = if ps.is_empty() { String::new() } else { format!(" |{}|", ps.join(", ")) };
+        writeln!(out, "{definer}({}) do{block_params}", expr::ruby_sym_literal(m.name.as_str())).unwrap();
+    }
     if let Some(mk) = body_marker {
         writeln!(out, "{mk}").unwrap();
     }
@@ -160,6 +173,14 @@ pub fn emit_method(m: &MethodDef) -> String {
     }
     out.push_str("end\n");
     out
+}
+
+/// Whether `def <name>` parses as a method named `name`: an identifier
+/// (a trailing `?`, `!` or `=` allowed) or an operator method. A Symbol
+/// literal that needs quotes (`:"tag:unit"`) names one only
+/// `define_method` can define.
+pub(crate) fn def_spellable(name: &str) -> bool {
+    !name.starts_with(['@', '$']) && !expr::ruby_sym_literal(name).starts_with(":\"")
 }
 
 /// Emit library-shape Ruby — for transpiled-shape input where class

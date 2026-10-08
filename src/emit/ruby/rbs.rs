@@ -188,7 +188,13 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
         _ => render_untyped_fallback(m),
     };
     CLASS_SIDE_SIG.with(|c| c.set(prev));
-    format!("def {receiver_prefix}{}: {sig}", m.name.as_str())
+    // RBS quotes a method name an identifier cannot spell in backticks
+    // (`define_method("tag:unit")`).
+    if crate::emit::ruby::def_spellable(m.name.as_str()) {
+        format!("def {receiver_prefix}{}: {sig}", m.name.as_str())
+    } else {
+        format!("def {receiver_prefix}`{}`: {sig}", m.name.as_str())
+    }
 }
 
 fn render_untyped_fallback(m: &MethodDef) -> String {

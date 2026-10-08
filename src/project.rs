@@ -1432,8 +1432,21 @@ fn reject_block_signatures(app: &App, target: BuildTarget) -> Result<(), String>
     let mut found = false;
     let mut f = |e: &crate::expr::Expr| visit(e, e.span, target.as_str(), &mut found);
     crate::lower::for_each_emit_body_ref(app, &mut f);
+    // A method only `define_method` can name (`define_method("tag:unit")
+    // do … end`, `ingest::library_class::class_body_define_method`): these
+    // targets spell a method's name as an identifier.
+    for lc in &app.library_classes {
+        for m in lc.methods.iter().filter(|m| !crate::emit::ruby::def_spellable(m.name.as_str())) {
+            found = true;
+            crate::emit::diagnostics::report_unsupported(
+                m.name_span, target.as_str(), "define_method_name",
+                &format!("`define_method({:?})` in `{}`: a method name no `def` can spell is not implemented on this target; use Ruby instead",
+                    m.name.as_str(), lc.name.0.as_str()),
+            );
+        }
+    }
     if found {
-        return Err(format!("{}: optional/keyword block parameters or a `def` inside a block are not supported; use Ruby instead", target.as_str()));
+        return Err(format!("{}: optional/keyword block parameters, a `def` inside a block or a method name only `define_method` can spell are not supported; use Ruby instead", target.as_str()));
     }
     Ok(())
 }

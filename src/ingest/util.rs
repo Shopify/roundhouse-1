@@ -790,6 +790,9 @@ fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
             || super::visibility::wrapped_declaration(&stmt).is_some_and(|call| {
                 constant_id_str(&call.name()).starts_with("attr_")
             })
+            // `define_method(:name) do … end` defines a method too
+            // (`library_class::class_body_define_method`).
+            || super::visibility::define_method_name(&stmt).is_some()
         {
             return true;
         }
