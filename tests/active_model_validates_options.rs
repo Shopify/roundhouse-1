@@ -1076,3 +1076,84 @@ end
     }
     assert_eq!(errors.len(), 7, "{}", errors.join("\n"));
 }
+
+/// A tableless subclass's own declarations run for the subclass only,
+/// after the ones it inherits, and a sibling without any sees none; a
+/// subclass of a class that declares none still validates.
+const SHAPE: &str = r##"class Shape
+  include ActiveModel::Validations
+
+  attr_reader :name, :sides
+
+  validates :name, presence: true
+
+  def initialize(name: "s", sides: 3)
+    @name = name
+    @sides = sides
+  end
+end
+"##;
+
+const SQUARE: &str = r##"class Square < Shape
+  validates :sides, numericality: { equal_to: 4 }
+  validate do
+    errors.add(:base, "Squares are named") if name == "s"
+  end
+end
+"##;
+
+const BLOB: &str = "class Blob < Shape\nend\n";
+
+const PLAIN: &str = r##"class Plain
+  include ActiveModel::Validations
+
+  attr_reader :size
+
+  def initialize(size: 1)
+    @size = size
+  end
+end
+"##;
+
+const SIZED: &str = "class Sized < Plain\n  validates :size, numericality: { less_than: 5 }\nend\n";
+
+const SHAPE_PROBE: &str = r##"class Probe
+  #: -> Array[String]
+  def self.lines
+    [
+      Observe.line("shape", Shape.new(sides: 4)),
+      Observe.line("shape blank", Shape.new(name: nil)),
+      Observe.line("square", Square.new(name: "sq", sides: 4)),
+      Observe.line("square wrong", Square.new(name: nil, sides: 3)),
+      Observe.line("blob", Blob.new(name: nil, sides: 9)),
+      Observe.line("sized", Sized.new(size: 2)),
+      Observe.line("sized big", Sized.new(size: 9)),
+      Observe.line("plain big", Plain.new(size: 9)),
+    ]
+  end
+end
+"##;
+
+#[test]
+fn subclass_validations_answer_like_activemodel() {
+    same_as_activemodel_with(
+        &[
+            ("app/models/shape.rb", SHAPE),
+            ("app/models/square.rb", SQUARE),
+            ("app/models/blob.rb", BLOB),
+            ("app/models/plain.rb", PLAIN),
+            ("app/models/sized.rb", SIZED),
+        ],
+        SHAPE_PROBE,
+        &[
+            r#"shape: true []"#,
+            r#"shape blank: false ["Name can't be blank"]"#,
+            r#"square: true []"#,
+            r#"square wrong: false ["Name can't be blank", "Sides must be equal to 4"]"#,
+            r#"blob: false ["Name can't be blank"]"#,
+            r#"sized: true []"#,
+            r#"sized big: false ["Size must be less than 5"]"#,
+            r#"plain big: true []"#,
+        ],
+    );
+}

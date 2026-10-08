@@ -110,8 +110,10 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
 
 /// Does the fold claim `call` (a lifecycle declaration whose every
 /// argument is a bare symbol)? `check` asks, before the pass runs.
+/// A validation declaration is answered by the sibling pass
+/// (`sti_subclass_validations`), which reports what it cannot lower.
 pub(crate) fn folds(call: &Expr) -> bool {
-    fold_targets(call).is_some()
+    fold_targets(call).is_some() || super::sti_subclass_validations::claims(call)
 }
 
 /// The hook and target methods of a declaration the fold claims. Every

@@ -49,7 +49,7 @@ pub mod class_eval_macro;
 pub mod delegate;
 pub mod thread_mattr;
 pub mod model;
-mod validates;
+pub(crate) mod validates;
 mod delegated_type;
 mod load_hook_includes;
 mod model_macros;

@@ -604,6 +604,12 @@ pub enum ValidationRule {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         with_record: bool,
     },
+    /// `validate SomeValidations.new`: an object ActiveSupport::Callbacks
+    /// calls as `object.validate(record)`. Rails evaluates the argument
+    /// once, in the class body; the lowered `validate` evaluates it on
+    /// each run, so ingest admits only an expression that does not read
+    /// `self` (a constant, `Const.new(...)`).
+    Object { object: Expr },
     /// `comparison:`: each check in the order the options were written,
     /// its bound resolved per run (a value, a Symbol method, a Proc).
     Comparison { checks: Vec<NumericCheck> },
@@ -773,6 +779,10 @@ pub struct RuleOptions {
     /// validation context is one of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub except_on: Vec<Symbol>,
+    /// `prepend: true` (`validate` / `validates_with`): the callback goes
+    /// to the front of the chain, ahead of the ones declared before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepend: bool,
 }
 
 /// ActiveModel's and ActiveRecord's English error messages (their

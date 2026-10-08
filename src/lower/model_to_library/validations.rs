@@ -24,16 +24,153 @@ use crate::ty::Ty;
 
 use super::{fn_sig, seq};
 
+/// The class whose class body declares a set of validations, as the
+/// checks lowered from them see it: `model_name` for `%{model}` and the
+/// I18n lookup, and the class a `uniqueness:` check queries.
+pub(crate) struct Declarer {
+    /// The declaring class (a model, or an STI subclass of one).
+    pub name: ClassId,
+    /// `lookup_ancestors`' `model_name.i18n_key`s, the declaring class
+    /// first: ActiveRecord walks up to the `base_class`, so an STI
+    /// subclass's missing translation names its own keys, then its
+    /// parents' up to the base.
+    pub i18n_keys: Vec<String>,
+    /// The class `uniqueness:` asks (`find_finder_class_for`).
+    pub finder: Finder,
+}
+
+/// The relation a `uniqueness:` check starts from. Rails walks from the
+/// record's class up to the class that declared the validation, and the
+/// last non-abstract one found is the finder; its `unscoped` relation
+/// keeps an STI subclass's type condition.
+pub(crate) enum Finder {
+    /// An abstract declaring class: the record's own class answers.
+    RecordClass,
+    /// The declaring class, with `type IN (...)` when it is an STI
+    /// subclass (itself and every subclass below it).
+    Declaring { class: ClassId, type_names: Vec<String> },
+}
+
+impl Declarer {
+    /// A model declaring its own validations.
+    pub(crate) fn model(model: &Model) -> Self {
+        Declarer {
+            name: model.name.clone(),
+            i18n_keys: vec![crate::naming::underscore(model.name.0.as_str())],
+            finder: if super::markers::is_abstract_class(model) {
+                Finder::RecordClass
+            } else {
+                Finder::Declaring { class: model.name.clone(), type_names: Vec::new() }
+            },
+        }
+    }
+}
+
 pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) {
+    let declarer = Declarer::model(model);
+    let mut stmts = validation_statements(model, model.spanned_validations(), &declarer);
+
+    // Rails 5+ default: every `belongs_to` requires the associated
+    // record to exist before save. Emit `validates_belongs_to(:assoc,
+    // @<fk>, <Target>)` per non-optional belongs_to. The runtime
+    // helper short-circuits when the FK is unset (nil/0) and queries
+    // `<Target>.exists?(fk_value)` otherwise.
+    for (span, assoc) in model.spanned_associations() {
+        if let Association::BelongsTo {
+            name, target, foreign_key, optional: false, polymorphic, ..
+        } = assoc
+        {
+            let mut check =
+                inline_belongs_to_check(name, foreign_key, target, *polymorphic);
+            check.inherit_span(span);
+            stmts.push(check);
+        }
+    }
+
+    stmts.extend(secure_password_checks(model));
+
+    if stmts.is_empty() {
+        // A tableless model (it includes ActiveModel::Validations or
+        // ::Model) answers `valid?` / `errors` with no rules of its own,
+        // and its subclasses' `validate` extends this one.
+        let defines_validate = model.body.iter().any(|item| matches!(
+            item,
+            crate::dialect::ModelBodyItem::Method { method, .. }
+                if method.name.as_str() == "validate" && method.receiver == MethodReceiver::Instance
+        ));
+        if model.parent.is_none() && !defines_validate {
+            let nil = Expr::new(model.span, ExprNode::Lit { value: Literal::Nil });
+            methods.push(validate_method_def(&model.name, vec![nil]));
+            push_active_model_validation_surface(methods, model);
+        }
+        return;
+    }
+
+    methods.push(validate_method_def(&model.name, stmts));
+
+    // A validating model OUTSIDE the ActiveRecord hierarchy (`class
+    // Search` + `include ActiveModel::Validations`, no superclass)
+    // can't inherit `valid?`/`errors` from the runtime Base —
+    // synthesize the same pair here. Skipped when the source defines
+    // either name itself.
+    if model.parent.is_none() {
+        push_active_model_validation_surface(methods, model);
+    }
+}
+
+/// `def validate; <stmts>; end` on `owner`.
+pub(crate) fn validate_method_def(owner: &ClassId, stmts: Vec<Expr>) -> MethodDef {
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from("validate"),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body: seq(stmts),
+        signature: Some(fn_sig(vec![], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// The checks `validations` (each with its declaration's span) lower
+/// to, against `model`'s attributes and associations and as `declarer`
+/// declares them, `prepend: true` ones first.
+pub(crate) fn validation_statements<'v>(
+    model: &Model,
+    validations: impl Iterator<Item = (Span, &'v crate::dialect::Validation)>,
+    declarer: &Declarer,
+) -> Vec<Expr> {
+    let (mut front, rest) = validation_statements_split(model, validations, declarer);
+    front.extend(rest);
+    front
+}
+
+/// [`validation_statements`] as (`prepend: true` checks, the rest). A
+/// prepended callback goes to the front of the chain when it is
+/// declared, ahead of every one before it (an STI subclass's ahead of
+/// the ones it inherits), so a later prepend runs before an earlier one.
+/// An STI subclass passes its base model and its own declarations.
+pub(crate) fn validation_statements_split<'v>(
+    model: &Model,
+    validations: impl Iterator<Item = (Span, &'v crate::dialect::Validation)>,
+    declarer: &Declarer,
+) -> (Vec<Expr>, Vec<Expr>) {
+    let mut front: Vec<Expr> = Vec::new();
     let mut stmts: Vec<Expr> = Vec::new();
     // `model_name.human`, which a `message:` reads as `%{model}`.
-    let model_human = humanize(&crate::naming::underscore(crate::naming::demodulize(model.name.0.as_str())));
-    // `model_name.i18n_key` and the I18n scope, which a Symbol
-    // `message:` with no English translation names.
-    let i18n_key = crate::naming::underscore(model.name.0.as_str());
+    let model_human = humanize(&crate::naming::underscore(crate::naming::demodulize(declarer.name.0.as_str())));
+    // The I18n scope, which a Symbol `message:` with no English
+    // translation names.
     let i18n_scope = if model.parent.is_some() { "activerecord" } else { "activemodel" };
 
-    for (span, v) in model.spanned_validations() {
+    for (span, v) in validations {
         // Column type from the model's attributes row (when present).
         // Lets the per-rule generator skip dead `is_a?(Array)` branches
         // for fields the schema declares as `Str` — tsc narrows
@@ -70,7 +207,7 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
             let text = ErrorText {
                 attr: &v.attribute,
                 model_human: &model_human,
-                i18n_key: &i18n_key,
+                i18n_keys: &declarer.i18n_keys,
                 i18n_scope,
                 message: options.and_then(|o| o.message.as_ref()).or(own_message.as_ref()),
             };
@@ -92,69 +229,30 @@ pub(super) fn push_validate_method(methods: &mut Vec<MethodDef>, model: &Model) 
                 (vec![check], reader)
             } else {
                 let value = if any_assoc { reader } else { ivar(&v.attribute) };
-                (validation_rule_to_calls(model, &v.attribute, rule, attr_ty, &value, &text), value)
+                (validation_rule_to_calls(model, &declarer.finder, &v.attribute, rule, attr_ty, &value, &text), value)
             };
+            let prepend = options.is_some_and(|o| o.prepend);
             let checks = match options {
                 Some(o) => guard_rule(value, checks, o),
                 None => checks,
             };
-            for mut check in checks {
-                // Each expanded check attributes to its `validates` line.
-                check.inherit_span(span);
-                stmts.push(check);
+            let mut checks: Vec<Expr> = checks
+                .into_iter()
+                .map(|mut check| {
+                    // Each expanded check attributes to its `validates` line.
+                    check.inherit_span(span);
+                    check
+                })
+                .collect();
+            if prepend {
+                checks.append(&mut front);
+                front = checks;
+            } else {
+                stmts.extend(checks);
             }
         }
     }
-
-    // Rails 5+ default: every `belongs_to` requires the associated
-    // record to exist before save. Emit `validates_belongs_to(:assoc,
-    // @<fk>, <Target>)` per non-optional belongs_to. The runtime
-    // helper short-circuits when the FK is unset (nil/0) and queries
-    // `<Target>.exists?(fk_value)` otherwise.
-    for (span, assoc) in model.spanned_associations() {
-        if let Association::BelongsTo {
-            name, target, foreign_key, optional: false, polymorphic, ..
-        } = assoc
-        {
-            let mut check =
-                inline_belongs_to_check(name, foreign_key, target, *polymorphic);
-            check.inherit_span(span);
-            stmts.push(check);
-        }
-    }
-
-    stmts.extend(secure_password_checks(model));
-
-    if stmts.is_empty() {
-        return;
-    }
-
-    methods.push(MethodDef {
-        visibility: crate::dialect::MethodVisibility::Public,
-        unsupported_formals: None,
-        has_anonymous_block: false,
-        name_span: crate::span::Span::synthetic(),
-        name: Symbol::from("validate"),
-        receiver: MethodReceiver::Instance,
-        params: Vec::new(),
-        body: seq(stmts),
-        signature: Some(fn_sig(vec![], Ty::Nil)),
-        effects: EffectSet::default(),
-        enclosing_class: Some(model.name.0.clone()),
-        kind: AccessorKind::Method,
-        is_async: false,
-            mutates_self: false,
-            block_param: None,
-    });
-
-    // A validating model OUTSIDE the ActiveRecord hierarchy (`class
-    // Search` + `include ActiveModel::Validations`, no superclass)
-    // can't inherit `valid?`/`errors` from the runtime Base —
-    // synthesize the same pair here. Skipped when the source defines
-    // either name itself.
-    if model.parent.is_none() {
-        push_active_model_validation_surface(methods, model);
-    }
+    (front, stmts)
 }
 
 /// The validations `has_secure_password` adds unless it is written
@@ -305,7 +403,7 @@ fn declares_before_validation(model: &Model) -> bool {
 
 /// `valid?` + `errors` mirroring the runtime Base implementations,
 /// for `include ActiveModel::Validations` classes with no superclass.
-fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Model) {
+pub(crate) fn push_active_model_validation_surface(methods: &mut Vec<MethodDef>, model: &Model) {
     let defines = |name: &str| {
         model.body.iter().any(|item| matches!(
             item,
@@ -500,6 +598,7 @@ fn uses_validation_context(model: &Model) -> bool {
 /// `value` parameter (no block-yield, no `instance_variable_get`).
 fn validation_rule_to_calls(
     model: &Model,
+    finder: &Finder,
     attr: &Symbol,
     rule: &ValidationRule,
     attr_ty: Option<&Ty>,
@@ -525,6 +624,12 @@ fn validation_rule_to_calls(
         ValidationRule::Comparison { checks } => inline_comparison_check(attr, value, checks, text),
         // `validate do ... end`: the block, called inside the record's
         // method (its `self`, as under `instance_exec`).
+        // `validate SomeValidations.new` → `<object>.validate(self)`.
+        ValidationRule::Object { object } => vec![send(
+            object.clone(),
+            "validate",
+            vec![Expr::new(Span::synthetic(), ExprNode::SelfRef)],
+        )],
         ValidationRule::Block { callable, with_record } => {
             let args = if *with_record { vec![Expr::new(Span::synthetic(), ExprNode::SelfRef)] } else { Vec::new() };
             vec![Expr::new(
@@ -556,7 +661,9 @@ fn validation_rule_to_calls(
         // a weaker check here would pass records Rails rejects.
         ValidationRule::Unsupported { .. } => Vec::new(),
         // `push_validate_method` unwraps the options before asking.
-        ValidationRule::Guarded { rule, .. } => validation_rule_to_calls(model, attr, rule, attr_ty, value, text),
+        ValidationRule::Guarded { rule, .. } => {
+            validation_rule_to_calls(model, finder, attr, rule, attr_ty, value, text)
+        }
         // `validate :validate_url` — a method the model defines, which
         // adds to `errors` itself. The synthesized `validate` just
         // calls it; everything else about the shape (when it runs, what
@@ -647,7 +754,7 @@ fn validation_rule_to_calls(
         // Reported by `roundhouse check`: there is no table to ask.
         ValidationRule::Uniqueness { .. } if model.parent.is_none() => Vec::new(),
         ValidationRule::Uniqueness { scope, case_sensitive, conditions } => {
-            inline_uniqueness_check(model, attr, attr_ty, scope, *case_sensitive, conditions.as_ref(), text)
+            inline_uniqueness_check(model, finder, attr, attr_ty, scope, *case_sensitive, conditions.as_ref(), text)
         }
     }
 }
@@ -1110,6 +1217,7 @@ fn inline_length_of_check(
 /// value is `IS NULL` either way. A `belongs_to` names its foreign key.
 fn inline_uniqueness_check(
     model: &Model,
+    finder: &Finder,
     attr: &Symbol,
     attr_ty: Option<&Ty>,
     scope: &[Symbol],
@@ -1137,8 +1245,14 @@ fn inline_uniqueness_check(
         vec![name.clone()]
     };
     let rel = Symbol::from(format!("{}_relation", attr.as_str()));
-    let model_class = send(Expr::new(s, ExprNode::SelfRef), "class", vec![]);
-    let base = Expr::new(
+    let model_class = match finder {
+        Finder::RecordClass => send(Expr::new(s, ExprNode::SelfRef), "class", vec![]),
+        Finder::Declaring { class, .. } => Expr::new(
+            s,
+            ExprNode::Const { path: class.0.as_str().split("::").map(Symbol::from).collect() },
+        ),
+    };
+    let relation = Expr::new(
         s,
         ExprNode::Send {
             recv: Some(Expr::new(
@@ -1151,6 +1265,19 @@ fn inline_uniqueness_check(
             parenthesized: true,
         },
     );
+    // An STI subclass's relation keeps its type condition: the rows of
+    // the subclass and of every class below it.
+    let base = match finder {
+        Finder::Declaring { type_names, .. } if !type_names.is_empty() => {
+            let names = type_names
+                .iter()
+                .map(|n| Expr::new(s, ExprNode::Lit { value: Literal::Str { value: n.clone() } }))
+                .collect();
+            let list = Expr::new(s, ExprNode::Array { elements: names, style: ArrayStyle::Brackets });
+            send(relation, "where", vec![hash(vec![(sym("type"), list)])])
+        }
+        _ => relation,
+    };
     // The attribute itself: a belongs_to binds its foreign key only.
     let own_col = columns(attr).into_iter().next().expect("one column");
     let own_value = ivar(&own_col);
@@ -1540,7 +1667,7 @@ pub(super) enum Count {
 pub(super) struct ErrorText<'a> {
     attr: &'a Symbol,
     model_human: &'a str,
-    i18n_key: &'a str,
+    i18n_keys: &'a [String],
     i18n_scope: &'a str,
     message: Option<&'a RuleMessage>,
 }
@@ -1647,15 +1774,19 @@ impl ErrorText<'_> {
     fn push_type(&self, kind: &str, count: Option<&Count>, value: &dyn Fn() -> Expr) -> Expr {
         let Some((one, other)) = crate::dialect::active_model_en_message(kind) else {
             let attr = self.attr.as_str();
-            let (scope, model) = (self.i18n_scope, self.i18n_key);
-            let missing = format!(
-                "Translation missing. Options considered were:\n\
-                 - en.{scope}.errors.models.{model}.attributes.{attr}.{kind}\n\
-                 - en.{scope}.errors.models.{model}.{kind}\n\
-                 - en.{scope}.errors.messages.{kind}\n\
-                 - en.errors.attributes.{attr}.{kind}\n\
-                 - en.errors.messages.{kind}"
-            );
+            let scope = self.i18n_scope;
+            let mut missing = String::from("Translation missing. Options considered were:");
+            for model in self.i18n_keys {
+                missing.push_str(&format!(
+                    "\n- en.{scope}.errors.models.{model}.attributes.{attr}.{kind}\
+                     \n- en.{scope}.errors.models.{model}.{kind}"
+                ));
+            }
+            missing.push_str(&format!(
+                "\n- en.{scope}.errors.messages.{kind}\
+                 \n- en.errors.attributes.{attr}.{kind}\
+                 \n- en.errors.messages.{kind}"
+            ));
             return errors_push(format!("{} {missing}", humanize(attr)));
         };
         match (one, count) {
@@ -1984,7 +2115,8 @@ mod tests {
     }
 
     fn plain(attr: &Symbol) -> ErrorText<'_> {
-        ErrorText { attr, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: None }
+        let keys: &'static [String] = Box::leak(vec![String::from("post")].into_boxed_slice());
+        ErrorText { attr, model_human: "Post", i18n_keys: keys, i18n_scope: "activerecord", message: None }
     }
 
     #[test]
@@ -2023,7 +2155,7 @@ mod tests {
     fn presence_message_replaces_the_default_text() {
         let a = attr();
         let message = RuleMessage::Text { text: "must be given".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", message: Some(&message) };
         let expr = inline_presence_check(&a, None, &text);
         assert_eq!(collect_error_messages(&expr), vec!["Title must be given"]);
     }
@@ -2075,7 +2207,7 @@ mod tests {
     fn length_message_interpolates_count() {
         let a = attr();
         let message = RuleMessage::Text { text: "needs %{count} for %{model}".into() };
-        let text = ErrorText { attr: &a, model_human: "Post", i18n_key: "post", i18n_scope: "activerecord", message: Some(&message) };
+        let text = ErrorText { attr: &a, model_human: "Post", i18n_keys: &[String::from("post")], i18n_scope: "activerecord", message: Some(&message) };
         let exprs = inline_length_check(&a, None, Some(4), &text, None);
         let msgs: Vec<String> = exprs.iter().flat_map(collect_error_messages).collect();
         assert_eq!(msgs, vec!["Title needs 4 for Post"]);

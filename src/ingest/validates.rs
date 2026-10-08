@@ -413,8 +413,8 @@ pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -
                 Err(detail) => return gap(format!("`{k}:` {detail}")),
             },
             "prepend" => match super::util::bool_value(v) {
-                Some(false) => {}
-                _ => return gap("`prepend:` (the callback runs before the validations declared earlier)".into()),
+                Some(prepend) => guard.prepend = prepend,
+                None => return gap("`prepend:` that is not `true` or `false`".into()),
             },
             // `validates_with` hands every option to the validator.
             _ if name == "validates_with" => {}
@@ -488,7 +488,13 @@ pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -
             }
             let expr = ingest_expr(a, file)?;
             let Some((lambda, _)) = callable(&expr) else {
-                return gap("an argument that is not a Symbol, a lambda/proc literal or a block".into());
+                // An object the callback chain calls `validate(record)`
+                // on (`validate Inventory::Validations::Group.new`).
+                if reads_self(&expr) {
+                    return gap("an object argument that reads `self` (evaluated in the class body)".into());
+                }
+                rules.push(ValidationRule::Object { object: expr });
+                continue;
             };
             let lambda = match &*lambda.node {
                 ExprNode::Send { block: Some(b), .. } => b.clone(),
@@ -509,10 +515,46 @@ pub(super) fn parse_validate_call(call: &ruby_prism::CallNode<'_>, file: &str) -
     Ok(Some(Validation { attribute, rules }))
 }
 
+/// The validations the class-body statement at `start..end` of `text`
+/// declares, read again from its source; `None` when it declares none.
+///
+/// An STI subclass declares no table, so ingest keeps it as a library
+/// class and its body statements as expressions, while the readers here
+/// read Prism nodes. The statement is re-parsed alone at its own
+/// offsets (every other byte blanked, newlines kept), so the spans and
+/// line numbers of what it reads stay those of the file.
+pub(crate) fn validations_in_source(
+    text: &str,
+    path: &str,
+    start: usize,
+    end: usize,
+) -> Option<IngestResult<Vec<Validation>>> {
+    let bytes = text.as_bytes();
+    if start >= end || end > bytes.len() {
+        return None;
+    }
+    let alone: Vec<u8> = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| if (i < start || i >= end) && b != b'\n' { b' ' } else { b })
+        .collect();
+    let result = super::prism::parse_silent(&alone);
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let stmt = program.statements().body().iter().find(|s| s.location().start_offset() == start)?;
+    let call = stmt.as_call_node()?;
+    match parse_validate_call(&call, path) {
+        Ok(Some(validation)) => return Some(Ok(vec![validation])),
+        Err(e) => return Some(Err(e)),
+        Ok(None) => {}
+    }
+    parse_validation_call(&call, path).transpose()
+}
+
 /// A `validate` block or lambda (an `ExprNode::Lambda`) as the rule
 /// that calls it inside the record's method: `self` is the record there
 /// as under `instance_exec`, and a one-parameter block gets the record.
-fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
+pub(crate) fn block_callable(lambda: Expr) -> Result<ValidationRule, String> {
     let ExprNode::Lambda { params, rest_param, block_param, .. } = &*lambda.node else {
         return Err("a block that is not a plain block".into());
     };

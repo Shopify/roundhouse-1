@@ -23,8 +23,10 @@ DDL = [
   'CREATE TABLE "shops" ("id" bigserial PRIMARY KEY, "name" character varying)',
   'CREATE TABLE "handles" ("id" bigserial PRIMARY KEY, "handle" character varying, "code" character varying, ' \
     '"shop_id" bigint, "is_deleted" boolean DEFAULT FALSE NOT NULL, "rank" integer)',
+  'CREATE TABLE "badges" ("id" bigserial PRIMARY KEY, "name" character varying, "code" character varying, ' \
+    '"type" character varying)',
 ].freeze
-MODELS = %w[application_record shop handle uniq_probe].freeze
+MODELS = %w[application_record shop handle badge gold_badge platinum_badge silver_badge uniq_probe].freeze
 
 def admin(options)
   conn = PG.connect(**options)

@@ -95,10 +95,10 @@ end
 }
 
 /// `on:` narrows a validation to one persistence context. Running it
-/// unconditionally would reject records Rails accepts, so the call is
-/// left where it was rather than promoted — campfire's `Room` writes
-/// exactly this shape (`validate :direct_rooms_keep_their_type, on:
-/// :update`).
+/// unconditionally would reject records Rails accepts, so the call runs
+/// only when the validation context is that one — campfire's `Room`
+/// writes exactly this shape (`validate :direct_rooms_keep_their_type,
+/// on: :update`).
 #[test]
 fn a_validate_carrying_on_is_not_promoted_to_an_always_on_check() {
     let src = emitted(
@@ -112,8 +112,11 @@ end
 "#,
     );
     let synthesized = src.split("def validate\n").nth(1).unwrap_or("");
+    let body = synthesized.split("\n  end\n").next().unwrap_or("");
+    let calls: Vec<&str> = body.lines().filter(|l| l.contains("type_is_unchanged")).collect();
     assert!(
-        !synthesized.contains("type_is_unchanged"),
+        calls.len() == 1
+            && calls[0].trim() == "self.type_is_unchanged if [:update].intersect?(Array(validation_context))",
         "an `on:`-narrowed validation must not run unconditionally:\n{src}",
     );
 }

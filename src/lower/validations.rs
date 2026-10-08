@@ -220,7 +220,10 @@ fn expand_rule(rule: &ValidationRule, out: &mut Vec<Check>) {
         // The validator class is a Ruby-family runtime port
         // (runtime/spinel/active_model_validator.rb); the check tables
         // have no shape for it.
-        ValidationRule::With { .. } | ValidationRule::Block { .. } | ValidationRule::Comparison { .. } => {}
+        ValidationRule::With { .. }
+        | ValidationRule::Block { .. }
+        | ValidationRule::Object { .. }
+        | ValidationRule::Comparison { .. } => {}
     }
 }
 
