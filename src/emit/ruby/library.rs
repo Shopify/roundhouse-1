@@ -9707,7 +9707,8 @@ fn is_model_or_library_class(name: &str, app: &App) -> bool {
 
 /// Whether `lc` is written in a gem the app compiles as source
 /// (roundhouse.yml `gem_sources:`, `App::gem_source_dirs`): the first
-/// real span of its methods or constants falls in one of those dirs.
+/// real span of its methods, constants, superclass or class-body calls
+/// falls in one of those dirs.
 fn declared_in_gem_source(lc: &LibraryClass, app: &App) -> bool {
     if app.gem_source_dirs.is_empty() {
         return false;
@@ -9718,6 +9719,7 @@ fn declared_in_gem_source(lc: &LibraryClass, app: &App) -> bool {
         .map(|m| m.name_span)
         .chain(lc.constants.iter().map(|(_, v)| v.span))
         .chain(std::iter::once(lc.parent_span))
+        .chain(lc.unknown_calls.iter().map(|c| c.span))
         .find(|s| !s.is_synthetic());
     let Some(source) = span.and_then(|s| (s.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i))) else {
         return false;
@@ -9748,7 +9750,14 @@ fn declared_in_gem_source(lc: &LibraryClass, app: &App) -> bool {
 ///   `class << self; attr_accessor :require_name; end` and then runs
 ///   `self.require_name = true` (dropped, `CreditCard.require_name` was
 ///   nil, and a card with no name passed validation). One through its
-///   own writer is written after the methods (`OwnClassCalls`).
+///   own writer is written after the methods (`OwnClassCalls`). Or a
+///   writer the `self.included(base)` hook of a module the class or an
+///   app superclass includes may define on `base` at the include, in a
+///   hook the emit writes as text (`included_hook_may_define`): Ruby runs
+///   that hook at the include, as the emitted tree does, and the write
+///   after it. A hook with computed names (`NAMES.each { |n|
+///   base.class_attribute n }`) is not expanded by
+///   `ingest::hook_class_attribute`, so no app method answers the writer.
 ///
 /// `private_constant` stays dropped: the emitter qualifies constant reads
 /// (`Worldwide::Currencies::X`), which a private constant refuses.
@@ -9768,6 +9777,7 @@ fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr>
     };
     let implicit_self = |r: &Option<Expr>| r.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
     let symbol = |e: &Expr| matches!(&*e.node, ExprNode::Lit { value: crate::expr::Literal::Sym { .. } });
+    let hooked = crate::ingest::inherited_alias::included_modules(&app.library_classes, lc);
     lc.unknown_calls
         .iter()
         .filter(|call| match &*call.node {
@@ -9790,15 +9800,146 @@ fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr>
                     && args.len() == 2
                     && args.iter().all(symbol)
             }
-            _ => crate::ingest::class_attribute::self_write(call).is_some_and(|name| {
+            _ => self_write_or_assign(call).is_some_and(|(name, reads)| {
                 let answers = |method: &str| {
                     crate::ingest::inherited_alias::answers(&app.library_classes, lc, method, MethodReceiver::Class)
+                        || hooked.iter().any(|m| included_hook_may_define(m, method))
                 };
-                answers(&format!("{name}="))
-                    && (!matches!(&*call.node, ExprNode::OpAssign { .. }) || answers(name))
+                answers(&format!("{name}=")) && (!reads || answers(name))
             }),
         })
         .collect()
+}
+
+/// The attribute a class-body statement writes through `self.x=`, and
+/// whether it also reads `self.x`: `self.x = v`, `self.x += v`, and
+/// `self.x ||= v` / `&&=`, which the ingest writes as `self.x ||
+/// self.x = v`.
+fn self_write_or_assign(call: &Expr) -> Option<(&str, bool)> {
+    if let Some(name) = crate::ingest::class_attribute::self_write(call) {
+        return Some((name, matches!(&*call.node, ExprNode::OpAssign { .. })));
+    }
+    let ExprNode::BoolOp { left, right, .. } = &*call.node else { return None };
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*left.node else { return None };
+    let name = crate::ingest::class_attribute::self_write(right)?;
+    (matches!(&*r.node, ExprNode::SelfRef) && args.is_empty() && method.as_str() == name).then_some((name, true))
+}
+
+/// Whether `module`'s `self.included(base)` hook may define the
+/// class-side method `method` (`x` or `x=`) on `base` when it runs: a
+/// call on `base` of `class_attribute` or a `cattr_*` / `mattr_*` macro,
+/// an `attr_*` or `define_method` on `base.singleton_class` (also
+/// through `send`, `public_send` or `__send__`), `define_singleton_method`
+/// on `base`, or those macros receiverless inside a `class_eval` /
+/// `class_exec` block on `base` or on its singleton class. Each macro
+/// names what it defines (an `_accessor` both sides, a `_writer` only
+/// `x=`); a computed name, a splat or a local, may be any.
+///
+/// activemerchant 1.137.0's `PostsData` hook declares its attributes
+/// with literal names, which `ingest::hook_class_attribute` expands into
+/// defs on the includers; a hook it does not read keeps its text.
+fn included_hook_may_define(module: &LibraryClass, method: &str) -> bool {
+    use crate::expr::Literal;
+    let Some(hook) = module
+        .methods
+        .iter()
+        .find(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "included" && m.params.len() == 1)
+    else {
+        return false;
+    };
+    let base = &hook.params[0].name;
+    let is_base = |e: &Expr| matches!(&*e.node, ExprNode::Var { name, .. } if name == base);
+    let singleton_of_base = |e: &Expr| {
+        matches!(&*e.node, ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str() == "singleton_class" && args.is_empty() && is_base(r))
+    };
+    let (attr, writer) = match method.strip_suffix('=') {
+        Some(attr) => (attr, true),
+        None => (method, false),
+    };
+    // Whether `macro_name` called with `args` may define `method`.
+    let defines = |macro_name: &str, args: &[Expr]| -> bool {
+        let names_attr = matches!(
+            macro_name,
+            "class_attribute" | "cattr_accessor" | "mattr_accessor" | "attr_accessor"
+        ) || (writer && matches!(macro_name, "cattr_writer" | "mattr_writer" | "attr_writer"))
+            || (!writer && matches!(macro_name, "cattr_reader" | "mattr_reader" | "attr_reader"));
+        let names_method = matches!(macro_name, "define_method" | "define_singleton_method");
+        if !names_attr && !names_method {
+            return false;
+        }
+        let wanted = if names_method { method } else { attr };
+        let args = if names_method { &args[..args.len().min(1)] } else { args };
+        args.iter().any(|a| match &*a.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str() == wanted,
+            ExprNode::Lit { value: Literal::Str { value } } => value == wanted,
+            // `instance_writer: false` and the like.
+            ExprNode::Hash { .. } => false,
+            _ => true,
+        })
+    };
+    let sent = |send_method: &str, args: &[Expr]| -> Option<(String, Vec<Expr>)> {
+        if !matches!(send_method, "send" | "public_send" | "__send__") {
+            return None;
+        }
+        let (first, rest) = args.split_first()?;
+        match &*first.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some((value.as_str().to_string(), rest.to_vec())),
+            ExprNode::Lit { value: Literal::Str { value } } => Some((value.clone(), rest.to_vec())),
+            _ => None,
+        }
+    };
+    #[derive(Clone, Copy, PartialEq)]
+    enum Body {
+        Hook,
+        // A `class_eval` block on `base`: self is `base`.
+        Base,
+        // A `class_eval` block on `base.singleton_class`.
+        Singleton,
+    }
+    fn walk(e: &Expr, at: Body, visit: &dyn Fn(&Expr, Body) -> Option<Body>) {
+        let inner = visit(e, at).unwrap_or(at);
+        e.node.for_each_child(&mut |c| walk(c, inner, visit));
+    }
+    let hit = std::cell::Cell::new(false);
+    let visit = |e: &Expr, at: Body| -> Option<Body> {
+        let ExprNode::Send { recv, method: m, args, block, .. } = &*e.node else { return None };
+        let m = m.as_str();
+        let self_recv = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+        let on_base = recv.as_ref().is_some_and(|r| is_base(r)) || (at == Body::Base && self_recv);
+        let on_singleton = recv.as_ref().is_some_and(|r| singleton_of_base(r))
+            || (at == Body::Singleton && self_recv)
+            || (at == Body::Base
+                && recv.as_ref().is_some_and(|r| matches!(&*r.node, ExprNode::Send { recv, method, args, block: None, .. }
+                    if method.as_str() == "singleton_class" && args.is_empty()
+                        && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)))));
+        let (name, args): (String, Vec<Expr>) = sent(m, args).unwrap_or_else(|| (m.to_string(), args.clone()));
+        let class_side = |n: &str| {
+            matches!(
+                n,
+                "class_attribute" | "cattr_accessor" | "cattr_reader" | "cattr_writer"
+                    | "mattr_accessor" | "mattr_reader" | "mattr_writer" | "define_singleton_method"
+            )
+        };
+        if (on_base && class_side(&name) && defines(&name, &args))
+            || (on_singleton
+                && matches!(name.as_str(), "attr_accessor" | "attr_reader" | "attr_writer" | "define_method")
+                && defines(&name, &args))
+        {
+            hit.set(true);
+        }
+        if block.is_some() && matches!(m, "class_eval" | "class_exec" | "module_eval" | "module_exec") {
+            if on_singleton {
+                return Some(Body::Singleton);
+            }
+            if on_base {
+                return Some(Body::Base);
+            }
+        }
+        None
+    };
+    walk(&hook.body, Body::Hook, &visit);
+    hit.get()
 }
 
 /// Split a class's constants into the ones that can be initialized

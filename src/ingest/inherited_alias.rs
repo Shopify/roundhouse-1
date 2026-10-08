@@ -260,6 +260,40 @@ fn ancestor_method<'a>(app: &[&'a LibraryClass], lc: &LibraryClass, name: &str, 
     None
 }
 
+/// The app modules `lc` (any of its reopenings) and its app superclasses
+/// include, `lc`'s first, each once: the modules whose `self.included`
+/// hooks ran on `lc` or on a class it inherits from.
+pub(crate) fn included_modules<'a>(app: &'a [LibraryClass], lc: &LibraryClass) -> Vec<&'a LibraryClass> {
+    let candidates: Vec<&LibraryClass> = app.iter().collect();
+    let mut classes: Vec<String> = vec![lc.name.0.as_str().to_string()];
+    let mut class = lc.name.0.as_str().to_string();
+    let mut parent = lc.parent.clone().or_else(|| {
+        named(&candidates, &class).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone())
+    });
+    while let Some(written) = parent {
+        let Some(resolved) = superclass(&candidates, &class, written.0.as_str()) else { break };
+        if classes.contains(&resolved) || classes.len() > 32 {
+            break;
+        }
+        classes.push(resolved.clone());
+        parent = named(&candidates, &resolved).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone());
+        class = resolved;
+    }
+    let mut modules: Vec<&LibraryClass> = Vec::new();
+    for id in &classes {
+        let own = (id == lc.name.0.as_str()).then_some(lc);
+        let includes = named(&candidates, id).into_iter().chain(own).flat_map(|c| c.includes.iter());
+        for module in includes {
+            for found in app.iter().filter(|c| c.is_module && c.name == *module) {
+                if !modules.iter().any(|m| std::ptr::eq(*m, found)) {
+                    modules.push(found);
+                }
+            }
+        }
+    }
+    modules
+}
+
 /// Whether `lc` (any of its reopenings) or an app superclass of it
 /// defines `name` on `receiver`'s side.
 pub(crate) fn answers(app: &[LibraryClass], lc: &LibraryClass, name: &str, receiver: MethodReceiver) -> bool {
