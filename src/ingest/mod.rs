@@ -55,6 +55,7 @@ mod delegated_type;
 mod load_hook_includes;
 mod model_macros;
 mod define_method_loops;
+mod trusted_id_attribute;
 pub(crate) use define_method_loops::REFUSAL_CONSTRUCT as DEFINE_METHOD_REFUSAL;
 pub mod on_load_hooks;
 pub mod on_load_reopen;

@@ -2460,6 +2460,7 @@ end
     splice_concern_class_methods_into_includers(&mut app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     super::define_method_loops::expand(&mut app, &sources);
+    super::trusted_id_attribute::expand(&mut app);
     claim_class_attribute_writes(&mut app);
     // After the splice, so a class method a concern contributed gets
     // the same treatment as one written in the model.
