@@ -2784,6 +2784,36 @@ fn conditional_definitions(
                 });
                 continue;
             }
+            // `attr_accessor :min_version` in the branch: the reader and
+            // writer it generates, named at each name's symbol so this
+            // branch's are told from any other definition of the name.
+            if let Some(call) = visibility::conditional_accessor(stmt) {
+                let kind = constant_id_str(&call.name()).to_string();
+                let receiver = if force_class_receiver { MethodReceiver::Class } else { MethodReceiver::Instance };
+                for arg in call.arguments().iter().flat_map(|args| args.arguments().iter()) {
+                    let Some(name) = super::util::symbol_or_string_value(&arg) else { continue };
+                    let name_span = Span {
+                        file: super::sources::file_id(file),
+                        start: arg.location().start_offset() as u32,
+                        end: arg.location().end_offset() as u32,
+                    };
+                    let name = Symbol::from(name);
+                    let mut generated = Vec::new();
+                    if kind != "attr_writer" {
+                        generated.push(synth_attr_reader(owner, &name, receiver));
+                    }
+                    if kind != "attr_reader" {
+                        generated.push(synth_attr_writer(owner, &name, receiver));
+                    }
+                    for mut m in generated {
+                        m.name_span = name_span;
+                        visibility.apply(stmt, &mut m);
+                        members.push(crate::dialect::ConditionalMember::of(&m));
+                        methods.push(m);
+                    }
+                }
+                continue;
+            }
             let Some(def) = visibility::definition(stmt) else {
                 return Err(super::error_site::at(
                     IngestError::Unsupported {

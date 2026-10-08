@@ -88,6 +88,57 @@ end
     assert_eq!(run.stdout, "\"other\"\n[\"development\", \"lenient\", \"other\", true, true, true]\n");
 }
 
+/// activemerchant 1.137.0's `ActiveMerchant::Connection` declares
+/// `attr_accessor :min_version, :max_version` under `if
+/// Net::HTTP.instance_methods.include?(:min_version=)`. Ingest refused
+/// the accessor ("conditional attr_reader ... is not a declaration this
+/// walk can keep") and left connection.rb's classes out of the app. The
+/// accessors are the branch's methods, defined when the branch runs.
+#[test]
+fn an_accessor_in_the_branch_ruby_selects_at_load_is_defined() {
+    let run = emit_and_run::empty_app()
+        .write(
+            "lib/connection.rb",
+            r#"require "net/http"
+
+class Connection
+  attr_accessor :endpoint
+
+  if Net::HTTP.instance_methods.include?(:min_version=)
+    attr_accessor :min_version
+    attr_accessor :max_version
+  else
+    attr_reader :legacy
+  end
+
+  unless Net::HTTP.instance_methods.include?(:min_version=)
+    attr_writer :never
+  end
+
+  private
+
+  if Net::HTTP.method_defined?(:start)
+    attr_reader :secret
+  end
+
+  public
+
+  def initialize
+    @secret = "s"
+  end
+
+  def report
+    self.min_version = :TLS1_2
+    [min_version, max_version, respond_to?(:legacy), respond_to?(:never=), respond_to?(:secret), secret]
+  end
+end
+"#,
+        )
+        .run_ruby("p Connection.new.report\n");
+    assert!(run.success, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(run.stdout, "[:TLS1_2, nil, false, false, false, \"s\"]\n");
+}
+
 fn app(root: &Path, files: &[(&str, &str)]) {
     let _ = std::fs::remove_dir_all(root);
     for (path, text) in [
@@ -120,7 +171,7 @@ fn a_branch_that_changes_visibility_stays_refused_by_name() {
             ),
             (
                 "lib/accessor.rb",
-                "class Accessor\n  if Rails.env.test?\n    def helper = 1\n    attr_reader :token\n  end\nend\n",
+                "class Accessor\n  if Rails.env.test?\n    def helper = 1\n    alias_method :token, :helper\n  end\nend\n",
             ),
             ("lib/plain.rb", "class Plain\n  if Rails.env.test?\n    def helper = 1\n  end\nend\n"),
             // Ruby raises NameError at `private :helper` when the branch

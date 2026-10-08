@@ -117,8 +117,24 @@ pub(super) fn conditional_definition<'pr>(node: &Node<'pr>) -> Option<Conditiona
         return None;
     }
     arms.iter()
-        .any(|(_, stmts)| stmts.iter().any(|stmt| definition(stmt).is_some() || is_declaration(stmt)))
+        .any(|(_, stmts)| {
+            stmts.iter().any(|stmt| definition(stmt).is_some() || is_declaration(stmt) || conditional_accessor(stmt).is_some())
+        })
         .then_some(ConditionalDefinition { negated, arms })
+}
+
+/// A bare `attr_reader` / `attr_writer` / `attr_accessor` with literal
+/// names. In a load-time conditional's branch it defines its methods
+/// only when the branch runs, as a `def` there does: activemerchant
+/// 1.137.0's `Connection` has `attr_accessor :min_version` under
+/// `if Net::HTTP.instance_methods.include?(:min_version=)`.
+pub(super) fn conditional_accessor<'pr>(stmt: &Node<'pr>) -> Option<CallNode<'pr>> {
+    let call = stmt.as_call_node()?;
+    (call.receiver().is_none()
+        && call.block().is_none()
+        && matches!(constant_id_str(&call.name()), "attr_reader" | "attr_writer" | "attr_accessor")
+        && call.arguments().is_some_and(|args| args.arguments().iter().all(|arg| symbol_or_string_value(&arg).is_some())))
+    .then_some(call)
 }
 
 /// A `class` or `module` statement. In a load-time conditional's branch
@@ -720,6 +736,13 @@ impl Visibility {
                             "a class or module declared in a load-time conditional inside `class << self` is not modeled",
                         ));
                     }
+                    continue;
+                }
+                // Its methods are this branch's alternatives, with the
+                // visibility in effect around the statement.
+                if let Some(call) = conditional_accessor(stmt) {
+                    self.alternatives.insert(offset, (statement, arm));
+                    self.declare(&call, offset, class_side, default, file)?;
                     continue;
                 }
                 let Some(def) = definition(stmt) else {
