@@ -410,10 +410,17 @@ fn splice_nested(
     let mut blocks: Vec<String> = Vec::new();
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
+    // The file the blocks run in: a `__dir__` read in a child
+    // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
+    let parent_rb = files.iter().find(|f| f.path.extension().is_some_and(|e| e == "rb")).map(|f| f.path.clone());
     for kid in kids {
         let stem = crate::naming::underscore(kid.name.0.as_str());
         let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
-        let rendered = emit_library_class_decl(kid, app, rb_path.clone());
+        let render = || emit_library_class_decl(kid, app, rb_path.clone());
+        let rendered = match &parent_rb {
+            Some(parent_rb) => super::expr::with_spliced_into(parent_rb, render),
+            None => render(),
+        };
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
         // class, not buried inside a class body where they would still

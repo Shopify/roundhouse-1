@@ -414,12 +414,23 @@ fn a_gem_source_reads_its_own_data_files() {
     const SP: &[(&str, &str)] = &[
         (
             "sp.rb",
-            "require \"yaml\"\n\nmodule Sp\n  QUERY = File.read(File.join(__dir__, \"sp/query.sql\")).freeze\n  SUBTAGS = YAML.safe_load_file(File.expand_path(File.join(__dir__, \"../data/subtags.yml\")))[\"subtags\"]\nend\n",
+            "require \"yaml\"\nrequire_relative \"sp/store\"\n\nmodule Sp\n  QUERY = File.read(File.join(__dir__, \"sp/query.sql\")).freeze\n  SUBTAGS = YAML.safe_load_file(File.expand_path(File.join(__dir__, \"../data/subtags.yml\")))[\"subtags\"]\nend\n",
         ),
         ("sp/query.sql", "SELECT 1\n"),
         ("../data/subtags.yml", "subtags:\n  en: en-Latn-US\n"),
+        (
+            "sp/store.rb",
+            "module Sp\n  class Store\n    class Lookup\n      QUERY = File.read(File.join(__dir__, \"lookup.sql\")).freeze\n    end\n  end\nend\n",
+        ),
+        ("sp/lookup.sql", "SELECT 2\n"),
     ];
-    let _ = same_as_native("data", &[("sp", SP)], "sp", "p [Sp::QUERY, Sp::SUBTAGS]\n", "[\"SELECT 1\\n\", {\"en\" => \"en-Latn-US\"}]\n");
+    let _ = same_as_native(
+        "data",
+        &[("sp", SP)],
+        "sp",
+        "p [Sp::QUERY, Sp::SUBTAGS, Sp::Store::Lookup::QUERY]\n",
+        "[\"SELECT 1\\n\", {\"en\" => \"en-Latn-US\"}, \"SELECT 2\\n\"]\n",
+    );
 }
 
 /// elasticsearch-shopify 6.0.1's errors.rb lists
