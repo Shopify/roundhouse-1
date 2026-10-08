@@ -1,13 +1,15 @@
 # frozen_string_literal: true
 
-# `errors.attribute_names`, `to_hash`, `as_json`, `messages` and
-# `merge!`, ported from activemodel 8.2.0.alpha (Shopify/rails 5813559f,
+# `errors.attribute_names`, `to_hash`, `as_json`, `messages`, `details`
+# and `merge!`, ported from activemodel 8.2.0.alpha (Shopify/rails 5813559f,
 # the version Core pins: lib/active_model/errors.rb, `#attribute_names`
 # is `@errors.map(&:attribute).uniq.freeze`, `#to_hash(full_messages =
 # false)` is `group_by_attribute.transform_values { |errors|
 # errors.map(&message_method) }`, `#as_json(options = nil)` is
 # `to_hash(options && options[:full_messages])`, `#messages` is that
-# Hash with an empty default, frozen, `#merge!(other)` imports each of
+# Hash with an empty default, frozen, `#details` is
+# `group_by_attribute.transform_values { |errors| errors.map(&:details)
+# }` with that default, frozen, `#merge!(other)` imports each of
 # `other.errors` as a NestedError unless `other` is this collection;
 # `#add`'s `normalize_arguments` symbolizes each attribute) for the
 # CRuby and JRuby trees, with an Error per recorded message (`objects`)
@@ -44,11 +46,14 @@
 #   answers the attributes recorded on it, usually none, from
 #   `attribute_names`; any other object answers the read itself.
 # - An Error built here is not an ActiveModel::Error and keeps no
-#   record (`base` raises). Its type and options are known only where the
-#   push recorded them; otherwise `raw_type`, `options`, `details` and
-#   equality raise naming the message, and `merge!` into Rails'
-#   collection adds the short message as written (Rails' `add(attr,
-#   message)`, whose type is that message).
+#   record (`base` raises, and equality leaves it out). Its type and
+#   options are known only where the push recorded them (the validates
+#   lowering's checks but uniqueness, a numericality bound and
+#   validates_associated; `errors.add` with a type, a String message or
+#   `message:` alone); otherwise `raw_type`, `options`, `details`,
+#   equality and `merge!` into Rails' collection raise naming the
+#   message. Its options are Rails' but the callback and `message:` ones,
+#   which `details` drops too.
 # - On the PostgreSQL tree a record over the ActiveModel::Validations
 #   port has Rails' ActiveModel::Errors, which answers each read itself;
 #   `merge!` between it and the accumulator goes through the records.
@@ -59,14 +64,20 @@ module ActiveModel
     UNSPLIT = Object.new.freeze
     # A recorded message whose type or options are not known.
     UNKNOWN = Object.new.freeze
+    # The type of a message added as text (`errors.add(:title, "is
+    # bad")`): Rails' Error keeps the text as its type.
+    SHORT = Object.new.freeze
     EMPTY = [].freeze
 
-    # `errors << message`, recording `attribute` for it, and its short
-    # message: what follows `prefix`, when given and the message starts
-    # with it. Returns the accumulator, as `<<` does.
+    # `errors << message`, recording `attribute` for it, its short
+    # message (what follows `prefix`, when given and the message starts
+    # with it), and the Error's type and options where the lowering knows
+    # them (`expr::ErrorDetail`; SHORT: the short message is the type).
+    # Returns the accumulator, as `<<` does.
     def self.add(errors, attribute, message, prefix = nil, type = UNKNOWN, options = UNKNOWN)
       errors << message
       short = prefix && message.is_a?(String) && message.start_with?(prefix) ? message[prefix.length..] : UNSPLIT
+      type = short.equal?(UNSPLIT) ? UNKNOWN : short if type.equal?(SHORT)
       pairs_of(errors) << [attribute.to_sym, message, short, type, options]
       errors
     end
@@ -74,9 +85,9 @@ module ActiveModel
     # `add` for an attribute held in a local: its message is the bare one
     # on `base` and `"#{ActiveSupport.humanize(attribute.to_s)} #{short}"`
     # otherwise (`lower::errors_add`).
-    def self.add_humanized(errors, attribute, message)
+    def self.add_humanized(errors, attribute, message, type = UNKNOWN, options = UNKNOWN)
       name = attribute.to_s
-      add(errors, attribute, message, name == "base" ? "" : "#{ActiveSupport.humanize(name)} ")
+      add(errors, attribute, message, name == "base" ? "" : "#{ActiveSupport.humanize(name)} ", type, options)
     end
 
     # The attributes of the messages in `errors`, in order, each once,
@@ -125,6 +136,21 @@ module ActiveModel
       hash.freeze
     end
 
+    # Rails' `details`: each attribute's errors as `{error: type}` merged
+    # with their options but the callback and `message:` ones, in the
+    # order each attribute first appears, with an empty, frozen default,
+    # frozen.
+    def self.details(errors)
+      return errors.details unless errors.is_a?(Array)
+      hash = {}
+      each_record(errors) do |message, record|
+        error = Error.new(message, record)
+        (hash[error.attribute] ||= []) << error.details
+      end
+      hash.default = EMPTY
+      hash.freeze
+    end
+
     # Rails' `merge!(other)`: `other`'s errors appended, each with its
     # attribute, short message, type and options (an ActiveModel::Errors
     # holds NestedErrors over them, whose full message is this record's
@@ -134,17 +160,14 @@ module ActiveModel
       unless errors.is_a?(Array)
         return errors.merge!(other) unless other.is_a?(Array)
         # A port record's collection (runtime/active_model_validations.rb)
-        # taking the accumulator's errors: added as the lowering recorded
-        # them, the short message kept as written.
+        # taking the accumulator's errors: each added with the type and
+        # options its push recorded and its short message, raising naming
+        # one whose were not recorded.
         each_record(other) do |message, record|
           raise unkeyed("merge!", message) unless record
           raise unsplit("merge!", message, record) if record[2].equal?(UNSPLIT)
-          if record[3].equal?(UNKNOWN)
-            errors.add(record[0], record[2])
-          else
-            options = record[4].equal?(UNKNOWN) ? {} : record[4]
-            errors.add(record[0], record[3], **options, message: record[2])
-          end
+          error = Error.new(message, record)
+          errors.add(error.attribute, error.raw_type, **error.options, message: error.message)
         end
         return objects(other)
       end
