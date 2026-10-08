@@ -617,16 +617,35 @@ fn deferred_concern_dependencies_stay_dormant_and_use_lexical_names() {
     ]);
     ingest_app_from_tree(files.clone()).expect("a Concern dependency is deferred, and the local namesake has no accessors");
     let mut shadowed = files.clone();
-    shadowed.insert("app/models/support.rb".into(), b"module Scope; module DraftState; def helper; 'local'; end; end; class Message < ApplicationRecord; self.table_name = 'messages'; include DraftState; end; end".to_vec());
-    let error = ingest_app_from_tree(shadowed.clone()).unwrap_err().to_string();
-    assert!(error.contains("on Scope::Message") && error.contains("source-resolved"), "{error}");
+    let shadowed_source = "module Scope; module DraftState; def helper; 'local'; end; end; class Message < ApplicationRecord; self.table_name = 'messages'; include DraftState; end; end";
+    shadowed.insert("app/models/support.rb".into(), shadowed_source.as_bytes().to_vec());
+    // Ruby's lexical lookup: `include DraftState` inside `Scope` names
+    // `Scope::DraftState`, which declares no accessor; `::DraftState` and
+    // its `included` block are never involved.
+    let native = std::process::Command::new("ruby").args(["-e", &format!(
+        "module DraftState; end\n{}\nabort 'wrong module' unless Scope::Message.include?(Scope::DraftState) && !Scope::Message.include?(::DraftState)\nabort 'accessor' if Scope::Message.method_defined?(:scratch=)",
+        shadowed_source.replace("class Message < ApplicationRecord; self.table_name = 'messages';", "class Message;"),
+    )]).output().unwrap();
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    // The model file registers its sibling `Scope::DraftState`, so the
+    // splice resolves the include to it, as Ruby does: no namesake items
+    // are carried, and there is nothing to refuse.
+    ingest_app_from_tree(shadowed.clone()).expect("the lexical namesake carries no accessor");
     roundhouse::ingest::survey::activate();
     let result = ingest_app_from_tree(shadowed);
     let gaps = roundhouse::ingest::survey::drain();
     let app = result.unwrap();
-    assert_eq!(gaps.len(), 1, "{gaps:?}");
-    assert_eq!(gaps[0].to_string(), error);
+    assert!(gaps.is_empty(), "{gaps:?}");
     let model = app.models.iter().find(|m| m.name.0.as_str() == "Scope::Message").unwrap();
+    let included: Vec<String> = model.body.iter().filter_map(|item| {
+        let roundhouse::dialect::ModelBodyItem::Unknown { expr, .. } = item else { return None };
+        let roundhouse::expr::ExprNode::Send { recv: None, method, args, .. } = &*expr.node else { return None };
+        (method.as_str() == "include").then_some(())?;
+        let [arg] = args.as_slice() else { return None };
+        let roundhouse::expr::ExprNode::Const { path } = &*arg.node else { return None };
+        Some(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::"))
+    }).collect();
+    assert_eq!(included, ["Scope::DraftState"], "{:?}", model.body);
     let lowered = roundhouse::lower::lower_model_to_library_class(model, &app.schema);
     assert!(!lowered.methods.iter().any(|m| ["scratch", "scratch="].contains(&m.name.as_str())));
     let mut files = files;

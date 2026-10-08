@@ -221,29 +221,46 @@ end
 
 #[test]
 fn collection_does_not_admit_unregistered_sibling_modules() {
-    let app = ingest_app_from_tree(tree(&[(
-        "app/models/workspace.rb",
-        r#"class Workspace < ApplicationRecord
+    // A model file registers its sibling modules as the library path
+    // would (`Registered` exists once the file loads, in Ruby as here),
+    // but not what another model in the file nests: the model pass reads
+    // one model per file. Concern items are collected for registered
+    // owners only.
+    const SOURCE: &str = r#"class Workspace < ApplicationRecord
   module Associations
     extend ActiveSupport::Concern
     included { has_many :memberships }
   end
 end
-module Unregistered
+module Registered
   extend ActiveSupport::Concern
   included { belongs_to :workspace }
 end
-"#,
-    )]))
-    .unwrap();
-    assert!(
-        app.concern_model_items
-            .contains_key(&roundhouse::ClassId("Workspace::Associations".into()))
-    );
-    assert!(
-        !app.concern_model_items
-            .contains_key(&roundhouse::ClassId("Unregistered".into()))
-    );
+class Receipt < ApplicationRecord
+  module Unregistered
+    extend ActiveSupport::Concern
+    included { belongs_to :workspace }
+  end
+end
+"#;
+    let native = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(format!(
+            "require 'active_support/concern'\nclass ApplicationRecord; end\n{SOURCE}\nabort 'sibling' unless Registered.is_a?(ActiveSupport::Concern)"
+        ))
+        .output()
+        .expect("CRuby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let app = ingest_app_from_tree(tree(&[("app/models/workspace.rb", SOURCE)])).unwrap();
+    let registered = |name: &str| app.library_classes.iter().any(|class| class.name.0.as_str() == name);
+    let collected = |name: &str| app.concern_model_items.contains_key(&roundhouse::ClassId(name.into()));
+    assert!(collected("Workspace::Associations"));
+    assert!(registered("Registered") && collected("Registered"));
+    assert!(!registered("Receipt::Unregistered"));
+    assert!(!collected("Receipt::Unregistered"));
+    for owner in app.concern_model_items.keys() {
+        assert!(registered(owner.0.as_str()), "{owner:?} collected without being registered");
+    }
 }
 
 #[test]
