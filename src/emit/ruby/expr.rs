@@ -372,6 +372,9 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
         // where the analyzer typed the receiver as Rails' collection
         // (`expr::ERRORS_PORT_CALL`): an `errors` of another type (a
         // GraphQL result's) keeps its own.
+        // `include?` and `has_key?` are Rails' aliases of `key?`; the
+        // port's module answers Module#include? itself.
+        (_, "include?" | "has_key?", _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => Some(read("key?")),
         (_, _, _) if e.decisions & crate::expr::ERRORS_PORT_CALL != 0 => {
             Some(read(method.as_str()))
         }
