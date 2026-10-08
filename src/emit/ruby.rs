@@ -1405,6 +1405,15 @@ pub fn emit_with_assertions(
             .iter()
             .filter_map(|l| l.test_class.parent.as_ref().map(|p| p.0.as_str()))
             .collect();
+        // Test modules that declare no tests (a support class such as
+        // `MockGCSInterface`): loading one runs nothing, so a test file
+        // that names it can require it.
+        let support_paths: crate::det::HashMap<&str, PathBuf> = test_lowered
+            .iter()
+            .zip(&out_paths)
+            .filter(|(l, _)| test_names_of(&l.test_class).is_empty())
+            .map(|(l, path)| (l.test_class.name.0.as_str(), path.clone()))
+            .collect();
         assert_eq!(test_lowered.len(), app.test_modules.len(), "one lowered class per test module");
         for ((lowered, out_path), module) in test_lowered.iter().zip(out_paths).zip(&app.test_modules) {
             let lc = &lowered.test_class;
@@ -1506,6 +1515,36 @@ pub fn emit_with_assertions(
             if let Some(parent_path) = lc.parent.as_ref().and_then(|p| test_paths.get(p.0.as_str())) {
                 let rel = parent_path.strip_prefix("test").unwrap_or(parent_path).with_extension("");
                 writeln!(preamble, "require_relative \"../{}\"", rel.display()).unwrap();
+            }
+            // A test-support class the test names (`MockGCSInterface`,
+            // `MockAlpha::Bucket`) is emitted in a test file of its own,
+            // which nothing else loads: the source loaded it with a
+            // `require_relative` (or from `config/environments/test.rb`)
+            // that the emitted test does not carry.
+            let mut support_requires: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+            for method in &lc.methods {
+                library::walk_const_paths(&method.body, &mut paths);
+            }
+            for (_, value) in &lowered.constants {
+                library::walk_const_paths(value, &mut paths);
+            }
+            for path in &paths {
+                let path: Vec<&str> =
+                    path.iter().map(|s| s.trim_start_matches("::")).filter(|s| !s.is_empty()).collect();
+                for len in 1..=path.len() {
+                    let prefix = path[..len].join("::");
+                    if prefix == class_name {
+                        continue;
+                    }
+                    if let Some(support_path) = support_paths.get(prefix.as_str()) {
+                        let rel = support_path.strip_prefix("test").unwrap_or(support_path).with_extension("");
+                        support_requires.insert(format!("require_relative \"../{}\"\n", rel.display()));
+                    }
+                }
+            }
+            for line in support_requires {
+                preamble.push_str(&line);
             }
             for (_, anchor) in &fixture_siblings {
                 // Test files live at `test/{models,controllers}/…`,

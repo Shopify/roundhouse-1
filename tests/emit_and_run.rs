@@ -9583,3 +9583,48 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
         )
         .assert_passes();
 }
+
+/// Two test-support files each nest a `Bucket` (Core's
+/// `MockGCSInterface::Bucket` and `MockS3Interface::Bucket`). In Ruby
+/// they are two classes; flattened to one `Bucket` they were one class
+/// reopened, which the analysis refused as a reopened fragment. The
+/// Ruby family writes each nested in its owner, and a test that names
+/// a support class requires its file. Targets that hoist inner classes
+/// under a flat name refuse it by name.
+#[test]
+fn same_named_classes_in_two_test_support_classes_stay_apart() {
+    use roundhouse::project::BuildTarget;
+    const ALPHA: &str = "class MockAlpha\n  def self.bucket(name)\n    Bucket.new(name)\n  end\n\n  class Bucket\n    attr_reader :name\n\n    def initialize(name)\n      @name = name\n    end\n\n    def kind(*)\n      [:alpha, name]\n    end\n  end\nend\n";
+    const BETA: &str = "class MockBeta\n  def self.bucket\n    Bucket.new\n  end\n\n  class Bucket\n    def kind\n      :beta\n    end\n  end\nend\n";
+    let script = "p [MockAlpha.bucket(\"a\").kind(1, 2), MockBeta.bucket.kind, MockAlpha::Bucket.new(\"b\").kind, MockBeta::Bucket.new.kind, MockAlpha::Bucket == MockBeta::Bucket]";
+    let native = emit_and_run::ruby()
+        .arg("-e")
+        .arg(format!("{ALPHA}\n{BETA}\n{script}"))
+        .output()
+        .expect("native Ruby control");
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        "[[:alpha, \"a\"], :beta, [:alpha, \"b\"], :beta, false]\n"
+    );
+    let test = "require \"test_helper\"\nrequire_relative \"../lib/support/mock_alpha\"\nrequire_relative \"../lib/support/mock_beta\"\n\nclass MockBucketTest < ActiveSupport::TestCase\n  test \"same-named inner classes stay apart\" do\n    assert_equal [:alpha, \"a\"], MockAlpha.bucket(\"a\").kind(1, 2)\n    assert_equal :beta, MockBeta.bucket.kind\n    assert_equal [:alpha, \"b\"], MockAlpha::Bucket.new(\"b\").kind\n    assert_equal :beta, MockBeta::Bucket.new.kind\n    refute_equal MockAlpha::Bucket, MockBeta::Bucket\n  end\nend\n";
+    let app = || {
+        emit_and_run::empty_app()
+            .write("test/test_helper.rb", "require \"active_support\"\n")
+            .write("test/lib/support/mock_alpha.rb", ALPHA)
+            .write("test/lib/support/mock_beta.rb", BETA)
+            .write("test/models/mock_bucket_test.rb", test)
+    };
+    let (_, errors) = app().emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:?}");
+    app().run_test("test/models/mock_bucket_test.rb").assert_passes();
+    for target in [BuildTarget::Typescript, BuildTarget::Crystal] {
+        let (_, errors) = app().emit(target);
+        for class in ["MockAlpha::Bucket", "MockBeta::Bucket"] {
+            assert!(
+                errors.iter().any(|e| e.contains("namespaced class in a test-support class") && e.contains(class)),
+                "{target:?} {class}: {errors:?}"
+            );
+        }
+    }
+}

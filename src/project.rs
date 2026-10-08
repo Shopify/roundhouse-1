@@ -1832,6 +1832,7 @@ pub fn target_files(
         report_keyword_params(app, target.as_str());
     }
     report_class_body_prepends(app, target);
+    report_namespaced_test_support_classes(app, target);
     if !matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel) {
         for controller in &app.controllers {
             if controller.class_methods().next().is_some() {
@@ -8414,6 +8415,43 @@ fn report_keyword_params(app: &App, target: &str) {
                     ),
                 );
             }
+        }
+    }
+}
+
+/// A class nested in a test-support class keeps its namespace
+/// (`MockGCSInterface::Bucket`, `ingest::test`). The Ruby family writes
+/// it nested inside its owner (`emit::ruby::library`'s namespaced
+/// header); every other target's test emit hoists inner classes under
+/// one flat name, so two support files' `Bucket`s would collide there.
+/// Refused by name. Roda emits no test files.
+fn report_namespaced_test_support_classes(app: &App, target: BuildTarget) {
+    if matches!(
+        target,
+        BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel | BuildTarget::Roda
+    ) {
+        return;
+    }
+    for module in &app.test_modules {
+        let prefix = format!("{}::", module.name.0.as_str());
+        for inner in module.inner_classes.iter().filter(|c| c.name.0.as_str().starts_with(&prefix)) {
+            let span = inner
+                .methods
+                .iter()
+                .map(|m| m.name_span)
+                .find(|s| !s.is_synthetic())
+                .unwrap_or(inner.parent_span);
+            emit::diagnostics::report_unsupported(
+                span,
+                target.as_str(),
+                "namespaced class in a test-support class",
+                format!(
+                    "`{}`: this target hoists a test file's inner classes under a flat name; \
+                     the Ruby family writes it nested in `{}`",
+                    inner.name.0.as_str(),
+                    module.name.0.as_str()
+                ),
+            );
         }
     }
 }
