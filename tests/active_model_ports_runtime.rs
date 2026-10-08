@@ -89,6 +89,41 @@ const PROBE: &str = r##"class FrProbe
 end
 "##;
 
+/// A record on `FrozenRecord::Compact` (a Concern: `ClassMethods` and
+/// ivar-backed attributes), the way Core's LandedCost thresholds are.
+const COMPACT_COUNTRY: &str = r##"class CompactCountry < FrozenRecord::Base
+  include FrozenRecord::Compact
+  self.base_path = File.expand_path("../../data", __dir__)
+  self.primary_key = :code
+  add_index :code, unique: true
+
+  def self.file_path = File.join(base_path, "countries.yml")
+
+  def initialize(*)
+    super
+  end
+
+  def label = "#{name} (#{code})"
+end
+"##;
+
+const COMPACT_PROBE: &str = r##"class CmpProbe
+  def self.lines
+    c = CompactCountry.find("fr")
+    [
+      "ancestors=#{CompactCountry.singleton_class.include?(FrozenRecord::Compact::ClassMethods)} #{CompactCountry.include?(FrozenRecord::Compact)}",
+      "count=#{CompactCountry.count} all=#{CompactCountry.all.map(&:code).inspect}",
+      "find=#{c.label} #{c[:region]} #{c["nato"]} #{c.nato?} #{CompactCountry.find("ch").nato?}",
+      "attributes=#{c.attributes.inspect}",
+      "ivars=#{c.instance_variables.sort.inspect}",
+      "cache=#{CompactCountry._attributes_cache.keys.map(&:inspect).sort.inspect}",
+      "where=#{CompactCountry.where(region: "europe").pluck(:name).inspect}",
+      "json=#{c.serializable_hash.inspect}",
+    ]
+  end
+end
+"##;
+
 const COUNTRIES: &str = "- id: 1\n  code: ca\n  name: Canada\n  region: americas\n  nato: true\n- id: 2\n  code: fr\n  name: France\n  region: europe\n  nato: true\n- id: 3\n  code: ch\n  name: Switzerland\n  region: europe\n  nato: false\n";
 
 const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activemodel (8.2.0.alpha)\n      activesupport (= 8.2.0.alpha)\n    activesupport (8.2.0.alpha)\n    frozen_record (0.27.4)\n      activemodel\n\nDEPENDENCIES\n  frozen_record\n";
@@ -125,6 +160,8 @@ fn frozen_record_app() -> PathBuf {
         ("test/test_helper.rb", "ENV[\"RAILS_ENV\"] ||= \"test\"\n"),
         ("app/models/country.rb", COUNTRY),
         ("app/models/fr_probe.rb", PROBE),
+        ("app/models/compact_country.rb", COMPACT_COUNTRY),
+        ("app/models/cmp_probe.rb", COMPACT_PROBE),
         ("data/countries.yml", COUNTRIES),
     ];
     for (path, text) in files {
@@ -142,7 +179,8 @@ fn frozen_record_app() -> PathBuf {
 fn native_lines(app: &Path) -> String {
     let script = format!(
         "require {oracle:?}\nRailsOracle.activate(\"activesupport\", \"activemodel\")\n\
-         $LOAD_PATH.unshift {lib:?}\n$LOAD_PATH.unshift {models:?}\nrequire \"frozen_record\"\nrequire \"country\"\nrequire \"fr_probe\"\nputs FrProbe.lines\n",
+         $LOAD_PATH.unshift {lib:?}\n$LOAD_PATH.unshift {models:?}\nrequire \"frozen_record\"\nrequire \"country\"\nrequire \"fr_probe\"\n\
+         require \"compact_country\"\nrequire \"cmp_probe\"\nputs FrProbe.lines\nputs CmpProbe.lines\n",
         oracle = root().join("tests/support/rails_oracle").display().to_string(),
         lib = app.join("vendor/gems/frozen_record-0.27.4/lib").display().to_string(),
         models = app.join("app/models").display().to_string(),
@@ -159,6 +197,7 @@ fn frozen_record_compiled_as_a_gem_source_answers_like_native() {
     let app = frozen_record_app();
     let native = native_lines(&app);
     assert!(native.contains("find_each=[\"fr\", \"ch\"]") && native.contains("load=false X (xx)"), "{native}");
+    assert!(native.contains("ancestors=true true") && native.contains("ivars=[:@code, :@id, :@name, :@nato, :@region]"), "{native}");
 
     let out_dir = app.join("emitted");
     let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
@@ -173,7 +212,10 @@ fn frozen_record_compiled_as_a_gem_source_answers_like_native() {
     // Every class-body statement frozen_record's Base and Scope run is
     // carried: `alias_method :load, :new` (above its own `def new`) and
     // `alias_method :find_each, :each` (below the `delegate` of `each`).
-    for dropped in ["base.rb:210", "scope.rb:12"] {
+    // Nor are Compact's `extend ActiveSupport::Concern` (what it does is
+    // written at the include) and Yaml's `autoload :ERB, 'erb'` (the
+    // tree requires erb where ERB is named) reported as dropped.
+    for dropped in ["base.rb:210", "scope.rb:12", "compact.rb:5", "yaml.rb:6"] {
         assert!(!log.lines().any(|l| l.contains(dropped) && l.contains("dropped")), "{dropped}:\n{log}");
     }
     let base = std::fs::read_to_string(out_dir.join("app/models/frozen_record/base.rb")).unwrap();
@@ -183,7 +225,7 @@ fn frozen_record_compiled_as_a_gem_source_answers_like_native() {
     let ruby_path = Command::new("ruby").args(["-e", "print Gem.path.join(\":\")"]).output().unwrap();
     let gem_path = format!("{}:{}", core_gem_home(), String::from_utf8_lossy(&ruby_path.stdout));
     let run = Command::new("ruby")
-        .args(["-e", "require \"./boot\"; puts FrProbe.lines"])
+        .args(["-e", "require \"./boot\"; puts FrProbe.lines; puts CmpProbe.lines"])
         .current_dir(&out_dir)
         .env("GEM_PATH", gem_path)
         .env("GLIBC_TUNABLES", "glibc.rtld.optional_static_tls=262144")

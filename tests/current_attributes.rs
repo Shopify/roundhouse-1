@@ -9,6 +9,7 @@
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 
 use roundhouse::emit::ruby;
 use roundhouse::ingest::ingest_app_from_tree;
@@ -154,4 +155,69 @@ puts "current attributes passed"
 "#,
         )
         .assert_passes();
+}
+
+const RESETTING_CURRENT: &str = r#"class Current < ActiveSupport::CurrentAttributes
+  attribute :a, :b
+
+  before_reset { $log << [:before1, a] }
+  resets do
+    $log << [:after1, a]
+    self.b = "B"
+  end
+  after_reset { $log << [:after2, b] }
+  before_reset :note
+
+  def b
+    super || "dflt"
+  end
+
+  private
+
+  def note
+    $log << [:note, a]
+  end
+end
+"#;
+
+const RESETTING_PROBE: &str = r#"
+$log = []
+p Current.b
+Current.a = 1
+Current.reset
+p $log
+p Current.a
+p Current.b
+Current.b = "set"
+p Current.b
+"#;
+
+/// Reset callbacks (`before_reset`, `resets`, `after_reset`, a block or a
+/// method name) and a reader reaching the storage through `super`, run
+/// as activesupport 8.2 runs them: before callbacks in order on the
+/// instance being reset, after ones in reverse on the reset instance.
+/// api_versioning 4.6.0's `ThreadLocalVersionStorage` `resets` its
+/// `requested_handle` and reads it through `super ||`.
+#[test]
+fn reset_callbacks_and_reader_super_run_like_activesupport() {
+    let oracle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/rails_oracle");
+    let script = std::env::temp_dir().join(format!("rh_current_reset_native_{}.rb", std::process::id()));
+    std::fs::write(
+        &script,
+        format!(
+            "require {:?}\nRailsOracle.activate(\"activesupport\")\nrequire \"active_support\"\n\
+             require \"active_support/current_attributes\"\n{RESETTING_CURRENT}\n{RESETTING_PROBE}",
+            oracle.display().to_string()
+        ),
+    )
+    .unwrap();
+    let native = Command::new("ruby").arg(&script).output().expect("ruby");
+    std::fs::remove_file(&script).unwrap();
+    assert!(native.status.success(), "{}", String::from_utf8_lossy(&native.stderr));
+    let native = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(native.contains("[[:before1, 1], [:note, 1], [:after2, \"dflt\"], [:after1, nil]]"), "{native}");
+
+    let run = emit_and_run::real_blog().write("app/models/current.rb", RESETTING_CURRENT).run_ruby(RESETTING_PROBE);
+    run.assert_passes();
+    assert_eq!(native, run.stdout);
 }

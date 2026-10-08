@@ -8067,6 +8067,7 @@ fn emit_library_class_decl_inner(
             if !own.iter().any(|c| std::ptr::eq(*c, call))
                 && !crate::analyze::is_include_refusal(call)
                 && !carried_block(call)
+                && !modelled_elsewhere(lc, call)
             {
                 report_dropped_class_body_call(lc, call);
             }
@@ -11354,6 +11355,42 @@ fn reopens_loaded_gem_class(lc: &LibraryClass, app: &App) -> bool {
 /// emit diagnostic sink is live here (ingest's is not — it runs before
 /// any `diagnostics::scope`), which is why the judgment happens at emit
 /// rather than where the call was captured.
+/// A class-body call that is not replayed because the tree already does
+/// what it does elsewhere, so it is not reported as dropped:
+/// - `extend ActiveSupport::Concern` in a module. The tree carries no
+///   Concern; what it does to an includer, extending it with the
+///   module's `ClassMethods` (and its Concern dependencies'), and running
+///   its `included` block there, is written at each include
+///   (`concern_carrier_extends`, the ingest's concern splices). An
+///   `included` / `class_methods` block that is not carried is reported
+///   on its own. frozen_record 0.27.4's `FrozenRecord::Compact`.
+/// - `autoload :Const, "feature"` for a library Ruby ships (a
+///   `rbs/requires.tsv` row: `require feature` defines `Const`). The
+///   tree requires the feature in every file naming the constant
+///   (`project::require_gaps`), and the module's own lookup of the name
+///   then finds the top-level constant, as it does natively once the
+///   autoload has loaded it. frozen_record's `Backends::Yaml`
+///   `autoload :ERB, 'erb'`.
+fn modelled_elsewhere(lc: &LibraryClass, call: &Expr) -> bool {
+    let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return false };
+    match (method.as_str(), args.as_slice()) {
+        ("extend", [only]) => {
+            lc.is_module
+                && matches!(&*only.node, ExprNode::Const { path }
+                    if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")
+        }
+        ("autoload", [name, feature]) => {
+            let (ExprNode::Lit { value: crate::expr::Literal::Sym { value: name } }, ExprNode::Lit { value: crate::expr::Literal::Str { value: feature } }) =
+                (&*name.node, &*feature.node)
+            else {
+                return false;
+            };
+            crate::stdlib_rbs::requires().iter().any(|row| row.constant == name.as_str() && row.feature == feature.as_str())
+        }
+        _ => false,
+    }
+}
+
 fn report_dropped_class_body_call(lc: &LibraryClass, call: &Expr) {
     let name = crate::lower::model_to_library::dropped_statement_name(call);
     crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
