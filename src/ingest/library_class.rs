@@ -265,9 +265,12 @@ fn file_guard_offset(root: &ruby_prism::Node<'_>) -> Option<usize> {
 /// declaration is carried inline behind it
 /// (`return unless ENV["EXFILTRATE_TYPES"]`). Not carried, and named:
 /// a file-level `case` holding declarations, and a statement the
-/// expression ingest refuses. `ActiveSupport.on_load` is
+/// expression ingest refuses. A top-level `ActiveSupport.on_load` is
 /// `on_load_reopen`'s, except a hook carried here as the statement it is
-/// (`on_load_reopen::registered_as_written`), and `autoload` the
+/// (`on_load_reopen::registered_as_written`); one inside a file-level
+/// conditional is that conditional's statement, registered where the
+/// branch runs (`project::reject_unported_load_hooks` refuses it on a
+/// tree without the lazy_load_hooks port). `autoload` is the
 /// autoloader's. A file-level `A::B = Class.new(C)` is a declaration
 /// (`file_class_new_path_write`), not a statement.
 pub(super) fn file_program(source: &[u8], file: &str, classes: &[LibraryClass]) -> Option<crate::app::FileProgram> {
@@ -456,8 +459,11 @@ fn program_items(
                     r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "ActiveSupport")
                 });
             // A hook this file registers as written falls through to
-            // `statement` (`on_load_reopen::registered_as_written`).
-            if on_load && !super::on_load_reopen::registered_as_written(&call) {
+            // `statement` (`on_load_reopen::registered_as_written`), and
+            // so does every hook in a file-level `if`/`unless`: the
+            // reopen pass reads only the top level, and Ruby registers
+            // the block only when the branch runs.
+            if on_load && !in_branch && !super::on_load_reopen::registered_as_written(&call) {
                 continue;
             }
         }

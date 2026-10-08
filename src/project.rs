@@ -1223,6 +1223,48 @@ fn reject_wide_integer_literals(app: &App, target: BuildTarget) -> Result<(), St
     Ok(())
 }
 
+/// Each `ActiveSupport.on_load(:hook)` call a support file's program
+/// makes as it loads, with its hook (`?` when not a symbol literal): a
+/// bare statement (`ingest::on_load_reopen::registered_as_written`), and
+/// one anywhere inside a statement, which registers when the statement
+/// runs it: `ActiveSupport.on_load(:h) do … end if defined?(ActiveSupport)`
+/// (paquito 1.0.2, secure_headers 5.2.0's view_helper.rb), or a hook in
+/// a file-level branch that declares classes.
+fn for_each_file_load_hook_registration(app: &App, f: &mut dyn FnMut(&crate::expr::Expr, &str)) {
+    use crate::app::ProgramItem;
+    use crate::expr::{Expr, ExprNode, Literal};
+    fn registrations(expr: &Expr, f: &mut dyn FnMut(&Expr, &str)) {
+        if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node {
+            let active_support = matches!(&*recv.node, ExprNode::Const { path }
+                if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport"]));
+            if active_support && method.as_str() == "on_load" {
+                let hook = match args.first().map(|a| &*a.node) {
+                    Some(ExprNode::Lit { value: Literal::Sym { value } }) => value.as_str(),
+                    _ => "?",
+                };
+                f(expr, hook);
+                return;
+            }
+        }
+        expr.node.for_each_child(&mut |child| registrations(child, f));
+    }
+    fn visit(items: &[ProgramItem], f: &mut dyn FnMut(&Expr, &str)) {
+        for item in items {
+            match item {
+                ProgramItem::Statement(expr) | ProgramItem::Guard(expr) => registrations(expr, f),
+                ProgramItem::Branch { then_items, else_items, .. } => {
+                    visit(then_items, f);
+                    visit(else_items, f);
+                }
+                _ => {}
+            }
+        }
+    }
+    for program in &app.file_programs {
+        visit(&program.items, f);
+    }
+}
+
 /// A support file's `ActiveSupport.on_load(:hook) do … end`, which its
 /// file program registers as written
 /// (`ingest::on_load_reopen::registered_as_written`), calls the runtime's
@@ -1233,44 +1275,19 @@ fn reject_unported_load_hooks(app: &App, target: BuildTarget) -> Result<(), Stri
     if matches!(target, BuildTarget::Ruby) && primary_postgresql(app) {
         return Ok(());
     }
-    fn visit(items: &[crate::app::ProgramItem], target: &str, found: &mut bool) {
-        use crate::app::ProgramItem;
-        for item in items {
-            match item {
-                ProgramItem::Statement(expr) => {
-                    let crate::expr::ExprNode::Send { recv: Some(recv), method, args, .. } = &*expr.node else { continue };
-                    let active_support = matches!(&*recv.node, crate::expr::ExprNode::Const { path }
-                        if path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).eq(["ActiveSupport"]));
-                    if !active_support || method.as_str() != "on_load" {
-                        continue;
-                    }
-                    let hook = match args.first().map(|a| &*a.node) {
-                        Some(crate::expr::ExprNode::Lit { value: crate::expr::Literal::Sym { value } }) => value.as_str().to_string(),
-                        _ => "?".to_string(),
-                    };
-                    *found = true;
-                    emit::diagnostics::report_unsupported(
-                        expr.span,
-                        target,
-                        "load_hook_registration",
-                        &format!(
-                            "`ActiveSupport.on_load(:{hook})` registers with lazy_load_hooks, whose runtime port \
-                             only the PostgreSQL CRuby tree carries"
-                        ),
-                    );
-                }
-                ProgramItem::Branch { then_items, else_items, .. } => {
-                    visit(then_items, target, found);
-                    visit(else_items, target, found);
-                }
-                _ => {}
-            }
-        }
-    }
     let mut found = false;
-    for program in &app.file_programs {
-        visit(&program.items, target.as_str(), &mut found);
-    }
+    for_each_file_load_hook_registration(app, &mut |expr, hook| {
+        found = true;
+        emit::diagnostics::report_unsupported(
+            expr.span,
+            target.as_str(),
+            "load_hook_registration",
+            &format!(
+                "`ActiveSupport.on_load(:{hook})` registers with lazy_load_hooks, whose runtime port \
+                 only the PostgreSQL CRuby tree carries"
+            ),
+        );
+    });
     if found {
         return Err(format!(
             "{}: a support file's `ActiveSupport.on_load` registration needs the PostgreSQL CRuby tree",
@@ -4484,8 +4501,15 @@ fn gem_source_dependency_block(app: &App) -> String {
 /// base, then run each boot initializer's carried statements
 /// (`ingest::initializer_programs`) in Rails' `load_config_initializers`
 /// order, after the gems' railtie initializers and before the Finisher.
+///
+/// A tree whose support files register load hooks and that has no
+/// initializers fires them too: Rails fires each framework hook whatever
+/// registered it, so a lib file's `ActiveSupport.on_load(:active_record)`
+/// runs once Active Record's base has loaded.
 fn initializer_program_block(app: &App) -> String {
-    if app.initializer_programs.is_empty() {
+    let mut registers = false;
+    for_each_file_load_hook_registration(app, &mut |_, _| registers = true);
+    if app.initializer_programs.is_empty() && !registers {
         return String::new();
     }
     let mut out = String::from(
