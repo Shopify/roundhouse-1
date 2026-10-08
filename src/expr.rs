@@ -217,6 +217,13 @@ pub enum IrHint {
     /// As `ErrorAttribute`, for an attribute held in the named local
     /// or parameter (an EachValidator's `errors.add(attribute, ...)`).
     ErrorAttributeLocal(crate::ident::Symbol),
+    /// On the message `lower::errors_add` grounded `errors.add(:attr)`
+    /// or `errors.add(:attr, :invalid)` to: Rails' default error type
+    /// with no options, the same Error a has_many adds for an invalid
+    /// record, which `errors.uniq!` keeps once. The CRuby and JRuby
+    /// trees dedupe the two (`emit::ruby::collection_autosave`); every
+    /// other emit ignores it.
+    InvalidErrorType,
     /// On the reader send `lower::assoc_loaded` collapsed
     /// `record.association(:name).target` onto (`record.name`). Rails'
     /// `target` answers the loaded record(s), nil or [] when nothing has

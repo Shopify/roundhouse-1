@@ -3514,6 +3514,38 @@ fn rewrite_send(expr: &mut Expr, ctx: &Ctx, locals: &mut Locals) -> Option<Class
                         _ => None,
                     };
                     if let Some((target, fk, owner_id)) = resolved {
+                        // `owner.lines << line` / `.push(line, …)`: Rails'
+                        // CollectionProxy#concat, which on a saved owner
+                        // saves the record under its key at once (and on
+                        // a new one keeps it for the owner's save). A tree
+                        // that keeps loaded records answers it in its
+                        // runtime (`Association.concat`), for an owner it
+                        // can name again, as `created` above. The other
+                        // trees keep the push onto the reader's Array.
+                        let renamable = matches!(&*ir.node,
+                            ExprNode::SelfRef | ExprNode::Var { .. } | ExprNode::Ivar { .. })
+                            || owner_reads_once(ir);
+                        if ctx.track_targets
+                            && renamable
+                            && matches!(method.as_str(), "<<" | "push")
+                            && !args.is_empty()
+                            && block.is_none()
+                        {
+                            let mut concat_args = vec![
+                                ir.clone(),
+                                syn(span, ExprNode::Lit { value: Literal::Sym { value: aname.clone() } }),
+                            ];
+                            concat_args.extend(args);
+                            *expr = put(
+                                span,
+                                Some(const_expr(span, &ClassId(Symbol::from("ActiveRecord::Associations::Association")))),
+                                Symbol::from("concat"),
+                                concat_args,
+                                None,
+                                true,
+                            );
+                            return None;
+                        }
                         // CollectionProxy constructors: `story.comments
                         // .build(attrs)` constructs the target with the
                         // association's FK preset — `Comment.new(attrs…,
