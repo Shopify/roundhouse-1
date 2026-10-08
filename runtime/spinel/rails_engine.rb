@@ -279,9 +279,7 @@ module Rails
       def isolate_namespace(mod)
         engine_name(generate_railtie_name(mod.name))
 
-        # ActiveSupport::Inflector.underscore without the acronym table,
-        # as `generate_railtie_name` (the tree has no Inflector acronyms).
-        config.default_scope = { module: mod.name.gsub("::", "/").gsub(/(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-z\d])(?=[A-Z])/, "_").tr("-", "_").downcase }
+        config.default_scope = { module: ActiveSupport::Inflector.underscore(mod.name) }
 
         self.isolated = true
 

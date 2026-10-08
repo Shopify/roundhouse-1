@@ -3949,6 +3949,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # ports (runtime/features).\n\
                  $LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))\n",
             );
+            // `require "active_support"` (config/boot's `require "rails"`)
+            // loads active_support/inflector and its default English rules
+            // before Bundler.require: a gem's railtie or engine names
+            // itself through it (`generate_railtie_name`,
+            // `isolate_namespace`) as it loads. After Module#delegate,
+            // which Inflections::Uncountables uses.
+            let delegate = "require_relative \"module_delegate\"\n";
+            let at = content.find(delegate).ok_or("PostgreSQL bootstrap: missing module_delegate require in gem_facades.rb")? + delegate.len();
+            content.insert_str(at, "require_relative \"active_support_inflector\"\n");
             // Where Bundler.require would have loaded them: with the gems.
             for (feature, stem) in &port_requires {
                 content.push_str(&format!(
@@ -3971,9 +3980,6 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  # `require \"active_support/core_ext\"` mixes ActiveSupport::Tryable\n\
                  # into Object before any app code: `Object#try`, ported.\n\
                  require_relative \"runtime/active_support_tryable\"\n\
-                 # `require \"active_support\"` loads active_support/inflector and its\n\
-                 # default English rules before any app code.\n\
-                 require_relative \"runtime/active_support_inflector\"\n\
                  # `require \"action_dispatch\"` defines its session stores, constants\n\
                  # and ShowExceptions before any app code.\n\
                  require_relative \"runtime/action_dispatch_session_store\"\n\
@@ -3993,13 +3999,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                  require_relative \"runtime/rails_engine\"\n",
             );
             // The app's `inflect.*` declarations (config/initializers), which
-            // Rails runs at boot: replayed into the port right after it
-            // loads, in registration order, so no caller (nor Core's
-            // memoizing prepend) sees the bare defaults.
-            let inflector = "require_relative \"runtime/active_support_inflector\"\n";
+            // Rails runs after the gems load and before the app's code, in
+            // registration order: replayed into the port (loaded with the
+            // gems, runtime/gem_facades.rb) before app/models, so no app
+            // caller (nor Core's memoizing prepend) sees the bare defaults.
             let replay = inflection_replay(&crate::naming::app_inflections());
             if !replay.is_empty() {
-                let at = content.find(inflector).ok_or("PostgreSQL bootstrap: missing inflector require in boot.rb")? + inflector.len();
+                let at = content.find(models).ok_or("PostgreSQL bootstrap: missing app/models require in boot.rb")?;
                 content.insert_str(at, &replay);
             }
             content.push_str("\nrequire_relative \"runtime/active_support_lazy_load_hooks\"\n");

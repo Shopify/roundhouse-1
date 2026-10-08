@@ -131,8 +131,9 @@ fn inflector_resolves_and_is_refused_where_the_tree_lacks_it() {
 }
 
 /// The PostgreSQL CRuby tree (`project::apply_postgres_bootstrap`) carries
-/// the port verbatim, loads it before the app's code, replays the app's
-/// literal inflections into it in registration order, and emits the
+/// the port verbatim, loads it with the gems (before Bundler.require, as
+/// `require "rails"` does), replays the app's literal inflections into it
+/// in registration order before the app's code, and emits the
 /// reads unrefused. (A regex rule is not read at ingest, which reports
 /// it, so it is not replayed.)
 #[test]
@@ -152,8 +153,15 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
         source("runtime/active_support_inflector.rb"),
         std::fs::read_to_string(root().join("runtime/spinel/active_support_inflector.rb")).unwrap()
     );
+    // With the gems, as `require "rails"` loads it before Bundler.require:
+    // after Module#delegate (Uncountables), ahead of every gem require.
+    let facades = source("runtime/gem_facades.rb");
+    let delegate = facades.find("require_relative \"module_delegate\"\n").expect("gem_facades loads Module#delegate");
+    let required = facades.find("require_relative \"active_support_inflector\"\n").unwrap_or_else(|| panic!("gem_facades requires the port:\n{facades}"));
+    assert_eq!(required, delegate + "require_relative \"module_delegate\"\n".len(), "{facades}");
     let boot = source("boot.rb");
-    let required = boot.find("require_relative \"runtime/active_support_inflector\"\n").expect("boot requires the port");
+    assert!(!boot.contains("runtime/active_support_inflector"), "boot loads the port a second time:\n{boot}");
+    let gems = boot.find("require_relative \"runtime/gem_facades\"").expect("boot loads the gems' facades");
     let replay = "# The app's config/initializers inflections, which Rails runs at boot.\n\
                   ActiveSupport::Inflector.inflections(:en) do |inflect|\n  \
                   inflect.acronym(\"API\")\n  \
@@ -163,12 +171,9 @@ fn the_postgresql_ruby_tree_carries_the_inflector_and_the_app_rules() {
                   inflect.irregular(\"fish\", \"fishes\")\n\
                   end\n";
     let replayed = boot.find(replay).unwrap_or_else(|| panic!("boot replays the app's inflections:\n{boot}"));
-    assert_eq!(replayed, required + "require_relative \"runtime/active_support_inflector\"\n".len(), "{boot}");
-    assert!(replayed < boot.find("require_relative \"app/models\"").expect("boot loads app/models"), "{boot}");
-    // Module#delegate (Uncountables) loads ahead of the port.
-    let delegate = boot.find("require_relative \"runtime/gem_facades\"").expect("boot loads the gems' facades");
-    assert!(delegate < required, "{boot}");
-    assert!(source("runtime/gem_facades.rb").contains("require_relative \"module_delegate\""));
+    // After the gems, immediately before the app's code.
+    assert!(gems < replayed, "{boot}");
+    assert_eq!(replayed + replay.len(), boot.find("require_relative \"app/models\"").expect("boot loads app/models"), "{boot}");
     let model = source("app/models/probe.rb");
     assert!(model.contains("ActiveSupport::Inflector.underscore(\"APIKey\")") && !model.contains("not supported"), "{model}");
     std::fs::remove_dir_all(dir).unwrap();

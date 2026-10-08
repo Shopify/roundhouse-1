@@ -106,10 +106,13 @@ fn an_app_engine_is_carried_and_runs_its_body_initializers_and_hooks_in_rails_or
             "ORDER = []\n\
              require_relative 'runtime/active_support_lazy_load_hooks'\n\
              $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+             require_relative 'runtime/module_delegate'\n\
+             require_relative 'runtime/active_support_inflector'\n\
              require_relative 'runtime/rails'\n\
              Rails.env_name = 'test'\n\
              require_relative 'runtime/rails_railtie'\n\
              require_relative 'runtime/rails_engine'\n\
+             require_relative 'runtime/active_support_deprecation'\n\
              require_relative 'app/models'\n\
              Rails::Railtie.run_initializers_of_railties(Rails.application, :finish)\n\
              puts ORDER.inspect\n\

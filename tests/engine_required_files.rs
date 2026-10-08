@@ -83,10 +83,13 @@ fn boot(dir: &std::path::Path, env: &str) -> std::process::Output {
             &format!(
                 "require_relative 'runtime/active_support_lazy_load_hooks'\n\
                  $LOAD_PATH.unshift(File.expand_path('runtime/features'))\n\
+                 require_relative 'runtime/module_delegate'\n\
+                 require_relative 'runtime/active_support_inflector'\n\
                  require_relative 'runtime/rails'\n\
                  Rails.env_name = {env:?}\n\
                  require_relative 'runtime/rails_railtie'\n\
                  require_relative 'runtime/rails_engine'\n\
+                 require_relative 'runtime/active_support_deprecation'\n\
                  require_relative 'app/models'\n\
                  puts WidgetService.price\n\
                  puts defined?(WidgetHelper).inspect\n\
