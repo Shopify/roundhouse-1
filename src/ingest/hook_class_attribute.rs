@@ -37,6 +37,17 @@
 //! with that condition whose branch holds only declarations is that
 //! branch.
 //!
+//! `base.cattr_accessor :pem_file` (and the other `cattr_*` / `mattr_*`)
+//! in the hook is the same shape for a class variable
+//! (activemerchant's `PaypalCommonAPI`): ActiveSupport's
+//! `Module#mattr_*` defines `def self.pem_file; @@pem_file; end` and its
+//! instance twin on `base` and seeds `@@pem_file` there. Each includer
+//! gets those defs (`cattr::Declaration::methods`, whose `@@pem_file`
+//! resolves in the includer as the `class_eval`ed one does), and the
+//! statement becomes the seed, `base.class_variable_set(:@@pem_file,
+//! default)`, or without a default `base.class_variable_set(:@@pem_file,
+//! nil) unless base.class_variable_defined?(:@@pem_file)`.
+//!
 //! The pass is all or nothing per module. A hook keeps its text when it
 //! has a `class_attribute` call this does not read, or when no app class
 //! includes the module. An unread call is one that is not a top-level
@@ -49,6 +60,28 @@ use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 
 use super::class_attribute::{Decl, storage_ivar};
+
+/// How many calls in `e` name a method `method_set` accepts.
+fn decl_count(e: &Expr, method_set: fn(&str) -> bool) -> usize {
+    let mut n = 0;
+    fn walk(e: &Expr, n: &mut usize, method_set: fn(&str) -> bool) {
+        if let ExprNode::Send { method, .. } = &*e.node
+            && method_set(method.as_str())
+        {
+            *n += 1;
+        }
+        e.node.for_each_child(&mut |c| walk(c, n, method_set));
+    }
+    walk(e, &mut n, method_set);
+    n
+}
+
+fn is_cattr_macro(method: &str) -> bool {
+    matches!(
+        method,
+        "cattr_accessor" | "cattr_reader" | "cattr_writer" | "mattr_accessor" | "mattr_reader" | "mattr_writer"
+    )
+}
 
 pub(super) fn expand(app: &mut App) {
     let mut planned: Vec<(usize, usize, Vec<(usize, Declaration)>)> = Vec::new();
@@ -88,14 +121,17 @@ pub(super) fn expand(app: &mut App) {
         for i in includers {
             let owner = app.library_classes[i].name.clone();
             let mut added: Vec<MethodDef> = Vec::new();
-            for decl in decls.iter().flat_map(|(_, d)| d.decls()) {
-                for method in super::class_attribute::methods(&owner, decl) {
-                    let own = &app.library_classes[i].methods;
-                    if own.iter().chain(added.iter()).any(|d| d.name == method.name && d.receiver == method.receiver) {
-                        continue;
-                    }
-                    added.push(method);
+            // In the hook's statement order, as ActiveSupport defines them.
+            let generated = decls.iter().flat_map(|(_, d)| match d {
+                Declaration::Cattr(c) => c.methods(&owner),
+                _ => d.decls().iter().flat_map(|decl| super::class_attribute::methods(&owner, decl)).collect(),
+            });
+            for method in generated {
+                let own = &app.library_classes[i].methods;
+                if own.iter().chain(added.iter()).any(|d| d.name == method.name && d.receiver == method.receiver) {
+                    continue;
                 }
+                added.push(method);
             }
             app.library_classes[i].methods.splice(0..0, added);
         }
@@ -109,7 +145,10 @@ pub(super) fn expand(app: &mut App) {
             ExprNode::Var { id: crate::ident::VarId(0), name: hook.params[0].name.clone() },
         );
         for (at, declaration) in decls.iter().rev() {
-            let seeds: Vec<Expr> = declaration.decls().iter().flat_map(|decl| seeds(&base, decl)).collect();
+            let seeds: Vec<Expr> = match declaration {
+                Declaration::Cattr(c) => cattr_seeds(&base, c, statements[*at].span),
+                _ => declaration.decls().iter().flat_map(|decl| seeds(&base, decl)).collect(),
+            };
             statements.splice(*at..*at + 1, seeds);
         }
         let span = hook.body.span;
@@ -135,7 +174,13 @@ fn hook_declarations(hook: &MethodDef) -> Option<Vec<(usize, Declaration)>> {
             out.push((i, Declaration::One(decl)));
         } else if let Some(decls) = guarded_declarations(statement, &base.name) {
             out.push((i, Declaration::Guarded(decls)));
+        } else if let Some(decl) = cattr_declaration(statement, &base.name) {
+            out.push((i, Declaration::Cattr(decl)));
         }
+    }
+    let cattrs = out.iter().filter(|(_, d)| matches!(d, Declaration::Cattr(_))).count();
+    if decl_count(&hook.body, is_cattr_macro) != cattrs {
+        return None;
     }
     fn count(e: &Expr, n: &mut usize) {
         if let ExprNode::Send { method, .. } = &*e.node
@@ -162,15 +207,132 @@ fn hook_declarations(hook: &MethodDef) -> Option<Vec<(usize, Declaration)>> {
 enum Declaration {
     One(Decl),
     Guarded(Vec<Decl>),
+    Cattr(super::cattr::Declaration),
 }
 
 impl Declaration {
+    /// The `class_attribute` declarations (none for a `cattr_*`).
     fn decls(&self) -> &[Decl] {
         match self {
             Declaration::One(decl) => std::slice::from_ref(decl),
             Declaration::Guarded(decls) => decls,
+            Declaration::Cattr(_) => &[],
         }
     }
+}
+
+/// `base.cattr_accessor(:a, :b, instance_reader: false, default: x)`
+/// (any `cattr_*`/`mattr_*`), with literal names and flags and no block.
+fn cattr_declaration(statement: &Expr, base: &Symbol) -> Option<super::cattr::Declaration> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*statement.node else {
+        return None;
+    };
+    if !is_cattr_macro(method.as_str()) || !matches!(&*recv.node, ExprNode::Var { name, .. } if name == base) {
+        return None;
+    }
+    let mut names: Vec<Symbol> = Vec::new();
+    let mut flags: [Option<bool>; 3] = [None; 3];
+    let mut default: Option<Expr> = None;
+    for (i, arg) in args.iter().enumerate() {
+        match &*arg.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => names.push(value.clone()),
+            ExprNode::Lit { value: Literal::Str { value } } => names.push(Symbol::from(value.as_str())),
+            ExprNode::Hash { entries, .. } if i + 1 == args.len() => {
+                for (key, value) in entries {
+                    let ExprNode::Lit { value: Literal::Sym { value: key } } = &*key.node else { return None };
+                    let slot = match key.as_str() {
+                        "instance_reader" => 0,
+                        "instance_writer" => 1,
+                        "instance_accessor" => 2,
+                        // ActiveSupport keeps a defined `@@x` when the
+                        // default evaluates to nil; only a nil literal or
+                        // a value that is never nil is read here.
+                        "default" if default.is_none() && never_nil_or_nil_literal(value) => {
+                            default = Some(value.clone());
+                            continue;
+                        }
+                        "location" => continue,
+                        _ => return None,
+                    };
+                    let flag = match &*value.node {
+                        ExprNode::Lit { value: Literal::Bool { value } } => *value,
+                        ExprNode::Lit { value: Literal::Nil } => false,
+                        _ => return None,
+                    };
+                    if flags[slot].replace(flag).is_some() {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let attribute = |n: &Symbol| {
+        let mut chars = n.as_str().chars();
+        chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    };
+    if names.is_empty() || !names.iter().all(attribute) {
+        return None;
+    }
+    let accessor = flags[2].unwrap_or(true);
+    Some(super::cattr::Declaration::new(
+        method.as_str(),
+        names,
+        flags[0].unwrap_or(true) && accessor,
+        flags[1].unwrap_or(true) && accessor,
+        default,
+    ))
+}
+
+/// A literal, or a collection, range or interpolation literal: what is
+/// never nil, or the nil literal itself.
+fn never_nil_or_nil_literal(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Lit { .. }
+            | ExprNode::Array { .. }
+            | ExprNode::Hash { .. }
+            | ExprNode::Range { .. }
+            | ExprNode::StringInterp { .. }
+    )
+}
+
+/// What ActiveSupport's `mattr_*` stores on `base`: per name,
+/// `base.class_variable_set(:@@name, default)`, the later names reading
+/// the first back so the one default object is shared; without a
+/// default, `base.class_variable_set(:@@name, nil) unless
+/// base.class_variable_defined?(:@@name)`.
+fn cattr_seeds(base: &Expr, decl: &super::cattr::Declaration, span: crate::span::Span) -> Vec<Expr> {
+    let send = |method: &str, args: Vec<Expr>| {
+        Expr::new(
+            span,
+            ExprNode::Send { recv: Some(base.clone()), method: Symbol::from(method), args, block: None, parenthesized: true },
+        )
+    };
+    let cvar = |name: &Symbol| {
+        Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: super::cattr::storage(name) } })
+    };
+    let nil = || Expr::new(span, ExprNode::Lit { value: Literal::Nil });
+    let first = &decl.names[0];
+    decl.names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match decl.default() {
+            Some(default) => {
+                let value = if i == 0 { default.clone() } else { send("class_variable_get", vec![cvar(first)]) };
+                send("class_variable_set", vec![cvar(name), value])
+            }
+            None => Expr::new(
+                span,
+                ExprNode::If {
+                    cond: send("class_variable_defined?", vec![cvar(name)]),
+                    then_branch: nil(),
+                    else_branch: send("class_variable_set", vec![cvar(name), nil()]),
+                },
+            ),
+        })
+        .collect()
 }
 
 /// `if base.respond_to?(:class_attribute) then <declarations> else … end`:

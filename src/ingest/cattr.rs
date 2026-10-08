@@ -137,6 +137,24 @@ fn is_nil(e: &Expr) -> bool {
 }
 
 impl Declaration {
+    /// A declaration read some other way than from source (an included
+    /// hook's `base.cattr_accessor`, `hook_class_attribute`).
+    pub(crate) fn new(kw: &str, names: Vec<Symbol>, instance_reader: bool, instance_writer: bool, default: Option<Expr>) -> Self {
+        Declaration {
+            names,
+            reader: kw.ends_with("_reader") || kw.ends_with("_accessor"),
+            writer: kw.ends_with("_writer") || kw.ends_with("_accessor"),
+            instance_reader,
+            instance_writer,
+            default,
+        }
+    }
+
+    /// The default, unless absent or a literal nil.
+    pub(crate) fn default(&self) -> Option<&Expr> {
+        self.default.as_ref().filter(|d| !is_nil(d))
+    }
+
     /// The accessors, class side first, as ActiveSupport defines them
     /// (public, whatever visibility is in effect around the call: its
     /// `module_eval` string starts its own scope).
