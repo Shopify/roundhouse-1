@@ -181,7 +181,23 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
             without_apart = copy;
             &without_apart
         };
-        let mut files = emit_library_class_pair(lc, app, out_path);
+        // A nested class the source wrote below some of its parent's
+        // constants is placed among them as it renders (`NestedPlacement`);
+        // the rest are spliced after the parent's header.
+        let nested = (last_of_name.get(lc.name.0.as_str()) == Some(&i))
+            .then(|| children.get(lc.name.0.as_str()))
+            .flatten()
+            .map(|kids| nested_blocks(lc, kids, app, &out_path));
+        let mut files = match &nested {
+            Some(nested) => {
+                let placing = NestedPlacement::install(lc, nested);
+                let mut files = emit_library_class_pair(lc, app, out_path);
+                let unplaced = placing.finish();
+                splice_nested(&mut files, lc, nested, &unplaced);
+                files
+            }
+            None => emit_library_class_pair(lc, app, out_path),
+        };
         for (j, stem) in &apart {
             let constant = LibraryClass {
                 includes: Vec::new(),
@@ -197,11 +213,6 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
                 ..lc.clone()
             };
             files.extend(emit_library_class_pair(&constant, app, PathBuf::from(format!("app/models/{stem}.rb"))));
-        }
-        if last_of_name.get(lc.name.0.as_str()) == Some(&i) {
-            if let Some(kids) = children.get(lc.name.0.as_str()) {
-                splice_nested(&mut files, lc, kids, app);
-            }
         }
         for file in files {
             match at_path.get(&file.path) {
@@ -301,9 +312,22 @@ fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -
     inserted.then(|| out.join("\n"))
 }
 
+/// The nested classes spliced into a parent's file, rendered.
+struct NestedBlocks {
+    /// Each nested class's block, in load order, with where the source
+    /// wrote it among the parent's constants (`nested_position`).
+    blocks: Vec<(Option<crate::span::Span>, String)>,
+    sidecar_blocks: Vec<String>,
+    hoisted: Vec<String>,
+}
+
 /// Put each nested class's block inside its parent's file, before the
 /// parent's own body — the order the source has, and the only one that
-/// works when the parent's class body references them.
+/// works when the parent's class body references them. A nested class
+/// the source wrote below some of the parent's constants goes among
+/// them instead, before the first constant below it (`NestedPlacement`):
+/// monorepo_slices' `IssueTrackingLabelValidator` reads the contract's
+/// `SLICE_LABEL_PREFIX` as its body loads.
 ///
 /// The child is rendered by the same function as before and its outer
 /// wrapper removed by COUNT, not by pattern: the parent's name has D
@@ -317,12 +341,7 @@ fn spliced_after_header(content: &str, header_indent: &str, blocks: &[String]) -
 /// the tree lost every nested class while the `.rb` kept them all.
 /// Spelled nested inside the parent's `class`, which is what the
 /// standalone sidecar's `module Parent` wrapper said too.
-fn splice_nested(
-    files: &mut [EmittedFile],
-    parent: &LibraryClass,
-    kids: &[&LibraryClass],
-    app: &App,
-) {
+fn nested_blocks(parent: &LibraryClass, kids: &[&LibraryClass], app: &App, parent_rb: &Path) -> NestedBlocks {
     let depth = parent.name.0.as_str().split("::").count();
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
@@ -407,20 +426,16 @@ fn splice_nested(
         ordered
     };
     let kids = &kids[..];
-    let mut blocks: Vec<String> = Vec::new();
+    let mut blocks: Vec<(Option<crate::span::Span>, String)> = Vec::new();
     let mut sidecar_blocks: Vec<String> = Vec::new();
     let mut hoisted: Vec<String> = Vec::new();
-    // The file the blocks run in: a `__dir__` read in a child
-    // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
-    let parent_rb = files.iter().find(|f| f.path.extension().is_some_and(|e| e == "rb")).map(|f| f.path.clone());
     for kid in kids {
         let stem = crate::naming::underscore(kid.name.0.as_str());
         let rb_path = PathBuf::from(format!("app/models/{stem}.rb"));
         let render = || emit_library_class_decl(kid, app, rb_path.clone());
-        let rendered = match &parent_rb {
-            Some(parent_rb) => super::expr::with_spliced_into(parent_rb, render),
-            None => render(),
-        };
+        // The file the blocks run in: a `__dir__` read in a child
+        // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
+        let rendered = super::expr::with_spliced_into(parent_rb, render);
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
         // class, not buried inside a class body where they would still
@@ -467,7 +482,7 @@ fn splice_nested(
             .filter(|l| !l.starts_with("require"))
             .collect();
         let Some(block) = unwrapped(&body, depth) else { continue };
-        blocks.push(block);
+        blocks.push((nested_position(parent, kid), block));
         // The sidecar `emit_library_class_pair` would have written for
         // the child's own file, minus the same wrapper. Its type names
         // were resolved inside the child's enclosing segments, which
@@ -479,22 +494,66 @@ fn splice_nested(
             sidecar_blocks.push(block);
         }
     }
-    if blocks.is_empty() {
+    NestedBlocks { blocks, sidecar_blocks, hoisted }
+}
+
+/// Where the source wrote `kid` among `parent`'s constants: the first
+/// position of its body (its superclass, a method, a constant, a
+/// class-body call) when that lies below one of the parent's constants
+/// in the same file. `None` (a block spliced after the header) when it
+/// is above them all, has no real span, or spans several files.
+fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::span::Span> {
+    let spans = std::iter::once(kid.parent_span)
+        .chain(kid.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
+        .chain(kid.constants.iter().map(|(_, e)| e.span))
+        .chain(kid.unknown_calls.iter().map(|e| e.span))
+        .chain(kid.class_ivar_initializers.iter().map(|e| e.span))
+        .filter(|span| span.file.0 != 0 && *span != crate::span::Span::synthetic());
+    let mut first: Option<crate::span::Span> = None;
+    for span in spans {
+        match first {
+            Some(f) if f.file != span.file => return None,
+            Some(f) if f.start <= span.start => {}
+            _ => first = Some(span),
+        }
+    }
+    let first = first?;
+    parent
+        .constants
+        .iter()
+        .any(|(_, value)| value.span.file == first.file && value.span != crate::span::Span::synthetic() && value.span.start < first.start)
+        .then_some(first)
+}
+
+/// Splice what `NestedPlacement` did not place among the constants
+/// (`unplaced`, indices into `nested.blocks`) after the parent's
+/// header, and the requires and sidecar blocks of them all.
+fn splice_nested(files: &mut [EmittedFile], parent: &LibraryClass, nested: &NestedBlocks, unplaced: &[usize]) {
+    if nested.blocks.is_empty() {
         return;
     }
+    let depth = parent.name.0.as_str().split("::").count();
+    let blocks: Vec<String> = unplaced.iter().map(|&j| nested.blocks[j].1.clone()).collect();
     let own_header_indent = "  ".repeat(depth - 1);
     let Some(rb) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rb")) else {
         return;
     };
-    let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, &blocks) else {
-        return;
+    // Every block may already be among the constants; the requires
+    // they need still open the file.
+    let spliced = if blocks.is_empty() {
+        rb.content.trim_end_matches('\n').to_string()
+    } else {
+        let Some(spliced) = spliced_after_header(&rb.content, &own_header_indent, &blocks) else {
+            return;
+        };
+        spliced
     };
     let mut content = String::new();
-    for r in &hoisted {
+    for r in &nested.hoisted {
         content.push_str(r);
         content.push('\n');
     }
-    if !hoisted.is_empty() {
+    if !nested.hoisted.is_empty() {
         content.push('\n');
     }
     content.push_str(&spliced);
@@ -504,12 +563,83 @@ fn splice_nested(
     // Only once the `.rb` took the body: a sidecar must describe the
     // file beside it, and a child left out of the one stays out of the
     // other.
+    splice_sidecar(files, depth, &nested.sidecar_blocks);
+}
+
+fn splice_sidecar(files: &mut [EmittedFile], depth: usize, sidecar_blocks: &[String]) {
+    let own_header_indent = "  ".repeat(depth - 1);
     let Some(rbs) = files.iter_mut().find(|f| f.path.extension().is_some_and(|e| e == "rbs"))
     else {
         return;
     };
-    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, &sidecar_blocks) {
+    if let Some(spliced) = spliced_after_header(&rbs.content, &own_header_indent, sidecar_blocks) {
         rbs.content = format!("{spliced}\n");
+    }
+}
+
+/// The nested classes of the class being rendered whose source lies
+/// below some of its constants (`nested_position`): each is written
+/// right before the first constant the source has below it, or after
+/// the constants, rather than after the class header. Installed by the
+/// library emit around rendering the class itself, and only for it.
+struct NestedPlacement;
+
+struct NestedPending {
+    owner: String,
+    /// Index into `NestedBlocks::blocks`, position, block, placed.
+    blocks: Vec<(usize, crate::span::Span, String, bool)>,
+}
+
+thread_local! {
+    static NESTED_PLACEMENT: std::cell::RefCell<Option<NestedPending>> = const { std::cell::RefCell::new(None) };
+}
+
+struct NestedPlacementGuard {
+    count: usize,
+}
+
+impl NestedPlacement {
+    fn install(parent: &LibraryClass, nested: &NestedBlocks) -> NestedPlacementGuard {
+        let blocks = nested
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(j, (at, block))| at.map(|at| (j, at, block.clone(), false)))
+            .collect();
+        NESTED_PLACEMENT.with(|slot| *slot.borrow_mut() = Some(NestedPending { owner: parent.name.0.as_str().to_string(), blocks }));
+        NestedPlacementGuard { count: nested.blocks.len() }
+    }
+
+    /// Write, in load order, the pending blocks of `owner` that `here`
+    /// accepts by their source position.
+    fn place(owner: &ClassId, s: &mut String, here: impl Fn(&crate::span::Span) -> bool) {
+        NESTED_PLACEMENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(pending) = slot.as_mut().filter(|p| p.owner == owner.0.as_str()) else { return };
+            for (_, at, block, placed) in pending.blocks.iter_mut() {
+                if !*placed && here(at) {
+                    s.push_str(block);
+                    s.push('\n');
+                    *placed = true;
+                }
+            }
+        });
+    }
+}
+
+impl NestedPlacementGuard {
+    /// The blocks left for the header, as indices in load order.
+    fn finish(self) -> Vec<usize> {
+        let placed: Vec<usize> = NESTED_PLACEMENT.with(|slot| {
+            slot.borrow().as_ref().map(|p| p.blocks.iter().filter(|b| b.3).map(|b| b.0).collect()).unwrap_or_default()
+        });
+        (0..self.count).filter(|j| !placed.contains(j)).collect()
+    }
+}
+
+impl Drop for NestedPlacementGuard {
+    fn drop(&mut self) {
+        NESTED_PLACEMENT.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -7613,8 +7743,16 @@ fn emit_library_class_decl_inner(
         }
     }
     let render_constants = |s: &mut String, which: &[usize]| {
+        // A nested class the source has above this point, below an
+        // earlier constant (`NestedPlacement`).
+        let place_above = |s: &mut String, at: crate::span::Span| {
+            if at != crate::span::Span::synthetic() {
+                NestedPlacement::place(&lc.name, s, |kid| kid.file == at.file && kid.start < at.start);
+            }
+        };
         for &i in which {
             for call in calls_before.get(&i).into_iter().flatten() {
+                place_above(s, call.span);
                 for line in super::emit_expr(call).lines() {
                     if line.is_empty() {
                         writeln!(s).unwrap();
@@ -7623,6 +7761,7 @@ fn emit_library_class_decl_inner(
                     }
                 }
             }
+            place_above(s, lc.constants[i].1.span);
             let (cname, value) = &lc.constants[i];
             let mut rendered = super::emit_expr(value);
             if rendered.trim().is_empty() {
@@ -7686,6 +7825,14 @@ fn emit_library_class_decl_inner(
         }
         None => render_constants(&mut s, &eager),
     }
+    // One below every eagerly written constant: after them, unless a
+    // constant written after the methods is above it too.
+    NestedPlacement::place(&lc.name, &mut s, |kid| {
+        !deferred.iter().any(|&i| {
+            let at = lc.constants[i].1.span;
+            at != crate::span::Span::synthetic() && at.file == kid.file && at.start < kid.start
+        })
+    });
     if !eager.is_empty() && !lc.methods.is_empty() {
         writeln!(s).unwrap();
     }
@@ -7808,8 +7955,22 @@ fn emit_library_class_decl_inner(
             writeln!(s).unwrap();
         }
         match conditional {
+            // After every def (below).
+            None if inherited_alias(lc, m).is_some() => {}
             Some(at) => write_conditional_definitions(&mut s, lc, &lc.conditional_definitions[at], &body_pad),
             None => write_library_method(&mut s, lc, index, &body_pad),
+        }
+    }
+    // An alias of an ancestor's method (`MethodAlias::inherited`) binds
+    // what the class then answers to the name: an override a pass wrote
+    // here for an inherited method stands for that method (a class
+    // method building `self`), so the alias follows every def. The
+    // class's own definition of the name would have kept the alias
+    // from resolving to an ancestor (`ingest::inherited_alias`).
+    for (index, m) in lc.methods.iter().enumerate() {
+        if inherited_alias(lc, m).is_some() {
+            writeln!(s).unwrap();
+            write_library_method(&mut s, lc, index, &body_pad);
         }
     }
 
@@ -7878,6 +8039,7 @@ fn emit_library_class_decl_inner(
             writeln!(s).unwrap();
         }
         render_constants(&mut s, &deferred);
+        NestedPlacement::place(&lc.name, &mut s, |_| true);
     }
 
     for i in (0..depth).rev() {
@@ -7954,6 +8116,21 @@ fn write_library_method(s: &mut String, lc: &LibraryClass, index: usize, body_pa
     // it keeps looking up the original's name, as in the source. The
     // alias takes the original's visibility; a different one on the
     // copy is a later visibility change, written after it.
+    // One of an ancestor's method (`MethodAlias::inherited`) is the
+    // native alias too: Ruby finds the original through the ancestors,
+    // and the alias keeps its visibility.
+    if let Some(alias) = inherited_alias(lc, m) {
+        let (to, from) = (m.name.as_str(), alias.original.as_str());
+        match m.receiver {
+            MethodReceiver::Instance => writeln!(s, "{body_pad}alias_method :{to}, :{from}").unwrap(),
+            MethodReceiver::Class => {
+                writeln!(s, "{body_pad}class << self").unwrap();
+                writeln!(s, "{body_pad}  alias_method :{to}, :{from}").unwrap();
+                writeln!(s, "{body_pad}end").unwrap();
+            }
+        }
+        return;
+    }
     if let Some(original) = native_alias_original(lc, index) {
         let (to, from) = (m.name.as_str(), original.name.as_str());
         match m.receiver {
@@ -8066,6 +8243,10 @@ fn write_conditional_definitions(
 /// and body spans; a replacing def has its own). Anything else (an
 /// original redefined in place, or a copy whose original a later pass
 /// dropped or moved) keeps the copied def.
+fn inherited_alias<'a>(lc: &'a LibraryClass, m: &MethodDef) -> Option<&'a crate::dialect::MethodAlias> {
+    lc.method_aliases.iter().find(|a| a.inherited && a.name == m.name && a.receiver == m.receiver)
+}
+
 fn native_alias_original(lc: &LibraryClass, index: usize) -> Option<&MethodDef> {
     let m = &lc.methods[index];
     let alias = lc.method_aliases.iter().find(|a| a.name == m.name && a.receiver == m.receiver)?;
@@ -10296,11 +10477,17 @@ pub(super) fn file_owner(name: &str, app: &App) -> String {
 /// The nested class's files include those that only declare it: Core's
 /// `config/test.rb` is `class Config; class Test < Config; end; end`, an
 /// empty body the owner's `config.rb` never declares. The owner's are
-/// its body's only, since such a file reopens it without adding to it.
+/// its body's, and each file declaring it that does not declare the
+/// nested class: merchant_workflows' `config.rb` is
+/// `class Config < ::Component::Config` around Sorbet calls only, an
+/// empty body once ingested, and still the owner's file. A file that
+/// declares both and adds nothing to the owner only reopens it around
+/// the nested class.
 fn written_apart(name: &str, owner: &str, app: &App) -> bool {
     let mut child = body_files(name, app);
     child.extend(declared_files(name, app));
-    let parent = body_files(owner, app);
+    let mut parent = body_files(owner, app);
+    parent.extend(declared_files(owner, app).into_iter().filter(|file| !child.contains(file)));
     !child.is_empty() && !parent.is_empty() && child.is_disjoint(&parent)
 }
 

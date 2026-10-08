@@ -388,15 +388,21 @@ fn program_items(
         }
         if declaration {
             let mut names: Vec<ClassId> = Vec::new();
+            // In source order, as Ruby evaluates them: oid_service.rb's
+            // `module Validation` loads before the `class Local` below it
+            // that extends it. An enclosing declaration starts before what
+            // it nests, so it still loads first.
             let classes = find_all_classes_with_scope(stmt).into_iter().filter_map(|(scope, c)| {
-                class_name_path(&c).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+                let start = c.location().start_offset();
+                class_name_path(&c).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
             });
             let modules = find_all_module_declarations_with_scope(stmt).into_iter().filter_map(|(scope, m)| {
-                module_name_path(&m).map(|p| scope.into_iter().chain(p).collect::<Vec<_>>().join("::"))
+                let start = m.location().start_offset();
+                module_name_path(&m).map(|p| (start, scope.into_iter().chain(p).collect::<Vec<_>>().join("::")))
             });
-            let mut found: Vec<String> = classes.chain(modules).collect();
-            found.sort_by_key(|n| n.matches("::").count());
-            for name in found {
+            let mut found: Vec<(usize, String)> = classes.chain(modules).collect();
+            found.sort_by_key(|(start, _)| *start);
+            for (_, name) in found {
                 if carried.contains(name.as_str()) && !names.iter().any(|n| n.0.as_str() == name) {
                     names.push(ClassId(Symbol::from(name)));
                 }
@@ -3221,15 +3227,50 @@ fn walk_decl_body_in<'pr>(
                         name: copy.name.clone(),
                         receiver,
                         original: Symbol::from(from.as_str()),
+                        inherited: false,
                     });
                     out.methods.push(copy);
                     continue;
                 }
+                // One naming a method this body does not define (an
+                // inherited one: graphql-client's `OperationDefinition <
+                // Definition` does `alias operation_name definition_name`)
+                // is the class body's `alias_method :to, :from`, which Ruby
+                // runs the same way on the class `alias` reopens. Where the
+                // walk can look the original up once every file is in
+                // (`inherited_alias::capturing`), it is captured as that
+                // call, in `class << self` on the singleton class, and the
+                // refusal below is deferred to that lookup: the file is
+                // refused still when no app ancestor defines the method.
+                // Elsewhere it refuses the file here.
+                if super::inherited_alias::is_capturing() {
+                    let span = Span {
+                        file: super::sources::file_id(file),
+                        start: stmt.location().start_offset() as u32,
+                        end: stmt.location().end_offset() as u32,
+                    };
+                    let symbol = |name: &str| Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } });
+                    let recv = force_class_receiver.then(|| {
+                        Expr::new(
+                            span,
+                            ExprNode::Send { recv: None, method: Symbol::from("singleton_class"), args: Vec::new(), block: None, parenthesized: false },
+                        )
+                    });
+                    out.unknown_calls.push(Expr::new(
+                        span,
+                        ExprNode::Send {
+                            recv,
+                            method: Symbol::from("alias_method"),
+                            args: vec![symbol(&to), symbol(&from)],
+                            block: None,
+                            parenthesized: false,
+                        },
+                    ));
+                    super::inherited_alias::defer(span);
+                    continue;
+                }
             }
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: "alias names a method this body has not defined".into(),
-            });
+            return Err(super::inherited_alias::refusal(file));
         }
         // `self.x += v` / `||=` / `&&=` through a `class_attribute`'s
         // class-side reader and writer, in source order with its seed.
@@ -3546,6 +3587,7 @@ fn walk_decl_body_in<'pr>(
                             name: copy.name.clone(),
                             receiver: copy.receiver,
                             original: out.methods[source].name.clone(),
+                            inherited: false,
                         });
                         out.methods.push(copy);
                     }
