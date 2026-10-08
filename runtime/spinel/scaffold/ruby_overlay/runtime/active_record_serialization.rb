@@ -14,9 +14,23 @@
 #
 # CRuby-only by nature (send/instance_variables reflection) — exactly
 # why it lives in the overlay and not runtime/ruby.
+#
+# Rails' other options (`except:`, `methods:`, `include:`, `root:`) are
+# ActiveModel::Serialization's, which only the PostgreSQL CRuby tree
+# carries; it replaces this method with Rails' own
+# (runtime/active_record_active_model.rb). Here a record asked for one
+# raises rather than answering a hash that ignores it.
 module ActiveRecord
   class Base
     def as_json(options = {})
+      if options
+        unported = options.keys & %i[except methods include]
+        unported << :root if options[:root]
+        unless unported.empty?
+          raise NotImplementedError,
+            "roundhouse: ActiveRecord::Base#as_json(#{unported.map(&:inspect).join(", ")}) is ActiveModel::Serialization's, which this tree does not carry (only the PostgreSQL CRuby tree does)"
+        end
+      end
       names =
         if options && options[:only]
           options[:only].map { |n| n.to_s }

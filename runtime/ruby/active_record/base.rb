@@ -537,13 +537,18 @@ module ActiveRecord
     end
 
     # ---- Persistence state ------------------------------------------
+    #
+    # Rails keeps `@new_record` and `@destroyed` (persistence.rb:
+    # `persisted?` is `!(@new_record || @destroyed)`); here `@persisted`
+    # is false for both a new and a destroyed record, so a destroyed one
+    # is not new: `new_record?` stays false after `destroy`, as in Rails.
 
     def persisted?
       @persisted
     end
 
     def new_record?
-      !@persisted
+      !@persisted && !@destroyed
     end
 
     def destroyed?

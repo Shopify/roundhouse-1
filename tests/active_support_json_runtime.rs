@@ -9,10 +9,11 @@
 // (`expr::OBJECT_AS_JSON`) and `lower::as_json_residue` writes it as
 // `ActiveSupport::JSON::Encoding.as_json(value, options)`. The PostgreSQL
 // CRuby tree carries the port wherever emitted app code names it; a tree
-// without it refuses the read by name. `errors.as_json` and a record's
-// `as_json(options)` other than `only:` stay refused: those answer
-// ActiveModel's serializable_hash and Errors, which the runtime does not
-// model.
+// without it refuses the read by name. `errors.as_json` stays refused:
+// it answers ActiveModel::Errors, which the runtime does not model. A
+// record's `as_json(options)` other than `only:` answers
+// ActiveModel::Serializers::JSON, which only the PostgreSQL CRuby tree's
+// ActiveRecord::Base includes; every other tree refuses it by name.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -154,13 +155,21 @@ fn active_model_as_json_stays_refused() {
     let dir = probe_app(false, true);
     let (ok, text) = run(&dir, &["check"]);
     assert!(!ok, "check accepted ActiveModel's as_json: {text}");
-    // Snapshot's sends route; only the two ActiveModel rows are refused.
+    // Snapshot's sends route; only `errors.as_json` is refused by every
+    // tree.
     let errors: Vec<&str> = text.lines().filter(|l| l.contains("error[")).collect();
-    assert_eq!(errors.len(), 2, "{text}");
+    assert_eq!(errors.len(), 1, "{text}");
     assert!(errors.iter().any(|l| l.contains("probe.rb:3:") && l.contains("ActiveModel::Errors not supported")
         && l.contains("runtime's Array of full messages")), "{text}");
-    assert!(errors.iter().any(|l| l.contains("probe.rb:9:") && l.contains("ActiveModel::Serializers::JSON not supported")
-        && l.contains("serializable_hash")), "{text}");
+    // A module's `as_json(except:)` may be a record's: the SQLite tree's
+    // Base has no Serializers::JSON, so its emit refuses it by name.
+    let (ok, text) = run(&dir, &["--target", "ruby"]);
+    assert!(!ok, "ruby accepted a record's as_json(except:): {text}");
+    assert!(
+        text.lines().any(|l| l.contains("runtime_constant") && l.contains("`ActiveRecord::Base#as_json(options)` answers ActiveModel::Serializers::JSON")
+            && l.contains("runtime/active_model_serialization.rb")),
+        "ruby lost the named refusal: {text}"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 

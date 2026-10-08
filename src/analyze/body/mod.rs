@@ -2481,12 +2481,20 @@ impl<'a> BodyTyper<'a> {
                         };
                     }
                 }
+                // A record's serialization beyond `only:`: gated to the
+                // tree whose ActiveRecord::Base carries it (`send::
+                // record_serialization`, `analyze::runtime_reads`).
+                if matches!(method.as_str(), "as_json" | "serializable_hash") && self.inquirers.is_some()
+                    && self.record_serialization(recv.as_ref(), recv_ty.as_ref(), method.as_str(), args, class_object_receiver, ctx)
+                {
+                    expr.decisions |= crate::expr::RECORD_SERIALIZATION;
+                }
                 // String / Array / Hash `as_json` the core tables answer
                 // (send.rs) is ActiveSupport's core_ext too, which no tree
                 // reopens: the same route, with the table's type.
                 if method.as_str() == "as_json" && self.inquirers.is_some() && expr.diagnostic.is_none()
                     && recv.is_some() && !class_object_receiver && send::as_json_core_receiver(recv_ty.as_ref())
-                    && matches!(self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some(), false, ctx),
+                    && matches!(self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some()),
                         send::AsJsonResidue::Route)
                 {
                     expr.decisions |= crate::expr::OBJECT_AS_JSON;
@@ -2499,7 +2507,7 @@ impl<'a> BodyTyper<'a> {
                     // which asks an object with an `as_json` of its own and
                     // answers core_ext/object/json.rb's table for the rest.
                     if method.as_str() == "as_json" && expr.diagnostic.is_none() {
-                        match self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some(), class_object_receiver, ctx) {
+                        match self.as_json_residue(recv.as_ref(), recv_ty.as_ref(), args, block.is_some()) {
                             send::AsJsonResidue::Route => {
                                 expr.decisions |= crate::expr::OBJECT_AS_JSON;
                                 return send::object_as_json_ty(recv_ty.as_ref(), class_object_receiver);

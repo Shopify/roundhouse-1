@@ -23,21 +23,20 @@ impl<'a> BodyTyper<'a> {
     /// (`expr::OBJECT_AS_JSON`). That function is ActiveSupport's
     /// dispatch written out: a value with an `as_json` of its own is
     /// asked, so the route never answers for a method the tree defines.
-    /// What it cannot be is a stand-in for the framework objects whose
+    /// What it cannot be is a stand-in for a framework object whose
     /// emitted shape is not Rails': an `errors` collection (the runtime's
     /// accumulator is an Array of full messages, where
-    /// `ActiveModel::Errors#as_json` is the attribute-keyed Hash), and a
-    /// record serializing itself with options (`serializable_hash`'s
-    /// `except:` / `methods:` / `include:`; the runtime's
-    /// `ActiveRecord::Base#as_json` honors `only:`).
+    /// `ActiveModel::Errors#as_json` is the attribute-keyed Hash). A
+    /// record serializing itself with options routes like any value; the
+    /// send also carries `expr::RECORD_SERIALIZATION`
+    /// (`record_serialization`), which gates it to the tree whose
+    /// ActiveRecord::Base has ActiveModel::Serialization.
     pub(super) fn as_json_residue(
         &self,
         recv: Option<&Expr>,
         recv_ty: Option<&Ty>,
         args: &[Expr],
         has_block: bool,
-        class_object: bool,
-        ctx: &Ctx,
     ) -> AsJsonResidue {
         if has_block
             || args.len() > 1
@@ -56,16 +55,67 @@ impl<'a> BodyTyper<'a> {
                 "as_json: the emitted `errors` is the runtime's Array of full messages, not ActiveModel::Errors' attribute-keyed collection",
             );
         }
-        let on_self = recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
-        if on_self && !class_object && !args.is_empty() && self.self_may_be_record(ctx)
-            && !args.first().is_some_and(only_option_literal)
-        {
-            return AsJsonResidue::Refuse(
-                "ActiveModel::Serializers::JSON",
-                "self may be a record (a module, an ActiveModel ancestor or a superclass outside the app); a record's as_json(options) is serializable_hash, and the runtime's ActiveRecord::Base#as_json honors only:",
-            );
-        }
         AsJsonResidue::Route
+    }
+
+    /// A record's `as_json(options)` with options beyond an `only:`
+    /// literal, or its `serializable_hash`: Rails answers both from
+    /// ActiveRecord::Serialization over ActiveModel::Serialization
+    /// (`except:`, `methods:`, `include:`, `root:`), which only the
+    /// PostgreSQL CRuby tree's ActiveRecord::Base includes
+    /// (runtime/spinel/cruby/active_record_active_model.rb). Every other
+    /// tree's Base#as_json honors `only:` alone and has no
+    /// `serializable_hash`, so the send is flagged
+    /// `expr::RECORD_SERIALIZATION` and `analyze::runtime_reads` refuses
+    /// it where the finished tree lacks the port. The receiver is `self`
+    /// where self may be a record (`self_may_be_record`), or a value typed
+    /// as a model.
+    pub(super) fn record_serialization(
+        &self,
+        recv: Option<&Expr>,
+        recv_ty: Option<&Ty>,
+        method: &str,
+        args: &[Expr],
+        class_object: bool,
+        ctx: &Ctx,
+    ) -> bool {
+        let beyond_only = match method {
+            "as_json" => !args.is_empty() && !args.first().is_some_and(only_option_literal),
+            "serializable_hash" => true,
+            _ => false,
+        };
+        if !beyond_only || class_object {
+            return false;
+        }
+        if recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+            return self.self_may_be_record(ctx);
+        }
+        // A nilable record (`Model.first`) is a record wherever the send
+        // reaches it.
+        let arms = match recv_ty {
+            Some(Ty::Union { variants }) => variants.as_slice(),
+            Some(ty) => std::slice::from_ref(ty),
+            None => &[],
+        };
+        arms.iter().any(|arm| matches!(arm, Ty::Class { id, .. } if self.class_is_record(id)))
+    }
+
+    /// The class is a model: its superclass chain reaches one with a
+    /// table, ApplicationRecord or ActiveRecord::Base.
+    fn class_is_record(&self, id: &ClassId) -> bool {
+        let mut current = Some(id.clone());
+        for _ in 0..32 {
+            let Some(id) = current else { return false };
+            if matches!(id.0.as_str(), "ApplicationRecord" | "ActiveRecord::Base") {
+                return true;
+            }
+            let Some(class) = self.classes().get(&id) else { return false };
+            if class.table.is_some() {
+                return true;
+            }
+            current = class.parent_id().cloned();
+        }
+        false
     }
 
     /// `self` may be a record, or an ActiveModel object: a module (its

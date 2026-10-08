@@ -4083,6 +4083,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             .map_err(|e| format!("read {port} runtime: {e}"))?;
         files.push((format!("runtime/{port}.rb"), text));
     }
+    // ActiveRecord::Base's Conversion, Serializers::JSON and
+    // ActiveRecord::Serialization (activerecord 8.2.0.alpha base.rb,
+    // serialization.rb), over the two ports above.
+    let active_model = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_active_model.rb")
+        .map_err(|e| format!("read Active Record ActiveModel runtime: {e}"))?;
+    files.push(("runtime/active_record_active_model.rb".into(), active_model));
     // Name#as_json and Serializers::JSON#as_json answer through
     // ActiveSupport::JSON's `as_json` table (runtime/spinel/
     // active_support_json.rb), which the naming port requires.
@@ -4190,10 +4196,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // Inflector: before any app file or gem source names them.
             let at = at + "require_relative \"active_support_inflector\"\nrequire_relative \"active_support_multibyte_unicode\"\n".len();
             let i18n = if carries_i18n { "require_relative \"active_support_i18n\"\n" } else { "" };
+            // Then ActiveRecord::Base's ActiveModel ancestry over them.
             let ports: String = std::iter::once(i18n.to_string())
                 .chain(
                     std::iter::once("active_support_string_inflections")
                         .chain(active_model_ports.iter().copied())
+                        .chain(std::iter::once("active_record_active_model"))
                         .map(|port| format!("require_relative \"{port}\"\n")),
                 )
                 .collect();
@@ -11995,20 +12003,20 @@ fn carries_active_support_cache(files: &[(String, String)]) -> bool {
 
 /// The ActiveModel ports (runtime/spinel/active_model_naming.rb,
 /// active_model_attribute_methods.rb, active_model_serialization.rb)
-/// the PostgreSQL CRuby tree carries, in load order: each where the
-/// app's code (a gem compiled as source among it) names one of its
-/// modules, and the naming port with the serialization port, whose
-/// Serializers::JSON extends its includer with Naming. frozen_record
-/// 0.27.4's FrozenRecord::Base names all three.
+/// the PostgreSQL CRuby tree carries, in load order. ActiveRecord::Base
+/// includes Conversion and Serializers::JSON there
+/// (runtime/spinel/cruby/active_record_active_model.rb), so the naming
+/// port, which holds Conversion, and the serialization port, whose
+/// Serializers::JSON extends its includer with Naming, always load; the
+/// attribute-methods port where the app's code (a gem compiled as source
+/// among it) names one of its modules. frozen_record 0.27.4's
+/// FrozenRecord::Base names it.
 fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
-    let serialization = carries_named(files, &["ActiveModel::Serialization", "ActiveModel::Serializers::JSON"]);
-    let naming = serialization
-        || carries_named(files, &["ActiveModel::Naming", "ActiveModel::Name", "ActiveModel::Conversion"]);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [
-        (naming, "active_model_naming"),
+        (true, "active_model_naming"),
         (attribute_methods, "active_model_attribute_methods"),
-        (serialization, "active_model_serialization"),
+        (true, "active_model_serialization"),
     ]
     .into_iter()
     .filter_map(|(carried, port)| carried.then_some(port))
