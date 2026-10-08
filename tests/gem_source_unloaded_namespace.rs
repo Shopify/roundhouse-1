@@ -60,6 +60,11 @@ fn unloaded_namespace(eager: bool) {
     let run = emit_and_run::empty_app()
         .write("roundhouse.yml", "gem_sources:\n  coinkit: vendor/gems/coinkit-1.0.0\n")
         .write("Gemfile.lock", LOCK)
+        // The app's Bundler.require loads the gem: a plain gem's
+        // constants are defined where its files are required, never
+        // autoloaded.
+        .write("Gemfile", "source \"https://rubygems.org\"\n\ngem \"coinkit\"\n")
+        .write("config/application.rb", "Bundler.require(*Rails.groups)\n")
         .write(
             "config/environments/development.rb",
             &format!("Rails.application.configure do\n  config.eager_load = {eager}\nend\n"),

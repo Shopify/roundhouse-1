@@ -173,7 +173,8 @@ fn a_gem_parent_s_nested_module_includes_run_once_where_written() {
 }
 
 /// As Core carries it: the class is a gem source's (`gem_sources:`), whose
-/// entry requires the base gem from the gem home, a lock dependency.
+/// entry, which the app's Bundler.require loads, requires the base gem
+/// from the gem home, a lock dependency.
 #[test]
 fn a_gem_source_s_class_on_a_required_gem_s_base_runs_as_in_cruby() {
     const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    dashkit (1.0.0)\n    panama (1.0.0)\n      dashkit (= 1.0.0)\n\nDEPENDENCIES\n  panama\n";
@@ -185,6 +186,10 @@ fn a_gem_source_s_class_on_a_required_gem_s_base_runs_as_in_cruby() {
     let (tree, errors) = emit_and_run::empty_app()
         .write("roundhouse.yml", &format!("gem_home: {}\ngem_sources:\n  panama: vendor/gems/panama-1.0.0\n", home.display()))
         .write("Gemfile.lock", LOCK)
+        // Core's Bundler.require loads the gem: a plain gem's constants
+        // are defined where its files are required, never autoloaded.
+        .write("Gemfile", "source \"https://rubygems.org\"\n\ngem \"panama\", path: \"vendor/gems/panama-1.0.0\"\n")
+        .write("config/application.rb", "Bundler.require(*Rails.groups)\n")
         .write("vendor/gems/panama-1.0.0/lib/panama.rb", "require \"dashkit\"\nrequire \"panama/schema\"\n")
         .write("vendor/gems/panama-1.0.0/lib/panama/schema.rb", SCHEMA)
         .emit(BuildTarget::Ruby);

@@ -117,9 +117,12 @@ fn bundler_require_loads_the_entry_program_of_each_carried_gem_its_groups_and_re
         .write("gems/prodgem/lib/prodgem.rb", "puts \"prodgem entry\"\n\nmodule Prodgem\nend\n")
         .write("gems/quiet/lib/quiet.rb", "puts \"quiet entry\"\n\nmodule Quiet\nend\n")
         .write("gems/named-gem/lib/named.rb", "puts \"named entry\"\n\nmodule Named\nend\n")
-        .run_ruby("puts \"booted\"\nQuiet\n");
+        .run_ruby("puts \"booted\"\np defined?(Quiet)\n");
     assert!(run.success, "{}\n{}", run.stdout, run.stderr);
-    assert_eq!(run.stdout, "widget entry\nnamed entry\nbooted\nquiet entry\n", "{}", run.stderr);
+    // `require: false` keeps quiet's entry unloaded, and nothing
+    // autoloads a plain gem's `lib/`: natively `Quiet` stays undefined
+    // until the app requires "quiet".
+    assert_eq!(run.stdout, "widget entry\nnamed entry\nbooted\nnil\n", "{}", run.stderr);
     let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).expect("app/models.rb");
     assert!(
         models.contains("  [\"models/roundhouse_files/gems/prodgem/lib/prodgem\", [\"production\"]], # config/application.rb:1 Bundler.require (Gemfile:9)\n"),

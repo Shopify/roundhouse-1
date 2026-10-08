@@ -5784,52 +5784,21 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         all_module: bool,
         seen: bool,
     }
-    let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
-    let mut boot_files: Vec<&str> = Vec::new();
-    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
-    for (anchor, content) in &models {
-        if in_place.contains(anchor) {
-            continue;
-        }
-        let Some(chain) = autoload_primary(anchor, content) else {
-            boot_files.push(anchor);
-            continue;
-        };
-        let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
-        // Two files that both define the same constant cannot both be its
-        // autoload; the second loads at boot, as before.
-        if claimed.contains_key(&full) {
-            boot_files.push(anchor);
-            continue;
-        }
-        claimed.insert(full, anchor.clone());
-        let mut parent = String::from("Object");
-        let last = chain.len() - 1;
-        for (i, (segment, is_module)) in chain.iter().enumerate() {
-            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
-            if !child.seen {
-                child.all_module = true;
-                child.seen = true;
-            }
-            child.all_module &= *is_module;
-            if i == last {
-                child.file = Some(anchor.clone());
-            }
-            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
-        }
-    }
-
     // A plain gem's files, which its `require`s load: under the `lib/`
     // of a gem the lockfile names (a vendored `<name>-<version>/lib`, a
     // PATH gem's `<name>/lib`) and under no Zeitwerk loader's root.
     // Native Ruby autoloads none of them: Rails' autoloader walks the
     // app's autoload paths and Zeitwerk its loaders' roots, never a
-    // gem's `lib/` otherwise. So a namespace only such files open is no
-    // implicit module (shopify-money's `require_relative
-    // 'rubocop/cop/money' if defined?(RuboCop)`: with the module defined
-    // at boot the guard passed and the cops, whose `RuboCop::Cop::Base`
-    // nothing defines, loaded), and `eager_load!` loads none of them;
-    // their programs' requires do, where Ruby runs them.
+    // gem's `lib/` otherwise. Their constants are defined where the
+    // gem's requires load their files (the file programs), so they get
+    // no autoload and do not load at boot. An autoload would run a file
+    // Ruby has not reached yet: graphql-client's schema/base_type.rb
+    // opens `module Schema`, which ran `GraphQL::Client::Schema`'s
+    // autoload, schema.rb, whose requires came back to base_type.rb
+    // while it was loading (a circular require). Only a constant the gem
+    // itself declares with `autoload :Name` (money_bag's
+    // `eager_autoload do autoload :Variadic end`, which the emitted
+    // module does not carry) keeps its autoload.
     let gem_names: std::collections::BTreeSet<&str> =
         app.gem_lock.iter().flat_map(|lock| lock.specs.iter().map(|(name, _)| name.as_str())).collect();
     let gem_dir = |dir: &str| {
@@ -5852,6 +5821,82 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     let gem_only = |anchor: &str| {
         declaring.get(anchor).is_some_and(|sources| !sources.is_empty() && sources.iter().all(|s| required_gem_file(s)))
     };
+    // Whether a gem file that opens `full`'s parent (`module Parent`,
+    // `class Parent`, a `Parent.autoload`) writes `autoload :Name` (or
+    // `autoload(:Name`) for it. Read from the source text: the
+    // statement itself is not ingested.
+    let gem_autoloads = |full: &str| -> bool {
+        let (parent, name) = full.rsplit_once("::").unwrap_or(("", full));
+        let parent = parent.rsplit("::").next().unwrap_or("");
+        let names = |text: &str, pattern: &str| {
+            text.match_indices(pattern).any(|(at, _)| {
+                !text[at + pattern.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            })
+        };
+        // `module Parent`, `class A::Parent < B`: the header's last segment.
+        let opens = |text: &str| {
+            text.lines().any(|line| {
+                let line = line.trim_start();
+                let Some(rest) = line.strip_prefix("module ").or_else(|| line.strip_prefix("class ")) else {
+                    return false;
+                };
+                let path = rest.split(|c: char| c.is_whitespace() || c == '<' || c == ';').next().unwrap_or("");
+                path.rsplit("::").next() == Some(parent)
+            }) || names(text, &format!("{parent}.autoload"))
+        };
+        app.sources.iter().filter(|source| required_gem_file(&source.path)).any(|source| {
+            let text = source.text.as_str();
+            (names(text, &format!("autoload :{name}")) || names(text, &format!("autoload(:{name}")))
+                && (parent.is_empty() || opens(text))
+        })
+    };
+    let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
+    let mut boot_files: Vec<&str> = Vec::new();
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    for (anchor, content) in &models {
+        if in_place.contains(anchor) {
+            continue;
+        }
+        let gem_file = gem_only(anchor);
+        let Some(chain) = autoload_primary(anchor, content) else {
+            if !gem_file {
+                boot_files.push(anchor);
+            }
+            continue;
+        };
+        let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
+        if gem_file && !gem_autoloads(&full) {
+            continue;
+        }
+        // Two files that both define the same constant cannot both be its
+        // autoload; the second loads at boot, as before.
+        if claimed.contains_key(&full) {
+            if !gem_file {
+                boot_files.push(anchor);
+            }
+            continue;
+        }
+        claimed.insert(full, anchor.clone());
+        let mut parent = String::from("Object");
+        let last = chain.len() - 1;
+        for (i, (segment, is_module)) in chain.iter().enumerate() {
+            let child = namespaces.entry(parent.clone()).or_default().entry(segment.clone()).or_default();
+            if !child.seen {
+                child.all_module = true;
+                child.seen = true;
+            }
+            child.all_module &= *is_module;
+            if i == last {
+                child.file = Some(anchor.clone());
+            }
+            parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
+        }
+    }
+
+    // A namespace no carried file defines whose registered constants are
+    // all a plain gem's own autoloads (money_bag's `autoload :Variadic`)
+    // is no implicit module: the gem's file defines it when required,
+    // and its children register then (`register` on ConstAdded).
     let mut not_implicit: Vec<(String, String)> = Vec::new();
     for (namespace, children) in &namespaces {
         for (name, child) in children {

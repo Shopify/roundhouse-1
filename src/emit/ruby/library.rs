@@ -6800,8 +6800,16 @@ fn emit_library_class_decl_inner(
     // later, so what its body names resolves like a method body's.
     let railtie = carried_railtie(lc, app);
     let replays_all = replays_foreign_class_body(lc, app);
+    // The same calls the body writes below (`replayed` there): a
+    // lowered `mixes_in_class_methods` runs in every body, and reads its
+    // modules at load (widget/describable.rb's `ClassMethods`, a plain
+    // gem's nested module no autoload defines).
     let own_calls = if railtie || replays_all { Vec::new() } else { app_extension_calls(lc, app) };
-    let replayed = |call: &&Expr| replays_all || own_calls.iter().any(|c| std::ptr::eq(*c, *call));
+    let replayed = |call: &&Expr| {
+        replays_all
+            || crate::ingest::sorbet_check::is_mixes_in(call)
+            || own_calls.iter().any(|c| std::ptr::eq(*c, *call))
+    };
     for call in lc.unknown_calls.iter().filter(|_| !railtie).filter(replayed) {
         let mut now: BTreeSet<Vec<String>> = BTreeSet::new();
         let mut later: BTreeSet<Vec<String>> = BTreeSet::new();
@@ -8812,13 +8820,36 @@ fn carried_source_files(app: &App) -> CarriedSources {
                 .or_insert_with(|| format!("models/{}", super::library_file_stem(first.0.as_str(), app)));
         }
     }
+    // A file with no program declares only classes and modules, each
+    // emitted to a file of its own: requiring it loads every one of
+    // them, in the order the file declares them, as Ruby running the
+    // file defines them all. One anchor would leave the rest to an
+    // autoload a plain gem's constants do not have (widget/taggable.rb's
+    // `Taggable::ClassMethods`, which `Taggable.included` reads).
+    let programs: BTreeSet<&str> = app.file_programs.iter().map(|p| p.source.as_str()).collect();
+    let mut declarations: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (source, names) in &app.library_class_files {
+        if programs.contains(source.as_str()) {
+            continue;
+        }
+        let anchors = declarations.entry(relative_source_path(app, source).to_string()).or_default();
+        for name in names {
+            let anchor = format!("models/{}", super::library_file_stem(name.0.as_str(), app));
+            if !anchors.contains(&anchor) {
+                anchors.push(anchor);
+            }
+        }
+    }
     let app_files = app.sources.iter().map(|f| relative_source_path(app, &f.path).to_string()).collect();
-    CarriedSources { anchors: table, app_files }
+    CarriedSources { anchors: table, declarations, app_files }
 }
 
 /// `carried_source_files`, with every app source's root-relative path.
 pub(super) struct CarriedSources {
     anchors: BTreeMap<String, String>,
+    /// A source with no file program => the files of the classes and
+    /// modules it declares, in its order.
+    declarations: BTreeMap<String, Vec<String>>,
     app_files: crate::det::HashSet<String>,
 }
 
@@ -8843,6 +8874,16 @@ fn program_require(
     relative: bool,
     table: &CarriedSources,
 ) -> Option<Result<String, String>> {
+    program_require_source(rel, feature, relative, table).map(|found| found.map(|(_, anchor)| anchor))
+}
+
+/// `program_require`, with the source the feature resolves to.
+fn program_require_source(
+    rel: &str,
+    feature: &str,
+    relative: bool,
+    table: &CarriedSources,
+) -> Option<Result<(String, String), String>> {
     let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
     let source = if relative {
         let base = Path::new(rel).parent().unwrap_or(Path::new(""));
@@ -8865,8 +8906,8 @@ fn program_require(
             _ => None,
         }
     };
-    if let Some(anchor) = source.as_ref().and_then(|src| table.anchors.get(src)) {
-        return Some(Ok(anchor.clone()));
+    if let Some((src, anchor)) = source.as_ref().and_then(|src| table.anchors.get(src).map(|a| (src, a))) {
+        return Some(Ok((src.clone(), anchor.clone())));
     }
     let app_file = source.as_ref().is_some_and(|src| table.app_files.contains(src));
     (app_file || relative).then(|| Err(source.unwrap_or_default()))
@@ -9169,10 +9210,20 @@ pub(super) fn emit_file_program(
                 ProgramItem::Require { span, feature, relative } => {
                     let table = sources.get_or_insert_with(|| carried_sources(app));
                     let site = statement_site(app, *span);
-                    match program_require(rel, feature, *relative, table) {
-                        Some(Ok(anchor)) => {
-                            if loaded.insert(anchor.clone()) {
-                                require_anchor(s, &anchor);
+                    match program_require_source(rel, feature, *relative, table) {
+                        Some(Ok((source, anchor))) => {
+                            let mut anchors: Vec<String> = table
+                                .declarations
+                                .get(&source)
+                                .map(|d| d.iter().filter(|a| emitted.contains(*a)).cloned().collect())
+                                .unwrap_or_default();
+                            if anchors.is_empty() {
+                                anchors.push(anchor);
+                            }
+                            for anchor in anchors {
+                                if loaded.insert(anchor.clone()) {
+                                    require_anchor(s, &anchor);
+                                }
                             }
                         }
                         Some(Err(_)) => {
