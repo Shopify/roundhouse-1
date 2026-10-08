@@ -13,10 +13,10 @@
 //! and `attributes=` call `_assign_attributes`, which sends each key's
 //! writer in the hash's order.
 //!
+//! The compiled `new`, `create` and `update` assign through
+//! `assign_attributes` too (`lower::model_to_library::assign_attributes`).
 //! What the tree does not run as Rails does is refused when a class
-//! macro of the include is used (`macro_replay::base_include_gaps`): the
-//! compiled `new`/`create`/`update` write columns directly rather than
-//! through `_assign_attributes`.
+//! macro of the include is used (`macro_replay::base_include_gaps`).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 #[path = "support/pg_probe.rs"]
@@ -161,6 +161,12 @@ const PROBE: &str = r##"class CoreHooksProbe
       out << "not a hash: #{e.message}"
     end
     t.save!
+    n = Shop.new(note: "n3", code: "w")
+    out << "new attrs: #{n.note} | #{n.code} #{n.trace.inspect}"
+    c = Shop.create!(name: "d", note: "n4")
+    out << "create: #{c.note} | #{c.persisted?} #{c.trace.inspect}"
+    c.update(note: "n5", code: "v")
+    out << "update: #{c.note} | #{c.trace.last}"
     t.remember(:code)
     Shop.find(t.id).update!(code: "z")
     out << "before reload: #{t.code} #{t.cached(:code)}"
@@ -182,7 +188,7 @@ require_relative "vendor/gems/tracing-1.0.0/lib/tracing"
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 11] = [
+const EXPECTED: [&str; 14] = [
     r#"new: ["init_internals"] cache=true"#,
     r#"load: ["init_internals"] cache=true"#,
     r#"assign: nil n1 name="a" raw=[:note, :name] | b ["init_internals", "assign:note,name"] raw=nil"#,
@@ -191,6 +197,9 @@ const EXPECTED: [&str; 11] = [
     r#"empty: nil 4"#,
     r#"unknown: ActiveModel::UnknownAttributeError unknown attribute 'bogus' for Shop. bogus true true"#,
     r#"not a hash: When assigning attributes, you must pass a hash as an argument, String passed."#,
+    r#"new attrs: n3 name=nil raw=[:note, :code] | w ["init_internals", "assign:note,code"]"#,
+    r#"create: n4 name="d" raw=[:name, :note] | true ["init_internals", "assign:name,note"]"#,
+    r#"update: n5 name="d" raw=[:note, :code] | assign:note,code"#,
     r#"before reload: y y"#,
     r#"reload: true z nil reload"#,
     r#"dup: dup cache=0 reload"#,
@@ -289,22 +298,17 @@ fn a_macro_of_an_include_wrapping_init_internals_and_reload_is_replayed() {
     assert!(core.contains("module Persistence"), "{core}");
 }
 
-/// An `_assign_attributes` override runs for `assign_attributes` but not
-/// for the compiled `new`/`create`/`update`, so a macro of its include is
-/// refused, naming what the override misses.
+/// An `_assign_attributes` override runs for `assign_attributes` and for
+/// the compiled `new`/`create`/`update`, so a macro of its include is
+/// replayed.
 #[test]
-fn a_macro_of_an_include_wrapping_assign_attributes_is_refused() {
+fn a_macro_of_an_include_wrapping_assign_attributes_is_replayed() {
     let hooks = MACRO_HOOKS.replace(
         "    module ClassMethods",
         "    def _assign_attributes(new_attributes)\n      @raw = new_attributes\n      super\n    ensure\n      @raw = nil\n    end\n\n    module ClassMethods",
     );
-    let (_emitted, errors) = with_macro(&hooks).emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(
-        errors.iter().any(|e| e.contains("model macro call on `Shop` not lowered")
-            && e.contains("`_assign_attributes` (only `assign_attributes`/`attributes=` run it")
-            && !e.contains("init_internals")
-            && !e.contains("`reload`")),
-        "{}",
-        errors.join("\n")
-    );
+    let (emitted, errors) = with_macro(&hooks).emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
+    let shop = std::fs::read_to_string(emitted.join("app/models/shop.rb")).expect("shop.rb");
+    assert!(shop.contains("traced(:code)") || shop.contains("traced :code"), "{shop}");
 }

@@ -7659,8 +7659,8 @@ fn emit_library_class_decl_inner(
     // macro defines) overrides them and supers into them.
     let (generated_attributes, without_generated_attributes);
     let lc = match generated_attribute_methods(lc, app) {
-        Some((module, rest)) => {
-            (generated_attributes, without_generated_attributes) = (Some(module), rest);
+        Some((module, rest, retargeted)) => {
+            (generated_attributes, without_generated_attributes) = (Some((module, retargeted)), rest);
             &without_generated_attributes
         }
         None => {
@@ -8016,7 +8016,7 @@ fn emit_library_class_decl_inner(
         }
     };
     open_header(&mut s);
-    if let Some(module) = &generated_attributes {
+    if let Some((module, retargeted)) = &generated_attributes {
         let inner_pad = format!("{body_pad}  ");
         writeln!(s, "{body_pad}module GeneratedAttributeMethods").unwrap();
         for index in 0..module.methods.len() {
@@ -8024,6 +8024,12 @@ fn emit_library_class_decl_inner(
                 writeln!(s).unwrap();
             }
             write_library_method(&mut s, module, index, &inner_pad, &[]);
+        }
+        if !retargeted.is_empty() {
+            writeln!(s).unwrap();
+        }
+        for writer in retargeted {
+            writeln!(s, "{inner_pad}alias_method :{}, :{}", generated_writer_alias(writer).as_str(), writer.as_str()).unwrap();
         }
         writeln!(s, "{body_pad}end").unwrap();
         writeln!(s, "{body_pad}private_constant :GeneratedAttributeMethods").unwrap();
@@ -8919,7 +8925,14 @@ fn extend_self_instance_defs(lc: &LibraryClass, app: &App, replayed: &[&Expr]) -
 /// synthesized defs of those names) as the methods of its
 /// GeneratedAttributeMethods module, and the class without them. An
 /// alias copy stays in the class, where its alias is written.
-fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryClass, LibraryClass)> {
+///
+/// Rails writes a record's default and loaded attributes without calling
+/// a writer (`_default_attributes`, `init_with_attributes`), so the
+/// synthesized `initialize`'s default writes and the hydration factories'
+/// column writes go through the module's own writers, under the
+/// `_generated_` aliases of the third element: an override of a writer
+/// runs for a value given to it, not for those.
+fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryClass, LibraryClass, Vec<Symbol>)> {
     if !super::expr::native_keywords() || lc.is_module || lc.origin.is_some() {
         return None;
     }
@@ -8938,9 +8951,66 @@ fn generated_attribute_methods(lc: &LibraryClass, app: &App) -> Option<(LibraryC
     let mut module = lc.clone();
     module.methods.retain(&generated);
     module.method_aliases.clear();
+    let writers: crate::det::HashSet<Symbol> =
+        module.methods.iter().filter(|m| m.name.as_str().ends_with('=')).map(|m| m.name.clone()).collect();
+    let mut retargeted = Vec::new();
     let mut rest = lc.clone();
     rest.methods.retain(|m| !generated(m));
-    Some((module, rest))
+    for method in rest.methods.iter_mut().filter(|m| m.name_span.is_synthetic()) {
+        match (method.receiver, method.name.as_str()) {
+            (MethodReceiver::Class, "from_row" | "from_stmt") => {
+                write_through_generated_writers(&mut method.body, &writers, None, &mut retargeted);
+            }
+            (MethodReceiver::Instance, "initialize") => {
+                let attrs = method.params.first().map(|p| p.name.clone());
+                if let ExprNode::Seq { exprs } = &mut *method.body.node {
+                    for stmt in exprs {
+                        write_through_generated_writers(stmt, &writers, attrs.as_ref(), &mut retargeted);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((module, rest, retargeted))
+}
+
+/// `_generated_<col>=`: the module's alias of its writer `<col>=`.
+fn generated_writer_alias(writer: &Symbol) -> Symbol {
+    Symbol::from(format!("_generated_{}", writer.as_str()))
+}
+
+/// Retarget a write `recv.<writer> value` (of a local or `self`) at the
+/// writer's `_generated_` alias unless its value reads `given` (the
+/// constructor's attrs), collecting each writer retargeted.
+fn write_through_generated_writers(
+    expr: &mut Expr,
+    writers: &crate::det::HashSet<Symbol>,
+    given: Option<&Symbol>,
+    retargeted: &mut Vec<Symbol>,
+) {
+    if let ExprNode::Send { recv: Some(recv), method, args, .. } = &mut *expr.node {
+        if args.len() == 1
+            && matches!(&*recv.node, ExprNode::Var { .. } | ExprNode::SelfRef)
+            && writers.contains(method)
+            && !given.is_some_and(|attrs| reads_var(&args[0], attrs))
+        {
+            if !retargeted.contains(method) {
+                retargeted.push(method.clone());
+            }
+            *method = generated_writer_alias(method);
+        }
+    }
+    expr.node.for_each_child_mut(&mut |c| write_through_generated_writers(c, writers, given, retargeted));
+}
+
+fn reads_var(expr: &Expr, name: &Symbol) -> bool {
+    if matches!(&*expr.node, ExprNode::Var { name: n, .. } if n == name) {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found = found || reads_var(c, name));
+    found
 }
 
 /// `lc.methods[index]`, then its visibility.

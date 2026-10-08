@@ -113,10 +113,7 @@ end
 const PROBE: &str = r##"class GeneratedAttributesProbe
   def self.lines
     out = []
-    # Construction and loading call no writer in Rails; the compiled
-    # initialize and hydration factories still do (hook 2's probe).
     s = Shop.new
-    s.trace.clear
     s.name = "  a  "
     s.code = "x"
     out << "writers: #{s.name.inspect} #{s.code.inspect} #{s.trace.inspect}"
@@ -125,7 +122,6 @@ const PROBE: &str = r##"class GeneratedAttributesProbe
     out << "macro writer clears: #{s.cached(:code).inspect} #{s.code}"
     s.save!
     t = Shop.find(s.id)
-    t.trace.clear
     out << "persisted: #{t.name.inspect} #{t.code.inspect} #{t.trace.inspect}"
     t.code = "none"
     out << "predicate: #{t.code?} #{Shop.new.code?}"

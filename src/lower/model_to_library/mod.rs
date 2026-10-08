@@ -21,6 +21,7 @@
 //! that haven't migrated.
 
 mod adapter_emit;
+mod assign_attributes;
 pub(crate) mod accessor_surface;
 pub(crate) mod schema;
 pub use schema::col_storage_name;
@@ -1839,6 +1840,12 @@ fn build_methods_for_dialect(
             permitted_fields.map(|fields| writable_permit_fields(model, table, fields));
         let permitted_fields = writable_fields.as_deref();
         push_schema_methods(&mut methods, model, models, table);
+        // The PostgreSQL CRuby tree ships Rails' mass assignment
+        // (runtime/spinel/cruby/active_record_core.rb); a PostgreSQL
+        // app's ruby family is that tree.
+        if dialect == crate::lower::arel::SqlDialect::Postgres && crate::emit::ruby::native_keywords() {
+            assign_attributes::route_through_assign_attributes(&mut methods);
+        }
         if dialect == crate::lower::arel::SqlDialect::Postgres {
             if let Some(method) = methods.iter_mut().find(|method| method.name.as_str() == "_table_sql") {
                 method.body = crate::lower::typing::lit_str(dialect.ident(table.name.as_str()));

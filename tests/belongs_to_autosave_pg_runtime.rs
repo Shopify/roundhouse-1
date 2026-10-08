@@ -198,7 +198,8 @@ fn belongs_to_autosave_keys_on_new_record() {
         "if value.new_record?",
         "if @shop_loaded && !(@shop_cache.nil?) && !(@shop_cache.destroyed?)",
         "@shop_cache.save if @shop_cache.new_record?",
-        "self.shop = attrs[:shop] if !(attrs[:shop].nil?)",
+        // `Product.new(shop: s)` sends `shop=` through assign_attributes.
+        "assign_attributes(attrs) if !(attrs.equal?(ActiveRecord::Base::HYDRATE_ATTRS))",
         "@shop_cache.save",
         "@shop_id = @shop_cache.id",
     ] {
