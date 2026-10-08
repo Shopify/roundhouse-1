@@ -244,3 +244,56 @@ end
     ];
     let _ = same_as_native("zeitwerk", &[("zw", ZW)], "zw", "p Zw::Decide.levels\n", "[3, 2]\n");
 }
+
+/// graphql-client 0.25.0's client.rb requires
+/// graphql/client/query_typename.rb, whose module ingest leaves out (a
+/// load-time conditional holding more than `def`s). The require was a
+/// plain `require` at boot, which failed with a LoadError (the emitted
+/// tree does not load a carried gem's files from the gem home). Now
+/// check reports it at the require, naming the left-out file and why,
+/// and the boot names it instead of raising; the rest of the file runs.
+#[test]
+fn a_require_of_a_file_ingest_left_out_is_reported_at_the_require() {
+    const GQ: &[(&str, &str)] = &[
+        (
+            "gq.rb",
+            "require \"gq/typename\"\nrequire \"gq/response\"\n\nmodule Gq\n  def self.ok\n    Response.new.ok\n  end\nend\n",
+        ),
+        (
+            "gq/typename.rb",
+            "module Gq\n  module Typename\n    if \"\".respond_to?(:upcase)\n      VISITOR = :upcase\n\n      def self.kind\n        VISITOR\n      end\n    end\n  end\nend\n",
+        ),
+        ("gq/response.rb", "module Gq\n  class Response\n    def ok\n      :ok\n    end\n  end\nend\n"),
+    ];
+    let run = same_as_native("left-out", &[("gq", GQ)], "gq", "p Gq.ok\n", ":ok\n");
+    let reported: Vec<&String> = run.errors.iter().filter(|e| e.contains("require \\\"gq/typename\\\"") || e.contains("require \"gq/typename\"")).collect();
+    assert_eq!(reported.len(), 1, "{:#?}", run.errors);
+    assert!(
+        reported[0].contains("vendor/gems/gq-1.0.0/lib/gq/typename.rb, whose classes, modules and constants ingest left out"),
+        "{}",
+        reported[0]
+    );
+    assert!(run.stderr.contains("error[file_require_not_carried]"), "{}", run.stderr);
+    assert!(!run.stderr.contains("LoadError"), "{}", run.stderr);
+}
+
+/// kafka-shopify 5.2.3's environment.rb requires kafka-shopify/writers,
+/// a file of `autoload` calls in `module Writers`. The tree registers
+/// those autoloads and has no file for it; the require stayed a plain
+/// `require` and failed with a LoadError. Natively the require defines
+/// `KafkaShopify::Writers`, under which the autoloads hang.
+#[test]
+fn a_require_of_a_file_of_autoloads_opens_its_modules() {
+    const KS: &[(&str, &str)] = &[
+        (
+            "ks.rb",
+            "require_relative \"ks/writers\"\nrequire \"ks/errors\"\n\nmodule Ks\n  def self.kinds\n    [Writers::LogWriter.new.kind, Errors::ConfigError.name]\n  end\nend\n",
+        ),
+        ("ks/writers.rb", "module Ks\n  module Writers\n    autoload(:LogWriter, \"ks/writers/log_writer\")\n  end\nend\n"),
+        ("ks/writers/log_writer.rb", "module Ks\n  module Writers\n    class LogWriter\n      def kind\n        :log\n      end\n    end\n  end\nend\n"),
+        ("ks/errors.rb", "module Ks\n  module Errors\n    autoload :ConfigError, \"ks/errors/config_error\"\n  end\nend\n"),
+        ("ks/errors/config_error.rb", "module Ks\n  module Errors\n    class ConfigError < StandardError\n    end\n  end\nend\n"),
+    ];
+    let run = same_as_native("autoloads", &[("ks", KS)], "ks", "p Ks.kinds\n", "[:log, \"Ks::Errors::ConfigError\"]\n");
+    assert!(!run.stderr.contains("LoadError") && !run.stderr.contains("file_require_not_carried"), "{}", run.stderr);
+}

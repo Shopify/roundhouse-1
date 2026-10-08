@@ -8979,7 +8979,14 @@ fn carried_source_files(app: &App) -> CarriedSources {
             .extend(anchors.into_iter().map(|(anchor, _)| anchor));
     }
     let app_files = app.sources.iter().map(|f| relative_source_path(app, &f.path).to_string()).collect();
-    CarriedSources { anchors: table, declarations, app_files }
+    let left_out = app
+        .ingest_drops
+        .iter()
+        .filter(|drop| drop.construct.is_none())
+        .filter_map(|drop| (drop.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)))
+        .map(|source| relative_source_path(app, &source.path).to_string())
+        .collect();
+    CarriedSources { anchors: table, declarations, app_files, left_out }
 }
 
 /// `carried_source_files`, with every app source's root-relative path.
@@ -8989,6 +8996,20 @@ pub(super) struct CarriedSources {
     /// modules it declares, in its order.
     declarations: BTreeMap<String, Vec<String>>,
     app_files: crate::det::HashSet<String>,
+    /// The app files whose classes, modules and constants ingest left
+    /// out (a whole-file `ingest_unsupported` drop).
+    left_out: BTreeSet<String>,
+}
+
+impl CarriedSources {
+    /// An app file ingest took whole that gives the tree nothing to
+    /// load: no program, no declaration of its own (kafka-shopify's
+    /// writers.rb, `module Writers` holding only `autoload` calls, which
+    /// app/models.rb registers). Requiring it loads nothing the tree
+    /// does not already define.
+    fn loads_nothing(&self, source: &str) -> bool {
+        self.app_files.contains(source) && !self.left_out.contains(source) && !self.anchors.contains_key(source)
+    }
 }
 
 /// `carried_source_files`, built once per `App` while the lookup indexes
@@ -9041,6 +9062,18 @@ fn program_require_source(
         let mut hits = table.anchors.keys().filter(|src| **src == lib || src.ends_with(&nested));
         match (hits.next(), hits.next()) {
             (Some(src), None) => Some(src.clone()),
+            // No carried file, but one app file the feature names
+            // (graphql-client's `require "graphql/client/operation_definition"`,
+            // whose classes ingest left out): named, not required from
+            // the gem home, which the emitted tree does not load a
+            // carried gem's files from.
+            (None, _) => {
+                let mut files = table.app_files.iter().filter(|src| **src == lib || src.ends_with(&nested));
+                match (files.next(), files.next()) {
+                    (Some(src), None) => Some(src.clone()),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     };
@@ -9077,6 +9110,9 @@ fn rewrite_program_requires(e: &mut Expr, app: &App, rel: &str, sources: &mut Op
                 Some(Ok(anchor)) => {
                     let path = call(Some(mk(ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })), "path", vec![lit(anchor)], true);
                     *e = call(None, "require", vec![path], false);
+                }
+                Some(Err(source)) if table.loads_nothing(&source) => {
+                    *e = mk(ExprNode::Lit { value: crate::expr::Literal::Bool { value: false } });
                 }
                 Some(Err(_)) => {
                     let message = format!(
@@ -9368,6 +9404,19 @@ pub(super) fn emit_file_program(
                                 if loaded.insert(anchor.clone()) {
                                     require_anchor(s, &anchor);
                                 }
+                            }
+                        }
+                        // Natively it opens its modules (kafka-shopify's
+                        // writers.rb, `module Writers` holding only
+                        // `autoload`s): they are opened here, which
+                        // registers the autoloads under them.
+                        Some(Err(source)) if table.loads_nothing(&source) => {
+                            let text = app.sources.iter().find(|f| relative_source_path(app, &f.path) == source).map(|f| f.text.as_str());
+                            let opened = text.and_then(crate::ingest::opened_modules::opened_modules).unwrap_or_default();
+                            writeln!(s, "{pad}# {site}: `require{} {feature:?}` loads {source}, which declares nothing the tree carries beyond the modules it opens", if *relative { "_relative" } else { "" }).unwrap();
+                            for path in opened {
+                                let open: Vec<String> = path.iter().map(|segment| format!("module {segment}")).collect();
+                                writeln!(s, "{pad}{}; {}", open.join("; "), vec!["end"; path.len()].join("; ")).unwrap();
                             }
                         }
                         Some(Err(_)) => {

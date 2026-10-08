@@ -55,6 +55,7 @@ mod load_hook_includes;
 mod model_macros;
 pub mod on_load_hooks;
 pub mod on_load_reopen;
+pub mod opened_modules;
 pub mod prism;
 pub mod rbi;
 pub mod rate_limit;

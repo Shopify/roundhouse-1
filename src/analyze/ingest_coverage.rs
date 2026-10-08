@@ -35,7 +35,102 @@ pub(super) fn diagnose(app: &App) -> Vec<Diagnostic> {
             kind,
         }
     });
-    drops.chain(calls).chain(validation_gaps(app)).chain(cross_file_redefinitions(app)).collect()
+    drops
+        .chain(calls)
+        .chain(required_left_out_files(app))
+        .chain(validation_gaps(app))
+        .chain(cross_file_redefinitions(app))
+        .collect()
+}
+
+/// A file program's `require` / `require_relative` of an app file whose
+/// classes, modules and constants ingest left out (its
+/// `ingest_unsupported` drop): graphql-client's client.rb requires
+/// graphql/client/operation_definition.rb, which the tree does not
+/// carry. Ruby loads that file there; the emitted program names the
+/// require at boot instead (`error[file_require_not_carried]`), and this
+/// reports it at the require, with the reason the file was left out, so
+/// a check shows what the boot will lack. Resolved as the emitted
+/// program resolves it: a relative path from the requiring file, else
+/// the one app file under a `lib/` the feature names.
+fn required_left_out_files(app: &App) -> Vec<Diagnostic> {
+    use crate::app::ProgramItem;
+    use std::collections::BTreeMap;
+    use std::path::{Component, Path, PathBuf};
+    let left_out: BTreeMap<&str, &str> = app
+        .ingest_drops
+        .iter()
+        .filter(|drop| drop.construct.is_none())
+        .filter_map(|drop| {
+            let file = app.sources.get((drop.span.file.0 as usize).checked_sub(1)?)?;
+            Some((file.path.as_str(), drop.message.as_str()))
+        })
+        .collect();
+    if left_out.is_empty() {
+        return Vec::new();
+    }
+    let normalize = |path: &Path| -> String {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other),
+            }
+        }
+        out.display().to_string()
+    };
+    let shown = |path: &str| path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string();
+    let resolve = |from: &str, feature: &str, relative: bool| -> Option<String> {
+        let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
+        if relative {
+            return Some(normalize(&Path::new(from).parent()?.join(&rb)));
+        }
+        let nested = format!("/lib/{rb}");
+        let mut hits = app.sources.iter().filter(|source| source.path.ends_with(&nested));
+        match (hits.next(), hits.next()) {
+            (Some(one), None) => Some(one.path.clone()),
+            _ => None,
+        }
+    };
+    fn walk<'a>(items: &'a [ProgramItem], out: &mut Vec<(crate::span::Span, &'a str, bool)>) {
+        for item in items {
+            match item {
+                ProgramItem::Require { span, feature, relative } => out.push((*span, feature.as_str(), *relative)),
+                ProgramItem::Branch { then_items, else_items, .. } => {
+                    walk(then_items, out);
+                    walk(else_items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for program in &app.file_programs {
+        let mut requires = Vec::new();
+        walk(&program.items, &mut requires);
+        for (span, feature, relative) in requires {
+            let Some(target) = resolve(&program.source, feature, relative) else { continue };
+            let Some(reason) = left_out.get(target.as_str()) else { continue };
+            let written = format!("require{} {feature:?}", if relative { "_relative" } else { "" });
+            let kind = DiagnosticKind::FileStatementUnsupported {
+                construct: written.as_str().into(),
+                detail: format!(
+                    "it loads {}, whose classes, modules and constants ingest left out of the emitted app ({reason})",
+                    shown(&target)
+                ),
+            };
+            out.push(Diagnostic {
+                span,
+                severity: Diagnostic::default_severity(&kind),
+                message: Diagnostic::stub_text(&kind),
+                kind,
+            });
+        }
+    }
+    out
 }
 
 /// A `validates` validator or option ingest does not model
