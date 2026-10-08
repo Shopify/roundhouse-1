@@ -4163,6 +4163,13 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let active_model = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_active_model.rb")
         .map_err(|e| format!("read Active Record ActiveModel runtime: {e}"))?;
     files.push(("runtime/active_record_active_model.rb".into(), active_model));
+    // ActiveRecord::Base's constructor, `reload` and mass assignment as
+    // methods of the modules Base includes (activerecord 8.2.0.alpha
+    // core.rb, persistence.rb, attribute_assignment.rb), so a module a gem
+    // includes into Base later supers into them.
+    let core = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_core.rb")
+        .map_err(|e| format!("read Active Record core runtime: {e}"))?;
+    files.push(("runtime/active_record_core.rb".into(), core));
     // ActiveSupport::StringInquirer (activesupport 8.2.0.alpha
     // string_inquirer.rb), verbatim.
     let inquirer = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inquirer.rb")
@@ -4323,7 +4330,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 .chain(
                     std::iter::once("active_support_string_inflections")
                         .chain(active_model_ports.iter().copied())
-                        .chain(["active_record_active_model", "active_support_string_inquirer"])
+                        .chain(["active_record_active_model", "active_record_core", "active_support_string_inquirer"])
                         .map(|port| format!("require_relative \"{port}\"\n")),
                 )
                 .collect();
