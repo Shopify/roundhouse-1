@@ -617,6 +617,15 @@ fn program_items(
                 }
                 fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
                 fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+                // A `Const.class_eval do … end` the branch carries as a
+                // `ProgramItem::ClassEval`.
+                fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                    if is_class_eval_item(node) {
+                        self.0 = true;
+                    } else {
+                        ruby_prism::visit_call_node(self, node);
+                    }
+                }
             }
             let mut finds = Finds::default();
             finds.visit(stmt);
@@ -695,7 +704,7 @@ fn class_eval_item(
         return None;
     }
     let receiver = call.receiver()?;
-    if receiver.as_constant_read_node().is_none() && receiver.as_constant_path_node().is_none() {
+    if !class_eval_receiver(&receiver) {
         return None;
     }
     let block = call.block()?.as_block_node()?;
@@ -718,6 +727,28 @@ fn class_eval_item(
         method: method.to_string(),
         parts,
     }))
+}
+
+/// A receiver [`class_eval_item`] carries: a constant, or its singleton
+/// class (`Shopify::Types::Configuration.singleton_class.class_eval do
+/// def run_all_sig_blocks! … end`, where a `def` defines a class method).
+fn class_eval_receiver(receiver: &ruby_prism::Node<'_>) -> bool {
+    let constant = |node: &ruby_prism::Node<'_>| node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some();
+    constant(receiver)
+        || receiver.as_call_node().is_some_and(|call| {
+            constant_id_str(&call.name()) == "singleton_class"
+                && call.arguments().is_none()
+                && call.block().is_none()
+                && call.receiver().is_some_and(|r| constant(&r))
+        })
+}
+
+/// Whether `node` is a call [`class_eval_item`] takes up.
+fn is_class_eval_item(call: &ruby_prism::CallNode<'_>) -> bool {
+    matches!(constant_id_str(&call.name()), "class_eval" | "module_eval" | "class_exec" | "module_exec")
+        && call.arguments().is_none()
+        && call.block().is_some_and(|b| b.as_block_node().is_some_and(|b| b.parameters().is_none()))
+        && call.receiver().is_some_and(|r| class_eval_receiver(&r))
 }
 
 /// A `class_eval` body's statements as parts: each run of statements a
@@ -806,8 +837,23 @@ fn class_eval_body(source: &[u8], start: usize, end: usize, file: &str, method: 
     let root = result.node();
     let classes =
         declared_classes(&root, file, usize::MAX).map_err(|err| format!("the ingest cannot carry this `{method}` body: {err}"))?;
+    if classes.iter().any(|c| c.name.0.as_str() != CLASS_EVAL_BODY) {
+        return Err(format!("a class or module declared in this `{method}` body is not carried"));
+    }
     match <[LibraryClass; 1]>::try_from(classes) {
         Ok([class]) => Ok(class),
+        // A body of calls alone (`ActiveSupport::TestCase.class_eval do
+        // setup do … end end`) declares no library module of its own;
+        // it is still the body.
+        Err(classes) if classes.is_empty() => {
+            let module = root
+                .as_program_node()
+                .and_then(|p| p.statements().body().iter().next())
+                .and_then(|n| n.as_module_node())
+                .ok_or_else(|| format!("this `{method}` body has no room for its carry"))?;
+            library_class_from_module_node_with_scope(&module, &[], file)
+                .map_err(|err| format!("the ingest cannot carry this `{method}` body: {err}"))
+        }
         Err(_) => Err(format!("a class or module declared in this `{method}` body is not carried")),
     }
 }
