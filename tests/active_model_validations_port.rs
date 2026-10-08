@@ -211,37 +211,53 @@ fn validations_without_i18n_in_the_lockfile_are_refused() {
     std::fs::remove_dir_all(app).unwrap();
 }
 
-/// frozen_record's `find` reaches the analyzer untyped: whether its
-/// record's `errors` is the port's ActiveModel::Errors or a model's
-/// Array accumulator is unknown, so each errors spelling the lowerings
-/// would ground for the accumulator is refused rather than guessed.
+/// frozen_record's `find` reaches the analyzer untyped. Its record
+/// flows from a port class (`Probe::ApiVersion.find`), so whether its
+/// `errors` is the port's ActiveModel::Errors is not known: each errors
+/// spelling the lowerings would ground as the models' accumulator is
+/// refused rather than guessed. A receiver that is merely untyped (a
+/// parameter) keeps the accumulator's grounding, with a note.
 #[test]
 fn untyped_errors_reads_on_a_port_tree_are_refused() {
     let probe = "class AvProbe\n  def self.lines\n    found = Probe::ApiVersion.find(\"2021-01\")\n    \
                  typed = Probe::ApiVersion.new(\"handle\" => \"\")\n    \
                  found.errors.add(:base, \"gone\")\n    \
-                 [found.errors.full_messages, found.errors[:handle], typed.errors.full_messages, typed.errors[:handle]]\n  end\nend\n";
+                 [found.errors.full_messages, found.errors[:handle], typed.errors.full_messages, typed.errors[:handle], \
+                 Probe::ApiVersion.find(\"2021-04\").errors.full_messages]\n  end\n\n  \
+                 def self.check(record)\n    record.errors.full_messages\n  end\nend\n";
     let app = api_versioning_app("untyped", probe);
     let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
-        .args(["--target", "ruby"])
+        .args(["--target", "ruby", "--allow-unsupported"])
         .arg(&app)
         .arg("-o")
         .arg(app.join("emitted"))
         .output()
         .unwrap();
     let log = String::from_utf8_lossy(&emit.stderr);
-    assert!(!emit.status.success(), "{log}");
+    assert!(emit.status.success(), "{log}");
     let refusals: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains("av_probe.rb") && l.contains("the receiver's type is unknown"))
+        .filter(|l| l.contains("av_probe.rb") && l.contains("the receiver may be a record over ActiveModel::Validations"))
         .collect();
     for (line, spelling) in [(5, "errors.add"), (6, "errors.full_messages"), (6, "errors[]")] {
         assert!(
-            refusals.iter().any(|l| l.contains(&format!("av_probe.rb:{line}:")) && l.contains(&format!("error[unsupported]: {spelling} not supported"))),
+            refusals.iter().any(|l| l.contains(&format!("av_probe.rb:{line}:")) && l.contains(&format!("[unsupported]: {spelling} not supported"))),
             "{spelling} at line {line} not refused:\n{log}"
         );
     }
-    // The records `new` built are typed: their reads stand as the port's.
-    assert_eq!(refusals.len(), 3, "{log}");
+    // `found`'s two reads and the inline `find(...)`'s; the records
+    // `new` built are typed, and their reads stand as the port's.
+    assert_eq!(refusals.iter().filter(|l| l.contains("av_probe.rb:6:")).count(), 3, "{log}");
+    assert_eq!(refusals.len(), 4, "{log}");
+    // The parameter flows from nothing the body can see.
+    let notes: Vec<&str> = log.lines().filter(|l| l.contains("av_probe.rb") && l.contains("on a receiver of unknown type is grounded")).collect();
+    assert!(
+        notes.len() == 1 && notes[0].contains("av_probe.rb:10:") && notes[0].contains("Array[String] accumulator"),
+        "{log}"
+    );
+    // Refused sites raise where they run; the grounded one stays.
+    let emitted = std::fs::read_to_string(app.join("emitted/app/models/av_probe.rb")).unwrap();
+    assert!(emitted.contains("record.errors\n") || emitted.contains("record.errors\r\n"), "{emitted}");
+    assert!(emitted.contains("raise \"roundhouse: errors.full_messages not supported"), "{emitted}");
     std::fs::remove_dir_all(app).unwrap();
 }

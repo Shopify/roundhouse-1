@@ -54,6 +54,7 @@
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
+use super::active_model_model::Reading;
 use crate::expr::{Expr, ExprNode, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
@@ -65,15 +66,18 @@ pub fn apply_errors_index_lowering(app: &mut App) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let port = super::active_model_model::ValidationsPort::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
-        let site = (&port, owner.cloned());
+        let locals = port.locals(body);
+        let site = (&port, owner.cloned(), &locals);
         rewrite(body, &site, &mut diags);
         ledger_messages(body, &site, &mut diags);
     });
     super::for_each_test_body(app, &mut |body| {
-        let site = (&port, None);
+        let locals = port.locals(body);
+        let site = (&port, None, &locals);
         rewrite(body, &site, &mut diags);
         ledger_messages(body, &site, &mut diags);
     });
+    diags.extend(port.take_notes());
     diags
 }
 
@@ -148,7 +152,7 @@ fn rewrite_messages(expr: &mut Expr, diags: &mut Vec<Diagnostic>) {
 }
 
 /// The ActiveModel::Validations port's classes, and the body's owner.
-type Site<'a> = (&'a super::active_model_model::ValidationsPort, Option<crate::ident::ClassId>);
+type Site<'a> = (&'a super::active_model_model::ValidationsPort, Option<crate::ident::ClassId>, &'a super::active_model_model::PortLocals);
 
 /// Whether the `errors` this site reads (`errors[…]`, `errors.messages`
 /// or a question asked of it) is the port's ActiveModel::Errors, whose
@@ -189,9 +193,15 @@ fn rewrite(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
     if on_port(expr, site) {
         return;
     }
-    if let Some((_, spelling)) = grounded_errors(expr).filter(|(errors, _)| site.0.unknown(errors, site.1.as_ref())) {
-        site.0.refuse(expr, spelling);
-        return;
+    if let Some((errors, spelling)) = grounded_errors(expr) {
+        match site.0.classify(errors, site.1.as_ref(), site.2) {
+            Reading::Refused => {
+                site.0.refuse(expr, spelling);
+                return;
+            }
+            Reading::Untyped => site.0.note_untyped("errors_index", spelling, expr.span),
+            Reading::Port | Reading::Accumulator => {}
+        }
     }
     rewrite_messages(expr, diags);
     rewrite_index(expr, diags);

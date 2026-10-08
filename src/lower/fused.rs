@@ -27,7 +27,7 @@ use crate::ident::Symbol;
 use std::collections::BTreeSet;
 use crate::det::HashSet;
 
-pub fn apply_fused_independent_rewrites(app: &mut App) {
+pub fn apply_fused_independent_rewrites(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
     let skip_exclude = super::exclude_predicate::app_defines_exclude(app);
     let skip_in = super::in_predicate::app_defines_in(app);
     let skip_including = super::including::app_defines_including(app);
@@ -35,20 +35,28 @@ pub fn apply_fused_independent_rewrites(app: &mut App) {
     let port = super::active_model_model::ValidationsPort::of(app);
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
-        let full_messages = (!skip_full_messages).then_some((&port, owner));
+        let locals = port.locals(body);
+        let site = (&port, owner, &locals);
+        let full_messages = (!skip_full_messages).then_some(&site);
         walk_postorder(body, &mut |e| {
             rewrite_hook_node(e, skip_exclude, skip_in, skip_including, full_messages);
         });
     });
-    let full_messages = (!skip_full_messages).then_some((&port, None));
     for view in &mut app.views {
+        let locals = port.locals(&view.body);
+        let site = (&port, None, &locals);
+        let full_messages = (!skip_full_messages).then_some(&site);
         walk_postorder(&mut view.body, &mut |e| {
             rewrite_view_node(e, skip_exclude, skip_in, skip_including, full_messages);
         });
     }
     super::for_each_test_body(app, &mut |body| {
+        let locals = port.locals(body);
+        let site = (&port, None, &locals);
+        let full_messages = (!skip_full_messages).then_some(&site);
         walk_postorder(body, &mut |e| rewrite_test_node(e, full_messages));
     });
+    port.take_notes()
 }
 
 /// Independent rewrites that must observe ingested (or already
@@ -430,7 +438,7 @@ fn is_format_suffix_wrap(e: &Expr, helpers: &HashSet<String>) -> bool {
 /// The errors_full_messages rewrite's inputs, or None when the app
 /// defines its own `full_messages` and the rewrite stands down: the
 /// ActiveModel::Validations port's classes, and the body's owner.
-type FullMessages<'a> = Option<(&'a super::active_model_model::ValidationsPort, Option<&'a crate::ident::ClassId>)>;
+type FullMessages<'a> = Option<&'a super::errors_full_messages::Site<'a>>;
 
 fn rewrite_hook_node(
     e: &mut Expr,
@@ -469,8 +477,8 @@ fn rewrite_hook_node(
     super::arel_attribute::rewrite_node(e);
     super::attr_or_assign::rewrite_node(e);
     super::group_count::rewrite_node(e);
-    if let Some((port, owner)) = full_messages {
-        super::errors_full_messages::rewrite_node(e, port, owner);
+    if let Some(site) = full_messages {
+        super::errors_full_messages::rewrite_node(e, site);
     }
     super::each_with_index::rewrite_node(e);
     // Last: produces `ActiveSupport.*` / Range nodes no earlier fused
@@ -511,8 +519,8 @@ fn rewrite_view_node(
     super::dirty_predicate_kwargs::rewrite_node(e);
     super::relation_select_block::rewrite_node(e);
     super::arel_attribute::rewrite_node(e);
-    if let Some((port, owner)) = full_messages {
-        super::errors_full_messages::rewrite_node(e, port, owner);
+    if let Some(site) = full_messages {
+        super::errors_full_messages::rewrite_node(e, site);
     }
     super::each_with_index::rewrite_node(e);
     super::time_calendar::rewrite_node(e);
@@ -523,8 +531,8 @@ fn rewrite_test_node(e: &mut Expr, full_messages: FullMessages<'_>) {
     super::enumerable_ext::rewrite_node(e);
     super::byte_size::rewrite_node(e);
     super::dirty_predicate_kwargs::rewrite_node(e);
-    if let Some((port, owner)) = full_messages {
-        super::errors_full_messages::rewrite_node(e, port, owner);
+    if let Some(site) = full_messages {
+        super::errors_full_messages::rewrite_node(e, site);
     }
 }
 
