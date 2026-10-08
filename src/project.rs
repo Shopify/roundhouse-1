@@ -5889,13 +5889,49 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                     .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
         })
     };
+    // The gem `lib/` directory a source is under (`vendor/gems/verdict-19.34.0/lib`).
+    let gem_lib = |source: &str| -> Option<String> {
+        let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
+        let segments: Vec<&str> = rel.split('/').collect();
+        (1..segments.len().saturating_sub(1))
+            .find(|&i| segments[i] == "lib" && gem_dir(segments[i - 1]))
+            .map(|i| segments[..=i].join("/"))
+    };
+    // A gem that sets up a Zeitwerk loader of its own in a form
+    // `ingest::zeitwerk` does not model (verdict 19.34.0 builds its
+    // `Zeitwerk::Loader.new` in a memoized class method, pushes its
+    // `lib/` and calls `Verdict.loader.setup` from verdict.rb): its files
+    // are autoloaded natively, so they keep their autoloads, as a modeled
+    // loader's root does. Read from the source text, since the loader is
+    // not ingested.
+    let self_loading_libs: std::collections::BTreeSet<String> = {
+        let mut creates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut sets_up: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for source in &app.sources {
+            let Some(lib) = gem_lib(&source.path) else { continue };
+            let text = source.text.as_str();
+            if text.contains("Zeitwerk::Loader.new") || text.contains("Zeitwerk::Loader.for_gem") {
+                creates.insert(lib.clone());
+            }
+            if text.lines().any(|line| {
+                let line = line.trim();
+                !line.starts_with('#') && line.contains("loader") && line.ends_with(".setup")
+            }) {
+                sets_up.insert(lib);
+            }
+        }
+        creates
+            .into_iter()
+            .filter(|lib| sets_up.contains(lib))
+            .filter(|lib| !loader_roots.iter().any(|root| *root == lib || root.starts_with(&format!("{lib}/"))))
+            .collect()
+    };
     let required_gem_file = |source: &str| -> bool {
         let rel = source.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(source);
         if loader_roots.iter().any(|root| !root.is_empty() && rel.starts_with(&format!("{root}/"))) {
             return false;
         }
-        let segments: Vec<&str> = rel.split('/').collect();
-        (1..segments.len().saturating_sub(1)).any(|i| segments[i] == "lib" && gem_dir(segments[i - 1]))
+        gem_lib(source).is_some_and(|lib| !self_loading_libs.contains(&lib))
     };
     let gem_only = |anchor: &str| {
         declaring.get(anchor).is_some_and(|sources| !sources.is_empty() && sources.iter().all(|s| required_gem_file(s)))

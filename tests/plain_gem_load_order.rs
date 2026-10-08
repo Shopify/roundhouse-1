@@ -196,3 +196,51 @@ fn a_statement_needing_the_loading_gem_root_does_not_require_it_again() {
     ];
     let _ = same_as_native("inflight", &[("vd", VD)], "vd", "p Vd::Decide.subscribed\n", ":yes\n");
 }
+
+/// verdict 19.34.0 sets up its own Zeitwerk loader for its `lib/`
+/// (verdict/zeitwerk_loader.rb's `Zeitwerk::Loader.new` and `push_dir`,
+/// in a memoized class method; `Verdict.loader.setup` at the end of
+/// verdict.rb). Its other files are autoloaded: subject_type/shop.rb
+/// reads `PiiLevel` at load, which no require loads.
+#[test]
+fn a_gem_that_sets_up_its_own_zeitwerk_loader_keeps_autoloading_its_files() {
+    const ZW: &[(&str, &str)] = &[
+        (
+            "zw.rb",
+            "require_relative \"zw/zeitwerk_loader\"\n\nmodule Zw\n  extend self\n\n  def loader\n    @loader ||= ZeitwerkLoader.loader\n  end\nend\n\nZw.loader.setup\nrequire \"zw/decide\"\n",
+        ),
+        (
+            "zw/zeitwerk_loader.rb",
+            r##"require "zeitwerk"
+
+module Zw
+  class ZeitwerkLoader
+    class << self
+      def loader
+        @loader ||= configure_loader
+      end
+
+      private
+
+      def configure_loader
+        loader = Zeitwerk::Loader.new
+        lib_path = File.expand_path("..", __dir__)
+        loader.push_dir(lib_path)
+        loader.inflector.inflect("pii_level" => "PiiLevel")
+        loader.ignore(__FILE__)
+        loader.ignore("#{lib_path}/zw.rb")
+        loader
+      end
+    end
+  end
+end
+"##,
+        ),
+        ("zw/decide.rb", "module Zw\n  module Decide\n    def self.levels\n      [SubjectType::Shop::LEVEL, Flag.new.configs.size]\n    end\n  end\nend\n"),
+        ("zw/pii_level.rb", "module Zw\n  module PiiLevel\n    HIGH = 3\n  end\nend\n"),
+        ("zw/subject_type/shop.rb", "module Zw\n  module SubjectType\n    class Shop\n      LEVEL = PiiLevel::HIGH\n    end\n  end\nend\n"),
+        ("zw/flag.rb", "module Zw\n  class Flag\n    def configs\n      RecordConfigurations.all\n    end\n  end\nend\n"),
+        ("zw/record_configurations.rb", "module Zw\n  class RecordConfigurations\n    def self.all\n      [1, 2]\n    end\n  end\nend\n"),
+    ];
+    let _ = same_as_native("zeitwerk", &[("zw", ZW)], "zw", "p Zw::Decide.levels\n", "[3, 2]\n");
+}
