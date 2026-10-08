@@ -53,6 +53,8 @@ mod validates;
 mod delegated_type;
 mod load_hook_includes;
 mod model_macros;
+mod define_method_loops;
+pub(crate) use define_method_loops::REFUSAL_CONSTRUCT as DEFINE_METHOD_REFUSAL;
 pub mod on_load_hooks;
 pub mod on_load_reopen;
 pub mod prism;
