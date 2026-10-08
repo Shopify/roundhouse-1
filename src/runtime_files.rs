@@ -52,6 +52,19 @@ fn under(dir: &str) -> impl Iterator<Item = (&'static str, &'static str)> {
     })
 }
 
+/// Test-tree ports the PostgreSQL bootstrap carries into the CRuby tree
+/// and its test helper requires (project.rs `apply_postgres_bootstrap`):
+/// Rubydex indexes them for apps that carry that runtime
+/// (`App::carries_postgresql_runtime`), beside `ruby_sources`.
+pub(crate) const POSTGRESQL_TEST_PORTS: &[&str] = &["runtime/spinel/cruby/test/active_record_test_fixtures.rb"];
+
+pub(crate) fn postgresql_test_ruby_sources() -> impl Iterator<Item = (&'static str, &'static str)> {
+    FILES
+        .iter()
+        .filter(|(path, _)| POSTGRESQL_TEST_PORTS.contains(path))
+        .map(|(path, text)| (*path, *text))
+}
+
 /// Real framework and shim declarations, without tests or emit scaffolds.
 pub(crate) fn ruby_sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     FILES

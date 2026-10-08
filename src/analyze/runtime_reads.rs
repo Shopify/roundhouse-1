@@ -42,6 +42,9 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_support_rescuable.rb", "runtime/active_support_rescuable.rb"),
     ("runtime/spinel/active_job_callbacks.rb", "runtime/active_job_callbacks.rb"),
     ("runtime/spinel/active_support_mem_cache_store.rb", "runtime/active_support_mem_cache_store.rb"),
+    ("runtime/spinel/active_support_file_store.rb", "runtime/active_support_file_store.rb"),
+    ("runtime/spinel/active_support_file_update_checker.rb", "runtime/active_support_file_update_checker.rb"),
+    ("runtime/spinel/active_support_benchmark.rb", "runtime/active_support_benchmark.rb"),
     ("runtime/spinel/active_support_testing_time_helpers.rb", "runtime/active_support_testing_time_helpers.rb"),
     ("runtime/spinel/active_support_messages.rb", "runtime/active_support_messages.rb"),
     ("runtime/spinel/active_support_json.rb", "runtime/active_support_json.rb"),
@@ -68,6 +71,9 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_attribute_methods.rb", "runtime/active_model_attribute_methods.rb"),
     ("runtime/spinel/active_model_serialization.rb", "runtime/active_model_serialization.rb"),
     ("runtime/spinel/active_support_string_inquirer.rb", "runtime/active_support_string_inquirer.rb"),
+    // The PostgreSQL CRuby tree only, required by its test helper
+    // (`runtime_files::POSTGRESQL_TEST_PORTS`).
+    ("runtime/spinel/cruby/test/active_record_test_fixtures.rb", "runtime/active_record_test_fixtures.rb"),
 ];
 
 /// Shared runtime every target carries: `active_support_ext.rb` stands
@@ -687,7 +693,7 @@ pub(crate) fn test_roots(app: &App, f: &mut impl FnMut(&Expr)) {
 /// Every read of a gated name in the app's emit-bound code, its tests
 /// included. A name the app declares itself is the app's, not gated.
 pub(crate) fn ruby_family_runtime_reads(app: &App) -> Vec<RuntimeRead> {
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let names = ruby_family_runtime_names();
     let gated = |name: &str| names.contains_key(name) && !resolver.has_source_namespace(name);
     let mut tests = Vec::new();
@@ -728,7 +734,7 @@ pub(crate) fn ruby_family_runtime_reads(app: &App) -> Vec<RuntimeRead> {
 /// keeps its includes as names, so its span is synthetic, as the
 /// analyzer's own include refusal is.
 pub(crate) fn ruby_family_runtime_includes(app: &App) -> Vec<(Span, String, &'static str, String)> {
-    let resolver = app.const_resolver.for_sources(&app.sources);
+    let resolver = app.const_resolver.for_app(app);
     let names = ruby_family_runtime_names();
     let gated = |name: &str| names.contains_key(name) && !resolver.has_source_namespace(name);
     let mut out = Vec::new();
@@ -820,6 +826,9 @@ mod tests {
             ("ActiveJob::Execution", "runtime/active_job_callbacks.rb"),
             ("ActiveSupport::Cache", "runtime/active_support_cache.rb"),
             ("ActiveSupport::Cache::MemCacheStore", "runtime/active_support_mem_cache_store.rb"),
+            ("ActiveSupport::Cache::FileStore", "runtime/active_support_file_store.rb"),
+            ("ActiveSupport::FileUpdateChecker", "runtime/active_support_file_update_checker.rb"),
+            ("ActiveSupport::Benchmark", "runtime/active_support_benchmark.rb"),
             ("ActiveSupport::Testing::TimeHelpers", "runtime/active_support_testing_time_helpers.rb"),
             ("ActiveSupport::Testing::SimpleStubs", "runtime/active_support_testing_time_helpers.rb"),
             ("ActiveSupport::MessageEncryptor", "runtime/active_support_messages.rb"),

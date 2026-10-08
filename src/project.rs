@@ -3086,6 +3086,10 @@ end
 module ActiveRecord
   DatabaseConfigurations = ::DatabaseConfigurations::Configurations
 end
+
+# ActiveRecord::TestFixtures, which Active Record autoloads in any process;
+# the test helper includes it into the test base, as rails/test_help.rb does.
+require_relative "active_record_test_fixtures"
 "#)
 }
 
@@ -3444,6 +3448,37 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_support_mem_cache_store.rb: {e}"))?,
         ));
     }
+    // FileStore (activesupport 8.2.0.alpha cache/file_store.rb), likewise
+    // where app code names the class (Core's cardserver simulator);
+    // tests/file_store_runtime.rb holds it to native ActiveSupport.
+    let carries_file_store = carries_cache && carries_named(&files, &["ActiveSupport::Cache::FileStore"]);
+    if carries_file_store {
+        files.push((
+            "runtime/active_support_file_store.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_support_file_store.rb")
+                .map_err(|e| format!("read runtime/spinel/active_support_file_store.rb: {e}"))?,
+        ));
+    }
+    // ActiveSupport::FileUpdateChecker and ActiveSupport::Benchmark
+    // (8.2.0.alpha file_update_checker.rb, benchmark.rb), each where app
+    // code names it (Core's developer dashboard, its Trilogy connection
+    // timing); tests/active_support_utilities_runtime.rb holds them to
+    // native ActiveSupport.
+    let utility_ports: Vec<&str> = [
+        ("ActiveSupport::FileUpdateChecker", "active_support_file_update_checker"),
+        ("ActiveSupport::Benchmark", "active_support_benchmark"),
+    ]
+    .into_iter()
+    .filter(|(name, _)| carries_named(&files, &[name]))
+    .map(|(_, port)| port)
+    .collect();
+    for port in &utility_ports {
+        files.push((
+            format!("runtime/{port}.rb"),
+            crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+                .map_err(|e| format!("read runtime/spinel/{port}.rb: {e}"))?,
+        ));
+    }
     // ActiveSupport::Testing::TimeHelpers (activesupport 8.1.4: Time.now,
     // Time.new, Date.today and DateTime.now stubbed on their singletons),
     // where the app or its tests name the module or call `freeze_time`,
@@ -3730,6 +3765,14 @@ fn ruby_family_files(
     } else {
         gem_facades
     };
+    let gem_facades = if carries_file_store {
+        format!("{gem_facades}require_relative \"active_support_file_store\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades: String = std::iter::once(gem_facades)
+        .chain(utility_ports.iter().map(|port| format!("require_relative \"{port}\"\n")))
+        .collect();
     let gem_facades = if carries_time_helpers {
         format!("{gem_facades}require_relative \"active_support_testing_time_helpers\"\n")
     } else {
@@ -4367,6 +4410,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let transactions = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_transactions.rb")
         .map_err(|e| format!("read transactions runtime: {e}"))?;
     files.push(("runtime/active_record_transactions.rb".into(), transactions));
+    // In runtime_files::POSTGRESQL_TEST_PORTS, which the analyzer indexes.
     let test_fixtures = crate::runtime_files::read_to_string("runtime/spinel/cruby/test/active_record_test_fixtures.rb")
         .map_err(|e| format!("read test fixtures runtime: {e}"))?;
     files.push(("runtime/active_record_test_fixtures.rb".into(), test_fixtures));
@@ -4606,9 +4650,10 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             if log_subscriber_test_helper {
                 content.push_str("\nrequire_relative \"../runtime/active_support_log_subscriber_test_helper\"\n");
             }
-            // rails/test_help.rb's ActiveRecord::TestFixtures: transactional
-            // tests on every writing pool.
-            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\n");
+            // rails/test_help.rb's ActiveRecord::TestFixtures (transactional
+            // tests on every writing pool): `ActiveSupport.on_load(:active_support_test_case)
+            // { include ActiveRecord::TestFixtures }`.
+            content.push_str("\nrequire_relative \"../runtime/active_record_test_fixtures\"\nTestBase.include(ActiveRecord::TestFixtures)\n");
         }
         if path == "main.rb" {
             let start = content.find("    db_path = ENV[\"BLOG_DB\"]")
@@ -10130,7 +10175,15 @@ fn spinel_files_with_assertions(
     // and the cache keep: the ruby-family forks push both back, and
     // runtime/logger.rb is the shared port here.
     files.retain(|(p, _)| p != "runtime/active_support_logger.rb" && p != "runtime/active_support_isolated_execution_state.rb");
-    files.retain(|(p, _)| p != "runtime/active_support_mem_cache_store.rb");
+    files.retain(|(p, _)| {
+        !matches!(
+            p.as_str(),
+            "runtime/active_support_mem_cache_store.rb"
+                | "runtime/active_support_file_store.rb"
+                | "runtime/active_support_file_update_checker.rb"
+                | "runtime/active_support_benchmark.rb"
+        )
+    });
     files.retain(|(p, _)| p != "runtime/active_support_testing_time_helpers.rb");
     // And for ActiveSupport::Callbacks, pushed back by the two ruby-family
     // forks where the app names it.

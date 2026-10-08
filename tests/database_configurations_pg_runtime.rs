@@ -39,7 +39,8 @@ end
 /// Configurations built from a hash, as Core's code reads them
 /// (`configs_for(env_name:, include_hidden: true)`, `filter_map(&:max_connections)`,
 /// a HashConfig copied with one key changed), and `Base.configurations=`
-/// wrapping a hash and restored. No environment-dependent call: native
+/// wrapping a hash and restored, and the loaded-fixture reset on
+/// ActiveRecord::TestFixtures outside a test. No environment-dependent call: native
 /// Rails runs without RAILS_ENV, the emitted program under `test`.
 const PROBE: &str = r##"class DatabaseConfigurationsProbe
   CONFIG = {
@@ -83,6 +84,7 @@ const PROBE: &str = r##"class DatabaseConfigurationsProbe
     out << "rewrapped: #{ActiveRecord::Base.configurations.configurations.map(&:name) == configs.configurations.map(&:name)}"
     ActiveRecord::Base.configurations = base
     out << "restored: #{ActiveRecord::Base.configurations.configurations.size == base.configurations.size}"
+    out << "test fixtures: #{ActiveRecord::TestFixtures.class_variable_set(:@@already_loaded_fixtures, {}).inspect} #{ActiveRecord::TestFixtures.instance_of?(Module)}"
     out << "widgets: #{Widget.count}"
     out
   end
@@ -142,7 +144,7 @@ fn configurations_answer_as_natively_on_postgresql() {
         &["app/models/application_record", "app/models/widget", "app/models/database_configurations_probe"],
     );
     let mut expected: Vec<String> = EXPECTED.iter().map(|s| s.to_string()).collect();
-    expected.extend(["rewrapped: true", "restored: true", "widgets: 0"].map(String::from));
+    expected.extend(["rewrapped: true", "restored: true", "test fixtures: {} true", "widgets: 0"].map(String::from));
     assert_eq!(native, expected, "native");
     assert!(real_errors(&errors).is_empty(), "{}", errors.join("\n"));
     assert_eq!(emitted_lines, native, "emitted");
@@ -150,7 +152,9 @@ fn configurations_answer_as_natively_on_postgresql() {
 
 /// Core's shapes: the configuration a Trilogy connection is copied from
 /// (globaldb_schema_sources.rb), a shard's configuration hash
-/// (podding/database/config.rb), a pool size (concurrent_batch_map.rb).
+/// (podding/database/config.rb), a pool size (concurrent_batch_map.rb),
+/// and the loaded-fixture reset (fixture_cache_pre_warmer.rb) on the
+/// TestFixtures port the PostgreSQL tree carries.
 const CORE_SHAPES: &str = r##"class ConfigurationReader
   def self.copied(name)
     config = ActiveRecord::Base.configurations.configs_for(env_name: "test_#{name}", include_hidden: true).sole
@@ -167,6 +171,10 @@ const CORE_SHAPES: &str = r##"class ConfigurationReader
 
   def self.found
     ActiveRecord::Base.configurations.find_db_config("globaldb_config")&.database
+  end
+
+  def self.reset_loaded_fixtures
+    ActiveRecord::TestFixtures.class_variable_set(:@@already_loaded_fixtures, {})
   end
 end
 "##;
@@ -205,7 +213,12 @@ fn configurations_type_on_postgresql_and_framework_classes_are_refused_by_name()
     // Nothing from the configurations reads or the probe.
     let configurations: Vec<_> = errors
         .iter()
-        .filter(|e| e.contains("configurations") || e.contains("DatabaseConfigurations") || e.contains("max_connections"))
+        .filter(|e| {
+            e.contains("configurations")
+                || e.contains("DatabaseConfigurations")
+                || e.contains("max_connections")
+                || e.contains("TestFixtures")
+        })
         .collect();
     assert!(configurations.is_empty(), "{configurations:#?}");
     let refusals: Vec<&String> = errors.iter().copied().filter(|e| e.contains("constant not supported")).collect();
@@ -237,6 +250,7 @@ fn configurations_stay_a_named_gap_without_the_postgresql_runtime() {
     for expected in [
         "ActiveRecord::Base not supported (all targets): configurations lacks a shared runtime/lowering implementation",
         "constant not supported (all targets): ActiveRecord::DatabaseConfigurations::HashConfig",
+        "constant not supported (all targets): ActiveRecord::TestFixtures",
     ] {
         assert!(errors.iter().any(|e| e.contains(expected)), "no {expected:?} in:\n{}", errors.join("\n"));
     }

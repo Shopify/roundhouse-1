@@ -33,6 +33,9 @@ use crate::det::{HashMap, HashSet};
 pub(super) const SIGNATURE_PORTS: &[&str] = &[
     "runtime/spinel/active_support_cache.rb",
     "runtime/spinel/active_support_mem_cache_store.rb",
+    "runtime/spinel/active_support_file_store.rb",
+    "runtime/spinel/active_support_file_update_checker.rb",
+    "runtime/spinel/active_support_benchmark.rb",
     "runtime/spinel/active_support_testing_time_helpers.rb",
     "runtime/spinel/active_support_messages.rb",
     "runtime/spinel/active_model_type.rb",

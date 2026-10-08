@@ -1237,6 +1237,14 @@ pub struct ImportmapPin {
 }
 
 impl App {
+    /// Whether the CRuby tree carries the PostgreSQL runtime: boot
+    /// resolves config/database.yml and the primary is postgresql
+    /// (project.rs `apply_postgres_bootstrap`, which also carries the
+    /// test-tree ports in `runtime_files::POSTGRESQL_TEST_PORTS`).
+    pub fn carries_postgresql_runtime(&self) -> bool {
+        self.database_yml.is_some() && self.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+    }
+
     /// The adapter the primary database is compiled for: the manifest's
     /// primary, else `config/database.yml`'s declared compile target;
     /// `None` keeps the single-database (sqlite3) selection.

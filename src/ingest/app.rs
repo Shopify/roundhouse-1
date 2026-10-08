@@ -2363,7 +2363,7 @@ end
     // doc). The real drain runs after them, below.
     let sources = std::sync::Arc::new(super::sources::snapshot());
     let const_resolver =
-        crate::analyze::ConstResolverTask::start(std::sync::Arc::clone(&sources));
+        crate::analyze::ConstResolverTask::start_for(std::sync::Arc::clone(&sources), app.carries_postgresql_runtime());
 
     // Logical stylesheets — file stems of `.css` files found in
     // `app/assets/stylesheets/` and `app/assets/builds/`. Rails'

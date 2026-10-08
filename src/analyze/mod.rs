@@ -1264,7 +1264,7 @@ impl Analyzer {
                 info.app_declared = true;
             }
         }
-        let const_resolver = app.const_resolver.for_sources(&app.sources);
+        let const_resolver = app.const_resolver.for_app(app);
         // Before signatures resolve: `#: -> IdentityAccountFields` inside
         // `IdentityAccount` names the Struct constant's class.
         data::register_blockless_structs(app, &const_resolver, &mut classes);
