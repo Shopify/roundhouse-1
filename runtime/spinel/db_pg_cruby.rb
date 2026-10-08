@@ -1107,7 +1107,20 @@ module Db
 
   def self.column_text(handle, index)
     value = column_value(handle, index)
-    value.nil? ? "" : value.to_s
+    value.nil? ? "" : text_value(value)
+  end
+
+  # A column read as text. PG::BasicTypeMapForResults decodes a
+  # timestamp to a UTC Time, whose `to_s` drops the microseconds; the
+  # stored form a temporal column's `_raw` slot holds is
+  # "YYYY-MM-DD HH:MM:SS.ffffff" (ActiveSupport.format_db_time's).
+  def self.text_value(value)
+    if value.is_a?(Time)
+      t = value.getutc
+      format("%04d-%02d-%02d %02d:%02d:%02d.%06d", t.year, t.month, t.day, t.hour, t.min, t.sec, t.usec)
+    else
+      value.to_s
+    end
   end
 
   def self.column_bool(handle, index)
@@ -1136,7 +1149,7 @@ module Db
 
   def self.column_text_opt(handle, index)
     value = column_value(handle, index)
-    value.nil? ? nil : value.to_s
+    value.nil? ? nil : text_value(value)
   end
 
   def self.column_bool_opt(handle, index)
@@ -1237,8 +1250,20 @@ module Db
     value.nil? ? "NULL" : escape_int(value)
   end
 
+  # Rails' quoting of a number (abstract/quoting.rb `_quote`): a
+  # BigDecimal (a decimal column's value) in plain notation, every digit
+  # kept; a Float in its shortest round-trip digits, its infinities and
+  # NaN quoted.
   def self.escape_float_opt(value)
-    value.nil? ? "NULL" : value.to_f.to_s
+    if value.nil?
+      "NULL"
+    elsif value.is_a?(BigDecimal)
+      value.to_s("F")
+    elsif value.is_a?(Float) && (value.infinite? || value.nan?)
+      "'#{value}'"
+    else
+      value.to_f.to_s
+    end
   end
 
   def self.escape_bool_opt(value)

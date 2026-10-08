@@ -21,6 +21,10 @@
 //! - a decimal column hydrates the driver's value (`Db.column_decimal`),
 //!   not a Float, and `reload` casts a value whose stored class differs
 //!   from the type's (a decimal, a declared type over another column).
+//!   The Hash-row path (`<Model>Row.from_raw`, an explicit `select`)
+//!   keeps a decimal's value too, and stores a timestamp the driver
+//!   decoded as its full text (`ActiveSupport.format_db_time`), the
+//!   microseconds included.
 //!
 //! The cast type is the one the model's `schema_column_types` names
 //! (`emit::ruby::attribute_api`): a column whose type the port does not
@@ -89,6 +93,10 @@ pub(crate) fn apply(lcs: &mut [LibraryClass], app: &App) {
         }
         public_attributes(lc, model, table);
         nil_unsaved_id(lc, model, table);
+        let row_class = format!("{}Row", model.name.0.as_str());
+        if let Some(row_lc) = lcs.iter_mut().find(|lc| lc.name.0.as_str() == row_class) {
+            raw_row_values(row_lc, &cols);
+        }
     }
     for lc in lcs.iter_mut().filter(|lc| app.models.iter().any(|m| m.name == lc.name)) {
         nil_unsaved_param(lc);
@@ -376,6 +384,44 @@ fn hand_to_writers(e: &mut Expr, cols: &[(&Column, Kind)]) {
             }
         }
         _ => {}
+    }
+}
+
+/// `from_raw`'s slot writes from the adapter row: a decimal column's
+/// `row["c"]` as the driver decoded it (a BigDecimal, which the model's
+/// writer casts), not `to_f`; a timestamp's as its stored text,
+/// `ActiveSupport.format_db_time(row["c"])`, not `Time#to_s`, which
+/// drops the microseconds.
+fn raw_row_values(lc: &mut LibraryClass, cols: &[(&Column, Kind)]) {
+    for m in lc.methods.iter_mut().filter(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == "from_raw") {
+        let Some(row) = m.params.first().map(|p| p.name.clone()) else { continue };
+        let ExprNode::Seq { exprs } = &mut *m.body.node else { continue };
+        for stmt in exprs.iter_mut() {
+            let (setter, value) = match &mut *stmt.node {
+                ExprNode::Send { method, args, .. } if args.len() == 1 => (method.as_str().to_string(), &mut args[0]),
+                ExprNode::Assign { target: LValue::Attr { name, .. }, value } => (format!("{}=", name.as_str()), value),
+                _ => continue,
+            };
+            let Some(&(col, kind)) = cols.iter().find(|(c, _)| setter.strip_suffix('=') == Some(c.name.as_str())) else {
+                continue;
+            };
+            let lookup = sp(ExprNode::Send {
+                recv: Some(var(&row)),
+                method: Symbol::from("[]"),
+                args: vec![lit(Literal::Str { value: col.name.as_str().to_string() })],
+                block: None,
+                parenthesized: false,
+            });
+            match (&col.col_type, kind) {
+                (ColumnType::Decimal { .. }, _) => *value = lookup,
+                (_, Kind::Time) => {
+                    let mut text = send(konst("ActiveSupport"), "format_db_time", vec![lookup]);
+                    text.ty = Some(Ty::Union { variants: vec![Ty::Str, Ty::Nil] });
+                    *value = text;
+                }
+                _ => {}
+            }
+        }
     }
 }
 

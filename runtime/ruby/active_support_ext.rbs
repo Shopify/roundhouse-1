@@ -107,3 +107,9 @@ module ActiveSupport
   # — declared on active_support_inflections.rbs (Ruby/Spinel scaffold;
   # strict targets literalize controller_name/path instead).
 end
+
+module ActiveSupport
+  module BigDecimalWithDefaultFormat
+    def to_s: (?String format) -> String
+  end
+end

@@ -825,3 +825,14 @@ module ActiveSupport
     sign + out + rest
   end
 end
+
+# activesupport core_ext/big_decimal/conversions.rb: a BigDecimal prints
+# in plain notation unless a format is given.
+module ActiveSupport
+  module BigDecimalWithDefaultFormat # :nodoc:
+    def to_s(format = "F")
+      super(format)
+    end
+  end
+end
+BigDecimal.prepend(ActiveSupport::BigDecimalWithDefaultFormat)
