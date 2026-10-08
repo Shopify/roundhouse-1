@@ -272,6 +272,14 @@ fn rewrite_errors_add(expr: &mut Expr, localized: Option<&(String, usize)>, diag
     // dispatching — leaving `ty = None` here makes it false-positive a
     // `send_dispatch_failed` on a receiver it can see the type of.
     let recv_ty = recv.as_ref().and_then(|r| r.ty.clone());
+    // The attribute the message is for, which the accumulator drops: the
+    // CRuby and JRuby trees record it for `errors.attribute_names`.
+    let attribute = match &*field_expr.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(crate::expr::IrHint::ErrorAttribute(value.clone())),
+        ExprNode::Var { name, .. } => Some(crate::expr::IrHint::ErrorAttributeLocal(name.clone())),
+        _ => None,
+    };
+    expr.hint = attribute;
     *expr.node = ExprNode::Send {
         recv,
         method: Symbol::from("<<"),

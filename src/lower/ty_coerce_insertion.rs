@@ -391,7 +391,7 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
         diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint,
+        hint: expr.hint.clone(),
         decisions: expr.decisions,
         keyword_arg: expr.keyword_arg.clone(),
     }

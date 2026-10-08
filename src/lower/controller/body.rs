@@ -182,7 +182,7 @@ fn unwrap_respond_to_inner(expr: &Expr, with_format_dispatch: bool, breadth: For
         effects: expr.effects.clone(),
         leading_blank_line: expr.leading_blank_line,
         diagnostic: expr.diagnostic.clone(),
-        hint: expr.hint,
+        hint: expr.hint.clone(),
         decisions: expr.decisions,
         keyword_arg: expr.keyword_arg.clone(),
     }

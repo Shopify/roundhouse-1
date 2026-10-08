@@ -4,8 +4,10 @@
 //! `root_transaction.has_attribute?(:payment_attempt_id)`. The runtime
 //! base implements it (schema columns; a column a `select` left out
 //! reads false), but the analyzer's model surface did not list it, so
-//! every call was `no known method`. `association(:name)` has no runtime
-//! implementation and stays refused.
+//! every call was `no known method`. `association(:name)` resolves too:
+//! the CRuby and JRuby trees carry the association object
+//! (tests/errors_association_ports.rs runs it; an undeclared name such
+//! as `:parts` below raises AssociationNotFoundError there, as in Rails).
 
 use roundhouse::det::HashMap;
 use std::path::PathBuf;
@@ -28,5 +30,5 @@ fn has_attribute_resolves_on_a_model() {
     roundhouse::session::analyze_and_lower(&mut app);
     let errors: Vec<String> = roundhouse::analyze::diagnose(&app).into_iter().map(|d| d.to_string()).collect();
     assert!(!errors.iter().any(|e| e.contains("has_attribute?")), "{errors:?}");
-    assert!(errors.iter().any(|e| e.contains("`association`")), "{errors:?}");
+    assert!(!errors.iter().any(|e| e.contains("`association`")), "{errors:?}");
 }

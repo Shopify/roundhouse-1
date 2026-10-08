@@ -45,6 +45,8 @@ const RUBY_FAMILY_RUNTIME: &[(&str, &str)] = &[
     ("runtime/spinel/active_model_validator.rb", "runtime/active_model_validator.rb"),
     ("runtime/spinel/active_support_backtrace_cleaner.rb", "runtime/active_support_backtrace_cleaner.rb"),
     ("runtime/spinel/active_record_log_subscriber.rb", "runtime/active_record_log_subscriber.rb"),
+    ("runtime/spinel/active_record_associations.rb", "runtime/active_record_associations.rb"),
+    ("runtime/spinel/active_model_errors.rb", "runtime/active_model_errors.rb"),
     // The PostgreSQL CRuby tree only (`project::apply_postgres_bootstrap`).
     ("runtime/spinel/user_agent_version.rb", "runtime/user_agent_version.rb"),
 ];
@@ -370,6 +372,65 @@ const UNTYPED_SINGLETONS: &[(&str, &str, &str)] = &[
     ("Rails", "configuration", "Rails::Configuration"),
 ];
 
+/// Instance methods only a gated port answers, though the registry types
+/// them on a class every tree has: by method, the class the receiver
+/// (`Receiver`) or the result (`Result`) is typed as, and the namespace
+/// the finished tree must declare. `errors.attribute_names` needs the
+/// attribute each message was added for, which only the CRuby and JRuby
+/// trees record (`ActiveModel::ErrorAttributes`); `record.association(
+/// :name)` is the association object, which only they carry.
+pub(crate) enum Typed {
+    Receiver(&'static str),
+    Result(&'static str),
+}
+
+pub(crate) const GATED_METHODS: &[(&str, Typed, &str)] = &[
+    ("attribute_names", Typed::Receiver("ActiveModel::Errors"), "ActiveModel::ErrorAttributes"),
+    ("association", Typed::Result("ActiveRecord::Associations::Association"), "ActiveRecord::Associations::Association"),
+];
+
+/// The namespace a gated method read needs, if `expr` is one.
+fn gated_method(expr: &Expr) -> Option<(&'static str, String)> {
+    let ExprNode::Send { recv, method, .. } = &*expr.node else { return None };
+    GATED_METHODS.iter().find_map(|(name, typed, needs)| {
+        if *name != method.as_str() {
+            return None;
+        }
+        let typed_as = match typed {
+            Typed::Receiver(class) => (class, class_name(&recv.as_ref()?.ty)?),
+            Typed::Result(class) => (class, class_name(&expr.ty)?),
+        };
+        if *typed_as.0 != typed_as.1 {
+            return None;
+        }
+        let shown = match recv.as_ref().map(|r| (&*r.node, &r.ty)) {
+            Some((_, ty)) => format!("{}#{}", class_name(ty).unwrap_or("Object"), method.as_str()),
+            None => format!("#{}", method.as_str()),
+        };
+        Some((*needs, shown))
+    })
+}
+
+/// Whether the app's emit-bound code or its tests read
+/// `errors.attribute_names`: the CRuby and JRuby trees then record each
+/// error message's attribute (`emit::ruby::with_error_attributes`).
+pub(crate) fn reads_error_attribute_names(app: &App) -> bool {
+    fn walk(e: &Expr, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if gated_method(e).is_some_and(|(needs, _)| needs == "ActiveModel::ErrorAttributes") {
+            *found = true;
+            return;
+        }
+        e.node.for_each_child(&mut |c| walk(c, found));
+    }
+    let mut found = false;
+    test_roots(app, &mut |root| walk(root, &mut found));
+    crate::lower::for_each_emit_body_ref(app, &mut |root| walk(root, &mut found));
+    found
+}
+
 fn written(path: &[crate::ident::Symbol]) -> String {
     path.iter().map(|s| s.as_str()).skip_while(|s| s.is_empty()).collect::<Vec<_>>().join("::")
 }
@@ -382,6 +443,9 @@ fn class_name(ty: &Option<Ty>) -> Option<&str> {
 }
 
 fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut Vec<RuntimeRead>) {
+    if let Some((needs, shown)) = gated_method(expr).filter(|(needs, _)| gated(needs)) {
+        out.push(RuntimeRead { span: expr.span, name: needs.to_string(), shown, in_test, declaration: false });
+    }
     match &*expr.node {
         ExprNode::Const { path } => {
             if let Some(name) = class_name(&expr.ty).filter(|name| gated(name)) {
@@ -414,7 +478,7 @@ fn collect(expr: &Expr, gated: &dyn Fn(&str) -> bool, in_test: bool, out: &mut V
     expr.node.for_each_child(&mut |child| collect(child, gated, in_test, out));
 }
 
-fn test_roots(app: &App, f: &mut impl FnMut(&Expr)) {
+pub(crate) fn test_roots(app: &App, f: &mut impl FnMut(&Expr)) {
     for module in &app.test_modules {
         if let Some(setup) = &module.setup {
             f(setup);

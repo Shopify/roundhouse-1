@@ -2945,7 +2945,13 @@ fn ruby_family_runtime_files(
     fixture: &Path,
     flavor: RubyFlavor,
 ) -> Result<Vec<(String, String)>, String> {
-    emit::ruby::with_native_keyword_splats(|| ruby_family_files(app, fixture, flavor))
+    // An app that reads `errors.attribute_names` gets each error
+    // message's attribute recorded beside it (`emit::ruby::expr::
+    // error_attribute_push`, runtime/spinel/active_model_errors.rb).
+    let error_attributes = crate::analyze::runtime_reads::reads_error_attribute_names(app);
+    emit::ruby::with_native_keyword_splats(|| {
+        emit::ruby::with_error_attributes(error_attributes, || ruby_family_files(app, fixture, flavor))
+    })
 }
 
 fn ruby_family_files(
@@ -3369,6 +3375,35 @@ fn ruby_family_files(
                 .map_err(|e| format!("read runtime/spinel/active_support_descendants_tracker.rb: {e}"))?,
         ));
     }
+    // `record.association(:name)`: the association object, ported from
+    // activerecord 8.2.0.alpha (see the file's header;
+    // tests/errors_association_ports.rs holds it to native ActiveRecord).
+    // It reads the record's association ivars by computed name, so
+    // ruby-family only, and carried where an emitted model dispatches to
+    // it (`emit::ruby::library::apply_association_reader`, which runs only
+    // where the app calls `association`). gem_facades.rb requires it after
+    // the ActiveRecord runtime, whose Base it reopens.
+    let carries_associations = carries_named(&files, &["ActiveRecord::Associations"]);
+    // `errors.attribute_names` (see the file's header): carried where the
+    // emitted code, its tests included, records or reads an error's
+    // attribute (`emit::ruby::expr::error_attribute_push`).
+    let carries_error_attributes = files.iter().any(|(path, content)| {
+        path.ends_with(".rb") && !path.starts_with("runtime/") && names_constant(content, "ActiveModel::ErrorAttributes")
+    });
+    if carries_error_attributes {
+        files.push((
+            "runtime/active_model_errors.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_model_errors.rb")
+                .map_err(|e| format!("read runtime/spinel/active_model_errors.rb: {e}"))?,
+        ));
+    }
+    if carries_associations {
+        files.push((
+            "runtime/active_record_associations.rb".to_string(),
+            crate::runtime_files::read_to_string("runtime/spinel/active_record_associations.rb")
+                .map_err(|e| format!("read runtime/spinel/active_record_associations.rb: {e}"))?,
+        ));
+    }
 
     // Gem façades are SPINEL-ONLY: spinel AOT can't link the native
     // gems, so it ships loudly-raising stubs. On the ruby family the
@@ -3505,6 +3540,16 @@ fn ruby_family_files(
     };
     let gem_facades = if carries_callbacks {
         format!("{gem_facades}require_relative \"active_support_callbacks\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_error_attributes {
+        format!("{gem_facades}require_relative \"active_model_errors\"\n")
+    } else {
+        gem_facades
+    };
+    let gem_facades = if carries_associations {
+        format!("{gem_facades}require_relative \"active_record_associations\"\n")
     } else {
         gem_facades
     };
@@ -8396,6 +8441,10 @@ fn spinel_files_with_assertions(
     // And for ActiveSupport::Callbacks, pushed back by the two ruby-family
     // forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_callbacks.rb" && p != "runtime/active_support_descendants_tracker.rb");
+    // And for the association object (computed-name ivar reads),
+    // pushed back by the two ruby-family forks where a model dispatches
+    // to it.
+    files.retain(|(p, _)| p != "runtime/active_record_associations.rb" && p != "runtime/active_model_errors.rb");
     // And for the messages port and its JSON coder (OpenSSL, Marshal),
     // pushed back by the two ruby-family forks where the app names it.
     files.retain(|(p, _)| p != "runtime/active_support_messages.rb" && p != "runtime/active_support_json.rb");

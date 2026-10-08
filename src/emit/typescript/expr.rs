@@ -658,9 +658,10 @@ pub(super) fn collect_reassigned(body: &Expr) -> HashSet<Symbol> {
 ///   site is the function's tail; an Append at the tail would be
 ///   a lowerer bug).
 fn try_string_builder_stmt(e: &Expr, declared: &mut HashSet<Symbol>) -> Option<Vec<JsStmt>> {
-    match e.hint? {
+    match e.hint.as_ref()? {
         IrHint::MutableStringLiteral => None, // emitted as the plain literal
         IrHint::StringBlank => None, // the `strip.empty?` it marks, as built
+        IrHint::AssociationTarget | IrHint::ErrorAttribute(_) | IrHint::ErrorAttributeLocal(_) => None, // CRuby/JRuby-only hints, the plain node elsewhere
         IrHint::StringBuilderInit => {
             if let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*e.node {
                 let escaped = escape_reserved_word(name.as_str());

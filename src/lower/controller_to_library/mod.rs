@@ -3053,7 +3053,7 @@ fn flatten_seqs(expr: &Expr) -> Expr {
             effects: e.effects.clone(),
             leading_blank_line: e.leading_blank_line,
             diagnostic: e.diagnostic.clone(),
-            hint: e.hint,
+            hint: e.hint.clone(),
             decisions: e.decisions,
             keyword_arg: e.keyword_arg.clone(),
         }

@@ -177,7 +177,7 @@ pub const KEYWORD_DEFAULT_FILL: u64 = 1 << 16;
 /// `None` means "no hint" — emitters fall through to their default
 /// per-`ExprNode` handling. Adding a variant has zero effect on
 /// existing emit paths until each target opts in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IrHint {
     /// On the `Assign` node initializing a string accumulator local
@@ -196,6 +196,24 @@ pub enum IrHint {
     /// own `r.blank?` (the overlay's `String#blank?`: `[[:space:]]`
     /// plus the encoding retry); the rest keep the `strip.empty?`.
     StringBlank,
+    /// On the `errors << msg` push an `errors.add(:attr, ...)` or a
+    /// `validates :attr` check grounded to (`lower::errors_add`,
+    /// `lower::model_to_library::validations`): the attribute the
+    /// message is for, which the `Array[String]` accumulator drops. The
+    /// CRuby and JRuby trees record it beside the message where the app
+    /// reads `errors.attribute_names` (runtime/spinel/
+    /// active_model_errors.rb); every other emit ignores it.
+    ErrorAttribute(crate::ident::Symbol),
+    /// As `ErrorAttribute`, for an attribute held in the named local
+    /// or parameter (an EachValidator's `errors.add(attribute, ...)`).
+    ErrorAttributeLocal(crate::ident::Symbol),
+    /// On the reader send `lower::assoc_loaded` collapsed
+    /// `record.association(:name).target` onto (`record.name`). Rails'
+    /// `target` answers the loaded record(s), nil or [] when nothing has
+    /// loaded; the reader loads. The CRuby and JRuby trees, which carry
+    /// the association object, write the read back as written; the
+    /// others keep the reader.
+    AssociationTarget,
 }
 
 /// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
