@@ -9400,7 +9400,7 @@ fn is_controller_named(name: &str, app: &App) -> bool {
 }
 
 /// The library classes named `name`, in `app.library_classes` order.
-fn library_classes_named<'a>(name: &str, app: &'a App) -> Vec<&'a LibraryClass> {
+pub(crate) fn library_classes_named<'a>(name: &str, app: &'a App) -> Vec<&'a LibraryClass> {
     match NameIndex::current(app) {
         Some(index) => index
             .library_classes

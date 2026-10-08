@@ -337,13 +337,17 @@ pub(crate) fn below_model(lc: &LibraryClass, app: &App) -> bool {
 /// rewrite the accumulator's spellings, so they stand down on these.
 pub(crate) struct ValidationsPort {
     owners: crate::det::HashSet<ClassId>,
+    /// The classes and modules above the port's classes (superclasses,
+    /// includes) that are not themselves on it: a receiver typed as one
+    /// (frozen_record's `FrozenRecord::Base`) may be a port record.
+    above: crate::det::HashSet<ClassId>,
 }
 
 impl ValidationsPort {
     pub(crate) fn of(app: &App) -> Self {
         let mut owners = crate::det::HashSet::default();
         if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
-            return ValidationsPort { owners };
+            return ValidationsPort { owners, above: Default::default() };
         }
         let port: Vec<&LibraryClass> = app
             .library_classes
@@ -355,7 +359,7 @@ impl ValidationsPort {
             })
             .collect();
         if port.is_empty() {
-            return ValidationsPort { owners };
+            return ValidationsPort { owners, above: Default::default() };
         }
         owners.extend(port.iter().map(|lc| lc.name.clone()));
         let names = |include: &ClassId, module: &str| {
@@ -389,7 +393,70 @@ impl ValidationsPort {
                 owners.insert(module.name.clone());
             }
         }
-        ValidationsPort { owners }
+        let mut above = crate::det::HashSet::default();
+        for lc in &port {
+            let mut queue: Vec<&LibraryClass> = vec![lc];
+            let mut seen: Vec<&ClassId> = Vec::new();
+            while let Some(c) = queue.pop() {
+                if seen.contains(&&c.name) {
+                    continue;
+                }
+                seen.push(&c.name);
+                above.insert(c.name.clone());
+                let parent = c.parent.iter().filter(|_| !c.is_module);
+                for (name, module) in c.includes.iter().map(|i| (i, true)).chain(parent.map(|p| (p, false))) {
+                    let name = name.0.as_str().trim_start_matches("::");
+                    above.insert(ClassId(crate::ident::Symbol::from(name)));
+                    queue.extend(
+                        crate::emit::ruby::library_classes_named(name, app).into_iter().filter(|c| c.is_module == module),
+                    );
+                }
+            }
+        }
+        above.retain(|c| !owners.contains(c));
+        ValidationsPort { owners, above }
+    }
+
+    /// Whether `errors` (a zero-arg `errors` send) may read the port's
+    /// Errors without the receiver's type saying so: the tree carries
+    /// the port, and the receiver is untyped, or typed as a class above
+    /// a port class. The errors lowerings refuse such a site rather than
+    /// guess the Array accumulator (which a port record does not have).
+    pub(crate) fn unknown(&self, errors: &Expr, owner: Option<&ClassId>) -> bool {
+        if self.owners.is_empty() || self.answers(errors, owner) {
+            return false;
+        }
+        let ExprNode::Send { recv: Some(r), .. } = &*errors.node else { return false };
+        if matches!(&*r.node, ExprNode::SelfRef) {
+            return false;
+        }
+        fn maybe(ty: Option<&crate::ty::Ty>, above: &crate::det::HashSet<ClassId>) -> bool {
+            use crate::ty::Ty;
+            match ty {
+                None | Some(Ty::Untyped | Ty::Var { .. }) => true,
+                Some(Ty::Class { id, .. }) => above.contains(id),
+                Some(Ty::Union { variants }) => variants.iter().any(|v| maybe(Some(v), above)),
+                Some(_) => false,
+            }
+        }
+        maybe(r.ty.as_ref(), &self.above)
+    }
+
+    /// Marks `site` (an `errors` spelling `unknown` holds for) refused,
+    /// naming the port's classes: the Ruby emitter writes the raise.
+    pub(crate) fn refuse(&self, site: &mut Expr, spelling: &str) {
+        let mut names: Vec<&str> = self.owners.iter().map(|c| c.0.as_str()).collect();
+        names.sort_unstable();
+        let shown = names.iter().take(4).map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
+        let more = if names.len() > 4 { format!(" and {} more", names.len() - 4) } else { String::new() };
+        site.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
+            target: None,
+            construct: crate::ident::Symbol::from(spelling),
+            detail: format!(
+                "the receiver's type is unknown, and on this PostgreSQL tree `errors` is the ActiveModel::Errors \
+                 port for {shown}{more} but the Array[String] accumulator for models: type the receiver"
+            ),
+        });
     }
 
     /// Whether `errors` (a zero-arg `errors` send) reads the port's

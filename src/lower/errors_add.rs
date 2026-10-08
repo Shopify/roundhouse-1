@@ -125,6 +125,10 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     if site.port.answers(r, site.owner) {
         return;
     }
+    if site.port.unknown(r, site.owner) {
+        site.port.refuse(expr, "errors.add");
+        return;
+    }
     // The field: a Symbol literal is baked at lower time; a local or
     // parameter (`errors.add(attribute, …)` in an EachValidator's
     // `validate_each`) is humanized at run time. Anything else stays

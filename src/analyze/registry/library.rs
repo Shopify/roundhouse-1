@@ -114,6 +114,15 @@ pub(in crate::analyze) fn register(
                 args: vec![],
             });
         }
+        // `class << self; alias_method :load, :new` above any class-side
+        // `new` of the body's own (frozen_record's Base, whose own `new`
+        // then calls `load(...)`) names Class#new, which builds an
+        // instance of the receiving class. The ingest keeps such an alias
+        // as the call it is (no app ancestor defines `new`), so without
+        // this the alias is unknown and every `new` built on it untyped.
+        for to in class_aliases_of_class_new(lc) {
+            cls.class_methods.entry(to).or_insert(Ty::SelfInstance);
+        }
         // `include Rails.application.routes.url_helpers` (recorded
         // at ingest as an include of the generated RouteHelpers
         // module — lobsters' Routes class does this inside
@@ -456,4 +465,43 @@ fn ar_instance_ty(kind: crate::catalog::ReturnKind) -> Option<Ty> {
         | ReturnKind::ArrayOfUntyped
         | ReturnKind::Untyped => None,
     }
+}
+
+/// The class-side aliases of the builtin `Class#new` the body makes:
+/// `alias_method :to, :new` on `singleton_class` (how the ingest keeps a
+/// `class << self` alias of a method no app ancestor defines), where no
+/// class-side `new` of the body's own runs before it.
+fn class_aliases_of_class_new(lc: &crate::dialect::LibraryClass) -> Vec<Symbol> {
+    use crate::expr::{ExprNode, Literal};
+    let sym = |e: &crate::expr::Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.clone()),
+        _ => None,
+    };
+    lc.unknown_calls
+        .iter()
+        .filter_map(|call| {
+            let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*call.node else { return None };
+            if method.as_str() != "alias_method" {
+                return None;
+            }
+            let ExprNode::Send { recv: None, method: on, args: on_args, block: None, .. } = &*recv.node else { return None };
+            if on.as_str() != "singleton_class" || !on_args.is_empty() {
+                return None;
+            }
+            let [to, from] = args.as_slice() else { return None };
+            let (to, from) = (sym(to)?, sym(from)?);
+            if from.as_str() != "new" {
+                return None;
+            }
+            let own_new_before = lc.methods.iter().any(|m| {
+                m.receiver == crate::dialect::MethodReceiver::Class
+                    && m.name.as_str() == "new"
+                    && (m.name_span.is_synthetic()
+                        || call.span.is_synthetic()
+                        || m.name_span.file != call.span.file
+                        || m.name_span.start < call.span.start)
+            });
+            (!own_new_before).then_some(to)
+        })
+        .collect()
 }

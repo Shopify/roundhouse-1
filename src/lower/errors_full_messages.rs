@@ -96,6 +96,10 @@ pub(crate) fn rewrite_node(
                 )
                 && !port.answers(r, owner) =>
         {
+            if port.unknown(r, owner) {
+                port.refuse(expr, "errors.full_messages");
+                return;
+            }
             Some((*r.node).clone())
         }
         _ => None,

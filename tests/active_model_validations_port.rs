@@ -71,13 +71,15 @@ const LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    activemo
 
 const API_VERSION: &str = "module Probe\n  class ApiVersion < ApiVersioning::ApiVersionRecord\n  end\nend\n";
 
-// The locals are ascribed: frozen_record's `find` and `new` reach the
-// analyzer untyped, and an `errors` read on an untyped receiver is the
-// models' accumulator (`lower::active_model_model::ValidationsPort`).
+// `new` types as the receiving record: frozen_record's own `new` calls
+// `load`, its `class << self` alias of Class#new. `find` reaches the
+// analyzer untyped, so its records are ascribed: an `errors` read on an
+// untyped receiver is refused while the tree carries the port (see
+// `untyped_errors_reads_on_a_port_tree_are_refused`).
 const PROBE: &str = r##"class AvProbe
   def self.bad_lines
-    bad = Probe::ApiVersion.new("handle" => "20x1", "fully_inaccessible" => "soon") #: Probe::ApiVersion
-    blank = Probe::ApiVersion.new("handle" => "") #: Probe::ApiVersion
+    bad = Probe::ApiVersion.new("handle" => "20x1", "fully_inaccessible" => "soon")
+    blank = Probe::ApiVersion.new("handle" => "")
     [bad.valid?, bad.errors.full_messages, bad.errors.attribute_names, bad.invalid?, blank.valid?, blank.errors.full_messages,
      begin; blank.validate!; rescue ActiveModel::ValidationError => e; e.message; end]
   end
@@ -99,7 +101,7 @@ const PROBE: &str = r##"class AvProbe
 end
 "##;
 
-fn api_versioning_app(tag: &str) -> PathBuf {
+fn api_versioning_app(tag: &str, probe: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rh_am_validations_{tag}_{}", std::process::id()));
     let files = [
         ("Gemfile", "source \"https://rubygems.org\"\ngem \"frozen_record\"\ngem \"api_versioning\"\n"),
@@ -116,7 +118,7 @@ fn api_versioning_app(tag: &str) -> PathBuf {
         ("config/database.yml", "test:\n  adapter: postgresql\n  database: roundhouse_unused\n"),
         ("test/test_helper.rb", "ENV[\"RAILS_ENV\"] ||= \"test\"\n"),
         ("app/models/probe/api_version.rb", API_VERSION),
-        ("app/models/av_probe.rb", PROBE),
+        ("app/models/av_probe.rb", probe),
     ];
     for (path, text) in files {
         let file = dir.join(path);
@@ -132,7 +134,7 @@ fn api_versioning_app(tag: &str) -> PathBuf {
 
 #[test]
 fn api_versioning_records_validate_like_native() {
-    let app = api_versioning_app("probe");
+    let app = api_versioning_app("probe", PROBE);
     let script = format!(
         "require {oracle:?}\nRailsOracle.activate(\"activesupport\", \"activemodel\")\n\
          $LOAD_PATH.unshift {fr:?}\n$LOAD_PATH.unshift {av:?}\n$LOAD_PATH.unshift {models:?}\nrequire \"pathname\"\nrequire \"frozen_record\"\nrequire \"api_versioning\"\nrequire \"probe/api_version\"\nrequire \"av_probe\"\nputs AvProbe.lines\n",
@@ -191,7 +193,7 @@ fn api_versioning_records_validate_like_native() {
 /// carrying a Validations that cannot answer `full_messages`.
 #[test]
 fn validations_without_i18n_in_the_lockfile_are_refused() {
-    let app = api_versioning_app("noi18n");
+    let app = api_versioning_app("noi18n", PROBE);
     let lock = LOCK
         .replace("      concurrent-ruby (~> 1.0, >= 1.3.1)\n      i18n (>= 1.6, < 2)\n", "")
         .replace("    i18n (1.15.2)\n      concurrent-ruby (~> 1.0)\n", "");
@@ -206,5 +208,40 @@ fn validations_without_i18n_in_the_lockfile_are_refused() {
     let log = String::from_utf8_lossy(&emit.stderr);
     assert!(!emit.status.success(), "{log}");
     assert!(log.contains("includes ActiveModel::Validations, whose messages translate through I18n, but the lockfile has no i18n"), "{log}");
+    std::fs::remove_dir_all(app).unwrap();
+}
+
+/// frozen_record's `find` reaches the analyzer untyped: whether its
+/// record's `errors` is the port's ActiveModel::Errors or a model's
+/// Array accumulator is unknown, so each errors spelling the lowerings
+/// would ground for the accumulator is refused rather than guessed.
+#[test]
+fn untyped_errors_reads_on_a_port_tree_are_refused() {
+    let probe = "class AvProbe\n  def self.lines\n    found = Probe::ApiVersion.find(\"2021-01\")\n    \
+                 typed = Probe::ApiVersion.new(\"handle\" => \"\")\n    \
+                 found.errors.add(:base, \"gone\")\n    \
+                 [found.errors.full_messages, found.errors[:handle], typed.errors.full_messages, typed.errors[:handle]]\n  end\nend\n";
+    let app = api_versioning_app("untyped", probe);
+    let emit = Command::new(env!("CARGO_BIN_EXE_roundhouse"))
+        .args(["--target", "ruby"])
+        .arg(&app)
+        .arg("-o")
+        .arg(app.join("emitted"))
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&emit.stderr);
+    assert!(!emit.status.success(), "{log}");
+    let refusals: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("av_probe.rb") && l.contains("the receiver's type is unknown"))
+        .collect();
+    for (line, spelling) in [(5, "errors.add"), (6, "errors.full_messages"), (6, "errors[]")] {
+        assert!(
+            refusals.iter().any(|l| l.contains(&format!("av_probe.rb:{line}:")) && l.contains(&format!("error[unsupported]: {spelling} not supported"))),
+            "{spelling} at line {line} not refused:\n{log}"
+        );
+    }
+    // The records `new` built are typed: their reads stand as the port's.
+    assert_eq!(refusals.len(), 3, "{log}");
     std::fs::remove_dir_all(app).unwrap();
 }
