@@ -9453,7 +9453,13 @@ fn declared_in_gem_source(lc: &LibraryClass, app: &App) -> bool {
 ///   ingest writes for an `include` inside `class << self`: worldwide's
 ///   `Locales` (dropped, `Locales.known` was NoMethodError);
 /// - `singleton_class.alias_method :new, :old` with two symbol names:
-///   `Locales`'s `alias_method :known, :to_a`.
+///   `Locales`'s `alias_method :known, :to_a`;
+/// - `self.x = v` through a class-side writer the class or an app
+///   superclass defines: activemerchant 1.137.0's `CreditCard` declares
+///   `class << self; attr_accessor :require_name; end` and then runs
+///   `self.require_name = true` (dropped, `CreditCard.require_name` was
+///   nil, and a card with no name passed validation). One through its
+///   own writer is written after the methods (`OwnClassCalls`).
 ///
 /// `private_constant` stays dropped: the emitter qualifies constant reads
 /// (`Worldwide::Currencies::X`), which a private constant refuses.
@@ -9495,7 +9501,13 @@ fn gem_source_body_effects<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr>
                     && args.len() == 2
                     && args.iter().all(symbol)
             }
-            _ => false,
+            _ => crate::ingest::class_attribute::self_write(call).is_some_and(|name| {
+                let answers = |method: &str| {
+                    crate::ingest::inherited_alias::answers(&app.library_classes, lc, method, MethodReceiver::Class)
+                };
+                answers(&format!("{name}="))
+                    && (!matches!(&*call.node, ExprNode::OpAssign { .. }) || answers(name))
+            }),
         })
         .collect()
 }
@@ -10050,6 +10062,7 @@ pub(crate) fn modelled_class_body_calls<'a>(lc: &'a LibraryClass, app: &App) -> 
         .iter()
         .filter(|c| {
             aliases_ancestor_method(lc, c)
+                || crate::ingest::inherited_alias::aliases_core_method(&app.library_classes, lc, c)
                 || crate::ingest::sorbet_check::is_mixes_in(c)
                 || extensions.iter().any(|e| std::ptr::eq(*e, *c))
                 || prepends.iter().any(|(p, _)| std::ptr::eq(*p, *c))

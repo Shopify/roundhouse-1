@@ -2120,7 +2120,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         conditional_definitions,
         class_attribute_effects,
         ..
-    } = walk_decl_body_in(module.body(), &owner, file, false, &visibility, true)?;
+    } = walk_decl_body_of(module.body(), &owner, file, false, &visibility, true, true)?;
     admit_nameless_rest(&mut methods);
     // `class_attribute` is `Class#class_attribute`: a module body has
     // none to call (a concern's `included do` block runs on the class).
@@ -2376,6 +2376,7 @@ impl DeclBody {
         owner: &ClassId,
         class_attributes: &HashSet<Symbol>,
         has_class_attr_default: bool,
+        module_body: bool,
         file: &str,
     ) -> IngestResult<()> {
         fn writes_classvar(expr: &Expr, class_attributes: Option<&HashSet<Symbol>>) -> bool {
@@ -2391,6 +2392,14 @@ impl DeclBody {
             found
         }
         for m in &mut self.methods {
+            // In a module's singleton method `self` is the module, whose
+            // own ivar is the cattr/mattr storage: activemerchant
+            // 1.137.0's `Billing::Base.gateway_mode=` writes `@@mode`,
+            // which `mattr_accessor :mode` reads. A class's would be the
+            // subclass's when a subclass calls it, not the shared storage.
+            if module_body && m.receiver == MethodReceiver::Class {
+                normalize_classvar_writes_to_ivars(&mut m.body, class_attributes);
+            }
             if writes_classvar(&m.body, Some(class_attributes)) {
                 return Err(IngestError::Unsupported {
                     file: file.into(),
@@ -2416,10 +2425,29 @@ impl DeclBody {
                 message: "cattr/mattr defaults require source-order initialization".into(),
             });
         }
+        // A class-body `@@x = value` of a declared cattr/mattr name
+        // initializes the storage the lowered accessors read, the
+        // class-side `@x` (activemerchant 1.137.0's `Gateway`:
+        // `cattr_reader :implementations; @@implementations = []`, which
+        // its `inherited` hook appends to). It is that ivar's write, in
+        // place, and keeps the ordering checks below. A nil one is the
+        // unset ivar's own value and is dropped.
+        let storage = |name: &Symbol| {
+            name.as_str().strip_prefix("@@").is_some_and(|bare| class_attributes.iter().any(|attr| attr.as_str() == bare))
+        };
         self.class_initializers.retain(|expr| !matches!(&*expr.node,
-            ExprNode::Assign { target: LValue::Var { name, .. }, .. }
-                if name.as_str().strip_prefix("@@").is_some_and(|bare|
-                    class_attributes.iter().any(|attr| attr.as_str() == bare))));
+            ExprNode::Assign { target: LValue::Var { name, .. }, value }
+                if storage(name) && matches!(&*value.node, ExprNode::Lit { value: Literal::Nil })));
+        for init in &mut self.class_initializers {
+            if let ExprNode::Assign { target, value } = &mut *init.node
+                && let LValue::Var { name, .. } = target
+                && let Some(bare) = name.as_str().strip_prefix("@@")
+                && class_attributes.iter().any(|attr| attr.as_str() == bare)
+            {
+                let name = Symbol::from(bare);
+                *init.node = ExprNode::Assign { target: LValue::Ivar { name }, value: value.clone() };
+            }
+        }
         if self.class_initializers.is_empty() {
             return Ok(());
         }
@@ -2784,6 +2812,36 @@ fn conditional_definitions(
                 });
                 continue;
             }
+            // `attr_accessor :min_version` in the branch: the reader and
+            // writer it generates, named at each name's symbol so this
+            // branch's are told from any other definition of the name.
+            if let Some(call) = visibility::conditional_accessor(stmt) {
+                let kind = constant_id_str(&call.name()).to_string();
+                let receiver = if force_class_receiver { MethodReceiver::Class } else { MethodReceiver::Instance };
+                for arg in call.arguments().iter().flat_map(|args| args.arguments().iter()) {
+                    let Some(name) = super::util::symbol_or_string_value(&arg) else { continue };
+                    let name_span = Span {
+                        file: super::sources::file_id(file),
+                        start: arg.location().start_offset() as u32,
+                        end: arg.location().end_offset() as u32,
+                    };
+                    let name = Symbol::from(name);
+                    let mut generated = Vec::new();
+                    if kind != "attr_writer" {
+                        generated.push(synth_attr_reader(owner, &name, receiver));
+                    }
+                    if kind != "attr_reader" {
+                        generated.push(synth_attr_writer(owner, &name, receiver));
+                    }
+                    for mut m in generated {
+                        m.name_span = name_span;
+                        visibility.apply(stmt, &mut m);
+                        members.push(crate::dialect::ConditionalMember::of(&m));
+                        methods.push(m);
+                    }
+                }
+                continue;
+            }
             let Some(def) = visibility::definition(stmt) else {
                 return Err(super::error_site::at(
                     IngestError::Unsupported {
@@ -3011,6 +3069,21 @@ fn walk_decl_body_in<'pr>(
     visibility: &Visibility,
     declaration_body: bool,
 ) -> IngestResult<DeclBody> {
+    walk_decl_body_of(body, owner, file, force_class_receiver, visibility, declaration_body, false)
+}
+
+/// [`walk_decl_body_in`]; `module_body`: `body` is a `module`'s own body,
+/// whose singleton methods only run with the module as `self`
+/// (`DeclBody::finalize_classvars`).
+fn walk_decl_body_of<'pr>(
+    body: Option<ruby_prism::Node<'pr>>,
+    owner: &ClassId,
+    file: &str,
+    force_class_receiver: bool,
+    visibility: &Visibility,
+    declaration_body: bool,
+    module_body: bool,
+) -> IngestResult<DeclBody> {
     let mut out = DeclBody::default();
     let mut class_attributes: HashSet<Symbol> = HashSet::default();
     let mut has_class_attr_default = false;
@@ -3085,6 +3158,30 @@ fn walk_decl_body_in<'pr>(
             }
             Visibility::reject_conditional_declaration(&statement, file)?;
             reject_conditional_accessor(&statement, file)?;
+            continue;
+        }
+        // A call on a literal list (`%w(month year).each do |m| … end`)
+        // runs as the body loads. One whose block `class_eval`s a def per
+        // element is those defs (`class_eval_macro::unrolled_class_eval_loop`).
+        // Any other is captured like a call on a constant, replayed where
+        // the body is replayed and reported where it is dropped, not
+        // skipped with no diagnostic.
+        if let Some(call) = statement.as_call_node()
+            && call.receiver().is_some_and(|r| r.as_array_node().is_some())
+            && let Ok(e) = ingest_expr(&statement, file)
+        {
+            match super::class_eval_macro::unrolled_class_eval_loop(&e) {
+                Some(methods) => {
+                    for mut m in methods {
+                        m.enclosing_class = Some(owner.0.clone());
+                        if force_class_receiver || extend_self_active {
+                            m.receiver = MethodReceiver::Class;
+                        }
+                        out.methods.push(m);
+                    }
+                }
+                None => out.unknown_calls.push(e),
+            }
             continue;
         }
         // `private attr_reader :x` declares like `attr_reader :x`; the
@@ -3942,7 +4039,7 @@ fn walk_decl_body_in<'pr>(
     }
 
     order_mark.observe(&mut out);
-    out.finalize_classvars(owner, &class_attributes, has_class_attr_default, file)?;
+    out.finalize_classvars(owner, &class_attributes, has_class_attr_default, module_body, file)?;
     Ok(out)
 }
 
@@ -4208,6 +4305,19 @@ fn substitute_body_locals(expr: &mut Expr, locals: &[BodyLocal], file: &str) -> 
 
 /// Only declared cattr/mattr reads use the existing class-ivar approximation.
 /// Ordinary class-variable reads retain native shared inheritance storage.
+/// [`normalize_classvars_to_ivars`] for writes (`@@x = v`, `@@x op= v`)
+/// of declared cattr/mattr names.
+fn normalize_classvar_writes_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
+    if let ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } = &mut *e.node
+        && let LValue::Var { name, .. } = target
+        && let Some(bare) = name.as_str().strip_prefix("@@")
+        && class_attributes.iter().any(|attr| attr.as_str() == bare)
+    {
+        *target = LValue::Ivar { name: Symbol::from(bare) };
+    }
+    e.node.for_each_child_mut(&mut |c| normalize_classvar_writes_to_ivars(c, class_attributes));
+}
+
 fn normalize_classvars_to_ivars(e: &mut Expr, class_attributes: &HashSet<Symbol>) {
     match &mut *e.node {
         ExprNode::Var { name, .. } if name.as_str().starts_with("@@")

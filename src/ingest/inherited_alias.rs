@@ -97,6 +97,7 @@ pub(super) fn decide(app: &[LibraryClass], held: &[(Vec<LibraryClass>, Vec<Span>
                         call.span == *span
                             && alias_call(call).is_some_and(|(receiver, _, from)| {
                                 ancestor_method(&candidates, lc, from, receiver).is_some()
+                                    || core_ancestor_defines(&candidates, lc, from, receiver)
                             })
                     })
                 })
@@ -255,6 +256,70 @@ fn ancestor_method<'a>(app: &[&'a LibraryClass], lc: &LibraryClass, name: &str, 
         class = resolved;
     }
     None
+}
+
+/// Whether `lc` (any of its reopenings) or an app superclass of it
+/// defines `name` on `receiver`'s side.
+pub(crate) fn answers(app: &[LibraryClass], lc: &LibraryClass, name: &str, receiver: MethodReceiver) -> bool {
+    let candidates: Vec<&LibraryClass> = app.iter().collect();
+    named(&candidates, lc.name.0.as_str())
+        .into_iter()
+        .chain(std::iter::once(lc))
+        .any(|c| c.methods.iter().any(|m| m.name.as_str() == name && m.receiver == receiver))
+        || ancestor_method(&candidates, lc, name, receiver).is_some()
+}
+
+/// A captured `alias_method` of `lc` that [`decide`] carried for a core
+/// ancestor's method: `lc` defines no method of the original's name on
+/// that side, and its superclass chain reaches a core class that does
+/// (`core_ancestor_defines`). The Ruby family replays it as written
+/// (`emit::ruby::library::modelled_class_body_calls`); Ruby aliases the
+/// core method there.
+pub(crate) fn aliases_core_method(app: &[LibraryClass], lc: &LibraryClass, call: &Expr) -> bool {
+    let Some((receiver, _, from)) = alias_call(call) else { return false };
+    if lc.methods.iter().any(|m| m.name.as_str() == from && m.receiver == receiver) {
+        return false;
+    }
+    let candidates: Vec<&LibraryClass> = app.iter().collect();
+    ancestor_method(&candidates, lc, from, receiver).is_none() && core_ancestor_defines(&candidates, lc, from, receiver)
+}
+
+/// No app ancestor defines `name`, but a core class `lc` inherits from
+/// does, by the vendored signatures (`stdlib_rbs::core_instance_method`):
+/// activemerchant 1.137.0's `class Errors < Hash; alias count size`. The
+/// first class along `lc`'s superclasses the app does not declare, or
+/// one it reopens that core declares (`Object` when the chain ends
+/// unwritten), answers for the rest of the chain. The captured
+/// `alias_method` stays the call it is, and Ruby resolves it there.
+/// Instance methods only.
+fn core_ancestor_defines(app: &[&LibraryClass], lc: &LibraryClass, name: &str, receiver: MethodReceiver) -> bool {
+    if receiver != MethodReceiver::Instance {
+        return false;
+    }
+    let mut seen: Vec<String> = vec![lc.name.0.as_str().to_string()];
+    let mut class = lc.name.0.as_str().to_string();
+    let mut parent = named(app, &class).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone());
+    if parent.is_none() && named(app, &class).iter().all(|c| !c.is_module) {
+        return crate::stdlib_rbs::core_instance_method("Object", name);
+    }
+    while let Some(written) = parent {
+        let Some(resolved) = superclass(app, &class, written.0.as_str()) else {
+            return crate::stdlib_rbs::core_instance_method(written.0.as_str(), name);
+        };
+        if crate::stdlib_rbs::declares_core_namespace(&resolved) {
+            return crate::stdlib_rbs::core_instance_method(&resolved, name);
+        }
+        if seen.contains(&resolved) || seen.len() > 32 {
+            return false;
+        }
+        seen.push(resolved.clone());
+        parent = named(app, &resolved).into_iter().filter(|c| !c.is_module).find_map(|c| c.parent.clone());
+        if parent.is_none() {
+            return crate::stdlib_rbs::core_instance_method("Object", name);
+        }
+        class = resolved;
+    }
+    false
 }
 
 /// The library class `written` names as `class`'s superclass: looked

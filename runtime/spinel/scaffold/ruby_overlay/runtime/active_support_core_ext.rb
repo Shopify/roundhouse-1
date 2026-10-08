@@ -289,14 +289,100 @@ class Hash
   alias nested_under_indifferent_access with_indifferent_access
 end
 
+# core_ext/hash/keys.rb (Rails 8.1.4), which hash/indifferent_access
+# loads natively: a gem compiled as source that requires it calls
+# `params.stringify_keys` on whatever Hash it is given (activemerchant
+# 1.137.0's `Billing::Response#initialize`), where no type lets
+# `lower::symbolize_keys` ground the call. Ported method for method.
+class Hash
+  def stringify_keys
+    transform_keys { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def stringify_keys!
+    transform_keys! { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def symbolize_keys
+    transform_keys { |key| key.to_sym rescue key }
+  end
+  alias_method :to_options, :symbolize_keys
+
+  def symbolize_keys!
+    transform_keys! { |key| key.to_sym rescue key }
+  end
+  alias_method :to_options!, :symbolize_keys!
+
+  def assert_valid_keys(*valid_keys)
+    valid_keys.flatten!
+    each_key do |k|
+      unless valid_keys.include?(k)
+        raise ArgumentError.new("Unknown key: #{k.inspect}. Valid keys are: #{valid_keys.map(&:inspect).join(', ')}")
+      end
+    end
+  end
+
+  def deep_transform_keys(&block)
+    _deep_transform_keys_in_object(self, &block)
+  end
+
+  def deep_transform_keys!(&block)
+    _deep_transform_keys_in_object!(self, &block)
+  end
+
+  def deep_stringify_keys
+    deep_transform_keys { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def deep_stringify_keys!
+    deep_transform_keys! { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def deep_symbolize_keys
+    deep_transform_keys { |key| key.to_sym rescue key }
+  end
+
+  def deep_symbolize_keys!
+    deep_transform_keys! { |key| key.to_sym rescue key }
+  end
+
+  private
+    def _deep_transform_keys_in_object(object, &block)
+      case object
+      when Hash
+        object.each_with_object(self.class.new) do |(key, value), result|
+          result[yield(key)] = _deep_transform_keys_in_object(value, &block)
+        end
+      when Array
+        object.map { |e| _deep_transform_keys_in_object(e, &block) }
+      else
+        object
+      end
+    end
+
+    def _deep_transform_keys_in_object!(object, &block)
+      case object
+      when Hash
+        object.keys.each do |key|
+          value = object.delete(key)
+          object[yield(key)] = _deep_transform_keys_in_object!(value, &block)
+        end
+        object
+      when Array
+        object.map! { |e| _deep_transform_keys_in_object!(e, &block) }
+      else
+        object
+      end
+    end
+end
+
 # ActiveSupport::HashWithIndifferentAccess (Rails 8.1.4,
 # active_support/hash_with_indifferent_access.rb): a Hash whose Symbol
 # keys are stored as Strings, so `h[:a]` and `h["a"]` read the same
 # entry, and whose nested Hashes (also inside Arrays) convert on the way
 # in. Ported method for method; the AS core_ext helpers Rails' version
 # leans on (`except!`, `symbolize_keys!`, `Hash#reverse_merge`) are
-# written out in place. Not ported: `slice!`, `to_options!`,
-# `extractable_options?`.
+# written out in place. Not ported: `slice!`, `extractable_options?`.
 module ActiveSupport
   class HashWithIndifferentAccess < Hash
     def with_indifferent_access
@@ -306,6 +392,12 @@ module ActiveSupport
     def nested_under_indifferent_access
       self
     end
+
+    # Rails' own: the in-place symbolizing forms would break the
+    # String-key invariant, and `to_options!` is the hash itself.
+    undef :symbolize_keys!
+    undef :deep_symbolize_keys!
+    def to_options!; self end
 
     def initialize(constructor = nil)
       if constructor.nil?

@@ -89,6 +89,146 @@ pub(crate) fn declares_include(class: &str, module: &str) -> bool {
         .is_some_and(|modules| modules.iter().any(|m| m.0.as_str() == module))
 }
 
+/// A class or module the vendored signatures declare, for
+/// [`core_instance_method`]: its instance methods (`def`, `alias`) and
+/// the names it inherits from, as written, with the namespaces they
+/// are written in.
+#[derive(Default)]
+struct CoreDecl {
+    is_module: bool,
+    superclass: Option<(String, Vec<String>)>,
+    includes: Vec<(String, Vec<String>)>,
+    methods: HashSet<String>,
+}
+
+fn core_decls() -> &'static HashMap<String, CoreDecl> {
+    static DECLS: OnceLock<HashMap<String, CoreDecl>> = OnceLock::new();
+    DECLS.get_or_init(|| {
+        let mut out: HashMap<String, CoreDecl> = HashMap::default();
+        for (_, text) in documents() {
+            if let Ok(signature) = ruby_rbs::node::parse(text) {
+                for declaration in signature.declarations().iter() {
+                    scan_core_decl(&declaration, &mut Vec::new(), &mut out);
+                }
+            }
+        }
+        out
+    })
+}
+
+fn rbs_written(name: &ruby_rbs::node::TypeNameNode<'_>) -> String {
+    let namespace = name.namespace();
+    let mut segments: Vec<String> = namespace
+        .path()
+        .iter()
+        .filter_map(|segment| match segment {
+            ruby_rbs::node::Node::Symbol(symbol) => Some(symbol.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    segments.push(name.name().as_str().to_string());
+    let written = segments.join("::");
+    if namespace.absolute() { format!("::{written}") } else { written }
+}
+
+fn scan_core_decl(node: &ruby_rbs::node::Node<'_>, cref: &mut Vec<String>, out: &mut HashMap<String, CoreDecl>) {
+    use ruby_rbs::node::{AliasKind, MethodDefinitionKind, Node};
+    let (is_module, name, superclass, members) = match node {
+        Node::Class(class) => (false, rbs_written(&class.name()), class.super_class().map(|s| rbs_written(&s.name())), class.members()),
+        Node::Module(module) => (true, rbs_written(&module.name()), None, module.members()),
+        _ => return,
+    };
+    let full = match (name.strip_prefix("::"), cref.last()) {
+        (Some(absolute), _) => absolute.to_string(),
+        (None, Some(scope)) => format!("{scope}::{name}"),
+        (None, None) => name,
+    };
+    let superclass = superclass.map(|written| (written, cref.clone()));
+    cref.push(full.clone());
+    let mut includes = Vec::new();
+    let mut methods = HashSet::default();
+    for member in members.iter() {
+        match &member {
+            Node::Include(include) => includes.push((rbs_written(&include.name()), cref.clone())),
+            Node::MethodDefinition(method)
+                if matches!(method.kind(), MethodDefinitionKind::Instance | MethodDefinitionKind::SingletonInstance) =>
+            {
+                methods.insert(method.name().as_str().to_string());
+            }
+            Node::Alias(alias) if matches!(alias.kind(), AliasKind::Instance) => {
+                methods.insert(alias.new_name().as_str().to_string());
+            }
+            Node::Class(_) | Node::Module(_) => scan_core_decl(&member, cref, out),
+            _ => {}
+        }
+    }
+    cref.pop();
+    let entry = out.entry(full).or_default();
+    entry.is_module |= is_module;
+    if superclass.is_some() {
+        entry.superclass = superclass;
+    }
+    entry.includes.extend(includes);
+    entry.methods.extend(methods);
+}
+
+/// The declared name `written` (in the namespaces `cref`) names: the
+/// innermost enclosing namespace that declares it, else the top level.
+fn resolve_core_name(written: &str, cref: &[String]) -> Option<String> {
+    let decls = core_decls();
+    if let Some(absolute) = written.strip_prefix("::") {
+        return decls.contains_key(absolute).then(|| absolute.to_string());
+    }
+    cref.iter()
+        .rev()
+        .map(|scope| format!("{scope}::{written}"))
+        .chain(std::iter::once(written.to_string()))
+        .find(|candidate| decls.contains_key(candidate))
+}
+
+/// Whether the vendored signatures declare the class or module `name`.
+pub(crate) fn declares_core_namespace(name: &str) -> bool {
+    core_decls().contains_key(name.trim_start_matches("::"))
+}
+
+/// Whether an instance of core or stdlib class `name` (a module: an
+/// includer of it) answers `method` by the vendored signatures: a `def`
+/// or `alias` of the class, of a module it includes, or of an ancestor
+/// (`Object` when no superclass is written). `Hash` answers `size`
+/// (`alias size length`), activemerchant's `Errors < Hash` aliases it.
+pub(crate) fn core_instance_method(name: &str, method: &str) -> bool {
+    let decls = core_decls();
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut pending = vec![(name.trim_start_matches("::").to_string(), true)];
+    while let Some((node, as_class)) = pending.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        let Some(decl) = decls.get(&node) else { continue };
+        if decl.methods.contains(method) {
+            return true;
+        }
+        for (written, cref) in &decl.includes {
+            if let Some(module) = resolve_core_name(written, cref) {
+                pending.push((module, false));
+            }
+        }
+        if !as_class || decl.is_module {
+            continue;
+        }
+        match &decl.superclass {
+            Some((written, cref)) => {
+                if let Some(superclass) = resolve_core_name(written, cref) {
+                    pending.push((superclass, true));
+                }
+            }
+            None if node == "BasicObject" => {}
+            None => pending.push(("Object".to_string(), true)),
+        }
+    }
+    false
+}
+
 /// Rubydex's RBS indexer skips `class Queue = Thread::Queue`. The same
 /// aliases as a Ruby document, in their lexical scopes, so the resolver
 /// declares them.

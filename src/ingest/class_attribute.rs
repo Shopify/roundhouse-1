@@ -138,7 +138,7 @@ pub(crate) fn parse(call: &ruby_prism::CallNode<'_>, file: &str) -> Option<Decl>
     })
 }
 
-fn is_method_name(name: &str) -> bool {
+pub(super) fn is_method_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c == '_' || c.is_ascii_lowercase())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
