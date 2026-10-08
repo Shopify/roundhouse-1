@@ -31,7 +31,7 @@ type Gem<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 /// required) and in the emitted tree (the gems carried as gem sources,
 /// `entry` required from config/application.rb); both must print
 /// `expected`.
-fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) {
+fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected: &str) -> emit_and_run::Run {
     let root = std::env::temp_dir().join(format!("roundhouse-plain-gem-load-order-{case}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mut native = emit_and_run::ruby();
@@ -74,6 +74,7 @@ fn same_as_native(case: &str, gems: &[Gem], entry: &str, script: &str, expected:
     );
     assert!(!run.stderr.contains("circular require"), "{}", run.stderr);
     assert_eq!(run.stdout, expected, "{}", run.stderr);
+    run
 }
 
 #[test]
@@ -89,7 +90,7 @@ fn a_declarations_file_reopening_the_gem_root_does_not_require_the_root() {
             "module Pq\n  Error = Class.new(StandardError)\n\n  class PackError < Error\n    def initialize(msg)\n      super(\"pack: #{msg}\")\n    end\n  end\n\n  UnpackError = Class.new(Error)\nend\n",
         ),
     ];
-    same_as_native(
+    let _ = same_as_native(
         "root",
         &[("pq", PQ)],
         "pq",
@@ -141,7 +142,7 @@ end
 "#,
         ),
     ];
-    same_as_native(
+    let _ = same_as_native(
         "split",
         &[("rm", RM)],
         "rm",
@@ -161,11 +162,37 @@ fn a_patch_files_prepend_on_another_gems_class_finds_its_module() {
             "module CoinOverride\n  def value\n    super * 2\n  end\nend\n\nmodule CoinFromCents\n  def from_cents(cents)\n    new(cents / 100.0)\n  end\nend\n\nclass Coin\n  extend CoinFromCents\n  prepend CoinOverride\nend\n",
         ),
     ];
-    same_as_native(
+    let _ = same_as_native(
         "prepend",
         &[("coin", COIN), ("ess", ESS)],
         "ess",
         "puts Coin.new(3).value\nputs Coin.from_cents(250).value\np Coin.ancestors.first(2)\n",
         "6\n5.0\n[CoinOverride, Coin]\n",
     );
+}
+
+/// verdict 19.34.0: verdict.rb defines `module Verdict`, then requires
+/// verdict/decide, which requires verdict/instrumentation, whose program
+/// runs `Verdict::Instrumentation::Subscriber.subscribe_all`. That
+/// statement's load-time need of `Verdict` was required through
+/// verdict.rb's program, which is the program loading: a circular
+/// require.
+#[test]
+fn a_statement_needing_the_loading_gem_root_does_not_require_it_again() {
+    const VD: &[(&str, &str)] = &[
+        ("vd.rb", "module Vd\n  def self.ready\n    :yes\n  end\nend\n\nrequire \"vd/decide\"\n"),
+        (
+            "vd/decide.rb",
+            "require \"vd/instrumentation\"\n\nmodule Vd\n  module Decide\n    def self.subscribed\n      Instrumentation::Subscriber.subscribed\n    end\n  end\nend\n",
+        ),
+        (
+            "vd/instrumentation.rb",
+            "require_relative \"instrumentation/subscriber\"\n\nVd::Instrumentation::Subscriber.subscribe_all\n",
+        ),
+        (
+            "vd/instrumentation/subscriber.rb",
+            "module Vd\n  module Instrumentation\n    class Subscriber\n      def self.subscribe_all\n        @subscribed = Vd.ready\n      end\n\n      def self.subscribed\n        @subscribed\n      end\n    end\n  end\nend\n",
+        ),
+    ];
+    let _ = same_as_native("inflight", &[("vd", VD)], "vd", "p Vd::Decide.subscribed\n", ":yes\n");
 }

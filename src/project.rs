@@ -6278,7 +6278,14 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     }
     require_namespace_files_first(files, app);
     load_declarations_through_their_program(files, app, &program_of_file);
-    for program in &autoloaded_programs {
+    // Each program that is an autoload, and each a load-time need is
+    // required through (`require_through`), autoloaded or not: that
+    // reads whether the program is loading from what `entering_program`
+    // noted. A plain gem's program has no autoload, and verdict.rb's was
+    // loading when verdict/instrumentation.rb's statement needed
+    // `Verdict`: required again, a circular require.
+    let entered: std::collections::BTreeSet<&String> = autoloaded_programs.iter().chain(program_of_file.values()).collect();
+    for program in entered {
         let file = format!("app/{program}.rb");
         if let Some((_, content)) = files.iter_mut().find(|(p, _)| *p == file) {
             // After the program's header comment (through its "else at
