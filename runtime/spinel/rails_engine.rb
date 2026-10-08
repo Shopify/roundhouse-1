@@ -30,8 +30,10 @@
 # I18n::Railtie. The rest are refused when the engine has what they would
 # apply (error[engine_initializer_not_applied]): `add_locales` without
 # I18n::Railtie, `add_view_paths`, `add_mailer_preview_paths`, `add_fixture_paths`,
-# `prepend_helpers_path`. Not ported: the engine as a Rack endpoint
-# (`app`, `call`, `routes`, `helpers`, `load_seed`), and generators,
+# `prepend_helpers_path`. `routes` records the engine's route blocks, as
+# RouteSet#append does before the routes are drawn, and refuses drawing
+# them (error[engine_routes_not_drawn]). Not ported: the engine as a Rack
+# endpoint (`app`, `call`, `helpers`, `load_seed`), and generators,
 # console, runner and tasks loading.
 require "pathname"
 require_relative "rails_railtie"
@@ -335,6 +337,10 @@ module Rails
             unless mod.respond_to?(:railtie_helpers_paths)
               define_method(:railtie_helpers_paths) { railtie.helpers_paths }
             end
+
+            unless mod.respond_to?(:railtie_routes_url_helpers)
+              define_method(:railtie_routes_url_helpers) { |include_path_helpers = true| railtie.routes.url_helpers(include_path_helpers) }
+            end
           end
         end
       end
@@ -394,6 +400,62 @@ module Rails
     def eager_load!
       # Already done by Zeitwerk::Loader.eager_load_all. By now, we leave the
       # method as a no-op for backwards compatibility.
+    end
+
+    # Defines the routes for this engine. If a block is given to routes,
+    # it is appended to the engine (railties engine.rb). Rails'
+    # ActionDispatch::Routing::RouteSet#append only records the block;
+    # the blocks run when the routes are drawn, lazily in a test
+    # process (first request, url helper or `reload_routes!`), never as
+    # the engine class loads. This tree's route table is compiled from
+    # the app's config/routes.rb, so an engine's set records its blocks
+    # and is never drawn: anything that would draw it or answer a route
+    # from it is refused by name (RouteBlocks).
+    def routes(&block)
+      @routes ||= RouteBlocks.new(self.class)
+      @routes.append(&block) if block_given?
+      @routes
+    end
+
+    def routes? # :nodoc:
+      @routes
+    end
+
+    # The recording half of ActionDispatch::Routing::RouteSet for an
+    # engine's `routes`: `append` and `prepend` keep their blocks, in
+    # order, unrun, as RouteSet's do until it draws.
+    class RouteBlocks
+      attr_reader :append_blocks, :prepend_blocks
+
+      def initialize(engine)
+        @engine = engine
+        @append_blocks = []
+        @prepend_blocks = []
+      end
+
+      def append(&block)
+        @append_blocks << block
+      end
+
+      def prepend(&block)
+        @prepend_blocks << block
+      end
+
+      def inspect
+        "#<#{self.class.name} #{@engine.name}: #{@prepend_blocks.size + @append_blocks.size} block(s), not drawn>"
+      end
+
+      # draw, url_helpers, url_for, recognize_path, call, routes,
+      # named_routes, finalize!, ...: the route set itself.
+      def method_missing(name, *, **, &)
+        raise NotImplementedError,
+          "roundhouse: error[engine_routes_not_drawn]: #{@engine.name}.routes.#{name}: an engine's route set is recorded, never drawn; " \
+          "this tree's routes are compiled from the app's config/routes.rb"
+      end
+
+      def respond_to_missing?(name, include_private = false)
+        false
+      end
     end
 
     # Returns all registered helpers paths.

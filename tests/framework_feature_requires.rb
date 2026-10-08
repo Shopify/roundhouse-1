@@ -47,11 +47,30 @@ else
 end
 
 if MODE == "refusals"
-  %w[active_support/all active_support/core_ext/hash active_support/core_ext/module/attribute_accessors_per_thread].each do |feature|
+  %w[active_support/all active_support/core_ext/hash].each do |feature|
     require feature
     puts "#{feature}: loaded"
   rescue LoadError => e
     puts "#{feature}: #{e.class}: #{e.message}"
+  end
+  # An engine's route set is recorded, never drawn: drawing it or
+  # answering a route from it is refused by name.
+  module Refused
+    class Engine < Rails::Engine
+      isolate_namespace(Refused)
+      routes { raise "an engine's route block ran at boot" }
+    end
+  end
+  [
+    -> { Refused::Engine.routes.draw {} },
+    -> { Refused::Engine.routes.url_helpers },
+    -> { Refused::Engine.routes.recognize_path("/") },
+    -> { Refused.railtie_routes_url_helpers },
+  ].each do |call|
+    call.call
+    puts "routes: answered"
+  rescue NotImplementedError => e
+    puts "routes: #{e.class}: #{e.message}"
   end
   exit
 end

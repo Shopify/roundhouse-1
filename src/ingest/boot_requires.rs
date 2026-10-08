@@ -87,6 +87,56 @@ pub(super) fn boot_loads<V: Vfs + ?Sized>(
     (walk.loads, walk.conditional_loads)
 }
 
+/// config/boot.rb's top-level, unconditional `require "lit"` calls that
+/// resolve to no file of the tree (a gem from the gem home, the standard
+/// library), as `(feature, site)` in source order: what native boot
+/// requires before `require "rails"` and Bundler.require
+/// ([`App::boot_native_requires`]).
+pub(super) fn boot_native_requires<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    path_gems: &[PathBuf],
+    gem_sources: &[(String, PathBuf)],
+) -> Vec<(String, String)> {
+    let mut load_path: Vec<PathBuf> =
+        path_gems.iter().map(|gem| gem.join("lib")).filter(|lib| vfs.is_dir(lib)).collect();
+    load_path.extend(gem_sources.iter().map(|(_, gem)| gem.join("lib")).filter(|lib| vfs.is_dir(lib)));
+    load_path.push(dir.join("lib"));
+    let walk = Walk {
+        vfs,
+        dir,
+        load_path,
+        gems: Vec::new(),
+        visited: BTreeSet::new(),
+        envs: Vec::new(),
+        conditional: false,
+        loads: Vec::new(),
+        conditional_loads: Vec::new(),
+        bundler_require: false,
+    };
+    let file = dir.join("config/boot.rb");
+    let Ok(source) = vfs.read(&file) else { return Vec::new() };
+    let result = ruby_prism::parse(&source);
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let mut out = Vec::new();
+    for stmt in program.statements().body().iter() {
+        let Some(call) = stmt.as_call_node() else { continue };
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "require" || call.block().is_some() {
+            continue;
+        }
+        let Some(arguments) = call.arguments() else { continue };
+        let args: Vec<_> = arguments.arguments().iter().collect();
+        let [one] = args.as_slice() else { continue };
+        let Some(string) = one.as_string_node() else { continue };
+        let feature = String::from_utf8_lossy(string.unescaped()).into_owned();
+        if walk.resolve(&feature).is_none() {
+            out.push((feature, walk.site(&file, &source, stmt.location().start_offset())));
+        }
+    }
+    out
+}
+
 /// A Gemfile gem whose source the tree carries: its entry file, the
 /// environments its group limits it to (empty: every one), and the
 /// Gemfile line.

@@ -1,0 +1,214 @@
+# frozen_string_literal: true
+
+# Module#thread_mattr_accessor and its kin, ported verbatim from the
+# activesupport native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha,
+# lib/active_support/core_ext/module/attribute_accessors_per_thread.rb)
+# for the PostgreSQL CRuby tree. A native gem's `require
+# "active_support/core_ext/module/attribute_accessors_per_thread"`
+# (turbo-rails, turbo_power) loads it through runtime/features
+# (project.rs::FRAMEWORK_FEATURE_PORTS). The state lives in
+# ActiveSupport::IsolatedExecutionState
+# (runtime/active_support_isolated_execution_state.rb), as native.
+# The app's own thread_mattr_accessor is lowered at ingest
+# (src/ingest/thread_mattr.rs); this file is for gems from the gem home.
+
+require_relative "active_support_isolated_execution_state"
+
+# Attribute Accessors per Thread
+# ------------------------------
+#
+# Extends the module object with class/module and instance accessors for
+# class/module attributes, just like the native attr* accessors for instance
+# attributes, but does so on a per-thread basis.
+#
+# So the values are scoped within the Thread.current space under the class name
+# of the module.
+#
+# Note that it can also be scoped per-fiber if `Rails.application.config.active_support.isolation_level`
+# is set to `:fiber`.
+class Module
+  # Defines a per-thread class attribute and creates class and instance reader methods.
+  # The underlying per-thread class variable is set to `nil`, if it is not previously defined.
+  #
+  # ```
+  # module Current
+  #   thread_mattr_reader :user
+  # end
+  #
+  # Current.user = "DHH"
+  # Current.user # => "DHH"
+  # Thread.new { Current.user }.value # => nil
+  # ```
+  #
+  # The attribute name must be a valid method name in Ruby.
+  #
+  #
+  # ```
+  # module Foo
+  #   thread_mattr_reader :"1_Badname"
+  # end
+  # # => NameError: invalid attribute name: 1_Badname
+  # ```
+  #
+  # To omit the instance reader method, pass
+  #
+  # `instance_reader: false` or `instance_accessor: false`.
+  #
+  # ```
+  # class Current
+  #   thread_mattr_reader :user, instance_reader: false
+  # end
+  #
+  # Current.new.user # => NoMethodError
+  # ```
+  def thread_mattr_reader(*syms, instance_reader: true, instance_accessor: true, default: nil) # :nodoc:
+    syms.each do |sym|
+      raise NameError.new("invalid attribute name: #{sym}") unless /^[_A-Za-z]\w*$/.match?(sym)
+
+      # The following generated method concatenates `object_id` because we want
+      # subclasses to maintain independent values.
+      if default.nil?
+        class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+          def self.#{sym}
+            key = "attr_#{sym}_\#{object_id}"
+            ::ActiveSupport::IsolatedExecutionState[key]
+          end
+        RUBY
+      else
+        default = default.dup.freeze unless default.frozen?
+        singleton_class.define_method("#{sym}_default_value") { default }
+
+        class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+          def self.#{sym}
+            key = "attr_#{sym}_\#{object_id}"
+            value = ::ActiveSupport::IsolatedExecutionState[key]
+
+            if value.nil? && !::ActiveSupport::IsolatedExecutionState.key?(key)
+              ::ActiveSupport::IsolatedExecutionState[key] = #{sym}_default_value
+            else
+              value
+            end
+          end
+        RUBY
+      end
+
+      if instance_reader && instance_accessor
+        class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+          def #{sym}
+            self.class.#{sym}
+          end
+        RUBY
+      end
+    end
+  end
+  alias :thread_cattr_reader :thread_mattr_reader
+
+  # Defines a per-thread class attribute and creates a class and instance writer methods to
+  # allow assignment to the attribute.
+  #
+  # ```
+  # module Current
+  #   thread_mattr_writer :user
+  # end
+  #
+  # Current.user = "DHH"
+  # Thread.current[:attr_Current_user] # => "DHH"
+  # ```
+  #
+  # To omit the instance writer method, pass
+  #
+  # `instance_writer: false` or `instance_accessor: false`.
+  #
+  # ```
+  # class Current
+  #   thread_mattr_writer :user, instance_writer: false
+  # end
+  #
+  # Current.new.user = "DHH" # => NoMethodError
+  # ```
+  def thread_mattr_writer(*syms, instance_writer: true, instance_accessor: true) # :nodoc:
+    syms.each do |sym|
+      raise NameError.new("invalid attribute name: #{sym}") unless /^[_A-Za-z]\w*$/.match?(sym)
+
+      # The following generated method concatenates `object_id` because we want
+      # subclasses to maintain independent values.
+      class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+        def self.#{sym}=(obj)
+          key = "attr_#{sym}_\#{object_id}"
+          ::ActiveSupport::IsolatedExecutionState[key] = obj
+        end
+      RUBY
+
+      if instance_writer && instance_accessor
+        class_eval(<<~RUBY, __FILE__, __LINE__ + 1)
+          def #{sym}=(obj)
+            self.class.#{sym} = obj
+          end
+        RUBY
+      end
+    end
+  end
+  alias :thread_cattr_writer :thread_mattr_writer
+
+  # Defines both class and instance accessors for class attributes.
+  #
+  # ```
+  # class Account
+  #   thread_mattr_accessor :user
+  # end
+  #
+  # Account.user = "DHH"
+  # Account.user     # => "DHH"
+  # Account.new.user # => "DHH"
+  # ```
+  #
+  # Unlike `mattr_accessor`, values are *not* shared with subclasses or parent classes.
+  #
+  # If a subclass changes the value, the parent class' value is not changed.
+  # If the parent class changes the value, the value of subclasses is not changed.
+  #
+  # ```
+  # class Customer < Account
+  # end
+  #
+  # Account.user   # => "DHH"
+  # Customer.user  # => nil
+  # Customer.user  = "Rafael"
+  # Customer.user  # => "Rafael"
+  # Account.user   # => "DHH"
+  # ```
+  #
+  # To omit the instance writer method, pass `instance_writer: false`.
+  #
+  # To omit the instance reader method, pass `instance_reader: false`.
+  #
+  # ```
+  # class Current
+  #   thread_mattr_accessor :user, instance_writer: false, instance_reader: false
+  # end
+  #
+  # Current.new.user = "DHH"  # => NoMethodError
+  # Current.new.user          # => NoMethodError
+  # ```
+  #
+  # Or pass `instance_accessor: false`, to omit both instance methods.
+  #
+  # ```
+  # class Current
+  #   thread_mattr_accessor :user, instance_accessor: false
+  # end
+  #
+  # Current.new.user = "DHH"  # => NoMethodError
+  # Current.new.user          # => NoMethodError
+  # ```
+  #
+  # A default value may be specified using the `:default` option. Because
+  #
+  # multiple threads can access the default value, non-frozen default values
+  # will be `dup`ed and frozen.
+  def thread_mattr_accessor(*syms, instance_reader: true, instance_writer: true, instance_accessor: true, default: nil)
+    thread_mattr_reader(*syms, instance_reader: instance_reader, instance_accessor: instance_accessor, default: default)
+    thread_mattr_writer(*syms, instance_writer: instance_writer, instance_accessor: instance_accessor)
+  end
+  alias :thread_cattr_accessor :thread_mattr_accessor
+end

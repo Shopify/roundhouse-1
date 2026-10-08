@@ -531,6 +531,27 @@ module Rails
       @config ||= Railtie::Configuration.new
     end
 
+    def railtie_namespace # :nodoc:
+      @railtie_namespace ||= module_parents_of(self.class).detect { |n| n.respond_to?(:railtie_namespace) }
+    end
+
+    # Module#module_parents (core_ext/module/introspection.rb), which
+    # railtie_namespace reads: the enclosing modules by name, innermost
+    # first, then Object.
+    private def module_parents_of(mod) # :nodoc:
+      parents = []
+      parent_name = mod.name =~ /::[^:]+\z/ ? -$` : nil
+      if parent_name
+        parts = parent_name.split("::")
+        until parts.empty?
+          parents << Object.const_get(parts * "::")
+          parts.pop
+        end
+      end
+      parents << Object unless parents.include? Object
+      parents
+    end
+
     def inspect
       "#<#{self.class.name}>"
     end
@@ -559,6 +580,16 @@ module Rails
       # Rails::Configuration::MiddlewareStackProxy records the operations
       # and merges them into the application's stack. This tree has no
       # stack for them; boot names each one (`refuse_app_middleware!`).
+      # Values set on app_generators become the application's generator
+      # defaults (tailwindcss-rails 4.1.0's engine: `config.app_generators
+      # { |g| g.template_engine :tailwindcss }`); recorded, as natively,
+      # for generator commands this tree never runs.
+      def app_generators
+        @@app_generators ||= Rails::Configuration::Generators.new
+        yield(@@app_generators) if block_given?
+        @@app_generators
+      end
+
       def app_middleware
         @@app_middleware ||= MiddlewareStackProxy.new
       end
@@ -644,6 +675,96 @@ module Rails
             @operations << [operation, args]
             self
           end
+        end
+      end
+    end
+  end
+end
+
+module Rails
+  # railties/lib/rails/configuration.rb's Generators (8.2.0.alpha),
+  # verbatim: what `config.app_generators` and a railtie's
+  # `config.generators` record. Rails::Configuration is
+  # runtime/rails_configuration.rb's class here, a module natively.
+  class Configuration
+    class Generators # :nodoc:
+      attr_accessor :aliases, :options, :templates, :fallbacks, :colorize_logging, :api_only
+      attr_reader :hidden_namespaces, :after_generate_callbacks
+
+      def initialize
+        @aliases = Hash.new { |h, k| h[k] = {} }
+        @options = Hash.new { |h, k| h[k] = {} }
+        @fallbacks = {}
+        @templates = []
+        @colorize_logging = true
+        @api_only = false
+        @hidden_namespaces = []
+        @after_generate_callbacks = []
+      end
+
+      def freeze
+        return self if frozen?
+
+        @aliases.default_proc = nil
+        @options.default_proc = nil
+        @aliases.freeze
+        @options.freeze
+        @fallbacks.freeze
+        @templates.freeze
+        @hidden_namespaces.freeze
+        @after_generate_callbacks.freeze
+        super
+      end
+
+      def initialize_copy(source)
+        @aliases = @aliases.deep_dup
+        @aliases.default_proc = proc { |h, k| h[k] = {} }
+        @options = @options.deep_dup
+        @options.default_proc = proc { |h, k| h[k] = {} }
+        @fallbacks = @fallbacks.deep_dup
+        @templates = @templates.dup
+      end
+
+      def hide_namespace(namespace)
+        @hidden_namespaces << namespace
+      end
+
+      def after_generate(&block)
+        @after_generate_callbacks << block
+      end
+
+      def apply_rubocop_autocorrect_after_generate!
+        after_generate do |files|
+          parsable_files = files.filter { |file| File.exist?(file) && file.end_with?(".rb") }
+          unless parsable_files.empty?
+            system(RbConfig.ruby, "bin/rubocop", "-A", "--fail-level=E", "--format=quiet", *parsable_files, exception: true)
+          end
+        end
+      end
+
+      def method_missing(method, *args)
+        method = method.name.delete_suffix("=").to_sym
+
+        if args.empty?
+          if method == :rails
+            return @options[method]
+          else
+            return @options[:rails][method]
+          end
+        end
+
+        if method == :rails || args.first.is_a?(Hash)
+          namespace, configuration = method, args.shift
+        else
+          namespace, configuration = args.shift, args.shift
+          namespace = namespace.to_sym if namespace.respond_to?(:to_sym)
+          @options[:rails][method] = namespace
+        end
+
+        if configuration
+          aliases = configuration.delete(:aliases)
+          @aliases[namespace].merge!(aliases) if aliases
+          @options[namespace].merge!(configuration)
         end
       end
     end
