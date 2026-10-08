@@ -185,16 +185,36 @@ pub(super) fn framework_concern_verdicts(
                     || included.iter().any(|id| id.0.as_str() == scope)
             };
             let own = || carriers.iter().filter(|c| &c.owner == owner);
+            // Ahead of the extension, `include M` is Module#include, as it
+            // is after it when M is no Concern (only a Concern include is
+            // deferred to the includer): equal when every M is an app
+            // module without `extend ActiveSupport::Concern`.
+            let is_concern = |id: &ClassId| extensions.get(id).is_some_and(|spans| !spans.is_empty());
+            let plain_app_module = |path: &Vec<String>| {
+                let written = path.join("::");
+                let suffix = format!("::{written}");
+                let mut resolved = module_includes
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .map(|id| ClassId(Symbol::from(id.0.as_str().trim_start_matches("::"))))
+                    .filter(|id| id.0.as_str() == written || id.0.as_str().ends_with(&suffix))
+                    .peekable();
+                resolved.peek().is_some()
+                    && resolved.all(|id| module_includes.contains_key(&id) && !is_concern(&id))
+            };
+            let in_order = |c: &ConcernClassMethodSpans| {
+                c.concern_calls.iter().zip(&c.concern_call_modules).all(|(call, modules)| {
+                    spans.iter().any(|extension| extension.file == call.file && extension.start < call.start)
+                        || modules.as_ref().is_some_and(|paths| paths.iter().all(plain_app_module))
+                })
+            };
             let verdict = if framework_shadows.iter().any(|scope| identity_scope(scope.0.as_str())) {
                 Err("a scope its constants resolve through rebinds ActiveSupport::Concern, T::Sig or T::Helpers")
             } else if own().any(|c| c.has_other_extensions) {
-                Err("it also extends a module other than ActiveSupport::Concern, T::Sig or T::Helpers, or declares `mixes_in_class_methods`, `sealed!` or `final!`, which change what an include does")
-            } else if !own().all(|c| {
-                c.concern_calls.iter().all(|call| {
-                    spans.iter().any(|extension| extension.file == call.file && extension.start < call.start)
-                })
-            }) {
-                Err("an `include`, `prepend` or `class_methods` precedes its `extend ActiveSupport::Concern`")
+                Err("it also extends a module other than ActiveSupport::Concern, T::Sig or T::Helpers, or declares `sealed!` or `final!`, which change what an include does")
+            } else if !own().all(in_order) {
+                Err("a `class_methods`, or an `include`/`prepend` of a Concern or of a module the app does not define, precedes its `extend ActiveSupport::Concern`")
             } else {
                 Ok(())
             };

@@ -48,8 +48,7 @@ fn native(name: &str, program: &str) -> String {
     stdout
 }
 
-const NATIVE_PRELUDE: &str =
-    "RailsOracle.activate(\"activesupport\", \"activemodel\", \"activerecord\")\n\
+const NATIVE_PRELUDE: &str = "RailsOracle.activate(\"activesupport\", \"activemodel\", \"activerecord\")\n\
      require \"active_support\"\nrequire \"active_support/concern\"\n\
      require \"active_support/core_ext/class/attribute\"\n";
 
@@ -373,13 +372,14 @@ fn a_sorbet_helpers_concern_runs_its_block_as_native() {
     );
 }
 
-/// A Concern this cannot verify (here a `mixes_in_class_methods`, which
-/// extends each includer, or an `include` ahead of the `extend`) does not
-/// get its block run on plain includers: an error naming the reason and
-/// the includers, not a warning.
+/// A Concern this cannot verify (here a `sealed!`, which checks each
+/// including file, or an `include` of a module the app does not define,
+/// or of a Concern, ahead of the `extend`) does not get its block run on
+/// plain includers: an error naming the reason and the includers, not a
+/// warning.
 #[test]
 fn an_unverified_concerns_block_is_an_error_not_a_drop() {
-    let mixing = "module Mixing\n  extend ActiveSupport::Concern\n  extend T::Helpers\n\n  module ClassMethods\n    def mixed = true\n  end\n  mixes_in_class_methods(ClassMethods)\n\n  included do\n    class_attribute :limit, default: 3\n  end\nend\n";
+    let mixing = "module Mixing\n  extend ActiveSupport::Concern\n  extend T::Helpers\n  sealed!\n\n  included do\n    class_attribute :limit, default: 3\n  end\nend\n";
     let (gaps, app) = refused(&[
         ("app/models/concerns/mixing.rb", mixing),
         ("app/models/one.rb", "class One\n  include Mixing\nend\n"),
@@ -393,7 +393,7 @@ fn an_unverified_concerns_block_is_an_error_not_a_drop() {
     assert!(
         ours[0].contains(
             "is not run on a plain (non-model) includer: it also extends a module other than"
-        ) && ours[0].contains("`mixes_in_class_methods`")
+        ) && ours[0].contains("`sealed!`")
             && ours[0].contains("One, Two would run without it"),
         "{}",
         ours[0]
@@ -412,4 +412,371 @@ fn an_unverified_concerns_block_is_an_error_not_a_drop() {
                 && g.contains("One would run without it")),
         "{gaps:#?}"
     );
+
+    // An app Concern ahead of the extension is included at once, not
+    // deferred to the includer: still refused.
+    let behind = "module Behind\n  include Mixing\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :size, default: 3\n  end\nend\n";
+    let mixing = "module Mixing\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :limit, default: 3\n  end\nend\n";
+    let (gaps, _) = refused(&[
+        ("app/models/concerns/mixing.rb", mixing),
+        ("app/models/concerns/behind.rb", behind),
+        ("app/models/one.rb", "class One\n  include Behind\nend\n"),
+    ]);
+    assert!(
+        gaps.iter()
+            .any(|g| g.contains("`included do` of Behind is not run")
+                && g.contains("precedes its `extend ActiveSupport::Concern`")),
+        "{gaps:#?}"
+    );
+}
+
+// ---- An app module included ahead of the extension --------------------------
+
+/// Core's `CustomCssValidator`, verbatim down to its header: a plain
+/// safelist module included before `extend ActiveSupport::Concern`, then
+/// `T::Helpers`, `requires_ancestor`, an `attr_reader`, constants and the
+/// `included do class_attribute … end`. Ahead of the extension `include`
+/// is `Module#include`, which it also is after it for a module that is no
+/// Concern, so the block runs on each includer. Only the Loofah, Crass and
+/// I18n parts of the bodies are cut (no gem here supplies them); the
+/// messages are the I18n keys.
+const CSS_SAFELIST: &str = r##"# typed: true
+# frozen_string_literal: true
+
+module CssSafelist
+  DENYLIST_SELECTORS = /<.*>|.shopify-section/ # shopify-section class and <> tags in the selector
+  CSS_IMPORTANT = "!important"
+  ADDITIONAL_CSS_PROPERTIES = [
+    "accent-color",
+    "bottom",
+  ].freeze
+end
+"##;
+
+const CSS_VALIDATOR: &str = r##"# typed: true
+# frozen_string_literal: true
+
+module CssValidator
+  include CssSafelist
+  extend ActiveSupport::Concern
+  extend T::Helpers
+  requires_ancestor { Kernel }
+
+  #: untyped
+  attr_reader :values
+
+  THEME = "theme"
+  SECTION = "section"
+  SCOPEABLE_AT_RULES = ["media", "container", "layer", "supports"].freeze
+
+  included do
+    class_attribute(:character_limit, default: 1500)
+    class_attribute(:type)
+  end
+
+  #: (untyped errors) -> void
+  def validate(errors)
+    return if values.nil?
+
+    validate_value_type(errors)
+    validate_size_limit(errors) if errors.empty?
+    validate_selectors(errors) if errors.empty?
+  end
+
+  private
+
+  #: (untyped errors) -> void
+  def validate_value_type(errors)
+    return if values.is_a?(Array) && values.all? { |value| value.is_a?(String) }
+
+    errors.add(
+      :base,
+      "online_store.asset_cloud.theme_settings_values_asset.custom_css_must_be_an_array_of_string_values"
+    )
+  end
+
+  #: (untyped errors) -> void
+  def validate_size_limit(errors)
+    normalized_values = normalize_values
+    return if normalized_values.length <= self.class.character_limit
+
+    errors.add(
+      :base,
+      "online_store.asset_cloud.theme_settings_values_asset.custom_css_content_limit_exceeded:#{self.class.character_limit}"
+    )
+  end
+
+  #: -> String
+  def normalize_values
+    values.join("").gsub(/\s+/, "")
+  end
+
+  #: (untyped errors) -> void
+  def validate_selectors(errors)
+    values.each do |css_value|
+      next unless css_value.match?(DENYLIST_SELECTORS)
+
+      errors.add(:base, "custom_css_selector_not_permitted:#{theme_custom_css?}")
+    end
+  end
+
+  #: -> bool
+  def theme_custom_css?
+    type == THEME
+  end
+end
+"##;
+
+const CSS_SECTION: &str = r##"# typed: strict
+# frozen_string_literal: true
+
+class Theme
+  module Sections
+    class CustomCss
+      include CssValidator
+
+      self.character_limit = 500
+      self.type = SECTION
+
+      #: (untyped values) -> void
+      def initialize(values)
+        @values = values
+      end
+    end
+  end
+end
+"##;
+
+const CSS_THEME: &str = r##"class Theme
+  class CustomCss
+    include CssValidator
+
+    self.type = THEME
+
+    def initialize(values)
+      @values = values
+    end
+  end
+end
+"##;
+
+const CSS_SCRIPT: &str = r##"class Errs
+  def initialize = @list = []
+  def add(*entry) = @list << entry
+  def empty? = @list.empty?
+  def to_a = @list
+end
+check = ->(css) { Errs.new.tap { |e| css.validate(e) }.to_a }
+section = Theme::Sections::CustomCss
+theme = Theme::CustomCss
+p [section.character_limit, section.type, theme.character_limit, theme.type]
+p check.(section.new(["a{color:red}"]))
+p check.(section.new(["a" * 501]))
+p check.(theme.new(["a" * 501]))
+p check.(section.new([".shopify-section{}"]))
+p check.(theme.new([".shopify-section{}"]))
+p check.(section.new([1]))
+p check.(section.new(nil))
+p [section.new([]).values, CssValidator::CSS_IMPORTANT, section.ancestors.take_while { |m| m != Object }]
+"##;
+
+#[test]
+fn an_app_module_ahead_of_the_extension_still_runs_the_block_as_native() {
+    let classes = [
+        ("app/models/concerns/css_safelist.rb", CSS_SAFELIST),
+        ("app/models/concerns/css_validator.rb", CSS_VALIDATOR),
+        ("app/models/theme/sections/custom_css.rb", CSS_SECTION),
+        ("app/models/theme/custom_css.rb", CSS_THEME),
+    ];
+    let program: String = classes.iter().map(|(_, source)| *source).collect();
+    let expected = native(
+        "css",
+        &format!("{NATIVE_PRELUDE}require \"sorbet-runtime\"\n{program}{CSS_SCRIPT}"),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        expected,
+        [
+            r#"[500, "section", 1500, "theme"]"#,
+            "[]",
+            r#"[[:base, "online_store.asset_cloud.theme_settings_values_asset.custom_css_content_limit_exceeded:500"]]"#,
+            "[]",
+            r#"[[:base, "custom_css_selector_not_permitted:false"]]"#,
+            r#"[[:base, "custom_css_selector_not_permitted:true"]]"#,
+            r#"[[:base, "online_store.asset_cloud.theme_settings_values_asset.custom_css_must_be_an_array_of_string_values"]]"#,
+            "[]",
+            r#"[[], "!important", [Theme::Sections::CustomCss, CssValidator, CssSafelist]]"#,
+        ],
+        "native control"
+    );
+    let run = classes
+        .iter()
+        .fold(emit_and_run::real_blog(), |overlay, (path, source)| {
+            overlay.write(path, source)
+        })
+        .run_ruby(CSS_SCRIPT);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(
+        actual, expected,
+        "emitted Ruby diverges from native line for line"
+    );
+}
+
+// ---- A re-include below an override -----------------------------------------
+
+/// `ReDial < FineDial` includes Tunable again. Ruby skips a module the
+/// ancestors already have, so `append_features` neither extends
+/// `ClassMethods` again nor runs the block: `ReDial.tune` is FineDial's
+/// override, and `ReDial.level` is the value FineDial set.
+const DIAL: &str = "class Dial\n  include Tunable\nend\n";
+const FINE_DIAL: &str = "class FineDial < Dial\n  self.level = 5\n\n  def self.tune(n)\n    self.level = n * 10\n  end\nend\n";
+const RE_DIAL: &str = "class ReDial < FineDial\n  include Tunable\nend\n";
+const DIAL_SCRIPT: &str = r##"p [Dial.level, FineDial.level, ReDial.level]
+ReDial.tune(2)
+p [Dial.level, FineDial.level, ReDial.level]
+Dial.tune(3)
+p [Dial.level, FineDial.level, ReDial.level]
+p [ReDial.method(:tune).owner == FineDial.singleton_class, ReDial.singleton_methods(false)]
+"##;
+
+#[test]
+fn a_reinclude_below_an_override_keeps_the_override_as_native() {
+    let classes = [
+        ("app/models/concerns/tunable.rb", TUNABLE),
+        ("app/models/dial.rb", DIAL),
+        ("app/models/fine_dial.rb", FINE_DIAL),
+        ("app/models/re_dial.rb", RE_DIAL),
+    ];
+    let program: String = classes.iter().map(|(_, source)| *source).collect();
+    let expected = native("dial", &format!("{NATIVE_PRELUDE}{program}{DIAL_SCRIPT}"));
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        expected,
+        ["[1, 5, 5]", "[1, 5, 20]", "[3, 5, 20]", "[true, []]"],
+        "native control"
+    );
+    let run = classes
+        .iter()
+        .fold(emit_and_run::real_blog(), |overlay, (path, source)| {
+            overlay.write(path, source)
+        })
+        .run_ruby(DIAL_SCRIPT);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(
+        actual, expected,
+        "emitted Ruby diverges from native line for line"
+    );
+}
+
+// ---- `mixes_in_class_methods` -------------------------------------------------
+
+/// sorbet-runtime's `mixes_in_class_methods` adds an `included` that
+/// extends the includer and calls `super`, so ActiveSupport::Concern's
+/// `append_features` still runs the block on it. (Declared ahead of the
+/// `included do`, its one-argument `included` shadows the Concern's and
+/// the module fails to load natively, so Core declares it after.)
+const MIXED: &str = r##"module Mixed
+  extend ActiveSupport::Concern
+  extend T::Helpers
+
+  module Definitions
+    def mixed(n) = "#{name}:#{n}:#{limit}"
+  end
+
+  included do
+    class_attribute :limit, default: 3
+  end
+
+  mixes_in_class_methods(Definitions)
+end
+"##;
+const MIXER: &str = "class Mixer\n  include Mixed\n  self.limit = 4\nend\n";
+const PLAIN_MIXER: &str = "class PlainMixer\n  include Mixed\nend\n";
+const MIXED_SCRIPT: &str = r##"p [Mixer.mixed(1), PlainMixer.mixed(2), Mixer.limit, PlainMixer.new.limit]
+p [Mixer.singleton_class.include?(Mixed::Definitions), Mixer.method(:mixed).owner]
+"##;
+
+#[test]
+fn a_mixes_in_class_methods_concern_runs_its_block_as_native() {
+    let classes = [
+        ("app/models/concerns/mixed.rb", MIXED),
+        ("app/models/mixer.rb", MIXER),
+        ("app/models/plain_mixer.rb", PLAIN_MIXER),
+    ];
+    let program: String = classes.iter().map(|(_, source)| *source).collect();
+    let expected = native(
+        "mixed",
+        &format!("{NATIVE_PRELUDE}require \"sorbet-runtime\"\n{program}{MIXED_SCRIPT}"),
+    );
+    let expected: Vec<&str> = expected.lines().collect();
+    assert_eq!(
+        expected,
+        [
+            r#"["Mixer:1:4", "PlainMixer:2:3", 4, 3]"#,
+            "[true, Mixed::Definitions]",
+        ],
+        "native control"
+    );
+    let run = classes
+        .iter()
+        .fold(emit_and_run::real_blog(), |overlay, (path, source)| {
+            overlay.write(path, source)
+        })
+        .run_ruby(MIXED_SCRIPT);
+    run.assert_passes();
+    let actual: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(
+        actual, expected,
+        "emitted Ruby diverges from native line for line"
+    );
+}
+
+// ---- The drop warning names only includers without the block ----------------
+
+/// The Concern's own `included do` is not emitted on the module: it is
+/// lowered into each includer. The emit's "not modelled and is dropped"
+/// warning at the block is true only when some includer (a controller,
+/// say) does not get it.
+#[test]
+fn the_included_drop_warning_fires_only_for_an_includer_without_the_block() {
+    use roundhouse::ingest::ingest_app_from_tree;
+    use roundhouse::project::BuildTarget;
+    let shared = "module Shared\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :limit, default: 3\n  end\nend\n";
+    let served = "module Served\n  extend ActiveSupport::Concern\n\n  included do\n    class_attribute :limit, default: 3\n  end\nend\n";
+    let files = [
+        ("app/models/concerns/shared.rb", shared),
+        ("app/models/concerns/served.rb", served),
+        ("app/models/one.rb", "class One\n  include Shared\nend\n"),
+        ("app/models/two.rb", "class Two\n  include Served\nend\n"),
+        (
+            "app/controllers/application_controller.rb",
+            "class ApplicationController < ActionController::Base\n  include Served\nend\n",
+        ),
+    ];
+    let ((app, emitted), diags) = roundhouse::emit::diagnostics::scope(|| {
+        let mut app = ingest_app_from_tree(tree(&files)).expect("ingest");
+        roundhouse::session::analyze_and_lower(&mut app);
+        let emitted = roundhouse::project::target_files(
+            &app,
+            std::path::Path::new("not-a-fixture"),
+            BuildTarget::Ruby,
+        );
+        (app, emitted)
+    });
+    emitted.expect("ruby files");
+    assert_eq!(
+        app.carried_included_blocks,
+        [roundhouse::ident::ClassId(roundhouse::ident::Symbol::from(
+            "Shared"
+        ))]
+    );
+    let drops: Vec<String> = diags
+        .iter()
+        .map(|d| d.message.clone())
+        .filter(|m| m.contains("`included` in the body of"))
+        .collect();
+    assert!(!drops.iter().any(|m| m.contains("`Shared`")), "{drops:#?}");
+    assert!(drops.iter().any(|m| m.contains("`Served`")), "{drops:#?}");
 }

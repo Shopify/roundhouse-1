@@ -620,6 +620,14 @@ pub struct App {
     /// names to emit a per-request `reset`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_attribute_classes: Vec<ClassId>,
+    /// Concerns whose `included do` block every static includer gets
+    /// from ingest: a model (`splice_concerns_into_models`) or a plain
+    /// class or module (`concern_accessors::splice_into_library_includers`),
+    /// each of which reports what it could not carry. The module's own
+    /// emitted body drops the call without a warning
+    /// (`concern_accessors::carried_included_blocks`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_included_blocks: Vec<ClassId>,
     /// Renderer view → the partial views it renders (`articles/show` →
     /// [`articles/_form`]), harvested from actual render sites as views
     /// are analyzed. The other half of the render graph that
@@ -1323,6 +1331,7 @@ impl App {
             concern_model_items: HashMap::default(),
             concern_prepended_items: HashMap::default(),
             current_attribute_classes: Vec::new(),
+            carried_included_blocks: Vec::new(),
             render_edges: HashMap::default(),
             view_feeders: HashMap::default(),
             controller_resolutions: HashMap::default(),

@@ -2467,6 +2467,8 @@ end
         &concern_class_method_spans,
         &framework_shadow_scopes,
     )?;
+    app.carried_included_blocks =
+        super::concern_accessors::carried_included_blocks(&app, &concern_class_method_spans);
     super::model_macros::expand_model_macros(&mut app, &sources)?;
     super::define_method_loops::expand(&mut app, &sources);
     super::trusted_id_attribute::expand(&mut app);
@@ -3541,14 +3543,45 @@ fn splice_concern_class_methods_into_includers(
         );
     }
 
-    let copies = |includes: Vec<ClassId>, mut taken: HashSet<Symbol>| {
+    // What each class's superclass chain already includes, transitively.
+    // Ruby skips a module its ancestors have, and a Concern's
+    // `append_features` returns early when `base < self`: a subclass that
+    // includes it again is not extended again, so it gets no copies (which
+    // would shadow a class method the parent defines over the Concern's).
+    let mut direct: HashMap<ClassId, (Option<ClassId>, Vec<ClassId>)> = HashMap::default();
+    for model in &app.models {
+        direct.insert(model.name.clone(), (model.parent.clone(), crate::analyze::model_includes(model)));
+    }
+    for lc in app.library_classes.iter().filter(|lc| !lc.is_module) {
+        direct.entry(lc.name.clone()).or_insert_with(|| (lc.parent.clone(), lc.includes.clone()));
+    }
+    let inherited = |name: &ClassId| -> HashSet<ClassId> {
+        let mut out: HashSet<ClassId> = HashSet::default();
+        let mut visited: HashSet<ClassId> = HashSet::default();
+        let mut at = direct.get(name).and_then(|(parent, _)| parent.clone());
+        while let Some(parent) = at.take() {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            let Some((grand, includes)) = direct.get(&parent) else { break };
+            let mut stack = includes.clone();
+            while let Some(id) = stack.pop() {
+                if out.insert(id.clone()) {
+                    stack.extend(module_includes.get(&id).into_iter().flatten().cloned());
+                }
+            }
+            at = grand.clone();
+        }
+        out
+    };
+    let copies = |includes: Vec<ClassId>, mut taken: HashSet<Symbol>, inherited: HashSet<ClassId>| {
         // Transitive closure of the includer's includes, in ancestor order.
         // `via` is whether a native include reaches the includer through
         // Concerns only: a Concern defers its own includes to its
         // includer, a plain module performed them on itself.
         let mut queue: Vec<(ClassId, bool)> = includes.into_iter().map(|id| (id, true)).collect();
         let mut order: Vec<(ClassId, bool)> = Vec::new();
-        let mut seen: HashSet<ClassId> = HashSet::default();
+        let mut seen: HashSet<ClassId> = inherited;
         while !queue.is_empty() {
             let (id, via) = queue.remove(0);
             if !seen.insert(id.clone()) {
@@ -3633,7 +3666,7 @@ fn splice_concern_class_methods_into_includers(
         // authored `prepended` hook's business, as with `included`.
         let mut mixins: Vec<ClassId> = model_concern_prepends(model, &concerns);
         mixins.extend(crate::analyze::model_includes(model));
-        let (added, provenance, carried) = copies(mixins, taken);
+        let (added, provenance, carried) = copies(mixins, taken, inherited(&model.name));
         let hooked: Vec<crate::app::ClassMethodsCarrierSplice> = carried
             .into_iter()
             .filter(|splice| splice.extend && extended_hooks.contains(&splice.carrier))
@@ -3659,7 +3692,7 @@ fn splice_concern_class_methods_into_includers(
             .filter(|m| m.receiver == MethodReceiver::Class)
             .map(|m| m.name.clone())
             .collect();
-        let (added, provenance, carried) = copies(lc.includes.clone(), taken);
+        let (added, provenance, carried) = copies(lc.includes.clone(), taken, inherited(&lc.name));
         lc.methods.extend(added);
         if !provenance.is_empty() {
             spliced.insert(lc.name.clone(), provenance);
