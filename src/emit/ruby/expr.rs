@@ -401,7 +401,17 @@ fn emit_node(n: &ExprNode) -> String {
             if let Some(b) = block { format!("{base} {{ {} }}", emit_expr(b)) } else { base }
         }
         ExprNode::Send { recv, method, args, block, parenthesized } => {
-            let base = emit_send_base(recv.as_ref(), method, args, *parenthesized);
+            // A brace block binds to the nearest call: after paren-less
+            // arguments it is the last argument's block (`f a, b { }` is
+            // `f(a, b { })`) or a syntax error (`f a, k: 1 { }`). The
+            // call's own `{ }` block (Core's graphql `field :name,
+            // :string, null: false, &:mask_sensitive_data`, ingested as
+            // `{ |x| x.mask_sensitive_data }`) takes the arguments in
+            // parentheses.
+            let brace = block.as_ref().is_some_and(|b| {
+                matches!(&*b.node, ExprNode::Lambda { block_style: crate::expr::BlockStyle::Brace, .. })
+            });
+            let base = emit_send_base(recv.as_ref(), method, args, *parenthesized || (brace && !args.is_empty()));
             match block {
                 None => base,
                 Some(b) => emit_do_block(&base, b),
@@ -623,7 +633,17 @@ fn emit_node(n: &ExprNode) -> String {
         },
         ExprNode::Retry => "retry".to_string(),
         ExprNode::Redo => "redo".to_string(),
-        ExprNode::Splat { value } => format!("*{}", emit_expr(value)),
+        // `*(handles unless ready)`: bare, a modifier operand ends the
+        // element (`[*handles unless ready, x]` does not parse) or binds
+        // the whole enclosing statement; a command operand takes the
+        // following elements as its arguments.
+        ExprNode::Splat { value } => {
+            if renders_open_ended(value) {
+                format!("*({})", emit_expr(value))
+            } else {
+                format!("*{}", emit_arg(value))
+            }
+        }
         ExprNode::ForwardArgs => "...".to_string(),
         ExprNode::ForwardKeywords => "**".to_string(),
         ExprNode::Defined { operand } => format!("defined?({})", emit_expr(operand)),
@@ -1114,7 +1134,10 @@ fn is_simple_ident(s: &str) -> bool {
 /// and `f((g a: 1 do ... end))` parses identically everywhere.
 /// Everything else passes through unchanged.
 fn emit_arg(e: &Expr) -> String {
-    if renders_as_trailing_modifier(e) || renders_as_command_with_block(e) || is_multi_seq(e) {
+    // A multiple assignment is a statement unless parenthesized: `if a, b
+    // = pair` does not parse, and as an argument its comma splits it.
+    let multi_assign = matches!(&*e.node, ExprNode::MultiAssign { .. });
+    if renders_as_trailing_modifier(e) || renders_as_command_with_block(e) || is_multi_seq(e) || multi_assign {
         format!("({})", emit_expr(e))
     } else {
         emit_expr(e)
