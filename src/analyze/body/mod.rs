@@ -1041,6 +1041,34 @@ impl<'a> BodyTyper<'a> {
         None
     }
 
+    /// A mixin argument naming a module: a proven class object, or a
+    /// bare constant at a file's top level that names a modeled module.
+    /// Rubydex records no reference for the argument of an `include`
+    /// outside any class or module body (rubydex d8ff475 ruby_indexer.rs
+    /// `handle_mixin` returns before `add_constant_reference` without a
+    /// lexical nesting), so the read was left unknown; Ruby reads it from
+    /// the top-level cref, the exact written name, which is how the read
+    /// is then typed.
+    fn top_level_mixin_argument(&self, arg: &mut Expr, ctx: &Ctx) -> bool {
+        let ExprNode::Const { path } = &mut *arg.node else { return false };
+        if arg.diagnostic.is_none() {
+            return self.is_class_object(arg, ctx);
+        }
+        let id = written_class_id(path);
+        let unreferenced = !arg.span.is_synthetic()
+            && self.const_resolver.as_ref().is_some_and(|r| r.has_source_file(arg.span.file) && r.reference(arg.span, path).is_none());
+        let module = self.classes().get(&id).is_some_and(|info| info.is_module);
+        let unknown_constant = matches!(&arg.diagnostic, Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, detail, .. })
+            if construct.as_str() == "constant" && *detail == id.0.as_str());
+        if !(unreferenced && module && unknown_constant) {
+            return false;
+        }
+        arg.diagnostic = None;
+        arg.decisions |= crate::expr::RESOLVED_CLASS_REF;
+        arg.ty = Some(Ty::Class { id, args: vec![] });
+        true
+    }
+
     /// Identity evidence for Module protocol, independent of nominal instance type.
     fn is_class_object(&self, expr: &Expr, ctx: &Ctx) -> bool {
         // `Class[top]`, `Module`, `T::Class[X]`: a declared type that is
@@ -2477,6 +2505,19 @@ impl<'a> BodyTyper<'a> {
                     if let Some(t) = send::object_protocol_method(recv_ty.as_ref(), method, block_ret.as_ref(), class_object) {
                         return t;
                     }
+                }
+                // Module#include / #prepend on a proven class object, of
+                // modules named by constant: a load hook's `include M` on
+                // the base it `class_eval`s (Core's `ActiveSupport.on_load(
+                // :active_record) { include SerializationOptions }`). The
+                // runtime's class answers it as Ruby does, and it returns
+                // the receiver.
+                if matches!(dispatched, Ty::Var { .. } | Ty::Untyped) && self.inquirers.is_some()
+                    && matches!(method.as_str(), "include" | "prepend") && block.is_none() && !args.is_empty()
+                    && class_object_receiver && expr.diagnostic.is_none()
+                    && args.iter_mut().all(|arg| self.top_level_mixin_argument(arg, ctx))
+                {
+                    return recv_ty.clone().unwrap_or(Ty::Untyped);
                 }
                 // type_toolkit's `x.not_nil!` (Core's `T.must`): Kernel's
                 // answers the receiver, NilClass's raises

@@ -287,6 +287,27 @@ class Hash
   end
 
   alias nested_under_indifferent_access with_indifferent_access
+
+  # core_ext/hash/keys.rb (activesupport 8.2.0.alpha, Shopify/rails
+  # 5813559f): the key conversions. Core's SerializationOptions reads
+  # `stringify_keys` of a Hash entry in `methods:`.
+  def stringify_keys
+    transform_keys { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def stringify_keys!
+    transform_keys! { |k| Symbol === k ? k.name : k.to_s }
+  end
+
+  def symbolize_keys
+    transform_keys { |key| key.to_sym rescue key }
+  end
+  alias_method :to_options,  :symbolize_keys
+
+  def symbolize_keys!
+    transform_keys! { |key| key.to_sym rescue key }
+  end
+  alias_method :to_options!, :symbolize_keys!
 end
 
 # core_ext/hash/keys.rb (Rails 8.1.4), which hash/indifferent_access

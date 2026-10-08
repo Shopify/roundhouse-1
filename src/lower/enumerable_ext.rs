@@ -265,9 +265,22 @@ fn fold_array_wrap(span: crate::span::Span, arg: &Expr) -> Option<Expr> {
         Some(Ty::Nil) => Some(empty),
         Some(Ty::Array { .. }) => Some(arg.clone()),
         Some(Ty::Union { variants }) => fold_union_wrap(span, arg, variants),
-        None => None,
-        Some(_) => Some(one(arg.clone())),
+        Some(ty) if closed_non_array(ty) => Some(one(arg.clone())),
+        // Untyped (Core's SerializationOptions: `Array.wrap(only)` of an
+        // options value that is often an Array), a Relation (its `to_ary`
+        // is its records) or a Tuple keeps the call.
+        _ => None,
     }
+}
+
+/// A type whose values are neither nil nor answer `to_ary`, so `Array.wrap`
+/// is `[value]`. A class with a custom `to_ary` is the dropped edge the
+/// note at `ground_array_wrap` names.
+fn closed_non_array(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Sym | Ty::Date | Ty::Time | Ty::Hash { .. } | Ty::Class { .. } | Ty::Fn { .. }
+    )
 }
 
 /// `Array | Nil` is `[]` or the array. `String | Nil` is `[]` or
@@ -280,7 +293,7 @@ fn fold_union_wrap(span: crate::span::Span, arg: &Expr, variants: &[Ty]) -> Opti
         .iter()
         .filter(|v| !matches!(v, Ty::Nil | Ty::Array { .. }))
         .collect();
-    if arrays.len() > 1 || (!others.is_empty() && !arrays.is_empty()) {
+    if arrays.len() > 1 || (!others.is_empty() && !arrays.is_empty()) || !others.iter().all(|t| closed_non_array(t)) {
         return None;
     }
     if !has_nil && arrays.is_empty() {
