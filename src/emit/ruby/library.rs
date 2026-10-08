@@ -31,11 +31,13 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
     // own body wants every one of them applied.
     crate::lower::tag_block_passing::apply_helpers(&mut lcs);
     crate::timings::lap("emit library: tag_block_passing");
-    // A model subclass's own associations (`lower::subclass_macros`).
+    // A model subclass's own associations and callbacks
+    // (`lower::subclass_macros`).
     let subclass_views = crate::lower::subclass_macros::views(app);
     for lc in lcs.iter_mut() {
         if let Some(view) = subclass_views.get(&lc.name) {
-            crate::lower::model_to_library::push_subclass_association_methods(&mut lc.methods, view, &app.models);
+            let lineage = crate::lower::subclass_macros::lineage(app, &subclass_views, view);
+            crate::lower::model_to_library::push_subclass_model_methods(&mut lc.methods, view, &lineage, &app.models);
         }
     }
     apply_scope_lowering(&mut lcs, app);

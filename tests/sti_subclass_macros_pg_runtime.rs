@@ -2,9 +2,11 @@
 //! native Rails 8.2 on the same local PostgreSQL database: Rails defines
 //! them on the subclass (a model to Rails, a library class to ingest),
 //! so `belongs_to` / `has_many` / `has_one` readers and writers, the
-//! `belongs_to` required check and `scope` class methods (bare, chained
-//! after a relation, with positional and keyword parameters) answer on
-//! the subclass and are absent from the base. Core's saved-view shape
+//! `belongs_to` required check (`belongs_to_required_by_default`, as
+//! Core's `load_defaults(8.1)` sets it), the `dependent: :destroy`
+//! cascade and `scope` class methods (bare, chained after a relation,
+//! with positional and keyword parameters) answer on the subclass and
+//! are absent from the base. Core's saved-view shape
 //! (`AbandonedCheckoutSavedView < SavedView; belongs_to :saved_search`).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
@@ -22,6 +24,7 @@ CREATE TABLE saved_views (
     type character varying,
     name character varying,
     saved_search_id bigint,
+    pinned_by_id bigint,
     CONSTRAINT saved_views_pkey PRIMARY KEY (id)
 );
 
@@ -42,8 +45,10 @@ test:
   database: rh_e2e_sti_subclass_macros
 "#;
 
+/// Core's `config.load_defaults(8.1)` requires a `belongs_to` by default.
 const APPLICATION_RECORD: &str = r#"class ApplicationRecord < ActiveRecord::Base
   self.abstract_class = true
+  self.belongs_to_required_by_default = true
 end
 "#;
 
@@ -57,7 +62,8 @@ end
 
 const ORDER_SAVED_VIEW: &str = r#"class OrderSavedView < SavedView
   belongs_to :saved_search
-  has_many :pins, foreign_key: :saved_view_id
+  belongs_to :pinned_by, class_name: "SavedSearch", optional: true
+  has_many :pins, foreign_key: :saved_view_id, dependent: :destroy
   has_one :first_pin, -> { order(:id) }, class_name: "Pin", foreign_key: :saved_view_id
 
   scope :named, ->(name) { where(name: name) }
@@ -91,6 +97,8 @@ const PROBE: &str = r##"class StiSubclassMacrosProbe
     Pin.create!(saved_view: a, label: "p1")
     out << "has_many: #{a.pins.count} #{a.pins.order(:label).map(&:label).join(",")} #{OrderSavedView.find(a.id).pins.size} #{b.pins.to_a.size} #{a.first_pin.label} #{b.first_pin.inspect}"
     out << "scope: #{OrderSavedView.named("a").count} #{OrderSavedView.searched.order(:id).map(&:name).join(",")} #{OrderSavedView.where(id: [a.id, b.id]).named("b").map(&:name).join(",")} #{OrderSavedView.for_search(search: s).map(&:name).join(",")} #{OrderSavedView.for_search(search: t, name: "x").count} #{SavedView.where(name: "a").count}"
+    a.destroy
+    out << "dependent: #{Pin.count} #{OrderSavedView.count} #{OrderSavedView.new(name: "e", saved_search: s).valid?}"
     out << "base: #{SavedView.respond_to?(:named)} #{SavedView.new.respond_to?(:saved_search)} #{OtherSavedView.new.respond_to?(:pins)} #{SavedView.order(:id).first.class.name}"
     out
   end
@@ -99,10 +107,11 @@ end
 
 /// What native Rails 8.2 answers (checked on the task PostgreSQL), so two
 /// identical wrong answers still fail.
-const EXPECTED: [&str; 4] = [
-    "belongs_to: s true t true  nil",
+const EXPECTED: [&str; 5] = [
+    "belongs_to: s true t false Saved search must exist nil",
     "has_many: 2 p1,p2 2 0 p2 nil",
     "scope: 1 a,b b a 0 2",
+    "dependent: 0 1 true",
     "base: false false false OrderSavedView",
 ];
 

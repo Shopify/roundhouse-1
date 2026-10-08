@@ -83,6 +83,9 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
     // column that does not exist. `sti_bases` is the one authority on
     // which subclasses are STI ones — it is what checks for the column.
     let sti = crate::lower::sti_scope::sti_columns(app);
+    // The declarations `lower::subclass_macros` lowers with the model's
+    // chains (options and all) are its own.
+    let lowered = crate::lower::subclass_macros::callback_spans(app);
     for lc in &mut app.library_classes {
         // An STI subclass is a library class whose parent IS a model.
         if !lc.parent.as_ref().is_some_and(|p| models.contains(p)) {
@@ -96,11 +99,11 @@ pub fn apply_sti_subclass_callbacks(app: &mut App) {
         }
         let mut folds: Vec<(&'static str, Vec<Symbol>)> = Vec::new();
         lc.unknown_calls.retain(|call| match fold_targets(call) {
-            Some(fold) => {
+            Some(fold) if !lowered.contains(&call.span) => {
                 folds.push(fold);
                 false
             }
-            None => true,
+            _ => true,
         });
         for (hook, targets) in folds {
             for target in targets {

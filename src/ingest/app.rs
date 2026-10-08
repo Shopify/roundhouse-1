@@ -3002,7 +3002,29 @@ end
 /// and stored on the nearest model ancestor
 /// (`Model::subclass_declarations`), for `lower::subclass_macros`.
 fn collect_subclass_declarations(app: &mut App) {
-    const DECLARATIONS: &[&str] = &["belongs_to", "has_many", "has_one", "scope"];
+    const DECLARATIONS: &[&str] = &[
+        "belongs_to",
+        "has_many",
+        "has_one",
+        "scope",
+        "before_validation",
+        "after_validation",
+        "before_save",
+        "after_save",
+        "before_create",
+        "after_create",
+        "before_update",
+        "after_update",
+        "before_destroy",
+        "after_destroy",
+        "after_commit",
+        "after_create_commit",
+        "after_update_commit",
+        "after_destroy_commit",
+        "after_save_commit",
+        "after_rollback",
+        "before_commit",
+    ];
     let models: crate::det::HashSet<crate::ident::ClassId> = app.models.iter().map(|m| m.name.clone()).collect();
     let mut declared: HashMap<crate::ident::ClassId, Vec<(crate::ident::ClassId, Vec<crate::dialect::ModelBodyItem>)>> =
         HashMap::default();
@@ -3051,7 +3073,11 @@ fn collect_subclass_declarations(app: &mut App) {
                 super::model::ingest_model_body_item(&node, &lc.name, &path, Vec::new()).ok()
             })
             .flatten();
-            if let Some(item @ (crate::dialect::ModelBodyItem::Association { .. } | crate::dialect::ModelBodyItem::Scope { .. })) =
+            if let Some(
+                item @ (crate::dialect::ModelBodyItem::Association { .. }
+                | crate::dialect::ModelBodyItem::Scope { .. }
+                | crate::dialect::ModelBodyItem::Callback { .. }),
+            ) =
                 item
             {
                 items.push(item);
