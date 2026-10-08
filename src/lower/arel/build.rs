@@ -146,6 +146,14 @@ pub fn try_build_arel_with_assocs(
             let (op, owner) = try_chain_recv(recv, schema, registry, assocs)?;
             return apply_count(op).map(|op| (op, owner));
         }
+        // `exists?` LAYERED on a chain, and the bare `Model.exists?`
+        // (an implicit `all`). The kwargs form is the base arm's. Without
+        // this arm the walk lifted `Model.where(id: 1)` to a hydrate and
+        // left `exists?` on the Array it answers — a NoMethodError.
+        "exists?" if args.is_empty() => {
+            let (op, owner) = try_chain_recv(recv, schema, registry, assocs)?;
+            return apply_exists(op).map(|op| (op, owner));
+        }
         _ => {}
     }
 
@@ -338,6 +346,29 @@ fn apply_count(op: ArelOp) -> Option<ArelOp> {
         return None;
     }
     sel.columns = ColumnSpec::Count;
+    Some(ArelOp::Select(sel))
+}
+
+/// `.exists?` on a chain — Rails' `SELECT 1 … LIMIT 1`, which drops the
+/// chain's order (`construct_relation_for_exists`), so this does too.
+/// Declines what `emit_exists` does not render (joins) and a chain that
+/// already carries a limit or answers one record; the mod.rs guard then
+/// leaves the whole chain to the runtime Relation.
+fn apply_exists(op: ArelOp) -> Option<ArelOp> {
+    let ArelOp::Select(mut sel) = op else {
+        return None;
+    };
+    if !matches!(sel.columns, ColumnSpec::All)
+        || sel.limit.is_some()
+        || sel.single_record
+        || !sel.joins.is_empty()
+    {
+        return None;
+    }
+    sel.columns = ColumnSpec::Exists;
+    sel.limit = Some(LimitSpec(1));
+    sel.orders.clear();
+    sel.preloads.clear();
     Some(ArelOp::Select(sel))
 }
 
