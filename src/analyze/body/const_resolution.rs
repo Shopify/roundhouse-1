@@ -87,6 +87,9 @@ pub(crate) struct ConstResolver {
     /// Each source namespace that others are nested in by name, with
     /// those nested ones (`A` to `A::B` and `A::B::C`).
     nested_namespaces: HashMap<Box<str>, Vec<Box<str>>>,
+    /// Each source constant's declaration by its full name; `None` where
+    /// two declarations share the name.
+    source_constants: HashMap<Box<str>, Option<DeclarationId>>,
     /// Includes paths, full text and order because answers use file IDs
     /// and byte offsets. Retain no second copy of the source snapshot.
     source_fingerprint: u64,
@@ -445,12 +448,26 @@ impl ConstResolver {
                 }
             }
         }
+        let mut source_constants: HashMap<Box<str>, Option<DeclarationId>> = HashMap::default();
+        for (declaration, name) in files.iter().flatten().flat_map(|file| file.constant_classes.iter()) {
+            match source_constants.entry(Box::from(name.0.as_str())) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Some(*declaration));
+                }
+                Entry::Occupied(mut slot) => {
+                    if *slot.get() != Some(*declaration) {
+                        slot.insert(None);
+                    }
+                }
+            }
+        }
         Self {
             files,
             stdlib_namespaces,
             superclasses,
             source_namespaces,
             nested_namespaces,
+            source_constants,
             source_fingerprint: source_fingerprint(sources),
         }
     }
@@ -544,6 +561,11 @@ impl ConstResolver {
     /// runtime namespace to it under a name a source class defines.
     pub(crate) fn has_source_namespace(&self, name: &str) -> bool {
         self.source_namespaces.contains(name)
+    }
+
+    /// The one source declaration of the constant `name` (full name).
+    pub(crate) fn source_constant(&self, name: &str) -> Option<DeclarationId> {
+        self.source_constants.get(name).copied().flatten()
     }
 
     /// The source classes and modules declared inside the source class
