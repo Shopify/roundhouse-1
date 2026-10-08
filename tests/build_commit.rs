@@ -102,6 +102,10 @@ impl Fixture {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("probe.rb"), "# fixture\n").unwrap();
         }
+        // The production script also watches the vendored `rbs/` tree;
+        // a watched path that does not exist reruns it on every build.
+        fs::create_dir_all(repo.join("rbs")).unwrap();
+        fs::write(repo.join("rbs/probe.rbs"), "# fixture\n").unwrap();
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "initial"]);
