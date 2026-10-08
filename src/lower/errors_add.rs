@@ -34,6 +34,7 @@
 
 use crate::app::App;
 use crate::diagnostic::Diagnostic;
+use super::active_model_model::Reading;
 use crate::expr::{Expr, ExprNode, InterpPart, Literal};
 use crate::ident::Symbol;
 use crate::ty::Ty;
@@ -47,8 +48,11 @@ pub fn apply_errors_add_lowering(app: &mut App) -> Vec<Diagnostic> {
     let port = super::active_model_model::ValidationsPort::of(app);
     super::for_each_owned_hook_body(app, &mut |owner, body| {
         let owner = owner.cloned();
-        rewrite_errors_add(body, &Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref() }, &mut diags)
+        let locals = port.locals(body);
+        let site = Site { localized: localized.as_ref(), port: &port, owner: owner.as_ref(), locals: &locals };
+        rewrite_errors_add(body, &site, &mut diags)
     });
+    diags.extend(port.take_notes());
     diags
 }
 
@@ -91,6 +95,7 @@ struct Site<'a> {
     localized: Option<&'a (String, usize)>,
     port: &'a super::active_model_model::ValidationsPort,
     owner: Option<&'a crate::ident::ClassId>,
+    locals: &'a super::active_model_model::PortLocals,
 }
 
 fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnostic>) {
@@ -122,12 +127,14 @@ fn rewrite_errors_add(expr: &mut Expr, site: &Site<'_>, diags: &mut Vec<Diagnost
     // A class over the ActiveModel::Validations port (and a module only
     // those include) holds the real ActiveModel::Errors: `add` is its
     // own, with Rails' arguments and messages.
-    if site.port.answers(r, site.owner) {
-        return;
-    }
-    if site.port.unknown(r, site.owner) {
-        site.port.refuse(expr, "errors.add");
-        return;
+    match site.port.classify(r, site.owner, site.locals) {
+        Reading::Port => return,
+        Reading::Refused => {
+            site.port.refuse(expr, "errors.add");
+            return;
+        }
+        Reading::Untyped => site.port.note_untyped("errors_add", "errors.add", expr.span),
+        Reading::Accumulator => {}
     }
     // The field: a Symbol literal is baked at lower time; a local or
     // parameter (`errors.add(attribute, …)` in an EachValidator's

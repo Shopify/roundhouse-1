@@ -341,13 +341,33 @@ pub(crate) struct ValidationsPort {
     /// includes) that are not themselves on it: a receiver typed as one
     /// (frozen_record's `FrozenRecord::Base`) may be a port record.
     above: crate::det::HashSet<ClassId>,
+    /// [`Self::note_untyped`]'s notes, for the pass to return.
+    notes: std::cell::RefCell<Vec<Diagnostic>>,
 }
+
+/// How an errors lowering treats an `errors` read
+/// ([`ValidationsPort::classify`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Reading {
+    /// The models' Array[String] accumulator: ground it.
+    Accumulator,
+    /// The port's ActiveModel::Errors: leave it as written.
+    Port,
+    /// May be the port's: refuse the site.
+    Refused,
+    /// Untyped, not flowing from a port class: ground it, with a note.
+    Untyped,
+}
+
+/// A body's locals that may hold a port record ([`ValidationsPort::locals`]).
+#[derive(Default)]
+pub(crate) struct PortLocals(crate::det::HashSet<Symbol>);
 
 impl ValidationsPort {
     pub(crate) fn of(app: &App) -> Self {
         let mut owners = crate::det::HashSet::default();
         if app.primary_database_adapter() != Some(&crate::database::DatabaseAdapter::Postgresql) {
-            return ValidationsPort { owners, above: Default::default() };
+            return ValidationsPort { owners, above: Default::default(), notes: Default::default() };
         }
         let port: Vec<&LibraryClass> = app
             .library_classes
@@ -359,7 +379,7 @@ impl ValidationsPort {
             })
             .collect();
         if port.is_empty() {
-            return ValidationsPort { owners, above: Default::default() };
+            return ValidationsPort { owners, above: Default::default(), notes: Default::default() };
         }
         owners.extend(port.iter().map(|lc| lc.name.clone()));
         let names = |include: &ClassId, module: &str| {
@@ -414,47 +434,124 @@ impl ValidationsPort {
             }
         }
         above.retain(|c| !owners.contains(c));
-        ValidationsPort { owners, above }
+        ValidationsPort { owners, above, notes: Default::default() }
     }
 
-    /// Whether `errors` (a zero-arg `errors` send) may read the port's
-    /// Errors without the receiver's type saying so: the tree carries
-    /// the port, and the receiver is untyped, or typed as a class above
-    /// a port class. The errors lowerings refuse such a site rather than
-    /// guess the Array accumulator (which a port record does not have).
-    pub(crate) fn unknown(&self, errors: &Expr, owner: Option<&ClassId>) -> bool {
-        if self.owners.is_empty() || self.answers(errors, owner) {
-            return false;
+    /// How the errors lowerings treat `errors` (a zero-arg `errors`
+    /// send) on a tree that carries the port; [`Reading::Accumulator`]
+    /// everywhere else. `locals` is the body's [`Self::locals`].
+    pub(crate) fn classify(&self, errors: &Expr, owner: Option<&ClassId>, locals: &PortLocals) -> Reading {
+        if self.owners.is_empty() {
+            return Reading::Accumulator;
         }
-        let ExprNode::Send { recv: Some(r), .. } = &*errors.node else { return false };
+        if self.answers(errors, owner) {
+            return Reading::Port;
+        }
+        let ExprNode::Send { recv: Some(r), .. } = &*errors.node else { return Reading::Accumulator };
         if matches!(&*r.node, ExprNode::SelfRef) {
-            return false;
+            return Reading::Accumulator;
         }
-        fn maybe(ty: Option<&crate::ty::Ty>, above: &crate::det::HashSet<ClassId>) -> bool {
-            use crate::ty::Ty;
-            match ty {
-                None | Some(Ty::Untyped | Ty::Var { .. }) => true,
-                Some(Ty::Class { id, .. }) => above.contains(id),
-                Some(Ty::Union { variants }) => variants.iter().any(|v| maybe(Some(v), above)),
-                Some(_) => false,
+        if self.may_be_port(r, locals) {
+            return Reading::Refused;
+        }
+        match r.ty.as_ref() {
+            None | Some(crate::ty::Ty::Untyped | crate::ty::Ty::Var { .. }) => Reading::Untyped,
+            Some(_) => Reading::Accumulator,
+        }
+    }
+
+    /// Whether a value may be a port record although its type does not
+    /// say it is one: typed as a class above a port class
+    /// (frozen_record's `FrozenRecord::Base`), or a union holding a port
+    /// class beside another class; or untyped and flowing from a port
+    /// class: a method called on one (`Probe::ApiVersion.find(id)`; a
+    /// class and its instances share the type), or a local of the body
+    /// assigned such a value.
+    fn may_be_port(&self, e: &Expr, locals: &PortLocals) -> bool {
+        use crate::ty::Ty;
+        let port_class = |ty: &Ty| matches!(ty, Ty::Class { id, .. } if self.owners.contains(id) || self.above.contains(id));
+        match e.ty.as_ref() {
+            Some(Ty::Class { .. }) => port_class(e.ty.as_ref().unwrap()),
+            Some(Ty::Union { variants }) => variants.iter().any(port_class),
+            None | Some(Ty::Untyped | Ty::Var { .. }) => match &*e.node {
+                ExprNode::Send { recv: Some(r), .. } => self.may_be_port(r, locals),
+                ExprNode::Var { name, .. } => locals.0.contains(name),
+                _ => false,
+            },
+            Some(_) => false,
+        }
+    }
+
+    /// The locals of `body` assigned a value that may be a port record
+    /// ([`Self::may_be_port`]), to a fixpoint (`b = a` after `a =
+    /// Probe::ApiVersion.find(id)`).
+    pub(crate) fn locals(&self, body: &Expr) -> PortLocals {
+        let mut locals = PortLocals::default();
+        if self.owners.is_empty() {
+            return locals;
+        }
+        fn assigns<'e>(e: &'e Expr, out: &mut Vec<(&'e Symbol, &'e Expr)>) {
+            if let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*e.node {
+                out.push((name, value));
+            }
+            e.node.for_each_child(&mut |c| assigns(c, out));
+        }
+        let mut found = Vec::new();
+        assigns(body, &mut found);
+        loop {
+            let before = locals.0.len();
+            for (name, value) in &found {
+                if !locals.0.contains(*name) && self.may_be_port(value, &locals) {
+                    locals.0.insert((*name).clone());
+                }
+            }
+            if locals.0.len() == before {
+                return locals;
             }
         }
-        maybe(r.ty.as_ref(), &self.above)
     }
 
-    /// Marks `site` (an `errors` spelling `unknown` holds for) refused,
-    /// naming the port's classes: the Ruby emitter writes the raise.
-    pub(crate) fn refuse(&self, site: &mut Expr, spelling: &str) {
+    /// The lowering note for an `errors` spelling on an untyped receiver
+    /// it grounds as the models' accumulator ([`Reading::Untyped`]).
+    pub(crate) fn note_untyped(&self, pass: &str, spelling: &str, span: Span) {
+        self.notes.borrow_mut().push(crate::lower::residue_diagnostic(
+            pass,
+            spelling,
+            span,
+            "untyped_receiver",
+            format!(
+                "`{spelling}` on a receiver of unknown type is grounded as the models' Array[String] accumulator; \
+                 on this PostgreSQL tree a record over ActiveModel::Validations ({}) holds Rails' ActiveModel::Errors \
+                 instead, which the receiver does not flow from here",
+                self.shown_owners()
+            ),
+        ));
+    }
+
+    /// The notes [`Self::note_untyped`] recorded.
+    pub(crate) fn take_notes(&self) -> Vec<Diagnostic> {
+        std::mem::take(&mut *self.notes.borrow_mut())
+    }
+
+    fn shown_owners(&self) -> String {
         let mut names: Vec<&str> = self.owners.iter().map(|c| c.0.as_str()).collect();
         names.sort_unstable();
         let shown = names.iter().take(4).map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
         let more = if names.len() > 4 { format!(" and {} more", names.len() - 4) } else { String::new() };
+        format!("{shown}{more}")
+    }
+
+    /// Marks `site` (an `errors` spelling [`Reading::Refused`] holds
+    /// for) refused, naming the port's classes: the Ruby emitter writes
+    /// the raise.
+    pub(crate) fn refuse(&self, site: &mut Expr, spelling: &str) {
         site.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
             target: None,
             construct: crate::ident::Symbol::from(spelling),
             detail: format!(
-                "the receiver's type is unknown, and on this PostgreSQL tree `errors` is the ActiveModel::Errors \
-                 port for {shown}{more} but the Array[String] accumulator for models: type the receiver"
+                "the receiver may be a record over ActiveModel::Validations, whose `errors` on this PostgreSQL tree \
+                 is the ActiveModel::Errors port ({}), where a model's is the Array[String] accumulator: type the receiver",
+                self.shown_owners()
             ),
         });
     }

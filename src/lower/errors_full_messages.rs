@@ -42,10 +42,17 @@ pub fn apply_errors_full_messages_lowering(app: &mut App) {
         return;
     }
     let port = super::active_model_model::ValidationsPort::of(app);
-    super::for_each_owned_hook_body(app, &mut |owner, body| rewrite(body, &port, owner));
-    super::for_each_test_body(app, &mut |body| rewrite(body, &port, None));
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        let locals = port.locals(body);
+        rewrite(body, &(&port, owner, &locals))
+    });
+    super::for_each_test_body(app, &mut |body| {
+        let locals = port.locals(body);
+        rewrite(body, &(&port, None, &locals))
+    });
     for view in &mut app.views {
-        rewrite(&mut view.body, &port, None);
+        let locals = port.locals(&view.body);
+        rewrite(&mut view.body, &(&port, None, &locals));
     }
 }
 
@@ -65,19 +72,20 @@ pub(crate) fn app_defines_full_messages(app: &App) -> bool {
         .any(|lc| lc.methods.iter().any(|m| is_fm(&m.name)))
 }
 
-fn rewrite(expr: &mut Expr, port: &super::active_model_model::ValidationsPort, owner: Option<&ClassId>) {
-    expr.node.for_each_child_mut(&mut |c| rewrite(c, port, owner));
-    rewrite_node(expr, port, owner);
+/// The ActiveModel::Validations port's classes, the body's owner and
+/// the body's locals that may hold a port record.
+pub(crate) type Site<'a> =
+    (&'a super::active_model_model::ValidationsPort, Option<&'a ClassId>, &'a super::active_model_model::PortLocals);
+
+fn rewrite(expr: &mut Expr, site: &Site<'_>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, site));
+    rewrite_node(expr, site);
 }
 
 /// `owner` is the class whose body this is; an `errors` that `port`
 /// answers (a class over the ActiveModel::Validations port, reading
 /// its own or another such record's) keeps Rails' `full_messages`.
-pub(crate) fn rewrite_node(
-    expr: &mut Expr,
-    port: &super::active_model_model::ValidationsPort,
-    owner: Option<&ClassId>,
-) {
+pub(crate) fn rewrite_node(expr: &mut Expr, &(port, owner, locals): &Site<'_>) {
     // `<recv>.errors.full_messages` — zero-arg, block-free on both hops.
     // The receiver being an `errors` reader is what makes this our
     // accumulator rather than some other object's method of the same
@@ -96,9 +104,15 @@ pub(crate) fn rewrite_node(
                 )
                 && !port.answers(r, owner) =>
         {
-            if port.unknown(r, owner) {
-                port.refuse(expr, "errors.full_messages");
-                return;
+            match port.classify(r, owner, locals) {
+                super::active_model_model::Reading::Refused => {
+                    port.refuse(expr, "errors.full_messages");
+                    return;
+                }
+                super::active_model_model::Reading::Untyped => {
+                    port.note_untyped("errors_full_messages", "errors.full_messages", expr.span)
+                }
+                _ => {}
             }
             Some((*r.node).clone())
         }
