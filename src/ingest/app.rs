@@ -3018,7 +3018,7 @@ fn concern_named<V>(
 /// block with the concern's lexical scope, so a bare constant the concern
 /// can see (`Gate` in `MutationGuard`, meaning `MutationGuard::Gate`) is
 /// written qualified; in the includer's body it would resolve elsewhere.
-fn rehome_carried(
+pub(super) fn rehome_carried(
     mut item: crate::dialect::ModelBodyItem,
     concern: &crate::ident::ClassId,
     model: &crate::ident::ClassId,
@@ -3187,9 +3187,14 @@ fn claim_class_attribute_writes(app: &mut App) {
             .into_iter()
             .partition(|e| super::class_attribute::self_write(e).is_some_and(|name| declared.contains(name)));
         lc.unknown_calls = rest;
-        if !writes.is_empty() {
+        if let Some(own) = writes.first().map(|e| e.span.file) {
             lc.class_ivar_initializers.extend(writes);
-            lc.class_ivar_initializers.sort_by_key(|e| e.span.start);
+            // By position in this body's file. A statement from another
+            // file, carried from a Concern's `included do`
+            // (`concern_accessors::splice_into_library_includers`), ran at
+            // the include and stays ahead, in its own order.
+            lc.class_ivar_initializers
+                .sort_by_key(|e| (e.span.file == own, if e.span.file == own { e.span.start } else { 0 }));
         }
     }
 }

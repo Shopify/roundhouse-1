@@ -62,7 +62,12 @@ pub(super) fn expand(
             // Concern whose `included` is only `attr_accessor` / custom
             // hooks is not a class_attribute carrier — surveying it
             // polluted store-check and model-concern suites.
-            if included_declares_class_attribute(&lc.unknown_calls) {
+            // And only for a controller's: a model's splice and a plain
+            // includer's (`concern_accessors::splice_into_library_includers`)
+            // carry the block their own way and report what they cannot.
+            let controller_carrier =
+                surfaces.controllers.values().any(|surface| surface.includes.contains(&lc.name));
+            if controller_carrier && included_declares_class_attribute(&lc.unknown_calls) {
                 survey::record(&IngestError::Unsupported {
                     file: lc.name.0.as_str().to_string(),
                     message: "class_attribute carrier `included do` must contain only class_attribute and filter DSL"

@@ -141,6 +141,19 @@ pub(super) fn verified_framework_concerns(
     module_includes: &HashMap<ClassId, Vec<ClassId>>,
     framework_shadows: &HashSet<ClassId>,
 ) -> HashSet<ClassId> {
+    framework_concern_verdicts(carriers, module_includes, framework_shadows)
+        .into_iter()
+        .filter_map(|(owner, verdict)| verdict.is_ok().then_some(owner))
+        .collect()
+}
+
+/// Every module that literally extends `ActiveSupport::Concern`, with why
+/// it is not [`verified_framework_concerns`] when it is not.
+pub(super) fn framework_concern_verdicts(
+    carriers: &[ConcernClassMethodSpans],
+    module_includes: &HashMap<ClassId, Vec<ClassId>>,
+    framework_shadows: &HashSet<ClassId>,
+) -> HashMap<ClassId, Result<(), &'static str>> {
     let mut extensions: HashMap<ClassId, Vec<crate::span::Span>> = HashMap::default();
     for carrier in carriers {
         extensions
@@ -150,7 +163,8 @@ pub(super) fn verified_framework_concerns(
     }
     extensions
         .iter()
-        .filter_map(|(owner, spans)| {
+        .filter(|(_, spans)| !spans.is_empty())
+        .map(|(owner, spans)| {
             // A literal path still resolves through Ruby's lexical
             // constants and the innermost module's included ancestors.
             // Refuse identity barriers, without evaluating their values
@@ -170,20 +184,21 @@ pub(super) fn verified_framework_concerns(
                     || lexical_scope(scope)
                     || included.iter().any(|id| id.0.as_str() == scope)
             };
-            let shadows_framework = framework_shadows
-                .iter()
-                .any(|scope| identity_scope(scope.0.as_str()));
-            let source_is_verified = !shadows_framework
-                && !spans.is_empty()
-                && carriers.iter().filter(|c| &c.owner == owner).all(|c| {
-                    !c.has_other_extensions
-                        && c.concern_calls.iter().all(|call| {
-                            spans.iter().any(|extension| {
-                                extension.file == call.file && extension.start < call.start
-                            })
-                        })
-                });
-            source_is_verified.then(|| owner.clone())
+            let own = || carriers.iter().filter(|c| &c.owner == owner);
+            let verdict = if framework_shadows.iter().any(|scope| identity_scope(scope.0.as_str())) {
+                Err("a scope its constants resolve through rebinds ActiveSupport::Concern, T::Sig or T::Helpers")
+            } else if own().any(|c| c.has_other_extensions) {
+                Err("it also extends a module other than ActiveSupport::Concern, T::Sig or T::Helpers, or declares `mixes_in_class_methods`, `sealed!` or `final!`, which change what an include does")
+            } else if !own().all(|c| {
+                c.concern_calls.iter().all(|call| {
+                    spans.iter().any(|extension| extension.file == call.file && extension.start < call.start)
+                })
+            }) {
+                Err("an `include`, `prepend` or `class_methods` precedes its `extend ActiveSupport::Concern`")
+            } else {
+                Ok(())
+            };
+            (owner.clone(), verdict)
         })
         .collect()
 }
