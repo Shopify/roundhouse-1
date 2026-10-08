@@ -400,3 +400,53 @@ fn a_concern_s_nameless_rest_runs_in_a_model_and_is_refused_in_a_controller() {
         .collect();
     assert_eq!(refused.len(), 1, "{refused:?}");
 }
+
+const REC: &str = r#"class Rec
+  def valid?(context = nil)
+    [:base, context]
+  end
+end
+"#;
+
+const CARD: &str = r#"class Card < Rec
+  def valid?(*)
+    super.tap { |result| result << :checked }
+  end
+end
+"#;
+
+const CARD_POLICY: &str = r#"class Card < Rec
+  module Policy
+    def self.x = 1
+  end
+end
+"#;
+
+const CARD_METHOD: &str = r#"class Card < Rec
+  def other = 1
+end
+"#;
+
+fn card_app(reopen: &str) -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/rec.rb", REC)
+        .write("app/models/card.rb", CARD)
+        .write("app/models/card/policy.rb", reopen)
+}
+
+/// Core's `GiftCard < GlobalDB::ShopRecord` is reopened in
+/// gift_card/redeemability_policy.rb to nest a module, restating its
+/// superclass. That reopen adds no member, so its `def valid?(*)` with
+/// a zsuper runs as written. A reopen that adds a method keeps the
+/// declaration refused.
+#[test]
+fn a_reopen_restating_the_superclass_keeps_a_nameless_rest_admitted() {
+    let script = "p Card.new.valid?, Card.new.valid?(:create), Card::Policy.x\n";
+    let expected = native(&[REC, CARD, CARD_POLICY], script);
+    assert_eq!(expected, "[:base, nil, :checked]\n[:base, :create, :checked]\n1\n");
+    let run = card_app(CARD_POLICY).run_ruby(script);
+    run.assert_passes();
+    assert_eq!(run.stdout, expected);
+    let (_, errors) = card_app(CARD_METHOD).emit(BuildTarget::Ruby);
+    assert!(errors.iter().any(|e| e.contains("a nameless rest in a reopened class fragment")), "{errors:?}");
+}
