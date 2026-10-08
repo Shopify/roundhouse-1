@@ -4283,16 +4283,23 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // ActiveSupport::Concern, Hash's key extensions and Action Controller's
     // errors (8.2.0.alpha concern.rb, core_ext/hash/keys.rb,
     // metal/exceptions.rb), which Rails loads before any gem,
-    // String#strip_heredoc (core_ext/string/strip.rb) and Module#mattr_*
-    // (core_ext/module/attribute_accessors.rb): a native gem's require of
-    // one answers from runtime/features.
+    // String#strip_heredoc (core_ext/string/strip.rb), Module#mattr_*
+    // (core_ext/module/attribute_accessors.rb), and Class#class_attribute
+    // and #descendants (core_ext/class/attribute.rb, subclasses.rb) over
+    // the descendants tracker, which an app may already carry: a native
+    // gem's require of one answers from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
-        "active_support_module_attribute_accessors",
+        "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
+        "active_support_descendants_tracker", "active_support_class_subclasses",
     ] {
+        let to = format!("runtime/{port}.rb");
+        if files.iter().any(|(p, _)| *p == to) {
+            continue;
+        }
         let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
             .map_err(|e| format!("read {port} runtime: {e}"))?;
-        files.push((format!("runtime/{port}.rb"), text));
+        files.push((to, text));
     }
     framework_feature_files(files);
     files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
@@ -4960,6 +4967,11 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
     ("active_support/core_ext/module/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/core_ext/class/attribute_accessors", &["active_support_module_attribute_accessors"]),
+    ("active_support/core_ext/module/redefine_method", &["active_support_redefine_method"]),
+    ("active_support/core_ext/class", &["active_support_class_attribute", "active_support_class_subclasses"]),
+    ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
+    ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
+    ("active_support/descendants_tracker", &["active_support_descendants_tracker"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
@@ -9758,6 +9770,9 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_hash_keys.rb"
         && p != "runtime/active_support_string_strip.rb"
         && p != "runtime/active_support_module_attribute_accessors.rb"
+        && p != "runtime/active_support_redefine_method.rb"
+        && p != "runtime/active_support_class_attribute.rb"
+        && p != "runtime/active_support_class_subclasses.rb"
         && p != "runtime/action_controller_exceptions.rb"
         && p != "runtime/active_support_attribute_accessors_per_thread.rb"
         && p != "runtime/active_support_inflector.rb"

@@ -48,6 +48,9 @@ require "action_view"
 require "active_support/core_ext/string/strip"
 require "active_support/core_ext/module/attribute_accessors.rb"
 require "active_support/core_ext/class/attribute_accessors"
+require "active_support/core_ext/class"
+require "active_support/core_ext/class/attribute"
+require "active_support/core_ext/module/redefine_method"
 
 require "rails/engine"
 
@@ -197,6 +200,43 @@ module ProbeGem
      File.basename(Settings.instance_method(:level).source_location.first), File.basename(Holder.method(:count).source_location.first)]
   end
 
+  # activerecord-rescue_from_duplicate's and app_profiler's class
+  # attributes.
+  class AttrBase
+    class_attribute :setting, default: :base
+    class_attribute :tags, instance_writer: false, default: []
+    class_attribute :secret, instance_accessor: false, instance_predicate: false
+  end
+
+  class AttrChild < AttrBase; end
+
+  class AttrGrandChild < AttrChild; end
+
+  def self.class_ext
+    AttrChild.setting = :child
+    b = AttrBase.new
+    c = AttrChild.new
+    c.setting = :instance
+    invalid = begin
+      Class.new { class_attribute 1 }
+    rescue TypeError => e
+      e.message
+    end
+    single = Object.new
+    single.singleton_class.class_attribute :solo, default: :s
+    redefined = Class.new do
+      def x = 1
+      private def y = 2
+    end
+    redefined.redefine_method(:x) { 10 }
+    redefined.redefine_method(:y) { 20 }
+    [AttrBase.setting, AttrChild.setting, AttrGrandChild.setting, b.setting, c.setting, AttrChild.new.setting, AttrBase.setting?, b.setting?,
+     b.respond_to?(:tags=), AttrBase.tags, AttrBase.respond_to?(:secret), b.respond_to?(:secret), b.respond_to?(:secret?), AttrBase.respond_to?(:secret?),
+     invalid, single.solo, AttrBase.descendants.map(&:name).sort, AttrBase.subclasses.map(&:name), AttrGrandChild.descendants,
+     redefined.new.x, redefined.private_method_defined?(:y), redefined.new.send(:y), redefined.method_visibility(:y),
+     ActiveSupport::DescendantsTracker.descendants(AttrBase).size]
+  end
+
   # typed_parameters' deprecation warning shape.
   def self.strip
     usage = <<-EOM
@@ -268,6 +308,7 @@ module ProbeGem
       hash_keys: hash_keys,
       strip: strip,
       mattr: mattr,
+      class_ext: class_ext,
       load_hooks: (ActiveSupport.run_load_hooks(:probe_gem_hook, :base); HOOKS),
       notifications: notifications,
       logger: logger,
@@ -352,6 +393,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         // `included`/`prepended` blocks, a second `included` refused.
         "concern: [[\"ProbeGem::Record\", \"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\"], true, :record_deleted, [:deleted_at], :s, [\"ProbeGem::SoftDeletable\", \"ProbeGem::Stamped\", \"ProbeGem::PrependedRecord\"], :prependedrecord_deleted, true, \"Cannot define multiple 'included' blocks for a Concern\"]",
         "try: [nil, 3, nil, \"ABC\", nil, :nope]",
+        "class_ext: [:base, :child, :child, :base, :instance, :child, true, true, false, [], true, false, false, false, \"1 is not a symbol nor a string\", :s, [\"ProbeGem::AttrChild\", \"ProbeGem::AttrGrandChild\"], [\"ProbeGem::AttrChild\"], [], 10, true, 20, :private, 2]",
         "mattr: [:warn, :warn, [:block], [:block], :io, false, true, false, 2, 2, 5, \"invalid attribute name: bad-name\", \"module attributes should be defined directly on class, not singleton\", \"probe_gem.rb\", \"probe_gem.rb\"]",
         "strip: [\"This command does such and such.\\n\\nSupported options are:\\n  -h         This message\\n\", \"x\\n  y\"",
         "hash_keys: [{\"a\" => {b: [{c: 1}]}, \"d\" => 2, \"3\" => :x}",

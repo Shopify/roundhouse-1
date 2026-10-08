@@ -7,10 +7,11 @@
 # (active_support_callbacks.rb), and Core extends classes with it and asks
 # `ActiveSupport::DescendantsTracker.descendants(klass)`.
 #
-# Not carried: core_ext/class/subclasses.rb, which reopens every Class with
-# `descendants` and prepends ReloadedClassesFiltering to it. A class that
-# extends the tracker answers `descendants` from the module's own method,
-# as natively.
+# core_ext/class/subclasses.rb, which reopens every Class with
+# `descendants` and prepends ReloadedClassesFiltering to it, loads only on
+# a native gem's require of it on the PostgreSQL tree
+# (active_support_class_subclasses.rb). A class that extends the tracker
+# answers `descendants` from the module's own method, as natively.
 
 require "weakref"
 
