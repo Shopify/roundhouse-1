@@ -392,7 +392,8 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
             // objects. Real Rails templates iterate via `e.full_message`;
             // rewrite that bareword projection back to the local so it
             // type-checks against spinel's runtime.
-            let body = if is_errors_each(recv) {
+            let messages = is_errors_each(recv);
+            let body = if messages {
                 rewrite_errors_each_body(body, &var_name)
             } else {
                 body.clone()
@@ -413,7 +414,7 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                     block_style: *block_style,
                 },
             );
-            vec![Expr::new(
+            let mut each = Expr::new(
                 Span::synthetic(),
                 ExprNode::Send {
                     recv: Some(recv.clone()),
@@ -422,7 +423,11 @@ fn walk_stmt(stmt: &Expr, ctx: &ViewCtx) -> Vec<Expr> {
                     block: Some(block_lambda),
                     parenthesized: false,
                 },
-            )]
+            );
+            if messages {
+                each.hint = Some(crate::expr::IrHint::ErrorMessagesEach);
+            }
+            vec![each]
         }
         // A receiver'd, blockless call in statement position (`<%
         // ancestors << subtree %>`) — a side-effecting mutation whose

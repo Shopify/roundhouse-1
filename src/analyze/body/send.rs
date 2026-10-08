@@ -506,16 +506,10 @@ impl<'a> BodyTyper<'a> {
             Ty::Class { id, .. } if id.0.as_str() == "CSV" && method.as_str() == "generate" => {
                 Some(vec![recv_ty.clone()])
             }
-            // ActiveModel::Errors iteration yields an Error to the block.
+            // ActiveModel::Errors iteration yields an Error to the block,
+            // as the Array of its Errors does (`expr::errors_enumerable`).
             Ty::Class { id, .. } if id.0.as_str() == "ActiveModel::Errors" => {
-                match method.as_str() {
-                    "each" | "map" | "collect" | "select" | "filter" | "reject"
-                    | "any?" | "all?" | "none?" => Some(vec![Ty::Class {
-                        id: ClassId(Symbol::from("ActiveModel::Error")),
-                        args: vec![],
-                    }]),
-                    _ => None,
-                }
+                self.block_params_for(Some(&active_model_error_objects()), method)
             }
             // Generic class-registry lookup: when the method is
             // registered with a Ty::Fn whose `block` field is set, use
@@ -3666,3 +3660,9 @@ fn only_option_literal(arg: &Expr) -> bool {
         && entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: crate::expr::Literal::Sym { value } } if value.as_str() == "only"))
 }
 
+
+/// `errors.errors` / `objects`: the Array of the collection's
+/// ActiveModel::Error, which Enumerable over the collection runs on.
+pub(super) fn active_model_error_objects() -> Ty {
+    Ty::Array { elem: Box::new(Ty::Class { id: ClassId(Symbol::from("ActiveModel::Error")), args: vec![] }) }
+}

@@ -2498,6 +2498,20 @@ impl<'a> BodyTyper<'a> {
                 if recv_ty == Some(Ty::Int) && method.as_str() == "times" && block.is_none() && args.is_empty() {
                     return Ty::Array { elem: Box::new(Ty::Int) };
                 }
+                // Enumerable over Rails' collection (`expr::errors_enumerable`):
+                // it runs over the Errors, an Array of ActiveModel::Error on
+                // the trees that build them (`expr::ERRORS_PORT_CALL`).
+                if crate::expr::errors_enumerable(method.as_str(), args.len(), block.is_some())
+                    && expr.hint != Some(crate::expr::IrHint::ErrorMessagesEach)
+                    && matches!(recv_ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == "ActiveModel::Errors")
+                {
+                    expr.decisions |= crate::expr::ERRORS_PORT_CALL;
+                    let objects = send::active_model_error_objects();
+                    if matches!(method.as_str(), "errors" | "objects") {
+                        return objects;
+                    }
+                    return self.dispatch(Some(&objects), method, block_ret.as_ref(), args);
+                }
                 let dispatched = self.dispatch(recv_ty.as_ref(), method, block_ret.as_ref(), args);
                 if let Some(receiver) = recv.as_mut() {
                     receiver.decisions &= !crate::expr::RESOLVED_OPERATOR_RECEIVER;

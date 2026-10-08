@@ -13,7 +13,13 @@
 # `other.errors` as a NestedError unless `other` is this collection;
 # `#add`'s `normalize_arguments` symbolizes each attribute) for the
 # CRuby and JRuby trees, with an Error per recorded message (`objects`)
-# for what `merge!` answers.
+# for what `merge!` answers. Rails' collection includes Enumerable over
+# `each`, which yields each Error: `errors.map(&:attribute)`,
+# `errors.first`, `errors.group_by(&:attribute)` and the like, and
+# `errors.errors` / `objects`, are written over
+# `ActiveModel::ErrorAttributes.objects(errors)`
+# (`expr::errors_enumerable`); a blockless count or emptiness query
+# answers the same over the messages and stays on the accumulator.
 #
 # The emitted record's `errors` is the shared runtime's accumulator, an
 # Array of full messages: the validates lowering bakes "Title can't be

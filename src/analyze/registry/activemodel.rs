@@ -173,6 +173,16 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("message", Ty::Str),
         ("attribute", Ty::Sym),
         ("type", Ty::Sym),
+        // The type as added (a Symbol, or the message added as text),
+        // its options, and `details` (`{error: raw_type, **options}`):
+        // runtime/spinel/active_model_errors.rb's Error answers them
+        // where the push recorded them.
+        ("raw_type", Ty::Untyped),
+        ("options", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+        ("details", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+        ("detail", Ty::Hash { key: Box::new(Ty::Sym), value: Box::new(Ty::Untyped) }),
+        ("match?", Ty::Bool),
+        ("strict_match?", Ty::Bool),
     ] {
         error_cls.instance_methods.insert(Symbol::from(m), ty);
     }

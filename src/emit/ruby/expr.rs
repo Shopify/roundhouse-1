@@ -246,7 +246,41 @@ fn error_attribute_push(e: &Expr) -> Option<String> {
     if !ERROR_ATTRIBUTES.with(Cell::get) {
         return None;
     }
-    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*e.node else { return None };
+    let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*e.node else { return None };
+    // Enumerable over Rails' collection (`expr::errors_enumerable`): the
+    // same call over `ActiveModel::ErrorAttributes.objects(errors)`, the
+    // Errors the accumulator's messages were added as.
+    if e.decisions & crate::expr::ERRORS_PORT_CALL != 0
+        && crate::expr::errors_enumerable(method.as_str(), args.len(), block.is_some())
+    {
+        let span = crate::span::Span::synthetic();
+        let port = Expr::new(
+            span,
+            ExprNode::Const { path: vec![Symbol::from("ActiveModel"), Symbol::from("ErrorAttributes")] },
+        );
+        let objects = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(port),
+                method: Symbol::from("objects"),
+                args: vec![recv.clone()],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        if matches!(method.as_str(), "errors" | "objects") {
+            return Some(emit_expr(&objects));
+        }
+        let mut call = e.clone();
+        call.decisions &= !crate::expr::ERRORS_PORT_CALL;
+        if let ExprNode::Send { recv, .. } = &mut *call.node {
+            *recv = Some(objects);
+        }
+        return Some(emit_expr(&call));
+    }
+    if block.is_some() {
+        return None;
+    }
     // The Error's type and options, trailing (`expr::ErrorDetail`): the
     // type alone where its options are not known, and the short message
     // (`ErrorAttributes::SHORT`) where it is the type.

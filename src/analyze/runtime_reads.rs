@@ -517,6 +517,11 @@ pub(crate) const GATED_METHODS: &[(&str, Typed, &str)] = &[
 /// The namespace a gated method read needs, if `expr` is one.
 fn gated_method(expr: &Expr) -> Option<(&'static str, String)> {
     let ExprNode::Send { recv, method, .. } = &*expr.node else { return None };
+    // A call the analyzer routed to the port (`expr::ERRORS_PORT_CALL`):
+    // Enumerable over the Errors, and the reads listed below.
+    if expr.decisions & crate::expr::ERRORS_PORT_CALL != 0 {
+        return Some(("ActiveModel::ErrorAttributes", format!("ActiveModel::Errors#{}", method.as_str())));
+    }
     GATED_METHODS.iter().find_map(|(name, typed, needs)| {
         if *name != method.as_str() {
             return None;
