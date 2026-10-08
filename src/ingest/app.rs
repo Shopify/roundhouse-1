@@ -2515,6 +2515,9 @@ end
     // PostgreSQL trees, whose boot runs the load hooks (below).
     if declared_database_adapter(vfs, dir).ok().flatten().is_some_and(|(adapter, _)| adapter == "postgresql") {
         super::load_hook_includes::lift(&mut app, vfs, dir, &sources, &boot_initializers);
+        // `Rails.autoloaders.main.on_load("ApplicationRecord") {
+        // ApplicationRecord.include(M) }`: the include ends the model's body.
+        super::load_hook_includes::lift_autoload_includes(&mut app, vfs, &boot_initializers);
     }
     // Before the splice: it (and every later consumer) looks concerns up
     // by ClassId, so the lexical-scope resolution has to have happened.

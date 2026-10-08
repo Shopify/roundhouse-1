@@ -417,19 +417,19 @@ module Rails
 
       # Finisher's `:eager_load!` (railties application/finisher.rb):
       # when the environment eager loads, the `:before_eager_load` hooks
-      # (I18n::Railtie initializes I18n there), then every
-      # `config.eager_load_namespaces` member's `eager_load!` (I18n,
-      # each engine, a gem's: phonelib loads its phone data). Rails
-      # eager loads the app's own code (`Zeitwerk::Loader.eager_load_all`,
-      # `Rails.eager_load!`) between the two; this tree has loaded it
-      # already, in app/models.rb before the app's initializers, as it
-      # loads every app file before them, so here the hooks run after
-      # the app's code rather than before it. The reloader part runs only
-      # under `config.reloading_enabled?`, false in this tree.
+      # (I18n::Railtie initializes I18n there), then the app's own code
+      # (`Zeitwerk::Loader.eager_load_all`; the emitted autoloader is
+      # app/models.rb's, and the app's initializers have registered their
+      # Zeitwerk `on_load` callbacks by now, runtime/rails_autoloaders.rb),
+      # then every `config.eager_load_namespaces` member's `eager_load!`
+      # (I18n, each engine, a gem's: phonelib loads its phone data). The
+      # reloader part runs only under `config.reloading_enabled?`, false
+      # in this tree.
       def eager_load_step(app) # :nodoc:
         return unless defined?(::RoundhouseAutoload) && ::RoundhouseAutoload.eager_load?
 
         ActiveSupport.run_load_hooks(:before_eager_load, app)
+        ::RoundhouseAutoload.eager_load!
         Configuration.eager_load_namespaces.each(&:eager_load!)
       end
 

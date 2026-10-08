@@ -44,8 +44,10 @@
 //! level; `__FILE__`, `__dir__`, `require_relative` and `load` (the
 //! initializer's own path); `return`/`yield`; calls with an implicit
 //! receiver outside a load hook, other than [`KERNEL`]; `instance_eval`
-//! and friends; Zeitwerk's `Rails.autoloaders.*.on_load` (the emitted
-//! tree has no Zeitwerk loader); a `require` that is neither a runtime
+//! and friends; Zeitwerk's `on_load` without a literal constant path,
+//! or on a loader other than `Rails.autoloaders.main`/`.once` (the
+//! emitted tree reports the load only of a constant a literal path
+//! names, runtime/spinel/rails_autoloaders.rb); a `require` that is neither a runtime
 //! port, a lib file boot already loads, nor a standard library feature;
 //! and a statement that does not ingest as app code.
 
@@ -325,6 +327,27 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
             {
                 continue;
             }
+            // A Zeitwerk callback ingest moved into its constant's body
+            // (`load_hook_includes::lift_autoload_includes`): its check.
+            if let Some(lifted) =
+                app.lifted_autoload_callbacks.iter().find(|l| l.file == file && l.start as usize == start).cloned()
+            {
+                let site = label(&rel, &text, &stmt);
+                let span = crate::span::Span {
+                    file: super::sources::file_id(&file),
+                    start: start as u32,
+                    end: end as u32,
+                };
+                match lifted_registration(&lifted.cpath, &site, span) {
+                    Ok(expr) => {
+                        kept.push(guard(expr, &site));
+                        super::initializers::consume(&file, start, end);
+                        carried += 1;
+                    }
+                    Err(reason) => super::initializers::refuse(&file, start, end, reason),
+                }
+                continue;
+            }
             let scan = Scan::new(inputs, fired, &mut framework);
             let mut scan = scan;
             match scan.statement(&stmt) {
@@ -400,6 +423,25 @@ pub(super) fn collect<V: Vfs + ?Sized>(app: &mut App, inputs: &Inputs<'_, V>, fi
         });
     }
     app.framework_load_hooks = framework.into_values().collect();
+}
+
+/// `Rails.autoloaders.main.on_load_lifted("Cpath", "site")`: the check a
+/// lifted callback leaves at its registration.
+fn lifted_registration(cpath: &str, site: &str, span: crate::span::Span) -> Result<Expr, String> {
+    let quote = |text: &str| -> String { text.chars().filter(|c| !matches!(c, '"' | '\\' | '#')).collect() };
+    let template = format!(
+        "def __lifted\n  Rails.autoloaders.main.on_load_lifted(\"{}\", \"{}\")\nend\n",
+        quote(cpath),
+        quote(site)
+    );
+    let mut methods = crate::runtime_src::parse_methods(&template).map_err(|e| format!("does not ingest: {e}"))?;
+    let method = methods.pop().ok_or("does not ingest")?;
+    let mut expr = match &*method.body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => exprs[0].clone(),
+        _ => method.body,
+    };
+    expr.span = span;
+    Ok(expr)
 }
 
 pub(super) fn holder_class(name: &str, method: MethodDef) -> LibraryClass {
@@ -642,6 +684,19 @@ pub(super) struct EnvironmentRules<'s> {
     pub config_write: &'s dyn Fn(&Node<'_>) -> Option<String>,
 }
 
+/// What an `on_load` is.
+enum Hook {
+    /// `ActiveSupport.on_load(:hook)` the emitted app fires: the block
+    /// runs on the hook's base.
+    Fired,
+    /// One a runtime port lifts itself.
+    Lifted,
+    /// Zeitwerk's `Rails.autoloaders.main.on_load("Cpath")`
+    /// (runtime/spinel/rails_autoloaders.rb): the block runs at `main`
+    /// when the constant's file loads.
+    Autoload,
+}
+
 /// The admission rule (module doc), statement by statement.
 pub(super) struct Scan<'s, 'a, V: Vfs + ?Sized> {
     inputs: &'s Inputs<'a, V>,
@@ -683,11 +738,14 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
                             self.visit(&a);
                         }
                     }
-                    let hook = name == "on_load";
+                    // A load hook's block runs on its base; a Zeitwerk
+                    // callback's at `main`, like the rest of the file.
+                    let mut hook = name == "on_load";
                     if hook {
                         match self.hook(&call) {
-                            Ok(true) => {}
-                            Ok(false) => return Verdict::Lifted,
+                            Ok(Hook::Fired) => {}
+                            Ok(Hook::Autoload) => hook = false,
+                            Ok(Hook::Lifted) => return Verdict::Lifted,
                             Err(reason) => return Verdict::Refused(reason),
                         }
                     }
@@ -732,18 +790,33 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
         }
     }
 
-    /// `Ok(true)`: an `on_load` the emitted app fires; `Ok(false)`: one a
-    /// runtime port lifts itself; `Err`: why it cannot run.
-    fn hook(&mut self, call: &ruby_prism::CallNode<'_>) -> Result<bool, String> {
+    /// Which `on_load` `call` is, or why it cannot run.
+    fn hook(&mut self, call: &ruby_prism::CallNode<'_>) -> Result<Hook, String> {
         let receiver = call.receiver().ok_or("a receiverless `on_load`")?;
         let path = constant_path_segments_strs(&receiver).map(|p| p.join("::"));
         if path.as_deref() != Some("ActiveSupport") {
             let loc = receiver.location();
             let text = String::from_utf8_lossy(loc.as_slice());
+            if super::load_hook_includes::rails_autoloader(&receiver).is_some() {
+                // runtime/spinel/rails_autoloaders.rb: the emitted file
+                // of a constant a literal path names reports its load.
+                let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                return match args.as_slice() {
+                    [] => Err("Zeitwerk `on_load` without a constant path runs for every constant's load; the \
+                               emitted tree reports the load only of a constant a literal path names"
+                        .into()),
+                    [cpath] if cpath.as_string_node().is_some() => Ok(Hook::Autoload),
+                    _ => Err("Zeitwerk `on_load` with a computed constant path; the emitted tree reports the load \
+                              only of a constant a literal path names"
+                        .into()),
+                };
+            }
             if text.contains("autoloaders") {
-                return Err("Zeitwerk `on_load` runs when its loader autoloads the constant; the emitted tree has \
-                            no Zeitwerk loader"
-                    .into());
+                return Err(format!(
+                    "Zeitwerk `on_load` on `{}`, not `Rails.autoloaders.main` or `.once`, the loaders the \
+                     emitted tree ports",
+                    cap(&text, 40)
+                ));
             }
             return Err(format!("`on_load` on `{}` is not ActiveSupport's load hook", cap(&text, 40)));
         }
@@ -752,7 +825,7 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
             return Err("`on_load` with a computed hook name".into());
         };
         if self.inputs.lifted.contains(&name.as_str()) {
-            return Ok(false);
+            return Ok(Hook::Lifted);
         }
         if let Some((hook, base, site)) = FRAMEWORK_LOAD_HOOKS.iter().find(|(h, _, _)| *h == name) {
             self.framework.entry(name.clone()).or_insert_with(|| FrameworkLoadHook {
@@ -760,10 +833,10 @@ impl<'s, 'a, V: Vfs + ?Sized> Scan<'s, 'a, V> {
                 base: base.to_string(),
                 site: site.to_string(),
             });
-            return Ok(true);
+            return Ok(Hook::Fired);
         }
         if self.fired.bases.contains_key(&name) {
-            return Ok(true);
+            return Ok(Hook::Fired);
         }
         Err(format!(
             "nothing fires `:{name}`: no `ActiveSupport.run_load_hooks(:{name}, …)` in the runtime or the app's code"
@@ -827,9 +900,10 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
             return;
         }
         if name == "on_load" && node.block().is_some() {
-            match self.scan.hook(node) {
-                Ok(true) => {}
-                Ok(false) => {
+            let rebinds = match self.scan.hook(node) {
+                Ok(Hook::Fired) => true,
+                Ok(Hook::Autoload) => false,
+                Ok(Hook::Lifted) => {
                     self.scan.refuse("an adapter load hook inside another statement");
                     return;
                 }
@@ -837,7 +911,7 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
                     self.scan.refuse(reason);
                     return;
                 }
-            }
+            };
             if let Some(r) = node.receiver() {
                 self.visit(&r);
             }
@@ -847,9 +921,9 @@ impl<'pr, V: Vfs + ?Sized> ruby_prism::Visit<'pr> for ScanVisit<'_, '_, '_, V> {
                 }
             }
             if let Some(block) = node.block() {
-                self.scan.in_hook += 1;
+                self.scan.in_hook += usize::from(rebinds);
                 self.visit(&block);
-                self.scan.in_hook -= 1;
+                self.scan.in_hook -= usize::from(rebinds);
             }
             return;
         }

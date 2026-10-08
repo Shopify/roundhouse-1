@@ -170,7 +170,7 @@ fn carried_statements_and_their_refusals() {
         app.initializer_programs.iter().map(|p| (p.file.as_str(), p.statements)).collect();
     assert_eq!(
         programs,
-        [("config/initializers/10_first.rb", 7), ("config/initializers/20_second.rb", 2)],
+        [("config/initializers/10_first.rb", 7), ("config/initializers/20_second.rb", 3)],
         "{:?}",
         app.initializer_programs
     );
@@ -184,17 +184,18 @@ fn carried_statements_and_their_refusals() {
     assert!(first[0].detail.starts_with("`def` in an initializer"), "{}", first[0].detail);
     let second = gaps_in(&app, "config/initializers/20_second.rb");
     let second: Vec<(&str, &str)> = second.iter().map(|g| (g.construct.as_str(), g.detail.as_str())).collect();
-    assert_eq!(second.len(), 3, "{second:?}");
+    // The Zeitwerk callback is carried (runtime/spinel/rails_autoloaders.rb).
+    assert_eq!(second.len(), 2, "{second:?}");
     assert_eq!(second[0].0, "ActiveSupport.on_load");
     assert!(second[0].1.starts_with("nothing fires `:never_fired`"), "{second:?}");
     assert!(second[1].1.starts_with("`configure_widgets` has an implicit receiver"), "{second:?}");
-    assert!(second[2].1.starts_with("Zeitwerk `on_load`"), "{second:?}");
 }
 
 /// Boot runs both initializers in order, the `:active_record` hook at
 /// registration (the runtime's base is loaded), a raising statement named
-/// and skipped, `after_initialize` in the Finisher, and the app hook when
-/// `WidgetRegistry` loads. Boot loads the `pg` gem (it never connects):
+/// and skipped, the app hook and then Zeitwerk's `on_load(
+/// "WidgetRegistry")` when Finisher's eager loading loads `WidgetRegistry`,
+/// and `after_initialize` after it. Boot loads the `pg` gem (it never connects):
 /// run with `--ignored` and a `GEM_PATH` that has it.
 #[test]
 #[ignore = "requires ruby with the pg gem"]
@@ -232,6 +233,12 @@ fn boot_runs_initializer_statements_in_rails_order() {
             "first: active_record on ActiveRecord::Base",
             "first: after the raise",
             "second: top saw 3",
+            // Zeitwerk's on_load("WidgetRegistry"), once its file loaded,
+            // after its body's load hook: Finisher's `eager_load!` (the
+            // fixture's test environment leaves `config.eager_load` nil,
+            // true by default) loads it before the `after_initialize`
+            // hooks.
+            "zeitwerk",
             "first: after_initialize",
             "[\"from first\"]",
         ],

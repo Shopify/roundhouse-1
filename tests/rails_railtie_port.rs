@@ -129,11 +129,13 @@ fn a_gem_s_railtie_defines_against_the_port_and_its_initializers_run_at_boot() {
     assert!(gems < models && models < finish, "{boot}");
     // The :boot phase runs once app/models has loaded the boot files and
     // the carried engines, before eager loading, as Rails runs it before
-    // `eager_load!`.
+    // `eager_load!`, which is Finisher's: the :finish phase's, after the
+    // app's initializers (runtime/rails_railtie.rb).
     let autoload = std::fs::read_to_string(dir.join("app/models.rb")).expect("app/models.rb");
     let run = autoload.find("Rails::Railtie.run_initializers_of_railties(Rails.application, :boot)").unwrap_or_else(|| panic!("{autoload}"));
-    let eager = autoload.find("RoundhouseAutoload.eager_load! if RoundhouseAutoload.eager_load?").unwrap_or_else(|| panic!("{autoload}"));
-    assert!(run < eager, "{autoload}");
+    assert!(!autoload[run..].contains("RoundhouseAutoload.eager_load!"), "{autoload}");
+    let railtie_port = std::fs::read_to_string(dir.join("runtime/rails_railtie.rb")).expect("rails_railtie.rb");
+    assert!(railtie_port.contains("::RoundhouseAutoload.eager_load!"), "{railtie_port}");
     let facades = std::fs::read_to_string(dir.join("runtime/gem_facades.rb")).expect("gem_facades.rb");
     let features = facades.find("$LOAD_PATH.unshift(File.expand_path(\"features\", __dir__))").unwrap_or_else(|| panic!("{facades}"));
     let dependency = facades.find("[\"hashlike\"].each do |feature|").unwrap_or_else(|| panic!("{facades}"));
