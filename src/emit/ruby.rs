@@ -1467,14 +1467,14 @@ pub fn emit_with_assertions(
                 consts_block.push('\n');
                 emitted.content = splice_after_class_header(&emitted.content, &consts_block);
             }
-            // Inner classes (declared inside the test class body in
-            // Ruby — `class Validatable; include …; end` inside
-            // ValidationsTest) hoist to file scope above the test
-            // class body so test methods that reference them by bare
-            // name resolve. CRuby would also accept the original
-            // nested form, but the IR has already flattened them via
-            // `lower_test_modules_with_inner`; emitting at file scope
-            // mirrors the TS pattern and keeps both targets aligned.
+            // Inner classes and modules (declared inside the test
+            // class body in Ruby — `class Validatable; include …; end`
+            // inside ValidationsTest — or beside it) go above the test
+            // class body. Each keeps its Ruby name: one in the test
+            // class body is written nested in a reopen of the test
+            // class (`ValidationsTest::Validatable`), so a bare read in
+            // a test method resolves to it lexically, as in the source,
+            // and its `name` is the source's.
             if !lowered.inner_classes.is_empty() {
                 let mut companion_block = String::new();
                 for inner in &lowered.inner_classes {
