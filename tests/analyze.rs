@@ -1719,6 +1719,49 @@ fn unresolved_type_names(app: &roundhouse::App) -> Vec<String> {
         .collect()
 }
 
+/// A `def` in a block (`fo.instance_exec do def destroyed? … end end`,
+/// Core's example_* concerns) is typed as a scope gate whose `self`
+/// nothing types: the ivars it reads are that instance's, gradual, not
+/// unresolved. A plain method's unassigned ivar still is.
+#[test]
+fn ivars_of_a_block_def_are_gradual() {
+    let app = app_from_files(&[
+        (
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\nend\n",
+        ),
+        (
+            "app/models/widget.rb",
+            r#"class Widget < ApplicationRecord
+  def self.example
+    w = Widget.new
+    w.instance_exec do
+      def destroy
+        @destroyed = true
+      end
+
+      def destroyed?
+        @destroyed
+      end
+
+      def labelled
+        @label = "x"
+        @label.upcase
+      end
+    end
+    w
+  end
+
+  def stray
+    @never_written
+  end
+end
+"#,
+        ),
+    ]);
+    assert_eq!(ivar_unresolved_names(&app), vec!["never_written".to_string()]);
+}
+
 #[test]
 fn association_writers_and_ar_instance_methods_resolve() {
     // belongs_to/has_one register a writer `name=` (not just the reader),
