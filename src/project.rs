@@ -4286,12 +4286,15 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     // String#strip_heredoc (core_ext/string/strip.rb), Module#mattr_*
     // (core_ext/module/attribute_accessors.rb), and Class#class_attribute
     // and #descendants (core_ext/class/attribute.rb, subclasses.rb) over
-    // the descendants tracker, which an app may already carry: a native
-    // gem's require of one answers from runtime/features.
+    // the descendants tracker, which an app may already carry, and
+    // Numeric's byte and Duration builders (core_ext/numeric/bytes.rb,
+    // time.rb) and BigDecimal#to_s (core_ext/big_decimal/conversions.rb):
+    // a native gem's require of one answers from runtime/features.
     for port in [
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
         "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
-        "active_support_descendants_tracker", "active_support_class_subclasses",
+        "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
+        "active_support_numeric_time", "active_support_big_decimal_conversions",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -4300,6 +4303,17 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
             .map_err(|e| format!("read {port} runtime: {e}"))?;
         files.push((to, text));
+    }
+    // ActiveSupport::NumberHelper and Numeric#to_fs over it
+    // (number_helper.rb, core_ext/numeric/conversions.rb), which translate
+    // through I18n; core_ext/numeric is all three Numeric extensions, so
+    // without i18n it has no file and is refused by name.
+    if carries_i18n {
+        for port in ["active_support_number_helper", "active_support_numeric_conversions", "active_support_numeric"] {
+            let text = crate::runtime_files::read_to_string(&format!("runtime/spinel/{port}.rb"))
+                .map_err(|e| format!("read {port} runtime: {e}"))?;
+            files.push((format!("runtime/{port}.rb"), text));
+        }
     }
     framework_feature_files(files);
     files.push(("runtime/framework_feature_refusal.rb".into(), framework_feature_refusal()));
@@ -4972,6 +4986,12 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/class/attribute", &["active_support_class_attribute"]),
     ("active_support/core_ext/class/subclasses", &["active_support_class_subclasses"]),
     ("active_support/descendants_tracker", &["active_support_descendants_tracker"]),
+    ("active_support/core_ext/numeric", &["active_support_numeric"]),
+    ("active_support/core_ext/numeric/bytes", &["active_support_numeric_bytes"]),
+    ("active_support/core_ext/numeric/time", &["active_support_numeric_time"]),
+    ("active_support/core_ext/numeric/conversions", &["active_support_numeric_conversions"]),
+    ("active_support/core_ext/big_decimal/conversions", &["active_support_big_decimal_conversions"]),
+    ("active_support/number_helper", &["active_support_number_helper"]),
     ("active_support/concern", &["active_support_concern"]),
     ("active_support/lazy_load_hooks", &["active_support_lazy_load_hooks"]),
     ("active_support/notifications", &["active_support_notifications"]),
@@ -9773,6 +9793,12 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_redefine_method.rb"
         && p != "runtime/active_support_class_attribute.rb"
         && p != "runtime/active_support_class_subclasses.rb"
+        && p != "runtime/active_support_numeric_bytes.rb"
+        && p != "runtime/active_support_numeric_time.rb"
+        && p != "runtime/active_support_big_decimal_conversions.rb"
+        && p != "runtime/active_support_number_helper.rb"
+        && p != "runtime/active_support_numeric_conversions.rb"
+        && p != "runtime/active_support_numeric.rb"
         && p != "runtime/action_controller_exceptions.rb"
         && p != "runtime/active_support_attribute_accessors_per_thread.rb"
         && p != "runtime/active_support_inflector.rb"
