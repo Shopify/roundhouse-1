@@ -8331,12 +8331,72 @@ fn app_extension_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
     };
     let gem = gem_mixin_macro_calls(lc, app);
     let carried = carried_class_macro_calls(lc, app);
-    if gem.is_empty() && carried.is_empty() {
+    let runtime = runtime_mixin_macro_calls(lc, app);
+    if gem.is_empty() && carried.is_empty() && runtime.is_empty() {
         return own;
     }
     lc.unknown_calls
         .iter()
-        .filter(|call| own.iter().chain(gem.iter()).chain(carried.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .filter(|call| own.iter().chain(gem.iter()).chain(carried.iter()).chain(runtime.iter()).any(|c| std::ptr::eq(*c, *call)))
+        .collect()
+}
+
+/// The body calls that name a class method a Ruby-family runtime port
+/// module the class (or an app superclass) includes gives it
+/// (`runtime_reads::mixed_in_class_methods`): Core's Plus::Plan::Change
+/// includes ActiveSupport::Callbacks and calls `define_callbacks
+/// :perform`; dropped, `run_callbacks(:perform)` found no chain. The
+/// port's `append_features` extends the includer, as Concern does, and the
+/// tree carries the port where the app names the module
+/// (`project::carries_named`); a tree without it refuses the include
+/// (`report_unsupported_runtime_reads`). Bare and `self.` calls only; an
+/// app module of the same name hides the port's.
+///
+/// So is a bare `extend M, ...` whose every module a gated port declares
+/// (Core's `extend ActiveSupport::DescendantsTracker`): the port answers
+/// what the class then asks of itself, and the tree that carries the port
+/// loads it before any app file (runtime/gem_facades.rb).
+fn runtime_mixin_macro_calls<'a>(lc: &'a LibraryClass, app: &App) -> Vec<&'a Expr> {
+    let port_module = |written: &str| -> Option<&'static str> {
+        let name = written.trim_start_matches("::");
+        if app.library_classes.iter().any(|own| own.name.0.as_str() == name) {
+            return None;
+        }
+        crate::analyze::runtime_reads::ruby_family_runtime_names().get_key_value(name).map(|(k, _)| k.as_str())
+    };
+    let provided = |c: &LibraryClass| -> Vec<&'static str> {
+        c.includes
+            .iter()
+            .filter_map(|inc| port_module(inc.0.as_str()))
+            .filter_map(crate::analyze::runtime_reads::mixed_in_class_methods)
+            .flatten()
+            .map(String::as_str)
+            .collect()
+    };
+    let mut methods = provided(lc);
+    for ancestor in app_library_ancestors(lc, app) {
+        methods.extend(provided(ancestor));
+    }
+    let port_extend = |call: &Expr| -> bool {
+        let ExprNode::Send { recv: None, method, args, block: None, .. } = &*call.node else { return false };
+        method.as_str() == "extend"
+            && !args.is_empty()
+            && args.iter().all(|a| match &*a.node {
+                ExprNode::Const { path } => {
+                    port_module(&path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")).is_some()
+                }
+                _ => false,
+            })
+    };
+    lc.unknown_calls
+        .iter()
+        .filter(|call| {
+            if port_extend(call) {
+                return true;
+            }
+            let ExprNode::Send { recv, method, .. } = &*call.node else { return false };
+            recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) && methods.contains(&method.as_str())
+        })
         .collect()
 }
 
