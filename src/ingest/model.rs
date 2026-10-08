@@ -2797,6 +2797,7 @@ fn parse_association(
     let mut belongs_to_default: Option<crate::expr::Expr> = None;
     let mut touch: Option<crate::dialect::Touch> = None;
     let mut autosave: Option<bool> = None;
+    let mut validate: Option<bool> = None;
 
     for arg in iter {
         // Positional lambda between name and kwargs — the association
@@ -2855,6 +2856,7 @@ fn parse_association(
                 "polymorphic" => polymorphic = bool_value(&value),
                 "as" => as_interface = symbol_value(&value),
                 "autosave" => autosave = bool_value(&value),
+                "validate" => validate = bool_value(&value),
                 // `default: -> { Current.user }` — the lambda BODY, not
                 // the lambda. Rails calls it with `instance_exec`, so
                 // the body is already written against the record; a
@@ -2949,6 +2951,8 @@ fn parse_association(
             dependent: dependent.unwrap_or_default(),
             as_interface: as_interface.as_deref().map(Symbol::from),
             scope,
+            skip_validation: validate == Some(false),
+            autosave: autosave == Some(true),
         }),
         "has_one" => Some(Association::HasOne {
             name: name.clone(),

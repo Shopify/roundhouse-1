@@ -292,6 +292,8 @@ mod tests {
             as_interface: None,
             scope: None,
             extension: Vec::new(),
+            skip_validation: false,
+            autosave: false,
         }
     }
 

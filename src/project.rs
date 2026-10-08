@@ -1656,6 +1656,7 @@ pub fn target_files(
     // reference that it hides would leave the transpile with fewer
     // errors than the app has.
     report_unsupported_bundled_constants(app, target);
+    report_strict_validation_contexts(app, target);
     reject_unsupported_pattern_matches(app, target)?;
     reject_unsupported_data_factories(app, target)?;
     reject_wide_integer_literals(app, target)?;
@@ -7844,6 +7845,90 @@ fn report_unavailable_class_value(
 /// PostgreSQL tree carries Rails' TransactionManager
 /// (runtime/active_record_transactions.rb: lazy BEGIN, savepoints,
 /// `requires_new:`, `joinable:`, `isolation:`).
+/// A validation that reads ActiveModel's validation context (`on:` /
+/// `except_on:`, and `validates_associated`, which validates each record
+/// in a custom context) is lowered to `validation_context` and
+/// `valid?(context)`, which only the Ruby-family runtimes define: on a
+/// strict target it is an error at the declaration, not an emit that
+/// names a method the runtime lacks. A model's declarations are its
+/// rules; an STI subclass's are already its `validate` (each check at
+/// its declaration's span, `lower::sti_subclass_validations`). An
+/// ActiveModel class defines its own context methods, on every target.
+fn report_strict_validation_contexts(app: &App, target: BuildTarget) {
+    use crate::dialect::ValidationRule;
+    if matches!(target, BuildTarget::Blog | BuildTarget::Spinel | BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Roda) {
+        return;
+    }
+    fn reads_context(rule: &ValidationRule) -> bool {
+        match rule {
+            ValidationRule::Guarded { options, .. } if !options.on.is_empty() || !options.except_on.is_empty() => true,
+            ValidationRule::Guarded { rule, .. } => reads_context(rule),
+            ValidationRule::Associated => true,
+            _ => false,
+        }
+    }
+    fn names_context(expr: &crate::expr::Expr) -> bool {
+        if matches!(&*expr.node, crate::expr::ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "validation_context" && args.is_empty())
+        {
+            return true;
+        }
+        let mut found = false;
+        expr.node.for_each_child(&mut |child| found = found || names_context(child));
+        found
+    }
+    // A tableless (ActiveModel) class synthesizes its own `valid?(context)`
+    // and `validation_context` with its validations; an ActiveRecord
+    // model's are the runtime's.
+    let active_record = |model: &crate::dialect::Model| model.parent.is_some();
+    let model_of = |lc: &crate::dialect::LibraryClass| {
+        let mut cursor = lc.parent.clone();
+        for _ in 0..8 {
+            let parent = cursor?;
+            if let Some(model) = app.models.iter().find(|m| m.name == parent) {
+                return Some(model);
+            }
+            cursor = app.library_classes.iter().find(|c| c.name == parent)?.parent.clone();
+        }
+        None
+    };
+    let target = target.as_str();
+    let mut spans: Vec<crate::span::Span> = Vec::new();
+    for model in app.models.iter().filter(|m| active_record(m)) {
+        spans.extend(model.spanned_validations().filter(|(_, v)| v.rules.iter().any(reads_context)).map(|(s, _)| s));
+    }
+    let sti_validates = app
+        .library_classes
+        .iter()
+        .filter(|lc| model_of(lc).is_some_and(active_record))
+        .flat_map(|lc| &lc.methods)
+        .filter(|m| {
+            m.name.as_str() == "validate" && m.receiver == crate::dialect::MethodReceiver::Instance && m.name_span.is_synthetic()
+        });
+    for method in sti_validates {
+        let stmts = match &*method.body.node {
+            crate::expr::ExprNode::Seq { exprs } => exprs.as_slice(),
+            _ => std::slice::from_ref(&method.body),
+        };
+        spans.extend(stmts.iter().filter(|s| !s.span.is_synthetic() && names_context(s)).map(|s| s.span));
+    }
+    let mut reported: Vec<crate::span::Span> = Vec::new();
+    for span in spans {
+        if reported.contains(&span) {
+            continue;
+        }
+        reported.push(span);
+        emit::diagnostics::report_unsupported(
+            span,
+            target,
+            "validation_context",
+            format!(
+                "the declaration reads ActiveModel's validation context (`on:`, or the context `validates_associated` validates each record in), run state only the Ruby-family runtimes carry; the {target} runtime has no `validation_context` or `valid?(context)`"
+            ),
+        );
+    }
+}
+
 fn report_unsupported_bundled_constants(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog) {
         return;

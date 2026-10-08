@@ -470,6 +470,16 @@ pub enum Association {
         /// blockless common case.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         extension: Vec<MethodDef>,
+        /// `validate: false`. Rails' has_many validates its records with
+        /// the owner by default (AutosaveAssociation's
+        /// `validate_collection_association`): the new ones, and in a
+        /// custom validation context every loaded one.
+        #[serde(default, skip_serializing_if = "is_false")]
+        skip_validation: bool,
+        /// `autosave: true`: Rails saves and validates every changed
+        /// loaded record, its errors nested under the association.
+        #[serde(default, skip_serializing_if = "is_false")]
+        autosave: bool,
     },
     HasOne {
         name: Symbol,

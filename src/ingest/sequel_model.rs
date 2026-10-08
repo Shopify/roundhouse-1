@@ -250,6 +250,8 @@ fn parse_sequel_association(
                 // Sequel has no association-extension block — its
                 // `one_to_many` takes a dataset block, a different thing.
                 extension: Vec::new(),
+                skip_validation: false,
+                autosave: false,
             }
         }
         "one_to_one" => Association::HasOne {

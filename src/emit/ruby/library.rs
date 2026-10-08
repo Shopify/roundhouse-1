@@ -1979,7 +1979,7 @@ pub(crate) fn apply_collection_memoization(lcs: &mut [LibraryClass], app: &App) 
             if through || relation {
                 track_through_reader(lc, &name);
             } else {
-                memoize_query_reader(lc, &name);
+                memoize_query_reader(lc, &name, singular);
             }
         }
     }
@@ -2055,7 +2055,7 @@ fn track_through_reader(lc: &mut LibraryClass, name: &Symbol) {
 /// @loaded = true, @cache]`, for the synthesized has_many/has_one reader
 /// shape: the loaded guard first, no `return` after it, and an Array or
 /// record value. Anything else is left alone.
-fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol) {
+fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol, singular: bool) {
     fn returns(e: &Expr) -> bool {
         let mut found = matches!(&*e.node, ExprNode::Return { .. });
         if !found {
@@ -2086,9 +2086,25 @@ fn memoize_query_reader(lc: &mut LibraryClass, name: &Symbol) {
     if !guard_matches || exprs[1..].iter().any(returns) {
         return;
     }
-    let value = exprs.pop().expect("len checked");
-    let span = value.span;
+    let query = exprs.pop().expect("len checked");
+    let span = query.span;
     let syn = |n| Expr::new(span, n);
+    // An unsaved owner's association loads nothing (Rails' `null_scope?`
+    // / `find_target?`): the query would match the rows whose key is
+    // NULL.
+    let none = if singular {
+        syn(ExprNode::Lit { value: Literal::Nil })
+    } else {
+        syn(ExprNode::Array { elements: vec![], style: crate::expr::ArrayStyle::Brackets })
+    };
+    let new_record = syn(ExprNode::Send {
+        recv: None,
+        method: Symbol::from("new_record?"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    let value = syn(ExprNode::If { cond: new_record, then_branch: none, else_branch: query });
     exprs.push(syn(ExprNode::Assign { target: LValue::Ivar { name: cache.clone() }, value }));
     exprs.push(syn(ExprNode::Assign {
         target: LValue::Ivar { name: loaded },
