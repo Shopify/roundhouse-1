@@ -110,6 +110,9 @@ pub(crate) fn push_normalize_methods(methods: &mut Vec<MethodDef>, model: &Model
         let read = || synthetic(ExprNode::Var { id: VarId(0), name: value.clone() });
         let mut normalized = body.clone();
         crate::lower::case_lambda::subst(&mut normalized, &param, &read());
+        // The lambda's body is the method's tail, so its own `next v`
+        // (and a lambda's `break v`) is the method's `return v`.
+        crate::lower::lifted_block::to_method_body(&mut normalized, crate::lower::lifted_block::Form::Lambda);
         let nil_check = synthetic(ExprNode::Send {
             recv: Some(read()),
             method: Symbol::from("nil?"),

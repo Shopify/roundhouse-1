@@ -2691,6 +2691,11 @@ fn parse_scope(
     // `->(x) { ... }` (a LambdaNode) or the spelled-out `lambda { |x| … }`
     // / `proc { |x| … }` (a receiverless CallNode whose block carries the
     // same parameters + body — Mastodon's multi-line scopes use this).
+    // `proc { … }` is the one spelling whose jumps are a proc's.
+    let form = match body_node.as_call_node() {
+        Some(call) if constant_id_str(&call.name()) == "proc" => crate::lower::lifted_block::Form::Block,
+        _ => crate::lower::lifted_block::Form::Lambda,
+    };
     let (param_node, lambda_body) = if let Some(lambda) = body_node.as_lambda_node() {
         (lambda.parameters(), lambda.body())
     } else if let Some((params, body)) = spelled_lambda_parts(&body_node) {
@@ -2752,7 +2757,7 @@ fn parse_scope(
     };
     // The body becomes a class method, where the lambda's own `next v`
     // (its early return) is `return v`; `next` in a def does not parse.
-    super::sql_functions::next_to_return(&mut body);
+    crate::lower::lifted_block::to_method_body(&mut body, form);
 
     Ok(Some(Scope { name, params, body }))
 }
