@@ -126,7 +126,11 @@ fn library_classes(
     // Ruby evaluates as another class's body. Before the `Class.new`
     // parent resolution below, so `Sub = Class.new(Point)` finds a
     // factory class `Point` this file declares.
-    out.extend(super::factory_class::factory_classes(&root, file)?);
+    // `Sub = Class.new(Base) do … end` is one (`origin` none: a plain
+    // class), whose parent resolves as the block-less form's does.
+    let factories = super::factory_class::factory_classes(&root, file)?;
+    synthesized.extend(factories.iter().filter(|class| class.origin.is_none()).map(|class| class.name.clone()));
+    out.extend(factories);
     // A file holding nothing but such constants still declares them.
     // Without a class to host the rest, other file-level constants
     // were dropped before this too.
@@ -752,9 +756,10 @@ fn take_class_new_declarations(owner: &mut LibraryClass) -> Vec<LibraryClass> {
 /// (`Error = Class.new(StandardError)`). The parent stays as written,
 /// to resolve lexically like any `class X < Parent`.
 ///
-/// A block body, a parent that is not a constant path, or a missing
-/// parent (`Class.new`) is not this shape and stays a constant, which
-/// analysis reports.
+/// A parent that is not a constant path, or a missing parent
+/// (`Class.new`) is not this shape and stays a constant, which analysis
+/// reports. A block body that defines methods is a class too, which
+/// `factory_class::factory_classes` builds (the body walks skip it).
 fn class_new_declaration(scope: &[&str], name: &Symbol, value: &Expr) -> Option<LibraryClass> {
     let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*value.node else {
         return None;
@@ -2602,13 +2607,13 @@ fn block_constant_value(write: &ruby_prism::ConstantWriteNode<'_>, file: &str) -
     if is_sorbet_type_alias(&write.value()) {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "type alias assigned inside a Struct.new/Data.define body block is not modeled".into(),
+            message: "type alias assigned inside a Struct.new/Data.define/Class.new body block is not modeled".into(),
         });
     }
     if super::factory_class::is_factory_class_write(&write.as_node()) {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "Struct.new/Data.define body block nested in another one is not modeled".into(),
+            message: "Struct.new/Data.define/Class.new body block nested in another one is not modeled".into(),
         });
     }
     ingest_expr(&write.value(), file)
@@ -2650,7 +2655,7 @@ pub(super) fn factory_class_body(
     if !conditional_definitions.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "a load-time conditional definition inside a Struct.new/Data.define body block is not modeled"
+            message: "a load-time conditional definition inside a Struct.new/Data.define/Class.new body block is not modeled"
                 .into(),
         });
     }
@@ -2662,7 +2667,7 @@ pub(super) fn factory_class_body(
         || enclosing.iter().any(|(name, _)| !carried.contains(name)) || !class_initializers.is_empty() {
         return Err(IngestError::Unsupported {
             file: file.into(),
-            message: "constant or class variable assigned inside a Struct.new/Data.define body block \
+            message: "constant or class variable assigned inside a Struct.new/Data.define/Class.new body block \
                       (it belongs to the enclosing scope) is not modeled"
                 .into(),
         });
@@ -2897,7 +2902,7 @@ fn walk_decl_body_in<'pr>(
                 if force_class_receiver && !declaration_body {
                     return Err(IngestError::Unsupported {
                         file: file.into(),
-                        message: "Struct.new/Data.define body block in a singleton or class-method \
+                        message: "Struct.new/Data.define/Class.new body block in a singleton or class-method \
                                   carrier is not modeled"
                             .into(),
                     });

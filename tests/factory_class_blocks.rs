@@ -385,11 +385,11 @@ fn unmodeled_factory_block_shapes_are_named_refusals() {
         ),
         (
             "X = Struct.new(:a) do\n  @@limit = 3\n  def capped = [a, @@limit].min\nend\n",
-            "constant or class variable assigned inside a Struct.new/Data.define body block",
+            "constant or class variable assigned inside a Struct.new/Data.define/Class.new body block",
         ),
         (
             "X = Struct.new(:a) do\n  Inner = Data.define(:b) do\n    def c = b\n  end\n  def d = a\nend\n",
-            "Struct.new/Data.define body block nested in another one is not modeled",
+            "Struct.new/Data.define/Class.new body block nested in another one is not modeled",
         ),
         (
             "module X\n  P = Struct.new(:a) do\n    class << self\n      C = 1\n      def c = C\n    end\n  end\nend\n",

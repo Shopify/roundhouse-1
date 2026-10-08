@@ -9865,7 +9865,11 @@ fn require_path_for_parent(parent: &ClassId, app: &App) -> Option<String> {
     }
     if is_model_or_library_class(raw, app) {
         // underscore: namespaced parents nest (see emit_library_class_decls).
-        return Some(format!("app/models/{}", crate::naming::underscore(raw)));
+        // A library class nested in another is written in that class's
+        // file (`file_owner`): `Top < Outer::Guard` requires `outer`,
+        // where no `outer/guard` file exists. A model keeps its own.
+        let file = if is_model_named(raw, app) { raw.to_string() } else { file_owner(raw, app) };
+        return Some(format!("app/models/{}", crate::naming::underscore(&file)));
     }
     if is_controller_named(raw, app) {
         return Some(format!("app/controllers/{}", crate::naming::underscore(raw)));

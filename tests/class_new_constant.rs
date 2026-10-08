@@ -2,8 +2,8 @@
 //! the shape Shopify Core writes its exception hierarchies in
 //! (`Error = Class.new(StandardError)`, `Sub = Class.new(Error)`).
 //! Ingest turns it into the `class NAME < Parent; end` it stands for.
-//! A block body or a non-constant parent is not that shape and stays
-//! an error.
+//! A non-constant parent is not that shape and stays an error. A block
+//! body that defines methods is a class too (tests/class_new_blocks.rs).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -87,21 +87,30 @@ end
 }
 
 #[test]
-fn class_new_with_a_block_body_stays_an_error() {
-    // The block's `def` is refused before this shape is read, so the
-    // error is at the module's first reader rather than at `Blocky`.
-    let (_, errors) = errors_app(r#"module Foo
+fn class_new_with_a_block_body_is_the_class_it_builds() {
+    // `ingest::factory_class`: the block's `def` is `Foo::Blocky`'s.
+    errors_app(r#"module Foo
   Blocky = Class.new(StandardError) do
     def code
       1
     end
   end
   def self.go
-    Blocky
+    raise Blocky, "blocky"
   end
 end
 "#)
-    .write("test/foo_test.rb", go_test())
-    .emit(BuildTarget::Ruby);
-    assert!(!errors.is_empty(), "a Class.new block body is not admitted");
+    .write("test/foo_test.rb", r#"require "test_helper"
+require "foo"
+class FooTest < ActiveSupport::TestCase
+  test "x" do
+    e = assert_raises(StandardError) { Foo.go }
+    assert_equal "Foo::Blocky", e.class.name
+    assert_equal 1, e.code
+    assert_equal "blocky", e.message
+  end
+end
+"#)
+    .run_test("test/models/foo_test.rb")
+    .assert_passes();
 }

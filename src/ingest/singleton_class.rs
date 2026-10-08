@@ -107,7 +107,7 @@ fn walk_statement(
             if !super::factory_class::block_constant_writes(stmt).is_empty() {
                 return unsupported(
                     file,
-                    "constant assigned inside a Struct.new/Data.define body block in a model or controller \
+                    "constant assigned inside a Struct.new/Data.define/Class.new body block in a model or controller \
                      `class << self` is not modeled",
                 );
             }
