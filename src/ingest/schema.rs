@@ -185,6 +185,26 @@ fn apply_migration_verb(
         .map(|a| a.arguments().iter().collect())
         .unwrap_or_default();
     let arg_name = |i: usize| args.get(i).and_then(table_name_value);
+    // A verb whose table or column name is not a literal cannot apply,
+    // and skipping it left the column typed: Core's
+    // `remove_column(:metaobject_index, :"str_value_#{slot}")` in a
+    // `STR_SLOTS.each` loop kept six dropped columns.
+    let named = match verb {
+        "drop_table" | "add_timestamps" => 1,
+        "rename_table" | "remove_column" | "change_column_null" | "change_column_default"
+        | "add_reference" | "add_belongs_to" | "remove_reference" | "remove_belongs_to" => 2,
+        "add_column" | "change_column" | "rename_column" => 3,
+        _ => 0,
+    };
+    if let Some(i) = (0..named).find(|&i| arg_name(i).is_none()) {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: format!(
+                "migration `{verb}` argument {} is not a literal name; the schema fold cannot apply it",
+                i + 1
+            ),
+        });
+    }
 
     match verb {
         "create_table" => {
@@ -688,6 +708,17 @@ fn table_from_create_table(
         }
     }
 
+    // A block column named like the implicit key defines the key:
+    // Core's `create_table(:virtual_card_transactions, …) { |t| t.uuid(:id,
+    // null: false) }` makes one uuid `id`, not a bigint `id` and a uuid one.
+    if let Some(key_at) = columns.iter().position(|c| c.primary_key) {
+        if let Some(at) = columns.iter().skip(key_at + 1).position(|c| c.name == columns[key_at].name) {
+            let mut col = columns.remove(key_at + 1 + at);
+            col.primary_key = true;
+            columns[key_at] = col;
+        }
+    }
+
     // An index over a column the walk dropped (unsupported type,
     // ledgered above) cannot apply: sqlite refuses the seed at `no such
     // column`. The index goes with the column.
@@ -1123,6 +1154,49 @@ mod tests {
         let clips = &schema.tables[&Symbol::from("clips")];
         assert!(matches!(clips.columns[3].col_type, ColumnType::Float));
         assert!(!clips.columns[4].nullable, "timestamps are null: false");
+    }
+
+    #[test]
+    fn a_block_id_column_defines_the_key() {
+        let schema = fold(&[r#"
+            class CreateTxns < ActiveRecord::Migration[8.2]
+              def change
+                create_table(:txns, hash: [:id]) do |t|
+                  t.uuid(:id, null: false)
+                  t.string :state
+                end
+              end
+            end
+        "#]);
+        assert_eq!(col_names(&schema, "txns"), ["id", "state"]);
+        let id = &schema.tables[&Symbol::from("txns")].columns[0];
+        assert!(matches!(id.col_type, ColumnType::Uuid) && id.primary_key && !id.nullable);
+    }
+
+    #[test]
+    fn a_non_literal_column_name_is_a_gap_not_a_skip() {
+        let mut schema = fold(&[r#"
+            class CreateIdx < ActiveRecord::Migration[8.2]
+              def change
+                create_table :idx do |t|
+                  t.string :str_value_1
+                end
+              end
+            end
+        "#]);
+        let err = ingest_migration(
+            br#"
+            class DropSlots < ActiveRecord::Migration[8.2]
+              def up
+                (1..1).each { |slot| remove_column(:idx, :"str_value_#{slot}") }
+              end
+            end
+        "#,
+            "drop.rb",
+            &mut schema,
+        )
+        .expect_err("a non-literal name cannot apply");
+        assert!(err.to_string().contains("`remove_column` argument 2 is not a literal"), "{err}");
     }
 
     #[test]
