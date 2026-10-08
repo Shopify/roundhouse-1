@@ -8636,6 +8636,7 @@ fn spinel_files_with_assertions(
     // anything the emit produces at the same path wins.
     let mut data = Vec::new();
     walk_data_files_into(fixture, &mut data)?;
+    walk_gem_source_data_into(app, fixture, &mut data)?;
     files.splice(0..0, data);
 
     let mut files = dedupe_last_wins(files);
@@ -12307,6 +12308,47 @@ fn carried_secrets_file(root: &Path, rel: &str) -> bool {
     }).and_then(|f| f.get("core_path")).and_then(|p| p.as_str()) else { return false };
     let same = matches!((fs::read(root.join(rel)), fs::read(core_root.join(core_path))), (Ok(a), Ok(b)) if a == b);
     same && tracked(core_root, core_path)
+}
+
+/// The files other than Ruby of each gem the app carries as source
+/// (`gem_sources:`, `gem_source_entries`), verbatim at their paths in the
+/// source tree: the gem reads its own data beside its code
+/// (shopify_spanner 4.9.0's `File.read(File.join(__dir__,
+/// "hydrate_search_query.sql"))`, shopify-i18n's
+/// `data/cldr/likely_subtags.yml`), and the emitted `__dir__` of a gem
+/// file names its directory there. `walk_data_files_into` skips `vendor/`
+/// and reads only YAML and JSON. A file [`named_for_secrets`] is not
+/// carried; one that is not UTF-8 is `collect_binary_assets`' to carry.
+fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, String)>) -> Result<(), String> {
+    // A source's path is the root's join (absolute) or root-relative.
+    let base = format!("{}/", root.display());
+    let mut dirs: Vec<String> = gem_source_entries(app)
+        .into_iter()
+        .filter_map(|(_, _, lib)| {
+            let lib = lib.strip_prefix(base.as_str()).unwrap_or(&lib);
+            (!lib.starts_with('/')).then(|| lib.strip_suffix("lib/").map(str::to_string)).flatten()
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    for dir in dirs {
+        let mut found = Vec::new();
+        if root.join(&dir).is_dir() {
+            walk_dir_into(&root.join(&dir), &dir, &mut found)?;
+        }
+        found.sort();
+        for (rel, content) in found {
+            if rel.ends_with(".rb") {
+                continue;
+            }
+            if rel.split('/').any(named_for_secrets) {
+                eprintln!("roundhouse: note: {rel} is named for secrets and is not carried into the tree");
+                continue;
+            }
+            out.push((rel, content));
+        }
+    }
+    Ok(())
 }
 
 /// The app's data files (`*.yml`, `*.yaml`, `*.json`, each optionally

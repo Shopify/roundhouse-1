@@ -401,3 +401,23 @@ fn a_bare_read_of_a_gems_private_constant_stays_lexical() {
     let _ = same_as_native_from("lexical", &[("tp", TP)], "tp", "p Tp.state\n", "\"Timeout::State\"\n", false, &extra);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// shopify_spanner 4.9.0's catalog/store.rb reads `File.read(File.join
+/// (__dir__, "hydrate_search_query.sql"))` in its class body, and
+/// shopify-i18n 5.6.0's locales.rb `YAML.safe_load_file(File.expand_path
+/// (File.join(__dir__, "../../data/cldr/likely_subtags.yml")))`: a gem
+/// reads its own data beside its code. The emitted `__dir__` names the
+/// gem's directory in the source tree, where only its Ruby was carried,
+/// so each read was an Errno::ENOENT at boot.
+#[test]
+fn a_gem_source_reads_its_own_data_files() {
+    const SP: &[(&str, &str)] = &[
+        (
+            "sp.rb",
+            "require \"yaml\"\n\nmodule Sp\n  QUERY = File.read(File.join(__dir__, \"sp/query.sql\")).freeze\n  SUBTAGS = YAML.safe_load_file(File.expand_path(File.join(__dir__, \"../data/subtags.yml\")))[\"subtags\"]\nend\n",
+        ),
+        ("sp/query.sql", "SELECT 1\n"),
+        ("../data/subtags.yml", "subtags:\n  en: en-Latn-US\n"),
+    ];
+    let _ = same_as_native("data", &[("sp", SP)], "sp", "p [Sp::QUERY, Sp::SUBTAGS]\n", "[\"SELECT 1\\n\", {\"en\" => \"en-Latn-US\"}]\n");
+}
