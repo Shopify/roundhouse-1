@@ -47,7 +47,7 @@ else
 end
 
 if MODE == "refusals"
-  %w[active_support/all active_support/core_ext/hash active_support/core_ext/module/attribute_accessors_per_thread].each do |feature|
+  %w[active_support/all active_support/core_ext/hash].each do |feature|
     require feature
     puts "#{feature}: loaded"
   rescue LoadError => e

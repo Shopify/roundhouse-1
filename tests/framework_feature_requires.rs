@@ -34,8 +34,15 @@ require "action_mailer"
 require "active_job"
 require "active_support/core_ext/object/blank"
 require "active_support/multibyte/unicode"
+require "active_support/core_ext/module/attribute_accessors_per_thread"
 
 module ProbeGem
+  # turbo-rails 2.x Turbo::Current's shape.
+  class Current
+    thread_mattr_accessor :request_id
+    thread_mattr_accessor :level, default: :info
+  end
+
   def self.report
     unicode = ActiveSupport::Multibyte::Unicode
     latin1 = "caf\xE9".dup.force_encoding(Encoding::UTF_8)
@@ -51,7 +58,19 @@ module ProbeGem
       decompose_compatibility: unicode.decompose(:compatibility, "ﬁ".codepoints),
       transliterate: ActiveSupport::Inflector.transliterate(latin1),
       parameterize: "Ærøskøbing Straße".parameterize,
+      per_thread: per_thread,
     }
+  end
+
+  def self.per_thread
+    Current.request_id = "main"
+    other = Thread.new { [Current.request_id, Current.level, (Current.new.request_id = "t"), Current.request_id] }.value
+    invalid = begin
+      Class.new { thread_mattr_accessor :"bad-name" }
+    rescue NameError => e
+      e.message
+    end
+    [Current.request_id, Current.new.request_id, Current.level, other, invalid]
   end
 end
 "#;
@@ -101,6 +120,8 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
         "transliterate: \"cafe\"",
         // String#parameterize through the Inflector (not the ASCII overlay).
         "parameterize: \"aeroskobing-strasse\"",
+        // Per thread, with the default seeded in each thread.
+        "per_thread: [\"main\", \"main\", :info, [nil, :info, \"t\", \"t\"], \"invalid attribute name: bad-name\"]",
     ] {
         assert!(native.contains(expected), "missing {expected:?}:\n{native}");
     }
@@ -112,7 +133,7 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
 fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     let (tree, _) = probe().emit(BuildTarget::Ruby);
     let out = run("refusals", &tree, None);
-    for feature in ["active_support/all", "active_support/core_ext/hash", "active_support/core_ext/module/attribute_accessors_per_thread"] {
+    for feature in ["active_support/all", "active_support/core_ext/hash"] {
         let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }

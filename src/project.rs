@@ -4179,6 +4179,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             ),
         ));
     }
+    // Module#thread_mattr_accessor (8.2.0.alpha core_ext/module/
+    // attribute_accessors_per_thread.rb), over the execution state the
+    // tree carries: a gem's require of it answers from runtime/features.
+    if files.iter().any(|(p, _)| p == "runtime/active_support_isolated_execution_state.rb") {
+        let per_thread = crate::runtime_files::read_to_string("runtime/spinel/active_support_attribute_accessors_per_thread.rb")
+            .map_err(|e| format!("read per-thread module accessors runtime: {e}"))?;
+        files.push(("runtime/active_support_attribute_accessors_per_thread.rb".into(), per_thread));
+    }
     framework_feature_files(files);
     // ActionDispatch::Session::AbstractStore over rack's Persisted, and
     // ActionDispatch::Constants and ShowExceptions (8.2.0.alpha).
@@ -4822,8 +4830,6 @@ fn compiled_gem_native_copies_block(app: &App) -> String {
     )
 }
 
-/// A Rails feature (`rails`, `active_support/...`, `action_...`): this
-/// tree's runtime ports answer it, so nothing requires it.
 /// A Rails feature a native gem requires as it loads, with the runtime
 /// ports that answer it on the PostgreSQL CRuby tree (runtime/features,
 /// first on the load path). Each is one Rails has loaded before any gem
@@ -4846,20 +4852,20 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("action_controller", &["action_controller"]),
     ("action_mailer", &["action_mailer"]),
     ("active_job", &["active_job", "active_job_errors"]),
+    // Not loaded by Rails natively until required; the port is the file.
+    (
+        "active_support/core_ext/module/attribute_accessors_per_thread",
+        &["active_support_isolated_execution_state", "active_support_attribute_accessors_per_thread"],
+    ),
 ];
 
 /// Rails features a native gem requires that Rails has not loaded by
 /// then natively and the tree ports only in part (Active Support's every
-/// core extension, the whole Hash extension set, the per-thread module
-/// accessors). Each answers with a named LoadError, never the gem home's
+/// core extension, the whole Hash extension set). Each answers with a named LoadError, never the gem home's
 /// activesupport (Rails' own code over the ports).
 const FRAMEWORK_FEATURES_NOT_PORTED: &[(&str, &str)] = &[
     ("active_support/all", "loads every Active Support extension (core_ext, time, json, ...), which this tree ports only in part"),
     ("active_support/core_ext/hash", "loads every Hash extension (conversions' to_xml/from_xml, deep_merge, indifferent access, ...), which this tree ports only in part"),
-    (
-        "active_support/core_ext/module/attribute_accessors_per_thread",
-        "defines Module#thread_mattr_accessor and its kin, which this tree does not port",
-    ),
 ];
 
 /// runtime/features/<feature>.rb for [`FRAMEWORK_FEATURE_PORTS`] and
@@ -4903,6 +4909,8 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
     }
 }
 
+/// A Rails feature (`rails`, `active_support/...`, `action_...`): this
+/// tree's runtime ports answer it, so nothing requires it.
 pub(crate) fn is_framework_feature(feature: &str) -> bool {
     feature == "rails"
         || ["rails/", "active_support", "active_record", "active_model", "active_job", "active_storage", "action_"]
