@@ -1,54 +1,261 @@
-# ActiveRecord::TestFixtures' transactional tests, ported from the Rails
-# native Core runs (Shopify/rails 5813559f4aed, 8.2.0.alpha,
-# activerecord/lib/active_record/test_fixtures.rb): with
-# `use_transactional_tests` (true unless the test class sets it false),
-# every writing pool of the connection handler is pinned to one
-# connection inside a non-joinable transaction begun before the test's
-# setup callbacks, as is a pool established while the test runs (the
-# `!connection.active_record` subscription); teardown rolls each back and
-# returns the connection, then clears every active connection.
+# ActiveRecord::TestFixtures, ported from the Rails native Core runs
+# (Shopify/rails 5813559f4aed, 8.2.0.alpha,
+# activerecord/lib/active_record/test_fixtures.rb, with
+# ActiveRecord::FixtureSet.create_fixtures and its insert from
+# fixtures.rb).
 #
-# The runner (minitest_runner.rb) calls the two hooks below where Rails'
+# setup_fixtures loads the class's fixture sets once per process, keyed
+# by [fixture_table_names, fixture_paths, fixture_class_names] in
+# `@@already_loaded_fixtures`. A transactional test then pins every
+# writing pool of the connection handler to one connection, inside a
+# non-joinable transaction begun before the test's setup callbacks, as
+# it does for a pool established while the test runs (the
+# `!connection.active_record` subscription). Teardown rolls each one back
+# and returns the connection, then clears every active connection. When a
+# pin was not clean (something committed or rolled the transaction back),
+# the loaded-fixture cache is cleared, so the next test loads again. A
+# test that is not transactional loads its fixtures before it runs and
+# invalidates the cache after.
+#
+# FixtureSet.insert groups the sets by their model's connection pool.
+# For each pool, in one `transaction(requires_new: true)` on a connection
+# from that pool (the writer that owns the model), it DELETEs FROM every
+# set's table, inserts the sets' rows, and then caps each primary key
+# sequence at max(pk). The rows here are the test helper's
+# `FixtureLoader.fixture_sets`: [set name, compiled fixture module, model,
+# table]. Each module's `_fixtures_load!` saves its records. Unlike Rails'
+# INSERTs, that save runs the model's callbacks.
+#
+# A set whose model or rows do not load is refused by name: this tree
+# says `error[fixture_set_not_loaded]` once on stderr, records the set
+# in `TestFixtures.fixture_sets_not_loaded`, and makes each of its
+# fixture accessors raise FixtureSetNotLoaded. The other sets in its
+# pool still load, each in its own savepoint. Rails would raise the
+# load error from every test's setup.
+#
+# The runner (minitest_runner.rb) calls the hooks below where Rails'
 # before_setup and after_teardown run setup_fixtures and
-# teardown_fixtures: after this tree's fixture load and reset
-# (`__roundhouse_setup_fixtures`), and after the test's teardown and
-# after_teardown.
+# teardown_fixtures: before the test's setup, and after its teardown and
+# after_teardown. Each test starts with fresh fixture accessors, as with
+# Rails' per-test `@fixture_cache`. Rails' `fixture_sets` accessors
+# (`shops(:snowdevil)`, `fixture(:shops, :snowdevil)`) answer through the
+# set's compiled module, where the compiler did not lower the call to it.
 #
-# Fixtures load before every test here (SchemaSetup.reset!), so Rails'
-# loaded-fixture cache (`@@already_loaded_fixtures`, cleared when a
-# transaction was not clean) has nothing to keep. `pre_loaded_fixtures`
-# and `use_instantiated_fixtures` are not ported. A class's
-# `self.use_transactional_tests = <literal>` compiles to its class reader.
+# Every emitted test class loads every set. The ingest drops Core's
+# `use_active_record_fixtures`, and with it the classes that load none,
+# so the default `fixture_table_names` is `fixtures :all`. A class's
+# `self.use_transactional_tests = <literal>` compiles to its class
+# reader. `use_instantiated_fixtures` and `pre_loaded_fixtures` are
+# refused when set. Rails' asynchronous-queries session is not ported:
+# this runtime runs no query asynchronously.
 #
 # Active Record autoloads the module in any process, so the PostgreSQL
 # boot (runtime/database_configuration.rb) requires it; the test helper
 # includes it into TestBase, as rails/test_help.rb does.
+require_relative "active_support_class_attribute"
+
 module ActiveRecord
   module TestFixtures
+    # A fixture accessor of a set this tree could not load.
+    class FixtureSetNotLoaded < StandardError; end
+
+    # Rails' test/fixtures/, which rails/test_help.rb appends to
+    # ActiveSupport::TestCase.fixture_paths: the tree's own (this file is
+    # <tree>/runtime/active_record_test_fixtures.rb).
+    FIXTURE_PATH = File.expand_path("../test/fixtures", __dir__) + "/"
+
+    @fixture_set_cache = {}
+    @fixture_sets_not_loaded = {}
+
+    class << self
+      # set name => "Class: message" for each set that did not load.
+      attr_reader :fixture_sets_not_loaded
+
+      # ActiveRecord::FixtureSet.reset_cache.
+      def reset_cache
+        @fixture_set_cache.clear
+      end
+
+      # The test helper's rows, by set name.
+      def fixture_set_rows
+        return {} unless defined?(::FixtureLoader) && ::FixtureLoader.respond_to?(:fixture_sets)
+        @fixture_set_rows ||= ::FixtureLoader.fixture_sets.to_h { |set, mod, model, table| [set, [set, mod, model, table]] }
+      end
+
+      # ActiveRecord::FixtureSet.create_fixtures: inserts each named set
+      # that is not cached yet, and answers the named sets' rows.
+      def create_fixtures(fixture_set_names, class_names = {})
+        fixture_set_names = Array(fixture_set_names).map(&:to_s)
+        rows = fixture_set_rows
+        fixture_set_names.each do |name|
+          row = rows[name]
+          unless row
+            raise NotImplementedError, "roundhouse: fixture set `#{name}`: this tree compiled no fixture module for it"
+          end
+          class_name = class_names[name] || class_names[name.to_sym]
+          class_name = class_name.name if class_name.is_a?(Module)
+          if class_name && class_name.to_s.delete_prefix("::") != row[2]
+            raise NotImplementedError,
+              "roundhouse: set_fixture_class #{name}: #{class_name}: the fixture module compiled for `#{name}` loads #{row[2]}"
+          end
+        end
+
+        to_read = fixture_set_names.reject { |name| @fixture_set_cache.key?(name) }
+        insert(to_read.map { |name| rows.fetch(name) }) unless to_read.empty?
+        to_read.each { |name| @fixture_set_cache[name] = rows.fetch(name) }
+        fixture_set_names.to_h { |name| [name, @fixture_set_cache.fetch(name)] }
+      end
+
+      # Rails' per-test `@fixture_cache = {}`: the compiled accessors
+      # memoize their record in the module, so each test clears them.
+      def reset_fixture_accessors(rows)
+        rows.each do |_set, mod, _model, _table|
+          next unless Object.const_defined?(mod, false)
+          fixtures = Object.const_get(mod, false)
+          fixtures.instance_variables.each do |ivar|
+            fixtures.instance_variable_set(ivar, nil) if ivar.start_with?("@__fx_")
+          end
+        end
+      end
+
+      private
+        # ActiveRecord::FixtureSet.insert.
+        def insert(rows)
+          by_pool = {}
+          rows.each do |row|
+            next if @fixture_sets_not_loaded.key?(row[0])
+            pool = attempt(row) do
+              model = Object.const_get(row[2])
+              Object.const_get(row[1])
+              model.connection_pool
+            end
+            (by_pool[pool] ||= []) << row if pool
+          end
+
+          by_pool.each do |pool, sets|
+            begin
+              pool.with_connection do |conn|
+                conn.transaction(requires_new: true) do
+                  sets.map { |row| row[3] }.uniq.each { |table| Db.exec("DELETE FROM #{quote_table_name(table)}") }
+                  sets.each do |row|
+                    attempt(row) do
+                      conn.transaction(requires_new: true) { Object.const_get(row[1])._fixtures_load! }
+                    end
+                  end
+                end
+                # Cap primary key sequences to max(pk).
+                sets.each do |row|
+                  next if @fixture_sets_not_loaded.key?(row[0])
+                  reset_pk_sequence(conn, row)
+                end
+              end
+            rescue NoMemoryError, SignalException, SystemExit
+              raise
+            rescue Exception => error # rubocop:disable Lint/RescueException
+              # The pool's DELETEs or its transaction failed: none of its
+              # sets loaded.
+              sets.each { |row| not_loaded(row, error) unless @fixture_sets_not_loaded.key?(row[0]) }
+            end
+          end
+        end
+
+        # The set's step, or its refusal: nil when it raised.
+        def attempt(row)
+          yield
+        rescue NoMemoryError, SignalException, SystemExit
+          raise
+        rescue Exception => error # rubocop:disable Lint/RescueException
+          not_loaded(row, error)
+          nil
+        end
+
+        def not_loaded(row, error)
+          set, mod, model, table = row
+          reason = "#{error.class}: #{error.message.to_s.lines.first.to_s.chomp}"
+          @fixture_sets_not_loaded[set] = reason
+          site = (error.backtrace || []).first
+          $stderr.puts "roundhouse: error[fixture_set_not_loaded]: fixture set `#{set}` (#{mod}, #{model}, table #{table}) " \
+            "was not loaded: #{reason}#{site ? " (#{site})" : ""}"
+          return unless Object.const_defined?(mod, false)
+          fixtures = Object.const_get(mod, false)
+          message = "fixture set `#{set}` was not loaded: #{reason}"
+          (fixtures.singleton_methods(false) - [:_fixtures_load!]).each do |label|
+            fixtures.define_singleton_method(label) { |*| raise FixtureSetNotLoaded, message }
+          end
+        end
+
+        # PostgreSQL's reset_pk_sequence! (SequenceReset): the sequence
+        # the primary key's default draws from, set to max(pk), or to
+        # its minimum, not yet called, for an empty table. The set's rows
+        # stay loaded when this fails; the error is named.
+        def reset_pk_sequence(conn, row)
+          set, _mod, model, table = row
+          pk = Object.const_get(model).primary_key
+          return unless pk.is_a?(String) || pk.is_a?(Symbol)
+          sequence = conn.select_value("SELECT pg_get_serial_sequence(#{quote_string(quote_table_name(table))}, #{quote_string(pk.to_s)})")
+          return if sequence.nil?
+          max = conn.select_value("SELECT MAX(#{quote_identifier(pk.to_s)}) FROM #{quote_table_name(table)}")
+          min = conn.select_value("SELECT seqmin FROM pg_sequence WHERE seqrelid = #{quote_string(sequence)}::regclass")
+          conn.select_value("SELECT setval(#{quote_string(sequence)}, #{Integer(max || min)}, #{max ? true : false})")
+        rescue NoMemoryError, SignalException, SystemExit
+          raise
+        rescue Exception => error # rubocop:disable Lint/RescueException
+          $stderr.puts "roundhouse: error[fixture_sequence_not_reset]: fixture set `#{set}` (table #{table}): " \
+            "#{error.class}: #{error.message.to_s.lines.first.to_s.chomp}"
+        end
+
+        def quote_table_name(name)
+          name.to_s.split(".").map { |part| quote_identifier(part) }.join(".")
+        end
+
+        def quote_identifier(name)
+          %("#{name.gsub('"', '""')}")
+        end
+
+        def quote_string(value)
+          "'#{value.to_s.gsub("'", "''")}'"
+        end
+    end
+
     module ClassMethods
-      def use_transactional_tests
-        true
-      end
-
-      def lock_threads
-        true
-      end
-
-      def database_transactions_config
-        return @database_transactions_config if instance_variable_defined?(:@database_transactions_config)
-        superclass.respond_to?(:database_transactions_config) ? superclass.database_transactions_config : {}
-      end
-
-      def database_transactions_config=(config)
-        @database_transactions_config = config
-      end
-
       def skip_transactional_tests_for_database(database_name)
         use_transactional_tests_for_database(database_name, false)
       end
 
       def use_transactional_tests_for_database(database_name, enabled = true)
         self.database_transactions_config = database_transactions_config.merge(database_name => enabled)
+      end
+
+      def set_fixture_class(class_names = {})
+        self.fixture_class_names = fixture_class_names.merge(class_names.transform_keys(&:to_s))
+      end
+
+      # `fixtures :all` names the sets this tree compiled (Rails globs
+      # fixture_paths for *.yml; the tree carries a compiled module per
+      # set, and not every set's YAML).
+      def fixtures(*fixture_set_names)
+        if fixture_set_names.first == :all
+          raise StandardError, "No fixture path found. Please set `#{self}.fixture_paths`." if fixture_paths.nil? || fixture_paths.empty?
+          fixture_set_names = TestFixtures.fixture_set_rows.keys
+        else
+          fixture_set_names = fixture_set_names.flatten.map(&:to_s)
+        end
+
+        self.fixture_table_names = (fixture_table_names | fixture_set_names).sort
+        setup_fixture_accessors(fixture_set_names)
+      end
+
+      def setup_fixture_accessors(fixture_set_names = nil)
+        fixture_set_names = Array(fixture_set_names || fixture_table_names)
+        unless fixture_set_names.empty?
+          self.fixture_sets = fixture_sets.dup
+          fixture_set_names.each do |fs_name|
+            key = fs_name.to_s.include?("/") ? -fs_name.to_s.tr("/", "_") : fs_name
+            key = -key.to_s if key.is_a?(Symbol)
+            fs_name = -fs_name.to_s if fs_name.is_a?(Symbol)
+            fixture_sets[key] = fs_name
+          end
+        end
       end
 
       def uses_transaction(*methods)
@@ -63,34 +270,72 @@ module ActiveRecord
     end
 
     def self.included(base)
+      base.class_eval do
+        class_attribute :fixture_paths, instance_writer: false, default: [FIXTURE_PATH]
+        class_attribute :fixture_table_names, default: TestFixtures.fixture_set_rows.keys.sort
+        class_attribute :fixture_class_names, default: {}
+        class_attribute :use_transactional_tests, default: true
+        class_attribute :use_instantiated_fixtures, default: false
+        class_attribute :pre_loaded_fixtures, default: false
+        class_attribute :lock_threads, default: true
+        class_attribute :fixture_sets, default: {}
+        class_attribute :database_transactions_config, default: {}
+      end
       base.extend(ClassMethods)
+      # The accessors of `fixtures :all` (fixture_table_names above).
+      base.setup_fixture_accessors
+      ActiveSupport.run_load_hooks(:active_record_fixtures, base) if ActiveSupport.respond_to?(:run_load_hooks)
     end
 
-    def use_transactional_tests
-      self.class.use_transactional_tests
+    # Generic fixture accessor for fixture names that may conflict with
+    # other methods: `fixture(:web_sites, :rubyonrails)`.
+    def fixture(fixture_set_name, *fixture_names)
+      active_record_fixture(fixture_set_name, *fixture_names)
     end
 
-    def lock_threads
-      self.class.lock_threads
-    end
-
-    def database_transactions_config
-      self.class.database_transactions_config
-    end
-
-    # setup_fixtures' transactional half, for the test method `name`.
-    def __roundhouse_setup_transactional_fixtures(name) # :nodoc:
+    # setup_fixtures, for the test method `name`.
+    def __roundhouse_setup_active_record_fixtures(name) # :nodoc:
       @__roundhouse_fixture_test_name = name
+      if pre_loaded_fixtures && !use_transactional_tests
+        raise RuntimeError, "pre_loaded_fixtures requires use_transactional_tests"
+      end
+      if pre_loaded_fixtures || use_instantiated_fixtures
+        raise NotImplementedError, "roundhouse: #{self.class}: pre_loaded_fixtures and use_instantiated_fixtures are not ported"
+      end
+
+      @fixture_cache = {}
+      @fixture_cache_key = [self.class.fixture_table_names.dup, self.class.fixture_paths.dup, self.class.fixture_class_names.dup]
       @fixture_connection_pools = []
+      @@already_loaded_fixtures ||= {}
       @connection_subscriber = nil
       @saved_pool_configs = Hash.new { |hash, key| hash[key] = {} }
-      setup_transactional_fixtures if run_in_transaction?
+
+      if run_in_transaction?
+        # Load fixtures once and begin transaction.
+        @loaded_fixtures = @@already_loaded_fixtures[@fixture_cache_key]
+        unless @loaded_fixtures
+          invalidate_already_loaded_fixtures
+          @loaded_fixtures = @@already_loaded_fixtures[@fixture_cache_key] = load_fixtures
+        end
+        TestFixtures.reset_fixture_accessors(@loaded_fixtures.values)
+
+        setup_transactional_fixtures
+      else
+        # Load fixtures for every test.
+        invalidate_already_loaded_fixtures
+        @loaded_fixtures = load_fixtures
+      end
     end
 
     # teardown_fixtures.
     def __roundhouse_teardown_fixtures(name) # :nodoc:
-      if instance_variable_defined?(:@fixture_connection_pools) && @fixture_connection_pools && run_in_transaction?
+      return unless instance_variable_defined?(:@fixture_connection_pools) && @fixture_connection_pools
+
+      # Rollback changes if a transaction is active.
+      if run_in_transaction?
         teardown_transactional_fixtures
+      else
+        invalidate_already_loaded_fixtures
       end
     ensure
       ActiveRecord::Base.connection_handler.clear_active_connections!(:all)
@@ -103,6 +348,15 @@ module ActiveRecord
           !self.class.uses_transaction?(@__roundhouse_fixture_test_name)
       end
 
+      def invalidate_already_loaded_fixtures
+        TestFixtures.reset_cache
+        @@already_loaded_fixtures.clear
+      end
+
+      def load_fixtures
+        TestFixtures.create_fixtures(fixture_table_names, fixture_class_names)
+      end
+
       def transactional_tests_for_pool?(pool)
         database_transactions_config.fetch(pool.db_config.name.to_sym, use_transactional_tests)
       end
@@ -110,8 +364,10 @@ module ActiveRecord
       def setup_transactional_fixtures
         setup_shared_connection_pool
 
+        # Begin transactions for connections already established
         pools = ActiveRecord::Base.connection_handler.connection_pool_list(:writing)
 
+        # Filter to pools that want to use transactions
         pools.select! { |pool| transactional_tests_for_pool?(pool) }
 
         pools.each do |pool|
@@ -120,6 +376,7 @@ module ActiveRecord
           pool.lease_connection
         end
 
+        # When connections are established in the future, begin a transaction too
         @connection_subscriber = ActiveSupport::Notifications.subscribe("!connection.active_record") do |_, _, _, _, payload|
           connection_name = payload[:connection_name] if payload.key?(:connection_name)
           shard = payload[:shard] if payload.key?(:shard)
@@ -142,9 +399,11 @@ module ActiveRecord
       def teardown_transactional_fixtures
         ActiveSupport::Notifications.unsubscribe(@connection_subscriber) if @connection_subscriber
 
-        # Rails clears its loaded-fixture cache unless every pin was
-        # clean; fixtures load before every test here.
-        @fixture_connection_pools.map(&:unpin_connection!)
+        unless @fixture_connection_pools.map(&:unpin_connection!).all?
+          # Something caused the transaction to be committed or rolled back
+          # We can no longer trust the database is in a clean state.
+          @@already_loaded_fixtures.clear
+        end
         @fixture_connection_pools.clear
         teardown_shared_connection_pool
       end
@@ -166,6 +425,66 @@ module ActiveRecord
             end
           end
         end
+      end
+
+      # `shops(:snowdevil)`: Rails' accessors, for the calls the compiler
+      # did not lower to the set's module (`ShopsFixtures.snowdevil`).
+      def method_missing(method, ...)
+        if fixture_sets.key?(method.name)
+          active_record_fixture(method, ...)
+        else
+          super
+        end
+      end
+
+      def respond_to_missing?(method, include_private = false)
+        if include_private && fixture_sets.key?(method.name)
+          true
+        else
+          super
+        end
+      end
+
+      def active_record_fixture(fixture_set_name, *fixture_names)
+        if fs_name = fixture_sets[fixture_set_name.name]
+          access_fixture(fs_name, *fixture_names)
+        else
+          raise StandardError, "No fixture set named '#{fixture_set_name.inspect}'"
+        end
+      end
+
+      # Each label is a method of the set's compiled module, which finds
+      # (and memoizes) its record; the module's memo is this test's, as
+      # `@fixture_cache` is (reset_fixture_accessors).
+      def access_fixture(fs_name, *fixture_names)
+        force_reload = fixture_names.pop if fixture_names.last == true || fixture_names.last == :reload
+        return_single_record = fixture_names.size == 1
+
+        row = @loaded_fixtures[fs_name]
+        raise NoMethodError, "undefined method 'fixtures' for nil" unless row
+        fixtures = Object.const_get(row[1], false)
+        labels = (fixtures.singleton_methods(false) - [:_fixtures_load!]).map(&:to_s)
+        if fixture_names.empty?
+          fixture_names = labels.sort_by { |label| fixtures.method(label).source_location&.last.to_i }
+        end
+        @fixture_cache[fs_name] ||= {}
+
+        instances = fixture_names.map do |f_name|
+          f_name = f_name.to_s if f_name.is_a?(Symbol)
+          @fixture_cache[fs_name].delete(f_name) if force_reload
+
+          if labels.include?(f_name)
+            @fixture_cache[fs_name][f_name] ||= begin
+              memo = :"@__fx_#{f_name}"
+              fixtures.instance_variable_set(memo, nil) if force_reload && fixtures.instance_variable_defined?(memo)
+              fixtures.public_send(f_name)
+            end
+          else
+            raise StandardError, "No fixture named '#{f_name}' found for fixture set '#{fs_name}'"
+          end
+        end
+
+        return_single_record ? instances.first : instances
       end
 
       def teardown_shared_connection_pool

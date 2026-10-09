@@ -847,6 +847,119 @@ RequestDispatch.prepend(RoundhouseResponseAssertions) if defined?(RequestDispatc
 # methods/overrides and setup/teardown super chains retain their precedence.
 TestBase.prepend(RoundhouseMinitestAssertions)
 
+# ---- ActiveSupport::Testing::SetupAndTeardown (ActiveSupport 8.2) ----
+#
+# The `setup` and `teardown` class macros that app code calls as it runs
+# (`ActiveSupport::TestCase.class_eval { setup do … end }` in a support
+# file, `base.setup do … end` in a helper's `included` hook); a test
+# class's own `setup do` blocks are compiled (`__roundhouse_before_setup`).
+# As with ActiveSupport::Callbacks' `set_callback(:setup, :before, …)` and
+# `set_callback(:teardown, :after, …)`, a class's chain holds what it and
+# its ancestors registered, in registration order (`prepend: true` puts a
+# callback first). Re-registering a method name moves it. Setup callbacks
+# run in order, after the fixtures and before `setup`; a `throw :abort`
+# skips the rest of them. Teardown callbacks run in reverse order, after
+# `teardown`. A filter is a block (instance_exec'd, given the test when
+# it takes an argument), a method name, or an object answering
+# `before_setup(test)` / `after_teardown(test)`. `if:` and `unless:` take
+# the same. Other options, `around` and string filters are refused.
+module RoundhouseTestCallbacks
+  @registered = 0
+
+  def self.next_registration
+    @registered += 1
+  end
+
+  module ClassMethods
+    def setup(*filters, &block)
+      RoundhouseTestCallbacks.register(self, :setup, filters, block)
+    end
+
+    def teardown(*filters, &block)
+      RoundhouseTestCallbacks.register(self, :teardown, filters, block)
+    end
+
+    def around(*)
+      raise NotImplementedError, "roundhouse: #{name}.around: ActiveSupport::Testing::SetupAndTeardown's around callbacks are not ported"
+    end
+  end
+
+  def self.register(klass, chain, filters, block)
+    filters = filters.dup
+    options = filters.last.is_a?(Hash) ? filters.pop : {}
+    unknown = options.keys - %i[if unless prepend]
+    unless unknown.empty?
+      raise NotImplementedError, "roundhouse: #{klass.name}.#{chain} #{unknown.map(&:inspect).join(', ')}: callback options other than if:, unless: and prepend: are not ported"
+    end
+    filters.unshift(block) if block
+    filters.each do |filter|
+      raise ArgumentError, "Passing string to define a callback is not supported. See the `.set_callback` documentation to see supported values." if filter.is_a?(String)
+      entry = {chain: chain, filter: filter, if: Array(options[:if]), unless: Array(options[:unless]),
+               prepend: options[:prepend] ? true : false, order: next_registration}
+      (klass.instance_variable_defined?(:@__roundhouse_test_callbacks) ? klass.instance_variable_get(:@__roundhouse_test_callbacks) : klass.instance_variable_set(:@__roundhouse_test_callbacks, [])) << entry
+    end
+    nil
+  end
+
+  # The chain `klass` runs, in order.
+  def self.callbacks(klass, chain)
+    entries = klass.ancestors.flat_map do |mod|
+      mod.instance_variable_defined?(:@__roundhouse_test_callbacks) ? mod.instance_variable_get(:@__roundhouse_test_callbacks) : []
+    end
+    entries = entries.select { |entry| entry.fetch(:chain) == chain }
+    latest = {}
+    entries.each do |entry|
+      filter = entry.fetch(:filter)
+      next unless filter.is_a?(Symbol)
+      latest[filter] = entry.fetch(:order) if latest.fetch(filter, 0) < entry.fetch(:order)
+    end
+    entries = entries.reject { |entry| entry.fetch(:filter).is_a?(Symbol) && latest.fetch(entry.fetch(:filter)) != entry.fetch(:order) }
+    entries.sort_by { |entry| entry.fetch(:prepend) ? [0, -entry.fetch(:order)] : [1, entry.fetch(:order)] }
+  end
+
+  def self.run_setup(test)
+    catch(:abort) do
+      callbacks(test.class, :setup).each do |entry|
+        call(test, entry.fetch(:filter), "before_setup") if applies?(test, entry)
+      end
+    end
+    nil
+  end
+
+  def self.run_teardown(test)
+    callbacks(test.class, :teardown).reverse_each do |entry|
+      call(test, entry.fetch(:filter), "after_teardown") if applies?(test, entry)
+    end
+    nil
+  end
+
+  def self.applies?(test, entry)
+    entry.fetch(:if).all? { |condition| call(test, condition, nil) } &&
+      entry.fetch(:unless).none? { |condition| call(test, condition, nil) }
+  end
+
+  def self.call(test, filter, object_method)
+    case filter
+    when Symbol
+      test.send(filter)
+    when Proc
+      if filter.arity > 1
+        test.instance_exec(test, nil, &filter)
+      elsif filter.arity > 0
+        test.instance_exec(test, &filter)
+      else
+        test.instance_exec(&filter)
+      end
+    else
+      unless object_method
+        raise NotImplementedError, "roundhouse: callback condition #{filter.inspect}: only method names and procs are ported"
+      end
+      filter.public_send(object_method, test)
+    end
+  end
+end
+TestBase.extend(RoundhouseTestCallbacks::ClassMethods)
+
 # Rack's multipart round trip for the rack-test gem's own
 # `Rack::Test::UploadedFile`: rack-test encodes the file as a multipart
 # part and Rails parses it back into an `ActionDispatch::Http::UploadedFile`
@@ -972,13 +1085,16 @@ module RoundhouseTestRunner
       test.__roundhouse_errors = errors if test.respond_to?(:__roundhouse_errors=)
       capture(errors, "setup") do
         yield if block_given?
-        test.__roundhouse_setup_fixtures
-        # ActiveRecord::TestFixtures#setup_fixtures' transactions, where
-        # the tree carries them (the PostgreSQL tree's
-        # runtime/active_record_test_fixtures.rb).
-        if test.respond_to?(:__roundhouse_setup_transactional_fixtures)
-          test.__roundhouse_setup_transactional_fixtures(name)
+        # ActiveRecord::TestFixtures#before_setup's setup_fixtures, first,
+        # where the tree carries it (the PostgreSQL tree's
+        # runtime/active_record_test_fixtures.rb): the fixtures, loaded
+        # once, and the test's transaction.
+        if test.respond_to?(:__roundhouse_setup_active_record_fixtures)
+          test.__roundhouse_setup_active_record_fixtures(name)
         end
+        test.__roundhouse_setup_fixtures
+        # ActiveSupport's before_setup: run_callbacks :setup.
+        RoundhouseTestCallbacks.run_setup(test) if test.class.is_a?(RoundhouseTestCallbacks::ClassMethods)
         test.__roundhouse_before_setup
         test.setup
       end
@@ -990,6 +1106,9 @@ module RoundhouseTestRunner
         capture(errors, "teardown") { test.__roundhouse_verify_stubs }
       end
       capture(errors, "teardown") { test.teardown }
+      # ActiveSupport's after_teardown: run_callbacks :teardown, its
+      # failure recorded and the rest of after_teardown run.
+      capture(errors, "teardown") { RoundhouseTestCallbacks.run_teardown(test) } if test.class.is_a?(RoundhouseTestCallbacks::ClassMethods)
       # Minitest's after_teardown hook, where something defines it
       # (ActiveSupport's TimeHelpers travels back there).
       capture(errors, "teardown") { test.after_teardown } if test.respond_to?(:after_teardown)
@@ -1004,11 +1123,21 @@ module RoundhouseTestRunner
     # cannot turn into a pass or disappear behind an earlier skip.
     statuses = errors.map { |error| error.fetch("status") }
     status = %w[error fail skip].find { |kind| statuses.include?(kind) } || "pass"
-    {"schema" => "roundhouse-test-result/v1", "id" => "#{klass.name}##{name}", "status" => status,
+    result = {"schema" => "roundhouse-test-result/v1", "id" => "#{klass.name}##{name}", "status" => status,
      "minitest_version" => Gem.loaded_specs.fetch("minitest").version.to_s,
      "minitest_runtime_version" => Minitest::VERSION,
      "assertions" => test ? test.assertions : 0, "exceptions" => errors,
      "assertion_count_scope" => "minitest"}
+    # The fixture sets this process refused (error[fixture_set_not_loaded]),
+    # beside a result whose database lacked their rows.
+    not_loaded = fixture_sets_not_loaded
+    result["fixture_sets_not_loaded"] = not_loaded unless not_loaded.empty?
+    result
+  end
+
+  def self.fixture_sets_not_loaded
+    return [] unless defined?(ActiveRecord::TestFixtures) && ActiveRecord::TestFixtures.respond_to?(:fixture_sets_not_loaded)
+    ActiveRecord::TestFixtures.fixture_sets_not_loaded.keys.sort
   end
 
   def self.run(klass, methods, &reset)
