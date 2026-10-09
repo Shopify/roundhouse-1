@@ -35,9 +35,10 @@
 # Persistence raises for a readonly record's save, destroy and touch
 # (core.rb, persistence.rb): after the before_save / before_destroy
 # callbacks, as Rails raises inside the callback run. And the slice of
-# Reflection::BelongsToReflection app code reads (reflection.rb), which
-# a class answers from `reflect_on_association` for the associations a
-# class macro declares (lower::model_to_library::macro_associations).
+# the association reflections app code reads (reflection.rb), which a
+# model answers from `reflect_on_association` for each association it
+# compiled (emit::ruby::library::apply_association_reflections) and for
+# those a class macro declares (lower::model_to_library::macro_associations).
 
 module ActiveModel
   # Raised when forbidden attributes are used for mass assignment.
@@ -172,15 +173,179 @@ module ActiveRecord
   end
 
   module Reflection
-    # A `belongs_to` association's reflection: its name, foreign key
-    # (and type), the target class and primary key.
-    class BelongsToReflection
-      attr_reader :name, :foreign_key, :foreign_type, :class_name
+    # The reflection `reflect_on_association` answers for an association
+    # the model compiled (reflection.rb's AssociationReflection and its
+    # macro subclasses). The generated `reflect_on_association` builds one
+    # per association, once per declaring class, and answers the same
+    # object after (emit::ruby::library::apply_association_reflections),
+    # so a write to it is seen by every later reader, as in Rails:
+    # `base.reflect_on_association(:metafields).options[:autosave] = false`.
+    #
+    # The name, keys and target class come from the compiled association.
+    # `options` is the declaration's keyword hash, normalized as
+    # MacroReflection#normalize_options does (`counter_cache`), with
+    # belongs_to's `required:` turned into `optional:` as the builder does.
+    # An option whose value the compiler does not carry (anything but a
+    # literal: a lambda, a constant, a `**splat`, a block's extension)
+    # makes `options` raise NotImplementedError naming it, rather than
+    # answer a hash without it. An association a class macro declares
+    # takes the options the macro's `belongs_to` passes when it runs
+    # (`_roundhouse_declared`, lower::model_to_library::macro_associations).
+    class AssociationReflection
+      attr_reader :name, :active_record
 
-      def initialize(name, foreign_key, class_name, foreign_type, primary_key)
+      def initialize(name, target, foreign_key, options, active_record, unsupported: [])
         @name = name
+        @target = target
         @foreign_key = foreign_key
-        @class_name = class_name
+        @options = options.nil? ? nil : normalize_options(options)
+        @active_record = active_record
+        @unsupported = unsupported
+      end
+
+      def options
+        if @options.nil?
+          raise NotImplementedError, "roundhouse: #{@active_record}.reflect_on_association(:#{@name}).options: " \
+            "the options are known once the class macro declaring the association runs"
+        end
+        unless @unsupported.empty?
+          raise NotImplementedError, "roundhouse: #{@active_record}.reflect_on_association(:#{@name}).options: " \
+            "#{@unsupported.join(", ")} not carried (the compiler copies literal option values only)"
+        end
+        @options
+      end
+
+      # The options a class macro's `belongs_to(name, *args, **options)`
+      # declares the association with.
+      def _roundhouse_declared(options)
+        @options = normalize_options(options)
+        @unsupported = []
+        @class_name = nil
+        self
+      end
+
+      # Rails' `options[:class_name]` or the name's class; the class the
+      # compiler resolved the association to while the options are not
+      # known.
+      def class_name
+        @class_name ||= if _roundhouse_options_known?
+          -(@options[:class_name] || derive_class_name).to_s
+        else
+          -@target.to_s
+        end
+      end
+
+      def foreign_key
+        if @foreign_key.nil?
+          raise NotImplementedError, "roundhouse: #{@active_record}.reflect_on_association(:#{@name}).foreign_key: " \
+            "the compiled #{macro} association has no foreign key"
+        end
+        @foreign_key
+      end
+
+      def klass
+        @klass ||= Object.const_get(@target)
+      end
+
+      def autosave=(autosave)
+        options[:autosave] = autosave
+      end
+
+      def collection?
+        false
+      end
+
+      def belongs_to?
+        false
+      end
+
+      def has_one?
+        false
+      end
+
+      def through_reflection?
+        false
+      end
+
+      def polymorphic?
+        options[:polymorphic]
+      end
+
+      def validate?
+        !options[:validate].nil? ? options[:validate] : (options[:autosave] == true || collection?)
+      end
+
+      private
+        def _roundhouse_options_known?
+          !@options.nil? && @unsupported.empty?
+        end
+
+        def derive_class_name
+          class_name = name.to_s
+          class_name = class_name.singularize if collection?
+          class_name.camelize
+        end
+
+        def normalize_options(options)
+          counter_cache = options.delete(:counter_cache)
+
+          if counter_cache
+            active = true
+
+            case counter_cache
+            when String, Symbol
+              column = -counter_cache.to_s
+            when Hash
+              active = counter_cache.fetch(:active, true)
+              column = counter_cache[:column]&.to_s
+            end
+
+            options[:counter_cache] = { active: active, column: column }
+          end
+
+          options
+        end
+    end
+
+    class HasManyReflection < AssociationReflection
+      def macro
+        :has_many
+      end
+
+      def collection?
+        true
+      end
+    end
+
+    class HasOneReflection < AssociationReflection
+      def macro
+        :has_one
+      end
+
+      def has_one?
+        true
+      end
+    end
+
+    class HasAndBelongsToManyReflection < AssociationReflection
+      def macro
+        :has_and_belongs_to_many
+      end
+
+      def collection?
+        true
+      end
+    end
+
+    # A `belongs_to` association's reflection: its name, foreign key
+    # (and type), the target class and primary key. Without options (a
+    # class macro's association before the macro runs), `polymorphic?`
+    # answers from the foreign type.
+    class BelongsToReflection < AssociationReflection
+      attr_reader :foreign_type
+
+      def initialize(name, foreign_key, class_name, foreign_type, primary_key, options = nil, active_record = nil, unsupported: [])
+        super(name, class_name, foreign_key, options, active_record, unsupported: unsupported)
         @foreign_type = foreign_type
         @primary_key = primary_key
       end
@@ -189,17 +354,81 @@ module ActiveRecord
         :belongs_to
       end
 
+      def belongs_to?
+        true
+      end
+
+      # Only a polymorphic declaration has a foreign type.
       def polymorphic?
-        !@foreign_type.nil?
+        _roundhouse_options_known? ? options[:polymorphic] : (true unless @foreign_type.nil?)
       end
 
       def klass
         raise ArgumentError, "Polymorphic associations do not support computing the class." if polymorphic?
-        Object.const_get(@class_name)
+        super
       end
 
       def association_primary_key
         @primary_key || klass.primary_key.to_s
+      end
+
+      private
+        def normalize_options(options)
+          options = super
+          options[:optional] = !options.delete(:required) if options.key?(:required)
+          options
+        end
+    end
+
+    # A `has_many :through` association's reflection: the has_many it
+    # wraps answers its name, options and class; the key is the source
+    # association's, on the class the through association reaches.
+    class ThroughReflection
+      attr_reader :delegate_reflection
+
+      def initialize(delegate_reflection)
+        @delegate_reflection = delegate_reflection
+      end
+
+      def name = @delegate_reflection.name
+      def options = @delegate_reflection.options
+      def macro = @delegate_reflection.macro
+      def active_record = @delegate_reflection.active_record
+      def class_name = @delegate_reflection.class_name
+      def klass = @delegate_reflection.klass
+      def collection? = @delegate_reflection.collection?
+      def has_one? = @delegate_reflection.has_one?
+      def belongs_to? = false
+      def polymorphic? = @delegate_reflection.polymorphic?
+      def validate? = @delegate_reflection.validate?
+      def through_reflection? = true
+
+      def autosave=(autosave)
+        @delegate_reflection.autosave = autosave
+      end
+
+      def through_reflection
+        active_record.reflect_on_association(options[:through])
+      end
+
+      def source_reflection_names
+        options[:source] ? [options[:source]] : [name.to_s.singularize, name].collect(&:to_sym).uniq
+      end
+
+      def source_reflection
+        source_reflection_names.each do |source|
+          reflection = through_reflection.klass.reflect_on_association(source)
+          return reflection if reflection
+        end
+        nil
+      end
+
+      def foreign_key
+        source_reflection.foreign_key
+      end
+
+      def foreign_type
+        source_reflection.foreign_type
       end
     end
   end
