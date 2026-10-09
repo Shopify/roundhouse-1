@@ -362,31 +362,122 @@ fn parse_methods(body: &str) -> Vec<MethodDef> {
 /// four writers were dropped with no diagnostic (`Model#initialize`'s
 /// `send("month=", 9)` then raised NoMethodError). Each element (a
 /// literal Symbol or String) replaces the block parameter in the string,
-/// so the result is the exact text Ruby evaluates. This applies only
-/// when every interpolation is that parameter. The text is read as a
+/// so the result is the exact text Ruby evaluates.
+///
+/// The loop may also run over a literal Hash, its block taking the key
+/// and the value, and its block may be one such loop over a value the
+/// outer block bound. activeresource's `HttpMock` writes its verbs so:
+///
+/// ```ruby
+/// { true  => %w[post patch put],
+///   false => %w[get delete head] }.each do |has_body, methods|
+///   methods.each do |method|
+///     module_eval <<-EOE, __FILE__, __LINE__ + 1
+///       def #{method}(path, #{'body, ' if has_body}headers, options = {})
+///         request = ActiveResource::Request.new(:#{method}, path, #{has_body ? 'body, ' : 'nil, '}headers, options)
+///         process(request)
+///       end
+///     EOE
+///   end
+/// end
+/// ```
+///
+/// An interpolation is a bound name, or a conditional on one whose
+/// branches are literal strings or nil, written as Ruby writes it
+/// (`nil` and `false` interpolate as "" and "false"). This applies
+/// only when every interpolation is one of those. The text is read as a
 /// class body. Its methods are public, as a string `class_eval` starts
 /// public. The file and line arguments only locate the text. `None` for
 /// any other shape, and the caller keeps the call.
 pub(super) fn unrolled_class_eval_loop(stmt: &Expr) -> Option<Vec<MethodDef>> {
+    let mut out = Vec::new();
+    unroll(stmt, &mut Vec::new(), &mut out)?;
+    Some(out)
+}
+
+/// A value the unrolled loop binds.
+#[derive(Clone)]
+enum Bound {
+    Text(String),
+    Bool(bool),
+    Nil,
+    List(Vec<Bound>),
+}
+
+impl Bound {
+    fn literal(expr: &Expr) -> Option<Bound> {
+        Some(match &*expr.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Bound::Text(value.as_str().to_string()),
+            ExprNode::Lit { value: Literal::Str { value } } => Bound::Text(value.clone()),
+            ExprNode::Lit { value: Literal::Bool { value } } => Bound::Bool(*value),
+            ExprNode::Lit { value: Literal::Nil } => Bound::Nil,
+            ExprNode::Array { elements, .. } => Bound::List(elements.iter().map(Bound::literal).collect::<Option<_>>()?),
+            _ => return None,
+        })
+    }
+
+    /// The text `"#{value}"` writes.
+    fn text(&self) -> Option<String> {
+        match self {
+            Bound::Text(s) => Some(s.clone()),
+            Bound::Bool(b) => Some(b.to_string()),
+            Bound::Nil => Some(String::new()),
+            Bound::List(_) => None,
+        }
+    }
+
+    fn truthy(&self) -> bool {
+        !matches!(self, Bound::Nil | Bound::Bool(false))
+    }
+}
+
+fn bound<'a>(env: &'a [(Symbol, Bound)], expr: &Expr) -> Option<&'a Bound> {
+    let ExprNode::Var { name, .. } = &*expr.node else { return None };
+    env.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+/// The value of an interpolated expression under `env`.
+fn evaluate(env: &[(Symbol, Bound)], expr: &Expr) -> Option<Bound> {
+    match &*expr.node {
+        ExprNode::Var { .. } => bound(env, expr).cloned(),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            let branch = if bound(env, cond)?.truthy() { then_branch } else { else_branch };
+            evaluate(env, branch)
+        }
+        ExprNode::Seq { exprs } if exprs.is_empty() => Some(Bound::Nil),
+        _ => Bound::literal(expr).filter(|v| !matches!(v, Bound::List(_))),
+    }
+}
+
+fn unroll(stmt: &Expr, env: &mut Vec<(Symbol, Bound)>, out: &mut Vec<MethodDef>) -> Option<()> {
     let ExprNode::Send { recv: Some(recv), method, args, block: Some(block), .. } = &*stmt.node else {
         return None;
     };
     if method.as_str() != "each" || !args.is_empty() {
         return None;
     }
-    let ExprNode::Array { elements, .. } = &*recv.node else { return None };
-    let items: Vec<String> = elements
-        .iter()
-        .map(|e| match &*e.node {
-            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
-            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
     let ExprNode::Lambda { params, rest_param: None, block_param: None, body, .. } = &*block.node else {
         return None;
     };
-    let [param] = params.as_slice() else { return None };
+    // Each iteration's bindings for the block parameters.
+    let rows: Vec<Vec<Bound>> = match &*recv.node {
+        ExprNode::Hash { entries, kwargs: false } => {
+            let [_, _] = params.as_slice() else { return None };
+            entries
+                .iter()
+                .map(|(k, v)| Some(vec![Bound::literal(k)?, Bound::literal(v)?]))
+                .collect::<Option<_>>()?
+        }
+        _ => {
+            let [_] = params.as_slice() else { return None };
+            let items = match &*recv.node {
+                ExprNode::Array { .. } => Bound::literal(recv)?,
+                _ => bound(env, recv)?.clone(),
+            };
+            let Bound::List(items) = items else { return None };
+            items.into_iter().map(|item| vec![item]).collect()
+        }
+    };
     let statement = match &*body.node {
         ExprNode::Seq { exprs } => match exprs.as_slice() {
             [only] => only,
@@ -394,6 +485,21 @@ pub(super) fn unrolled_class_eval_loop(stmt: &Expr) -> Option<Vec<MethodDef>> {
         },
         _ => body,
     };
+    for row in rows {
+        let depth = env.len();
+        env.extend(params.iter().cloned().zip(row));
+        if matches!(&*statement.node, ExprNode::Send { method, block: Some(_), .. } if method.as_str() == "each") {
+            unroll(statement, env, out)?;
+        } else {
+            out.extend(evaluated_class_eval(statement, env)?);
+        }
+        env.truncate(depth);
+    }
+    Some(())
+}
+
+/// The methods one string `class_eval` writes under `env`.
+fn evaluated_class_eval(statement: &Expr, env: &[(Symbol, Bound)]) -> Option<Vec<MethodDef>> {
     let ExprNode::Send { recv: eval_recv, method: eval, args: eval_args, block: None, .. } = &*statement.node else {
         return None;
     };
@@ -405,30 +511,28 @@ pub(super) fn unrolled_class_eval_loop(stmt: &Expr) -> Option<Vec<MethodDef>> {
         return None;
     }
     let ExprNode::StringInterp { parts } = &*eval_args[0].node else { return None };
-    let mut out = Vec::new();
-    for item in &items {
-        let mut src = String::new();
-        for part in parts {
-            match part {
-                InterpPart::Text { value } => src.push_str(value),
-                InterpPart::Expr { expr } => match &*expr.node {
-                    ExprNode::Var { name, .. } if name == param => src.push_str(item),
-                    _ => return None,
-                },
-            }
+    let mut src = String::new();
+    for part in parts {
+        match part {
+            InterpPart::Text { value } => src.push_str(value),
+            InterpPart::Expr { expr } => src.push_str(&evaluate(env, expr)?.text()?),
         }
-        if !src.contains("def ") {
-            return None;
-        }
-        let methods = parse_methods(&src);
-        if methods.is_empty() {
-            return None;
-        }
-        out.extend(methods.into_iter().map(|mut m| {
-            m.visibility = crate::dialect::MethodVisibility::Public;
-            m.name_span = crate::span::Span::synthetic();
-            m
-        }));
     }
-    Some(out)
+    if !src.contains("def ") {
+        return None;
+    }
+    let methods = parse_methods(&src);
+    if methods.is_empty() {
+        return None;
+    }
+    Some(
+        methods
+            .into_iter()
+            .map(|mut m| {
+                m.visibility = crate::dialect::MethodVisibility::Public;
+                m.name_span = crate::span::Span::synthetic();
+                m
+            })
+            .collect(),
+    )
 }

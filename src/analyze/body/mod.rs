@@ -1329,6 +1329,26 @@ impl<'a> BodyTyper<'a> {
     /// `ActiveRecord::Base` [`runtime_base`] reads: the registry seeds
     /// `ActiveRecord::DatabaseConfigurations` exactly then
     /// (`registry::ar::carries_database_configurations`).
+    /// Whether `id`, through the modules it or an ancestor includes,
+    /// answers `method` from a runtime ActiveModel port
+    /// (`runtime_base::module_answers`).
+    fn runtime_port_answers(&self, id: &ClassId, method: &str, class_side: bool, explicit_receiver: bool) -> bool {
+        let classes = self.classes();
+        let mut current = Some(id.clone());
+        for _ in 0..32 {
+            let Some(cid) = current else { return false };
+            let Some(cls) = classes.get(&cid) else { return false };
+            if cls.includes().iter().any(|m| {
+                m.0.as_str().starts_with("ActiveModel::")
+                    && runtime_base::module_answers(m.0.as_str(), method, class_side, explicit_receiver)
+            }) {
+                return true;
+            }
+            current = cls.parent().cloned();
+        }
+        false
+    }
+
     fn carries_postgresql_base(&self) -> bool {
         self.classes().contains_key(&ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations")))
     }
@@ -2986,6 +3006,25 @@ impl<'a> BodyTyper<'a> {
                         if answered {
                             // Typed as the registry does a Base method it
                             // seeds without a signature: the gradual escape.
+                            return if matches!(dispatched, Ty::Var { .. }) { Ty::Untyped } else { dispatched };
+                        }
+                    }
+                    // A class (an app's, or a gem source's: ActiveResource::Base)
+                    // that includes one of the runtime's ActiveModel ports the
+                    // PostgreSQL tree carries (`include ActiveModel::Conversion`)
+                    // answers that port's methods as Ruby dispatches them
+                    // (`to_param`, `to_key`): a plain send, typed gradually.
+                    if let Some(Ty::Class { id, .. }) = recv_ty.as_ref()
+                        && id.0.as_str() != "ActiveRecord::Base"
+                        && !ctx.claimed_macro_template
+                        && expr.diagnostic.is_none()
+                        && self.carries_postgresql_base()
+                    {
+                        let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+                        let class_side = class_object_receiver
+                            || recv.as_ref().is_some_and(|r| self.is_class_of_value(r, ctx));
+                        let sides: &[bool] = if class_side { &[true] } else if on_self { &[false] } else { &[false, true] };
+                        if sides.iter().any(|&side| self.runtime_port_answers(id, method.as_str(), side, !on_self)) {
                             return if matches!(dispatched, Ty::Var { .. }) { Ty::Untyped } else { dispatched };
                         }
                     }
@@ -4912,10 +4951,10 @@ mod runtime_base {
         files
     }
 
-    /// Per side: what `ActiveRecord::Base` answers, by name → public.
-    fn surface() -> &'static [HashMap<String, bool>; 2] {
-        static SURFACE: OnceLock<[HashMap<String, bool>; 2]> = OnceLock::new();
-        SURFACE.get_or_init(|| {
+    /// Every runtime file above, walked once.
+    fn walker() -> &'static Walker {
+        static WALKER: OnceLock<Walker> = OnceLock::new();
+        WALKER.get_or_init(|| {
             let mut walker = Walker::default();
             for (_, text) in sources() {
                 let parsed = ruby_prism::parse(text.as_bytes());
@@ -4926,6 +4965,15 @@ mod runtime_base {
                 let top = root.as_program_node().map(|p| p.statements().as_node());
                 walker.statements(top, &mut Body { owner: String::new(), side: INSTANCE, public: true });
             }
+            walker
+        })
+    }
+
+    /// Per side: what `ActiveRecord::Base` answers, by name → public.
+    fn surface() -> &'static [HashMap<String, bool>; 2] {
+        static SURFACE: OnceLock<[HashMap<String, bool>; 2]> = OnceLock::new();
+        SURFACE.get_or_init(|| {
+            let walker = walker();
             let mut sides: [HashMap<String, bool>; 2] = Default::default();
             for (side, out) in sides.iter_mut().enumerate() {
                 walker.answers("ActiveRecord::Base", side, &mut HashSet::default(), out);
@@ -4949,9 +4997,43 @@ mod runtime_base {
         crate::stdlib_rbs::core_instance_method(if class_side { "Class" } else { "Object" }, method)
     }
 
+    /// Whether an includer of the runtime module `module` (an
+    /// ActiveModel port, `ActiveModel::Conversion`) answers `method` from
+    /// it: on an instance, the module's own ancestry; on the class, what
+    /// its `included` / `append_features` hook mixes in
+    /// (`base.extend ClassMethods`). Public, unless `self` is the
+    /// receiver. A module no runtime file opens answers nothing.
+    pub(super) fn module_answers(module: &str, method: &str, class_side: bool, explicit_receiver: bool) -> bool {
+        let walker = walker();
+        let Some(space) = walker.spaces.get(module) else { return false };
+        let mut out = HashMap::default();
+        if class_side {
+            for (scope, written, _) in &space.includer_mixins[SINGLETON] {
+                if let Some(hooked) = walker.resolve(scope, written) {
+                    walker.answers(&hooked, INSTANCE, &mut HashSet::default(), &mut out);
+                }
+            }
+        } else {
+            walker.answers(module, INSTANCE, &mut HashSet::default(), &mut out);
+        }
+        out.get(method).is_some_and(|public| *public || !explicit_receiver)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::answers;
+        use super::{answers, module_answers};
+
+        #[test]
+        fn an_includer_of_a_runtime_active_model_port_answers_its_methods() {
+            // active_model_naming.rb's Conversion (ActiveResource::Base's
+            // `include ActiveModel::Conversion`, `to_param` in base.rb).
+            assert!(module_answers("ActiveModel::Conversion", "to_param", false, false));
+            assert!(module_answers("ActiveModel::Conversion", "to_key", false, true));
+            assert!(module_answers("ActiveModel::Conversion", "param_delimiter", true, true));
+            assert!(!module_answers("ActiveModel::Conversion", "to_param", true, true));
+            assert!(!module_answers("ActiveModel::Conversion", "some_unknown_api", false, false));
+            assert!(!module_answers("ActiveModel::NoSuchPort", "to_param", false, false));
+        }
 
         #[test]
         fn the_postgresql_base_answers_what_its_runtime_defines() {

@@ -3633,9 +3633,14 @@ fn walk_decl_body_in<'pr>(
         // replay of the class body is: there it is a body statement,
         // carried inside a `class << self` of its own or named
         // (cldr.rb's `["t", "translate", …].each do |m| class_eval … end`).
+        //
+        // A loop over a literal Hash (HttpMock's `{ true => %w[post …],
+        // false => … }.each`) is taken here only when it unrolls; any
+        // other stays the computed-receiver statement below.
         if let Some(call) = statement.as_call_node()
-            && call.receiver().is_some_and(|r| r.as_array_node().is_some())
+            && let Some(list) = call.receiver().filter(|r| r.as_array_node().is_some() || r.as_hash_node().is_some())
             && let Ok(e) = ingest_expr(&statement, file)
+            && (list.as_array_node().is_some() || super::class_eval_macro::unrolled_class_eval_loop(&e).is_some())
         {
             match super::class_eval_macro::unrolled_class_eval_loop(&e) {
                 Some(methods) => {
