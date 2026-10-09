@@ -7215,20 +7215,46 @@ pub(crate) fn apply_constant_rooting(
             let segs: Vec<&str> = name.split("::").collect();
             (1..segs.len()).map(|i| segs[..i].join("::")).collect()
         };
+        let scope = LexicalScope { own: name.to_string(), prefixes: &prefixes };
         for m in &mut lc.methods {
-            root_shadowed_constants(&mut m.body, &shadowing, &prefixes, &known);
+            root_shadowed_constants(&mut m.body, &shadowing, &scope, &known);
         }
+        // The class body is the same lexical scope as its methods: a
+        // constant's value and a class-level `@ivar = …` read their
+        // constants exactly as a method body does.
+        for (_, value) in &mut lc.constants {
+            root_shadowed_constants(value, &shadowing, &scope, &known);
+        }
+        for init in &mut lc.class_ivar_initializers {
+            root_shadowed_constants(init, &shadowing, &scope, &known);
+        }
+    }
+}
+
+/// The lexical scope an emitted class body reads constants in, innermost
+/// first: the class itself (`own`), then each namespace the emit opens
+/// around it (`prefixes`, outermost first), then Object.
+struct LexicalScope<'a> {
+    own: String,
+    prefixes: &'a [String],
+}
+
+impl LexicalScope<'_> {
+    /// Innermost first, the class itself included.
+    fn innermost_first(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.own.as_str()).chain(self.prefixes.iter().rev().map(String::as_str))
     }
 }
 
 fn root_shadowed_constants(
     expr: &mut Expr,
     shadowing: &[String],
-    prefixes: &[String],
+    scope: &LexicalScope<'_>,
     known: &dyn Fn(&str) -> bool,
 ) {
     expr.node
-        .for_each_child_mut(&mut |c| root_shadowed_constants(c, shadowing, prefixes, known));
+        .for_each_child_mut(&mut |c| root_shadowed_constants(c, shadowing, scope, known));
+    let prefixes = scope.prefixes;
     let ExprNode::Const { path } = &mut *expr.node else {
         return;
     };
@@ -7243,10 +7269,18 @@ fn root_shadowed_constants(
     // under `module UI`. Rubydex already resolved the source reference.
     // Root its actual class when the new nesting would bind the head to
     // another class; a typed VALUE constant never carries this mark.
+    //
+    // The class's OWN constants are the innermost scope, and analysis
+    // writes a resolved reference as its full name, which puts a head
+    // there the source never looked up. Core's `lib/counters.rb` nests a
+    // `module Counters` inside `module Counters`; the bare `LiveCounters`
+    // in `Counters.live` resolves to `Counters::LiveCounters` and, written
+    // so inside `module Counters`, reads `Counters::Counters::LiveCounters`:
+    // a NameError on every query (the 087_counters.rb subscriber).
     if expr.decisions & crate::expr::RESOLVED_CLASS_REF != 0 {
         if let Some(crate::ty::Ty::Class { id, .. }) = &expr.ty {
             let resolved = id.0.as_str();
-            for prefix in prefixes.iter().rev() {
+            for prefix in scope.innermost_first() {
                 if known(&format!("{prefix}::{}", head.as_str())) {
                     if format!("{prefix}::{joined}") != resolved {
                         *path = resolved.split("::").map(Symbol::from).collect();

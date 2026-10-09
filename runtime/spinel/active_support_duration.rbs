@@ -61,6 +61,10 @@ module ActiveSupport
     def +: (untyped other) -> Duration
     def -: (untyped other) -> Duration
     def -@: () -> Duration
+    def +@: () -> Duration
+    def *: (untyped other) -> Duration
+    # A Duration by a number, or a plain number for Duration / Duration.
+    def /: (untyped other) -> untyped
     def inspect: () -> String
     def ==: (untyped other) -> bool
     def eql?: (untyped other) -> bool

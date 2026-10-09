@@ -21,6 +21,18 @@
 //! and a global opt-out is the honest reading of "this app means
 //! something else by that name".
 //!
+//! A stood-down site is left as the app wrote it, so the target's
+//! runtime has to answer `exclude?` itself. The CRuby overlay does:
+//! runtime/active_support_core_ext.rb carries activesupport's
+//! `Enumerable#exclude?` and `String#exclude?` verbatim. Shopify Core
+//! is such an app (its own classes define `exclude?`), and its boot
+//! path's `[...].exclude?(..)` in
+//! `Podding::Database::PodConnectionConfigProvider` raised NoMethodError
+//! until the overlay had them. A per-receiver refinement (rewrite where
+//! the receiver is statically a builtin collection even when an app
+//! class defines the name) would need `fused`'s gate to pass the
+//! receiver through; the overlay makes it an optimization, not a fix.
+//!
 //! Views ARE walked here, unlike the blank pass. Its exclusion exists
 //! because the per-target view-cond predicate rewrites match the
 //! original `blank?`/`present?` shapes and would miss a rewritten one;

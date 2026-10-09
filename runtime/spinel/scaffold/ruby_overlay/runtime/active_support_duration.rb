@@ -303,6 +303,94 @@ module ActiveSupport
       Duration.new(-@seconds, parts, @order.dup)
     end
 
+    def +@
+      self
+    end
+
+    # activesupport 8.2 `Duration#*`: a number (or a Scalar, or another
+    # Duration's value) scales the value and each part
+    # (`30.minutes * 2` is "60 minutes"). Core's
+    # `ExternalProviderTokens` reads `SESSION_TTL * 2` at class load.
+    def *(other)
+      if Scalar === other || Duration === other
+        Duration.new(@seconds * other.value, scaled_parts { |n| n * other.value }, @order.dup)
+      elsif Numeric === other
+        Duration.new(@seconds * other, scaled_parts { |n| n * other }, @order.dup)
+      else
+        raise_type_error(other)
+      end
+    end
+
+    # activesupport 8.2 `Duration#/`: a number divides the value and each
+    # part (`1.hour / 2` is 1800 seconds; its `hours` part, 1 / 2, is 0
+    # and drops); a Duration divides value by value into a plain number
+    # (`1.hour / 30.minutes` is 2).
+    def /(other)
+      if Scalar === other
+        Duration.new(@seconds / other.value, scaled_parts { |n| n / other.value }, @order.dup)
+      elsif Duration === other
+        @seconds / other.value
+      elsif Numeric === other
+        Duration.new(@seconds / other, scaled_parts { |n| n / other }, @order.dup)
+      else
+        raise_type_error(other)
+      end
+    end
+
+    # activesupport 8.2 `Duration#%`: the remainder, rebuilt into parts
+    # (`Duration.build`).
+    def %(other)
+      if Duration === other || Scalar === other
+        Duration.build(@seconds % other.value)
+      elsif Numeric === other
+        Duration.build(@seconds % other)
+      else
+        raise_type_error(other)
+      end
+    end
+
+    # Rails' `attr_reader :value`: the seconds count, which `Scalar` and
+    # the operators read from either operand.
+    def value
+      @seconds
+    end
+
+    # activesupport 8.2 `Duration.build`: a seconds value spread over the
+    # parts, largest first, each the whole count of that unit left in
+    # the remainder; the seconds part keeps the rest. Zero parts drop
+    # (unless the value is zero, which is "0 seconds").
+    PARTS_IN_SECONDS = [SECONDS_PER_YEAR, SECONDS_PER_MONTH, SECONDS_PER_WEEK, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_MINUTE, 1].freeze
+
+    def self.build(value)
+      unless value.is_a?(::Numeric)
+        raise TypeError, "can't build an #{name} from a #{value.class.name}"
+      end
+      parts = [nil, nil, nil, nil, nil, nil, nil]
+      remainder_sign = value <=> 0
+      remainder = value.round(9).abs
+      unless value == 0
+        i = 0
+        while i < 6
+          parts[i] = remainder.div(PARTS_IN_SECONDS[i]) * remainder_sign
+          remainder %= PARTS_IN_SECONDS[i]
+          i += 1
+        end
+      end
+      parts[6] = remainder * remainder_sign
+      new(value, parts)
+    end
+
+    # Each present part through the block, in place: Rails'
+    # `@parts.transform_values`.
+    def scaled_parts
+      @parts.map { |n| n.nil? ? nil : yield(n) }
+    end
+
+    def raise_type_error(other)
+      raise TypeError, "no implicit conversion of #{other.class} into #{self.class}"
+    end
+    private :scaled_parts, :raise_type_error
+
     # activesupport 8.2 `Duration#inspect`: its parts in PARTS order, a
     # unit of 1 singular, joined as `to_sentence(locale: false)` joins
     # ("1 day, 2 hours, and 5 minutes"); "<value> seconds" with none.
@@ -397,12 +485,134 @@ module ActiveSupport
       other.is_a?(Duration) ? other.seconds : other
     end
 
-    # Numeric comparison protocol: `Time.current - created_at <=
-    # 14.days` has a Float receiver, and Ruby's numeric `<=>` resolves
-    # an unknown operand through its `coerce`: the duration pairs up as
-    # its seconds value (AS Duration is coercible the same way).
+    # Numeric operator protocol, activesupport 8.2: `2 * 30.minutes` and
+    # `Time.current - created_at <= 14.days` have a numeric receiver,
+    # which resolves the Duration operand through its `coerce`. The
+    # number comes back wrapped as a Scalar, whose operators answer as
+    # Rails' do: a Duration for `2 * 30.minutes` ("60 minutes") and
+    # `10 - 1.minute`, a number for `3600 / 30.minutes`, and a value
+    # comparison for `<=`.
     def coerce(other)
-      [other, @seconds]
+      if Scalar === other
+        [other, self]
+      elsif Duration === other
+        [Scalar.new(other.value), self]
+      else
+        [Scalar.new(other), self]
+      end
+    end
+
+    # activesupport 8.2: anything else a Duration is asked goes to its
+    # value (`30.minutes.to_r`, `1.day.positive?`, `Time.at(n + 1.hour)`).
+    def respond_to_missing?(method, _)
+      @seconds.respond_to?(method)
+    end
+
+    def method_missing(...)
+      @seconds.public_send(...)
+    end
+    private :respond_to_missing?, :method_missing
+
+    # activesupport 8.2 `Duration::Scalar`: the number on the left of a
+    # Duration operator, after `coerce`.
+    class Scalar < Numeric
+      attr_reader :value
+
+      def initialize(value)
+        @value = value
+      end
+
+      def to_i = @value.to_i
+      def to_f = @value.to_f
+      def to_s = @value.to_s
+
+      def coerce(other)
+        [Scalar.new(other), self]
+      end
+
+      def -@
+        Scalar.new(-value)
+      end
+
+      def <=>(other)
+        if Scalar === other || Duration === other
+          value <=> other.value
+        elsif Numeric === other
+          value <=> other
+        end
+      end
+
+      # A number plus a Duration adds into its seconds part, which is
+      # appended last when the Duration has none (`10 + 1.minute` is
+      # "1 minute and 10 seconds").
+      def +(other)
+        if Duration === other
+          parts = other.part_slots.dup
+          parts[6] = value + (parts[6] || 0)
+          order = other.part_order.dup
+          order << 6 unless order.include?(6)
+          Duration.new(value + other.value, parts, order)
+        else
+          calculate(:+, other)
+        end
+      end
+
+      def -(other)
+        if Duration === other
+          parts = other.part_slots.map { |v| v.nil? ? nil : -v }
+          parts[6] = value - (other.part_slots[6] || 0)
+          order = other.part_order.dup
+          order << 6 unless order.include?(6)
+          Duration.new(value - other.value, parts, order)
+        else
+          calculate(:-, other)
+        end
+      end
+
+      def *(other)
+        if Duration === other
+          parts = other.part_slots.map { |v| v.nil? ? nil : value * v }
+          Duration.new(value * other.value, parts, other.part_order.dup)
+        else
+          calculate(:*, other)
+        end
+      end
+
+      def /(other)
+        if Duration === other
+          value / other.value
+        else
+          calculate(:/, other)
+        end
+      end
+
+      def %(other)
+        if Duration === other
+          Duration.build(value % other.value)
+        else
+          calculate(:%, other)
+        end
+      end
+
+      def variable?
+        false
+      end
+
+      private
+
+      def calculate(op, other)
+        if Scalar === other
+          Scalar.new(value.public_send(op, other.value))
+        elsif Numeric === other
+          Scalar.new(value.public_send(op, other))
+        else
+          raise_type_error(other)
+        end
+      end
+
+      def raise_type_error(other)
+        raise TypeError, "no implicit conversion of #{other.class} into #{self.class}"
+      end
     end
   end
 end
