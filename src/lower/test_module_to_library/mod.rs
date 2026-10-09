@@ -705,7 +705,19 @@ fn build_library_class(
         .tests
         .iter()
         .map(|t| {
-            test_to_method_def(&tm.name, t, if native_assertions { None } else { inline_setup.as_ref() }, &helper_shadows, route_id_segments)
+            if native_assertions && t.toggle_flags {
+                crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                    t.body.span,
+                    None,
+                    "toggle_flags_test",
+                    format!(
+                        "test {:?} declares ToggleFlagsHelper `flags:`: natively it runs as `_FLAGS:` variants, \
+                         each under its flag configuration; it is emitted once, as {}, without them",
+                        t.name, t.method_name
+                    ),
+                ));
+            }
+            test_to_method_def(&tm.name, t, if native_assertions { None } else { inline_setup.as_ref() }, &helper_shadows, route_id_segments, native_assertions)
         })
         .collect();
     if native_assertions {
@@ -801,15 +813,25 @@ fn contains_setup_jump(expr: &Expr) -> bool {
 /// argument — when present — gets prepended to the test body so
 /// every test method is self-contained (no out-of-band setup
 /// dependency, no double-call risk vs runtime auto-discovery).
+///
+/// `native_names` (the CRuby Minitest tree) keeps the method Minitest
+/// runs natively, `t.method_name` (`test_#call_ok?_tag:slow:true`), so
+/// emitted ids are native ids; the Ruby emit defines a name `def`
+/// cannot spell with `define_method`, as ActiveSupport does. Other
+/// targets need an identifier and take the sanitized name.
 fn test_to_method_def(
     owner: &ClassId,
     t: &Test,
     setup: Option<&Expr>,
     shadows: &crate::det::HashSet<Symbol>,
     route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    native_names: bool,
 ) -> MethodDef {
-    let snake = sanitize_test_name(&t.name);
-    let method_name = Symbol::from(format!("test_{snake}"));
+    let method_name = if native_names && !t.method_name.is_empty() {
+        Symbol::from(t.method_name.as_str())
+    } else {
+        Symbol::from(format!("test_{}", sanitize_test_name(&t.name)))
+    };
     let raw_body = match setup {
         None => t.body.clone(),
         Some(s) => prepend_setup(s, &t.body),

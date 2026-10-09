@@ -198,6 +198,10 @@ fn render_def(m: &MethodDef, enclosing: &[&str]) -> String {
     // (`define_method("tag:unit")`).
     if crate::emit::ruby::def_spellable(m.name.as_str()) {
         format!("def {receiver_prefix}{}: {sig}", m.name.as_str())
+    } else if m.name.as_str().contains('`') {
+        // A quoted RBS name cannot hold a backtick (a native test name
+        // such as `test_…_does`t_exist`); the method has no RBS spelling.
+        format!("# def {receiver_prefix}{:?}: {sig} (no RBS spelling for this name)", m.name.as_str())
     } else {
         format!("def {receiver_prefix}`{}`: {sig}", m.name.as_str())
     }

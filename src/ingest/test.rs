@@ -312,10 +312,55 @@ fn ingest_test_class(
     let mut constants: Vec<(Symbol, Expr)> = Vec::new();
     let mut includes: Vec<ClassId> = Vec::new();
     let mut teardowns: Vec<Expr> = Vec::new();
+    // TestTags state: this class's own (a subclass starts empty), and
+    // the tags each enclosing `tag … do` block restores.
+    let mut test_tags = TestTags::default();
+    let mut saved_tags: Vec<Vec<(String, String)>> = Vec::new();
     if let Some(class_body) = class.body() {
-        for stmt in flatten_statements(class_body) {
-            if let Some(test) = ingest_test_declaration(&stmt, file)? {
-                tests.push(test);
+        let mut items = Vec::new();
+        class_body_items(flatten_statements(class_body), file, &mut items)?;
+        for item in items {
+            let stmt = match item {
+                BodyItem::Stmt(stmt) => stmt,
+                BodyItem::TagsBegin(tags) => {
+                    saved_tags.push(test_tags.tags.clone());
+                    merge_tags(&mut test_tags.tags, &tags);
+                    continue;
+                }
+                BodyItem::TagsEnd => {
+                    test_tags.tags = saved_tags.pop().unwrap_or_default();
+                    continue;
+                }
+            };
+            // A blockless `tag(...)`: the tags stay for the rest of the
+            // class body, and the hook renames untagged tests at the end.
+            if let Some((tags, None)) = tag_declaration(&stmt, file)? {
+                merge_tags(&mut test_tags.tags, &tags);
+                test_tags.persistent = true;
+                continue;
+            }
+            if let Some(test) = ingest_test_declaration(&stmt, file, &test_tags)? {
+                let is_def = stmt.as_def_node().is_some();
+                // A ToggleFlagsHelper `flags:` test defines only its
+                // `_FLAGS:` variants natively, never `method_name`, so it
+                // cannot collide (its lowering reports it as unmodeled).
+                let collides = |t: &Test| !t.toggle_flags && !test.toggle_flags && t.method_name == test.method_name;
+                match tests.iter().position(collides) {
+                    // Ruby redefines a `def` of the same name in place.
+                    Some(at) if is_def => tests[at] = test,
+                    // ActiveSupport::Testing::Declarative#test raises
+                    // while the class body loads.
+                    Some(_) => {
+                        return Err(IngestError::Unsupported {
+                            file: file.into(),
+                            message: format!(
+                                "{} is already defined in {}: ActiveSupport raises this when the class body loads",
+                                test.method_name, name.0
+                            ),
+                        })
+                    }
+                    None => tests.push(test),
+                }
                 continue;
             }
             if let Some(body) = ingest_teardown_block(&stmt, file)? {
@@ -486,6 +531,18 @@ fn ingest_test_class(
                         "a test declared{line} by a class-body statement ingest does not model (a computed name, a loop or a block); its tests would not run"
                     ),
                 });
+            }
+        }
+    }
+
+    // TestTags' persistent hook (`_process_persistent_tags`, run before
+    // Minitest lists the class's methods): every test method the class
+    // defines whose name carries no tag yet gets the class's tags as they
+    // stand at the end of the body.
+    if test_tags.persistent && !test_tags.tags.is_empty() {
+        for test in &mut tests {
+            if !test.method_name.contains("tag:") {
+                test.method_name = name_with_tags(&test.method_name, &test_tags.tags);
             }
         }
     }
@@ -1008,16 +1065,218 @@ fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Exp
     }
 }
 
+/// Core's `TestTags` (components/platform/essentials/lib/platform/
+/// testing/test_tags.rb), prepended on `ActiveSupport::TestCase`'s
+/// singleton, as one class body's `test_tags`: each pair is the Hash
+/// entry (key identity, `[key, value].join(":")`), in insertion order.
+/// `persistent` is set once a blockless `tag(...)` installed its
+/// `runnable_methods` hook.
+#[derive(Clone, Debug, Default)]
+struct TestTags {
+    tags: Vec<(String, String)>,
+    persistent: bool,
+}
+
+/// `Hash#merge!`: a key already present keeps its place and takes the
+/// new value.
+fn merge_tags(into: &mut Vec<(String, String)>, more: &[(String, String)]) {
+    for (key, pair) in more {
+        match into.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = pair.clone(),
+            None => into.push((key.clone(), pair.clone())),
+        }
+    }
+}
+
+/// `TestTags.generate_name_with_tags`: `name`, then `_tag:<k>:<v>` for
+/// each tag joined by `_`.
+fn name_with_tags(name: &str, tags: &[(String, String)]) -> String {
+    if tags.is_empty() {
+        return name.to_string();
+    }
+    let suffix: Vec<String> = tags.iter().map(|(_, pair)| format!("tag:{pair}")).collect();
+    format!("{name}_{}", suffix.join("_"))
+}
+
+/// `"test_#{name.gsub(/\s+/, '_')}"`: ActiveSupport::Testing::
+/// Declarative#test's method name. Ruby's `\s` is ASCII whitespace.
+fn declarative_method_name(name: &str) -> String {
+    let mut out = String::from("test_");
+    let mut in_space = false;
+    for c in name.chars() {
+        if matches!(c, ' ' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r') {
+            if !in_space {
+                out.push('_');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
+
+/// One element of `[key, value].join(":")`: what `Array#join` writes for
+/// a literal (`to_s`, a nested Array joined with the same separator).
+/// `None` for anything whose text is not known before the code runs.
+fn tag_join_piece(node: &Node<'_>) -> Option<String> {
+    if let Some(sym) = node.as_symbol_node() {
+        return Some(String::from_utf8_lossy(sym.unescaped()).into_owned());
+    }
+    if let Some(string) = node.as_string_node() {
+        return Some(String::from_utf8_lossy(string.unescaped()).into_owned());
+    }
+    if node.as_true_node().is_some() {
+        return Some("true".into());
+    }
+    if node.as_false_node().is_some() {
+        return Some("false".into());
+    }
+    if node.as_nil_node().is_some() {
+        return Some(String::new());
+    }
+    if let Some(int) = node.as_integer_node() {
+        return Some(super::util::integer_decimal(&int.value()));
+    }
+    if let Some(array) = node.as_array_node() {
+        let pieces: Option<Vec<String>> = array
+            .elements()
+            .iter()
+            .map(|element| if element.as_splat_node().is_some() { None } else { tag_join_piece(&element) })
+            .collect();
+        return pieces.map(|p| p.join(":"));
+    }
+    None
+}
+
+/// A Hash key's identity for `merge`: `:slow` and `"slow"` are two keys.
+fn tag_key_identity(node: &Node<'_>) -> Option<String> {
+    let kind = if node.as_symbol_node().is_some() {
+        "sym"
+    } else if node.as_string_node().is_some() {
+        "str"
+    } else if node.as_integer_node().is_some() {
+        "int"
+    } else {
+        return None;
+    };
+    Some(format!("{kind}:{}", tag_join_piece(node)?))
+}
+
+/// The pairs of a literal tags Hash (`slow: true`, `{ pg_only: true }`),
+/// and whether it has ToggleFlagsHelper's `flags:` key, which is not a
+/// tag of the name (its own naming is not modeled; the pair is left out).
+/// `Ok(None)` when `node` is not a Hash literal.
+fn literal_tags(node: &Node<'_>, file: &str) -> IngestResult<Option<(Vec<(String, String)>, bool)>> {
+    let elements: Vec<Node<'_>> = if let Some(hash) = node.as_keyword_hash_node() {
+        hash.elements().iter().collect()
+    } else if let Some(hash) = node.as_hash_node() {
+        hash.elements().iter().collect()
+    } else {
+        return Ok(None);
+    };
+    let unknown = |what: &str| IngestError::Unsupported {
+        file: file.into(),
+        message: format!(
+            "a test tag {what} is not a literal: Core's TestTags puts each tag in the Minitest method name, \
+             which is not known before the code runs"
+        ),
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut flags = false;
+    for element in &elements {
+        let Some(assoc) = element.as_assoc_node() else { return Err(unknown("splat")) };
+        let key = assoc.key();
+        if key.as_symbol_node().is_some_and(|s| s.unescaped() == b"flags") {
+            flags = true;
+            continue;
+        }
+        let identity = tag_key_identity(&key).ok_or_else(|| unknown("key"))?;
+        let pair = format!(
+            "{}:{}",
+            tag_join_piece(&key).ok_or_else(|| unknown("key"))?,
+            tag_join_piece(&assoc.value()).ok_or_else(|| unknown("value"))?
+        );
+        merge_tags(&mut pairs, &[(identity, pair)]);
+    }
+    Ok(Some((pairs, flags)))
+}
+
+/// A class-body `tag(slow: true)` (TestTags#tag): its tags, and the
+/// statements of its block when it has one. `Ok(None)` for any other
+/// statement, including a `tag` call whose argument is not one Hash.
+#[allow(clippy::type_complexity)]
+fn tag_declaration<'pr>(stmt: &Node<'pr>, file: &str) -> IngestResult<Option<(Vec<(String, String)>, Option<Vec<Node<'pr>>>)>> {
+    let Some(call) = stmt.as_call_node() else { return Ok(None) };
+    if call.receiver().is_some() || call.name().as_slice() != b"tag" {
+        return Ok(None);
+    }
+    let args: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let [arg] = args.as_slice() else { return Ok(None) };
+    let Some((tags, flags)) = literal_tags(arg, file)? else { return Ok(None) };
+    if flags {
+        return Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "a class-level `tag(flags: …)` is not modeled".into(),
+        });
+    }
+    let block = match call.block() {
+        None => None,
+        Some(block) => match block.as_block_node() {
+            Some(block) => Some(block.body().map(flatten_statements).unwrap_or_default()),
+            None => {
+                return Err(IngestError::Unsupported {
+                    file: file.into(),
+                    message: "`tag(…, &block)` is not modeled: its tests are declared where the block runs".into(),
+                })
+            }
+        },
+    };
+    Ok(Some((tags, block)))
+}
+
+/// A class-body statement, or where a `tag(...) do … end` block begins
+/// and ends: TestTags#tag merges its tags for the statements in the
+/// block and restores the previous ones after it.
+enum BodyItem<'pr> {
+    Stmt(Node<'pr>),
+    TagsBegin(Vec<(String, String)>),
+    TagsEnd,
+}
+
+/// The class body's statements in order, each `tag … do` block's
+/// statements spliced in between its begin and end.
+fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyItem<'pr>>) -> IngestResult<()> {
+    for stmt in stmts {
+        match tag_declaration(&stmt, file)? {
+            Some((tags, Some(block))) => {
+                out.push(BodyItem::TagsBegin(tags));
+                class_body_items(block, file, out)?;
+                out.push(BodyItem::TagsEnd);
+            }
+            _ => out.push(BodyItem::Stmt(stmt)),
+        }
+    }
+    Ok(())
+}
+
 /// Recognize a single test declaration. Two shapes are supported:
 ///
 ///   `test "name" do ... end`  — Rails AS::TestCase DSL. Test name is the
-///                                string argument verbatim.
+///                                string argument verbatim. An optional
+///                                literal tags Hash (`test "x", slow:
+///                                true do`) is Core's TestTags: the
+///                                method name carries the tags.
 ///   `def test_*; ...; end`    — vanilla Minitest. Test name is the
 ///                                method name with the `test_` prefix
 ///                                stripped and underscores replaced with
 ///                                spaces (mirrors how Minitest reports
 ///                                them; keeps the two shapes
 ///                                indistinguishable downstream).
+///
+/// Either way `method_name` is the method Minitest runs: the `def`'s
+/// name, or ActiveSupport's `test_` name over the tagged name.
 ///
 /// Returns `None` for any other statement shape (intentional — we
 /// silently drop unrecognized body items rather than error; they'll
@@ -1026,6 +1285,7 @@ fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Exp
 fn ingest_test_declaration(
     stmt: &Node<'_>,
     file: &str,
+    tags: &TestTags,
 ) -> IngestResult<Option<Test>> {
     // `def test_*; ...; end` form (vanilla Minitest).
     if let Some(def) = stmt.as_def_node() {
@@ -1042,7 +1302,7 @@ fn ingest_test_declaration(
             Some(body_node) => ingest_expr(&body_node, file)?,
             None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
         };
-        return Ok(Some(Test { name, body }));
+        return Ok(Some(Test { name, body, method_name: method_name.to_string(), toggle_flags: false }));
     }
 
     let Some(call) = stmt.as_call_node() else {
@@ -1061,14 +1321,33 @@ fn ingest_test_declaration(
     let Some(args) = call.arguments() else {
         return Ok(None);
     };
-    let args_iter = args.arguments();
-    let Some(first_arg) = args_iter.iter().next() else {
+    let args: Vec<Node<'_>> = args.arguments().iter().collect();
+    let Some(first_arg) = args.first() else {
         return Ok(None);
     };
     let Some(string_node) = first_arg.as_string_node() else {
         return Ok(None);
     };
     let name = String::from_utf8_lossy(string_node.unescaped()).into_owned();
+    // TestTags#test(name, tags = nil): the class's tags, merged with the
+    // test's own.
+    let (own_tags, toggle_flags) = match &args[1..] {
+        [] => (Vec::new(), false),
+        [arg] if arg.as_nil_node().is_some() => (Vec::new(), false),
+        [arg] => literal_tags(arg, file)?.ok_or_else(|| IngestError::Unsupported {
+            file: file.into(),
+            message: format!("test {name:?}: its tags argument is not a literal Hash"),
+        })?,
+        _ => {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("test {name:?}: TestTags#test takes a name and one tags Hash"),
+            })
+        }
+    };
+    let mut all_tags = tags.tags.clone();
+    merge_tags(&mut all_tags, &own_tags);
+    let method_name = declarative_method_name(&name_with_tags(&name, &all_tags));
 
     // The block body — Prism exposes it via `call.block()` when present.
     let body = match call.block() {
@@ -1082,7 +1361,7 @@ fn ingest_test_declaration(
         None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
     };
 
-    Ok(Some(Test { name, body }))
+    Ok(Some(Test { name, body, method_name, toggle_flags }))
 }
 
 #[cfg(test)]
@@ -1287,6 +1566,41 @@ end
         let helpers: Vec<&str> =
             tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
         assert_eq!(helpers, ["Fakes::Client"]);
+    }
+
+    fn method_names(src: &str) -> Vec<(String, bool)> {
+        let tms = ingest_test_files(src.as_bytes(), "names_test.rb").expect("ingest");
+        tms[0].tests.iter().map(|t| (t.method_name.clone(), t.toggle_flags)).collect()
+    }
+
+    #[test]
+    fn method_names_are_native_minitest_names() {
+        let src = "class NamesTest < ActiveSupport::TestCase\n  test \"#call ok?\", slow: true, reasons: [:a, 2], why: nil do\n  end\n  def test_x\n    assert false\n  end\n  def test_x\n    assert true\n  end\n  test \"x\", flags: { name: \"f\" } do\n  end\n  test \"y\", flags: { name: \"f\" }, slow: true do\n  end\nend\n";
+        let names = method_names(src);
+        assert_eq!(
+            names,
+            [
+                ("test_#call_ok?_tag:slow:true_tag:reasons:a:2_tag:why:".to_string(), false),
+                // The later `def` redefines the method where it stood.
+                ("test_x".to_string(), false),
+                // A `flags:` test is marked, its other tags kept; it does
+                // not collide with `test_x`, which it never defines.
+                ("test_x".to_string(), true),
+                ("test_y_tag:slow:true".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tag_whose_name_text_is_unknown_is_refused() {
+        for args in ["slow: SLOW", "**more", "slow: \"#{x}\""] {
+            let src = format!("class NamesTest < ActiveSupport::TestCase\n  test \"a\", {args} do\n  end\nend\n");
+            let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
+            assert!(err.contains("is not a literal"), "{args}: {err}");
+        }
+        let src = "class NamesTest < ActiveSupport::TestCase\n  tag(owner: OWNER) do\n    test \"a\" do\n    end\n  end\nend\n";
+        let err = ingest_test_files(src.as_bytes(), "names_test.rb").unwrap_err().to_string();
+        assert!(err.contains("is not a literal"), "{err}");
     }
 }
 

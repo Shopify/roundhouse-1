@@ -1601,6 +1601,12 @@ pub fn emit_with_assertions(
             path: PathBuf::from("test/roundhouse_tests.json"),
             content: serde_json::to_string_pretty(&serde_json::json!({
                 "schema": "roundhouse-test-index/v1",
+                // "minitest": each class's `tests` are the methods
+                // Minitest runs natively (ActiveSupport's `test_` name,
+                // Core's `_tag:` segments included), so an emitted id is
+                // the native id. "sanitized": identifiers made from the
+                // test name (lowercase, other runs as one `_`).
+                "test_names": if assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest { "minitest" } else { "sanitized" },
                 "sources": sources,
             }))
             .expect("test index json")
@@ -1706,7 +1712,9 @@ fn rbs_only_from_funcs(
 /// (Minitest runs them once under the parent, and again, inherited,
 /// under the subclass, which `test_names` lists).
 fn render_minitest_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[String]) -> String {
-    let methods: Vec<String> = test_names.iter().map(|name| format!("{name:?}")).collect();
+    // A native name is any text (`test_#call_ok?`, `test_x_#@y`): a
+    // literal that does not interpolate.
+    let methods: Vec<String> = test_names.iter().map(|name| expr::ruby_str_literal(name)).collect();
     let mut s = String::from("\nif RoundhouseTestRunner.drive?(__FILE__)\n");
     writeln!(s, "  RoundhouseTestRunner.run({}, [{}]) do", lc.name.0, methods.join(", ")).unwrap();
     for line in reset_lines {
