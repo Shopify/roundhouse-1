@@ -2940,6 +2940,7 @@ end
     // A file-level `Dir[...].each { |f| require_relative f }` is the
     // requires of the files it matches, read off the registered tree.
     expand_glob_requires(&mut app, dir);
+    split_ensure_statements(&mut app);
     app.test_helper_programs = test_helper_programs(vfs, dir, &path_gems, &app);
     // What the gem sources require from the gem home, read now that
     // their files are registered.
@@ -3297,6 +3298,76 @@ fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathB
     }
     out
 }
+/// A file-level `begin … ensure … end` with no `rescue` is the file's
+/// statements with a cleanup: each statement of its body runs as a
+/// file-level statement does (`RoundhouseAutoload.file_statement`), named
+/// where it raises, and the rest still run before the `ensure`. Core's
+/// platform/testing/test_runtime.rb requires its whole test runtime that
+/// way (`Thread.current[:__platform_testing_runtime_preloading] = true;
+/// begin; require …; require "support/initializers/active_support_test_case";
+/// …; ensure; … = false; end`), and as one statement the first require the
+/// tree cannot answer (`active_resource/http_mock`) skipped every later
+/// one, so ActiveSupport::TestCase never included ActiveRecordTestHelper
+/// and its file's `FasterFixtures::FixtureSet.prepend` never ran. A
+/// `rescue` clause decides what a raise in the body means, so that shape
+/// stays one statement.
+fn split_ensure_statements(app: &mut App) {
+    use crate::app::ProgramItem;
+    use crate::expr::{BlockStyle, Expr, ExprNode, Literal};
+    let root = app.root.clone();
+    let site = |sources: &[crate::span::SourceFile], span: crate::span::Span| -> Option<String> {
+        let source = (span.file.0 as usize).checked_sub(1).and_then(|i| sources.get(i))?;
+        let (line, _) = source.line_col(span.start);
+        let path = source.path.as_str();
+        let path = if root.is_empty() { path } else { path.strip_prefix(root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path) };
+        Some(format!("{path}:{line}"))
+    };
+    let sources = std::mem::take(&mut app.sources);
+    for program in &mut app.file_programs {
+        for item in &mut program.items {
+            let ProgramItem::Statement(expr) = item else { continue };
+            let ExprNode::BeginRescue { body, rescues, else_branch: None, ensure: Some(_), implicit: false } = &mut *expr.node else {
+                continue;
+            };
+            if !rescues.is_empty() {
+                continue;
+            }
+            let ExprNode::Seq { exprs } = &mut *body.node else { continue };
+            if exprs.len() < 2 {
+                continue;
+            }
+            for statement in exprs.iter_mut() {
+                let Some(at) = site(&sources, statement.span) else { continue };
+                let span = statement.span;
+                let inner = std::mem::replace(statement, Expr::new(span, ExprNode::Seq { exprs: Vec::new() }));
+                let block = Expr::new(
+                    span,
+                    ExprNode::Lambda {
+                        params: Vec::new(),
+                        rest_param: None,
+                        extra_params: Vec::new(),
+                        block_param: None,
+                        body: inner,
+                        block_style: BlockStyle::Do,
+                        signature: Default::default(),
+                    },
+                );
+                *statement = Expr::new(
+                    span,
+                    ExprNode::Send {
+                        recv: Some(Expr::new(span, ExprNode::Const { path: vec![Symbol::from("RoundhouseAutoload")] })),
+                        method: Symbol::from("file_statement"),
+                        args: vec![Expr::new(span, ExprNode::Lit { value: Literal::Str { value: at } })],
+                        block: Some(block),
+                        parenthesized: true,
+                    },
+                );
+            }
+        }
+    }
+    app.sources = sources;
+}
+
 /// A file program's top-level glob requires
 /// (`autoload_glob::file_glob_requires`) as the `ProgramItem::Require`s
 /// they are, one per matched file of the tree, in `Dir`'s order.
