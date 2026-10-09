@@ -10980,7 +10980,10 @@ fn spinel_files_with_assertions(
     // it has to read the FINAL file set, not the fixture.
     apply_makefile_asset_list(&mut files, app);
     apply_makefile_stylesheet_list(&mut files, app);
-    apply_test_gem_wiring(&mut files);
+    apply_test_gem_wiring(
+        &mut files,
+        assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest,
+    );
     apply_spinel_sql_functions(&mut files, app)?;
     apply_pagination_demand(&mut files)?;
     Ok((files, test_stems))
@@ -11085,7 +11088,16 @@ enum Marker {
 /// include). The stub-slot clears — mocha's and webmock's — go in
 /// whichever of the two was demanded, because the slots they clear are
 /// defined by runtime files every helper requires, not by either gem.
-fn patch_stub_lifecycle(helper: &mut String, with_mocha: bool) {
+///
+/// `minitest` (the CRuby tree, whose runner is real Minitest) moves the
+/// verifies out of `teardown` into `__roundhouse_verify_stubs`, which
+/// the runner calls where mocha/minitest verifies — `before_teardown`,
+/// for a test that passed — so each expectation verified counts one
+/// assertion on the test (`MochaStub.verify_all!(self)`, mocha's
+/// `AssertionCounter`) and an unmet one fails it as a
+/// `Minitest::Assertion`. The runner's `after_teardown` unstubs
+/// (`mocha_teardown`) after the authored teardown.
+fn patch_stub_lifecycle(helper: &mut String, with_mocha: bool, minitest: bool) {
     const SETUP: &str = "  def setup\n    SchemaSetup.reset! if defined?(SchemaSetup)";
     const TEARDOWN: &str = "  def teardown\n  end";
 
@@ -11112,7 +11124,16 @@ fn patch_stub_lifecycle(helper: &mut String, with_mocha: bool) {
     // which the autorun shim charges to the test that filed it — the
     // same moment, and the same failure, as `mocha_verify`.
     let verifies = crate::lower::mocha::stub_verify_lines("    ");
-    if let Some(at) = helper.find(TEARDOWN) {
+    if minitest {
+        if let Some(at) = helper.find(TEARDOWN) {
+            let verifies = verifies.replace("MochaStub.verify_all!\n", "MochaStub.verify_all!(self)\n");
+            let mocha = if with_mocha { "    mocha_verify if defined?(Mocha)\n" } else { "" };
+            let verified = format!(
+                "  def teardown\n  end\n\n  def __roundhouse_verify_stubs\n{verifies}{mocha}  end"
+            );
+            helper.replace_range(at..at + TEARDOWN.len(), &verified);
+        }
+    } else if let Some(at) = helper.find(TEARDOWN) {
         let verified = if with_mocha {
             format!(
                 "  def teardown\n{verifies}    mocha_verify if defined?(Mocha)\n  ensure\n    mocha_teardown if defined?(Mocha)\n  end"
@@ -11197,7 +11218,7 @@ fn patch_webmock_api_include(helper: &mut String) {
 /// the same behaviour built at its own transport seam; nothing here
 /// pretends otherwise. Same seam the tree already uses for sqlite3 and
 /// bcrypt.
-fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
+fn apply_test_gem_wiring(files: &mut Vec<(String, String)>, minitest: bool) {
     // (marker a test body writes, gem, the require that gives it)
     //
     // WebMock is named as a CONSTANT (`WebMock.stub_request`), so the
@@ -11256,7 +11277,19 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
             needed.push((gem, entry));
         }
     }
+    // An app method's stub slot (`lower::mocha` writes `MochaStub.` and
+    // no mocha spelling at all) still needs the lifecycle: cleared in
+    // setup and verified after the test, or an unmet `expects` passes and
+    // its filing leaks into the next test.
+    let slots = files.iter().any(|(p, c)| {
+        p.starts_with("test/") && p.ends_with(".rb") && p != "test/test_helper.rb" && c.contains("MochaStub.")
+    });
     if needed.is_empty() {
+        if slots {
+            if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
+                patch_stub_lifecycle(helper, false, minitest);
+            }
+        }
         return;
     }
     // One require, in the helper every test file loads — the place the
@@ -11270,8 +11303,8 @@ fn apply_test_gem_wiring(files: &mut Vec<(String, String)>) {
         }
         let with_mocha = needed.iter().any(|(gem, _)| *gem == "mocha");
         let with_webmock = needed.iter().any(|(gem, _)| *gem == "webmock");
-        if with_mocha || with_webmock {
-            patch_stub_lifecycle(helper, with_mocha);
+        if with_mocha || with_webmock || slots {
+            patch_stub_lifecycle(helper, with_mocha, minitest);
         }
         if with_webmock {
             patch_webmock_api_include(helper);
@@ -15554,7 +15587,7 @@ mod tests {
             ),
             ("Gemfile".to_string(), "source \"https://rubygems.org\"\n".to_string()),
         ];
-        apply_test_gem_wiring(&mut files);
+        apply_test_gem_wiring(&mut files, false);
         let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
         assert!(
             !gemfile.contains("webmock"),
@@ -15566,7 +15599,7 @@ mod tests {
             "class ArticleTest < TestBase\n  def test_x\n    WebMock.stub_request(:get, \"/\")\n  end\nend\n"
                 .to_string();
         files[2].1 = "source \"https://rubygems.org\"\n".to_string();
-        apply_test_gem_wiring(&mut files);
+        apply_test_gem_wiring(&mut files, false);
         let gemfile = &files.iter().find(|(p, _)| p == "Gemfile").unwrap().1;
         assert!(gemfile.contains("webmock"), "a test body's demand stands:\n{gemfile}");
     }

@@ -9558,9 +9558,9 @@ fn assertions_inside_a_destructured_block_run_where_they_are_written() {
 /// follows it, inside the block and after it — the effect count is the
 /// native run's. A raw Minitest call would instead raise NoMethodError
 /// before any assertion is checked. The CRuby tree runs Minitest's own
-/// assertions, so the failure reads as Minitest's; the Rails assertion
-/// it lowers (`assert_difference`) still fails, not errors, through
-/// `flunk`.
+/// assertions, so the failure reads as Minitest's; ActiveSupport's
+/// `assert_difference` is a call there too (the runner carries it), and
+/// fails with its own message through `assert_equal`.
 #[test]
 fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
     let cases = [
@@ -9572,7 +9572,7 @@ fn a_failing_assertion_inside_a_destructured_block_stops_what_follows() {
         ("branch_fail", "Expected: 1\n  Actual: 2", 0, "  test \"t\" do\n    out, err = capture_io do\n      unless Widget.flag\n        assert_equal 1, 2\n      end\n      Widget.hit\n    end\n    Widget.hit\n  end\n"),
         ("class_method", "Expected: 1\n  Actual: 2", 0, "  def self.assert_equal(a, b)\n    Widget.hit\n  end\n\n  test \"t\" do\n    out, err = capture_io do\n      assert_equal 1, 2\n      Widget.hit\n    end\n  end\n"),
         ("diff_bind_fail", "Expected: 0\n  Actual: 5", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\") do\n      Widget.hit\n      [5, 6]\n    end\n    assert_equal 0, a\n    Widget.hit\n  end\n"),
-        ("diff_delta_fail", "Widget.hits didn't change by 2", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      [5, 6]\n    end\n    Widget.hit\n  end\n"),
+        ("diff_delta_fail", "`Widget.hits` didn't change by 2, but by 1.\nExpected: 2\n  Actual: 1", 1, "  test \"t\" do\n    a, b = assert_difference(\"Widget.hits\", 2) do\n      Widget.hit\n      [5, 6]\n    end\n    Widget.hit\n  end\n"),
     ];
     for (name, failure, hits, members) in cases {
         let run = destructured_block_app(name, members).run_test("test/models/widget_test.rb");

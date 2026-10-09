@@ -161,6 +161,11 @@ fn lower_value_in_place(e: &mut Expr, own: &dyn Fn(&str) -> bool, mode: Assertio
     if !on_self || !matches!(method.as_str(), "assert_difference" | "assert_no_difference") || own(method.as_str()) {
         return false;
     }
+    // A Minitest target keeps the call, which answers the block's value
+    // itself (`minitest_call`).
+    if mode == AssertionMode::Minitest {
+        return false;
+    }
     let mut args: Vec<Expr> = args.clone();
     for arg in &mut args {
         walk_inline(arg, own, mode);
@@ -237,12 +242,16 @@ pub(crate) fn spliced_block<'a>(e: &'a Expr, own: &dyn Fn(&str) -> bool) -> Opti
 }
 
 fn minitest_call(e: &Expr) -> bool {
-    let ExprNode::Send { method, args, .. } = &*e.node else { return false };
+    let ExprNode::Send { method, .. } = &*e.node else { return false };
     match method.as_str() {
-        "assert_raises" | "assert_raise" => {
-            // The app-specific match: extension is not Minitest's contract.
-            !args.iter().any(|arg| matches!(&*arg.node, ExprNode::Hash { kwargs: true, .. }))
-        }
+        // `match:` is ActiveSupport's own extension (Assertions#assert_raises,
+        // which the CRuby runner carries): Minitest's assertion plus an
+        // `assert_match`, three assertions where an inlined raise had none.
+        "assert_raises" | "assert_raise" => true,
+        // ActiveSupport's, carried by the CRuby runner: `assert_nothing_raised`
+        // plus one `assert_equal` per expression, and a String expression is
+        // evaluated in the block's binding as Rails does.
+        "assert_difference" | "assert_no_difference" => true,
         "assert" | "refute" | "assert_not" | "assert_equal" | "refute_equal"
         | "assert_not_equal" | "assert_nil" | "refute_nil" | "assert_not_nil"
         | "assert_empty" | "refute_empty" | "assert_not_empty" | "assert_includes"
