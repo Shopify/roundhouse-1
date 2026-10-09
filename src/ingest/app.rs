@@ -2939,7 +2939,8 @@ end
     app.source_index_required = !app.sources.is_empty();
     // A file-level `Dir[...].each { |f| require_relative f }` is the
     // requires of the files it matches, read off the registered tree.
-    expand_glob_requires(&mut app);
+    expand_glob_requires(&mut app, dir);
+    app.test_helper_programs = test_helper_programs(vfs, dir, &path_gems, &app);
     // What the gem sources require from the gem home, read now that
     // their files are registered.
     if let Some(home) = super::gem_source_constants::gem_home(configured_gem_home(vfs, dir)?.as_deref()) {
@@ -3224,6 +3225,77 @@ end
     Ok(app)
 }
 
+
+/// `App::test_helper_programs`: the carried file programs the app's
+/// `test/test_helper.rb` requires, in source order. Core's helper loads
+/// its test runtime inside blocks
+/// (`StatsdMetrics.measure_load_test_environment do CoreCI.step(…) do …
+/// require "platform/testing/test_helper"`), which the harness's own
+/// helper does not run; so every `require`/`require_relative` of a
+/// string literal outside a method body is read, resolved on the test
+/// `$LOAD_PATH` (the test roots, the app's `lib` and each path gem's
+/// `lib`) or against the helper's directory, and kept where it names a
+/// carried program. A feature no program answers (Rails' own
+/// `rails/test_help`, the app's `config/environment`) is the harness's.
+fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathBuf], app: &App) -> Vec<String> {
+    use ruby_prism::Visit;
+    struct Requires(Vec<(String, bool)>);
+    impl<'pr> Visit<'pr> for Requires {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let method = super::util::constant_id_str(&node.name());
+            if node.receiver().is_none() && matches!(&*method, "require" | "require_relative") {
+                let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if let [one] = args.as_slice() {
+                    if let Some(s) = one.as_string_node() {
+                        self.0.push((String::from_utf8_lossy(s.unescaped()).into_owned(), method == "require_relative"));
+                    }
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+    }
+    let helper = dir.join("test/test_helper.rb");
+    let Ok(source) = vfs.read(&helper) else { return Vec::new() };
+    let result = super::prism::parse(&source, &helper.display().to_string());
+    let mut requires = Requires(Vec::new());
+    requires.visit(&result.node());
+    // Lexically, as `File.expand_path` folds `..`.
+    let clean = |path: PathBuf| -> String {
+        let mut out = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other),
+            }
+        }
+        out.display().to_string()
+    };
+    let programs: crate::det::HashSet<&str> = app.file_programs.iter().map(|p| p.source.as_str()).collect();
+    let mut load_path: Vec<PathBuf> = app.test_load_roots.iter().map(|root| dir.join(root)).collect();
+    load_path.push(dir.join("lib"));
+    load_path.extend(path_gems.iter().map(|gem| gem.join("lib")));
+    let mut out: Vec<String> = Vec::new();
+    for (feature, relative) in requires.0 {
+        let file = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+        let found = if relative {
+            Some(clean(dir.join("test").join(&file))).filter(|path| programs.contains(path.as_str()))
+        } else if feature.starts_with('/') || feature.starts_with('.') {
+            None
+        } else {
+            load_path.iter().map(|root| clean(root.join(&file))).find(|path| programs.contains(path.as_str()))
+        };
+        if let Some(path) = found {
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
 /// A file program's top-level glob requires
 /// (`autoload_glob::file_glob_requires`) as the `ProgramItem::Require`s
 /// they are, one per matched file of the tree, in `Dir`'s order.
@@ -3234,9 +3306,16 @@ end
 /// and `BuyerRiskMl::Keys`, `LightGBMModel`, `ThresholdLoader` and the
 /// rest were defined only where an app file happened to name them (a
 /// gem's constants have no autoload).
-fn expand_glob_requires(app: &mut App) {
+fn expand_glob_requires(app: &mut App, dir: &Path) {
     use crate::app::ProgramItem;
     let listing: Vec<String> = app.sources.iter().map(|s| s.path.clone()).collect();
+    // Each carried engine's absolute root, which `Engine.root` names
+    // (`autoload_glob::engine_root_glob_requires`).
+    let roots: Vec<(String, String)> = app
+        .railties
+        .iter()
+        .filter_map(|r| Some((r.name.0.to_string(), dir.join(r.root.as_ref()?).display().to_string())))
+        .collect();
     let texts: HashMap<&str, &str> = app.sources.iter().map(|s| (s.path.as_str(), s.text.as_str())).collect();
     let mut carried: Vec<crate::span::Span> = Vec::new();
     for program in &mut app.file_programs {
@@ -3245,10 +3324,13 @@ fn expand_glob_requires(app: &mut App) {
             continue;
         }
         let Some(text) = texts.get(program.source.as_str()) else { continue };
-        if !text.contains("Dir[") && !text.contains("Dir.glob") {
-            continue;
+        let mut loops = Vec::new();
+        if text.contains("Dir[") || text.contains("Dir.glob") {
+            loops.extend(super::autoload_glob::file_glob_requires(text, &program.source, &listing));
         }
-        let loops = super::autoload_glob::file_glob_requires(text, &program.source, &listing);
+        if text.contains(".root.join(") && text.contains(".glob(") {
+            loops.extend(super::autoload_glob::engine_root_glob_requires(text, &program.source, &listing, &roots));
+        }
         if loops.is_empty() {
             continue;
         }

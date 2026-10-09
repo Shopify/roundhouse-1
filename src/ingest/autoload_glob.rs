@@ -587,6 +587,119 @@ fn segment(p: &[u8], s: &[u8], start: bool) -> bool {
     }
 }
 
+/// A file's top-level require loop over an engine's own directory, each
+/// `(statement start, features)`:
+///
+/// ```ruby
+/// PlatformComponent::Essentials::Engine.root.join("test/support/initializers").glob("**/*.rb") do |file|
+///   require file.to_s
+/// end
+/// ```
+///
+/// (essentials' platform/testing/test_helper.rb, which so loads every
+/// test initializer). `Engine.root` is the engine's root directory
+/// (`roots`: each engine class's absolute root), `Pathname#join` of
+/// string literals a directory under it and `Pathname#glob(pattern)`
+/// `Dir.glob(pattern, base:)` there, in `Dir`'s order; so the statement
+/// is the requires of the matched files of the tree (`listing`), each
+/// feature relative to `file`'s directory and without `.rb`, as
+/// [`file_glob_requires`] gives them. The block is `require param` or
+/// `require param.to_s`, alone; a loop matching nothing is not one.
+pub(crate) fn engine_root_glob_requires(
+    source: &str,
+    file: &str,
+    listing: &[String],
+    roots: &[(String, String)],
+) -> Vec<(usize, Vec<String>)> {
+    let result = ruby_prism::parse(source.as_bytes());
+    let root = result.node();
+    let Some(program) = root.as_program_node() else { return Vec::new() };
+    let dir = dirname(file);
+    let mut out = Vec::new();
+    for statement in program.statements().body().iter() {
+        let Some(paths) = engine_glob_loop(&statement, listing, roots) else { continue };
+        let features: Option<Vec<String>> = paths
+            .iter()
+            .map(|path| relative_path_from(path, &dir).map(|rel| rel.strip_suffix(".rb").unwrap_or(&rel).to_string()))
+            .collect();
+        if let Some(features) = features {
+            out.push((statement.location().start_offset(), features));
+        }
+    }
+    out
+}
+
+fn engine_glob_loop(statement: &Node<'_>, listing: &[String], roots: &[(String, String)]) -> Option<Vec<String>> {
+    let mut call = statement.as_call_node()?;
+    let block = call.block()?.as_block_node()?;
+    if constant_id_str(&call.name()) == "each" && call.arguments().is_none() {
+        call = call.receiver()?.as_call_node()?;
+        if call.block().is_some() {
+            return None;
+        }
+    }
+    if constant_id_str(&call.name()) != "glob" {
+        return None;
+    }
+    let args: Vec<Node<'_>> = call.arguments()?.arguments().iter().collect();
+    let [pattern] = args.as_slice() else { return None };
+    let pattern = String::from_utf8_lossy(pattern.as_string_node()?.unescaped()).into_owned();
+    let joined = call.receiver()?.as_call_node()?;
+    if constant_id_str(&joined.name()) != "join" || joined.block().is_some() {
+        return None;
+    }
+    let parts: Option<Vec<String>> = joined
+        .arguments()?
+        .arguments()
+        .iter()
+        .map(|a| a.as_string_node().map(|s| String::from_utf8_lossy(s.unescaped()).into_owned()))
+        .collect();
+    let parts = parts?;
+    // An absolute part replaces the root, which is no longer the engine's.
+    if parts.is_empty() || parts.iter().any(|p| p.starts_with('/')) {
+        return None;
+    }
+    let root_call = joined.receiver()?.as_call_node()?;
+    if constant_id_str(&root_call.name()) != "root" || root_call.arguments().is_some() || root_call.block().is_some() {
+        return None;
+    }
+    let engine = constant_full_name(&root_call.receiver()?)?;
+    let (_, engine_root) = roots.iter().find(|(name, _)| *name == engine)?;
+    let param = block_param(&block)?;
+    let body: Vec<Node<'_>> = block.body().map(flatten_statements).unwrap_or_default();
+    let [only] = body.as_slice() else { return None };
+    let require = only.as_call_node()?;
+    let args: Vec<Node<'_>> = require.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let [arg] = args.as_slice() else { return None };
+    let receiver = arg.as_call_node().and_then(|to_s| {
+        (constant_id_str(&to_s.name()) == "to_s" && to_s.arguments().is_none() && to_s.block().is_none())
+            .then(|| to_s.receiver())
+            .flatten()
+    });
+    let arg = receiver.as_ref().unwrap_or(arg);
+    let required = arg.as_local_variable_read_node().is_some_and(|read| constant_id_str(&read.name()) == param);
+    if require.receiver().is_some() || require.block().is_some() || constant_id_str(&require.name()) != "require" || !required {
+        return None;
+    }
+    let base = cleanpath(&join(std::iter::once(engine_root.as_str()).chain(parts.iter().map(String::as_str))));
+    let pattern = format!("{base}/{pattern}");
+    let mut matched: Vec<String> = listing.iter().filter(|f| f.ends_with(".rb") && glob_matches(&pattern, f)).cloned().collect();
+    dir_order(&mut matched);
+    (!matched.is_empty()).then_some(matched)
+}
+
+/// `A::B::C` (or `::A::B::C`) as `"A::B::C"`.
+fn constant_full_name(node: &Node<'_>) -> Option<String> {
+    if let Some(read) = node.as_constant_read_node() {
+        return Some(constant_id_str(&read.name()).to_string());
+    }
+    let path = node.as_constant_path_node()?;
+    let name = constant_id_str(&path.name()?).to_string();
+    match path.parent() {
+        None => Some(name),
+        Some(parent) => Some(format!("{}::{name}", constant_full_name(&parent)?)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +750,25 @@ mod tests {
         assert!(features("Dir[File.join(__dir__, \"x/*.rb\")].each { |f| load f }\n").is_empty());
         assert!(features("Dir[File.join(__dir__, \"x/*.rb\")].each { |f| puts f; require f }\n").is_empty());
         assert!(features("Dir[File.join(__dir__, \"y/*.rb\")].each { |f| require f }\n").is_empty());
+    }
+
+    #[test]
+    fn engine_root_glob_requires_follow_pathname_glob() {
+        let listing: Vec<String> = ["/t/e/test/support/initializers/b.rb", "/t/e/test/support/initializers/a/y.rb", "/t/e/test/support/initializers/a.rb", "/t/e/test/support/initializers/c.yml", "/t/e/test/support/helpers/h.rb"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let roots = vec![("Platform::Engine".to_string(), "/t/e".to_string())];
+        let features = |source: &str| engine_root_glob_requires(source, "/t/e/lib/platform/testing/test_helper.rb", &listing, &roots);
+        let expected = vec!["../../../test/support/initializers/a/y", "../../../test/support/initializers/a", "../../../test/support/initializers/b"];
+        let found = features("require \"x\"\nPlatform::Engine.root.join(\"test/support/initializers\").glob(\"**/*.rb\") do |file|\n  require file.to_s\nend\n");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 12);
+        assert_eq!(found[0].1, expected);
+        assert_eq!(features("::Platform::Engine.root.join(\"test\", \"support/initializers\").glob(\"**/*.rb\").each { |f| require f }\n")[0].1, expected);
+        // Not this shape: another engine, another block, no match.
+        assert!(features("Other::Engine.root.join(\"test/support/initializers\").glob(\"**/*.rb\") { |f| require f.to_s }\n").is_empty());
+        assert!(features("Platform::Engine.root.join(\"test/support/initializers\").glob(\"**/*.rb\") { |f| load f.to_s }\n").is_empty());
+        assert!(features("Platform::Engine.root.join(\"test/support/none\").glob(\"**/*.rb\") { |f| require f.to_s }\n").is_empty());
     }
 }

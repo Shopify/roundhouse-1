@@ -531,6 +531,15 @@ pub struct App {
     /// (`project::test_load_path_features`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_load_roots: Vec<String>,
+    /// The carried file programs `test/test_helper.rb` requires, by
+    /// source path, in the order it requires them: Core's
+    /// `require "platform/testing/test_helper"` inside its load block,
+    /// which loads the test runtime, its helpers and every test
+    /// initializer. The emitted helper is the harness's own, so each
+    /// test requires these after it, where the app's helper had run
+    /// them (`ingest::app::test_helper_programs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_helper_programs: Vec<String>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
@@ -1450,6 +1459,7 @@ impl App {
             bundler_gems: Vec::new(),
             gem_source_dirs: Vec::new(),
             test_load_roots: Vec::new(),
+            test_helper_programs: Vec::new(),
             library_class_files: Vec::new(),
             eager_load: Vec::new(),
             zeitwerk_loaders: Vec::new(),
