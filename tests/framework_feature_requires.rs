@@ -11,7 +11,9 @@
 // active_support/multibyte/unicode", identifications): the tree had no
 // file for the feature, where natively Rails had loaded it before any
 // gem. The features it does not port fail by name instead
-// (FRAMEWORK_FEATURES_NOT_PORTED).
+// (project.rs::framework_feature_refusal); active_support/all and
+// core_ext/hash load what the tree ports of them
+// (tests/active_support_all_feature.rs).
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -432,13 +434,15 @@ fn a_gems_rails_feature_requires_answer_from_the_ports_as_natively_from_the_load
 }
 
 /// The features the tree does not port fail by name, never loading the
-/// gem home's activesupport.
+/// gem home's activesupport. active_support/all and core_ext/hash, which
+/// it ports in part, load (their unported methods refuse by name:
+/// tests/active_support_all_feature.rs).
 #[test]
 fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     let (tree, _) = probe().emit(BuildTarget::Ruby);
     let out = run("refusals", &tree, None);
     for feature in ["active_support/all", "active_support/core_ext/hash"] {
-        let line = format!("{feature}: LoadError: roundhouse: error[framework_feature_not_ported]: `require {feature:?}`");
+        let line = format!("{feature}: loaded\n");
         assert!(out.contains(&line), "missing {line:?}:\n{out}");
     }
     // Every other Rails feature with no port (Integer#months, the whole
@@ -459,7 +463,7 @@ fn a_rails_feature_the_tree_does_not_port_is_a_named_load_error() {
     ] {
         assert!(out.contains(line), "missing {line:?}:\n{out}");
     }
-    assert_eq!(out.matches("framework_feature_not_ported").count(), 6, "{out}");
+    assert_eq!(out.matches("framework_feature_not_ported").count(), 4, "{out}");
     assert!(out.contains("routes: NotImplementedError: error[route_set_not_drawn]: the routes block at "), "{out}");
     for method in ["url_helpers", "recognize_path"] {
         let line = format!("routes: NotImplementedError: error[route_set_not_drawn]: ActionDispatch::Routing::RouteSet#{method} needs a drawn route set");
