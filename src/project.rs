@@ -4593,7 +4593,8 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
         "active_support_concern", "active_support_hash_keys", "action_controller_exceptions", "active_support_string_strip",
         "active_support_module_attribute_accessors", "active_support_redefine_method", "active_support_class_attribute",
         "active_support_descendants_tracker", "active_support_class_subclasses", "active_support_numeric_bytes",
-        "active_support_numeric_time", "active_support_big_decimal_conversions",
+        "active_support_numeric_time", "active_support_big_decimal_conversions", "active_support_integer_time",
+        "active_support_time_change",
     ] {
         let to = format!("runtime/{port}.rb");
         if files.iter().any(|(p, _)| *p == to) {
@@ -4776,7 +4777,7 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
             // (`require "active_support/all"`): the extensions of it app code
             // calls with no require.
             for ext in boot_extensions.iter().filter(|ext| !ext.at_require_rails) {
-                let numeric: Vec<&str> = if carries_i18n {
+                let numeric: Vec<&str> = if carries_i18n || !ext.ports.contains(&"active_support_numeric") {
                     ext.ports.to_vec()
                 } else {
                     // Numeric#to_fs formats through ActiveSupport::NumberHelper
@@ -5355,6 +5356,7 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/numeric/bytes", &["active_support_numeric_bytes"]),
     ("active_support/core_ext/numeric/time", &["active_support_numeric_time"]),
     ("active_support/core_ext/numeric/conversions", &["active_support_numeric_conversions"]),
+    ("active_support/core_ext/integer/time", &["active_support_integer_time"]),
     ("active_support/core_ext/big_decimal/conversions", &["active_support_big_decimal_conversions"]),
     ("active_support/number_helper", &["active_support_number_helper"]),
     ("active_support/concern", &["active_support_concern"]),
@@ -5421,6 +5423,19 @@ const BOOT_LOADED_CORE_EXTENSIONS: &[BootCoreExtension] = &[
             ".seconds", ".second", ".minutes", ".minute", ".hours", ".hour", ".days", ".day", ".weeks", ".week",
             ".fortnights", ".fortnight", ".in_milliseconds", ".to_fs", ".to_formatted_s",
         ],
+        at_require_rails: false,
+    },
+    BootCoreExtension {
+        feature: "active_support/core_ext/integer/time",
+        ports: &["active_support_integer_time"],
+        calls: &[".months", ".month", ".years", ".year"],
+        at_require_rails: false,
+    },
+    // Time#change only; the rest of core_ext/time/calculations is not ported.
+    BootCoreExtension {
+        feature: "active_support/core_ext/time/calculations",
+        ports: &["active_support_time_change"],
+        calls: &[".change"],
         at_require_rails: false,
     },
 ];
@@ -11786,6 +11801,8 @@ fn spinel_files_with_assertions(
         && p != "runtime/active_support_class_subclasses.rb"
         && p != "runtime/active_support_numeric_bytes.rb"
         && p != "runtime/active_support_numeric_time.rb"
+        && p != "runtime/active_support_integer_time.rb"
+        && p != "runtime/active_support_time_change.rb"
         && p != "runtime/active_support_big_decimal_conversions.rb"
         && p != "runtime/active_support_number_helper.rb"
         && p != "runtime/active_support_numeric_conversions.rb"

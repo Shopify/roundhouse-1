@@ -176,6 +176,51 @@ module Rails
       !read(key).nil?
     end
 
+    # ActiveSupport::Cache::Store's multi-key API (8.2.0.alpha cache.rb:
+    # read_multi, write_multi, fetch_multi, delete_multi), over the
+    # single-key methods above. Core writes per-feed keys in one
+    # `Rails.cache.write_multi(entries, expires_in:)`
+    # (product_feeds/incremental_event_queue.rb). A trailing options Hash
+    # on read_multi / fetch_multi is the options, as `extract_options!`
+    # takes it; a cached nil is a hit, as a stored Entry is.
+    def read_multi(*names)
+      return {} if names.empty?
+      names.pop if names.last.is_a?(Hash)
+      names.each_with_object({}) do |name, results|
+        found, value = lookup(name)
+        results[name] = value if found
+      end
+    end
+
+    def write_multi(hash, options = nil)
+      return hash if hash.empty?
+      hash.each { |name, value| write(name, value, options || {}) }
+      hash
+    end
+
+    def fetch_multi(*names)
+      raise ArgumentError, "Missing block: `Cache#fetch_multi` requires a block." unless block_given?
+      return {} if names.empty?
+      options = names.last.is_a?(Hash) ? names.pop : {}
+      reads = options[:force] ? {} : read_multi(*names)
+      writes = {}
+      ordered = names.each_with_object({}) do |name, memo|
+        memo[name] = reads.fetch(name) { writes[name] = yield(name) }
+      end
+      writes.compact! if options[:skip_nil]
+      write_multi(writes, options)
+      ordered
+    end
+
+    def delete_multi(names, options = nil)
+      return 0 if names.empty?
+      names.count do |name|
+        k = name.to_s
+        s = shard_of(k)
+        @mutexes[s].synchronize { !@shards[s].delete(k).nil? }
+      end
+    end
+
     def clear
       s = 0
       while s < SHARD_COUNT
@@ -208,6 +253,16 @@ module Rails
         end
       end
       encoded
+    end
+
+    # [true, value] for a live entry (a cached nil included), else [false, nil].
+    def lookup(name)
+      k = name.to_s
+      s = shard_of(k)
+      entry = @shards[s][k]
+      return [false, nil] if entry.nil?
+      encoded = expired?(entry) ? live_encoded_after_expiry_recheck(s, k) : entry[0]
+      encoded.nil? ? [false, nil] : [true, decode(encoded)]
     end
 
     # Entry = [encoded_value, expires_at_or_nil]; a Marshal'd payload is

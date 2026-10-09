@@ -314,6 +314,17 @@ module RoundhouseActiveSupportAssertions
     end
 end
 
+# The port answers to Rails' own name: app test code includes it
+# explicitly (Core's TestCase and its RowLevelAccess::TestHelper:
+# `include ActiveSupport::Testing::Assertions`). TestBase already has it
+# (RoundhouseMinitestAssertions, prepended), so a test class's include is
+# a no-op, as natively ActiveSupport::TestCase already includes it.
+module ActiveSupport
+  module Testing
+    Assertions = RoundhouseActiveSupportAssertions unless const_defined?(:Assertions, false)
+  end
+end
+
 # ---- The Rails test helpers this tree models ------------------------
 #
 # TestBase's job, query, event and error helpers compute their answer

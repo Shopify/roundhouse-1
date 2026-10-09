@@ -183,3 +183,58 @@ puts "ALL OK"
     );
     assert!(out.status.success(), "driver exited {:?}", out.status.code());
 }
+
+#[test]
+fn overlay_memory_store_multi_key_api_answers_like_active_support() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // ActiveSupport::Cache::Store (8.2.0.alpha cache.rb) read_multi /
+    // write_multi / fetch_multi / delete_multi; Core's
+    // ProductFeeds::IncrementalEventQueue writes with
+    // `Rails.cache.write_multi(entries, expires_in:)`.
+    let script = r##"
+require_relative "runtime/spinel/scaffold/ruby_overlay/runtime/rails_cache"
+
+store = Rails::MemoryStore.new
+entries = { "a" => 1, "b" => nil, "c" => "str" }
+raise "write_multi return" unless store.write_multi(entries, expires_in: 60).equal?(entries)
+raise "write_multi empty" unless store.write_multi({}) == {}
+raise "read a" unless store.read("a") == 1
+got = store.read_multi("a", "b", "c", "missing", expires_in: 5)
+raise "read_multi #{got.inspect}" unless got == { "a" => 1, "b" => nil, "c" => "str" }
+raise "read_multi empty" unless store.read_multi == {}
+yielded = []
+fetched = store.fetch_multi("a", "x", "y") { |name| yielded << name; name * 2 }
+raise "fetch_multi #{fetched.inspect}" unless fetched == { "a" => 1, "x" => "xx", "y" => "yy" } && fetched.keys == %w[a x y]
+raise "fetch_multi yielded #{yielded.inspect}" unless yielded == %w[x y]
+raise "fetch_multi wrote" unless store.read("x") == "xx"
+forced = store.fetch_multi("a", force: true) { |name| :forced }
+raise "fetch_multi force" unless forced == { "a" => :forced } && store.read("a") == :forced
+store.fetch_multi("n", skip_nil: true) { nil }
+raise "fetch_multi skip_nil" if store.read_multi("n").key?("n")
+begin
+  store.fetch_multi("a")
+  raise "fetch_multi without block"
+rescue ArgumentError => e
+  raise e.message unless e.message == "Missing block: `Cache#fetch_multi` requires a block."
+end
+raise "delete_multi count" unless store.delete_multi(%w[a b nope]) == 2
+raise "delete_multi empty" unless store.delete_multi([]) == 0
+raise "deleted" unless store.read_multi("a", "b") == {}
+expiring = Rails::MemoryStore.new
+expiring.write_multi({ "e" => 1 }, expires_in: -1)
+raise "expired entry read" unless expiring.read_multi("e") == {}
+puts "ALL OK"
+"##;
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(script)
+        .current_dir(root)
+        .output()
+        .expect("ruby is on PATH");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("ALL OK"),
+        "overlay multi-key API failed\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+    );
+}

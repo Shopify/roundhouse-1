@@ -86,6 +86,10 @@ const QUOTA: &str = r#"class Quota
       "bytes: #{size_for(3)} #{size_for(1.5)} #{2.kilobytes}",
       "window: #{window_for(2).class} #{window_for(2).to_i} #{3.hours.to_i} #{90.minutes.in_hours}",
       "to_fs: #{1234567.to_fs(:delimited)} #{12345.to_fs(:human_size)} #{0.5.to_fs(:percentage, precision: 1)}",
+      # core_ext/integer/time and Time#change (core_ext/time/calculations),
+      # as Core's class bodies call them: `expected_ttl: 1.year.to_i`,
+      # `Time.now.utc.change(nsec: 0)`.
+      "calendar: #{1.year.to_i} #{2.months.inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(hour: 5).inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(nsec: 0).nsec}",
     ]
   end
 end
@@ -134,7 +138,8 @@ retries: 3 3 3\n\
 service: gateway gateway\n\
 bytes: 3145728 1572864.0 2048\n\
 window: ActiveSupport::Duration 172800 10800 1.5\n\
-to_fs: 1,234,567 12.1 KB 0.5%\n";
+to_fs: 1,234,567 12.1 KB 0.5%\n\
+calendar: 31556952 2 months 2024-01-31 05:00:00 UTC 0\n";
 
 #[test]
 fn app_code_calls_the_core_extensions_rails_boot_loaded() {
@@ -142,7 +147,10 @@ fn app_code_calls_the_core_extensions_rails_boot_loaded() {
     let unexpected: Vec<&String> = errors.iter().filter(|e| !e.contains("database_adapter not supported")).collect();
     assert!(unexpected.is_empty(), "{errors:#?}");
     let facades = std::fs::read_to_string(tree.join("runtime/gem_facades.rb")).unwrap();
-    for port in ["active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric"] {
+    for port in [
+        "active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric",
+        "active_support_integer_time", "active_support_time_change",
+    ] {
         assert!(facades.contains(&format!("require_relative \"{port}\"\n")), "{port} not loaded at boot:\n{facades}");
     }
     let scratch = tree.parent().expect("scratch").to_path_buf();
@@ -169,8 +177,12 @@ fn app_code_that_calls_none_loads_none() {
         .write("app/models/plain.rb", "class Plain\n  # class_attribute :x, 2.days\n  def self.name_of(x) = x.to_s\nend\n")
         .emit(BuildTarget::Ruby);
     let facades = std::fs::read_to_string(tree.join("runtime/gem_facades.rb")).unwrap();
-    for port in ["active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric"] {
+    for port in [
+        "active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric",
+        "active_support_integer_time", "active_support_time_change",
+    ] {
         assert!(!facades.contains(&format!("require_relative \"{port}\"\n")), "{port} loaded at boot:\n{facades}");
     }
     assert!(tree.join("runtime/features/active_support/core_ext/class/attribute.rb").exists());
+    assert!(tree.join("runtime/features/active_support/core_ext/integer/time.rb").exists());
 }

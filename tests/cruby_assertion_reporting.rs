@@ -426,3 +426,31 @@ puts [ActiveSupport::TestCase.equal?(TestBase), ActionController::TestCase.super
     assert!(output.status.success(), "{log}");
     assert!(String::from_utf8_lossy(&output.stdout).lines().any(|line| line == "[true, true, 1]"), "{log}");
 }
+
+/// Core's TestCase (`class TestCase < TestBase`) names
+/// `include ActiveSupport::Testing::Assertions` itself; the runtime's
+/// port answers to that name, and the include adds nothing a test class
+/// does not already have (natively ActiveSupport::TestCase includes it).
+#[test]
+fn explicit_active_support_testing_assertions_include_resolves() {
+    compare(r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  include ActiveSupport::Testing::Assertions
+
+  def bump
+    @count = @count + 1
+  end
+
+  def test_difference
+    @count = 0
+    assert_difference(-> { @count }) { bump }
+    assert_not false
+  end
+
+  def test_changes
+    @count = 0
+    assert_changes(-> { @count }, from: 0, to: 1) { bump }
+  end
+end
+"#);
+}
