@@ -944,8 +944,19 @@ fn every_runtime_method_body_concretely_typed() {
     // lation]`, `[:requires_new]`, `.key?(:joinable) ? [:joinable] :
     // true`), and each `Hash[Symbol, untyped]` value read is gradual —
     // same shape `connection.rb`'s other `opts`-style Hash call sites
-    // already carry. Upstream 304 -> 310 (+6); merged over this tree's 520.
-    const CEILING: usize = 526;
+    // already carry.
+    // `ActiveRecord::RecordNotFound#initialize` (model/primary_key/id)
+    // adds 1, MEASURED on the runtime after #671: the `@id = id` store
+    // of the id Rails passes through, whose RBS type is the flat
+    // `String | Integer | Float | Array | nil` union (Float added after
+    // #689 review; MEASURED, no change).
+    // Campfire's repin past 2393f01 adds 5, MEASURED, each from a value
+    // Rails itself leaves dynamic: `Connection#select_value` (one SQL cell, as
+    // `select_rows`' rows are), `Base.uncached`'s block value (the
+    // `Timeout.timeout` shape), and `Relation#to_h`'s yielded pairs.
+    // Upstream 304 -> 316 (+12); merged over this tree's 520 (+6 at the
+    // a47f2b16a merge, +6 at the 4228ed837 merge).
+    const CEILING: usize = 532;
     assert!(
         total_gradual <= CEILING,
         "{total_gradual} Ty::Untyped sites exceeds ceiling of {CEILING}",

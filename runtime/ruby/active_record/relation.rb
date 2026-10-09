@@ -362,6 +362,24 @@ module ActiveRecord
       self
     end
 
+    # `order(Arel.sql("…"))` — a caller-authored ordering fragment, kept
+    # as written (Rails takes an `Arel.sql` literal past its column-name
+    # check; campfire's `reorder(Arel.sql("+messages.created_at"))`
+    # keeps SQLite off an index). `lower::arel_sql_order` renames the
+    # call; the bare String `order` still validates. A loaded relation
+    # reads again rather than guess at a fragment's sort.
+    def order_sql(fragment)
+      own_lists
+      @orders << fragment
+      @records = nil
+      self
+    end
+
+    def reorder_sql(fragment)
+      @orders = []
+      order_sql(fragment)
+    end
+
     # `reorder(*parts)` — Rails' "replace the ordering": drop every term
     # gathered so far, then order by these. Same in-memory resort as
     # `order` when the records are already loaded.
@@ -1135,6 +1153,13 @@ module ActiveRecord
       loaded_records.map { |x| yield x }
     end
 
+    # Enumerable's `to_h { |rec| [k, v] }` over the materialized rows
+    # (campfire's push pool test keys each subscription's badge by its
+    # endpoint this way).
+    def to_h
+      loaded_records.to_h { |x| yield x }
+    end
+
     # `collect` is Enumerable's second name for `map`, and Rails
     # relations answer it because they delegate the whole of Enumerable
     # to `to_a`. campfire's membership extension reaches it
@@ -1260,7 +1285,7 @@ module ActiveRecord
     # dispatch layer) instead of returning nil when the relation is empty.
     def first!
       record = first
-      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
@@ -1514,7 +1539,9 @@ module ActiveRecord
       ok
     end
 
-    # `exists?` / `exists?(id)`. Hash/String forms are unsupported.
+    # `exists?` / `exists?(id)` / `exists?(hash)`. Hash conditions share
+    # where's predicate builder; scalar conditions select the primary key.
+    # String forms are unsupported.
     # Integer? narrows by early return — rust2 does not narrow Option
     # across `unless x.nil?`. Unloaded: exists_sql (SELECT 1 LIMIT 1).
     # No argument asks for any row; `exists?(nil)` is false, as Rails'
@@ -1529,10 +1556,20 @@ module ActiveRecord
         return probe_existence(1) > 0
       end
       own_lists
-      @wheres << "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(@model.primary_key, id))}"
-      found = probe_existence(1) > 0
-      @wheres.pop
-      found
+      # Popped for the same reason `find` and `find_by` pop: a terminal
+      # that answered a question must not narrow the relation it was
+      # asked on.
+      sql = if id.is_a?(Hash)
+        hash_conditions(id)
+      else
+        "#{@table}.#{@model.primary_key} = #{ActiveRecord.adapter.escape_value(@model._attribute_for_database(@model.primary_key, id))}"
+      end
+      @wheres << sql unless sql.empty?
+      begin
+        probe_existence(1) > 0
+      ensure
+        @wheres.pop unless sql.empty?
+      end
     end
 
     # How many probe rows `exists_sql(n)` returns. Shared by `exists?`,
@@ -1749,10 +1786,20 @@ module ActiveRecord
     # narrow every later use of it to that one row. Popped BEFORE the
     # raise for the same reason — an exception a caller rescues must not
     # leave the relation altered.
+    #
+    # The messages are Rails 8.1's (`raise_record_not_found_exception!`)
+    # minus the ` [WHERE ...]` suffix Rails appends for a scoped
+    # relation: Rails renders it from Arel with `?` binds, while the
+    # wheres here are SQL text with the values already filled in, so
+    # the suffix could not match. An unscoped relation's message is
+    # exactly Rails'.
     def find(id)
       if @model.composite_primary_key?
         raise NotImplementedError, "roundhouse: find on a relation of #{@model.name}, whose primary key is composite, is not supported"
       end
+      # Rails compacts the ids first, so `find(nil)` has none: the
+      # "without an ID" form, with no id, as `Base.find(nil)` raises.
+      raise RecordNotFound.new("Couldn't find #{@model.name} without an ID", @model.name, @model.primary_key) if id.nil?
       return find_ids(id) if id.is_a?(Array)
       key = @model._cast_primary_key(id)
       prior_limit = @limit
@@ -1767,7 +1814,7 @@ module ActiveRecord
         @wheres.pop
       end
       if record.nil?
-        raise RecordNotFound, "Couldn't find record in #{@model.table_name} with id=#{id}"
+        raise RecordNotFound.new("Couldn't find #{@model.name} with '#{@model.primary_key}'=#{id.inspect}", @model.name, @model.primary_key, id)
       end
       record
     end
@@ -1810,7 +1857,8 @@ module ActiveRecord
         @wheres.pop
       end
       if rows.length != expected
-        raise RecordNotFound, "Couldn't find all records in #{@table} with ids=#{ids}"
+        listed = ids.map { |each_id| each_id.inspect }.join(", ")
+        raise RecordNotFound.new("Couldn't find all #{Inflector.pluralize_word(@model.name, 2)} with '#{@model.primary_key}': (#{listed}) (found #{rows.length} results, but was looking for #{expected}).", @model.name, @model.primary_key, ids)
       end
       if @orders.empty?
         keys.map { |key| rows.find { |row| row.id == key } }
@@ -1842,7 +1890,7 @@ module ActiveRecord
     # `find_by!` — `find_by` that raises `RecordNotFound` on no match.
     def find_by!(conditions)
       record = find_by(conditions)
-      raise RecordNotFound, "Couldn't find record in #{@model.table_name}" if record.nil?
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if record.nil?
       record
     end
 
@@ -1873,7 +1921,7 @@ module ActiveRecord
       loaded = @records
       unless loaded.nil?
         rows = loaded_sole_rows(loaded)
-        raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+        raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if rows.length == 0
         raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
         return rows[0]
       end
@@ -1882,7 +1930,7 @@ module ActiveRecord
       rows = to_a
       @limit = prior_limit
       @records = nil
-      raise RecordNotFound, "Couldn't find #{@model.name}" if rows.length == 0
+      raise RecordNotFound.new("Couldn't find #{@model.name}", @model.name, @model.primary_key) if rows.length == 0
       raise SoleRecordExceeded, "Wanted only one #{@model.name}" if rows.length > 1
       rows[0]
     end

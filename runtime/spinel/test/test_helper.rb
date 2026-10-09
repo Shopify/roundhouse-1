@@ -760,6 +760,12 @@ class ActionResponse
   # Rails hands a test: campfire's logo test reads
   # `@response.headers["content-type"]`, and against a Hash keyed the
   # way the header is spelled on the wire that read is nil.
+  # Rails' `response.media_type`: the content type without its
+  # parameters (`text/html`, not `text/html; charset=utf-8`).
+  def media_type
+    @content_type.split(";").first.to_s.strip
+  end
+
   def headers
     out = {}
     @extra_headers.each { |k, v| out[k.to_s.downcase] = v }
@@ -1087,8 +1093,17 @@ class TestBase
     end
   end
 
+  # Rails' `travel(duration) { … }` travels for the block and back.
+  # Taking no block here dropped it unrun — a test whose body sat in the
+  # block passed without executing a line of it.
   def travel(duration)
     travel_to(Time.now + duration.to_i)
+    return unless block_given?
+    begin
+      yield
+    ensure
+      travel_back
+    end
   end
 
   def travel_back
@@ -1102,6 +1117,17 @@ class TestBase
   # own message.
   def assert_nothing_raised
     yield
+  # Rails' `freeze_time`: `travel_to(Time.now)`, held still — every
+  # read until `travel_back` (the block's end, or the next test's
+  # setup) answers the same whole second.
+  def freeze_time
+    ActiveSupport.freeze(ActiveSupport.now.to_i)
+    return unless block_given?
+    begin
+      yield
+    ensure
+      travel_back
+    end
   end
 
   # `assert_match` left as a method — nilable value handling differs
@@ -1679,6 +1705,17 @@ module RequestDispatch
     @__host
   end
 
+  # `https!(flag = true)` — Rails' integration session: every later
+  # request in this test arrives over TLS (`request.ssl?`, and so the
+  # `https://` its absolute URLs carry).
+  def https!(flag = true)
+    @__https = flag
+  end
+
+  def https?
+    @__https == true
+  end
+
   def dispatch_request(method, path, params, headers = {}, as = nil)
     require_relative "../config/routes"
     # Controllers load on demand (the CRuby target's routes.rb no longer
@@ -1810,6 +1847,7 @@ module RequestDispatch
       "HTTP_USER_AGENT" => "Roundhouse Test",
     }
     headers.each { |k, v| env[env_key(k.to_s)] = v.to_s }
+    env["HTTPS"] = "on" if https?
     env["CONTENT_TYPE"] = "application/json" if as == :json
     env["REQUEST_METHOD"] = method
     env["PATH_INFO"]      = request_path

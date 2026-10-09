@@ -802,6 +802,20 @@ impl<'a> BodyTyper<'a> {
         }
     }
 
+    fn has_unknown_ancestor(&self, id: &crate::ident::ClassId) -> bool {
+        let classes = self.classes();
+        let mut current = Some(id.clone());
+        for step in 0..32 {
+            let Some(cid) = current else { return false };
+            let Some(cls) = classes.get(&cid) else { return step > 0 };
+            if cls.open {
+                return true;
+            }
+            current = cls.parent.clone();
+        }
+        false
+    }
+
     /// Whether `self`'s class, its includes or its ancestors register
     /// `method` — an app definition, whatever type it answered.
     fn app_defines(&self, self_ty: Option<&Ty>, method: &Symbol) -> bool {
@@ -2916,10 +2930,22 @@ impl<'a> BodyTyper<'a> {
                         {
                             Some("Object extension")
                         }
+                        // Not refused again on a receiver the constant refusal already accounts for.
+                        _ if matches!(recv_ty, None | Some(Ty::Var { .. } | Ty::Untyped))
+                            && recv.as_ref().is_some_and(|r| rooted_in_refused_constant(r)) => None,
                         _ if matches!(method.as_str(), "to_query" | "instance_values" | "acts_like?" | "presence_in" | "with_options" | "pretty_inspect") => Some("Object extension"),
                         _ => None,
                     };
-                    if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
+                    // Not an Object extension under an unseen ancestor: a gem likely defines it, and only a dispatch miss keeps the receiver attribution needs.
+                    let gem_ancestry = recv_ty
+                        .clone()
+                        .filter(|ty| gap == Some("Object extension") && matches!(ty, Ty::Class { id, .. } if self.has_unknown_ancestor(id)));
+                    if let Some(recv_ty) = gem_ancestry.filter(|_| expr.diagnostic.is_none()) {
+                        expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::SendDispatchFailed {
+                            method: method.clone(),
+                            recv_ty,
+                        });
+                    } else if let Some(owner) = gap.filter(|_| expr.diagnostic.is_none()) {
                         expr.diagnostic = Some(crate::diagnostic::DiagnosticKind::Unsupported {
                             target: None,
                             construct: Symbol::from(owner),
@@ -6232,6 +6258,18 @@ fn kernel_conversion_ty(method: &Symbol, args: &[Expr]) -> Option<Ty> {
     };
     if !arity.contains(&positional.len()) { return None; }
     Some(if exception { Ty::Union { variants: vec![ty, Ty::Nil] } } else { ty })
+}
+
+/// Whether `expr` is a refused constant or a send chain rooted in one.
+fn rooted_in_refused_constant(expr: &Expr) -> bool {
+    match &*expr.node {
+        ExprNode::Const { .. } => matches!(
+            &expr.diagnostic,
+            Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }) if construct.as_str() == "constant"
+        ),
+        ExprNode::Send { recv: Some(recv), .. } => rooted_in_refused_constant(recv),
+        _ => false,
+    }
 }
 
 fn literal_extremum_ty(recv: Option<&Expr>, recv_ty: &Ty, method: &Symbol, args: &[Expr]) -> Option<Ty> {

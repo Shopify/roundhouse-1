@@ -20,3 +20,8 @@ module ActionController
     def failures: () -> Array[String]
   end
 end
+
+module AbstractController
+  class ActionNotFound < StandardError
+  end
+end

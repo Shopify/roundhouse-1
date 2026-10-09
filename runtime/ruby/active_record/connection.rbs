@@ -47,6 +47,7 @@ module ActiveRecord
     def _await_preload: () -> nil
     # Request values stay intact until the schema-selected scalar adapter.
     def self.find: (Integer | Float | String | nil id) -> Base
+    def self.find_by!: (Hash[String | Symbol, untyped] conditions) -> Base
     def self._find_primary_key_input: (Integer | Float | String | nil id) -> Base?
     def self._find_composite_primary_key: (untyped id) -> untyped
     def self.composite_primary_key?: () -> bool
@@ -54,7 +55,9 @@ module ActiveRecord
     def self.connection: () -> Connection
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
+    def self.uncached: () { () -> untyped } -> untyped
     def self.transaction: (?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
+    def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer
     def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
     def self.upsert: (Hash[Symbol, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol]), ?on_duplicate: String?, ?returning: untyped) -> Integer

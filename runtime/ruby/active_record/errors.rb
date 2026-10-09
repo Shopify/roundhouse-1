@@ -7,9 +7,9 @@
 # the class name the way Ruby's Exception does.
 #
 # Rails' fuller constructors on these classes (AdapterError's
-# `connection_pool:`, StatementInvalid's `sql:`/`binds:`, RecordNotFound's
-# model/primary_key/id, RecordInvalid's I18n message) are not
-# transpilable shapes; the CRuby tree's overlay installs them
+# `connection_pool:`, StatementInvalid's `sql:`/`binds:`, RecordInvalid's
+# I18n message) are not transpilable shapes (RecordNotFound's positional
+# model/primary_key/id is, and is written below); the CRuby tree's overlay installs them
 # (ruby_overlay/runtime/active_record_statement_errors.rb). The rest of
 # Rails' hierarchy is Ruby-family only (error_classes.rb).
 module ActiveRecord
@@ -32,10 +32,21 @@ module ActiveRecord
   end
 
   class RecordNotFound < ActiveRecordError
-    # Bare-construct default. Ruby's StandardError sets the message to
-    # the class name implicitly; JS Error doesn't, so spell the
-    # contract out so transpiled targets get the same default.
-    def initialize(message = "ActiveRecord::RecordNotFound")
+    # Rails' readers (activerecord 8.1.4): the model's class name, its
+    # primary key and the id that was looked up, as passed. `find` sets
+    # all three; `find_by!` / `first!` / `sole` set the model and key and
+    # leave `id` nil. Apps read them in a `rescue_from` handler to build
+    # the 404 body.
+    attr_reader :model, :primary_key, :id
+
+    # Rails' positional signature. The message default differs on
+    # purpose: Ruby's StandardError sets the message to the class name
+    # implicitly; JS Error doesn't, so spell the contract out so
+    # transpiled targets get the same default.
+    def initialize(message = "ActiveRecord::RecordNotFound", model = nil, primary_key = nil, id = nil)
+      @model = model
+      @primary_key = primary_key
+      @id = id
       super(message)
     end
   end

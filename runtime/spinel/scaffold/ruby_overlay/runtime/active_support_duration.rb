@@ -252,6 +252,11 @@ module ActiveSupport
     def in_weeks = @seconds / SECONDS_PER_WEEK.to_f
     def in_months = @seconds / SECONDS_PER_MONTH.to_f
     def in_years = @seconds / SECONDS_PER_YEAR.to_f
+    # Numeric predicates (Rails delegates them to the value; net/http
+    # asks `zero?` of a timeout).
+    def zero? = @seconds.zero?
+    def positive? = @seconds.positive?
+    def negative? = @seconds.negative?
     # Rails parity: Duration#to_s is the seconds value's to_s
     # (`30.minutes.to_s == "1800"`) — also what interpolation calls
     # (lobsters embeds durations in cache keys).

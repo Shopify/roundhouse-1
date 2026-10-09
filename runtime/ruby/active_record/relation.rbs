@@ -83,6 +83,8 @@ module ActiveRecord
     def or: (Relation other) -> Relation
     def add_condition: (Hash[String | Symbol, untyped] | String | nil condition, Array[untyped] args, bool negate, ?bool note) -> bool
     def order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def order_sql: (String fragment) -> Relation
+    def reorder_sql: (String fragment) -> Relation
     # In-memory sort of a LOADED relation. Records are `Base` (same
     # interim as first/take); `preloaded` stays bare for Spinel integer
     # seeds, but the loaded cache itself is a record array.
@@ -169,6 +171,7 @@ module ActiveRecord
     def ==: (untyped other) -> bool
     def filter: () { (Base) -> bool } -> Array[Base]
     def map: () { (Base) -> untyped } -> untyped
+    def to_h: () { (Base) -> Array[untyped] } -> Hash[untyped, untyped]
     def collect: () { (Base) -> untyped } -> untyped
     # `other` is `untyped`, NOT `Array[untyped]`, on all four set
     # operators: each body only hands the argument on to Array's own
@@ -225,7 +228,7 @@ module ActiveRecord
     def one?: () -> bool
     def many?: () -> bool
     def all?: () { (Base) -> bool } -> bool
-    def exists?: (?Integer? id) -> bool
+    def exists?: (?(Integer | String | Hash[String | Symbol, untyped] | nil) id) -> bool
     def probe_existence: (Integer n) -> Integer
     def more_than?: (Integer n) -> bool
     def length: () -> Integer
@@ -258,7 +261,7 @@ module ActiveRecord
     def pluck: (String | Symbol col) -> Array[untyped]
     def pick: (String | Symbol col) -> untyped
     def ids: () -> Array[Integer]
-    def find: (Integer | Float | String | Array[Integer | Float | String] id) -> untyped
+    def find: (Integer | Float | String | Array[Integer | Float | String] | nil id) -> untyped
     def find_ids: (Array[Integer | Float | String] ids) -> Array[Base]
     def find_by: (Hash[Symbol, untyped] | String | nil conditions) -> Base?
     def find_by!: (Hash[Symbol, untyped] | String | nil conditions) -> Base

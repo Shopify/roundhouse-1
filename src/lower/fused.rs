@@ -317,6 +317,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
     let json_map = super::has_json::has_json_columns(&app.models);
     let by_model = super::assoc_loaded::has_many_by_model(app);
     let readers = super::assoc_loaded::association_readers_by_model(app);
+    let flat_loaded = super::assoc_loaded::flat_loaded_by_model(app);
     let sole_includer = app.sole_includer_of_modules();
 
     super::for_each_owned_hook_body(app, &mut |owner, body| {
@@ -332,6 +333,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &sole_includer,
                 &by_model,
                 &readers,
+                &flat_loaded,
             );
         });
     });
@@ -348,6 +350,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &sole_includer,
                 &by_model,
                 &readers,
+                &flat_loaded,
             );
         });
     }
@@ -364,6 +367,7 @@ pub fn apply_fused_mid_rewrites(app: &mut App) {
                 &sole_includer,
                 &by_model,
                 &readers,
+                &flat_loaded,
             );
         });
     });
@@ -380,6 +384,7 @@ fn rewrite_mid_node(
     sole_includer: &crate::det::HashMap<crate::ident::ClassId, crate::ident::ClassId>,
     by_model: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
     readers: &super::assoc_loaded::AssociationReaders,
+    flat_loaded: &crate::det::HashMap<crate::ident::ClassId, crate::det::HashSet<Symbol>>,
 ) {
     if !helpers.is_empty() {
         super::route_format_suffix::rewrite_node(e, helpers);
@@ -400,7 +405,8 @@ fn rewrite_mid_node(
     if !json_map.is_empty() {
         super::has_json::rewrite_node(e, json_map);
     }
-    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, readers);
+    super::assoc_loaded::rewrite_node(e, enclosing, sole_includer, by_model, readers, flat_loaded);
+    super::arel_sql_order::rewrite_node(e);
 }
 
 fn apply_route_url_followups(

@@ -228,7 +228,7 @@ module Main
 
     begin
       controller.process_action(matched.action)
-    rescue ActiveRecord::RecordNotFound, ActionController::RoutingError
+    rescue ActiveRecord::RecordNotFound, ActionController::RoutingError, AbstractController::ActionNotFound
       return [404, "<h1>404 Not Found</h1>", "text/html; charset=utf-8", nil, {}, {}, {}, {}, {}]
     rescue ActionController::ParameterMissing
       # `params.expect` / `params.require` refused the request and the app
@@ -446,6 +446,7 @@ if __FILE__ == $PROGRAM_NAME
     # The forgery check's two headers (runtime/request_forgery_protection.rb).
     "HTTP_X_CSRF_TOKEN" => ENV["HTTP_X_CSRF_TOKEN"],
     "HTTP_ORIGIN"       => ENV["HTTP_ORIGIN"],
+    "HTTP_SEC_FETCH_SITE" => ENV["HTTP_SEC_FETCH_SITE"],
     # The HTTP Token/Basic helpers' credentials (runtime/http_authentication.rb).
     "HTTP_AUTHORIZATION" => ENV["HTTP_AUTHORIZATION"],
     "HTTP_HOST"         => ENV["HTTP_HOST"],

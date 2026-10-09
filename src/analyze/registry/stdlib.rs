@@ -872,6 +872,7 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         // active_support_core_ext.rb, a NoMethodError); `project` refuses
         // it off the CRuby and JRuby trees.
         ("ActiveSupport::DelegationError", None),
+        ("AbstractController::ActionNotFound", None),
     ] {
         let mut methods = exception_surface.to_vec();
         methods.extend(extra);

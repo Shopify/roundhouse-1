@@ -1208,6 +1208,22 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         chain: ChainKind::Builder,
         return_kind: Some(ReturnKind::RelationOfSelf),
     },
+    // `order(Arel.sql(…))` / `reorder(Arel.sql(…))`, renamed by
+    // `lower::arel_sql_order` so the fragment skips the column check.
+    CatalogedMethod {
+        name: "order_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reorder_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
     CatalogedMethod {
         name: "skip_preloading!",
         receiver: ReceiverContext::Relation,
@@ -1613,6 +1629,13 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         effect: EffectClass::DbRead,
         chain: ChainKind::Terminal,
         return_kind: Some(ReturnKind::ArrayOfInt),
+    },
+    CatalogedMethod {
+        name: "to_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
     },
     CatalogedMethod {
         name: "pluck",

@@ -54,6 +54,9 @@ module ActiveSupport
     def in_weeks: () -> Float
     def in_months: () -> Float
     def in_years: () -> Float
+    def zero?: () -> bool
+    def positive?: () -> bool
+    def negative?: () -> bool
     def to_s: () -> String
     def seconds: () -> Integer
     def part_slots: () -> Array[Integer?]

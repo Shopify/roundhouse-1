@@ -2996,8 +2996,9 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
     // has_secure_password virtual attrs: `User.new(password: "...",
     // password_confirmation: "...")` is the factory/signup shape —
     // Rails routes them through the macro's plaintext writers (where
-    // digest computation lives). The digest COLUMN was already covered
-    // by the column loop above.
+    // digest computation lives). A supplied nil also reaches the writer;
+    // only an omitted key is skipped. The digest COLUMN was already
+    // covered by the column loop above.
     if let Some(attr) = crate::lower::secure_password::secure_password_attr(&model.body) {
         for key in [attr.as_str().to_string(), format!("{}_confirmation", attr.as_str())] {
             let lookup = Expr::new(
@@ -3010,7 +3011,24 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
                     parenthesized: false,
                 },
             );
-            stmts.push(assign_via_writer_unless_nil(Symbol::from(format!("{key}=")), lookup));
+            let assign = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(self_ref()),
+                    method: Symbol::from(format!("{key}=")),
+                    args: vec![lookup],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            stmts.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: bool_send(var_ref(attrs.clone()), "key?", lit_sym(Symbol::from(key))),
+                    then_branch: assign,
+                    else_branch: nil_lit(),
+                },
+            ));
         }
     }
 
@@ -3094,6 +3112,28 @@ fn synth_initialize(owner: &ClassId, table: &Table, model: &Model, models: &[Mod
     // has_one gets `nil` (single record or absent). Harmless on dynamic
     // targets. Names from `associations::{cache_ivar,loaded_ivar}`.
     for assoc in model.associations() {
+        // belongs_to's `<name>_loaded?` (`push_singular_loaded_reader`)
+        // reads the flag the ruby family's load-once reader sets. The
+        // strict targets' reader queries every time and never sets it,
+        // so it has to exist there as `false` or the read names a field
+        // the class never declared (TS `article_loaded`, Go
+        // `ArticleLoaded`). On those targets `loaded?` stays false.
+        if let Association::BelongsTo { name, polymorphic: false, .. } = assoc {
+            stmts.push(Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign {
+                    target: LValue::Ivar { name: super::associations::loaded_ivar(name) },
+                    value: with_ty(
+                        Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Lit { value: Literal::Bool { value: false } },
+                        ),
+                        Ty::Bool,
+                    ),
+                },
+            ));
+            continue;
+        }
         if let Association::HasOne { name, .. } = assoc {
             stmts.push(Expr::new(
                 Span::synthetic(),
@@ -4261,6 +4301,7 @@ fn synth_update_hash(
     .chain(crate::lower::plain_text_attr::plain_text_attrs(model))
     .map(|(_s, a)| a)
     .collect();
+    let secure_password = crate::lower::secure_password::secure_password_attr(&model.body);
     let mut virtuals = super::writable_field_set(model, table);
     // Hand-written `def <field>=` in the model body. `writable_field_set`
     // deliberately leaves these out — its callers hold a field name and
@@ -4303,7 +4344,16 @@ fn synth_update_hash(
                 parenthesized: false,
             },
         );
-        stmts.push(guard_unless_nil(lookup(&field), assign));
+        // Only the secure-password pair changes nil dispatch here; other
+        // virtual writers retain their existing value guard.
+        let password_field = secure_password.as_ref().is_some_and(|attr| {
+            &field == attr || field.as_str() == format!("{}_confirmation", attr.as_str())
+        });
+        stmts.push(if password_field {
+            when_present(&field, assign)
+        } else {
+            guard_unless_nil(lookup(&field), assign)
+        });
     }
 
     stmts.push(Expr::new(
