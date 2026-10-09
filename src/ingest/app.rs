@@ -252,6 +252,7 @@ fn keep_initializer_defined(
     app: &mut App,
     dir: &Path,
     sources: &[crate::span::SourceFile],
+    initializers: &[PathBuf],
     candidates: Vec<InitializerDefined>,
 ) {
     const FRAMEWORK_ROOTS: &[&str] = &[
@@ -288,27 +289,43 @@ fn keep_initializer_defined(
     };
     for InitializerDefined { file, ranges, decls, mixed_in, lc } in candidates {
         let name = lc.name.0.as_str().to_string();
-        if name.contains("::")
-            || FRAMEWORK_ROOTS.contains(&name.as_str())
-            || CORE.contains(&name.as_str())
+        let root_segment = name.split("::").next().unwrap_or_default();
+        if FRAMEWORK_ROOTS.contains(&root_segment)
+            || CORE.contains(&root_segment)
             || app.library_classes.iter().any(|c| c.name == lc.name)
             || app.models.iter().any(|m| m.name == lc.name)
             || app.controllers.iter().any(|c| c.name == lc.name)
         {
             continue;
         }
-        let own_mixin = mixed_in
-            && lc.is_module
-            && !namespace_of_app(app, &name)
-            && !crate::analyze::runtime_reads::is_runtime_declared_namespace(&name);
-        if !referenced(&name) && !own_mixin {
+        let own_namespace =
+            !namespace_of_app(app, &name) && !crate::analyze::runtime_reads::is_runtime_declared_namespace(&name);
+        let own_mixin = mixed_in && lc.is_module && own_namespace;
+        // Named by the boot's initializers themselves, outside its own
+        // definition (`initializers::referenced_by_initializers`), top
+        // level or nested under a namespace.
+        let initializer_local = own_namespace
+            && super::initializers::referenced_by_initializers(sources, initializers, &name, &file, &ranges);
+        if name.contains("::") {
+            if !initializer_local {
+                continue;
+            }
+        } else if !referenced(&name) && !own_mixin && !initializer_local {
             continue;
         }
+        let text = sources.iter().find(|f| f.path == file).map(|f| f.text.clone()).unwrap_or_default();
         for (start, end) in ranges {
             super::initializers::consume(&file, start, end);
         }
         for start in decls {
             super::initializers::define(&file, start, &name);
+            // Nested in a namespace wrapper: loaded where the wrapper
+            // stands, the statement the initializer's program walks.
+            if let Some(outer) = super::initializers::namespace_wrapper_start(text.as_bytes(), start) {
+                if super::initializers::defined_at(&file, outer).is_none() {
+                    super::initializers::define(&file, outer, &name);
+                }
+            }
         }
         app.library_classes.push(lc);
     }
@@ -1047,6 +1064,14 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     (app.boot_loads, app.boot_conditional_loads) =
         super::boot_requires::boot_loads(vfs, dir, &path_gems, &gem_sources);
     app.boot_native_requires = super::boot_requires::boot_native_requires(vfs, dir, &path_gems, &gem_sources);
+    // The boot files' own statements, as programs loaded ahead of the
+    // walk's boot loads (`boot_requires::boot_programs`).
+    let (seed_loads, boot_programs) = super::boot_requires::boot_programs(vfs, dir, &path_gems, &gem_sources);
+    app.boot_loads.splice(0..0, seed_loads);
+    for (program, source) in boot_programs {
+        report_not_carried(&source, &program.items, &mut app);
+        app.file_programs.push(program);
+    }
 
     // `app/helpers/*.rb` — ingested as library classes like the support
     // dirs above, but ALSO registered in `helper_method_index` so the
@@ -1935,12 +1960,11 @@ end
         }
         // The engines' initializers run at boot too: a module one of them
         // defines and mixes in waits for the same test.
+        // So does one they define and name themselves
+        // (`initializers::referenced_by_initializers`).
         for entry in boot_initializers.iter().filter(|e| !e.starts_with(&init_dir)) {
             let Ok(bytes) = vfs.read(entry) else { continue };
             let mixed_in = mixed_in_constants(&bytes);
-            if mixed_in.is_empty() {
-                continue;
-            }
             let path_str = entry.display().to_string();
             let decls = super::initializers::declaration_ranges(&bytes);
             let taken = super::initializer_constants::taken_in(&initializer_constants, &path_str);
@@ -1950,9 +1974,6 @@ end
                 .collect();
             let Ok(classes) = ingest_library_classes(&bytes, &path_str) else { continue };
             for (i, mut lc) in classes.into_iter().enumerate() {
-                if !mixed_in.iter().any(|m| m == lc.name.0.as_str()) {
-                    continue;
-                }
                 let hoisted = |name: &crate::ident::Symbol| taken.iter().any(|&(n, _)| n == name.as_str());
                 lc.constants
                     .retain(|(name, _)| !(hoisted(name) && lc.top_level_constants.iter().any(|c| &c.name == name)));
@@ -2607,7 +2628,7 @@ end
     drop_abstract_stubs(&mut app, &abstract_methods);
 
     enum_constants.validate_consumed_sources(&app, &sources, &enum_input_files)?;
-    keep_initializer_defined(&mut app, dir, &sources, initializer_defined);
+    keep_initializer_defined(&mut app, dir, &sources, &boot_initializers, initializer_defined);
     super::initializer_constants::keep(&mut app, dir, initializer_constants);
     // Carrier provenance must not depend on where a module lives:
     // models, services, helpers and lib all use the same splice.

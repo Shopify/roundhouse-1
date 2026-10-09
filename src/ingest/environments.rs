@@ -198,6 +198,10 @@ pub(super) enum ConfigWrite {
     AppKey(String),
     /// A framework key the runtime applies, lifted to this reader.
     Applied(String),
+    /// A framework accessor the runtime's `Rails.application.config`
+    /// answers itself (`initializers::RUNTIME_FRAMEWORK_CONFIG_KEYS`):
+    /// carried as written, not lifted.
+    Runtime,
     /// Framework configuration the emitted runtime does not apply.
     Framework,
 }
@@ -280,6 +284,9 @@ pub(super) fn classify(path: &[String]) -> ConfigWrite {
     let dotted = path.join(".");
     if super::app::APPLIED_FRAMEWORK_CONFIG_KEYS.iter().any(|(key, _)| *key == dotted) {
         return ConfigWrite::Applied(super::app::applied_framework_config_reader(&dotted));
+    }
+    if super::initializers::runtime_framework_config(path) {
+        return ConfigWrite::Runtime;
     }
     match path {
         [key] if super::app::FRAMEWORK_CONFIG_KEYS.contains(&key.as_str()) => ConfigWrite::Framework,
@@ -553,6 +560,7 @@ fn config_verdict(path: &[String], lifted: &LiftedConfig) -> Result<bool, String
     let written = format!("config.{}", path.join("."));
     match classify(path) {
         ConfigWrite::EagerLoad | ConfigWrite::Inert => Ok(false),
+        ConfigWrite::Runtime => Ok(true),
         ConfigWrite::AppKey(key) if lifted.superseded.contains(&key) => Ok(false),
         ConfigWrite::AppKey(key) | ConfigWrite::Applied(key) => {
             if lifted.readers.contains(&key) {

@@ -51,6 +51,22 @@ thread_local! {
     static DEFINED: RefCell<Vec<(String, usize, String)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Framework configuration `Rails.application.config` answers in the
+/// ruby-family runtime itself (runtime/spinel/rails_configuration.rb),
+/// with Rails' default until written: Application::Configuration's
+/// `attr_accessor :consider_all_requests_local` (railties 8.2.0.alpha
+/// application/configuration.rb, `false`). A write of one in an
+/// environment file or an initializer is carried as written, not lifted
+/// onto the application reopen: the runtime's accessor holds the one
+/// value app code reads (Core's QueryCapture::Capture, PlatformComponent's
+/// test slices) and tests stub.
+pub(crate) const RUNTIME_FRAMEWORK_CONFIG_KEYS: &[&str] = &["consider_all_requests_local"];
+
+/// `config.<key>` for a key in [`RUNTIME_FRAMEWORK_CONFIG_KEYS`].
+pub(super) fn runtime_framework_config(path: &[String]) -> bool {
+    matches!(path, [key] if RUNTIME_FRAMEWORK_CONFIG_KEYS.contains(&key.as_str()))
+}
+
 /// A statement a reader recognized and did not apply, with the reason.
 #[derive(Clone)]
 struct Refusal {
@@ -233,6 +249,64 @@ pub(super) fn declaration_ranges(source: &[u8]) -> Vec<(String, usize, usize)> {
         walk(program.statements().body().iter().collect(), &[], &mut out);
     }
     out
+}
+
+/// Whether `text` names the constant `name` as a receiver (`Name.x`,
+/// `Name::X`), outside the byte ranges `skip`: the reference test
+/// `app::keep_initializer_defined` applies to what an initializer
+/// defines.
+pub(super) fn names_constant(text: &str, name: &str, skip: &[(usize, usize)]) -> bool {
+    text.match_indices(name).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + name.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':')
+            && matches!(after, Some('.') | Some(':'))
+            && !skip.iter().any(|&(start, end)| start <= i && i < end)
+    })
+}
+
+/// An initializer-local definition: a module or class an initializer
+/// defines (top-level, or nested under a namespace) that an initializer
+/// names outside the definition itself. Rails runs every initializer at
+/// boot, so the definition exists when its own file's later statements
+/// run: Core's merchandising `sql_table_query_counter.rb` defines
+/// `Merchandising::SqlTableQueryCounter::TRACKED_TABLES` and reads it in
+/// the `sql.active_record` subscriber it registers below. `file` is the
+/// defining initializer and `ranges` its declarations there; `sources`
+/// are the ingested files, of which the boot initializers (`initializers`
+/// in [`initializer_files`]) are read.
+pub(super) fn referenced_by_initializers(
+    sources: &[crate::span::SourceFile],
+    initializers: &[PathBuf],
+    name: &str,
+    file: &str,
+    ranges: &[(usize, usize)],
+) -> bool {
+    sources.iter().any(|f| {
+        let own = f.path == file;
+        (own || initializers.iter().any(|i| i.display().to_string() == f.path))
+            && names_constant(&f.text, name, if own { ranges } else { &[] })
+    })
+}
+
+/// The top-level declaration of `source` that holds the nested
+/// declaration starting at `start` and whose body is nothing but
+/// declarations (a namespace wrapper, `module Merchandising` around
+/// `module SqlTableQueryCounter`): its start, where the initializer's
+/// program loads what it nests (`define`).
+pub(super) fn namespace_wrapper_start(source: &[u8], start: usize) -> Option<usize> {
+    let result = ruby_prism::parse(source);
+    let root = result.node();
+    let program = root.as_program_node()?;
+    let found = program.statements().body().iter().find(|stmt| {
+        let loc = stmt.location();
+        loc.start_offset() < start && start < loc.end_offset()
+    })?;
+    let body = found.as_module_node().and_then(|m| m.body()).or_else(|| found.as_class_node().and_then(|c| c.body()))?;
+    flatten_statements(body)
+        .iter()
+        .all(|s| s.as_module_node().is_some() || s.as_class_node().is_some())
+        .then(|| found.location().start_offset())
 }
 
 /// `NAME = …` at the top level of a file: the constants
