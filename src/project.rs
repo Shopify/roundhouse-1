@@ -5871,9 +5871,69 @@ fn i18n_config_block(app: &App, carries_i18n: bool) -> String {
 /// its source wrote in the class body (or after it, at the file's top
 /// level), so the hook fires when the class loads, as in Rails. A class
 /// the tree has no file for is named, not skipped.
+///
+/// A source with a file program runs its hook where the program runs the
+/// source's file, behind the requires the source writes above the class:
+/// - a file-level call is the program's own statement already
+///   (`RoundhouseAutoload.file_statement` at its site), so the class file
+///   gets none: it fired twice, the second time from a class file that
+///   is not the source's (active_model_serializers 0.9.13's railtie.rb
+///   fires `:active_model_serializers` after its Railtie, not at the end
+///   of ActiveModel::Serializer);
+/// - a class-body call follows the program's load of the class's
+///   declarations. Another program may load those declarations first:
+///   hedwig 1.68.0's configuration/command_table.rb reopens `class
+///   Configuration`, and configuration.rb requires it before its other
+///   `require_relative`s. The hook then ran from the declarations file,
+///   before configuration.rb had required configuration/dequeue_decorator,
+///   and Core's `on_load(:hedwig)` `Hedwig.configure` raised NameError
+///   on Hedwig::Configuration::DequeueDecorator.
 fn apply_class_load_hooks(files: &mut [(String, String)], app: &App) {
+    // The emitted file of each source's file program, by the source's
+    // root-relative path (a hook's `site` names its file the same way).
+    let programs: std::collections::BTreeMap<String, String> = app
+        .file_programs
+        .iter()
+        .map(|program| {
+            let anchor = emit::ruby::file_program_anchor(app, program);
+            let source = format!("{}.rb", anchor.strip_prefix("models/roundhouse_files/").unwrap_or(&anchor));
+            (source, format!("app/{anchor}.rb"))
+        })
+        .collect();
     for hook in &app.class_load_hooks {
         let stem = crate::naming::underscore(&hook.class);
+        let source = hook.site.rsplit_once(':').map_or(hook.site.as_str(), |(file, _)| file);
+        if let Some((_, program)) = programs.get(source).and_then(|path| files.iter_mut().find(|(p, _)| p == path)) {
+            if program.contains(&format!("RoundhouseAutoload.file_statement({:?}) do", hook.site)) {
+                continue;
+            }
+            let declarations = format!("\"models/{stem}\")");
+            let mut offset = 0;
+            let mut after: Option<(usize, String)> = None;
+            for line in program.split_inclusive('\n') {
+                offset += line.len();
+                let text = line.trim_end_matches('\n');
+                let statement = text.trim_start();
+                if (statement.starts_with("require RoundhouseAutoload.path(")
+                    || statement.starts_with("RoundhouseAutoload.require_declaration("))
+                    && statement.ends_with(&declarations)
+                {
+                    after = Some((offset, text[..text.len() - statement.len()].to_string()));
+                }
+            }
+            if let Some((at, pad)) = after {
+                let newline = if program[..at].ends_with('\n') { "" } else { "\n" };
+                program.insert_str(
+                    at,
+                    &format!(
+                        "{newline}{pad}# {}: the class body's `ActiveSupport.run_load_hooks`, after the body\n\
+                         {pad}ActiveSupport.run_load_hooks({}, {})\n",
+                        hook.site, hook.hook_literal, hook.base
+                    ),
+                );
+                continue;
+            }
+        }
         let candidates = [format!("app/models/{stem}.rb"), format!("app/controllers/{stem}.rb")];
         let Some((_, content)) = files.iter_mut().find(|(p, _)| candidates.contains(p)) else {
             emit::diagnostics::report_unsupported(
@@ -7122,6 +7182,59 @@ fn autoload_primary(anchor: &str, content: &str) -> Option<Vec<(String, bool)>> 
     Some(chain)
 }
 
+/// Whether Ruby source `text` opens `module <name>` directly inside
+/// `parent` (outermost first), nested or by a compact path, where its
+/// body runs as the file loads: not in a method or a block.
+/// app_profiler 0.6.0's app_profiler.rb opens `module Storage` inside
+/// `module AppProfiler`.
+fn opens_module_within(text: &str, parent: &[&str], name: &str) -> bool {
+    struct Opened<'a> {
+        nesting: Vec<String>,
+        parent: &'a [&'a str],
+        name: &'a str,
+        found: bool,
+    }
+    impl Opened<'_> {
+        fn enter(&mut self, path: &[u8], body: Option<ruby_prism::Node<'_>>, module: bool) {
+            let path = String::from_utf8_lossy(path).into_owned();
+            let outer = std::mem::take(&mut self.nesting);
+            self.nesting = match path.strip_prefix("::") {
+                Some(rooted) => rooted.split("::").map(str::to_string).collect(),
+                None => outer.iter().cloned().chain(path.split("::").map(str::to_string)).collect(),
+            };
+            if module
+                && self.nesting.len() == self.parent.len() + 1
+                && self.nesting.last().is_some_and(|last| last == self.name)
+                && self.nesting.iter().zip(self.parent).all(|(a, b)| a == b)
+            {
+                self.found = true;
+            }
+            if let Some(body) = body.filter(|_| !self.found) {
+                ruby_prism::Visit::visit(self, &body);
+            }
+            self.nesting = outer;
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Opened<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body(), false);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.enter(node.constant_path().location().as_slice(), node.body(), true);
+        }
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {}
+    }
+    if !text.contains(&format!("module {name}")) && !text.contains(&format!("::{name}")) {
+        return false;
+    }
+    let parsed = ruby_prism::parse(text.as_bytes());
+    let mut opened = Opened { nesting: Vec::new(), parent, name, found: false };
+    ruby_prism::Visit::visit(&mut opened, &parsed.node());
+    opened.found
+}
+
 /// `Name = <value>`: the constant name, when the line assigns a bare
 /// constant (a factory class `Name = Struct.new(...) do`, a class
 /// alias `Name = Other`, any other value).
@@ -7670,6 +7783,36 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     // all a plain gem's own autoloads (money_bag's `autoload :Variadic`)
     // is no implicit module: the gem's file defines it when required,
     // and its children register then (`register` on ConstAdded).
+    //
+    // Unless the gem's own code defines it as a module where its parent
+    // is defined, by a file the tree carries nothing of: app_profiler
+    // 0.6.0's `autoload(:Backend, "app_profiler/backend")`, a file that
+    // only opens `module Backend` for its children's autoloads, and the
+    // `module Storage` and `module Viewer` of app_profiler.rb, which hold
+    // only autoloads. Neither declares anything the emitted declarations
+    // keep, so nothing in the tree defined them: `AppProfiler::Backend`
+    // raised NameError. Such a namespace stays the implicit module,
+    // defined when its parent registers, as the gem's file defines it.
+    let gem_defines = |namespace: &str, name: &str, full: &str| -> bool {
+        if gem_autoloads(full) {
+            return true;
+        }
+        if namespace == "Object" {
+            return false;
+        }
+        // The parent's own file: under a gem `lib/`, at the path that
+        // names the parent (`lib/app_profiler.rb` for AppProfiler).
+        let parent: Vec<&str> = namespace.split("::").collect();
+        let wanted = fold_stem(&crate::naming::underscore(namespace));
+        required_files.iter().any(|source| {
+            let Some(lib) = gem_lib(&source.path) else { return false };
+            let rel = rel_of(&source.path);
+            rel.strip_prefix(&format!("{lib}/"))
+                .and_then(|r| r.strip_suffix(".rb"))
+                .is_some_and(|stem| fold_stem(stem) == wanted)
+                && opens_module_within(&source.text, &parent, name)
+        })
+    };
     let mut not_implicit: Vec<(String, String)> = Vec::new();
     for (namespace, children) in &namespaces {
         for (name, child) in children {
@@ -7677,6 +7820,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 continue;
             }
             let full = if namespace == "Object" { name.clone() } else { format!("{namespace}::{name}") };
+            if gem_defines(namespace, name, &full) {
+                continue;
+            }
             let inner = format!("{full}::");
             let mut under = namespaces
                 .iter()
@@ -7771,7 +7917,9 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
          # `eager_load!` does.\n\
          module RoundhouseAutoload\n\
          \x20 ROOT = __dir__\n\
-         \x20 # namespace => [[constant, file (nil: implicit module), written as module], ...]\n\
+         \x20 # namespace => [[constant, file (nil: none), written as module], ...]: with no\n\
+         \x20 # file, a constant written as module is an implicit module; one that is\n\
+         \x20 # not is left to the file that defines it\n\
          \x20 NAMESPACES = {\n",
     );
     for (namespace, children) in &namespaces {
@@ -14824,14 +14972,67 @@ fn walk_dir_into(
     Ok(())
 }
 
-/// A file or directory name that says it holds secret material
-/// (credentials, keys, secrets, tokens, passwords, private data), which
-/// is never copied into an emitted tree, whatever its extension: Core's
-/// git-tracked `config/secrets.test.json` included.
-pub(crate) fn named_for_secrets(name: &str) -> bool {
+/// Whether `path` (app-relative, or a single file or directory name)
+/// says it holds secret material, which is never copied into an emitted
+/// tree, whatever its extension: Core's git-tracked
+/// `config/secrets.test.json` included, unless [`carried_secrets_file`]
+/// allows it. Names are read as whole names and words, never by
+/// substring:
+/// - a directory whose whole name is `secret(s)` or `credential(s)`
+///   (Rails' `config/credentials/`): everything under it;
+/// - a file ending in `.key`, `.pem`, `.ejson`, `.enc`, `.p12` or `.pfx`
+///   (`master.key`, `config/credentials/test.key`,
+///   `credentials.yml.enc`), or an SSH private key by its name (`id_rsa`);
+/// - a file other than Ruby source whose name has the word `secret(s)`
+///   (`secrets.test.json`, `api_client_secrets.yml`), or whose stem (the
+///   name up to its first dot) names what it holds: its last word is
+///   `credential(s)`, `password(s)`, `passwd` or `token(s)`
+///   (`credentials.yml`, `api_token.yml`, `passwords.json`), or `key(s)`
+///   after `private`, `secret`, `master`, `signing` or `encryption`
+///   (`private_keys.yml`).
+///
+/// A word in a directory's name, or one that modifies another, says what
+/// the data is about, not what it holds: Core's FrozenRecord data
+/// `db/data/token_gated_commerce/agreement_questions.yml` and
+/// `components/taxes/db/taxes/filing/credential_rulesets.yml` are
+/// carried (withheld by the earlier substring rule, every
+/// `TokenGatedCommerce::AttestationQuestionnaire` read raised
+/// Errno::ENOENT and its class body never set a table). Ruby source is
+/// code named for its subject (`app/models/access_token.rb`).
+pub fn named_for_secrets(path: &str) -> bool {
+    let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let Some(file) = segments.pop() else { return false };
+    segments.iter().any(|dir| dir_named_for_secrets(dir)) || file_named_for_secrets(file)
+}
+
+/// A directory whose whole name says it holds secrets (`config/credentials`,
+/// `SECRETS`): not `token_gated_commerce`, nor `remove_password_task`.
+fn dir_named_for_secrets(name: &str) -> bool {
+    ["secret", "secrets", "credential", "credentials"].iter().any(|w| name.eq_ignore_ascii_case(w))
+}
+
+/// A file name that says it holds secret material ([`named_for_secrets`]).
+fn file_named_for_secrets(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ["credential", "secret", "token", "password", "private", "master.key"].iter().any(|w| lower.contains(w))
-        || [".key", ".pem", ".ejson", ".enc"].iter().any(|ext| lower.ends_with(ext))
+    if [".key", ".pem", ".ejson", ".enc", ".p12", ".pfx"].iter().any(|ext| lower.ends_with(ext))
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].contains(&lower.as_str())
+    {
+        return true;
+    }
+    if lower.ends_with(".rb") {
+        return false;
+    }
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+    };
+    if words(&lower).iter().any(|w| w == "secret" || w == "secrets") {
+        return true;
+    }
+    let stem = words(lower.split('.').next().unwrap_or(""));
+    let Some(last) = stem.last().map(String::as_str) else { return false };
+    ["credential", "credentials", "password", "passwords", "passwd", "token", "tokens"].contains(&last)
+        || (["key", "keys"].contains(&last)
+            && stem[..stem.len() - 1].iter().any(|w| ["private", "secret", "master", "signing", "encryption"].contains(&w.as_str())))
 }
 
 /// The secrets-named files a tree carries anyway: each is git-tracked
@@ -14918,7 +15119,7 @@ fn walk_gem_source_data_into(app: &App, root: &Path, out: &mut Vec<(String, Stri
             if rel.ends_with(".rb") && rel.starts_with(lib.as_str()) {
                 continue;
             }
-            if rel.split('/').any(named_for_secrets) {
+            if named_for_secrets(&rel) {
                 eprintln!("roundhouse: note: {rel} is named for secrets and is not carried into the tree");
                 continue;
             }
@@ -14964,8 +15165,11 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
             if name.starts_with('.') {
                 continue;
             }
-            if named_for_secrets(&name) {
-                if carried_secrets_file(root, &rel) {
+            let Ok(ty) = entry.file_type() else { continue };
+            // A directory by its whole name, a file by its own: the
+            // directories above it were read on the way down.
+            if if ty.is_dir() { dir_named_for_secrets(&name) } else { file_named_for_secrets(&name) } {
+                if ty.is_file() && carried_secrets_file(root, &rel) {
                     if let Ok(content) = fs::read_to_string(entry.path()) {
                         eprintln!("roundhouse: note: {rel} is named for secrets; carried: allowlisted, git-tracked, read by native test boot");
                         out.push((rel, content));
@@ -14975,7 +15179,6 @@ fn walk_data_files_into(root: &Path, out: &mut Vec<(String, String)>) -> Result<
                 }
                 continue;
             }
-            let Ok(ty) = entry.file_type() else { continue };
             if ty.is_dir() {
                 if !SKIP_DIRS.contains(&name.as_str()) && !(prefix.is_empty() && name == "sorbet") {
                     stack.push((entry.path(), format!("{rel}/")));
