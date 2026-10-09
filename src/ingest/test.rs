@@ -513,6 +513,15 @@ fn ingest_test_class(
                     }
                     continue;
                 }
+                // `CASES = [...].each do |c| test … end`: the loop's tests,
+                // and the constant its receiver (`each` returns it).
+                if let Some(offset) = hidden_test_declaration(&cw.value()) {
+                    if let (Some(const_name), Some(receiver)) = (const_name, test_unroll::loop_receiver(&cw.value())) {
+                        constants.push((const_name, ingest_expr(&receiver, file)?));
+                    }
+                    test_unroll::declare_hidden(&cw.value(), offset, class, &name, file, &test_tags, &mut tests)?;
+                    continue;
+                }
                 if let Some(const_name) = const_name {
                     let value = ingest_expr(&cw.value(), file)?;
                     constants.push((const_name, value));
@@ -521,16 +530,12 @@ fn ingest_test_class(
             }
             // Any other class-body statement is not modeled. One that
             // declares tests (`%w[a b].each { |x| test "#{x}" do … end }`,
-            // a `test` named by a non-literal) would lose them silently,
-            // so the class is refused instead.
+            // a `test` named by a non-literal) would lose them silently.
+            // A loop over a literal is unrolled; anything else is refused
+            // as that statement alone, so the class's other tests still
+            // run (strict ingest fails on it).
             if let Some(offset) = hidden_test_declaration(&stmt) {
-                let line = super::sources::line_at(file, offset).map(|l| format!(" at line {l}")).unwrap_or_default();
-                return Err(IngestError::Unsupported {
-                    file: file.into(),
-                    message: format!(
-                        "a test declared{line} by a class-body statement ingest does not model (a computed name, a loop or a block); its tests would not run"
-                    ),
-                });
+                test_unroll::declare_hidden(&stmt, offset, class, &name, file, &test_tags, &mut tests)?;
             }
         }
     }
@@ -1264,9 +1269,10 @@ fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyIt
 /// Recognize a single test declaration. Two shapes are supported:
 ///
 ///   `test "name" do ... end`  — Rails AS::TestCase DSL. Test name is the
-///                                string argument verbatim. An optional
-///                                literal tags Hash (`test "x", slow:
-///                                true do`) is Core's TestTags: the
+///                                string argument's text, adjacent
+///                                literals (`"a " \ "b"`) joined. An
+///                                optional literal tags Hash (`test "x",
+///                                slow: true do`) is Core's TestTags: the
 ///                                method name carries the tags.
 ///   `def test_*; ...; end`    — vanilla Minitest. Test name is the
 ///                                method name with the `test_` prefix
@@ -1278,17 +1284,21 @@ fn class_body_items<'pr>(stmts: Vec<Node<'pr>>, file: &str, out: &mut Vec<BodyIt
 /// Either way `method_name` is the method Minitest runs: the `def`'s
 /// name, or ActiveSupport's `test_` name over the tagged name.
 ///
-/// Returns `None` for any other statement shape (intentional — we
-/// silently drop unrecognized body items rather than error; they'll
-/// surface when the test tries to reference something that isn't
-/// emitted).
+/// Returns `None` for any other statement, including a `test` whose
+/// name is computed or whose tags or block are not modeled: the class
+/// body loop names that statement as a gap (`test_unroll::
+/// declare_hidden`), or unrolls the loop that declares it.
 fn ingest_test_declaration(
     stmt: &Node<'_>,
     file: &str,
     tags: &TestTags,
 ) -> IngestResult<Option<Test>> {
-    // `def test_*; ...; end` form (vanilla Minitest).
+    // `def test_*; ...; end` form (vanilla Minitest). `def self.test_*`
+    // is a class method, which Minitest never runs.
     if let Some(def) = stmt.as_def_node() {
+        if def.receiver().is_some() {
+            return Ok(None);
+        }
         let name_bytes = def.name().as_slice();
         let Some(method_name) = std::str::from_utf8(name_bytes).ok() else {
             return Ok(None);
@@ -1317,32 +1327,51 @@ fn ingest_test_declaration(
         return Ok(None);
     }
 
-    // First positional argument: the test's name as a string literal.
+    // First positional argument: the test's name, known before the code
+    // runs.
     let Some(args) = call.arguments() else {
         return Ok(None);
     };
-    let args: Vec<Node<'_>> = args.arguments().iter().collect();
-    let Some(first_arg) = args.first() else {
+    let Some(first_arg) = args.arguments().iter().next() else {
         return Ok(None);
     };
-    let Some(string_node) = first_arg.as_string_node() else {
+    let Some(name) = test_unroll::static_string(&first_arg) else {
         return Ok(None);
     };
-    let name = String::from_utf8_lossy(string_node.unescaped()).into_owned();
+    Ok(dsl_test(&call, name, Vec::new(), file, tags)?.ok())
+}
+
+/// `test name, tags do … end` (`call`) as the test it defines, its name
+/// already known: TestTags' name over the class's tags merged with the
+/// test's own, and the block's body after `prelude` (the bindings an
+/// unrolled loop gives it). Without a block ActiveSupport defines a test
+/// that flunks. `Err((what, detail))` when the tags or the block are not
+/// modeled; the caller names the statement.
+#[allow(clippy::type_complexity)]
+fn dsl_test(
+    call: &ruby_prism::CallNode<'_>,
+    name: String,
+    prelude: Vec<Expr>,
+    file: &str,
+    tags: &TestTags,
+) -> IngestResult<Result<Test, (String, String)>> {
+    let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     // TestTags#test(name, tags = nil): the class's tags, merged with the
     // test's own.
-    let (own_tags, toggle_flags) = match &args[1..] {
+    let (own_tags, toggle_flags) = match args.get(1..).unwrap_or_default() {
         [] => (Vec::new(), false),
         [arg] if arg.as_nil_node().is_some() => (Vec::new(), false),
-        [arg] => literal_tags(arg, file)?.ok_or_else(|| IngestError::Unsupported {
-            file: file.into(),
-            message: format!("test {name:?}: its tags argument is not a literal Hash"),
-        })?,
+        [arg] => match literal_tags(arg, file) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Ok(Err(("tags are not literal".into(), format!("test {name:?}: its tags argument is not a literal Hash")))),
+            Err(IngestError::Unsupported { message, .. }) => return Ok(Err(("tags are not literal".into(), format!("test {name:?}: {message}")))),
+            Err(other) => return Err(other),
+        },
         _ => {
-            return Err(IngestError::Unsupported {
-                file: file.into(),
-                message: format!("test {name:?}: TestTags#test takes a name and one tags Hash"),
-            })
+            return Ok(Err((
+                "arguments are not a name and one tags Hash".into(),
+                format!("test {name:?}: TestTags#test takes a name and one tags Hash"),
+            )))
         }
     };
     let mut all_tags = tags.tags.clone();
@@ -1356,13 +1385,40 @@ fn ingest_test_declaration(
                 Some(body_node) => ingest_expr(&body_node, file)?,
                 None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
             },
-            None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+            None => return Ok(Err(("block is passed with `&`".into(), format!("test {name:?}")))),
         },
-        None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+        // ActiveSupport::Testing::Declarative#test without a block.
+        None => Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("flunk"),
+                args: vec![Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit { value: crate::expr::Literal::Str { value: format!("No implementation provided for {name}") } },
+                )],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+    };
+    let body = if prelude.is_empty() {
+        body
+    } else {
+        let span = body.span;
+        let mut exprs = prelude;
+        match &*body.node {
+            ExprNode::Seq { exprs: inner } => exprs.extend(inner.iter().cloned()),
+            _ => exprs.push(body),
+        }
+        Expr::new(span, ExprNode::Seq { exprs })
     };
 
-    Ok(Some(Test { name, body, method_name, toggle_flags }))
+    Ok(Ok(Test { name, body, method_name, toggle_flags }))
 }
+
+#[path = "test_unroll.rs"]
+mod test_unroll;
 
 #[cfg(test)]
 mod tests {
