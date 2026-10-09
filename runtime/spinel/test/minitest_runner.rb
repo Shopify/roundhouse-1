@@ -415,139 +415,111 @@ module RoundhouseRailsTestHelpers
   # Ported from active_support/testing/event_reporter_assertions.rb over
   # the tree's `ActiveSupport.event_reporter` (runtime/active_support_reporters.rb),
   # which delivers each event hash to a subscriber's `emit`.
-  module EventCollector
-    @subscribed = false
-    @mutex = Mutex.new
+  module EventReporterAssertions
+    module EventCollector
+      @subscribed = false
+      @mutex = Mutex.new
 
-    class Event
-      attr_reader :event_data
+      class Event
+        attr_reader :event_data
 
-      def initialize(event_data)
-        @event_data = event_data
-      end
-
-      def inspect
-        "#{event_data[:name]} (payload: #{event_data[:payload].inspect}, tags: #{event_data[:tags].inspect})"
-      end
-
-      def matches?(name, payload, tags)
-        return false unless name.to_s == event_data[:name]
-
-        if payload && payload.is_a?(Hash)
-          return false unless matches_hash?(payload, :payload)
+        def initialize(event_data)
+          @event_data = event_data
         end
 
-        return false unless matches_hash?(tags, :tags)
-        true
-      end
+        def inspect
+          "#{event_data[:name]} (payload: #{event_data[:payload].inspect}, tags: #{event_data[:tags].inspect})"
+        end
 
-      private
-        def matches_hash?(expected_hash, event_key)
-          expected_hash.all? do |k, v|
-            if v.is_a?(Regexp)
-              event_data.dig(event_key, k).to_s.match?(v)
-            else
-              event_data.dig(event_key, k) == v
-            end
+        def matches?(name, payload, tags)
+          return false unless name.to_s == event_data[:name]
+
+          if payload && payload.is_a?(Hash)
+            return false unless matches_hash?(payload, :payload)
           end
+
+          return false unless matches_hash?(tags, :tags)
+          true
         end
-    end
 
-    class << self
-      def emit(event)
-        event_recorders&.each do |events|
-          events << Event.new(event)
-        end
-        true
-      end
-
-      def record
-        subscribe
-        events = []
-        event_recorders << events
-        begin
-          yield
-          events
-        ensure
-          event_recorders.delete_if { |r| events.equal?(r) }
-        end
-      end
-
-      private
-        def subscribe
-          return if @subscribed
-
-          @mutex.synchronize do
-            unless @subscribed
-              if defined?(ActiveSupport.event_reporter) && ActiveSupport.event_reporter
-                ActiveSupport.event_reporter.subscribe(self)
-                @subscribed = true
+        private
+          def matches_hash?(expected_hash, event_key)
+            expected_hash.all? do |k, v|
+              if v.is_a?(Regexp)
+                event_data.dig(event_key, k).to_s.match?(v)
               else
-                raise Minitest::Assertion, "No event reporter is configured"
+                event_data.dig(event_key, k) == v
               end
             end
           end
-        end
-
-        def event_recorders
-          Thread.current[:active_support_event_reporter_assertions] ||= []
-        end
-    end
-  end
-
-  def assert_no_event_reported(name = nil, payload: {}, tags: {}, &block)
-    events = EventCollector.record(&block)
-
-    if name.nil?
-      assert_predicate(events, :empty?)
-    else
-      matching_event = events.find { |event| event.matches?(name, payload, tags) }
-      if matching_event
-        message = "Expected no '#{name}' event to be reported, but found:\n  " \
-          "#{matching_event.inspect}"
-        flunk(message)
       end
-      assert(true)
+
+      class << self
+        def emit(event)
+          event_recorders&.each do |events|
+            events << Event.new(event)
+          end
+          true
+        end
+
+        def record
+          subscribe
+          events = []
+          event_recorders << events
+          begin
+            yield
+            events
+          ensure
+            event_recorders.delete_if { |r| events.equal?(r) }
+          end
+        end
+
+        private
+          def subscribe
+            return if @subscribed
+
+            @mutex.synchronize do
+              unless @subscribed
+                if defined?(ActiveSupport.event_reporter) && ActiveSupport.event_reporter
+                  ActiveSupport.event_reporter.subscribe(self)
+                  @subscribed = true
+                else
+                  raise Minitest::Assertion, "No event reporter is configured"
+                end
+              end
+            end
+          end
+
+          def event_recorders
+            Thread.current[:active_support_event_reporter_assertions] ||= []
+          end
+      end
     end
-  end
 
-  def assert_event_reported(name, payload: nil, tags: {}, &block)
-    events = EventCollector.record(&block)
+    def assert_no_event_reported(name = nil, payload: {}, tags: {}, &block)
+      events = EventCollector.record(&block)
 
-    if events.empty?
-      flunk("Expected an event to be reported, but there were no events reported.")
-    elsif (event = events.find { |event| event.matches?(name, payload, tags) })
-      assert(true)
-      event.event_data
-    else
-      message = "Expected an event to be reported matching:\n  " \
-        "name: #{name.inspect}\n  " \
-        "payload: #{payload.inspect}\n  " \
-        "tags: #{tags.inspect}\n" \
-        "but none of the #{events.size} reported events matched:\n  " \
-        "#{events.map(&:inspect).join("\n  ")}"
-      flunk(message)
-    end
-  end
-
-  def assert_events_reported(expected_events, &block)
-    events = EventCollector.record(&block)
-
-    if events.empty? && expected_events.size > 0
-      flunk("Expected #{expected_events.size} events to be reported, but there were no events reported.")
+      if name.nil?
+        assert_predicate(events, :empty?)
+      else
+        matching_event = events.find { |event| event.matches?(name, payload, tags) }
+        if matching_event
+          message = "Expected no '#{name}' event to be reported, but found:\n  " \
+            "#{matching_event.inspect}"
+          flunk(message)
+        end
+        assert(true)
+      end
     end
 
-    events_copy = events.dup
+    def assert_event_reported(name, payload: nil, tags: {}, &block)
+      events = EventCollector.record(&block)
 
-    expected_events.each do |expected_event|
-      name = expected_event[:name]
-      payload = expected_event[:payload] || {}
-      tags = expected_event[:tags] || {}
-
-      matching_event_index = events_copy.find_index { |event| event.matches?(name, payload, tags) }
-
-      if matching_event_index
-        events_copy.delete_at(matching_event_index)
+      if events.empty?
+        flunk("Expected an event to be reported, but there were no events reported.")
+      elsif (event = events.find { |event| event.matches?(name, payload, tags) })
+        assert(true)
+        event.event_data
       else
         message = "Expected an event to be reported matching:\n  " \
           "name: #{name.inspect}\n  " \
@@ -555,17 +527,48 @@ module RoundhouseRailsTestHelpers
           "tags: #{tags.inspect}\n" \
           "but none of the #{events.size} reported events matched:\n  " \
           "#{events.map(&:inspect).join("\n  ")}"
-
         flunk(message)
       end
     end
 
-    assert(true)
-  end
+    def assert_events_reported(expected_events, &block)
+      events = EventCollector.record(&block)
 
-  def with_debug_event_reporting(&block)
-    ActiveSupport.event_reporter.with_debug(&block)
+      if events.empty? && expected_events.size > 0
+        flunk("Expected #{expected_events.size} events to be reported, but there were no events reported.")
+      end
+
+      events_copy = events.dup
+
+      expected_events.each do |expected_event|
+        name = expected_event[:name]
+        payload = expected_event[:payload] || {}
+        tags = expected_event[:tags] || {}
+
+        matching_event_index = events_copy.find_index { |event| event.matches?(name, payload, tags) }
+
+        if matching_event_index
+          events_copy.delete_at(matching_event_index)
+        else
+          message = "Expected an event to be reported matching:\n  " \
+            "name: #{name.inspect}\n  " \
+            "payload: #{payload.inspect}\n  " \
+            "tags: #{tags.inspect}\n" \
+            "but none of the #{events.size} reported events matched:\n  " \
+            "#{events.map(&:inspect).join("\n  ")}"
+
+          flunk(message)
+        end
+      end
+
+      assert(true)
+    end
+
+    def with_debug_event_reporting(&block)
+      ActiveSupport.event_reporter.with_debug(&block)
+    end
   end
+  include EventReporterAssertions
 
   # ---- ActiveSupport::Testing::ErrorReporterAssertions (8.2) -------
   module ErrorCollector
@@ -758,6 +761,15 @@ end
 module RoundhouseMinitestAssertions
   include RoundhouseActiveSupportAssertions
   include RoundhouseRailsTestHelpers
+end
+
+# Rails' name for the event reporter assertions, which app test code
+# includes explicitly (Core's CheckoutPlatform TestCase); TestBase
+# already has them.
+module ActiveSupport
+  module Testing
+    EventReporterAssertions = RoundhouseRailsTestHelpers::EventReporterAssertions unless const_defined?(:EventReporterAssertions, false)
+  end
 end
 
 if defined?(Mocha::API)

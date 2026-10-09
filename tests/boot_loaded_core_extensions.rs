@@ -62,7 +62,7 @@ const POSTSY: &str = r#"module Postsy
 end
 "#;
 
-const QUOTA: &str = r#"class Quota
+const QUOTA: &str = r##"class Quota
   def self.size_for(n)
     n.megabytes
   end
@@ -90,10 +90,25 @@ const QUOTA: &str = r#"class Quota
       # as Core's class bodies call them: `expected_ttl: 1.year.to_i`,
       # `Time.now.utc.change(nsec: 0)`.
       "calendar: #{1.year.to_i} #{2.months.inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(hour: 5).inspect} #{Time.utc(2024, 1, 31, 13, 45, 30.5).change(nsec: 0).nsec}",
+      zone_line,
     ]
   end
+
+  # ActiveSupport::TimeZone (values/time_zone.rb), as Core's tests call
+  # it: `ActiveSupport::TimeZone["UTC"].parse(...)`. Its times are read
+  # through what a Time and a TimeWithZone both answer.
+  def self.zone_line
+    utc = ActiveSupport::TimeZone["UTC"]
+    east = ActiveSupport::TimeZone["Eastern Time (US & Canada)"]
+    t = utc.parse("2022-04-11T12:00:00Z")
+    "zone: #{utc.name} #{east} #{east.formatted_offset(false)} #{east.tzinfo.identifier} #{ActiveSupport::TimeZone["Nowhere"].inspect} " \
+      "#{t.iso8601} #{(t + 86400).to_i} #{east.local(2024, 7, 1, 12).iso8601} #{east.parse("2024-03-10 02:30").iso8601} " \
+      "#{east.at(0).iso8601} #{east.iso8601("2024-01-15T08:00:00").iso8601} #{east.rfc3339("2024-01-15T08:00:00Z").iso8601} " \
+      "#{ActiveSupport::TimeZone[-5].name} #{ActiveSupport::TimeZone.new("Tokyo").utc_offset} #{ActiveSupport::TimeZone.all.size} " \
+      "#{east.parse("").inspect} #{ActiveSupport::TimeZone["America/Chicago"].name} #{utc <=> east} #{east =~ /New_York/}"
+  end
 end
-"#;
+"##;
 
 /// The gem's entry, which native Bundler.require loads before the app's
 /// files; and the app file.
@@ -139,7 +154,10 @@ service: gateway gateway\n\
 bytes: 3145728 1572864.0 2048\n\
 window: ActiveSupport::Duration 172800 10800 1.5\n\
 to_fs: 1,234,567 12.1 KB 0.5%\n\
-calendar: 31556952 2 months 2024-01-31 05:00:00 UTC 0\n";
+calendar: 31556952 2 months 2024-01-31 05:00:00 UTC 0\n\
+zone: UTC (GMT-05:00) Eastern Time (US & Canada) -0500 America/New_York nil 2022-04-11T12:00:00Z 1649764800 \
+2024-07-01T12:00:00-04:00 2024-03-10T03:30:00-04:00 1969-12-31T19:00:00-05:00 2024-01-15T08:00:00-05:00 \
+2024-01-15T03:00:00-05:00 Bogota 32400 154 nil America/Chicago 1 true\n";
 
 #[test]
 fn app_code_calls_the_core_extensions_rails_boot_loaded() {
@@ -149,7 +167,7 @@ fn app_code_calls_the_core_extensions_rails_boot_loaded() {
     let facades = std::fs::read_to_string(tree.join("runtime/gem_facades.rb")).unwrap();
     for port in [
         "active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric",
-        "active_support_integer_time", "active_support_time_change",
+        "active_support_integer_time", "active_support_time_change", "active_support_time_zone",
     ] {
         assert!(facades.contains(&format!("require_relative \"{port}\"\n")), "{port} not loaded at boot:\n{facades}");
     }
@@ -179,7 +197,7 @@ fn app_code_that_calls_none_loads_none() {
     let facades = std::fs::read_to_string(tree.join("runtime/gem_facades.rb")).unwrap();
     for port in [
         "active_support_module_attribute_accessors", "active_support_class_attribute", "active_support_numeric",
-        "active_support_integer_time", "active_support_time_change",
+        "active_support_integer_time", "active_support_time_change", "active_support_time_zone",
     ] {
         assert!(!facades.contains(&format!("require_relative \"{port}\"\n")), "{port} loaded at boot:\n{facades}");
     }

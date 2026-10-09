@@ -600,6 +600,8 @@ end
 fn event_reporter_assertions_count_like_active_support() {
     compare(r#"
 class AssertionCountTest < ActiveSupport::TestCase
+  include ActiveSupport::Testing::EventReporterAssertions
+
   def test_event_reported
     assert_event_reported("probe.pinged", payload: { id: 1 }) do
       ActiveSupport.event_reporter.notify("probe.pinged", id: 1)
@@ -626,6 +628,14 @@ class AssertionCountTest < ActiveSupport::TestCase
 
   def test_no_event_reported_fails
     assert_no_event_reported("probe.pinged") { ActiveSupport.event_reporter.notify("probe.pinged", id: 3) }
+  end
+
+  def test_debug_event_reported
+    with_debug_event_reporting do
+      assert_event_reported("probe.debugged", payload: { id: 4 }) do
+        ActiveSupport.event_reporter.debug("probe.debugged", id: 4)
+      end
+    end
   end
 end
 "#, &["test_none_reported_fails", "test_mismatch_fails", "test_no_event_reported_fails"]);

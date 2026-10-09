@@ -12,6 +12,76 @@
 # columns), so a typed bag is the honest contract rather than an
 # avoidable erasure.
 module ActiveRecord
+  module Scoping
+    # scoping.rb's ScopeRegistry: the current and global scopes, per model
+    # name, of this thread (ActiveSupport::IsolatedExecutionState where
+    # the tree carries it).
+    class ScopeRegistry
+      def self.instance
+        if defined?(ActiveSupport::IsolatedExecutionState)
+          ActiveSupport::IsolatedExecutionState[:active_record_scope_registry] ||= new
+        else
+          Thread.current[:active_record_scope_registry] ||= new
+        end
+      end
+
+      def self.current_scope(model, skip_inherited_scope = false)
+        instance.current_scope(model, skip_inherited_scope)
+      end
+
+      def self.set_current_scope(model, value)
+        instance.set_current_scope(model, value)
+      end
+
+      def self.global_current_scope(model, skip_inherited_scope = false)
+        instance.global_current_scope(model, skip_inherited_scope)
+      end
+
+      def self.set_global_current_scope(model, value)
+        instance.set_global_current_scope(model, value)
+      end
+
+      def initialize
+        @current_scope = {}
+        @global_current_scope = {}
+      end
+
+      def current_scope(model, skip_inherited_scope = false)
+        value_for(@current_scope, model, skip_inherited_scope)
+      end
+
+      def set_current_scope(model, value)
+        @current_scope[model.name] = value
+      end
+
+      def global_current_scope(model, skip_inherited_scope = false)
+        value_for(@global_current_scope, model, skip_inherited_scope)
+      end
+
+      def set_global_current_scope(model, value)
+        @global_current_scope[model.name] = value
+      end
+
+      # A model's own value, else its nearest STI ancestor's up to the
+      # base class (skip_inherited_scope: its own only).
+      def value_for(scope_type, model, skip_inherited_scope)
+        return nil if scope_type.empty?
+        return scope_type[model.name] if skip_inherited_scope
+        klass = model
+        base = model.base_class
+        until klass.equal?(base)
+          value = scope_type[klass.name]
+          return value if value
+          klass = klass.superclass
+        end
+        scope_type[klass.name]
+      end
+      private :value_for
+    end
+  end
+end
+
+module ActiveRecord
   # Integer finder inputs must be validated before entering a typed adapter.
   # Keep validity separate from the Integer payload: every signed 64-bit
   # value, including INT64_MIN, is a valid payload, never a nil sentinel.
@@ -282,7 +352,7 @@ module ActiveRecord
     def self.find(id)
       return _find_composite_primary_key(id) if composite_primary_key?
       raise RecordNotFound.new("Couldn't find #{name} without an ID", name, primary_key, id) if id.nil?
-      return ActiveRecord::Relation.new(self).find(id) if _default_scope_applies?
+      return ActiveRecord::Relation.new(self).find(id) if _scoped_reads?
       result = _find_primary_key_input(id)
       raise RecordNotFound.new("Couldn't find #{name} with '#{primary_key}'=#{id.inspect}", name, primary_key, id) if result.nil?
       result
@@ -352,7 +422,7 @@ module ActiveRecord
     def self.exists?(id = EXISTS_ANY_ROW)
       return false if id.nil?
       return all.exists? if EXISTS_ANY_ROW.equal?(id)
-      return all.exists?(id) if _default_scope_applies?
+      return all.exists?(id) if _scoped_reads?
       _exists_primary_key_input(id)
     end
     EXISTS_ANY_ROW = Object.new.freeze
@@ -1201,6 +1271,12 @@ module ActiveRecord
       _default_scoped? && (@_unscoped_depth.nil? || @_unscoped_depth == 0)
     end
 
+    # Whether the class's finders read through a relation: a default
+    # scope applies, or a `scoping` block of the class is running.
+    def self._scoped_reads?
+      _default_scope_applies? || !current_scope.nil?
+    end
+
     # A join onto this model (`Shelf.joins(:docs)`) carries its default
     # scope's conditions in the ON clause, as Rails' join scope does:
     # `lower::scope_chain` appends this to the join it renders. Empty
@@ -1212,16 +1288,42 @@ module ActiveRecord
     end
 
     # `Model.unscoped` is a relation without the default scope;
-    # `Model.unscoped { ... }` runs the block with the class's own finders,
-    # relations and `new` unscoped.
+    # `Model.unscoped { ... }` runs the block under it (scoping.rb's
+    # `relation.scoping(&block)`): the class's own finders, relations and
+    # `new` unscoped.
     def self.unscoped
-      return ActiveRecord::Relation.new(self, false) unless block_given?
+      relation = ActiveRecord::Relation.new(self, false)
+      return relation unless block_given?
       @_unscoped_depth = (@_unscoped_depth || 0) + 1
       begin
-        yield
+        relation.scoping { yield }
       ensure
         @_unscoped_depth -= 1
       end
+    end
+
+    # scoping.rb's `current_scope` / `current_scope=`: the relation a
+    # `scoping` block of this class (or of an STI ancestor up to its base
+    # class) is running, nil outside one. `Relation.new(Model)` starts
+    # from it, as `Model.all` does.
+    def self.current_scope(skip_inherited_scope = false)
+      ActiveRecord::Scoping::ScopeRegistry.current_scope(self, skip_inherited_scope)
+    end
+
+    def self.current_scope=(scope)
+      ActiveRecord::Scoping::ScopeRegistry.set_current_scope(self, scope)
+    end
+
+    def self.global_current_scope(skip_inherited_scope = false)
+      ActiveRecord::Scoping::ScopeRegistry.global_current_scope(self, skip_inherited_scope)
+    end
+
+    def self.global_current_scope=(scope)
+      ActiveRecord::Scoping::ScopeRegistry.set_global_current_scope(self, scope)
+    end
+
+    def self.scope_registry
+      ActiveRecord::Scoping::ScopeRegistry.instance
     end
 
     # Called last by a default-scoped model's `initialize`: Rails' scope
@@ -1234,15 +1336,15 @@ module ActiveRecord
     # base.rb's `count` / `last` / `destroy_all` read the table through
     # the adapter; a default scope reads through the relation.
     def self.count
-      _default_scope_applies? ? ActiveRecord::Relation.new(self).count : _adapter_count
+      _scoped_reads? ? ActiveRecord::Relation.new(self).count : _adapter_count
     end
 
     def self.last
-      _default_scope_applies? ? ActiveRecord::Relation.new(self).last : _adapter_last
+      _scoped_reads? ? ActiveRecord::Relation.new(self).last : _adapter_last
     end
 
     def self.destroy_all
-      return ActiveRecord::Relation.new(self).destroy_all if _default_scope_applies?
+      return ActiveRecord::Relation.new(self).destroy_all if _scoped_reads?
       records = _adapter_all
       records.each { |r| r.destroy() }
       records

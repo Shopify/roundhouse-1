@@ -60,6 +60,7 @@ else
   require File.join(runtime, "active_support_i18n")
   require File.join(runtime, "active_support_string_inflections")
   require File.join(runtime, "rails_framework_locales")
+  require File.join(runtime, "active_support_concern")
   require File.join(runtime, "active_model_validations")
 end
 I18n.enforce_available_locales = false
@@ -270,6 +271,40 @@ show("with_options", [Opts.with_options(a: 1, b: { c: 2 }) { |o| o.call(:x, b: {
 show("unknown key", outcome { Class.new { include ActiveModel::Validations; validate :x, bogus: true } })
 show("unknown validator", outcome { Class.new { include ActiveModel::Validations; validates :x, bogus: true } })
 show("no validation", outcome { Class.new { include ActiveModel::Validations; validates :x } })
+
+# ---- a concern that includes Validations defers it to its includers
+# (ActiveResource::Validations' shape); an app concern reaches the tree
+# lowered, without its `extend ActiveSupport::Concern`.
+module Vouched
+  extend ActiveSupport::Concern
+  include ActiveModel::Validations
+  included do
+    attr_accessor :voucher
+    validates :voucher, presence: true
+  end
+end
+module LoweredVouched
+  extend ActiveSupport::Concern if MODE == "native"
+  include ActiveModel::Validations
+  def vouched? = true
+end
+module LoweredVouchedTwice
+  extend ActiveSupport::Concern if MODE == "native"
+  include ActiveModel::Validations
+  include LoweredVouched
+end
+class VouchedRecord
+  include Vouched
+end
+class LoweredRecord
+  include LoweredVouchedTwice
+  attr_accessor :code
+  validates :code, presence: true
+end
+show("concern defers", [Vouched.include?(ActiveModel::Validations), Vouched.respond_to?(:validates), LoweredVouched.include?(ActiveModel::Validations), LoweredVouched.respond_to?(:validates)])
+report("concern includer", VouchedRecord.new)
+report("lowered includer", LoweredRecord.new)
+show("lowered ancestry", [LoweredRecord.include?(ActiveModel::Validations), LoweredRecord.new.vouched?, LoweredRecord.validators.map(&:kind), VouchedRecord.validators_on(:voucher).map(&:kind)])
 
 if MODE == "emitted" && $LOADED_FEATURES.any? { |f| f.include?("/activemodel") }
   abort "emitted: the pinned activemodel was loaded"
