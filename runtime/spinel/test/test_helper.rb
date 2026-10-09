@@ -701,6 +701,16 @@ end
 # `from_params` takes it as the file it would see in production.
 # rack-test requires `original_filename` for a StringIO; the path form
 # (copying a file on disk into a tempfile) is not modeled.
+#
+# Only where rack-test itself is not loaded. An app whose Bundler.require
+# names the gem (Core's Gemfile does, in :test) has the real class before
+# this file runs, and reopening it with another superclass is a TypeError
+# ("superclass mismatch for class UploadedFile") that stopped every test
+# at boot. The real class stands, path form included; the CRuby runner
+# (test/minitest_runner.rb) does Rack's multipart round trip on it at
+# the dispatch boundary, so a controller still gets an
+# `ActionDispatch::Http::UploadedFile`.
+unless defined?(::Rack::Test::UploadedFile)
 module Rack
   module Test
     class UploadedFile < ActionDispatch::Http::UploadedFile
@@ -709,6 +719,7 @@ module Rack
       end
     end
   end
+end
 end
 
 # In-process request dispatch — equivalent of Rails's
