@@ -81,9 +81,82 @@ module ActiveRecord
       @ctes = []
       @shared_lists = false
       @default_scoped = default_scoped
-      # An STI subclass's type condition, which `unscoped` keeps.
-      model._apply_type_condition(self)
-      model._apply_default_scope(self) if default_scoped && model._default_scope_applies?
+      # Inside a `scoping` block of the model, `Model.all` is that scope
+      # (a copy, or merged into an STI subclass's relation) in place of
+      # the default scope (scoping/named.rb `all`).
+      scope = default_scoped ? model.current_scope : nil
+      if scope.nil?
+        # An STI subclass's type condition, which `unscoped` keeps.
+        model._apply_type_condition(self)
+        model._apply_default_scope(self) if default_scoped && model._default_scope_applies?
+      else
+        model._apply_type_condition(self) unless scope.model.equal?(model)
+        inherit_scope(scope)
+      end
+    end
+
+    # `scope.clone` for `all` under a current scope: its query state and
+    # its `extending` modules.
+    def inherit_scope(scope)
+      scope.where_clauses.each { |w| @wheres << w }
+      scope.join_clauses.each { |j| @joins << j }
+      scope.order_clauses.each { |o| @orders << o }
+      @scope_attributes = scope.scope_attributes
+      @default_scoped = scope.default_scoped?
+      extensions = []
+      scope.singleton_class.ancestors.each do |mod|
+        break if mod.equal?(scope.class)
+        extensions.unshift(mod) unless mod.equal?(scope.singleton_class)
+      end
+      extensions.each { |mod| extend(mod) }
+      self
+    end
+
+    def model
+      @model
+    end
+
+    def default_scoped?
+      @default_scoped
+    end
+
+    def join_clauses
+      @joins
+    end
+
+    def order_clauses
+      @orders
+    end
+
+    # Relation#scoping: the block runs with this relation as the model's
+    # current scope (`Model.all`, the class's finders and `unscoped`'s
+    # `current_scope` read it), and the previous one is restored after.
+    # `all_queries: true` also makes it the model's global scope.
+    def scoping(all_queries: nil)
+      if @model.global_current_scope(true) && all_queries == false
+        raise ArgumentError, "Scoping is set to apply to all queries and cannot be unset in a nested block."
+      end
+      previous = @model.current_scope(true)
+      @model.current_scope = self
+      if all_queries
+        previous_global = @model.global_current_scope(true)
+        @model.global_current_scope = self
+      end
+      begin
+        yield
+      ensure
+        @model.current_scope = previous
+        @model.global_current_scope = previous_global if all_queries
+      end
+    end
+
+    # Rails' `where_values_hash`: the relation's `where` equalities on its
+    # own columns, by column name. IN lists, which Rails includes, are
+    # not tracked here and are left out.
+    def where_values_hash
+      out = {}
+      @scope_attributes.each { |col, val| out[col.to_s] = val }
+      out
     end
 
     # Rails' `Relation#unscoped`: the model's relation with nothing
