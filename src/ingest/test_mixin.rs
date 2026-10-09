@@ -660,6 +660,8 @@ impl TestMixins {
             tags: TestTags::default(),
             setups: Vec::new(),
             block_setup: false,
+            teardowns: Vec::new(),
+            block_teardown: false,
             block_helpers: Vec::new(),
             includes_out: Vec::new(),
             used: Vec::new(),
@@ -717,6 +719,12 @@ struct ClassWalk<'a> {
     tags: TestTags,
     setups: Vec<Expr>,
     block_setup: bool,
+    /// Each `teardown do … end` callback the class registers, in the
+    /// order Rails registers them: its body's where they stand, and a
+    /// concern's `included do` block's where its include stands.
+    teardowns: Vec<Expr>,
+    /// One of `teardowns` comes from an `included do` block.
+    block_teardown: bool,
     block_helpers: Vec<MethodDef>,
     includes_out: Vec<String>,
     /// Every shared test module included, directly or not.
@@ -830,11 +838,15 @@ impl ClassWalk<'_> {
                             }
                             continue;
                         }
-                        "teardown" if in_block => {
-                            return Err(format!(
-                                "a `teardown` in an `included do` block ({}) is not modeled",
-                                at(file, stmt.location().start_offset())
-                            ));
+                        // `teardown :name` and other forms are refused by
+                        // `ingest_teardown_block` (the class body's already
+                        // were, by `ingest_test_class`).
+                        "teardown" => {
+                            if let Some(body) = ingest_teardown_block(&stmt, file).map_err(message)? {
+                                self.teardowns.push(body);
+                                self.block_teardown |= in_block;
+                            }
+                            continue;
                         }
                         _ => {}
                     }
@@ -936,8 +948,24 @@ impl ClassWalk<'_> {
 
     /// The class as Minitest sees it: its tests under their method names.
     fn finish(self, tm: &TestModule) -> Result<TestModule, String> {
-        let ClassWalk { reg, tables, class, mut t, own, base_tags, tags, setups, block_setup, block_helpers, includes_out, .. } = self;
+        let ClassWalk {
+            reg,
+            tables,
+            class,
+            mut t,
+            own,
+            base_tags,
+            tags,
+            setups,
+            block_setup,
+            teardowns,
+            block_teardown,
+            mut block_helpers,
+            includes_out,
+            ..
+        } = self;
         let table = |m: usize| -> &Table { table_of(tables, m).expect("an included module's table is built") };
+        let (class_helpers, teardown_def) = merge_teardowns(tm, teardowns, &mut block_helpers, &t.mro, reg)?;
         // TestTags' persistent hook renames what the class itself defines,
         // and undefines the old names, so an ancestor's are hidden too.
         let originals: Vec<String> = t.slots.iter().map(|(n, _)| n.clone()).collect();
@@ -965,7 +993,7 @@ impl ClassWalk<'_> {
                 first.entry(name).or_insert(public);
             };
             let public = |h: &MethodDef| h.visibility == MethodVisibility::Public;
-            for h in tm.helpers.iter().chain(block_helpers.iter()) {
+            for h in class_helpers.iter().chain(block_helpers.iter()) {
                 note(h.name.to_string(), public(h));
             }
             for &m in &t.mro {
@@ -1088,7 +1116,7 @@ impl ClassWalk<'_> {
         // One that calls `super` reaches the next definition: that one is
         // kept in a module of its own the class includes, in the same
         // lookup order, so the chain runs as it does natively.
-        let mut helpers = tm.helpers.clone();
+        let mut helpers = class_helpers.clone();
         let mut chains: Vec<(String, Vec<(Option<usize>, MethodDef)>)> = Vec::new();
         let add = |owner: Option<usize>, h: MethodDef, chains: &mut Vec<(String, Vec<(Option<usize>, MethodDef)>)>| {
             let name = h.name.to_string();
@@ -1097,11 +1125,11 @@ impl ClassWalk<'_> {
                 None => chains.push((name, vec![(owner, h)])),
             }
         };
-        for h in &tm.helpers {
+        for h in &class_helpers {
             add(None, h.clone(), &mut chains);
         }
         for h in block_helpers {
-            if !tm.helpers.iter().any(|own| own.name == h.name) {
+            if !class_helpers.iter().any(|own| own.name == h.name) {
                 add(None, h, &mut chains);
             }
         }
@@ -1214,8 +1242,74 @@ impl ClassWalk<'_> {
         if block_setup {
             out.setup = Some(Expr::new(Span::synthetic(), ExprNode::Seq { exprs: setups }));
         }
+        out.teardown_blocks |= block_teardown;
+        out.teardown_def = teardown_def;
         Ok(out)
     }
+}
+
+/// The class's `teardown` with every callback it registers. Minitest
+/// calls the `def teardown` the class's lookup finds, then
+/// ActiveSupport's `after_teardown` runs the `teardown do … end`
+/// callbacks in reverse registration order; a concern's `included do`
+/// block registers its own on the class where the `include` stands.
+/// `ingest_test_class` merged the class body's alone (its own def's
+/// body, then its blocks reversed); this merges them all, so a
+/// concern's cleanup runs where Rails runs it instead of the class being
+/// refused.
+///
+/// The def part is the class's own `def teardown`, else one an
+/// `included do` block defines, else a shared module's, which the
+/// merged method reaches through `super` (the helper chains keep it in
+/// a module the class includes): without that, a class's own callbacks
+/// replaced the module's `def teardown` that Rails still runs.
+/// Returns the class's helpers and whether the merged method includes a
+/// `def teardown` (`TestModule::teardown_def`).
+fn merge_teardowns(
+    tm: &TestModule,
+    teardowns: Vec<Expr>,
+    block_helpers: &mut Vec<MethodDef>,
+    mro: &[usize],
+    reg: &TestMixins,
+) -> Result<(Vec<MethodDef>, bool), String> {
+    let mut helpers = tm.helpers.clone();
+    if teardowns.is_empty() {
+        return Ok((helpers, tm.teardown_def));
+    }
+    let is_teardown = |m: &MethodDef| m.name.as_str() == "teardown";
+    let mut exprs: Vec<Expr> = Vec::new();
+    let mut name_span = Span::synthetic();
+    let mut def = false;
+    if let Some(merged) = helpers.iter().position(is_teardown).map(|i| helpers.remove(i)) {
+        name_span = merged.name_span;
+        if tm.teardown_def {
+            let body = if tm.teardown_blocks {
+                match &*merged.body.node {
+                    ExprNode::Seq { exprs } if !exprs.is_empty() => exprs[0].clone(),
+                    _ => return Err("its merged `teardown` is not the shape the shared-test splice expects".into()),
+                }
+            } else {
+                merged.body
+            };
+            exprs.push(body);
+            def = true;
+        }
+    }
+    if !def {
+        if let Some(m) = block_helpers.iter().position(is_teardown).map(|i| block_helpers.remove(i)) {
+            name_span = m.name_span;
+            exprs.push(m.body);
+            def = true;
+        } else if mro.iter().any(|&m| reg.mixins[m].helpers.iter().any(is_teardown)) {
+            exprs.push(Expr::new(Span::synthetic(), ExprNode::Super { args: None, block: None }));
+            def = true;
+        }
+    }
+    exprs.extend(teardowns.into_iter().rev());
+    let mut method = synth_method("teardown", Expr::new(Span::synthetic(), ExprNode::Seq { exprs }), &ClassId(tm.name.0.clone()));
+    method.name_span = name_span;
+    helpers.push(method);
+    Ok((helpers, def))
 }
 
 /// The modules other than shared test ones that including `k` brings,
