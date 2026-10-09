@@ -3,12 +3,13 @@
 //!
 //! - a name of adjacent literals (`"a " "b"`) is one literal;
 //! - a loop over a literal collection (`%w[]`, an Array, a Hash, a Range,
-//!   `n.times`, or a same-class `CONST = [...].freeze`) declares one test
-//!   per element, under the name Ruby builds for it, with the block's
-//!   parameters bound to that element in the test body;
+//!   `n.times`, or a same-class `CONST = [...].freeze` of frozen values)
+//!   declares one test per element, under the name Ruby builds for it,
+//!   with the block's parameters bound to that element in the test body;
 //! - any other statement that declares tests (a loop over a computed
-//!   collection, a computed name, a conditional `test`) is a named gap:
-//!   strict ingest fails, survey mode records it and emits the rest.
+//!   collection or a constant that is not a literal of frozen values, a
+//!   computed name, a conditional `test`) is a named gap: strict ingest
+//!   fails, survey mode records it and emits the rest.
 //!
 //! The native oracle is ActiveSupport's `test` under Minitest.
 #[path = "support/emit_and_run.rs"]
@@ -19,7 +20,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::process::Command;
 
-const UNROLL: &str = r##"class UnrollTest < ActiveSupport::TestCase
+const UNROLL: &str = r##"# frozen_string_literal: true
+class UnrollTest < ActiveSupport::TestCase
   CASES = [
     { name: "plain", input: 1, expected: 2 },
     { name: "zero", input: 0, expected: 1 },
@@ -338,7 +340,7 @@ fn literal_loops_unroll_and_other_declarations_are_named_gaps() {
     // Strict ingest names the first statement it does not model.
     let err = roundhouse::ingest::ingest_test_files(PARTIAL.as_bytes(), "partial_test.rb").unwrap_err().to_string();
     assert!(
-        err.contains("tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`PartialTest` line 8, first test at line 9"),
+        err.contains("tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run (`PartialTest` line 8, first test at line 9: `PartialTest::COMPUTED`: `COMPUTED = %w[x y].map(&:upcase)`"),
         "{err}"
     );
     // A literal-only class ingests strictly.
@@ -356,7 +358,7 @@ fn literal_loops_unroll_and_other_declarations_are_named_gaps() {
     let gaps: Vec<String> = roundhouse::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "{errors:#?}");
     let named = [
-        "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`PartialTest` line 8, first test at line 9",
+        "tests declared by a loop over a constant whose value is not a literal of frozen values are not modeled; they will not run (`PartialTest` line 8, first test at line 9: `PartialTest::COMPUTED`: `COMPUTED = %w[x y].map(&:upcase)`",
         "tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`EdgeTest` line 49, first test at line 50",
         "tests declared by a conditional are not modeled; they will not run (`PartialTest` line 14",
         "tests declared by a loop whose test names are not known before it runs are not modeled; they will not run (`PartialTest` line 18, first test at line 19",

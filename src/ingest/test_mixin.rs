@@ -938,6 +938,9 @@ impl TestMixins {
                 .into_iter()
                 .find_map(|(called, at)| macros.iter().find(|(m, _)| *m == called).map(|(m, owner)| (m.clone(), owner.clone(), at)));
             let Some((method, owner, at)) = hit else { continue };
+            if super::test::macro_call_expanded(file, stmt.location().start_offset()) {
+                continue;
+            }
             let line = super::sources::line_at(file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
             super::survey::continue_or_fail(IngestError::Unsupported {
                 file: file.into(),
