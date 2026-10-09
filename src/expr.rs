@@ -250,6 +250,12 @@ pub const SOURCE_KEYWORD_ARG: u64 = 1 << 15;
 /// itself keyword-form ([`SOURCE_KEYWORD_ARG`] or [`ERASED_KEYWORD_SPLAT`]).
 pub const KEYWORD_DEFAULT_FILL: u64 = 1 << 16;
 
+/// A `permit` Send that the source wrote as `params.expect(r: [...])`.
+/// `rewrite_params` respells `expect` as `require(:r).permit(...)`, and
+/// the two refuse a malformed request differently in Rails, so the
+/// strong-params lowering reads this to know which refusal to apply.
+pub const FROM_PARAMS_EXPECT: u64 = 1 << 28;
+
 /// Cross-target intent annotation for canonical Ruby idioms whose
 /// optimal emit shape differs per target. Set by the lowerer when it
 /// synthesizes a pattern it knows the target-specific name for (and by
@@ -1959,6 +1965,7 @@ mod tests {
             SOURCE_KEYWORD_ARG, KEYWORD_DEFAULT_FILL, RUBY_NATIVE_KEYWORD_SPLAT, GUARDED_CONSTANT_WRITE,
             RUNTIME_VALUE_REF, OBJECT_AS_JSON, RECORD_SERIALIZATION, ERRORS_PORT_CALL,
             SINGLETON_CONSTANT_WRITE, SINGLETON_CONSTANT_REF, BODY_STATEMENT, SINGLETON_BODY,
+            FROM_PARAMS_EXPECT,
         ];
         let mut seen = 0u64;
         for bit in bits {
