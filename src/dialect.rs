@@ -2679,6 +2679,40 @@ pub struct TestModule {
     /// (`ingest::test::refuse_inherited_test_redefinitions`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub defined_tests: Vec<(String, bool)>,
+    /// The other statements of the class body, which Ruby runs in the
+    /// class as it loads (`use_gcs`, `use_active_record_fixtures`, `let
+    /// (:x) { … }`, `self.allow_setup_mutations = true`), in source
+    /// order. Each runs as written in the emitted class
+    /// (`ingest::test::carried_body_statement`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub body_statements: Vec<TestBodyStatement>,
+}
+
+/// A test class-body statement carried as written (`TestModule::
+/// body_statements`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TestBodyStatement {
+    pub expr: Expr,
+    /// The line the source writes it on, for the runner's name of a
+    /// statement that raises (`RoundhouseTestCallbacks.class_body_statement`).
+    #[serde(default)]
+    pub line: u32,
+    /// A test, method or class definition is above it in the body: it
+    /// runs after the class's definitions (the emitted class defines
+    /// them all in one place), else before them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_definitions: bool,
+    /// A `setup do` block of the class is above it. The blocks are
+    /// compiled into a method the runner calls after the callback chain
+    /// (`__roundhouse_before_setup`), so a setup callback the statement
+    /// registers after them could not run in its native place: the
+    /// runner names it (`RoundhouseTestCallbacks.after_compiled_blocks`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_setup_blocks: bool,
+    /// Likewise a `teardown do` block (compiled into `teardown`, which
+    /// the runner calls before the chain).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_teardown_blocks: bool,
 }
 
 impl TestModule {
