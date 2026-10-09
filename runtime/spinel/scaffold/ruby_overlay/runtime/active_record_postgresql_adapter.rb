@@ -10,12 +10,92 @@
 # to the current thread/fiber, as Rails' lease_connection
 # (runtime/active_record_connection_handling.rb); before the database is
 # configured it is a per-thread adapter without a session.
+#
+# Rails' ancestry: PostgreSQLAdapter < AbstractAdapter, so a reopen of
+# AbstractAdapter (Core's podding patch: `abstract_connection_name`,
+# `allow_preconnect`) reaches the live connection, and a module prepended
+# to AbstractAdapter (Core's TransactionConnectionTracker around
+# `transaction`, the test helper's FollowerReadWriteGuard around
+# `preventing_writes?`) wraps what Rails defines there. So the members
+# Rails defines on AbstractAdapter and its modules (DatabaseStatements,
+# Savepoints) live on AbstractAdapter here too (this file, and the
+# AbstractAdapter reopens of runtime/active_record_transactions.rb and
+# runtime/active_record_connection_handling.rb); PostgreSQLAdapter keeps
+# what Rails' PostgreSQLAdapter and its PostgreSQL:: modules override.
+# The shared `Connection` facade stays the parent of AbstractAdapter, so
+# every raw-SQL member it already has is unchanged.
+#
+# NOT modeled: the lifecycle module (Db::ConnectionLifecycle) mixes Rails'
+# abstract members (connect!, verify!, reconnect!, disconnect!) with the
+# PostgreSQL overrides (active?, reconnect, configure_connection) at
+# AbstractAdapter's level, so a module prepended to AbstractAdapter wraps
+# a PostgreSQL override Rails' PostgreSQLAdapter would shadow. The
+# adapter's checkout/checkin callbacks (`define_callbacks :checkout,
+# :checkin`) are not run by this runtime's pool; `set_callback` and
+# `skip_callback` on the adapter refuse by name (below).
 require_relative "active_record_statement_errors"
 
 module ActiveRecord
   module ConnectionAdapters
-    class PostgreSQLAdapter < Connection
+    class AbstractAdapter < Connection
+      ADAPTER_NAME = "Abstract"
+
       include Db::ConnectionLifecycle
+
+      # abstract_adapter.rb:46, `include ActiveSupport::Callbacks` and
+      # `define_callbacks :checkout, :checkin`: Rails runs the chains when
+      # its pool checks a connection out (`clean!`) and in (`expire`). This
+      # runtime's pool (Db.checkout / Db.checkin_to) runs neither, so a
+      # callback set on them would never run: refused by name instead.
+      class << self
+        def set_callback(name, *filter_list, &block)
+          raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: " \
+            "#{self.name}.set_callback(#{name.inspect}, ...): the adapter's checkout/checkin callbacks " \
+            "(AbstractAdapter `define_callbacks :checkout, :checkin`) are not run by this runtime's connection pool"
+        end
+
+        def skip_callback(name, *filter_list, &block)
+          raise NotImplementedError, "roundhouse: error[framework_feature_not_ported]: " \
+            "#{self.name}.skip_callback(#{name.inspect}, ...): the adapter's checkout/checkin callbacks " \
+            "(AbstractAdapter `define_callbacks :checkout, :checkin`) are not run by this runtime's connection pool"
+        end
+      end
+
+      # Returns the human-readable name of the adapter (Rails:
+      # `self.class::ADAPTER_NAME`).
+      def adapter_name
+        self.class::ADAPTER_NAME
+      end
+
+      # AbstractAdapter's feature defaults the runtime reads; the
+      # PostgreSQL adapter overrides them as Rails' does.
+      def supports_savepoints?
+        false
+      end
+
+      def supports_lazy_transactions?
+        false
+      end
+
+      def supports_restart_db_transaction?
+        false
+      end
+
+      # abstract/database_statements.rb query_command: a statement without
+      # rows on this adapter's session, recorded and instrumented as every
+      # statement is.
+      def query_command(sql, name = nil, materialize_transactions: true) # :nodoc:
+        Db.record_query(sql)
+        Db.context[:cache]&.clear
+        result = raw_execute(sql, name, [], materialize_transactions: materialize_transactions) { |conn| perform_query(conn, sql) }
+        nil
+      ensure
+        result&.clear
+      end
+    end
+
+    class PostgreSQLAdapter < AbstractAdapter
+      ADAPTER_NAME = "PostgreSQL"
 
       # activerecord 8.1.4 postgresql_adapter.rb:105,
       # `class_attribute :create_unlogged_tables, default: false`: class
@@ -47,10 +127,6 @@ module ActiveRecord
         !!create_unlogged_tables
       end
 
-      def adapter_name
-        "PostgreSQL"
-      end
-
       def quote(value)
         return Db.escape_bool(value) if value == true || value == false
         super(value)
@@ -80,17 +156,6 @@ module ActiveRecord
       def exec_restart_db_transaction # :nodoc:
         cancel_any_running_query
         query_command("ROLLBACK AND CHAIN", "TRANSACTION", materialize_transactions: true)
-      end
-
-      # A statement without rows on this adapter's session (Rails'
-      # query_command), recorded and instrumented as every statement is.
-      def query_command(sql, name = nil, materialize_transactions: true) # :nodoc:
-        Db.record_query(sql)
-        Db.context[:cache]&.clear
-        result = raw_execute(sql, name, [], materialize_transactions: materialize_transactions) { |conn| perform_query(conn, sql) }
-        nil
-      ensure
-        result&.clear
       end
 
       private

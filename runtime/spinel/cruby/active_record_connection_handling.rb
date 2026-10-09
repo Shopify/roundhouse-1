@@ -1118,7 +1118,12 @@ module ActiveRecord
       rescue ArgumentError # Invalid encoding
         !READ_QUERY.match?(sql.b)
       end
+    end
 
+    # abstract_adapter.rb: on AbstractAdapter, so a module prepended to it
+    # (Core's test helper's FollowerReadWriteGuard, around
+    # `preventing_writes?`) wraps them on the live PostgreSQL adapter.
+    class AbstractAdapter
       # AbstractAdapter#pool: the pool this adapter was checked out of.
       def pool
         ConnectionHandling.pools_by_key[@rh_pg_database]
@@ -1126,6 +1131,15 @@ module ActiveRecord
 
       def replica?
         @config.is_a?(Hash) && (@config[:replica] || @config["replica"]) ? true : false
+      end
+
+      # AbstractAdapter#role / #shard: the pool's.
+      def role
+        pool&.role
+      end
+
+      def shard
+        pool&.shard
       end
 
       # AbstractAdapter#connection_descriptor / #preventing_writes?.
