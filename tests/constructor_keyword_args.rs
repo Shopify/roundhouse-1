@@ -1,7 +1,7 @@
 //! A keyword passed to `.new` must bind to its source `initialize` slot
 //! after optional keywords are flattened for the emitted Ruby ABI.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};

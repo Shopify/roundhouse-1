@@ -358,8 +358,8 @@ pub(super) fn is_delegate_declaration(expr: &Expr) -> bool {
 
 /// The association-checked expansion (module doc): consume each
 /// declaration in `unknown_calls` that `declarations::DelegateEligibility`
-/// admits and return its forwarders, each carrying the visibility in
-/// effect at the declaration and placed at it.
+/// admits and return its forwarders, each placed at its declaration and
+/// public, as Rails' `module_eval`-defined forwarders are.
 pub(super) fn expand_delegates(
     name: &crate::ident::ClassId,
     methods: &[MethodDef],
@@ -367,7 +367,6 @@ pub(super) fn expand_delegates(
     additional_method_bodies: &[Expr],
     blocked_names: &crate::det::HashSet<String>,
     supported_target_methods: Option<&crate::det::HashSet<(String, String, usize)>>,
-    sources: &[crate::span::SourceFile],
 ) -> Vec<MethodDef> {
     let called_with_args =
         declarations::names_called_with_arguments(methods, additional_method_bodies);
@@ -376,7 +375,6 @@ pub(super) fn expand_delegates(
         &called_with_args,
         blocked_names,
         supported_target_methods,
-        sources,
     );
     let delegates = declarations::take_delegate_decls_from_calls(unknown_calls, &mut eligibility);
     if delegates.is_empty() {
@@ -395,7 +393,6 @@ pub(super) fn expand_delegates(
                     .iter()
                     .find(|delegate| delegate.name == method.name.as_str())
                 {
-                    method.visibility = delegate.visibility;
                     let at = crate::span::Span {
                         file: delegate.declaration_span.file,
                         start: delegate.declaration_span.start,
@@ -511,10 +508,13 @@ fn expand_delegates_declining(
     (methods, full, declined)
 }
 
-/// The shape `synthesized_source` writes as a zero-arg forwarder: an
-/// instance-side reader that is neither a setter nor an operator.
+/// The forwarders the Ruby target replaces with their `(...)` twin: an
+/// instance-side reader that is neither a setter nor an operator (the
+/// strict targets get it zero-arg), and an indexer (`[]`, `[]=`), whose
+/// strict form has a fixed arity.
 fn forwards_zero_arg(d: &Delegation) -> bool {
-    !d.class_side && !d.method.as_str().ends_with('=') && operator_forwarder("t", d.method.as_str()).is_none()
+    let m = d.method.as_str();
+    !d.class_side && (matches!(m, "[]" | "[]=") || (!m.ends_with('=') && operator_forwarder("t", m).is_none()))
 }
 
 fn parse_forwarders(src: &str, delegates: &[Delegation]) -> Vec<MethodDef> {
@@ -954,7 +954,13 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation], full_forward:
         // A setter takes the one argument Ruby's own assignment syntax
         // supplies (with `prefix: true`, `d.name` is already
         // `<prefix>_name=`); an operator takes its fixed operands.
-        let (params, call) = if let Some(forwarder) = operator_forwarder(t, m) {
+        // On the Ruby target an indexer forwards `(...)`, as Rails
+        // generates it: `[]` and `[]=` take any positional arity
+        // (`store[a, b]`, `store[a, b] = v`), which a fixed `(key)` or
+        // `(key, value)` signature would reject.
+        let (params, call) = if full_forward && matches!(m, "[]" | "[]=") {
+            ("...", format!("{t}.{m}(...)"))
+        } else if let Some(forwarder) = operator_forwarder(t, m) {
             forwarder
         } else if let Some(attr) = m.strip_suffix('=') {
             ("value", format!("{t}.{attr} = value"))
@@ -973,9 +979,17 @@ fn synthesized_source(lc: &LibraryClass, delegates: &[Delegation], full_forward:
         // under allow_nil (for example `nil == other` returns a Boolean).
         // An `if`, not `return nil if …`: it leaves the method ending in a
         // read, which is what the strict targets want of a non-void body.
+        //
+        // The Ruby target writes Rails' own test, `if !_.nil? ||
+        // nil.respond_to?(:m)`: a method nil implements (`to_s`,
+        // `inspect`, an app's `NilClass` extension) runs on nil rather
+        // than answering nil. The target-neutral form keeps the fixed
+        // list of nil's operators.
         let nil_operator = matches!(m, "==" | "!=" | "===" | "=~" | "!~" | "&" | "|" | "^" | "!");
         let call = if d.allow_nil {
-            let result = if nil_operator {
+            let result = if full_forward {
+                format!("if {t}.nil? && !nil.respond_to?(:{m})\n      nil\n    else\n      {call}\n    end")
+            } else if nil_operator {
                 call
             } else {
                 format!("if {t}.nil?\n      nil\n    else\n      {call}\n    end")

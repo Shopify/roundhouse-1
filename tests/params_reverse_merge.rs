@@ -9,7 +9,7 @@
 //! only when the request did not provide that key; a default for any
 //! other key is always assigned.
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -24,7 +24,7 @@ fn controller_for(target: BuildTarget, helper_body: &str) -> String {
     let controller = format!(
         "class WidgetsController < ApplicationController\n  def create\n    @widget = Widget.create(widget_params)\n    head :created\n  end\n\n  private\n\n  def widget_params\n    {helper_body}\n  end\nend\n"
     );
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/widget.rb"), b"class Widget < ApplicationRecord\nend\n".to_vec());
     tree.insert(

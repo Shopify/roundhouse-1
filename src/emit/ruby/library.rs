@@ -8147,7 +8147,10 @@ fn emit_library_class_decl_inner(
             else {
                 continue;
             };
-            if m.receiver == MethodReceiver::Instance && m.params.is_empty() && m.block_param.is_none() {
+            // An indexer forwarder (`[]`, `[]=`) has a fixed arity in the
+            // IR; its `(...)` twin sits at the same declaration.
+            let indexer = matches!(m.name.as_str(), "[]" | "[]=") && m.name_span == f.name_span;
+            if m.receiver == MethodReceiver::Instance && (indexer || (m.params.is_empty() && m.block_param.is_none())) {
                 *m = crate::dialect::MethodDef { visibility: m.visibility, name: m.name.clone(), ..f.clone() };
             }
         }

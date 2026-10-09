@@ -616,7 +616,7 @@ fn mutates_constructor_lookup_method(
 
 #[cfg(test)]
 mod tests {
-    use crate::det::HashSet;
+    use std::collections::HashSet;
 
     use super::constructor_owner_aliases;
     use crate::ident::{ClassId, Symbol};

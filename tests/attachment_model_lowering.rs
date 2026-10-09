@@ -154,10 +154,11 @@ end
         ),
     ]))
     .expect_err("private concern delegates are not modeled");
+    // The refusal names the block the declaration sits in.
     assert!(
         error
             .to_string()
-            .contains("conditional or dynamic visibility declarations are not modeled"),
+            .contains("visibility declarations inside a `included do … end` block are not modeled"),
         "unexpected ingest error: {error}"
     );
 }

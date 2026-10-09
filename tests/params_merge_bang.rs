@@ -2,7 +2,7 @@
 //! `merge` does. It stayed on the typed `WidgetParams`, which defines no
 //! `merge!` (`NoMethodError` at request time).
 
-use std::collections::HashMap;
+use roundhouse::det::HashMap;
 use std::path::{Path, PathBuf};
 
 use roundhouse::ingest::ingest_app_from_tree;
@@ -16,7 +16,7 @@ fn emit(action: &str) -> String {
     let controller = format!(
         "class WidgetsController < ApplicationController\n{action}\n\n  private\n\n  def widget_params\n    params.require(:widget).permit(:name)\n  end\nend\n"
     );
-    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut tree: HashMap<PathBuf, Vec<u8>> = HashMap::default();
     tree.insert(PathBuf::from("db/schema.rb"), SCHEMA.as_bytes().to_vec());
     tree.insert(PathBuf::from("app/models/widget.rb"), b"class Widget < ApplicationRecord\nend\n".to_vec());
     tree.insert(

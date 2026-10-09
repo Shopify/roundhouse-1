@@ -48,8 +48,13 @@ fn emit_model(app: &mut roundhouse::App, suffix: &str) -> String {
         .content
 }
 
+/// Rails defines a forwarder with a string `module_eval`, whose fresh
+/// scope is public, so a bare `private` above `delegate` does not reach
+/// it: under ActiveSupport 8.1.3, `private; delegate :display_name, to:
+/// :profile` leaves `display_name` public (`private_method_defined?` is
+/// false). Both the model and the library-class forwarder stay public.
 #[test]
-fn private_delegate_visibility_is_preserved_for_models_and_library_classes() {
+fn a_bare_private_does_not_reach_delegate_forwarders_as_in_rails() {
     let mut files = tree("");
     files.insert(
         PathBuf::from("app/models/account.rb"),
@@ -80,7 +85,7 @@ fn private_delegate_visibility_is_preserved_for_models_and_library_classes() {
         .expect("model delegate");
     assert_eq!(
         account_delegate.visibility,
-        roundhouse::dialect::MethodVisibility::Private
+        roundhouse::dialect::MethodVisibility::Public
     );
     let service = app
         .library_classes
@@ -94,7 +99,7 @@ fn private_delegate_visibility_is_preserved_for_models_and_library_classes() {
         .expect("library-class delegate");
     assert_eq!(
         service_delegate.visibility,
-        roundhouse::dialect::MethodVisibility::Private
+        roundhouse::dialect::MethodVisibility::Public
     );
 }
 
@@ -235,7 +240,7 @@ end
     );
     assert!(
         out.contains(
-            "def request_host(...)\n    __delegate_target = request\n    if __delegate_target.nil?\n      nil\n    else\n      __delegate_target.host(...)\n    end\n  end"
+            "def request_host(...)\n    __delegate_target = request\n    if __delegate_target.nil? && !(nil.respond_to?(:host))\n      nil\n    else\n      __delegate_target.host(...)\n    end\n  end"
         ),
         "got:\n{out}"
     );
@@ -584,7 +589,8 @@ end
 #[test]
 fn delegated_operators_forward_their_operands() {
     // Binary operators have a fixed single-argument contract; unary
-    // operators need no positional forwarding and remain valid delegates.
+    // operators remain valid delegates, forwarding `(...)` on the Ruby
+    // target as Rails generates them.
     let out = emit(
         r#"class Filter
   delegate :<<, :==, :!, :-@, to: :@set
@@ -597,8 +603,8 @@ end
     );
     assert!(out.contains("@set << other"), "got:\n{out}");
     assert!(out.contains("@set == other"), "got:\n{out}");
-    assert!(out.contains("def !\n    !(@set)\n  end"), "got:\n{out}");
-    assert!(out.contains("def -@\n    @set.-@\n  end"), "got:\n{out}");
+    assert!(out.contains("def !(...)\n    @set.!(...)\n  end"), "got:\n{out}");
+    assert!(out.contains("def -@(...)\n    @set.-@(...)\n  end"), "got:\n{out}");
 }
 
 #[test]
@@ -623,21 +629,32 @@ end
     );
 }
 
+/// `[]` and `[]=` take any positional arity, so on the Ruby target they
+/// forward `(...)`, as Rails generates them; a fixed `(key)` signature
+/// would reject `filter[a, b]`.
 #[test]
-fn variable_arity_index_operators_are_left_unexpanded() {
-    let out = emit(
-        r#"class Filter
+fn index_operators_forward_any_arity_on_the_ruby_target() {
+    let source = r#"class Filter
   delegate :[], :[]=, to: :@items
+
+  def initialize
+    @items = Grid.new
+  end
+
+  def items
+    @items
+  end
 end
-"#,
-    );
-    assert!(
-        !out.contains("def []"),
-        "variable-arity indexers need forwarding:\n{out}"
-    );
-    assert!(
-        !out.contains("def []="),
-        "variable-arity indexers need forwarding:\n{out}"
+"#;
+    let out = emit(source);
+    assert!(out.contains("def [](...)\n    @items.[](...)\n  end"), "got:\n{out}");
+    assert!(out.contains("def []=(...)\n    @items.[]=(...)\n  end"), "got:\n{out}");
+    assert_eq!(
+        run_emitted(
+            source,
+            "class Grid; def [](*a) = a; def []=(*a); @last = a; end; attr_reader :last; end\nf = Filter.new; p f[1, 2]; f[1, 2] = 3; p f.items.last"
+        ),
+        "[1, 2]\n[1, 2, 3]\n"
     );
 }
 
@@ -675,18 +692,17 @@ end
     );
 }
 
+/// Rails' `allow_nil: true` forwarder is `if !_.nil? ||
+/// nil.respond_to?(:m)`: a method nil implements (`to_s`) runs on nil,
+/// and only one it lacks (`host`) answers nil.
 #[test]
-fn allow_nil_true_is_not_lowered_to_an_incomplete_nil_guard() {
-    let out = emit(
-        r#"class Filter
+fn allow_nil_runs_methods_nil_implements_as_rails_does() {
+    let source = r#"class Filter
   attr_reader :request
 
   delegate :to_s, to: :request, allow_nil: true
+  delegate :host, to: :request, allow_nil: true
 end
-"#,
-    );
-    assert!(
-        !out.contains("def to_s"),
-        "nil implements `to_s`, so a nil guard would differ from Rails:\n{out}"
-    );
+"#;
+    assert_eq!(run_emitted(source, "f = Filter.new; p f.to_s, f.host"), "\"\"\nnil\n");
 }

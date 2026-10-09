@@ -1,7 +1,6 @@
 //! Parse and validate `delegate` declarations before forwarder synthesis.
 
 use super::*;
-use crate::dialect::MethodVisibility;
 use crate::expr::{ExprNode, Literal};
 use crate::ident::Symbol;
 use crate::det::{HashMap, HashSet};
@@ -15,7 +14,6 @@ pub(super) struct Delegation {
     /// source registry can still resolve it. Empty when it can't.
     pub(super) file: String,
     pub(super) declaration_span: crate::span::Span,
-    pub(super) visibility: MethodVisibility,
 }
 
 #[derive(Default)]
@@ -44,8 +42,6 @@ pub(super) struct DelegateEligibility<'a> {
     called_with_args: &'a CallsWithArguments,
     blocked_names: &'a HashSet<String>,
     supported_target_methods: Option<&'a HashSet<(String, String, usize)>>,
-    sources: &'a [crate::span::SourceFile],
-    visibility_cache: HashMap<crate::span::FileId, HashMap<usize, MethodVisibility>>,
 }
 
 impl<'a> DelegateEligibility<'a> {
@@ -54,15 +50,12 @@ impl<'a> DelegateEligibility<'a> {
         called_with_args: &'a CallsWithArguments,
         blocked_names: &'a HashSet<String>,
         supported_target_methods: Option<&'a HashSet<(String, String, usize)>>,
-        sources: &'a [crate::span::SourceFile],
     ) -> Self {
         Self {
             methods,
             called_with_args,
             blocked_names,
             supported_target_methods,
-            sources,
-            visibility_cache: HashMap::default(),
         }
     }
 
@@ -74,37 +67,11 @@ impl<'a> DelegateEligibility<'a> {
         if declaration.has_unsupported_option {
             return None;
         }
+        // Rails defines the forwarder with a string `module_eval`, whose
+        // fresh scope is public: a bare `private` above the declaration
+        // does not reach it (ActiveSupport 8.1's `private; delegate :m`
+        // leaves `m` public). The forwarder keeps the public default.
         let file = super::super::sources::path_of(call.span.file).unwrap_or_default();
-        let visibility_defaults =
-            self.visibility_cache
-                .entry(call.span.file)
-                .or_insert_with(|| {
-                    super::super::sources::with_text(&file, |source| {
-                        super::super::visibility::Visibility::declaration_defaults(source, &file)
-                    })
-                    .or_else(|| {
-                        call.span
-                            .file
-                            .0
-                            .checked_sub(1)
-                            .and_then(|index| self.sources.get(index as usize))
-                            .map(|source| {
-                                super::super::visibility::Visibility::declaration_defaults(
-                                    &source.text,
-                                    &source.path,
-                                )
-                            })
-                    })
-                    .unwrap_or_default()
-                });
-        let Some(&visibility) = visibility_defaults.get(&(call.span.start as usize)) else {
-            super::super::survey::record(&crate::ingest::IngestError::Unsupported {
-                file,
-                message: "delegate visibility could not be resolved from its source".into(),
-            });
-            return None;
-        };
-
         let mut entries = Vec::new();
         for method in &declaration.names {
             let name = generated_name(
@@ -151,7 +118,6 @@ impl<'a> DelegateEligibility<'a> {
                 name,
                 file: file.clone(),
                 declaration_span: call.span,
-                visibility,
             });
         }
         if self.supported_target_methods.is_some_and(|supported| {
