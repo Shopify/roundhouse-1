@@ -1311,6 +1311,14 @@ impl<'a> BodyTyper<'a> {
             && matches!(recv_ty, Some(Ty::Class { id, .. }) if self.classes().get(id).is_some_and(|c| c.is_module && c.has_class_method(method)))
     }
 
+    /// Whether the app emits the PostgreSQL CRuby tree, whose
+    /// `ActiveRecord::Base` [`runtime_base`] reads: the registry seeds
+    /// `ActiveRecord::DatabaseConfigurations` exactly then
+    /// (`registry::ar::carries_database_configurations`).
+    fn carries_postgresql_base(&self) -> bool {
+        self.classes().contains_key(&ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations")))
+    }
+
     fn owns_operator(&self, ty: Option<&Ty>, method: &Symbol, class_object: bool) -> bool {
         match ty {
             Some(Ty::Union { variants }) => !variants.is_empty()
@@ -2891,6 +2899,48 @@ impl<'a> BodyTyper<'a> {
                             send::AsJsonResidue::Gap => {}
                         }
                     }
+                    // A receiver typed as `ActiveRecord::Base` itself
+                    // (`record = self #: as ActiveRecord::Base`, a
+                    // `singleton(ActiveRecord::Base)` parameter) is a
+                    // model or a model class, whose ancestry reaches the
+                    // runtime's Base: a method the registry models there,
+                    // or the PostgreSQL CRuby tree's Base defines, is a
+                    // plain send Ruby dispatches. Only a method neither
+                    // answers stays a named gap.
+                    //
+                    // The side is the receiver's where it is proven: a
+                    // constant, `x.class` or `self` in a class body is
+                    // the class; `self` in an instance body an instance.
+                    // A value read from a local, an ivar or a call has
+                    // one flat `Ty::Class` for both (`rbs::ty_from_node` types
+                    // `singleton(C)` as `C`), which dispatch answers
+                    // from either side (`send::dispatch_on`), so here too.
+                    if let Some(Ty::Class { id, .. }) = recv_ty.as_ref()
+                        && id.0.as_str() == "ActiveRecord::Base"
+                        && !ctx.claimed_macro_template
+                        && expr.diagnostic.is_none()
+                    {
+                        let on_self = recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef));
+                        let class_side = class_object_receiver
+                            || recv.as_ref().is_some_and(|r| self.is_class_of_value(r, ctx));
+                        let sides: &[bool] = if class_side {
+                            &[true]
+                        } else if on_self {
+                            &[false]
+                        } else {
+                            &[false, true]
+                        };
+                        let pg = self.carries_postgresql_base();
+                        let answered = sides.iter().any(|&class_side| {
+                            self.owns_operator(recv_ty.as_ref(), method, class_side)
+                                || (pg && runtime_base::answers(method.as_str(), class_side, !on_self))
+                        });
+                        if answered {
+                            // Typed as the registry does a Base method it
+                            // seeds without a signature: the gradual escape.
+                            return if matches!(dispatched, Ty::Var { .. }) { Ty::Untyped } else { dispatched };
+                        }
+                    }
                     let gap = match recv_ty.as_ref() {
                         Some(Ty::Class { id, .. }) if matches!(id.0.as_str(), "ActiveModel::Errors" | "ActiveModel::Error") => Some(id.0.as_str()),
                         Some(Ty::Class { id, .. })
@@ -4287,7 +4337,562 @@ pub(super) fn union_many(tys: Vec<Ty>) -> Ty {
     }
 }
 
+/// What the PostgreSQL CRuby tree's `ActiveRecord::Base` answers, read
+/// from the runtime files that tree composes it from, so a call on a
+/// receiver typed as the base itself (`record = self #: as
+/// ActiveRecord::Base`, Core's BumpsShopVersion) dispatches as Ruby does
+/// when the runtime defines the method, and is refused by name when it
+/// does not. A PostgreSQL app emits only that tree (`lower::try_guard::
+/// runtime_tryable`), so its Base is the one the emitted models subclass.
+///
+/// The files:
+/// - `runtime/ruby/active_record/*.rb`, the shared Ruby-family base
+///   (`id`, `table_name`, `where`, `type_for_attribute`, `arel_table`);
+/// - every `runtime/spinel/cruby/*.rb`, the Rails module ancestry the
+///   PostgreSQL bootstrap carries (`project::apply_postgres_bootstrap`:
+///   Core, Persistence, Callbacks, ConnectionHandling, Transactions'
+///   `current_transaction`);
+/// - the CRuby overlay's Active Record reopens the PostgreSQL boot loads
+///   (`active_record_bang.rb`, `_serialization`, `_relation_ext`,
+///   `_postgresql_adapter`, `_statement_errors`; not the SQLite adapter's);
+/// - the ActiveModel ports Base includes there that the bootstrap always
+///   carries (`active_model_naming.rb`'s Conversion,
+///   `active_model_serialization.rb`'s Serializers::JSON), and
+///   `active_support_tryable.rb`'s `Object#try`.
+///
+/// Read as Ruby builds the ancestry: a body's `def`s, accessors, aliases,
+/// `define_method(:literal)` and `delegate`s on the side they define, with
+/// `private`/`protected`; its `include`/`prepend` and `extend` (and
+/// `singleton_class.prepend`, `class << self` mixins); and a hook's
+/// `base.extend(X)` (`self.included(base)`, `self.append_features(base)`).
+/// `remove_method :name` drops the body's own definition, so a module
+/// below it answers (active_record_core.rb's `reload`). A name built
+/// from a literal list (`[:save, :create].each do |event|
+/// define_method(:"before_#{event}")`) is read once per element; one
+/// computed any other way at load time is not, so the answer stays a
+/// refusal: under-reading is the safe side.
+mod runtime_base {
+    use crate::det::{HashMap, HashSet};
+    use std::sync::OnceLock;
 
+    const INSTANCE: usize = 0;
+    const SINGLETON: usize = 1;
+
+    /// One class or module body, across every file that opens it.
+    #[derive(Default)]
+    struct Namespace {
+        /// Per side: method name → whether it is public.
+        own: [HashMap<String, bool>; 2],
+        /// Per side: `remove_method` / `undef_method` names.
+        removed: [HashSet<String>; 2],
+        /// Per side: mixins as `(lexical scope, written name, prepended)`.
+        mixins: [Vec<(String, String, bool)>; 2],
+        /// Per side of the includer: what this module's `included` /
+        /// `append_features` hook mixes into it (`base.extend(ClassMethods)`).
+        includer_mixins: [Vec<(String, String, bool)>; 2],
+    }
+
+    #[derive(Default)]
+    struct Walker {
+        spaces: HashMap<String, Namespace>,
+        /// The block variable of a literal `[:a, :b].each do |event|` the
+        /// walk is inside, and the element it stands for this pass.
+        each_binding: Option<(Vec<u8>, String)>,
+    }
+
+    /// The body a statement runs in: its namespace, the side a bare `def`
+    /// defines on, and the default visibility so far.
+    struct Body {
+        owner: String,
+        side: usize,
+        public: bool,
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    fn symbol(node: &ruby_prism::Node<'_>) -> Option<String> {
+        if let Some(sym) = node.as_symbol_node() {
+            return Some(text(sym.unescaped()));
+        }
+        node.as_string_node().map(|s| text(s.unescaped()))
+    }
+
+    fn constant(node: &ruby_prism::Node<'_>) -> Option<String> {
+        (node.as_constant_read_node().is_some() || node.as_constant_path_node().is_some())
+            .then(|| text(node.location().as_slice()))
+    }
+
+    fn is_self(node: Option<ruby_prism::Node<'_>>) -> bool {
+        node.is_none_or(|n| n.as_self_node().is_some())
+    }
+
+    impl Walker {
+        /// A literal method name: a symbol or string, or an interpolated
+        /// symbol whose only interpolation is the `each` block variable.
+        fn name_of(&self, node: &ruby_prism::Node<'_>) -> Option<String> {
+            if let Some(literal) = symbol(node) {
+                return Some(literal);
+            }
+            let (var, value) = self.each_binding.as_ref()?;
+            let mut out = String::new();
+            for part in node.as_interpolated_symbol_node()?.parts().iter() {
+                if let Some(text_part) = part.as_string_node() {
+                    out.push_str(&text(text_part.unescaped()));
+                    continue;
+                }
+                let embedded = part.as_embedded_statements_node()?.statements()?;
+                let mut statements = embedded.body().iter();
+                let (Some(only), None) = (statements.next(), statements.next()) else { return None };
+                let read = only.as_local_variable_read_node()?;
+                if read.name().as_slice() != var.as_slice() {
+                    return None;
+                }
+                out.push_str(value);
+            }
+            Some(out)
+        }
+
+        /// `[:save, :create].each do |event| define_method(:"before_#{event}") ... end`
+        /// at body level: the block body once per element, with the
+        /// variable bound (active_record_callbacks.rb's model callbacks).
+        fn literal_each(&mut self, call: &ruby_prism::CallNode<'_>, body: &mut Body) -> bool {
+            let Some(array) = call.receiver().and_then(|r| r.as_array_node()) else { return false };
+            let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return false };
+            let elements: Option<Vec<String>> = array.elements().iter().map(|e| symbol(&e)).collect();
+            let Some(elements) = elements else { return false };
+            let var = block
+                .parameters()
+                .and_then(|p| p.as_block_parameters_node())
+                .and_then(|p| p.parameters())
+                .filter(|p| p.requireds().iter().count() == 1 && p.optionals().iter().next().is_none() && p.rest().is_none())
+                .and_then(|p| p.requireds().iter().next())
+                .and_then(|p| p.as_required_parameter_node())
+                .map(|p| p.name().as_slice().to_vec());
+            let (Some(var), true) = (var, block.body().is_some()) else { return false };
+            if self.each_binding.is_some() {
+                return false;
+            }
+            for element in elements {
+                self.each_binding = Some((var.clone(), element));
+                self.statements(block.body(), body);
+            }
+            self.each_binding = None;
+            true
+        }
+
+        fn space(&mut self, owner: &str) -> &mut Namespace {
+            self.spaces.entry(owner.to_string()).or_default()
+        }
+
+        fn define(&mut self, body: &Body, side: usize, name: String, public: bool) {
+            self.space(&body.owner).own[side].insert(name, public);
+        }
+
+        fn statements(&mut self, node: Option<ruby_prism::Node<'_>>, body: &mut Body) {
+            let Some(node) = node else { return };
+            match node.as_statements_node() {
+                Some(list) => {
+                    for statement in list.body().iter() {
+                        self.statement(&statement, body);
+                    }
+                }
+                None => self.statement(&node, body),
+            }
+        }
+
+        fn nested(&mut self, body: &Body, path: &[u8], inner: Option<ruby_prism::Node<'_>>) {
+            let written = text(path);
+            let owner = match written.strip_prefix("::") {
+                Some(top) => top.to_string(),
+                None if body.owner.is_empty() => written,
+                None => format!("{}::{written}", body.owner),
+            };
+            self.space(&owner);
+            self.statements(inner, &mut Body { owner, side: INSTANCE, public: true });
+        }
+
+        fn statement(&mut self, node: &ruby_prism::Node<'_>, body: &mut Body) {
+            if let Some(class) = node.as_class_node() {
+                self.nested(body, class.constant_path().location().as_slice(), class.body());
+            } else if let Some(module) = node.as_module_node() {
+                self.nested(body, module.constant_path().location().as_slice(), module.body());
+            } else if let Some(singleton) = node.as_singleton_class_node() {
+                if singleton.expression().as_self_node().is_some() {
+                    let mut inner = Body { owner: body.owner.clone(), side: SINGLETON, public: true };
+                    self.statements(singleton.body(), &mut inner);
+                }
+            } else if let Some(def) = node.as_def_node() {
+                self.def(&def, body);
+            } else if let Some(alias) = node.as_alias_method_node() {
+                if let (Some(new), Some(old)) = (symbol(&alias.new_name()), symbol(&alias.old_name())) {
+                    let public = self.space(&body.owner).own[body.side].get(&old).copied().unwrap_or(body.public);
+                    self.define(body, body.side, new, public);
+                }
+            } else if let Some(call) = node.as_call_node() {
+                self.call(&call, body);
+            } else if let Some(branch) = node.as_if_node() {
+                self.statements(branch.statements().map(|s| s.as_node()), body);
+                self.statements(branch.subsequent(), body);
+            } else if let Some(other) = node.as_else_node() {
+                self.statements(other.statements().map(|s| s.as_node()), body);
+            } else if let Some(branch) = node.as_unless_node() {
+                self.statements(branch.statements().map(|s| s.as_node()), body);
+                self.statements(branch.else_clause().map(|e| e.as_node()), body);
+            } else if let Some(block) = node.as_begin_node() {
+                self.statements(block.statements().map(|s| s.as_node()), body);
+                self.statements(block.ensure_clause().and_then(|e| e.statements()).map(|s| s.as_node()), body);
+            }
+        }
+
+        fn def(&mut self, def: &ruby_prism::DefNode<'_>, body: &Body) -> String {
+            let name = text(def.name().as_slice());
+            let on_self = def.receiver().is_some_and(|r| r.as_self_node().is_some());
+            if def.receiver().is_some() && !on_self {
+                return name;
+            }
+            let (side, public) = if on_self { (SINGLETON, true) } else { (body.side, body.public) };
+            // `initialize` is private wherever it is written.
+            self.define(body, side, name.clone(), public && name != "initialize");
+            if on_self && matches!(name.as_str(), "included" | "append_features" | "prepended") {
+                self.hook(def, body);
+            }
+            name
+        }
+
+        /// `base.extend(X)` / `base.include(X)` / `base.prepend(X)` in a
+        /// module's inclusion hook: what every includer gets.
+        fn hook(&mut self, def: &ruby_prism::DefNode<'_>, body: &Body) {
+            struct Mixins<'b>(&'b [u8], Vec<(usize, String, bool)>);
+            impl<'pr> ruby_prism::Visit<'pr> for Mixins<'_> {
+                fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                    let on_base = node
+                        .receiver()
+                        .and_then(|r| r.as_local_variable_read_node())
+                        .is_some_and(|r| r.name().as_slice() == self.0);
+                    let side = match node.name().as_slice() {
+                        b"extend" => Some((SINGLETON, false)),
+                        b"include" => Some((INSTANCE, false)),
+                        b"prepend" => Some((INSTANCE, true)),
+                        _ => None,
+                    };
+                    if let (true, Some((side, prepended))) = (on_base, side) {
+                        for arg in node.arguments().iter().flat_map(|a| a.arguments().iter()) {
+                            if let Some(written) = constant(&arg) {
+                                self.1.push((side, written, prepended));
+                            }
+                        }
+                    }
+                    ruby_prism::visit_call_node(self, node);
+                }
+            }
+            let Some(base) = def
+                .parameters()
+                .and_then(|p| p.requireds().iter().next())
+                .and_then(|p| p.as_required_parameter_node())
+                .map(|p| p.name().as_slice().to_vec())
+            else {
+                return;
+            };
+            let Some(inner) = def.body() else { return };
+            let mut found = Mixins(&base, Vec::new());
+            ruby_prism::Visit::visit(&mut found, &inner);
+            let owner = body.owner.clone();
+            for (side, written, prepended) in found.1 {
+                self.space(&owner).includer_mixins[side].push((owner.clone(), written, prepended));
+            }
+        }
+
+        fn call(&mut self, call: &ruby_prism::CallNode<'_>, body: &mut Body) {
+            let name = call.name().as_slice();
+            let args: Vec<ruby_prism::Node<'_>> = call.arguments().iter().flat_map(|a| a.arguments().iter()).collect();
+            let symbols = || args.iter().filter_map(symbol).collect::<Vec<_>>();
+            if name == b"each" && self.literal_each(call, body) {
+                return;
+            }
+            // `singleton_class.prepend(X)` / `.include(X)`.
+            if let Some(receiver) = call.receiver() {
+                let on_singleton = receiver.as_call_node().is_some_and(|r| {
+                    r.name().as_slice() == b"singleton_class" && is_self(r.receiver()) && r.arguments().is_none()
+                });
+                if on_singleton && matches!(name, b"include" | b"prepend") {
+                    for written in args.iter().filter_map(constant) {
+                        self.space(&body.owner).mixins[SINGLETON].push((body.owner.clone(), written, name == b"prepend"));
+                    }
+                }
+                if receiver.as_self_node().is_none() {
+                    return;
+                }
+            }
+            let side = body.side;
+            match name {
+                b"private" | b"protected" | b"public" => {
+                    let public = name == b"public";
+                    if args.is_empty() {
+                        body.public = public;
+                    }
+                    for arg in &args {
+                        let named = match arg.as_def_node() {
+                            Some(def) => Some(self.def(&def, body)),
+                            None => symbol(arg),
+                        };
+                        if let Some(named) = named {
+                            self.define(body, side, named, public);
+                        }
+                    }
+                }
+                b"private_class_method" | b"public_class_method" => {
+                    for named in symbols() {
+                        self.define(body, SINGLETON, named, name == b"public_class_method");
+                    }
+                }
+                b"include" | b"prepend" | b"extend" => {
+                    let target = if name == b"extend" { SINGLETON } else { side };
+                    for written in args.iter().filter_map(constant) {
+                        self.space(&body.owner).mixins[target].push((body.owner.clone(), written, name == b"prepend"));
+                    }
+                }
+                b"attr_reader" | b"attr_writer" | b"attr_accessor" => {
+                    for named in symbols() {
+                        if name != b"attr_writer" {
+                            self.define(body, side, named.clone(), body.public);
+                        }
+                        if name != b"attr_reader" {
+                            self.define(body, side, format!("{named}="), body.public);
+                        }
+                    }
+                }
+                b"alias_method" => {
+                    if let [new, old, ..] = symbols().as_slice() {
+                        let public = self.space(&body.owner).own[side].get(old).copied().unwrap_or(body.public);
+                        self.define(body, side, new.clone(), public);
+                    }
+                }
+                b"define_method" => {
+                    if let Some(named) = args.first().and_then(|a| self.name_of(a)) {
+                        self.define(body, side, named, body.public);
+                    }
+                }
+                b"define_singleton_method" => {
+                    if let Some(named) = args.first().and_then(|a| self.name_of(a)) {
+                        self.define(body, SINGLETON, named, true);
+                    }
+                }
+                // `delegate :a, :b, to: :x`; a `prefix:` renames them.
+                b"delegate" => {
+                    let prefixed = args.iter().filter_map(|a| a.as_keyword_hash_node()).any(|hash| {
+                        hash.elements().iter().any(|e| e.as_assoc_node().is_some_and(|a| symbol(&a.key()).as_deref() == Some("prefix")))
+                    });
+                    if !prefixed {
+                        for named in symbols() {
+                            self.define(body, side, named, body.public);
+                        }
+                    }
+                }
+                b"class_attribute" | b"cattr_accessor" | b"mattr_accessor" | b"cattr_reader" | b"mattr_reader" => {
+                    let writer = !matches!(name, b"cattr_reader" | b"mattr_reader");
+                    for named in symbols() {
+                        for side in [INSTANCE, SINGLETON] {
+                            self.define(body, side, named.clone(), true);
+                            if writer {
+                                self.define(body, side, format!("{named}="), true);
+                            }
+                            if name == b"class_attribute" {
+                                self.define(body, side, format!("{named}?"), true);
+                            }
+                        }
+                    }
+                }
+                b"remove_method" | b"undef_method" => {
+                    for named in symbols() {
+                        self.space(&body.owner).removed[side].insert(named);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// `written` as Ruby resolves it from `scope`'s nesting: innermost
+        /// first, then outward, then top level.
+        fn resolve(&self, scope: &str, written: &str) -> Option<String> {
+            if let Some(top) = written.strip_prefix("::") {
+                return self.spaces.contains_key(top).then(|| top.to_string());
+            }
+            let mut at = Some(scope).filter(|s| !s.is_empty());
+            while let Some(prefix) = at {
+                let candidate = format!("{prefix}::{written}");
+                if self.spaces.contains_key(&candidate) {
+                    return Some(candidate);
+                }
+                at = prefix.rsplit_once("::").map(|(outer, _)| outer);
+            }
+            self.spaces.contains_key(written).then(|| written.to_string())
+        }
+
+        /// The methods `side` of `name` answers, by name → public, as its
+        /// ancestry orders them: included modules, then its own (less what
+        /// it removed), then prepended modules, each overriding the last.
+        fn answers(&self, name: &str, side: usize, seen: &mut HashSet<(String, usize)>, out: &mut HashMap<String, bool>) {
+            if !seen.insert((name.to_string(), side)) {
+                return;
+            }
+            let Some(space) = self.spaces.get(name) else { return };
+            let mut mixins: Vec<(String, bool, bool)> = Vec::new();
+            for (scope, written, prepended) in &space.mixins[side] {
+                if let Some(module) = self.resolve(scope, written) {
+                    mixins.push((module, *prepended, false));
+                }
+            }
+            // An included module's own hook mixes into this side too.
+            for (scope, written, _) in &space.mixins[INSTANCE] {
+                let Some(module) = self.resolve(scope, written) else { continue };
+                let Some(included) = self.spaces.get(&module) else { continue };
+                for (scope, written, prepended) in &included.includer_mixins[side] {
+                    if let Some(hooked) = self.resolve(scope, written) {
+                        mixins.push((hooked, *prepended, true));
+                    }
+                }
+            }
+            for (module, _, _) in mixins.iter().filter(|(_, prepended, _)| !prepended) {
+                self.answers(module, INSTANCE, seen, out);
+            }
+            for (method, public) in &space.own[side] {
+                if !space.removed[side].contains(method) {
+                    out.insert(method.clone(), *public);
+                }
+            }
+            for (module, _, _) in mixins.iter().filter(|(_, prepended, _)| *prepended) {
+                self.answers(module, INSTANCE, seen, out);
+            }
+        }
+    }
+
+    const OVERLAY: &str = "runtime/spinel/scaffold/ruby_overlay/runtime/";
+    const OVERLAY_FILES: &[&str] = &[
+        "active_record_bang.rb",
+        "active_record_serialization.rb",
+        "active_record_relation_ext.rb",
+        "active_record_postgresql_adapter.rb",
+        "active_record_statement_errors.rb",
+    ];
+    const PORTS: &[&str] = &[
+        "runtime/spinel/active_model_naming.rb",
+        "runtime/spinel/active_model_serialization.rb",
+        "runtime/spinel/active_support_tryable.rb",
+    ];
+
+    fn sources() -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = crate::runtime_files::ruby_sources()
+            .filter(|(path, _)| {
+                let flat = |dir: &str| path.strip_prefix(dir).is_some_and(|rest| !rest.contains('/'));
+                flat("runtime/ruby/active_record/") || flat("runtime/spinel/cruby/") || PORTS.contains(path)
+            })
+            .map(|(path, text)| (path.to_string(), text.to_string()))
+            .collect();
+        for file in OVERLAY_FILES {
+            let path = format!("{OVERLAY}{file}");
+            // The browser analyzer embeds no emit scaffold.
+            if let Some(text) = crate::runtime_files::read(&path) {
+                files.push((path, text.to_string()));
+            }
+        }
+        files
+    }
+
+    /// Per side: what `ActiveRecord::Base` answers, by name → public.
+    fn surface() -> &'static [HashMap<String, bool>; 2] {
+        static SURFACE: OnceLock<[HashMap<String, bool>; 2]> = OnceLock::new();
+        SURFACE.get_or_init(|| {
+            let mut walker = Walker::default();
+            for (_, text) in sources() {
+                let parsed = ruby_prism::parse(text.as_bytes());
+                if parsed.errors().next().is_some() {
+                    continue;
+                }
+                let root = parsed.node();
+                let top = root.as_program_node().map(|p| p.statements().as_node());
+                walker.statements(top, &mut Body { owner: String::new(), side: INSTANCE, public: true });
+            }
+            let mut sides: [HashMap<String, bool>; 2] = Default::default();
+            for (side, out) in sides.iter_mut().enumerate() {
+                walker.answers("ActiveRecord::Base", side, &mut HashSet::default(), out);
+                // Every object answers Object's runtime reopens (`try`).
+                walker.answers("Object", INSTANCE, &mut HashSet::default(), out);
+            }
+            sides
+        })
+    }
+
+    /// Whether the PostgreSQL CRuby tree's `ActiveRecord::Base` answers
+    /// `method` on its class side or on an instance: a method the runtime
+    /// defines (public, unless `self` is the receiver), or one Ruby's
+    /// Object (an instance) or Class (the class) answers by the vendored
+    /// core signatures (`public_send`, `respond_to?`, `name`).
+    pub(super) fn answers(method: &str, class_side: bool, explicit_receiver: bool) -> bool {
+        let side = &surface()[usize::from(class_side)];
+        if let Some(public) = side.get(method) {
+            return *public || !explicit_receiver;
+        }
+        crate::stdlib_rbs::core_instance_method(if class_side { "Class" } else { "Object" }, method)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::answers;
+
+        #[test]
+        fn the_postgresql_base_answers_what_its_runtime_defines() {
+            for (method, class_side) in [
+                ("current_transaction", true),
+                ("table_name", true),
+                ("primary_key", true),
+                ("where", true),
+                ("unscoped", true),
+                ("arel_table", true),
+                ("type_for_attribute", true),
+                ("connection_pool", true),
+                ("connection_db_config", true),
+                ("validators_on", true),
+                ("public_send", true),
+                ("name", true),
+                ("id", false),
+                ("has_attribute?", false),
+                ("saved_changes", false),
+                ("reload", false),
+                ("try", false),
+                ("public_send", false),
+                ("attribute_names", false),
+                // `[:save, :create, :update, :destroy].each` in
+                // active_record_callbacks.rb's ClassMethods.
+                ("after_create", true),
+                ("around_save", true),
+                ("before_destroy", true),
+            ] {
+                assert!(answers(method, class_side, true), "{method} (class side: {class_side})");
+            }
+        }
+
+        #[test]
+        fn the_postgresql_base_does_not_answer_what_no_runtime_defines() {
+            for (method, class_side) in [
+                ("some_unknown_ar_api", true),
+                ("some_unknown_ar_api", false),
+                ("sanitize_sql_like", true),
+                ("base_class", true),
+                // Class side only: an instance has no `table_name`.
+                ("table_name", false),
+                ("current_transaction", false),
+                // Instance side only.
+                ("id", true),
+                // Private on the runtime base: not for an explicit receiver.
+                ("initialize", false),
+            ] {
+                assert!(!answers(method, class_side, true), "{method} (class side: {class_side})");
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
