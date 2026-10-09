@@ -191,6 +191,17 @@ fn lower_model_delegates(
     if calls.is_empty() {
         return;
     }
+    // A method written above a `delegate` that names it, in the same
+    // file, is one Rails' later `module_eval` redefines: the forwarder
+    // replaces it. One written below the declaration (or in another
+    // file, a concern's) stands, and the declaration skips that name.
+    let replaced_by = |m: &MethodDef, call: &Expr| {
+        m.receiver == MethodReceiver::Instance
+            && m.name_span.file == call.span.file
+            && m.name_span.start < call.span.start
+            && delegated_names(call).iter().any(|n| n == m.name.as_str())
+    };
+    let declarations = calls.clone();
     let mut lc = LibraryClass {
         conditional_definitions: Vec::new(),
         method_aliases: Vec::new(),
@@ -200,7 +211,7 @@ fn lower_model_delegates(
         parent: model.parent.clone(),
         parent_span: Default::default(),
         includes: Vec::new(),
-        methods: model.methods().cloned().collect(),
+        methods: model.methods().filter(|m| !calls.iter().any(|c| replaced_by(m, c))).cloned().collect(),
         nullable_columns: Vec::new(),
         origin: None,
         constants: Vec::new(),
@@ -211,10 +222,19 @@ fn lower_model_delegates(
     let (methods, full, declined) = expand_delegates_declining(&mut lc, decline);
     // The declarations the expansion consumed: those it left are declined.
     let left: Vec<crate::span::Span> = lc.unknown_calls.iter().map(|e| e.span).collect();
+    // The earlier methods a consumed declaration's forwarder replaced.
+    let replaced = |m: &MethodDef| {
+        methods.iter().any(|f| f.receiver == MethodReceiver::Instance && f.name == m.name)
+            && declarations.iter().any(|c| !left.contains(&c.span) && replaced_by(m, c))
+    };
+    let replaced: Vec<crate::span::Span> =
+        model.methods().filter(|m| replaced(m)).map(|m| m.name_span).collect();
     let mut by_file_pos: Vec<MethodDef> = methods;
     let mut body = Vec::with_capacity(model.body.len());
     for item in std::mem::take(&mut model.body) {
         match item {
+            ModelBodyItem::Method { ref method, .. }
+                if method.receiver == MethodReceiver::Instance && replaced.contains(&method.name_span) => {}
             ModelBodyItem::Unknown { expr, leading_comments, leading_blank_line }
                 if is_delegate(&expr) && !left.contains(&expr.span) =>
             {
