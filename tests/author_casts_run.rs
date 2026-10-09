@@ -432,7 +432,7 @@ fn author_casts_emit_the_value_or_the_check() {
         assert!(!caster.contains(conversion), "{conversion} in\n{caster}");
     }
     let at = lib_line;
-    let path = "File.expand_path(\"../../lib/caster.rb\", __dir__)";
+    let path = "::File.expand_path(\"../../lib/caster.rb\", __dir__)";
     for expected in [
         "    @held = values.first\n".to_string(),
         "    @maybe = nil\n    @names = []\n".to_string(),
