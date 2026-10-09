@@ -653,87 +653,104 @@ fn resolve_fk_id(
 /// = rooms(:pets).attachable_sgid.split("--")` kept its bare fixture
 /// call — `undefined method 'rooms'` on the ruby lane, a compile error
 /// on spinel — while the plain assignment beside it was rewritten.
+///
+/// The rewritten reader keeps the argument SLOT's keyword marks
+/// (`lower::keyword_marks`). A test class's own keyword helper — one it
+/// defines, or one spliced in from an included helper module — has its
+/// calls respelled to marked positionals by `helper_kwargs` before this
+/// runs, so `build_cart_transforms(shop: @shop, api_client:
+/// api_clients(:translation_app))` reaches here with the fixture call
+/// marked `api_client`. A fresh `Expr` drops that mark, and the ruby
+/// family wrote `build_cart_transforms(shop: @shop,
+/// ApiClientsFixtures.translation_app)`, which does not parse (Core's
+/// `cart_transforms_test.rb`, unit-1000).
 pub fn rewrite_fixture_calls(body: &Expr, fixture_names: &[Symbol]) -> Expr {
     map_expr(body, &|e| {
-        let ExprNode::Send {
-            recv: None,
-            method,
-            args,
-            block: None,
-            ..
-        } = &*e.node
-        else {
-            return None;
-        };
-        if !fixture_names.iter().any(|f| f == method) {
-            return None;
-        }
-        if args.is_empty() {
-            return None;
-        }
-        let owner = format!("{}Fixtures", camelize(method.as_str()));
-        let owner_id = ClassId(Symbol::from(owner.clone()));
-        let class_const = || {
-            with_ty(
-                Expr::new(
-                    e.span,
-                    ExprNode::Const { path: vec![Symbol::from(owner.as_str())] },
-                ),
-                Ty::Class { id: owner_id.clone(), args: vec![] },
-            )
-        };
-        // One argument → one record.
-        //
-        // `users(:david)` — the label is known here, so bind straight to
-        // the generated reader. Concrete dispatch, no table lookup.
-        // `users(name)` — the label is a value. Rails allows it and
-        // campfire's `SessionTestHelper#sign_in` writes it, so route it
-        // through the generated `by_label` table rather than leaving a
-        // bare `users(...)` that resolves to nothing.
-        let one = |arg: &Expr| -> Expr {
-            if let ExprNode::Lit { value: Literal::Sym { value: label } } = &*arg.node {
-                return Expr::new(
-                    e.span,
-                    ExprNode::Send {
-                        recv: Some(class_const()),
-                        method: label.clone(),
-                        args: vec![],
-                        block: None,
-                        parenthesized: true,
-                    },
-                );
-            }
+        let mut rewritten = rewrite_fixture_call(e, fixture_names)?;
+        crate::lower::keyword_marks::SlotMarks::of(e).restore(&mut rewritten);
+        Some(rewritten)
+    })
+}
+
+fn rewrite_fixture_call(e: &Expr, fixture_names: &[Symbol]) -> Option<Expr> {
+    let ExprNode::Send {
+        recv: None,
+        method,
+        args,
+        block: None,
+        ..
+    } = &*e.node
+    else {
+        return None;
+    };
+    if !fixture_names.iter().any(|f| f == method) {
+        return None;
+    }
+    if args.is_empty() {
+        return None;
+    }
+    let owner = format!("{}Fixtures", camelize(method.as_str()));
+    let owner_id = ClassId(Symbol::from(owner.clone()));
+    let class_const = || {
+        with_ty(
             Expr::new(
+                e.span,
+                ExprNode::Const { path: vec![Symbol::from(owner.as_str())] },
+            ),
+            Ty::Class { id: owner_id.clone(), args: vec![] },
+        )
+    };
+    // One argument → one record.
+    //
+    // `users(:david)` — the label is known here, so bind straight to
+    // the generated reader. Concrete dispatch, no table lookup.
+    // `users(name)` — the label is a value. Rails allows it and
+    // campfire's `SessionTestHelper#sign_in` writes it, so route it
+    // through the generated `by_label` table rather than leaving a
+    // bare `users(...)` that resolves to nothing.
+    let one = |arg: &Expr| -> Expr {
+        if let ExprNode::Lit { value: Literal::Sym { value: label } } = &*arg.node {
+            return Expr::new(
                 e.span,
                 ExprNode::Send {
                     recv: Some(class_const()),
-                    method: Symbol::from("by_label"),
-                    args: vec![arg.clone()],
+                    method: label.clone(),
+                    args: vec![],
                     block: None,
                     parenthesized: true,
                 },
-            )
-        };
-        if args.len() == 1 {
-            return Some(one(&args[0]));
+            );
         }
-        // Rails' accessor is `def users(*names)`, and with more than one
-        // name it answers the ARRAY of those records — campfire's
-        // account page test reads `users(:david, :jason).map(&:name)`.
-        // Left unrewritten this stayed a bare `users(:david, :jason)`
-        // that resolved to nothing, which is the same silent hole the
-        // value-label case above was opened to close, one arity over.
-        //
-        // An Array LITERAL of the per-label readers, not a call to a
-        // variadic helper: each element is the same concrete dispatch
-        // the single-argument form emits, so the array's element type
-        // follows from its members and no target needs a splat.
-        Some(Expr::new(
+        Expr::new(
             e.span,
-            ExprNode::Array {
-                elements: args.iter().map(one).collect(),
-                style: crate::expr::ArrayStyle::Brackets,
+            ExprNode::Send {
+                recv: Some(class_const()),
+                method: Symbol::from("by_label"),
+                args: vec![arg.clone()],
+                block: None,
+                parenthesized: true,
             },
-        ))
-    })
+        )
+    };
+    if args.len() == 1 {
+        return Some(one(&args[0]));
+    }
+    // Rails' accessor is `def users(*names)`, and with more than one
+    // name it answers the ARRAY of those records — campfire's
+    // account page test reads `users(:david, :jason).map(&:name)`.
+    // Left unrewritten this stayed a bare `users(:david, :jason)`
+    // that resolved to nothing, which is the same silent hole the
+    // value-label case above was opened to close, one arity over.
+    //
+    // An Array LITERAL of the per-label readers, not a call to a
+    // variadic helper: each element is the same concrete dispatch
+    // the single-argument form emits, so the array's element type
+    // follows from its members and no target needs a splat.
+    Some(Expr::new(
+        e.span,
+        ExprNode::Array {
+            elements: args.iter().map(one).collect(),
+            style: crate::expr::ArrayStyle::Brackets,
+        },
+    ))
 }
