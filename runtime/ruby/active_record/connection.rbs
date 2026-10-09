@@ -56,6 +56,7 @@ module ActiveRecord
     def self.sanitize_sql: (Array[untyped] statement) -> String
     def self.sanitize_sql_array: (Array[untyped] statement) -> String
     def self.uncached: () { () -> untyped } -> untyped
+    def self.sanitize_sql_like: (String string, ?String escape_character) -> String
     def self.transaction: (?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
     def self.delete_all: () -> Integer
@@ -68,6 +69,13 @@ module ActiveRecord
     def self.abstract_class: () -> bool?
     def self.abstract_class=: (bool? value) -> bool?
     def self.abstract_class?: () -> bool
+    def self.base_class: () -> untyped
+    def self.base_class?: () -> bool
+    def self.store_full_class_name: () -> bool
+    def self.store_full_class_name=: (bool value) -> bool
+    def self.store_full_class_name?: () -> bool
+    def self.polymorphic_name: () -> String
+    def self.polymorphic_class_for: (String name) -> untyped
     def self.schema_column_types: () -> Hash[String, Array[(Symbol | Integer | String)?]]
     def self.type_for_attribute: (String | Symbol attribute_name) ?{ (String) -> ActiveModel::Type::Value } -> ActiveModel::Type::Value
     def self.attribute_types: () -> Hash[String, ActiveModel::Type::Value]
@@ -136,7 +144,11 @@ module ActiveRecord
     def _attribute_snapshot: () -> Hash[String, untyped]
     def _note_hydrated: () -> void
     def _note_unloaded: (Hash[String, untyped] row) -> nil
-    def has_attribute?: (Symbol name) -> bool
+    def has_attribute?: (String | Symbol attr_name) -> bool
+    def _has_attribute?: (untyped attr_name) -> bool
+    def self.has_attribute?: (String | Symbol attr_name) -> bool
+    def self._has_attribute?: (untyped attr_name) -> bool
+    def self.reflect_on_all_associations: (?Symbol? macro) -> Array[untyped]
     def attribute_previously_was: (String name) -> untyped
     def self.first: () -> Base?
     def self.take: () -> Base?

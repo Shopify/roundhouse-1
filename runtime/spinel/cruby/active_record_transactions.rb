@@ -791,7 +791,11 @@ module ActiveRecord
         end
     end
 
-    class PostgreSQLAdapter
+    # abstract_adapter.rb and its abstract/database_statements.rb and
+    # abstract/savepoints.rb: on AbstractAdapter, so a module prepended to
+    # it (Core's TransactionConnectionTracker) wraps `transaction` on the
+    # live PostgreSQL adapter.
+    class AbstractAdapter
       # Rails 8.2 AbstractAdapter#pinned: held by ConnectionPool#pin_connection!.
       attr_accessor :pinned # :nodoc:
 
@@ -952,6 +956,30 @@ module ActiveRecord
         query_command("RELEASE SAVEPOINT #{name}", "TRANSACTION")
       end
 
+      def savepoint_errors_invalidate_transactions?
+        false
+      end
+
+      # Rails' transaction_manager.restorable?, with the session's own
+      # transaction state as well (see the header).
+      def reconnect_can_restore_state?
+        super && transaction_manager.restorable?
+      end
+
+      # AbstractAdapter#throw_away!: the session is closed; the adapter
+      # stays in the runtime's pool and connects anew at its next use (the
+      # runtime's pools do not remove adapters).
+      def throw_away!
+        disconnect!
+      end
+
+      def clear_cache!(new_connection: false)
+        nil
+      end
+    end
+
+    # postgresql_adapter.rb's overrides of the abstract members above.
+    class PostgreSQLAdapter
       def supports_savepoints?
         true
       end
@@ -960,22 +988,12 @@ module ActiveRecord
         true
       end
 
-      def savepoint_errors_invalidate_transactions?
-        false
-      end
-
       def supports_restart_db_transaction?
         database_version >= 12_00_00 # >= 12.0
       end
 
       def database_version # :nodoc:
         @database_version ||= valid_raw_connection.server_version
-      end
-
-      # Rails' transaction_manager.restorable?, with the session's own
-      # transaction state as well (see the header).
-      def reconnect_can_restore_state?
-        super && transaction_manager.restorable?
       end
 
       # Rails 8.2 PostgreSQLAdapter#reset! over AbstractAdapter#reset!.
@@ -993,17 +1011,6 @@ module ActiveRecord
             configure_connection
           end
         end
-      end
-
-      # AbstractAdapter#throw_away!: the session is closed; the adapter
-      # stays in the runtime's pool and connects anew at its next use (the
-      # runtime's pools do not remove adapters).
-      def throw_away!
-        disconnect!
-      end
-
-      def clear_cache!(new_connection: false)
-        nil
       end
     end
 
