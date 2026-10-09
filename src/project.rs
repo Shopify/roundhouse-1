@@ -7563,6 +7563,36 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         anchors.map(|a| as_loaded(a)).filter(|a| seen.insert(a.clone())).collect()
     };
+    // The namespaces each boot file is nested under whose own file is a
+    // constant's autoload, outermost first. The boot loop references
+    // each into loading before the file (`RoundhouseAutoload.load_boot_file`),
+    // as Zeitwerk loads a namespace's file before its children's, and
+    // the requires between nested files assume that order
+    // (`require_namespace_files_first` skips the enclosing namespaces).
+    // Required first instead, Core's pagination/ast.rb's split child
+    // `Ast::ElasticSearch::FilterChildNode` (its Struct and the class
+    // reopened for its constants, so no one constant and a boot file)
+    // required ../node_interface, whose `module Ast` autoloaded ast.rb,
+    // whose requires of its children reached node_interface.rb while it
+    // was loading: a circular require, which StrictWarning raises.
+    let file_cpaths: BTreeMap<&str, String> = namespaces
+        .iter()
+        .flat_map(|(namespace, children)| {
+            children.iter().filter_map(move |(name, child)| {
+                let cpath = if namespace == "Object" { name.clone() } else { format!("{namespace}::{name}") };
+                child.file.as_deref().map(|file| (file, cpath))
+            })
+        })
+        .collect();
+    let mut boot_namespaces: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for anchor in &boot_files {
+        let segments: Vec<&str> = anchor.split('/').collect();
+        let cpaths: Vec<String> =
+            (2..segments.len()).filter_map(|n| file_cpaths.get(segments[..n].join("/").as_str()).cloned()).collect();
+        if !cpaths.is_empty() {
+            boot_namespaces.entry(as_loaded(anchor)).or_insert(cpaths);
+        }
+    }
     let boot_files: Vec<String> = loaded_list(&mut boot_files.iter().copied());
     // The programs a constant's autoload (or the boot files) loads.
     let mut autoloaded: std::collections::BTreeSet<String> = boot_files.iter().cloned().collect();
@@ -7624,6 +7654,11 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         })
         .collect();
     write!(body, "  BOOT_FILES = [\n{}  ].freeze\n", list(&mut boot_files.iter().map(String::as_str))).unwrap();
+    body.push_str("  # boot file => the namespaces it is nested under whose files load first\n  BOOT_NAMESPACES = {\n");
+    for (file, cpaths) in &boot_namespaces {
+        writeln!(body, "    {file:?} => {cpaths:?},").unwrap();
+    }
+    body.push_str("  }.freeze\n");
     let all_files = loaded_list(
         &mut models
             .iter()
@@ -7700,6 +7735,21 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     for (program, constants) in &program_constants {
         let pairs: Vec<String> = constants.iter().map(|(ns, name)| format!("[{ns:?}, :{name}]")).collect();
         writeln!(body, "    {program:?} => [{}],", pairs.join(", ")).unwrap();
+    }
+    body.push_str("  }.freeze\n");
+    // Each declarations file whose source has a file program: an autoload
+    // the app registers at run time for that file loads the program
+    // (`RoundhouseAutoload.autoload_target`), as Ruby's autoload of the
+    // source runs the whole file.
+    let mut declaration_programs: BTreeMap<&str, &str> = BTreeMap::new();
+    for (anchor, program) in program_of_file.iter().chain(&in_place_program) {
+        if emitted_file(anchor) {
+            declaration_programs.entry(anchor.as_str()).or_insert(program.as_str());
+        }
+    }
+    body.push_str("  # declarations file => the file program of its source\n  DECLARATION_PROGRAMS = {\n");
+    for (anchor, program) in &declaration_programs {
+        writeln!(body, "    {anchor:?} => {program:?},").unwrap();
     }
     body.push_str("  }.freeze\n");
     let autoloaded_programs: Vec<String> = program_constants.keys().cloned().collect();
@@ -7880,7 +7930,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
         );
     }
     body.push_str(
-        "RoundhouseAutoload::BOOT_FILES.each { |file| require File.expand_path(\"#{file}.rb\", RoundhouseAutoload::ROOT) }\n",
+        "RoundhouseAutoload::BOOT_FILES.each { |file| RoundhouseAutoload.load_boot_file(file) }\n",
     );
     if !railtie_files.is_empty() {
         body.push_str("[\n");
@@ -8522,6 +8572,45 @@ const AUTOLOAD_RUNTIME: &str = r##"
     ALL_FILES.each { |file| require path(file) unless shadowed_file?(file) }
   end
 
+  # A boot file nested under namespaces that have files of their own
+  # (BOOT_NAMESPACES): each namespace is referenced into loading first,
+  # outermost first, as Zeitwerk loads a namespace's file before its
+  # children's. One already defined, or not registered, is left as it is.
+  def self.load_boot_file(file)
+    (BOOT_NAMESPACES[file] || []).each do |cpath|
+      cpath.split("::").inject(Object) do |mod, name|
+        break unless mod.is_a?(Module) && mod.const_defined?(name, false)
+        mod.const_get(name, false)
+      end
+    end
+    require path(file)
+  end
+
+  # The file an autoload the app registers at run time loads: for a
+  # declarations file whose source has a file program
+  # (DECLARATION_PROGRAMS), the program, as Ruby's autoload of the source
+  # runs the whole file, its requires before its declarations. Core's
+  # Component::Config.inherited autoloads `config/test.rb` beside the
+  # file `Object.const_source_location` names, which in this tree is the
+  # declarations of PlatformComponent::Essentials::Config::Test: loaded
+  # alone, the requires of its program (the test cache stores) never ran.
+  def self.autoload_target(file)
+    text = file.respond_to?(:to_path) ? file.to_path : file
+    return file unless text.is_a?(String) && File.absolute_path?(text)
+    full = File.expand_path(text)
+    prefix = "#{ROOT}/"
+    return file unless full.start_with?(prefix)
+    program = DECLARATION_PROGRAMS[full[prefix.length..].delete_suffix(".rb")]
+    program ? path(program) : file
+  end
+
+  module AutoloadThroughProgram
+    def autoload(name, file)
+      return super if RoundhouseAutoload.registering_autoload?
+      super(name, RoundhouseAutoload.autoload_target(file))
+    end
+  end
+
   # The trailer of the file a constant's autoload loads, for a constant a
   # Zeitwerk `on_load("Cpath")` callback names (AUTOLOAD_CALLBACK_CPATHS):
   # the loaders run its callbacks with its value and the file, as
@@ -8589,6 +8678,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
     end
   end
   Module.prepend(ConstAdded)
+  Module.prepend(AutoloadThroughProgram)
 "##;
 
 /// Replace the scaffold `main.rb`'s blog-hardcoded
@@ -12393,7 +12483,24 @@ fn apply_locked_bundled_gems(files: &mut Vec<(String, String)>, lock: Option<&cr
             boot.insert_str(0, "require_relative \"runtime/bundled_gems\"\n");
         }
     }
+    // And before the test helper's own requires, which run before it
+    // requires boot.rb: a test file loads test/test_helper.rb first, and
+    // the test gems' requires there (`apply_test_gem_wiring`) and the
+    // stdlib ones (`with_bundled_requires`) come ahead of boot. mocha
+    // 2.5.0's parameter_matchers/equivalent_uri.rb requires "cgi", which
+    // then loaded Ruby 4.0's stub, and vcr's `CGI.method(:parse)` raised
+    // NameError for every Core test. Under Rails, Bundler.setup runs
+    // before any of them. `insert_require_line` keeps this line first.
+    if let Some((_, helper)) = files.iter_mut().find(|(p, _)| p == "test/test_helper.rb") {
+        if !helper.contains(TEST_HELPER_BUNDLED_GEMS) {
+            insert_require_line(helper, TEST_HELPER_BUNDLED_GEMS);
+        }
+    }
 }
+
+/// test/test_helper.rb's activation of the locked bundled gems
+/// (`apply_locked_bundled_gems`).
+const TEST_HELPER_BUNDLED_GEMS: &str = "require_relative \"../runtime/bundled_gems\"";
 
 /// The CRuby tree runs as plain `ruby` on the gem home's GEM_PATH, with no
 /// Bundler, and RubyGems never sees a `GIT` gem: Bundler checks it out
@@ -13605,12 +13712,24 @@ fn write_bundled_require_lines(files: &mut [(String, String)]) {
 /// which Core's StrictWarning (components/platform/essentials/lib/
 /// strict_warnings.rb) raises as an offense when the file loads after
 /// boot. A shebang stays the first line.
+///
+/// Also after a leading boot prelude (`boot_prelude_require`): the
+/// activation of the locked gems, and a test file's require of the test
+/// helper, which activates them and boots. A require written above it
+/// loads whatever RubyGems finds first, not the locked gem, as Bundler.setup
+/// running first would have it: the test helper's `require "mocha/api"`
+/// loaded Ruby 4.0's cgi stub ahead of the locked cgi 0.4.2.
 fn insert_require_line(content: &mut String, line: &str) {
     let mut at = 0;
+    let mut in_magic = true;
     for (n, text) in content.split_inclusive('\n').enumerate() {
         let trimmed = text.trim_end();
-        let magic = (n == 0 && trimmed.starts_with("#!")) || ruby_magic_comment(trimmed);
-        if !magic {
+        if in_magic && ((n == 0 && trimmed.starts_with("#!")) || ruby_magic_comment(trimmed)) {
+            at += text.len();
+            continue;
+        }
+        in_magic = false;
+        if !boot_prelude_require(trimmed) {
             break;
         }
         at += text.len();
@@ -13636,6 +13755,29 @@ fn ruby_magic_comment(line: &str) -> bool {
         key.as_str(),
         "frozen_string_literal" | "encoding" | "coding" | "warn_indent" | "shareable_constant_value" | "warn_past_scope"
     )
+}
+
+/// A file's leading require that stands for Bundler.setup and so stays
+/// ahead of every require written into the file (`insert_require_line`):
+/// runtime/bundled_gems.rb, which activates the locked gems
+/// (`apply_locked_bundled_gems`), or a test file's test helper, which
+/// requires it and then boots. `test_helpers/session_test_helper` is a
+/// helper of the app's, not the test helper.
+fn boot_prelude_require(line: &str) -> bool {
+    let Some(path) = line
+        .strip_prefix("require_relative \"")
+        .or_else(|| line.strip_prefix("require \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return false;
+    };
+    let path = path.strip_suffix(".rb").unwrap_or(path);
+    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+    match file {
+        "bundled_gems" => dir.is_empty() || dir == "runtime" || dir.ends_with("/runtime"),
+        "test_helper" => dir.is_empty() || dir.split('/').all(|part| part == ".." || part == "."),
+        _ => false,
+    }
 }
 
 /// The emitted call every declared variant lowers to (`lower::attached
