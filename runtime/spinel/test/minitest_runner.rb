@@ -847,6 +847,33 @@ RequestDispatch.prepend(RoundhouseResponseAssertions) if defined?(RequestDispatc
 # methods/overrides and setup/teardown super chains retain their precedence.
 TestBase.prepend(RoundhouseMinitestAssertions)
 
+# Minitest::Test::LifecycleHooks (minitest 5.27): the four hooks around
+# setup and teardown, empty at the bottom of the chain so a module's
+# override reaches them with `super`. Core's TestAccessBlocker, a Module
+# its test helpers include, defines `before_setup` (block, then `super()`)
+# and `after_teardown` (`super()`, then unblock); without these its
+# `super` had no method to reach. Included after TestBase's own modules,
+# each passes on to one of theirs below it (ActiveSupport's TimeHelpers
+# travels back in `after_teardown`).
+module RoundhouseMinitestLifecycleHooks
+  def before_setup
+    super if defined?(super)
+  end
+
+  def after_setup
+    super if defined?(super)
+  end
+
+  def before_teardown
+    super if defined?(super)
+  end
+
+  def after_teardown
+    super if defined?(super)
+  end
+end
+TestBase.include(RoundhouseMinitestLifecycleHooks)
+
 # ---- ActiveSupport::Testing::SetupAndTeardown (ActiveSupport 8.2) ----
 #
 # The `setup` and `teardown` class macros that app code calls as it runs
@@ -1093,12 +1120,19 @@ module RoundhouseTestRunner
           test.__roundhouse_setup_active_record_fixtures(name)
         end
         test.__roundhouse_setup_fixtures
+        # Minitest's before_setup hook (`RoundhouseMinitestLifecycleHooks`),
+        # where a test's own modules define it; the fixture and callback
+        # phases its native `super` chain reaches are the runner's own
+        # steps around it.
+        test.before_setup if test.respond_to?(:before_setup)
         # ActiveSupport's before_setup: run_callbacks :setup.
         RoundhouseTestCallbacks.run_setup(test) if test.class.is_a?(RoundhouseTestCallbacks::ClassMethods)
         test.__roundhouse_before_setup
         test.setup
+        test.after_setup if test.respond_to?(:after_setup)
       end
       capture(errors, "test") { test.public_send(name) } if errors.empty?
+      capture(errors, "teardown") { test.before_teardown } if test.respond_to?(:before_teardown)
       # Minitest's before_teardown, where mocha/minitest verifies, and
       # only a test that passed (`return unless passed?`): the stub slots'
       # and mocha's expectations (`__roundhouse_verify_stubs`, the helper's).

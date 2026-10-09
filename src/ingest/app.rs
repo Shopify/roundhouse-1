@@ -3520,12 +3520,12 @@ fn keep_carried_body_statements(app: &mut App) {
         .map(|lc| {
             // Only its own literal-list calls can answer: skip the
             // (name-scanning) drop verdict for a class with none.
-            if !lc.unknown_calls.iter().any(is_literal_list_call) {
+            if !lc.unknown_calls.iter().any(|c| is_literal_list_call(c) || is_computed_mixin_call(c)) {
                 return Vec::new();
             }
             crate::emit::ruby::dropped_class_body_calls(lc, app)
                 .into_iter()
-                .filter(|c| is_literal_list_call(c))
+                .filter(|c| is_literal_list_call(c) || is_computed_mixin_call(c))
                 .filter_map(|c| lc.unknown_calls.iter().position(|u| std::ptr::eq(u, c)))
                 .collect()
         })
@@ -3604,6 +3604,26 @@ fn keep_carried_body_statements(app: &mut App) {
 /// `[…].m …` / `%i[…].m …`: a call whose receiver is a literal list.
 fn is_literal_list_call(call: &crate::expr::Expr) -> bool {
     matches!(&*call.node, crate::expr::ExprNode::Send { recv: Some(r), .. } if matches!(&*r.node, crate::expr::ExprNode::Array { .. }))
+}
+
+/// `include <expr>` / `self.include(<expr>)` (or `extend`, `prepend`)
+/// of a module computed as the body loads: Core's test helpers'
+/// `self #: untyped .include(@test_access_blocker)`, a `TestAccessBlocker
+/// < Module` instance. Ingest keeps it as a class-body call, replayed
+/// where the body replays; elsewhere it is a body statement like a
+/// literal-list call, kept in place where it can be.
+fn is_computed_mixin_call(call: &crate::expr::Expr) -> bool {
+    use crate::expr::ExprNode;
+    matches!(&*call.node, ExprNode::Send { recv, method, args, block: None, .. }
+        if matches!(method.as_str(), "include" | "extend" | "prepend")
+            && recv.as_ref().is_none_or(|r| match &*r.node {
+                ExprNode::SelfRef => true,
+                // `self #: untyped` / `self #: as untyped`
+                ExprNode::Cast { value, .. } => matches!(&*value.node, ExprNode::SelfRef),
+                _ => false,
+            })
+            && !args.is_empty()
+            && args.iter().any(|a| !matches!(&*a.node, ExprNode::Const { .. })))
 }
 
 /// The `file_statement_unsupported` gap of a literal-list call the body

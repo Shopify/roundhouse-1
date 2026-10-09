@@ -72,7 +72,7 @@ pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModu
     // in a test directory often declares one, and it has no tests.
     if test_nodes.is_empty() {
         let mut helper_nodes = helper_nodes;
-        let Some(first) = helper_nodes.iter().position(|(scope, _)| scope.is_empty()) else {
+        let Some(first) = helper_nodes.iter().position(|(scope, c)| scope.is_empty() && may_be_test_class(c)) else {
             refuse_unreached_test_classes(&root, &[], file)?;
             return Ok(Vec::new());
         };
@@ -299,6 +299,24 @@ fn refuse_unreached_test_classes(root: &Node<'_>, reached: &[ScopedClass<'_>], f
         }))?;
     }
     Ok(())
+}
+
+/// The fallback's candidate (`ingest_test_files`): a top-level class
+/// that is not test-shaped is still taken as the file's test when it
+/// declares tests, or inherits from a class named like one
+/// (`class Variant < ProductBaseTest`), which may give it its tests. A
+/// class that does neither is a support class: Core's
+/// test/support/test_access_blocker.rb declares only
+/// `class TestAccessBlocker < Module`, which tests include as a module,
+/// and taking it for a test kept it out of the library tree.
+fn may_be_test_class(c: &ruby_prism::ClassNode<'_>) -> bool {
+    if declares_tests(c) {
+        return true;
+    }
+    c.superclass()
+        .and_then(|parent| constant_path_of(&parent))
+        .and_then(|path| path.last().cloned())
+        .is_some_and(|last| last.ends_with("Test") || last.ends_with("TestCase") || last.ends_with("Spec"))
 }
 
 /// The class body declares at least one test: `test "…"` with arguments
@@ -1931,16 +1949,29 @@ end
         assert!(tms.is_empty());
     }
 
-    // A class nested in a top-level support class is that class's
-    // constant (`MockStore::Bucket`), so two support files' `Bucket`s
-    // stay two classes. So is a test class's own (`StoreTest::Bucket`),
-    // whose `name` is that in Ruby.
+    // A top-level support class that declares no tests and inherits from
+    // no class named like a test (`class MockStore`, Core's `class
+    // TestAccessBlocker < Module`) is not the file's test: the file is a
+    // support file, carried as a library file. One that declares tests,
+    // or inherits a test-named base, still is.
     #[test]
-    fn a_support_class_namespaces_its_nested_classes() {
+    fn a_top_level_support_class_is_not_a_test() {
         let src = "class MockStore\n  class Bucket\n    def x\n      1\n    end\n  end\nend\n";
-        let tms = ingest_test_files(src.as_bytes(), "mock_store.rb").expect("ingest");
-        let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
-        assert_eq!(names, ["MockStore::Bucket"]);
+        assert!(ingest_test_files(src.as_bytes(), "mock_store.rb").expect("ingest").is_empty());
+        let src = "class TestAccessBlocker < Module\n  def initialize(name)\n    super()\n  end\nend\n";
+        assert!(ingest_test_files(src.as_bytes(), "test_access_blocker.rb").expect("ingest").is_empty());
+        let src = "class Variant < ProductBaseTest\nend\n";
+        let tms = ingest_test_files(src.as_bytes(), "variant.rb").expect("ingest");
+        assert_eq!(tms.iter().map(|tm| tm.name.0.as_str()).collect::<Vec<_>>(), ["Variant"]);
+        let src = "class Checks\n  def test_one\n    assert true\n  end\nend\n";
+        let tms = ingest_test_files(src.as_bytes(), "checks.rb").expect("ingest");
+        assert_eq!(tms.iter().map(|tm| tm.name.0.as_str()).collect::<Vec<_>>(), ["Checks"]);
+    }
+
+    // A class nested in a test class is that class's constant
+    // (`StoreTest::Bucket`), whose `name` is that in Ruby.
+    #[test]
+    fn a_test_class_namespaces_its_nested_classes() {
         let src = "class StoreTest < ActiveSupport::TestCase\n  class Bucket\n  end\n\n  test \"t\" do\n    assert true\n  end\nend\n";
         let tms = ingest_test_files(src.as_bytes(), "store_test.rb").expect("ingest");
         let names: Vec<&str> = tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();

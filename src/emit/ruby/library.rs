@@ -11639,11 +11639,18 @@ pub(crate) fn carries_body_statement(lc: &LibraryClass, call: &Expr, app: &App) 
         return false;
     }
     let replays = carried_railtie(lc, app) || replays_foreign_base(lc, app);
-    if !replays && (is_concern_body(lc) || !self_calls_answered(lc, call)) {
+    // A Concern's own body statement runs once, on the module, as the
+    // module loads (its `included do` is what runs on each includer);
+    // the emitted module is a plain one its includers include.
+    if !replays && !self_calls_answered(lc, call) {
         return false;
     }
+    // The emitted module writes no `extend ActiveSupport::Concern`
+    // (`modelled_elsewhere`), so it is no mixin the statement could
+    // be reordered against.
+    let written_mixin = |c: &Expr| statement_mixes_in(c) && !(lc.is_module && is_concern_extend(c));
     if statement_mixes_in(call)
-        && (!lc.includes.is_empty() || lc.unknown_calls.iter().any(|c| !std::ptr::eq(c, call) && statement_mixes_in(c)))
+        && (!lc.includes.is_empty() || lc.unknown_calls.iter().any(|c| !std::ptr::eq(c, call) && written_mixin(c)))
     {
         return false;
     }
@@ -11688,7 +11695,8 @@ fn body_statement_place(lc: &LibraryClass, call: &Expr) -> Option<Option<usize>>
             _ => return None,
         }
     }
-    if !defs.windows(2).all(|w| w[0].1.start < w[1].1.start) {
+    // An `attr_accessor`'s reader and writer share its span: one place.
+    if !defs.windows(2).all(|w| w[0].1.start <= w[1].1.start) {
         return None;
     }
     if !defs.iter().any(|(_, span)| above(*span)) {
@@ -11898,6 +11906,14 @@ fn carrier_included_modules<'a>(
 
 /// Whether a module body uses ActiveSupport::Concern's hooks, which
 /// `splice_concerns_into_models` applies to each includer.
+/// `extend ActiveSupport::Concern`.
+fn is_concern_extend(call: &Expr) -> bool {
+    matches!(&*call.node, ExprNode::Send { recv: None, method, args, block: None, .. }
+        if method.as_str() == "extend"
+            && matches!(args.as_slice(), [only] if matches!(&*only.node, ExprNode::Const { path }
+                if path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::").trim_start_matches("::") == "ActiveSupport::Concern")))
+}
+
 fn is_concern_body(lc: &LibraryClass) -> bool {
     lc.unknown_calls.iter().any(|call| match &*call.node {
         ExprNode::Send { recv: None, method, args, .. } => match method.as_str() {
