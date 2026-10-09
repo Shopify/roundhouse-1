@@ -458,6 +458,37 @@ end
     assert!(rows.iter().all(|row| row["status"] == "pass" && row["assertions"] == 2), "{rows:#?}");
 }
 
+/// A carried statement that raises in the emitted tree (a macro whose
+/// module did not load there) is named, and the class still loads: its
+/// other tests run, as a file program's failing statement leaves the rest
+/// of the file. Natively the macro is there; this test has none on
+/// either side, so only the emitted run is checked.
+#[test]
+fn a_class_body_statement_that_raises_is_named_and_the_class_loads() {
+    let source = r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  use_missing_macro
+  def test_runs
+    assert true
+  end
+end
+"#;
+    let (emitted, errors) = app(source).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let results = emitted.join("results.jsonl");
+    let output = ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), "test/models/assertion_contract_test.rb"])
+        .current_dir(&emitted)
+        .env("ROUNDHOUSE_TEST_RESULTS", &results)
+        .env("BLOG_DB", ":memory:")
+        .output().expect("emitted CRuby");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error[test_class_statement_not_run]: AssertionContractTest's class-body statement at")
+        && stderr.contains("use_missing_macro"), "{stderr}");
+    let text = std::fs::read_to_string(&results).expect("results");
+    assert!(text.contains("\"pass\""), "{text}\n{stderr}");
+}
+
 /// A setup callback registered below the class's compiled `setup do`
 /// block would run before it here: the test names that, not run it out of
 /// order.

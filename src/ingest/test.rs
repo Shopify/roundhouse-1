@@ -804,6 +804,7 @@ pub(super) fn ingest_test_class(
             if let Some(expr) = carried_body_statement(&stmt, &name, file)? {
                 body_statements.push(crate::dialect::TestBodyStatement {
                     expr,
+                    line: super::sources::line_at(file, stmt.location().start_offset()).unwrap_or(0),
                     after_definitions,
                     after_setup_blocks,
                     after_teardown_blocks,

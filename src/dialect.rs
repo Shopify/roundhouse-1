@@ -2693,6 +2693,10 @@ pub struct TestModule {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TestBodyStatement {
     pub expr: Expr,
+    /// The line the source writes it on, for the runner's name of a
+    /// statement that raises (`RoundhouseTestCallbacks.class_body_statement`).
+    #[serde(default)]
+    pub line: u32,
     /// A test, method or class definition is above it in the body: it
     /// runs after the class's definitions (the emitted class defines
     /// them all in one place), else before them.

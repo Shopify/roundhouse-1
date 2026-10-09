@@ -1493,7 +1493,7 @@ pub fn emit_with_assertions(
             // after the class's mixins, the others at the end of the class.
             if !module.body_statements.is_empty() {
                 if minitest {
-                    emitted.content = splice_test_body_statements(&emitted.content, &module.body_statements, &test_rb_path);
+                    emitted.content = splice_test_body_statements(&emitted.content, &module.body_statements, module.source_file.as_deref().unwrap_or(class_name), &test_rb_path);
                 } else {
                     for statement in &module.body_statements {
                         crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
@@ -2053,8 +2053,13 @@ fn strip_require_headers(content: &str) -> String {
 /// and `extend`s, which the library emit writes first), the others just
 /// before its `end`, each group in source order. Before the first one
 /// below a `setup do` (`teardown do`) block, the class tells the runner
-/// so (`RoundhouseTestCallbacks.after_compiled_blocks`).
-fn splice_test_body_statements(content: &str, statements: &[crate::dialect::TestBodyStatement], rb_path: &std::path::Path) -> String {
+/// so (`RoundhouseTestCallbacks.after_compiled_blocks`). Each runs in
+/// `RoundhouseTestCallbacks.class_body_statement`, which names one that
+/// raises (a macro whose module did not load) and loads the rest of the
+/// class, as a file program's statement is (`RoundhouseAutoload.
+/// file_statement`); a local variable write stays bare, in the class
+/// body's scope, for the statements after it.
+fn splice_test_body_statements(content: &str, statements: &[crate::dialect::TestBodyStatement], source: &str, rb_path: &std::path::Path) -> String {
     let (mut setup_marked, mut teardown_marked) = (false, false);
     let mut render = |group: &[&crate::dialect::TestBodyStatement]| -> String {
         let mut out = String::new();
@@ -2068,8 +2073,24 @@ fn splice_test_body_statements(content: &str, statements: &[crate::dialect::Test
                     *marked = true;
                 }
             }
-            out.push_str(&expr::with_emitted_file(rb_path, || expr::emit_expr(&statement.expr)));
-            out.push('\n');
+            let text = expr::with_emitted_file(rb_path, || expr::emit_expr(&statement.expr));
+            let local_write = matches!(&*statement.expr.node, crate::expr::ExprNode::Assign { target: crate::expr::LValue::Var { .. }, .. });
+            if local_write {
+                out.push_str(&text);
+                out.push('\n');
+            } else if text.contains('\n') {
+                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) do", format!("{source}:{}", statement.line)).unwrap();
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        out.push('\n');
+                    } else {
+                        writeln!(out, "  {line}").unwrap();
+                    }
+                }
+                out.push_str("end\n");
+            } else {
+                writeln!(out, "RoundhouseTestCallbacks.class_body_statement(self, {:?}) {{ {text} }}", format!("{source}:{}", statement.line)).unwrap();
+            }
         }
         out
     };

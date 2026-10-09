@@ -915,6 +915,16 @@ module RoundhouseTestCallbacks
     @registered += 1
   end
 
+  # A test class-body statement (`use_gcs`, carried as written): one
+  # that raises is named and the class goes on loading, as a file
+  # program's statement does (`RoundhouseAutoload.file_statement`).
+  def self.class_body_statement(klass, site)
+    yield
+  rescue StandardError, NotImplementedError => e
+    $stderr.puts "roundhouse: error[test_class_statement_not_run]: #{klass.name}'s class-body statement at #{site} did not run: #{e.class}: #{e.message}"
+    nil
+  end
+
   def self.after_compiled_blocks(klass, chain)
     blocks = klass.instance_variable_defined?(:@__roundhouse_after_compiled_blocks) ? klass.instance_variable_get(:@__roundhouse_after_compiled_blocks) : klass.instance_variable_set(:@__roundhouse_after_compiled_blocks, [])
     blocks << chain
