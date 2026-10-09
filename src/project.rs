@@ -9305,15 +9305,30 @@ fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
         }
         parts.join("/")
     };
-    let required = |dir: &str, line: &str| -> Option<String> {
+    // A require line's target, and the modifier guard it carries
+    // (`require_relative "x" unless defined?(X)`: " unless defined?(X)"),
+    // empty when unguarded. A guarded require is still an edge: it runs
+    // whenever its guard lets it.
+    let required = |dir: &str, line: &str| -> Option<(String, String)> {
         let text = line.trim();
-        if let Some(rel) = text.strip_prefix("require_relative \"").and_then(|r| r.strip_suffix('"')) {
+        let guard = |rest: &str| -> Option<String> {
+            let rest = rest.trim_end();
+            if rest.is_empty() {
+                return Some(String::new());
+            }
+            let cond = rest.strip_prefix(" unless ").or_else(|| rest.strip_prefix(" if "))?;
+            (!cond.trim().is_empty()).then(|| rest.to_string())
+        };
+        if let Some((rel, rest)) = text.strip_prefix("require_relative \"").and_then(|r| r.split_once('"')) {
+            if rel.contains(['#', '\\']) {
+                return None;
+            }
             let target = normalize(&format!("{dir}/{rel}"));
-            return Some(target.strip_suffix(".rb").map(str::to_string).unwrap_or(target));
+            let target = target.strip_suffix(".rb").map(str::to_string).unwrap_or(target);
+            return Some((target, guard(rest)?));
         }
-        text.strip_prefix("require RoundhouseAutoload.path(\"")
-            .and_then(|r| r.strip_suffix("\")"))
-            .map(|anchor| format!("app/{anchor}"))
+        let (anchor, rest) = text.strip_prefix("require RoundhouseAutoload.path(\"")?.split_once("\")")?;
+        Some((format!("app/{anchor}"), guard(rest)?))
     };
     let dir_of = |path: &str| path.rsplit_once('/').map_or(String::new(), |(d, _)| d.to_string());
     let stem_of = |path: &str| path.strip_suffix(".rb").unwrap_or(path).to_string();
@@ -9326,7 +9341,7 @@ fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
         }
         let dir = dir_of(path);
         let out = edges.entry(stem_of(path)).or_default();
-        out.extend(content.lines().filter_map(|l| required(&dir, l)));
+        out.extend(content.lines().filter_map(|l| required(&dir, l).map(|(target, _)| target)));
     }
     let reaches = |edges: &BTreeMap<String, BTreeSet<String>>, from: &str, to: &str| -> bool {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -9368,7 +9383,7 @@ fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
         let mut changed = false;
         let mut out = String::with_capacity(content.len());
         for line in content.split_inclusive('\n') {
-            let Some(target) = required(&dir, line) else {
+            let Some((target, guard)) = required(&dir, line) else {
                 out.push_str(line);
                 continue;
             };
@@ -9386,13 +9401,21 @@ fn require_namespace_files_first(files: &mut [(String, String)], app: &App) {
                     }
                     let indent = &line[..line.len() - line.trim_start().len()];
                     let rel = relative_path(&dir, &namespace);
-                    out.push_str(&format!("{indent}require_relative {rel:?}\n"));
+                    // Under the require's own guard: the namespace loads
+                    // ahead of its child only when the child does.
+                    out.push_str(&format!("{indent}require_relative {rel:?}{guard}\n"));
                     edges.entry(own.clone()).or_default().insert(namespace.clone());
-                    before.insert(namespace);
+                    // A guarded load may not run, so a later unguarded
+                    // child still requires its namespace first.
+                    if guard.is_empty() {
+                        before.insert(namespace);
+                    }
                     changed = true;
                 }
             }
-            before.insert(target);
+            if guard.is_empty() {
+                before.insert(target);
+            }
             out.push_str(line);
         }
         if changed {
@@ -16669,6 +16692,41 @@ mod tests {
         );
         let kept = ["models/a", "models/a/b", "models/c"];
         assert_eq!(order(&kept), kept);
+    }
+
+    #[test]
+    fn a_guarded_require_is_an_edge_and_its_namespace_requires_keep_the_guard() {
+        let file = |path: &str, body: &str| (path.to_string(), body.to_string());
+        let mut files = vec![
+            file("app/models/payments.rb", "module Payments\nend\n"),
+            // The namespace file reaches the requiring file only through a
+            // guarded require: inserting `require_relative "payments/vault"`
+            // into vaulted.rb would close a circular require.
+            file(
+                "app/models/payments/vault.rb",
+                "module Payments\n  module Vault\n  end\nend\nrequire_relative \"../vaulted\" unless defined?(::Vaulted)\n",
+            ),
+            file("app/models/payments/vault/card.rb", "module Payments\n  module Vault\n    class Card\n    end\n  end\nend\n"),
+            file("app/models/vaulted.rb", "require_relative \"payments/vault/card\"\n\nmodule Vaulted\nend\n"),
+            file("app/models/guarded.rb", "require_relative \"payments/vault/card\" if ENV[\"CARDS\"]\nrequire_relative \"payments/vault/card\"\n"),
+        ];
+        super::require_namespace_files_first(&mut files, &App::new());
+        let body = |path: &str| files.iter().find(|(p, _)| p == path).unwrap().1.clone();
+        assert_eq!(
+            body("app/models/vaulted.rb"),
+            "require_relative \"payments\"\nrequire_relative \"payments/vault/card\"\n\nmodule Vaulted\nend\n"
+        );
+        // A guarded child's namespaces load under its guard, and an
+        // unguarded child after it still requires them.
+        assert_eq!(
+            body("app/models/guarded.rb"),
+            "require_relative \"payments\" if ENV[\"CARDS\"]\n\
+             require_relative \"payments/vault\" if ENV[\"CARDS\"]\n\
+             require_relative \"payments/vault/card\" if ENV[\"CARDS\"]\n\
+             require_relative \"payments\"\n\
+             require_relative \"payments/vault\"\n\
+             require_relative \"payments/vault/card\"\n"
+        );
     }
 
     #[test]
