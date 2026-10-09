@@ -311,6 +311,22 @@ fn an_initializer_requiring_a_gem_file_of_declarations_carries_the_require() {
     );
 }
 
+/// The gem file nests (`module Gqlc; class Plain`), so `Shapes` in
+/// Plain's `SIZE = Shapes::ALL.size` reads `Gqlc::Shapes` lexically.
+/// Constant values are rooted like method bodies; `Gqlc::Shapes::ALL` is
+/// a value constant, and taking only class names as targets made the
+/// compact-form rule root it to a `::Shapes` that does not exist (the
+/// boot test below then failed with `uninitialized constant Shapes`).
+#[test]
+fn a_gem_constant_reading_a_sibling_module_keeps_its_lexical_target() {
+    let dir = gem_file_fixture_app();
+    let app = roundhouse::ingest::ingest_app(&dir.0).expect("ingest fixture");
+    let (_out, files) = emit(&app);
+    let plain = &files.iter().find(|(p, _)| p == "app/models/gqlc/plain.rb").expect("plain.rb").1;
+    assert!(!plain.contains("= ::Shapes"), "{plain}");
+    assert!(plain.contains("SIZE = Shapes::ALL.size") || plain.contains("SIZE = Gqlc::Shapes::ALL.size"), "{plain}");
+}
+
 /// The boot runs it as native Ruby does: the constants are undefined
 /// before the require and defined after it. Boot loads the `pg` gem:
 /// run with `--ignored` and a `GEM_PATH` that has it.

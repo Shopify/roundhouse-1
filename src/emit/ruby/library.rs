@@ -7178,13 +7178,25 @@ pub(crate) fn apply_constant_rooting(
     view_namespaces.dedup();
 
     // Every class name this emit defines, app and runtime alike — the
-    // authority for "does the inner reading have a target?".
+    // authority for "does the inner reading have a target?". A class's
+    // value constants count as targets too (`Gqlc::Shapes::ALL`): since
+    // constant values are rooted like method bodies, a nested source's
+    // `SIZE = Shapes::ALL.size` inside `module Gqlc; class Plain` would
+    // otherwise read as a compact-form shadow (`Gqlc::Shapes` known,
+    // `Gqlc::Shapes::ALL` not) and be rooted to a `::Shapes` that does
+    // not exist.
     let class_names: crate::det::HashSet<String> = app
         .models
         .iter()
         .map(|m| m.name.0.as_str().to_string())
         .chain(app.library_classes.iter().map(|c| c.name.0.as_str().to_string()))
         .chain(lcs.iter().map(|c| c.name.0.as_str().to_string()))
+        .chain(
+            app.library_classes
+                .iter()
+                .chain(lcs.iter())
+                .flat_map(|c| c.constants.iter().map(move |(k, _)| format!("{}::{}", c.name.0.as_str(), k.as_str()))),
+        )
         .collect();
     let known = |n: &str| class_names.contains(n);
     for lc in lcs.iter_mut() {
