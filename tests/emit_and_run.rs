@@ -214,7 +214,9 @@ fn a_has_many_readers_to_sql_is_the_scoped_query() {
         .run_ruby(
             r#"a = Article.create!(title: "One", body: "A sufficiently long body.")
 sql = a.comment_sql
-raise "comment_sql: #{sql}" unless sql.include?("comments") && sql.include?("article_id = #{a.id}")
+# Rails quotes the column (`"comments"."article_id" = 1`); so does
+# this adapter, quoting aside the same predicate.
+raise "comment_sql: #{sql}" unless sql.include?("comments") && sql.delete('"').include?("article_id = #{a.id}")
 puts "has_many to_sql passed"
 "#,
         );
@@ -10425,8 +10427,9 @@ raise "vf vs vframes" unless ActiveStorage.video_preview_vf_filter == "scale=320
 /// they are two classes; flattened to one `Bucket` they were one class
 /// reopened, which the analysis refused as a reopened fragment. The
 /// Ruby family writes each nested in its owner, and a test that names
-/// a support class requires its file. Targets that hoist inner classes
-/// under a flat name refuse it by name.
+/// a support class requires its file. A support file with no test
+/// class is a library file, so a strict target keeps its classes apart
+/// too, or refuses each by name.
 #[test]
 fn same_named_classes_in_two_test_support_classes_stay_apart() {
     use roundhouse::project::BuildTarget;
@@ -10454,14 +10457,22 @@ fn same_named_classes_in_two_test_support_classes_stay_apart() {
     let (_, errors) = app().emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:?}");
     app().run_test("test/models/mock_bucket_test.rb").assert_passes();
-    for target in [BuildTarget::Typescript, BuildTarget::Crystal] {
-        let (_, errors) = app().emit(target);
-        for class in ["MockAlpha::Bucket", "MockBeta::Bucket"] {
-            assert!(
-                errors.iter().any(|e| e.contains("nested class in a test file") && e.contains(class)),
-                "{target:?} {class}: {errors:?}"
-            );
-        }
+    // The support files are library files: TypeScript writes each
+    // `Bucket` as a class of its own; Crystal, which carries no plain
+    // Ruby class, refuses each by its qualified name. What either refuses
+    // beyond that is `kind(*)`'s nameless rest.
+    let (tree, errors) = app().emit(BuildTarget::Typescript);
+    for file in ["app/models/mock_alpha::bucket.ts", "app/models/mock_beta::bucket.ts"] {
+        let ts = std::fs::read_to_string(tree.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert!(ts.contains("export class Bucket"), "{file}: {ts}");
+    }
+    assert!(errors.iter().all(|e| e.contains("`*` on `kind`") || e.contains("nameless rest")), "{errors:?}");
+    let (_, errors) = app().emit(BuildTarget::Crystal);
+    for class in ["MockAlpha::Bucket", "MockBeta::Bucket"] {
+        assert!(
+            errors.iter().any(|e| e.contains("plain Ruby class not supported") && e.contains(&format!("`{class}`"))),
+            "Crystal {class}: {errors:?}"
+        );
     }
 }
 

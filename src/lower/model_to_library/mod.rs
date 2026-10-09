@@ -1180,7 +1180,8 @@ pub(crate) fn unclaimed_unknowns(model: &Model, app: &crate::App) -> Vec<crate::
         } else if self::markers::BLOCK_CALLBACK_HOOKS.contains(&name) {
             // A block declaring `extra_params` is declined there, so it
             // reports here like any unlowered DSL call; one with a
-            // `signature` is refused by name there.
+            // `signature` binds its defaults there (a required keyword is
+            // refused by name).
             if block.as_ref().is_some_and(|b| {
                 !matches!(&*b.node, ExprNode::Lambda { extra_params, .. } if !extra_params.is_empty())
             }) {

@@ -1638,8 +1638,6 @@ fn push_block_callback(
             ("before_validation" | "after_validation", Some(_)) => hook,
             _ => return,
         };
-        // A block whose optional or keyword parameters bind names its
-        // body reads cannot be spliced into a parameterless hook method.
         let ExprNode::Lambda { body: lambda_body, signature, params, rest_param, block_param, .. } =
             &*callback.node
         else {
@@ -1684,19 +1682,25 @@ fn push_block_callback(
             ));
             return;
         }
-        // Refused by name: the diagnose pass claims every block-form
-        // hook, so returning quietly dropped the callback.
-        if !signature.is_empty() {
-            let names: Vec<String> = signature.names().map(|n| format!("`{n}`")).collect();
+        // Rails runs the proc with `instance_exec` and at most the record
+        // (`CallTemplate.build`: arity 0 passes nothing, arity 1 the
+        // record), so an optional positional or keyword takes its
+        // default and a keyword rest is empty. A required keyword raises
+        // ArgumentError on every save natively; it is refused by name,
+        // since the diagnose pass claims every block-form hook and
+        // returning quietly dropped the callback.
+        let required: Vec<String> =
+            signature.keywords.iter().filter(|(_, d)| d.is_none()).map(|(n, _)| format!("`{n}:`")).collect();
+        if !required.is_empty() {
             crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
                 expr.span,
                 None,
                 "block_callback_signature",
                 format!(
-                    "`{hook} {{ |…| … }}` on `{}` takes {}, which a hook method has no caller to bind; \
-                     the callback is not lowered",
+                    "`{hook} {{ |…| … }}` on `{}` takes the required keyword {}, which Rails' callback \
+                     never passes (ArgumentError natively); the callback is not lowered",
                     model.name.0.as_str(),
-                    names.join(", "),
+                    required.join(", "),
                 ),
             ));
             return;
@@ -1705,24 +1709,39 @@ fn push_block_callback(
         // Translate Rails-API broadcast calls (`assoc.broadcast_replace_to(...)`
         // etc.) inside the block body to spinel-shape `Broadcasts.<action>(...)`
         // calls. Other content passes through unchanged.
-        let lambda_body = match bound_param {
-            // `<param> = self` ahead of the spliced body.
-            Some(name) => {
-                let bind = Expr::new(
-                    Span::synthetic(),
-                    ExprNode::Assign {
-                        target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name },
-                        value: Expr::new(Span::synthetic(), ExprNode::SelfRef),
-                    },
-                );
-                let mut stmts = vec![bind];
-                match &*lambda_body.node {
-                    ExprNode::Seq { exprs } => stmts.extend(exprs.clone()),
-                    _ => stmts.push(lambda_body.clone()),
-                }
-                seq(stmts)
+        let assign = |name: Symbol, value: Expr| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: crate::expr::LValue::Var { id: crate::ident::VarId(0), name }, value },
+            )
+        };
+        // `<param> = self`, then each default in source order, ahead of
+        // the spliced body.
+        let mut binds: Vec<Expr> = Vec::new();
+        if let Some(name) = bound_param {
+            binds.push(assign(name, Expr::new(Span::synthetic(), ExprNode::SelfRef)));
+        }
+        for (name, default) in &signature.optionals {
+            binds.push(assign(name.clone(), default.clone()));
+        }
+        for (name, default) in &signature.keywords {
+            binds.push(assign(name.clone(), default.clone().expect("required keywords refused above")));
+        }
+        if let Some(name) = signature.kwrest.as_ref().filter(|n| !n.as_str().is_empty()) {
+            binds.push(assign(
+                name.clone(),
+                Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false }),
+            ));
+        }
+        let lambda_body = if binds.is_empty() {
+            lambda_body.clone()
+        } else {
+            let mut stmts = binds;
+            match &*lambda_body.node {
+                ExprNode::Seq { exprs } => stmts.extend(exprs.clone()),
+                _ => stmts.push(lambda_body.clone()),
             }
-            None => lambda_body.clone(),
+            seq(stmts)
         };
         let mut lambda_body = lambda_body;
         lifted_block::to_method_body(&mut lambda_body, form);

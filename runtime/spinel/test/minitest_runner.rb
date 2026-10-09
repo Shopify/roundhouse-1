@@ -703,10 +703,19 @@ module RoundhouseResponseAssertions
     # `_compute_redirect_to_location`: a URL with a scheme (or `//`) as
     # written, a path under this request's origin. Rails' controller
     # answers the absolute form in `Location`; this tree's keeps the path.
+    # The origin is the request's `protocol + host_with_port`, which
+    # RequestDispatch builds (`https://`, the scheme's standard port
+    # dropped) when it is present.
     def __roundhouse_redirection(fragment)
       case fragment
       when Regexp then fragment
       when /\A([a-z][a-z\d\-+.]*:|\/\/).*/i then fragment.to_str.delete("\0\r\n")
+      when /\A\// then
+        if respond_to?(:redirection_url_for_assertion, true)
+          redirection_url_for_assertion(fragment).delete("\0\r\n")
+        else
+          "http://#{respond_to?(:host) ? host : "www.example.com"}#{fragment}".delete("\0\r\n")
+        end
       when String then "http://#{respond_to?(:host) ? host : "www.example.com"}#{fragment}".delete("\0\r\n")
       else fragment
       end

@@ -322,6 +322,9 @@ fn rewrite(
                     rewrite(d, params, &mut inner.clone(), used);
                 }
             }
+            for d in signature.defaults_mut() {
+                rewrite(d, params, &mut inner.clone(), used);
+            }
             rewrite(body, params, &mut inner, used);
         }
         ExprNode::Var { name, .. } => {

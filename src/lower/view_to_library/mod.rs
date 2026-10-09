@@ -3490,8 +3490,16 @@ pub(super) fn rewrite_ivars_to_locals(expr: &Expr) -> Expr {
                 .collect(),
             kwargs: *kwargs,
         },
-        ExprNode::Lambda { signature, rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
+        ExprNode::Lambda { signature, rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda {
             // A default (`|label = @page_title|`) reads the view local too.
+            signature: {
+                let mut signature = signature.clone();
+                for d in signature.defaults_mut() {
+                    *d = rewrite_ivars_to_locals(d);
+                }
+                signature
+            },
+            rest_param: rest_param.clone(),
             extra_params: extra_params
                 .iter()
                 .map(|p| {

@@ -262,8 +262,16 @@ fn rewrite_expr(expr: &Expr, registry: &CalleeRegistry, class_name: &str) -> Exp
             left: rewrite_expr(left, registry, class_name),
             right: rewrite_expr(right, registry, class_name),
         },
-        ExprNode::Lambda { signature, rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda { signature: signature.clone(), rest_param: rest_param.clone(),
+        ExprNode::Lambda { signature, rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda {
             // Defaults are call sites like the body: same coercion.
+            signature: {
+                let mut signature = signature.clone();
+                for d in signature.defaults_mut() {
+                    *d = rewrite_expr(d, registry, class_name);
+                }
+                signature
+            },
+            rest_param: rest_param.clone(),
             extra_params: extra_params
                 .iter()
                 .map(|p| {
@@ -692,5 +700,37 @@ mod tests {
         let ExprNode::Lambda { extra_params, body, .. } = &*out.node else { panic!("lambda") };
         assert!(first_arg_is_cast(body), "body: {body:?}");
         assert!(first_arg_is_cast(extra_params[0].default.as_ref().unwrap()), "default: {extra_params:?}");
+    }
+
+    /// The same for the `signature` the Ruby ingest builds a block's
+    /// optional and keyword parameters into.
+    #[test]
+    fn a_block_signature_default_gets_the_coercion_its_body_gets() {
+        let mut registry: CalleeRegistry = HashMap::default();
+        registry.entry("Foo".into()).or_default().insert(
+            "take".into(),
+            vec![Ty::Union { variants: vec![Ty::Str, Ty::Nil] }],
+        );
+        let signature = crate::expr::BlockSignature {
+            optionals: vec![(Symbol::from("size"), call_take())],
+            keywords: vec![(Symbol::from("label"), Some(call_take()))],
+            kwrest: None,
+        };
+        let lambda = Expr::new(
+            Span::synthetic(),
+            ExprNode::Lambda {
+                signature,
+                params: vec![],
+                rest_param: None,
+                extra_params: vec![],
+                block_param: None,
+                body: call_take(),
+                block_style: Default::default(),
+            },
+        );
+        let out = rewrite_expr(&lambda, &registry, "Foo");
+        let ExprNode::Lambda { signature, .. } = &*out.node else { panic!("lambda") };
+        assert!(signature.defaults().all(first_arg_is_cast), "defaults: {signature:?}");
+        assert_eq!(signature.defaults().count(), 2);
     }
 }

@@ -23,20 +23,43 @@ fn a_form_block_with_an_optional_parameter_is_reported_not_dropped() {
 
 
 /// A block callback declaring keyword parameters (`before_save { |key: 7| … }`)
-/// is not spliced into a hook body that has no `key` binding; it stays
-/// unlowered (and is reported as such) instead.
+/// is not spliced into a hook body that has no `key` binding. Rails runs
+/// the proc through `instance_exec` with no argument (its arity is 0), so
+/// `key` takes its default: the hook binds it ahead of the body, and the
+/// save answers what Rails' does.
 #[test]
 fn a_block_callback_with_keyword_parameters_is_not_spliced_unbound() {
-    let (tree, errors) = super::emit_and_run::real_blog()
+    let app = || {
+        super::emit_and_run::real_blog().edit(
+            "app/models/article.rb",
+            "class Article < ApplicationRecord\n",
+            "class Article < ApplicationRecord\n  before_save { |key: 7, **rest| self.body = \"#{body} #{key} #{rest.size}\" }\n",
+        )
+    };
+    let (tree, errors) = app().emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let model = std::fs::read_to_string(tree.join("app/models/article.rb")).unwrap();
+    let bind = model.find("key = 7").unwrap_or_else(|| panic!("{model}"));
+    assert!(bind < model.find("#{key}").unwrap(), "{model}");
+    app()
+        .run_ruby(
+            "a = Article.create!(title: \"One\", body: \"A sufficiently long body.\")\nraise \"body: #{a.body}\" unless a.body == \"A sufficiently long body. 7 0\"\nputs \"ok\"\n",
+        )
+        .assert_passes();
+}
+
+/// A required keyword (`|key:|`) is never passed by Rails' callback,
+/// which raises ArgumentError on each save; it is refused by name.
+#[test]
+fn a_block_callback_with_a_required_keyword_is_refused_by_name() {
+    let (_tree, errors) = super::emit_and_run::real_blog()
         .edit(
             "app/models/article.rb",
             "class Article < ApplicationRecord\n",
-            "class Article < ApplicationRecord\n  before_save { |key: 7| self.body = \"#{body} #{key}\" }\n",
+            "class Article < ApplicationRecord\n  before_save { |key:| self.body = \"#{body} #{key}\" }\n",
         )
         .emit(roundhouse::project::BuildTarget::Ruby);
-    assert!(errors.is_empty(), "{errors:#?}");
-    let model = std::fs::read_to_string(tree.join("app/models/article.rb")).unwrap();
-    assert!(!model.contains("#{key}"), "{model}");
+    assert!(errors.iter().any(|e| e.contains("block_callback_signature") && e.contains("`key:`")), "{errors:#?}");
 }
 
 /// A default reads the method's parameter after `param_rebind` renamed a
