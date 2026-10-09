@@ -30,6 +30,10 @@
 # own class (rails.rb, required first), not a `class Application`
 # reopen: this file's declared namespaces are what `check` gates, and
 # `Rails::Application` is not this file's to gate.
+#
+# `Rails.logger` is here for the same reason it is not in rails.rb: the
+# log device this tree writes is ActiveSupport::Logger over Ruby's Logger,
+# which only the ruby-family trees carry (see `Rails.logger` below).
 require_relative "rails"
 
 module Rails
@@ -43,24 +47,127 @@ module Rails
     end
   end
 
-  # `Rails.logger` takes the stdlib Logger's call forms here: the shared
-  # runtime's Logger (rails.rb) takes one positional message, which is
-  # every call the strict targets compile, while gems on this tree log
-  # lazily (`Dalli.logger.debug { "..." }`, `.warn { "..." }`; dalli logs
-  # through Rails.logger when Rails is defined). As in the stdlib
-  # (`Logger#add`), a block is the message and the argument becomes the
-  # progname. Same class_eval reasoning as above: Rails::Logger is the
-  # shared runtime's to gate.
-  Logger.class_eval do
-    %i[info error warn fatal].each do |level|
-      write = instance_method(level)
-      define_method(level) do |progname = nil, &block|
-        write.bind_call(self, block ? block.call : progname)
-      end
+  # `Rails.logger` on this tree is the logger railties' bootstrap
+  # initializer makes (railties 8.2.0.alpha application/bootstrap.rb:34-64,
+  # `initialize_logger`): an ActiveSupport::Logger
+  # (runtime/active_support_logger.rb, a ::Logger) on the environment's
+  # log file, `log/<env>.log` under Rails.root, with
+  # ActiveSupport::Logger::SimpleFormatter and the level of
+  # `config.log_level` (:debug unless set). So `Rails.logger.warn "x"`
+  # appends "x\n" to log/test.log in a test run, as natively, and the
+  # stdlib Logger's call forms (`level`, `debug?`, the block form
+  # `Dalli.logger.debug { ... }`, `add`, `silence`) are Ruby's own.
+  #
+  # The shared runtime's Rails::Logger (rails.rb) is the strict targets'
+  # logger: one positional message, written to stderr through Kernel#warn.
+  # On this tree that was wrong where it mattered: a test environment that
+  # turns warnings into errors (Core's StrictWarning, whose `warn` raises
+  # StrictWarning::Offense) killed boot at the first log line, bugsnag's
+  # "No API key has been set". Natively those lines go to the log device
+  # and never reach Kernel#warn.
+  #
+  # Each value the initializer reads is taken from `Rails.configuration`
+  # where it answers the key (a lifted key, or one a railtie stored), with
+  # Rails' default otherwise: `logger` (nil), `log_file_size` (nil),
+  # `paths["log"]` (log/<env>.log), `autoflush_log` (true),
+  # `log_formatter` (SimpleFormatter) and `log_level` (:debug). Ingest
+  # does not lift `config.logger` or `config.log_level` today
+  # (error[environment_statement_not_carried]), so on Core's tree each is
+  # Rails' default, which for Core's test.rb (LOG_LEVEL and CI unset)
+  # writes the same lines to the same file.
+  #
+  # Not carried, by name: a configured logger that is no ::Logger
+  # (error[rails_logger_not_carried]): this tree has no
+  # ActiveSupport::BroadcastLogger, and its ActiveSupport::TaggedLogging
+  # is a wrapper (runtime/logger.rb), not a logger extended with tags.
+  # Rails 8.2 also wraps the logger it builds in TaggedLogging and a
+  # BroadcastLogger; here Rails.logger is the ActiveSupport::Logger
+  # itself, so `tagged`, `broadcast_to` and `broadcasts` are
+  # NoMethodErrors rather than answered.
+  # A stand-in the shared reader memoized before this file loaded is not
+  # this tree's logger; the first read below builds Rails'.
+  if instance_variable_defined?(:@logger) && const_defined?(:Logger, false) && @logger.instance_of?(Logger)
+    remove_instance_variable(:@logger)
+  end
+
+  class << self
+    # The shared runtime's reader, replaced (removed first, so the
+    # redefinition is not a warning under $VERBOSE). The runtime shake
+    # drops it from an emitted rails.rb whose app never reads it, while a
+    # gem's code (dalli, bugsnag) still may; this file's reader is not
+    # shaken.
+    remove_method :logger if method_defined?(:logger, false)
+
+    # railties rails.rb `attr_accessor :logger`, which Rails fills in
+    # `initialize_logger`. This tree's boot runs none of the bootstrap
+    # initializers (rails_railtie.rb, BOOTSTRAP_INITIALIZERS), so the
+    # first read stands in for that one, as ActiveSupport::LogSubscriber's
+    # first `logger` read stands in for set_log_subscriber_logger. An
+    # assigned logger, nil included, is kept.
+    def logger
+      @logger = initialize_logger unless instance_variable_defined?(:@logger)
+      @logger
     end
 
-    # Dropped, as the shared runtime's debug is; the block is not called.
-    define_method(:debug) { |progname = nil, &block| nil }
+    attr_writer :logger
+
+    private
+
+    def initialize_logger
+      require_relative "active_support_logger"
+      config = configuration
+      logger = configured(config, :logger, nil)
+      unless logger.nil? || logger.is_a?(::Logger)
+        $stderr.puts "roundhouse: error[rails_logger_not_carried]: config.logger is #{logger.class.name || logger.class.inspect}, " \
+          "which this tree cannot carry as Rails.logger (it carries a ::Logger: there is no ActiveSupport::BroadcastLogger, " \
+          "and ActiveSupport::TaggedLogging here is a wrapper, not a logger); Rails.logger is the framework default, " \
+          "an ActiveSupport::Logger on #{log_path(config)}"
+        logger = nil
+      end
+      logger ||= begin
+        size = configured(config, :log_file_size, nil)
+        built = size ? ActiveSupport::Logger.new(default_log_file(config), 1, size) : ActiveSupport::Logger.new(default_log_file(config))
+        built.formatter = configured(config, :log_formatter, ActiveSupport::Logger::SimpleFormatter.new)
+        built
+      rescue StandardError
+        path = log_path(config)
+        fallback = ActiveSupport::Logger.new(STDERR)
+        fallback.level = ActiveSupport::Logger::WARN
+        fallback.warn(
+          "Rails Error: Unable to access log file. Please ensure that #{path} exists and is writable " \
+          "(i.e. make it writable for user and group: chmod 0664 #{path}). " \
+          "The log level has been raised to WARN and the output directed to STDERR until the problem is fixed."
+        )
+        fallback
+      end
+      logger.level = ActiveSupport::Logger.const_get(configured(config, :log_level, :debug).to_s.upcase)
+      logger
+    end
+
+    # Application::Configuration#default_log_file.
+    def default_log_file(config)
+      require "fileutils"
+      path = log_path(config)
+      FileUtils.mkdir_p(File.dirname(path)) unless File.exist?(File.dirname(path))
+      file = File.open(path, "a")
+      file.binmode
+      file.sync = configured(config, :autoflush_log, true) # if true make sure every write flushes
+      file
+    end
+
+    # `config.paths["log"].first`: Application::Configuration's
+    # `paths.add "log", with: "log/#{Rails.env}.log"`, expanded under the
+    # root as Rails::Paths does (this tree's root is the directory it runs
+    # in), so the logger's file name is absolute, as natively.
+    def log_path(config)
+      return config.paths["log"].first.to_s if config.respond_to?(:paths)
+
+      File.expand_path(root.join("log", "#{env}.log").to_s)
+    end
+
+    def configured(config, key, default)
+      config.respond_to?(key) ? config.public_send(key) : default
+    end
   end
 
   class Configuration
