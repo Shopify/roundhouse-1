@@ -514,6 +514,13 @@ fn nested_blocks(
     inline: Option<&Path>,
 ) -> NestedBlocks {
     let depth = parent.name.0.as_str().split("::").count();
+    // A kid nested in another kid (`Update::Input::VariantInput` under
+    // `Update`) is written inside that kid's block, where the source has
+    // it, so the enclosing class's body (`field :variants,
+    // [VariantInput]`) runs after it as natively. A block of its own
+    // after the enclosing one ran that body first: NameError at load.
+    let (kids, hosted) = hosted_kids(kids);
+    let kids = &kids[..];
     // Order the children so a superclass precedes its subclass. They
     // share one file now, so `class Image < Sound::ImageStruct` runs
     // where the base must already be defined — the requirement the
@@ -607,7 +614,20 @@ fn nested_blocks(
         let render = || emit_library_class_decl(kid, app, rb_path.clone());
         // The file the blocks run in: a `__dir__` read in a child
         // (`File.join(__dir__, "lookup.sql")`) is anchored on it.
-        let rendered = super::expr::with_spliced_into(parent_rb, render);
+        let own_kids = hosted.iter().find(|(host, _)| std::ptr::eq(*host, *kid)).map_or(&[][..], |(_, d)| d.as_slice());
+        let rendered = if own_kids.is_empty() {
+            super::expr::with_spliced_into(parent_rb, render)
+        } else {
+            // Its own kids go into its render the way it goes into the
+            // parent's: their requires rebased onto its path, which the
+            // lines below rebase again onto the parent's.
+            let inner = nested_blocks(kid, own_kids, app, parent_rb, inline);
+            let placing = NestedPlacement::install(kid, &inner);
+            let mut files = vec![super::expr::with_spliced_into(parent_rb, render)];
+            let unplaced = placing.finish();
+            splice_nested(&mut files, kid, &inner, &unplaced);
+            files.remove(0)
+        };
         let lines: Vec<&str> = rendered.content.lines().collect();
         // Requires belong at the top of the file that now holds the
         // class, not buried inside a class body where they would still
@@ -671,13 +691,80 @@ fn nested_blocks(
         // were resolved inside the child's enclosing segments, which
         // are the parent's followed by the child's own — the position
         // it is spliced into.
-        let sidecar = super::rbs::emit_library_class_rbs(kid, &rb_path, app);
-        let lines: Vec<&str> = sidecar.content.lines().collect();
-        if let Some(block) = unwrapped(&lines, depth) {
-            sidecar_blocks.push(block);
+        // Its own kids' sidecars stay blocks of the parent's, as before:
+        // each names its enclosing classes in its wrapper.
+        for each in std::iter::once(*kid).chain(own_kids.iter().copied()) {
+            let path = inline.map_or_else(
+                || PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(each.name.0.as_str()))),
+                Path::to_path_buf,
+            );
+            let sidecar = super::rbs::emit_library_class_rbs(each, &path, app);
+            let lines: Vec<&str> = sidecar.content.lines().collect();
+            if let Some(block) = unwrapped(&lines, depth) {
+                sidecar_blocks.push(block);
+            }
         }
     }
     NestedBlocks { blocks, names, sidecar_blocks, hoisted }
+}
+
+/// `kids` split into those no other kid encloses, and, for each of
+/// those that encloses some, the kids nested in it (at any depth), in
+/// their order. Of several declarations of the enclosing name (a class
+/// reopened in the file), the host is the last one the source writes
+/// above the nested kid (`first_span`), else the last one.
+fn hosted_kids<'a>(kids: &[&'a LibraryClass]) -> (Vec<&'a LibraryClass>, Vec<(&'a LibraryClass, Vec<&'a LibraryClass>)>) {
+    let encloses = |outer: &str, inner: &str| inner.len() > outer.len() + 2 && inner.starts_with(outer) && inner[outer.len()..].starts_with("::");
+    let host_of = |k: &LibraryClass| -> Option<&'a LibraryClass> {
+        let own = k.name.0.as_str();
+        // The outermost enclosing kid: it hosts every level below it.
+        let outer = kids
+            .iter()
+            .filter(|c| encloses(c.name.0.as_str(), own))
+            .map(|c| c.name.0.as_str())
+            .min_by_key(|n| n.len())?;
+        let at = first_span(k);
+        let candidates: Vec<&'a LibraryClass> = kids.iter().copied().filter(|c| c.name.0.as_str() == outer).collect();
+        candidates
+            .iter()
+            .rev()
+            .find(|c| matches!((first_span(c), at), (Some(h), Some(a)) if h.file == a.file && h.start < a.start))
+            .or(candidates.last())
+            .copied()
+    };
+    let mut direct: Vec<&'a LibraryClass> = Vec::new();
+    let mut hosted: Vec<(&'a LibraryClass, Vec<&'a LibraryClass>)> = Vec::new();
+    for &k in kids {
+        match host_of(k) {
+            None => direct.push(k),
+            Some(host) => match hosted.iter_mut().find(|(h, _)| std::ptr::eq(*h, host)) {
+                Some((_, list)) => list.push(k),
+                None => hosted.push((host, vec![k])),
+            },
+        }
+    }
+    (direct, hosted)
+}
+
+/// The first real source position of `lc`'s body: its superclass, a
+/// method, a constant, a class-body call. `None` when it has none or
+/// they span several files.
+fn first_span(lc: &LibraryClass) -> Option<crate::span::Span> {
+    let spans = std::iter::once(lc.parent_span)
+        .chain(lc.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
+        .chain(lc.constants.iter().map(|(_, e)| e.span))
+        .chain(lc.unknown_calls.iter().map(|e| e.span))
+        .chain(lc.class_ivar_initializers.iter().map(|e| e.span))
+        .filter(|span| span.file.0 != 0 && *span != crate::span::Span::synthetic());
+    let mut first: Option<crate::span::Span> = None;
+    for span in spans {
+        match first {
+            Some(f) if f.file != span.file => return None,
+            Some(f) if f.start <= span.start => {}
+            _ => first = Some(span),
+        }
+    }
+    first
 }
 
 /// The classes of `App::singleton_scoped_classes` the Ruby family writes
@@ -757,21 +844,7 @@ fn nested_position(parent: &LibraryClass, kid: &LibraryClass) -> Option<crate::s
     if mixes_in(parent, &kid.name) {
         return None;
     }
-    let spans = std::iter::once(kid.parent_span)
-        .chain(kid.methods.iter().flat_map(|m| [m.name_span, m.body.span]))
-        .chain(kid.constants.iter().map(|(_, e)| e.span))
-        .chain(kid.unknown_calls.iter().map(|e| e.span))
-        .chain(kid.class_ivar_initializers.iter().map(|e| e.span))
-        .filter(|span| span.file.0 != 0 && *span != crate::span::Span::synthetic());
-    let mut first: Option<crate::span::Span> = None;
-    for span in spans {
-        match first {
-            Some(f) if f.file != span.file => return None,
-            Some(f) if f.start <= span.start => {}
-            _ => first = Some(span),
-        }
-    }
-    let first = first?;
+    let first = first_span(kid)?;
     parent
         .constants
         .iter()
