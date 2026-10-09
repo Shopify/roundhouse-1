@@ -5365,7 +5365,12 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/multibyte/unicode", &["active_support_multibyte_unicode"]),
     ("active_model", &["active_model_errors", "active_model_type", "active_model_validator"]),
     ("active_record", &["active_record"]),
+    ("arel", &["active_record"]),
     ("action_controller", &["action_controller"]),
+    // actionpack's own root features, which action_controller loads
+    // natively (offsite_payments' `require 'action_pack'`).
+    ("action_pack", &["action_controller"]),
+    ("abstract_controller", &["action_controller"]),
     ("action_controller/metal/exceptions", &["action_controller_exceptions"]),
     ("action_view", &["action_view"]),
     ("action_mailer", &["action_mailer"]),
@@ -5805,6 +5810,12 @@ const FRAMEWORKS: &[&str] = &[
     "action_mailer",
     "action_text",
     "action_view",
+    // Loaded with action_controller (actionpack) and active_record
+    // natively: offsite_payments 3.0.1's action_view_helper.rb requires
+    // "action_pack".
+    "action_pack",
+    "abstract_controller",
+    "arel",
 ];
 
 /// runtime/framework_feature_refusal.rb, required right after
@@ -8884,6 +8895,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
     if !app.eager_load.is_empty() {
         body.push_str("    else\n      true\n    end\n  end\nend\n\n");
     }
+    body.push_str(IMPLICIT_NAMESPACE_REQUIRE);
     if !compiled_features.is_empty() || !test_features.is_empty() {
         body.push_str(COMPILED_GEM_REQUIRE);
     }
@@ -9635,6 +9647,29 @@ module Kernel
 end
 "##;
 
+/// The `require` that answers an implicit namespace's autoload
+/// (`RoundhouseAutoload.implicit_autoload`), after app/models.rb's
+/// RoundhouseAutoload module.
+const IMPLICIT_NAMESPACE_REQUIRE: &str = r##"
+# Answers the autoload of an implicit namespace
+# (`RoundhouseAutoload.implicit_autoload`), as Zeitwerk's Kernel#require
+# answers a directory's; every other require goes on to Kernel's own
+# `require` as it stood. Kernel's own method, not a module prepended to
+# it: Zeitwerk's `alias_method :zeitwerk_original_require, :require`
+# would take the prepended method, whose `super` then has no method of
+# the alias's name (COMPILED_GEM_REQUIRE).
+module Kernel
+  previous = instance_method(:require)
+  previous = previous.super_method while previous.owner != Kernel && previous.super_method
+  RoundhouseAutoload.const_set(:REQUIRE_BEFORE_IMPLICIT_NAMESPACES, previous)
+
+  private def require(feature)
+    return RoundhouseAutoload.autovivify(feature) if feature.is_a?(String) && RoundhouseAutoload.implicit?(feature)
+    RoundhouseAutoload::REQUIRE_BEFORE_IMPLICIT_NAMESPACES.bind_call(self, feature)
+  end
+end
+"##;
+
 /// The registration half of the generated `app/models.rb`
 /// ([`apply_models_autoload`]).
 const AUTOLOAD_RUNTIME: &str = r##"
@@ -9776,7 +9811,8 @@ const AUTOLOAD_RUNTIME: &str = r##"
   end
 
   # Register `mod`'s children: an autoload for each file, an implicit
-  # module for a namespace only other files open. A child already
+  # module for a namespace only other files open (autovivified on first
+  # reference, `implicit_autoload`). A child already
   # defined (a runtime class the app reopens, or a gem's namespace the
   # app's file reopens, observe-instrument's `Observe`) loads its file
   # now, after its siblings are registered, since nothing will reference
@@ -9786,8 +9822,14 @@ const AUTOLOAD_RUNTIME: &str = r##"
   # Except a file Zeitwerk manages (its path names the constant: not in
   # UNNAMED_FILES) whose constant a gem's own code defined: Zeitwerk
   # ignores that file as shadowed (`shadowed?`), so it does not load.
-  def self.register(mod)
-    key = mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
+  #
+  # `key`: the namespace's constant path, when that is not its module's
+  # name: a gem's `Object.const_set("Monorail", MonorailV2)` makes
+  # `Monorail` an alias, and Core's lib/monorail/ children register on it
+  # (Zeitwerk sets up the children of the defined constant, whatever its
+  # name).
+  def self.register(mod, key = nil)
+    key ||= mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)
     entries = NAMESPACES[key] or return
     defined = []
     entries.each do |name, file, written_module|
@@ -9809,16 +9851,51 @@ const AUTOLOAD_RUNTIME: &str = r##"
           @registering_autoload = false
         end
       elsif written_module
-        mod.const_set(name, Module.new)
+        implicit_autoload(mod, name)
       end
     end
     defined.each do |name, file|
       child = mod.const_get(name, false)
-      register(child) if child.is_a?(Module)
+      register(child, key == "Object" ? name.to_s : "#{key}::#{name}") if child.is_a?(Module)
       next unless file
       next if !UNNAMED_FILES.key?(file) && shadowed?(mod, name, file)
       if @deferred then @deferred << file else require path(file) end
     end
+  end
+
+  # An implicit namespace, as Zeitwerk defines one: an autoload whose
+  # feature is the namespace (a directory for Zeitwerk; here a path no
+  # file has), which the `require` it runs (IMPLICIT_NAMESPACE_REQUIRE) answers
+  # by setting a new module, on first reference. Nothing defines it
+  # before then, so a gem's own definition of the constant
+  # (monorail's `Object.const_set("Monorail", MonorailV2)`, Bundler.require'd
+  # after this registration) replaces the autoload without Ruby's
+  # "already initialized constant" warning, which Core's StrictWarning
+  # raises, and the namespace's children register on the gem's module.
+  IMPLICIT_ROOT = "#{ROOT}/roundhouse_implicit_namespaces"
+
+  def self.implicit_autoload(mod, name)
+    feature = "#{IMPLICIT_ROOT}/#{mod.equal?(Object) ? "Object" : MODULE_NAME.bind_call(mod)}/#{name}"
+    (@implicit ||= {})[feature] = [mod, name]
+    @registering_autoload = true
+    begin
+      mod.autoload(name, feature)
+    ensure
+      @registering_autoload = false
+    end
+  end
+
+  # The `require` of an implicit namespace's autoload: sets its module.
+  # false for any other feature.
+  def self.autovivify(feature)
+    mod, name = @implicit&.delete(feature)
+    return false unless mod
+    mod.const_set(name, Module.new) unless mod.const_defined?(name, false) && !mod.autoload?(name, false)
+    true
+  end
+
+  def self.implicit?(feature)
+    @implicit&.key?(feature) || false
   end
 
   # The emitted tree (app/models.rb's directory's parent): runtime/, app/.
@@ -9975,7 +10052,7 @@ const AUTOLOAD_RUNTIME: &str = r##"
       return unless RoundhouseAutoload::NAMESPACES.key?(key)
       return if RoundhouseAutoload.registering_autoload? || autoload?(name, false)
       child = const_get(name, false)
-      RoundhouseAutoload.register(child) if child.is_a?(Module)
+      RoundhouseAutoload.register(child, key) if child.is_a?(Module)
     end
   end
   Module.prepend(ConstAdded)
@@ -16498,7 +16575,7 @@ mod tests {
 
     #[test]
     fn a_framework_feature_is_a_rails_framework_or_a_file_under_one() {
-        for feature in ["rails", "rails/railtie", "active_support", "active_support/core_ext/object/blank", "active_model", "action_controller", "action_dispatch/routing", "active_job"] {
+        for feature in ["rails", "rails/railtie", "active_support", "active_support/core_ext/object/blank", "active_model", "action_controller", "action_dispatch/routing", "active_job", "action_pack", "abstract_controller", "arel"] {
             assert!(super::is_framework_feature(feature), "{feature}");
         }
         // Gems named like a framework, and Core's own lib files (Core's

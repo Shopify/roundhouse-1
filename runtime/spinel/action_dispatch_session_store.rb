@@ -126,4 +126,15 @@ module ActionDispatch
         end
     end
   end
+
+  # Rails 8.2's session object, ActionDispatch::Http::Session (8.2.0.alpha
+  # actionpack/lib/action_dispatch/http/session.rb; Request::Session
+  # before 8.2), is the shared runtime's `ActionDispatch::Session` on
+  # this tree, so the name answers that class. identity_client 59.3.0's
+  # session_class.rb picks `ActionDispatch::Http::Session` by `defined?`
+  # at load and names it in its sigs. Its class methods (`create`, `find`) are
+  # request-time paths this tree does not carry (SessionObject above).
+  module Http
+    Session = ::ActionDispatch::Session unless const_defined?(:Session, false)
+  end
 end
