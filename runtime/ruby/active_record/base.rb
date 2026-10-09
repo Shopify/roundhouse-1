@@ -555,6 +555,8 @@ module ActiveRecord
       @destroyed
     end
 
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def mark_persisted!
       @persisted = true
       @destroyed = false
@@ -701,6 +703,8 @@ module ActiveRecord
     # sets `@_trigger_update_callback` from the UPDATE's affected-row
     # count; `_adapter_update` does not report one, so an update always
     # counts as one row.
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def save_after_validation
       _transaction_write_begin
       before_save
@@ -766,6 +770,8 @@ module ActiveRecord
       @_trigger_destroy_callback = false
     end
 
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def _run_commit_hooks
       _run_commit_callbacks
       after_create_commit if _transaction_include_create?
@@ -776,6 +782,8 @@ module ActiveRecord
     end
 
     # transactions.rb `rolledback!`'s callbacks.
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def _transaction_rolled_back
       _run_rollback_callbacks
       after_rollback
@@ -997,6 +1005,8 @@ module ActiveRecord
     # cascade stops one level short and a room's `updated_at` never
     # moves. The commit callbacks run as Rails runs them: an update
     # when the model has an `updated_at` to touch.
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def touch
       _transaction_write_begin
       fill_timestamps(false)
@@ -1018,6 +1028,8 @@ module ActiveRecord
       destroy
     end
 
+    # (The PostgreSQL CRuby tree runs a copy with the runtime-registered
+    # callbacks: runtime/spinel/cruby/active_record_callbacks.rb. Change both.)
     def destroy
       return self unless persisted?
       _transaction_write_begin

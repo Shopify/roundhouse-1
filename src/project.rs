@@ -4402,6 +4402,14 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
     let core = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_core.rb")
         .map_err(|e| format!("read Active Record core runtime: {e}"))?;
     files.push(("runtime/active_record_core.rb".into(), core));
+    // ActiveRecord::Base's callback registration called at runtime
+    // (`base.before_create(:x)` from a concern's `included` hook) and the
+    // chains it runs with the compiled hooks (activerecord 8.2.0.alpha
+    // callbacks.rb, transactions.rb), over active_record_core.rb's
+    // Persistence.
+    let callbacks = crate::runtime_files::read_to_string("runtime/spinel/cruby/active_record_callbacks.rb")
+        .map_err(|e| format!("read Active Record callbacks runtime: {e}"))?;
+    files.push(("runtime/active_record_callbacks.rb".into(), callbacks));
     // ActiveSupport::StringInquirer (activesupport 8.2.0.alpha
     // string_inquirer.rb), verbatim.
     let inquirer = crate::runtime_files::read_to_string("runtime/spinel/active_support_string_inquirer.rb")
@@ -4617,7 +4625,12 @@ fn apply_postgres_bootstrap(files: &mut Vec<(String, String)>, app: &App) -> Res
                 .chain(
                     std::iter::once("active_support_string_inflections")
                         .chain(active_model_ports.iter().copied())
-                        .chain(["active_record_active_model", "active_record_core", "active_support_string_inquirer"])
+                        .chain([
+                            "active_record_active_model",
+                            "active_record_core",
+                            "active_record_callbacks",
+                            "active_support_string_inquirer",
+                        ])
                         .map(|port| format!("require_relative \"{port}\"\n")),
                 )
                 .collect();
@@ -10547,6 +10560,7 @@ fn spinel_files_with_assertions(
             && p != "runtime/active_model_attribute_methods.rb"
             && p != "runtime/active_model_serialization.rb"
             && p != "runtime/active_model_validations.rb"
+            && p != "runtime/active_record_validations.rb"
             && p != "runtime/active_support_option_merger.rb"
     });
 
@@ -13112,14 +13126,18 @@ fn carries_active_support_cache(files: &[(String, String)]) -> bool {
 /// model, include ActiveModel::Validations (a lowered model's include is
 /// gone by emit).
 fn active_model_ports_carried(files: &[(String, String)]) -> Vec<&'static str> {
-    let validations =
-        carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"]);
+    // ActiveRecord::Validations (Core's Validatable extends a Struct with
+    // its ClassMethods) builds on the ActiveModel::Validations port.
+    let record_validations = carries_named(files, &["ActiveRecord::Validations"]);
+    let validations = record_validations
+        || carries_named(files, &["ActiveModel::Validations", "ActiveModel::Errors", "ActiveModel::ValidationError"]);
     let attribute_methods = carries_named(files, &["ActiveModel::AttributeMethods", "ActiveModel::MissingAttributeError"]);
     [
         (true, "active_model_naming"),
         (attribute_methods, "active_model_attribute_methods"),
         (true, "active_model_serialization"),
         (validations, "active_model_validations"),
+        (record_validations, "active_record_validations"),
     ]
     .into_iter()
     .filter_map(|(carried, port)| carried.then_some(port))
