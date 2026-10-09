@@ -3237,9 +3237,9 @@ end
 /// `lib`) or against the helper's directory, and kept where it names a
 /// carried program. A feature no program answers (Rails' own
 /// `rails/test_help`, the app's `config/environment`) is the harness's.
-fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathBuf], app: &App) -> Vec<String> {
+fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathBuf], app: &App) -> Vec<(String, String)> {
     use ruby_prism::Visit;
-    struct Requires(Vec<(String, bool)>);
+    struct Requires(Vec<(String, bool, usize)>);
     impl<'pr> Visit<'pr> for Requires {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             let method = super::util::constant_id_str(&node.name());
@@ -3247,7 +3247,7 @@ fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathB
                 let args: Vec<_> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
                 if let [one] = args.as_slice() {
                     if let Some(s) = one.as_string_node() {
-                        self.0.push((String::from_utf8_lossy(s.unescaped()).into_owned(), method == "require_relative"));
+                        self.0.push((String::from_utf8_lossy(s.unescaped()).into_owned(), method == "require_relative", node.location().start_offset()));
                     }
                 }
             }
@@ -3278,8 +3278,8 @@ fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathB
     let mut load_path: Vec<PathBuf> = app.test_load_roots.iter().map(|root| dir.join(root)).collect();
     load_path.push(dir.join("lib"));
     load_path.extend(path_gems.iter().map(|gem| gem.join("lib")));
-    let mut out: Vec<String> = Vec::new();
-    for (feature, relative) in requires.0 {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (feature, relative, at) in requires.0 {
         let file = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
         let found = if relative {
             Some(clean(dir.join("test").join(&file))).filter(|path| programs.contains(path.as_str()))
@@ -3289,8 +3289,9 @@ fn test_helper_programs<V: Vfs + ?Sized>(vfs: &V, dir: &Path, path_gems: &[PathB
             load_path.iter().map(|root| clean(root.join(&file))).find(|path| programs.contains(path.as_str()))
         };
         if let Some(path) = found {
-            if !out.contains(&path) {
-                out.push(path);
+            if !out.iter().any(|(seen, _)| *seen == path) {
+                let line = source[..at].iter().filter(|b| **b == b'\n').count() + 1;
+                out.push((path, format!("test/test_helper.rb:{line}")));
             }
         }
     }

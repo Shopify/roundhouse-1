@@ -1316,11 +1316,13 @@ pub fn emit_with_assertions(
         // as synthesized siblings so any test body that references one
         // gets an explicit `require_relative "../fixtures/<plural>"`.
         let declaration_programs = declaration_programs(app);
-        let test_helper_anchors: Vec<String> = app
+        let test_helper_anchors: Vec<(String, &str)> = app
             .test_helper_programs
             .iter()
-            .filter_map(|source| app.file_programs.iter().find(|p| &p.source == source))
-            .map(|program| library::file_program_anchor(app, program))
+            .filter_map(|(source, site)| {
+                let program = app.file_programs.iter().find(|p| &p.source == source)?;
+                Some((library::file_program_anchor(app, program), site.as_str()))
+            })
             .collect();
         let fixture_siblings: Vec<(String, String)> = fixture_lcs
             .iter()
@@ -1559,8 +1561,10 @@ pub fn emit_with_assertions(
             // the test's `require "test_helper"` ran the app's helper natively:
             // Core's `require "platform/testing/test_helper"`, its test
             // runtime, helpers and initializers, before the class is defined.
-            for anchor in &test_helper_anchors {
-                writeln!(preamble, "require_relative \"../../app/{anchor}\"").unwrap();
+            // A load that raises is named and the test still runs, as a
+            // file program's statement is (`RoundhouseAutoload.file_statement`).
+            for (anchor, site) in &test_helper_anchors {
+                writeln!(preamble, "RoundhouseAutoload.file_statement({site:?}) {{ require_relative \"../../app/{anchor}\" }}").unwrap();
             }
             if let Some(parent_path) = lc.parent.as_ref().and_then(|p| test_paths.get(p.0.as_str())) {
                 let rel = parent_path.strip_prefix("test").unwrap_or(parent_path).with_extension("");

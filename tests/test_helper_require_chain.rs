@@ -107,7 +107,7 @@ fn emitted_test_requires_the_helpers_programs() {
     let test = std::fs::read_to_string(emitted.join("test/models/foo_widget_test.rb")).expect("emitted test");
     let helper = test.find("require_relative \"../test_helper\"\n").expect("harness helper required");
     let runtime = test
-        .find("require_relative \"../../app/models/roundhouse_files/test/support/test_runtime\"\n")
+        .find("RoundhouseAutoload.file_statement(\"test/test_helper.rb:11\") { require_relative \"../../app/models/roundhouse_files/test/support/test_runtime\" }\n")
         .unwrap_or_else(|| panic!("the helper's runtime program is required:\n{test}"));
     assert!(helper < runtime, "after the harness helper:\n{test}");
     assert!(!test.contains("test_help\""), "Rails' own feature is the harness's:\n{test}");

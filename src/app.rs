@@ -537,9 +537,10 @@ pub struct App {
     /// which loads the test runtime, its helpers and every test
     /// initializer. The emitted helper is the harness's own, so each
     /// test requires these after it, where the app's helper had run
-    /// them (`ingest::app::test_helper_programs`).
+    /// them (`ingest::app::test_helper_programs`). Each is `(source,
+    /// site)`, the site the helper's `test/test_helper.rb:<line>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub test_helper_programs: Vec<String>,
+    pub test_helper_programs: Vec<(String, String)>,
     /// Each support file the ingest carried => the library classes and
     /// modules it declares, in the order it declares them; what a
     /// `require` of that file loads in the emitted tree.
