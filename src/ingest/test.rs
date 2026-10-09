@@ -1871,8 +1871,8 @@ mod test_unroll;
 mod test_macros;
 
 /// Did ingest expand the test macro call at `offset` of `file` (its
-/// tests run under the class that calls it)? `TestMixins` names the
-/// calls it did not.
+/// tests run under the class that calls it), or name it a survey gap?
+/// `TestMixins` names the calls it did neither.
 pub(super) fn macro_call_expanded(file: &str, offset: usize) -> bool {
     test_macros::expanded(file, offset)
 }

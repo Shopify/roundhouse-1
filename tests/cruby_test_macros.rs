@@ -18,7 +18,11 @@
 //!   order, helpers beside a macro, a loop local assigned again, writes
 //!   after a module body, a redefined macro, `send` of a macro, element
 //!   identity, a singleton macro's constant scope, a concern macro in a
-//!   test-root helper).
+//!   test-root helper, a later `extend` or plain concern method, a
+//!   subclass's call of an inherited macro, a test source registered
+//!   after the test, `A = B =`, changes through `const_get` or a block,
+//!   a class-body local a loop's tests read, a concern macro that cannot
+//!   be expanded or is registered later).
 //!
 //! The native oracle is Core's TestGenerator and ActiveSupport's `test`
 //! under Minitest; ids, outcomes and assertion counts must match.
@@ -405,8 +409,8 @@ end
 
 // ---- The review's cases, each against native Minitest -------------
 
-/// Native Minitest's results for `files` (path, source) loaded in order,
-/// then the emitted program's (in survey mode): the index lists every
+/// Native Minitest's results for `files` (path, source; the Ruby ones)
+/// loaded in order, then the emitted program's (in survey mode): the index lists every
 /// native id `gapped` does not take, the run reports native's outcomes
 /// and assertion counts for them, and the survey names each of `gaps`
 /// once and records no other unmodeled test. Returns the native results.
@@ -418,6 +422,7 @@ fn matches_native(
 ) -> BTreeMap<String, (String, u64)> {
     let sources: Vec<String> = files
         .iter()
+        .filter(|(path, _)| path.ends_with(".rb"))
         .map(|(_, text)| text.lines().filter(|l| l.trim() != r#"require "test_helper""#).map(|l| format!("{l}\n")).collect())
         .collect();
     let native = native_results(&sources.iter().map(String::as_str).collect::<Vec<_>>(), classes);
@@ -680,7 +685,7 @@ end
         ],
         &["SubModeTest", "FarModeTest"],
         &|id| id.starts_with("FarModeTest#"),
-        &["tests declared by a loop over a constant an ancestor of its class may declare are not modeled; they will not run (`FarModeTest` line 4, first test at line 5: `MODES`, looked up past the ancestors of `FarModeTest`: `FarBase` is not in a registered source)"],
+        &["tests declared by a loop over a constant an ancestor of its class may declare are not modeled; they will not run (`FarModeTest` line 4, first test at line 5: `MODES`, looked up past the ancestors of `FarModeTest`: `FarBase` is declared in test/support/far_base.rb, a test source not registered before this one)"],
     );
 }
 
@@ -958,4 +963,322 @@ fn a_concern_macro_from_a_test_root_helper_has_no_gap() {
     let mut tests: Vec<String> = listed["ConcernMacroTest"].1.iter().map(|t| format!("ConcernMacroTest#{t}")).collect();
     tests.sort();
     assert_eq!(tests, native.keys().cloned().collect::<Vec<_>>());
+}
+
+const GEN_CONCERN: &str = r##"module GenConcern
+  extend ActiveSupport::Concern
+
+  class_methods do
+    def gen(k)
+      test("concern #{k}") { assert_kind_of Symbol, k }
+    end
+  end
+end
+"##;
+
+/// A class method comes from the latest of the modules a class body
+/// includes or extends: an extended module's method that declares other
+/// tests, or none, or a later concern's plain method, is the one a call
+/// runs.
+#[test]
+fn the_latest_module_gives_the_class_method() {
+    let other = "module OtherGen\n  def gen(k)\n    test(\"other #{k}\") { assert_kind_of Symbol, k }\n  end\nend\n";
+    let quiet = "module QuietGen\n  def gen(k)\n  end\nend\n";
+    let plain = "module PlainConcern\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def gen(k)\n      k\n    end\n  end\nend\n";
+    let test = r##"class OverrideTest < ActiveSupport::TestCase
+  include GenConcern
+  extend OtherGen
+
+  gen(:a)
+end
+
+class QuietTest < ActiveSupport::TestCase
+  include GenConcern
+  extend QuietGen
+
+  gen(:b)
+
+  test "quiet kept" do
+    assert true
+  end
+end
+
+class TwoConcernsTest < ActiveSupport::TestCase
+  include GenConcern
+  include PlainConcern
+
+  gen(:a)
+
+  test "kept" do
+    assert true
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/gen_concern.rb", GEN_CONCERN),
+            ("app/models/other_gen.rb", other),
+            ("app/models/quiet_gen.rb", quiet),
+            ("app/models/plain_concern.rb", plain),
+            ("test/models/override_test.rb", test),
+        ],
+        &["OverrideTest", "QuietTest", "TwoConcernsTest"],
+        &|_| false,
+        &[],
+    );
+    assert_eq!(
+        native.keys().collect::<Vec<_>>(),
+        ["OverrideTest#test_other_a", "QuietTest#test_quiet_kept", "TwoConcernsTest#test_kept"]
+    );
+}
+
+/// A subclass's call of a macro its superclass gets (from its own
+/// `class << self`, or a concern it includes) is named; the inherited
+/// tests still run.
+#[test]
+fn a_subclass_call_of_an_inherited_macro_is_named() {
+    let base = "class ABaseMacroTest < ActiveSupport::TestCase\n  class << self\n    def gen(k)\n      test(\"gen #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\n\n  gen(:a)\nend\n";
+    let child = "class BChildMacroTest < ABaseMacroTest\n  gen(:b)\nend\n";
+    let parent = "class AParentTest < ActiveSupport::TestCase\n  include GenConcern\n\n  gen(:p)\nend\n";
+    let concern_child = "class BChildTest < AParentTest\n  gen(:c)\nend\n";
+    let inherited = "the method it runs is not one the class body, or a module it includes or extends, defines (one it inherits, or another), and a method of that name declares tests in ";
+    let native = matches_native(
+        &[
+            ("app/models/gen_concern.rb", GEN_CONCERN),
+            ("test/models/a_base_macro_test.rb", base),
+            ("test/models/a_parent_test.rb", parent),
+            ("test/models/b_child_macro_test.rb", child),
+            ("test/models/b_child_test.rb", concern_child),
+        ],
+        &["ABaseMacroTest", "BChildMacroTest", "AParentTest", "BChildTest"],
+        &|id| id == "BChildMacroTest#test_gen_b" || id == "BChildTest#test_concern_c",
+        &[
+            &format!("tests declared by a call of the class method `gen` are not modeled; they will not run (`BChildMacroTest` line 2: {inherited}"),
+            &format!("tests declared by a call of the class method `gen` are not modeled; they will not run (`BChildTest` line 2: {inherited}"),
+        ],
+    );
+    assert_eq!(native.len(), 6, "{native:#?}");
+}
+
+/// A test source that sorts after the test (one its helper requires
+/// first) is not registered when the test is read: a loop over a
+/// constant it changes, or one it may declare in an ancestor of the
+/// class (reopening `ActiveSupport::TestCase`), is a named gap.
+#[test]
+fn later_test_sources_that_change_a_loop_are_gaps() {
+    let levels = "module Levels\n  ALL = [:a, :b]\nend\n";
+    let levels_test = r##"class LevelsTest < ActiveSupport::TestCase
+  Levels::ALL.each do |l|
+    test "level #{l}" do
+      assert_kind_of Symbol, l
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/levels.rb", levels),
+            ("test/support/levels_ext.rb", "Levels::ALL << :extra\n"),
+            ("test/models/levels_test.rb", levels_test),
+        ],
+        &["LevelsTest"],
+        &|_| true,
+        &["tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (test/support/levels_ext.rb line 1, a test source not registered before this one))"],
+    );
+    assert!(native.contains_key("LevelsTest#test_level_extra"), "{native:#?}");
+
+    // The same under `roundhouse.yml` test roots outside `test/` (Core's
+    // `components/*/test/…`).
+    matches_native(
+        &[
+            ("roundhouse.yml", "test_paths:\n  - components/a/test/models\n  - components/z/test/support\n"),
+            ("app/models/levels.rb", levels),
+            ("components/z/test/support/levels_ext.rb", "Levels::ALL << :extra\n"),
+            ("components/a/test/models/levels_test.rb", levels_test),
+        ],
+        &["LevelsTest"],
+        &|_| true,
+        &["tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run (`LevelsTest` line 2, first test at line 3: `Levels::ALL`: `Levels::ALL << :extra` (components/z/test/support/levels_ext.rb line 1, a test source not registered before this one))"],
+    );
+
+    let modes_test = r##"class ModesTest < ActiveSupport::TestCase
+  MODES.each do |m|
+    test "mode #{m}" do
+      assert_equal :support, m
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[
+            ("app/models/modes.rb", "MODES = [:top]\n"),
+            ("test/support/base_ext.rb", "class ActiveSupport::TestCase\n  MODES = [:support]\nend\n"),
+            ("test/models/modes_test.rb", modes_test),
+        ],
+        &["ModesTest"],
+        &|_| true,
+        &["tests declared by a loop over a constant an ancestor of its class may declare are not modeled; they will not run (`ModesTest` line 2, first test at line 3: `MODES`, looked up past the ancestors of `ModesTest`: `ActiveSupport::TestCase` is declared in test/support/base_ext.rb, a test source not registered before this one)"],
+    );
+    assert_eq!(native.keys().collect::<Vec<_>>(), ["ModesTest#test_mode_support"]);
+}
+
+/// `A = B = :x` declares both: a loop over the module's constants is a
+/// gap rather than one that drops `B`.
+#[test]
+fn a_chained_constant_write_is_not_dropped() {
+    let chained = "module Chained\n  A = B = :x\n  C = :c\nend\n";
+    let test = r##"class ChainedTest < ActiveSupport::TestCase
+  Chained.constants.each do |c|
+    test "const #{c}" do
+      assert_equal Chained.const_get(c), Chained.const_get(c)
+    end
+  end
+end
+"##;
+    let native = matches_native(
+        &[("app/models/chained.rb", chained), ("test/models/chained_test.rb", test)],
+        &["ChainedTest"],
+        &|_| true,
+        &["tests declared by a loop over a collection that is not a literal are not modeled; they will not run (`ChainedTest` line 2, first test at line 3: "],
+    );
+    assert_eq!(native.len(), 3, "{native:#?}");
+}
+
+/// A constant changed through `const_get`, or through its elements in a
+/// block (`each(&:upcase!)`, `each { |k| k << "z" }`, a local bound to
+/// one), is a gap; a block that only reads them is not.
+#[test]
+fn constants_changed_through_const_get_or_elements_are_gaps() {
+    let levels = "module Levels\n  ALL = [:a, :b]\n  NAMES = %w[x y]\n  KEYS = %w[k]\n  COPIED = %w[m]\n  SAFE = %w[s]\nend\n";
+    let setup = r##"Levels.const_get(:ALL) << :c
+Levels::NAMES.each(&:upcase!)
+Levels::KEYS.each { |k| k << "z" }
+Levels::COPIED.each do |n|
+  m = n
+  m.concat("q")
+end
+Levels::SAFE.each { |s| s.upcase }
+Levels.const_get(:SAFE).map(&:upcase)
+"##;
+    let test = r##"class EscapeTest < ActiveSupport::TestCase
+  Levels::ALL.each do |l|
+    test "level #{l}" do
+      assert_kind_of Symbol, l
+    end
+  end
+
+  Levels::NAMES.each do |n|
+    test "name #{n}" do
+      assert_kind_of String, n
+    end
+  end
+
+  Levels::KEYS.each do |k|
+    test "key #{k}" do
+      assert_equal "kz", k
+    end
+  end
+
+  Levels::COPIED.each do |c|
+    test "copied #{c}" do
+      assert_equal "mq", c
+    end
+  end
+
+  Levels::SAFE.each do |s|
+    test "safe #{s}" do
+      assert_equal "s", s
+    end
+  end
+end
+"##;
+    let changed = "tests declared by a loop over a constant that is changed after it is assigned are not modeled; they will not run";
+    let native = matches_native(
+        &[("app/models/levels.rb", levels), ("app/models/levels_setup.rb", setup), ("test/models/escape_test.rb", test)],
+        &["EscapeTest"],
+        &|id| !id.ends_with("#test_safe_s"),
+        &[
+            &format!("{changed} (`EscapeTest` line 2, first test at line 3: `Levels::ALL`: `Levels.const_get(:ALL) << :c` (app/models/levels_setup.rb line 1))"),
+            &format!("{changed} (`EscapeTest` line 8, first test at line 9: `Levels::NAMES`: `Levels::NAMES.each(&:upcase!)` (app/models/levels_setup.rb line 2))"),
+            &format!("{changed} (`EscapeTest` line 14, first test at line 15: `Levels::KEYS`: "),
+            &format!("{changed} (`EscapeTest` line 20, first test at line 21: `Levels::COPIED`: "),
+        ],
+    );
+    for id in ["EscapeTest#test_level_c", "EscapeTest#test_name_X", "EscapeTest#test_key_kz", "EscapeTest#test_copied_mq"] {
+        assert!(native.contains_key(id), "{id}: {native:#?}");
+    }
+}
+
+/// A loop's tests close over the class body's locals too; the emitted
+/// tests bind only the loop's names, so a loop whose block reads one is
+/// a gap. An inner loop's tests read the outer loop's parameter.
+#[test]
+fn loops_reading_class_body_locals_are_gaps() {
+    let levels = "module Levels\n  ALL = [:a, :b].freeze\nend\n";
+    let test = r##"class BodyLocalTest < ActiveSupport::TestCase
+  prefix = "x"
+
+  Levels::ALL.each do |l|
+    test "level #{l}" do
+      assert_equal "x", prefix
+    end
+  end
+
+  [:c].each do |l|
+    test "lit #{l}" do
+      assert_equal "x", prefix
+    end
+  end
+
+  [:o, :p].each do |o|
+    [1].each do |i|
+      test "nested #{o} #{i}" do
+        assert_equal 1, i
+        assert_includes [:o, :p], o
+      end
+    end
+  end
+end
+"##;
+    let outer = "tests declared by a loop whose block reads a local from outside it are not modeled; they will not run";
+    let native = matches_native(
+        &[("app/models/levels.rb", levels), ("test/models/body_local_test.rb", test)],
+        &["BodyLocalTest"],
+        &|id| !id.contains("#test_nested_"),
+        &[
+            &format!("{outer} (`BodyLocalTest` line 4, first test at line 5: `prefix` at line 6)"),
+            &format!("{outer} (`BodyLocalTest` line 10, first test at line 11: `prefix` at line 12)"),
+        ],
+    );
+    assert!(native.values().all(|(s, _)| s == "pass"), "{native:#?}");
+    assert_eq!(native.len(), 5, "{native:#?}");
+}
+
+/// A concern macro that does more than declare tests is named, as is one
+/// in a test source registered after the test (a helper its
+/// `test_helper` requires); the class's other tests run.
+#[test]
+fn unexpandable_or_later_concern_macros_are_named() {
+    let concern = "module LoudConcern\n  extend ActiveSupport::Concern\n\n  class_methods do\n    def loud(k)\n      puts \"declaring\" if false\n      test(\"loud #{k}\") { assert_kind_of Symbol, k }\n    end\n  end\nend\n";
+    let test = "class UnexpandableTest < ActiveSupport::TestCase\n  include LoudConcern\n\n  loud(:a)\n\n  test \"kept\" do\n    assert true\n  end\nend\n";
+    matches_native(
+        &[("app/models/loud_concern.rb", concern), ("test/models/unexpandable_test.rb", test)],
+        &["UnexpandableTest"],
+        &|id| id == "UnexpandableTest#test_loud_a",
+        &["tests declared by a call of the class method `loud` are not modeled; they will not run (`UnexpandableTest` line 4: its body does more than declare tests (`puts \"declaring\" if false`))"],
+    );
+
+    let test = "class ConcernMacroTest < ActiveSupport::TestCase\n  include Access::PermissionHelper\n\n  test_permission(Reasons, :alpha, sufficient: [:a, :b], insufficient: [:a])\nend\n";
+    let native = matches_native(
+        &[
+            ("app/models/reasons.rb", REASONS),
+            ("lib/test_generator.rb", TEST_GENERATOR),
+            ("test/support/helpers/access/permission_helper.rb", PERMISSION_HELPER),
+            ("test/models/concern_macro_test.rb", test),
+        ],
+        &["ConcernMacroTest"],
+        &|_| true,
+        &["tests declared by a call of the class method `test_permission` are not modeled; they will not run (`ConcernMacroTest` line 4: the module that defines it is not known (`Access::PermissionHelper` is declared in test/support/helpers/access/permission_helper.rb, a test source not registered before this one))"],
+    );
+    assert_eq!(native.len(), 2, "{native:#?}");
 }

@@ -1322,6 +1322,12 @@ impl<'pr> Unroll<'_, 'pr> {
         let Some(params) = block_params(&block) else {
             return Ok(Err(not_modeled("a loop whose block parameters are not modeled", first_line(&call.as_node()))));
         };
+        // A test's closure also sees the class body's locals (`prefix =
+        // "x"` before the loop); the tests bind only the loop's names.
+        if let Some((name, at)) = outer_local(&block, bound) {
+            let line = super::super::sources::line_at(self.file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
+            return Ok(Err(not_modeled("a loop whose block reads a local from outside it", format!("`{name}` at line {line}"))));
+        }
         let stmts = block.body().map(flatten_statements).unwrap_or_default();
         // The names each test's closure shares with the loop: the block
         // parameters and the locals its body binds (first binding only).
@@ -1407,6 +1413,74 @@ impl<'pr> Unroll<'_, 'pr> {
         }
         Ok(Ok(()))
     }
+}
+
+/// The first local `block` (a loop's block, inside the loops `bound`
+/// binds) reads or writes that lives outside it and those loops (a
+/// class-body local), with where it does.
+fn outer_local(block: &ruby_prism::BlockNode<'_>, bound: &[(String, Elem)]) -> Option<(String, usize)> {
+    use ruby_prism::Visit;
+    struct Scan<'a> {
+        /// Blocks entered inside `block`.
+        level: u32,
+        bound: &'a [(String, Elem)],
+        found: Option<(String, usize)>,
+    }
+    impl Scan<'_> {
+        fn local(&mut self, name: &ruby_prism::ConstantId<'_>, depth: u32, node: &Node<'_>) {
+            let name = constant_id_str(name);
+            if self.found.is_none() && depth > self.level && !self.bound.iter().any(|(n, _)| n == name) {
+                self.found = Some((name.to_string(), node.location().start_offset()));
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Scan<'_> {
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            self.level += 1;
+            ruby_prism::visit_block_node(self, node);
+            self.level -= 1;
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            self.level += 1;
+            ruby_prism::visit_lambda_node(self, node);
+            self.level -= 1;
+        }
+        // Their own scopes: an outer local is not seen there.
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+        fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+        }
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.local(&node.name(), node.depth(), &node.as_node());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+    }
+    let mut scan = Scan { level: 0, bound, found: None };
+    if let Some(params) = block.parameters() {
+        scan.visit(&params);
+    }
+    if let Some(body) = block.body() {
+        scan.visit(&body);
+    }
+    scan.found
 }
 
 /// A test that changes a shared object in place (`k << x`): the copies
@@ -1789,6 +1863,7 @@ pub(super) mod consts {
 
     pub(in super::super) const CHANGED: &str = "a loop over a constant that is changed after it is assigned";
     pub(in super::super) const ANCESTOR: &str = "a loop over a constant an ancestor of its class may declare";
+    pub(in super::super) const LATE_SOURCE: &str = "a loop over a constant a test source not registered before it may declare";
 
     impl ConstCx {
         /// This context for a statement at `at` of the same body.
@@ -2073,7 +2148,8 @@ pub(super) mod consts {
         match find(name) {
             Found::Namespace => Some(Hit::Namespace(name.to_string())),
             Found::Value(decl) => Some(Hit::Decl(decl)),
-            Found::Missing | Found::Unknown => None,
+            Found::Unknown => late_reason(name).and_then(|why| refuse(LATE_SOURCE, why)),
+            Found::Missing => None,
         }
     }
 
@@ -2096,7 +2172,7 @@ pub(super) mod consts {
             let full = format!("{scope}::{name}");
             match find(&full) {
                 Found::Missing => continue,
-                Found::Unknown => return None,
+                Found::Unknown => return late_reason(&full).and_then(|why| refuse(LATE_SOURCE, why)),
                 Found::Namespace => return Some(Hit::Namespace(full)),
                 Found::Value(decl) => return Some(Hit::Decl(decl)),
             }
@@ -2299,6 +2375,9 @@ pub(super) mod consts {
         if !decl.certain || decl.names.len() != 1 || decl.kind != Kind::Module {
             return None;
         }
+        if let Some(why) = late_reason(module) {
+            return refuse(LATE_SOURCE, format!("`{module}.constants`: {why}"));
+        }
         let dir = format!("/{}/", underscore(module));
         let mut id = 1;
         while let Some(path) = sources::path_of(FileId(id)) {
@@ -2307,14 +2386,21 @@ pub(super) mod consts {
             }
             id += 1;
         }
+        let writes_into = |text: &str| {
+            text.contains(&format!("{last}.const_set")) || text.contains(&format!("{last}::const_set")) || assigns_into(text, last)
+        };
         for id in files_with(last, 0) {
             let Some(path) = sources::path_of(FileId(id)) else { continue };
-            let written = sources::with_text(&path, |text| {
-                text.contains(&format!("{last}.const_set")) || text.contains(&format!("{last}::const_set")) || assigns_into(text, last)
-            });
-            if written != Some(false) {
+            if sources::with_text(&path, writes_into) != Some(false) {
                 return None;
             }
+        }
+        let (files, late) = late_sources(Some(last));
+        if let Some(i) = late.into_iter().find(|i| files[*i].0.contains(&dir) || writes_into(&files[*i].1)) {
+            return refuse(
+                LATE_SOURCE,
+                format!("`{module}.constants`: {} may add to it, a test source not registered before this one", sources::relative_path(&files[i].0)),
+            );
         }
         if let Some(site) = changed_from_outside(module, &decl.path, decl.cref.last().map(String::as_str)) {
             return refuse(CHANGED, format!("`{module}.constants`: `{module}` {site}"));
@@ -2328,6 +2414,10 @@ pub(super) mod consts {
             let mut private: Vec<String> = Vec::new();
             for stmt in module_node.body().map(flatten_statements).unwrap_or_default() {
                 if let Some(write) = stmt.as_constant_write_node() {
+                    // `A = B = :x` writes `B` too; `A = const_set(…)` more.
+                    if writes_constants(&write.value()) {
+                        return None;
+                    }
                     out.push(constant_id_str(&write.name()).to_string());
                 } else if let Some(path) = stmt.as_module_node().map(|m| m.constant_path()).or_else(|| stmt.as_class_node().map(|c| c.constant_path())) {
                     match segments(&path) {
@@ -2358,6 +2448,42 @@ pub(super) mod consts {
             Some(names.into_iter().map(Value::Sym).collect())
         })
         .flatten()
+    }
+
+    /// Does `node` write a constant, or call what may (`const_set`,
+    /// `class_eval`, `send`, a `Class.new`/`Module.new` block)?
+    fn writes_constants(node: &Node<'_>) -> bool {
+        use ruby_prism::Visit;
+        struct Scan {
+            found: bool,
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
+                self.found |= node.as_constant_write_node().is_some()
+                    || node.as_constant_or_write_node().is_some()
+                    || node.as_constant_and_write_node().is_some()
+                    || node.as_constant_operator_write_node().is_some()
+                    || node.as_constant_path_write_node().is_some()
+                    || node.as_constant_path_or_write_node().is_some()
+                    || node.as_constant_path_and_write_node().is_some()
+                    || node.as_constant_path_operator_write_node().is_some()
+                    || node.as_multi_write_node().is_some_and(|m| {
+                        m.lefts().iter().chain(m.rest()).chain(m.rights().iter()).any(|t| {
+                            t.as_constant_target_node().is_some() || t.as_constant_path_target_node().is_some()
+                        })
+                    })
+                    || node.as_call_node().is_some_and(|c| {
+                        matches!(
+                            c.name().as_slice(),
+                            b"const_set" | b"class_eval" | b"module_eval" | b"class_exec" | b"module_exec" | b"instance_eval"
+                                | b"instance_exec" | b"send" | b"public_send" | b"__send__" | b"eval"
+                        ) || (c.name().as_slice() == b"new" && c.block().is_some())
+                    });
+            }
+        }
+        let mut scan = Scan { found: false };
+        scan.visit(node);
+        scan.found
     }
 
     /// `extend T::Sig`, `private`, `sig { … }`: a call that adds no
@@ -2412,6 +2538,10 @@ pub(super) mod consts {
 
     fn find(full: &str) -> Found {
         let last = full.rsplit("::").next().unwrap_or(full);
+        // A test source not registered yet may declare it again.
+        if late_decls(last).iter().any(|d| d.names.iter().any(|n| n == full)) {
+            return Found::Unknown;
+        }
         let found: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == full)).collect();
         if found.is_empty() {
             return Found::Missing;
@@ -2468,6 +2598,10 @@ pub(super) mod consts {
         "Rails::Generators::TestCase", "Rails::Generators::Testing::Assertions", "Rails::Generators::Testing::Behavior",
         "Rails::Generators::Testing::SetupAndTeardown", "Comparable", "Enumerable", "StatsD::Instrument::Assertions",
         "StatsD::Instrument::Helpers",
+        // Core's `TestGenerator` (platform/essentials'
+        // `lib/platform/testing/test_generator.rb`, whose `generate_test`
+        // `test_macros` models): no constants, no ancestors.
+        "TestGenerator",
     ];
 
     /// Every constant any of `KNOWN_MODULES` has (`constants(false)` of
@@ -2525,6 +2659,55 @@ pub(super) mod consts {
         KNOWN_MODULES.contains(&module)
     }
 
+    /// Is `module` (a full name) one of the framework's that a test class
+    /// may have as an ancestor without a registered source?
+    pub(in super::super) fn known_module(module: &str) -> bool {
+        known(module)
+    }
+
+    /// The `module` statements that declare the module `full`, as (file,
+    /// start, end, the lexical scopes inside it). `Err` says why they
+    /// are not all known: it is not declared in a registered source, a
+    /// test source not registered yet declares it, it is not a module
+    /// declared with certainty, or a source changes it from outside its
+    /// body.
+    pub(in super::super) fn module_declarations(full: &str) -> Result<Vec<(String, usize, usize, Vec<String>)>, String> {
+        if let Some(why) = late_reason(full) {
+            return Err(why);
+        }
+        let last = full.rsplit("::").next().unwrap_or(full);
+        let own: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == full)).collect();
+        if own.is_empty() {
+            return Err(format!("`{full}` is not in a registered source"));
+        }
+        if own.iter().any(|d| !d.certain || d.names.len() > 1 || d.kind != Kind::Module) {
+            return Err(format!("`{full}` is not a module declared with certainty"));
+        }
+        if let Some(site) = changed_from_outside(full, &own[0].path, own[0].cref.last().map(String::as_str)) {
+            return Err(format!("`{full}` {site}"));
+        }
+        Ok(own
+            .into_iter()
+            .map(|d| {
+                let mut cref = d.cref.clone();
+                cref.push(full.to_string());
+                (d.path, d.start, d.end, cref)
+            })
+            .collect())
+    }
+
+    /// The test source not registered now that declares a constant
+    /// written `written` (`A::B`, under any scope), by its path relative
+    /// to the app.
+    pub(in super::super) fn late_declared(written: &str) -> Option<String> {
+        let last = written.rsplit("::").next().unwrap_or(written);
+        let suffix = format!("::{written}");
+        late_decls(last)
+            .into_iter()
+            .find(|d| d.names.iter().any(|n| n == written || n.ends_with(&suffix)))
+            .map(|d| sources::relative_path(&d.path))
+    }
+
     /// May `module` (an ancestor) have the constant `name` itself?
     fn declares(module: &str, name: &str) -> bool {
         !matches!(find(&format!("{module}::{name}")), Found::Missing) || (known(module) && KNOWN_CONSTANTS.contains(&name))
@@ -2538,12 +2721,28 @@ pub(super) mod consts {
             RefCell::new((None, 0, HashMap::new()));
     }
 
+    /// The registry: its first path and how many files (ids are dense
+    /// from 1, so found by bisection).
     fn registered() -> (Option<String>, u32) {
-        let mut n = 0;
-        while sources::path_of(FileId(n + 1)).is_some() {
-            n += 1;
+        let exists = |n: u32| n == 0 || sources::path_of(FileId(n)).is_some();
+        let mut high = 1u32;
+        while exists(high) {
+            high = high.saturating_mul(2);
+            if high == u32::MAX {
+                break;
+            }
         }
-        (sources::path_of(FileId(1)), n)
+        // exists(low), !exists(high)
+        let mut low = high / 2;
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            if exists(mid) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        (sources::path_of(FileId(1)), low)
     }
 
     /// The ancestors of the class or module `scope` (a full name) other
@@ -2603,6 +2802,9 @@ pub(super) mod consts {
             parents.push(parent.to_string());
         }
         let own: Vec<Decl> = decls(last).into_iter().filter(|d| d.names.iter().any(|n| n == module)).collect();
+        if let Some(why) = late_reason(module) {
+            return Err(why);
+        }
         if !known(module) {
             match find(module) {
                 Found::Namespace => {}
@@ -2620,13 +2822,20 @@ pub(super) mod consts {
             return Err(format!("`{module}` {site}"));
         }
         if let Some((_, hook)) = LOAD_HOOKS.iter().find(|(c, _)| *c == module) {
+            // `on_load` is ActiveSupport's: a file that runs one names it.
             let needle = format!(":{hook}");
-            let mut id = 1;
-            while let Some(path) = sources::path_of(FileId(id)) {
+            for id in files_with("ActiveSupport", 0) {
+                let Some(path) = sources::path_of(FileId(id)) else { continue };
                 if sources::with_text(&path, |t| t.contains(&needle)) == Some(true) {
                     return Err(format!("`{module}` has an `on_load(:{hook})` hook ({})", sources::relative_path(&path)));
                 }
-                id += 1;
+            }
+            let (files, late) = late_sources(Some("ActiveSupport"));
+            if let Some(i) = late.into_iter().find(|i| files[*i].1.contains(&needle)) {
+                return Err(format!(
+                    "`{module}` has an `on_load(:{hook})` hook ({}, a test source not registered before this one)",
+                    sources::relative_path(&files[i].0)
+                ));
             }
         }
         Ok(parents)
@@ -2833,7 +3042,12 @@ pub(super) mod consts {
         } else {
             match first_name(cref, first) {
                 Resolution::Missing => None,
-                Resolution::Unknown => return Err(format!("`{written}` is not declared once with certainty")),
+                Resolution::Unknown => {
+                    return Err(match late_declared(first) {
+                        Some(path) => format!("`{first}` is declared in {path}, a test source not registered before this one"),
+                        None => format!("`{written}` is not declared once with certainty"),
+                    })
+                }
                 Resolution::Declared(full) => Some(full),
             }
         };
@@ -2908,10 +3122,13 @@ pub(super) mod consts {
             let line_start = before.rfind('\n').map_or(0, |n| n + 1);
             let line = &before[line_start..];
             let prev = before.bytes().last();
-            // A Symbol or String naming it: `const_set(:ALL, …)`.
+            // A Symbol or String naming it: `const_set(:ALL, …)`, or
+            // `Levels.const_get(:ALL)`, the constant itself.
             if (prev == Some(b':') && !before.ends_with("::")) || matches!(prev, Some(b'"' | b'\'')) {
                 if line.contains("const_set") || line.contains("remove_const") {
                     out.push(Site { path: path.to_string(), at, qualifier: None, rooted: false, kind: SiteKind::Change, method: "const_set".into() });
+                } else if let Some(site) = const_get_site(text, path, at, end, line) {
+                    out.push(site);
                 }
                 continue;
             }
@@ -2923,7 +3140,276 @@ pub(super) mod consts {
             let (kind, method) = classify(&text[end..]);
             out.push(Site { path: path.to_string(), at, qualifier, rooted, kind, method });
         }
+        // Read through a call whose block may change what it is given
+        // (`ALL.each(&:upcase!)`, `ALL.each { |n| n << "x" }`): its
+        // elements change.
+        if out.iter().any(|s| s.kind != SiteKind::Change) {
+            let changers = block_changers(path, text);
+            for site in out.iter_mut().filter(|s| s.kind != SiteKind::Change) {
+                if changers.iter().any(|(start, end)| *start <= site.at && site.at < *end) {
+                    site.kind = SiteKind::Change;
+                }
+            }
+        }
         out
+    }
+
+    /// `Levels.const_get(:ALL)` (the Symbol or String at `at..end`, on a
+    /// line that begins with `line`): a mention of the constant it
+    /// returns, qualified by the receiver (any constant of the name when
+    /// that is not a constant path) and classified by what follows the
+    /// call. A name not known before it runs (`const_get(name)`) is not
+    /// seen here.
+    fn const_get_site(text: &str, path: &str, at: usize, end: usize, line: &str) -> Option<Site> {
+        let quote = line.bytes().last()?;
+        let head = line[..line.len() - 1].trim_end_matches([' ', '\t']);
+        let (head, parens) = match head.strip_suffix('(') {
+            Some(head) => (head.trim_end_matches([' ', '\t']), true),
+            None => (head, false),
+        };
+        let head = head.strip_suffix("const_get")?;
+        let (qualifier, rooted) = match head.strip_suffix("&.").or_else(|| head.strip_suffix('.')) {
+            Some(receiver) => qualifier_before(&format!("{}::", receiver.trim_end())),
+            None => (None, false),
+        };
+        let mut rest = &text[end..];
+        if quote != b':' {
+            rest = rest.strip_prefix(quote as char)?;
+        }
+        let (kind, method) = if parens {
+            match matching(rest, b'(', b')') {
+                Some(close) => classify(&rest[close + 1..]),
+                None => (SiteKind::Change, String::new()),
+            }
+        } else {
+            (SiteKind::Passed, String::new())
+        };
+        Some(Site { path: path.to_string(), at, qualifier, rooted, kind, method })
+    }
+
+    thread_local! {
+        /// `block_changers` by path (with the length of the text read).
+        static CHANGERS: RefCell<HashMap<String, (usize, Rc<Vec<(usize, usize)>>)>> = RefCell::new(HashMap::new());
+    }
+
+    /// The spans (from the start of the call to its block) of the calls
+    /// in `text` whose block may change what it is given: a block
+    /// argument other than a Symbol of a method that changes nothing
+    /// (`&:upcase!`, `&blk`), or a block that changes a parameter in place
+    /// (`|n| n << "x"`, `n.upcase!`, `n[0] = x`), or passes it to a method
+    /// that may. Tests' and hooks' blocks and methods' bodies run later,
+    /// after the class bodies declared their tests: they are not counted.
+    fn block_changers(path: &str, text: &str) -> Rc<Vec<(usize, usize)>> {
+        use ruby_prism::Visit;
+        if let Some(found) = CHANGERS.with(|c| c.borrow().get(path).filter(|(len, _)| *len == text.len()).map(|(_, f)| f.clone())) {
+            return found;
+        }
+        struct Scan {
+            out: Vec<(usize, usize)>,
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if let Some(block) = node.block() {
+                    if !later_block(node) && block_changes(&block) {
+                        self.out.push((node.location().start_offset(), block.location().start_offset()));
+                    }
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let result = ruby_prism::parse(text.as_bytes());
+        let mut scan = Scan { out: Vec::new() };
+        scan.visit(&result.node());
+        let found = Rc::new(scan.out);
+        CHANGERS.with(|c| c.borrow_mut().insert(path.to_string(), (text.len(), found.clone())));
+        found
+    }
+
+    /// Calls whose block runs once tests run, not as the class body is
+    /// read (`test "…" do`, `setup do`).
+    const LATER: &[&str] = &["test", "setup", "teardown", "it", "specify", "before", "after", "around"];
+
+    fn later_block(call: &ruby_prism::CallNode<'_>) -> bool {
+        call.receiver().is_none() && LATER.contains(&constant_id_str(&call.name()))
+    }
+
+    /// Methods a block's parameter may be passed to without being changed.
+    const PASSES: &[&str] = &[
+        "test", "it", "specify", "describe", "context", "define_method", "puts", "p", "pp", "print", "format",
+        "sprintf", "raise", "fail", "include?", "key?", "member?", "is_a?", "kind_of?", "instance_of?", "equal?", "eql?",
+        "fetch", "dig", "index", "find_index", "count",
+    ];
+
+    /// May the block (or block argument) `block` change what it is given?
+    fn block_changes(block: &Node<'_>) -> bool {
+        use ruby_prism::Visit;
+        if let Some(arg) = block.as_block_argument_node() {
+            return match arg.expression() {
+                Some(expr) => match expr.as_symbol_node() {
+                    Some(sym) => std::str::from_utf8(sym.unescaped()).map_or(true, super::mutates),
+                    None => true,
+                },
+                None => true,
+            };
+        }
+        let Some(block) = block.as_block_node() else { return true };
+        struct Scan {
+            names: Vec<String>,
+            found: bool,
+        }
+        impl Scan {
+            fn rooted(&self, node: Option<Node<'_>>) -> bool {
+                node.as_ref().and_then(root_name).is_some_and(|n| self.names.contains(&n))
+            }
+        }
+        impl<'pr> Visit<'pr> for Scan {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                let name = constant_id_str(&node.name());
+                let rooted = self.rooted(node.receiver());
+                if rooted && super::mutates(name) {
+                    self.found = true;
+                }
+                let operator = !name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+                if !operator && !PASSES.contains(&name) {
+                    let args = node.arguments().map(|a| a.arguments().iter().collect::<Vec<_>>()).unwrap_or_default();
+                    let param = |a: &Node<'_>| {
+                        (a.as_local_variable_read_node().is_some() || a.as_it_local_variable_read_node().is_some())
+                            && root_name(a).is_some_and(|n| self.names.contains(&n))
+                    };
+                    if args.iter().any(|a| param(a) || a.as_splat_node().and_then(|s| s.expression()).is_some_and(|e| param(&e))) {
+                        self.found = true;
+                    }
+                }
+                if let Some(block) = node.block() {
+                    if later_block(node) {
+                        if let Some(args) = node.arguments() {
+                            self.visit_arguments_node(&args);
+                        }
+                        return;
+                    }
+                    if rooted {
+                        match block.as_block_node() {
+                            // Its elements are the parameter's.
+                            Some(inner) => self.names.extend(param_names(&inner)),
+                            None => self.found |= block_changes(&block),
+                        }
+                    }
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+            fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+                if self.rooted(Some(node.value())) {
+                    self.names.push(constant_id_str(&node.name()).to_string());
+                }
+                ruby_prism::visit_local_variable_write_node(self, node);
+            }
+            fn visit_index_operator_write_node(&mut self, node: &ruby_prism::IndexOperatorWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_index_operator_write_node(self, node);
+            }
+            fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_index_or_write_node(self, node);
+            }
+            fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_index_and_write_node(self, node);
+            }
+            fn visit_call_operator_write_node(&mut self, node: &ruby_prism::CallOperatorWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_call_operator_write_node(self, node);
+            }
+            fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_call_or_write_node(self, node);
+            }
+            fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
+                self.found |= self.rooted(node.receiver());
+                ruby_prism::visit_call_and_write_node(self, node);
+            }
+            fn visit_index_target_node(&mut self, node: &ruby_prism::IndexTargetNode<'pr>) {
+                self.found |= self.rooted(Some(node.receiver()));
+                ruby_prism::visit_index_target_node(self, node);
+            }
+            fn visit_call_target_node(&mut self, node: &ruby_prism::CallTargetNode<'pr>) {
+                self.found |= self.rooted(Some(node.receiver()));
+                ruby_prism::visit_call_target_node(self, node);
+            }
+            fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        }
+        let mut scan = Scan { names: param_names(&block), found: false };
+        if let Some(body) = block.body() {
+            scan.visit(&body);
+        }
+        scan.found
+    }
+
+    /// The names a block's parameters bind (`_1`…, `it` included).
+    fn param_names(block: &ruby_prism::BlockNode<'_>) -> Vec<String> {
+        use ruby_prism::Visit;
+        struct Names(Vec<String>);
+        impl Names {
+            fn add(&mut self, name: Option<ruby_prism::ConstantId<'_>>) {
+                if let Some(name) = name {
+                    self.0.push(constant_id_str(&name).to_string());
+                }
+            }
+        }
+        impl<'pr> Visit<'pr> for Names {
+            fn visit_required_parameter_node(&mut self, node: &ruby_prism::RequiredParameterNode<'pr>) {
+                self.add(Some(node.name()));
+            }
+            fn visit_optional_parameter_node(&mut self, node: &ruby_prism::OptionalParameterNode<'pr>) {
+                self.add(Some(node.name()));
+                ruby_prism::visit_optional_parameter_node(self, node);
+            }
+            fn visit_rest_parameter_node(&mut self, node: &ruby_prism::RestParameterNode<'pr>) {
+                self.add(node.name());
+            }
+            fn visit_required_keyword_parameter_node(&mut self, node: &ruby_prism::RequiredKeywordParameterNode<'pr>) {
+                self.add(Some(node.name()));
+            }
+            fn visit_optional_keyword_parameter_node(&mut self, node: &ruby_prism::OptionalKeywordParameterNode<'pr>) {
+                self.add(Some(node.name()));
+                ruby_prism::visit_optional_keyword_parameter_node(self, node);
+            }
+            fn visit_keyword_rest_parameter_node(&mut self, node: &ruby_prism::KeywordRestParameterNode<'pr>) {
+                self.add(node.name());
+            }
+            fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+                self.add(node.name());
+            }
+            fn visit_numbered_parameters_node(&mut self, node: &ruby_prism::NumberedParametersNode<'pr>) {
+                self.0.extend((1..=node.maximum()).map(|i| format!("_{i}")));
+            }
+            fn visit_it_parameters_node(&mut self, _: &ruby_prism::ItParametersNode<'pr>) {
+                self.0.push("it".into());
+            }
+        }
+        let mut names = Names(Vec::new());
+        if let Some(params) = block.parameters() {
+            names.visit(&params);
+        }
+        names.0
+    }
+
+    /// The local (or `it`) a chain of calls starts from (`n` of
+    /// `n.first[0]`).
+    fn root_name(node: &Node<'_>) -> Option<String> {
+        if node.as_it_local_variable_read_node().is_some() {
+            return Some("it".into());
+        }
+        if let Some(read) = node.as_local_variable_read_node() {
+            return Some(constant_id_str(&read.name()).to_string());
+        }
+        if let Some(call) = node.as_call_node() {
+            return root_name(&call.receiver()?);
+        }
+        let parens = node.as_parentheses_node()?;
+        match parens.body().map(flatten_statements).unwrap_or_default().as_slice() {
+            [only] => root_name(only),
+            _ => None,
+        }
     }
 
     /// The constant path written before a name: `A::B::` → (["A", "B"]),
@@ -3078,7 +3564,7 @@ pub(super) mod consts {
             // inherited, or from a file with its own constant of the name.
             return site.path == path
                 || scope.is_none()
-                || scope.is_some_and(|s| sources::with_text(&site.path, |t| t.contains(s)).unwrap_or(true))
+                || scope.is_some_and(|s| with_any_text(&site.path, |t| t.contains(s)).unwrap_or(true))
                 || !decls.iter().any(|d| d.path == site.path);
         }
         let written = format!("{}::{name}", qualifier.join("::"));
@@ -3095,15 +3581,16 @@ pub(super) mod consts {
     }
 
     fn describe(site: &Site) -> String {
-        let line = sources::line_at(&site.path, site.at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
-        let text = sources::with_text(&site.path, |t| {
+        let line = any_line_at(&site.path, site.at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
+        let text = with_any_text(&site.path, |t| {
             let start = t[..site.at].rfind('\n').map_or(0, |n| n + 1);
             let end = t[site.at..].find('\n').map_or(t.len(), |n| site.at + n);
             let line = t[start..end].trim();
             if line.chars().count() > 80 { format!("{}…", line.chars().take(80).collect::<String>()) } else { line.to_string() }
         })
         .unwrap_or_default();
-        format!("`{text}` ({} line {line})", sources::relative_path(&site.path))
+        let late = if is_registered(&site.path) { "" } else { ", a test source not registered before this one" };
+        format!("`{text}` ({} line {line}{late})", sources::relative_path(&site.path))
     }
 
     /// The first place a registered source changes the constant `full`
@@ -3112,7 +3599,8 @@ pub(super) mod consts {
     /// passes it on.
     fn changed(full: &str, path: &str, scope: Option<&str>, container: bool) -> Option<String> {
         let name = full.rsplit("::").next().unwrap_or(full);
-        let (sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
+        let (mut sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
+        sites.extend(late_sites(name));
         sites
             .iter()
             .filter(|s| s.kind == SiteKind::Change || (container && s.kind == SiteKind::Passed))
@@ -3125,12 +3613,216 @@ pub(super) mod consts {
     /// `Mod.class_eval`).
     fn changed_from_outside(module: &str, path: &str, scope: Option<&str>) -> Option<String> {
         let name = module.rsplit("::").next().unwrap_or(module);
-        let (sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
+        let (mut sites, decls) = with_entry(name, |e| (e.sites.clone(), e.decls.clone()));
+        sites.extend(late_sites(name));
         sites
             .iter()
             .filter(|s| REOPENERS.contains(&s.method.as_str()))
             .find(|s| relevant(s, module, path, scope, &decls))
             .map(|s| format!("is changed from outside its body at {}", describe(s)))
+    }
+
+    // ---- Test sources not registered yet -----------------------------
+
+    /// The app's test sources as they are on disk (`test/**/*.rb`, its
+    /// fixtures aside, and its `test_paths`), by the capital words in
+    /// each. App ingest
+    /// registers the test files one at a time in path order, so a file
+    /// sorted after a test (a support file that changes a constant the
+    /// test's loop reads, or reopens an ancestor of its class) is not
+    /// registered yet when that test is ingested: an answer such a file
+    /// may change is refused, never computed from fewer sources than
+    /// the program loads.
+    #[derive(Default)]
+    struct Late {
+        root: Option<String>,
+        files: Rc<Vec<(String, String)>>,
+        words: HashMap<String, Vec<usize>>,
+        decls: HashMap<String, Vec<Decl>>,
+        sites: HashMap<String, Vec<Site>>,
+    }
+
+    thread_local! {
+        static LATE: RefCell<Late> = RefCell::new(Late::default());
+        /// `app_root`'s answer for a registry: (its first path, root).
+        static ROOT: RefCell<(Option<String>, Option<String>)> = const { RefCell::new((None, None)) };
+    }
+
+    /// The app root registered paths are under (the one
+    /// `sources::relative_path` strips), when one is set.
+    fn app_root() -> Option<String> {
+        let first = sources::path_of(FileId(1));
+        if let Some(root) = ROOT.with(|r| {
+            let r = r.borrow();
+            (r.0 == first && first.is_some()).then(|| r.1.clone())
+        }) {
+            return root;
+        }
+        let root = (1..=64u32).map_while(|id| sources::path_of(FileId(id))).find_map(|path| {
+            let rel = sources::relative_path(&path);
+            (rel != path).then(|| path.strip_suffix(&rel).map(str::to_string)).flatten()
+        });
+        ROOT.with(|r| *r.borrow_mut() = (first, root.clone()));
+        root
+    }
+
+    fn is_registered(path: &str) -> bool {
+        sources::with_text(path, |_| ()).is_some()
+    }
+
+    /// `f` of the late sources (registered since or not), read once per
+    /// app root.
+    fn with_late<R>(f: impl FnOnce(&mut Late) -> R) -> R {
+        let root = app_root();
+        LATE.with(|late| {
+            let mut late = late.borrow_mut();
+            if late.root != root {
+                let files = root.as_deref().map(read_test_sources).unwrap_or_default();
+                let mut words: HashMap<String, Vec<usize>> = HashMap::new();
+                for (at, (_, text)) in files.iter().enumerate() {
+                    for word in capital_words(text) {
+                        words.entry(word).or_default().push(at);
+                    }
+                }
+                *late = Late { root: root.clone(), files: Rc::new(files), words, ..Late::default() };
+            }
+            f(&mut late)
+        })
+    }
+
+    /// Every `.rb` file under `root`'s `test/` but `test/fixtures`, and
+    /// under the `test_paths` of its `roundhouse.yml` (Core's
+    /// `components/*/test/…`), skipping hidden entries and symlinks, with
+    /// its text.
+    fn read_test_sources(root: &str) -> Vec<(String, String)> {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Config {
+            test_paths: Vec<std::path::PathBuf>,
+        }
+        let root = std::path::Path::new(root);
+        let base = root.join("test");
+        let fixtures = base.join("fixtures");
+        let config: Config = std::fs::read_to_string(root.join("roundhouse.yml"))
+            .ok()
+            .and_then(|text| serde_yaml_ng::from_str::<Option<Config>>(&text).ok().flatten())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        let mut todo = vec![base];
+        todo.extend(
+            config
+                .test_paths
+                .iter()
+                .filter(|p| p.is_relative() && !p.components().any(|c| matches!(c, std::path::Component::ParentDir)))
+                .map(|p| root.join(p)),
+        );
+        while let Some(dir) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_name().to_string_lossy().starts_with('.') || path == fixtures {
+                    continue;
+                }
+                let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    todo.push(path);
+                } else if path.extension().is_some_and(|e| e == "rb") {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        out.push((path.display().to_string(), text));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
+    /// The test sources on disk, and which of them are not registered
+    /// now: those that have `word` when it is given.
+    pub(in super::super) fn late_sources(word: Option<&str>) -> (Rc<Vec<(String, String)>>, Vec<usize>) {
+        with_late(|late| {
+            let ids: Vec<usize> = match word {
+                Some(w) if w.as_bytes().first().is_some_and(u8::is_ascii_uppercase) => {
+                    late.words.get(w).cloned().unwrap_or_default()
+                }
+                Some(w) => (0..late.files.len()).filter(|i| late.files[*i].1.contains(w)).collect(),
+                None => (0..late.files.len()).collect(),
+            };
+            let ids = ids.into_iter().filter(|i| !is_registered(&late.files[*i].0)).collect();
+            (late.files.clone(), ids)
+        })
+    }
+
+    /// The app root the late sources were read from (a key for what a
+    /// caller derives from all of them).
+    pub(in super::super) fn late_root() -> Option<String> {
+        with_late(|late| late.root.clone())
+    }
+
+    /// The declarations of `name` in test sources not registered now.
+    fn late_decls(name: &str) -> Vec<Decl> {
+        let found = with_late(|late| {
+            if let Some(found) = late.decls.get(name) {
+                return found.clone();
+            }
+            let ids = late.words.get(name).cloned().unwrap_or_default();
+            let files = late.files.clone();
+            let mut found = Vec::new();
+            for i in ids {
+                let (path, text) = &files[i];
+                if may_declare(text, name) {
+                    found.extend(scan(text, path, name));
+                }
+            }
+            late.decls.insert(name.to_string(), found.clone());
+            found
+        });
+        found.into_iter().filter(|d| !is_registered(&d.path)).collect()
+    }
+
+    /// Where test sources not registered now mention `name`.
+    fn late_sites(name: &str) -> Vec<Site> {
+        let found = with_late(|late| {
+            if let Some(found) = late.sites.get(name) {
+                return found.clone();
+            }
+            let ids = late.words.get(name).cloned().unwrap_or_default();
+            let files = late.files.clone();
+            let mut found = Vec::new();
+            for i in ids {
+                let (path, text) = &files[i];
+                found.extend(scan_sites(text, path, name));
+            }
+            late.sites.insert(name.to_string(), found.clone());
+            found
+        });
+        found.into_iter().filter(|s| !is_registered(&s.path)).collect()
+    }
+
+    /// Why `full` is not known when a test source not registered now
+    /// declares it.
+    fn late_reason(full: &str) -> Option<String> {
+        let last = full.rsplit("::").next().unwrap_or(full);
+        late_decls(last).into_iter().find(|d| d.names.iter().any(|n| n == full)).map(|d| {
+            format!("`{full}` is declared in {}, a test source not registered before this one", sources::relative_path(&d.path))
+        })
+    }
+
+    /// `f` of the text of `path`, registered or a late test source.
+    fn with_any_text<R>(path: &str, f: impl Fn(&str) -> R) -> Option<R> {
+        if let Some(r) = sources::with_text(path, &f) {
+            return Some(r);
+        }
+        with_late(|late| late.files.iter().find(|(p, _)| p == path).map(|(_, text)| f(text)))
+    }
+
+    /// The line of `path` (registered or a late test source) at `at`.
+    fn any_line_at(path: &str, at: usize) -> Option<u32> {
+        sources::line_at(path, at).or_else(|| with_any_text(path, |t| t.get(..at).map(|b| b.matches('\n').count() as u32 + 1)).flatten())
     }
 
     // ---- Registered sources by name ----------------------------------
