@@ -4094,6 +4094,7 @@ fn ruby_family_files(
         .map(str::to_string)
         .collect();
     files.extend(emit::ruby::file_program_files(app, &emitted_anchors));
+    unroll_literal_require_loops(&mut files, app);
     apply_models_autoload(&mut files, app);
     apply_route_table_root(&mut files, app);
     apply_cable_strip(&mut files, app)?;
@@ -5328,6 +5329,10 @@ const FRAMEWORK_FEATURE_PORTS: &[(&str, &[&str])] = &[
     ("active_support/core_ext/object/try", &["active_support_tryable"]),
     ("active_support/core_ext/hash/keys", &["active_support_hash_keys"]),
     ("active_support/core_ext/string/strip", &["active_support_string_strip"]),
+    // Loaded with the Inflector before any gem (runtime/gem_facades.rb), as
+    // `require "active_support"` loads it natively; Core's component gem
+    // (trusted_id/global_identification.rb) requires it by name.
+    ("active_support/core_ext/string/inflections", &["active_support_string_inflections"]),
     ("active_support/core_ext/module/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/core_ext/class/attribute_accessors", &["active_support_module_attribute_accessors"]),
     ("active_support/core_ext/module/redefine_method", &["active_support_redefine_method"]),
@@ -5442,17 +5447,57 @@ fn boot_loaded_core_extensions(files: &[(String, String)]) -> Vec<&'static BootC
 }
 
 /// Rails features a native gem requires that Rails has not loaded by
-/// then natively and the tree ports only in part (Active Support's every
-/// core extension, the whole Hash extension set). Each answers with a named LoadError, never the gem home's
-/// activesupport (Rails' own code over the ports).
-const FRAMEWORK_FEATURES_NOT_PORTED: &[(&str, &str)] = &[
-    ("active_support/all", "loads every Active Support extension (core_ext, time, json, ...), which this tree ports only in part"),
-    ("active_support/core_ext/hash", "loads every Hash extension (conversions' to_xml/from_xml, deep_merge, indifferent access, ...), which this tree ports only in part"),
+/// then natively and the tree does not port at all. Each answers with a
+/// named LoadError, never the gem home's activesupport (Rails' own code
+/// over the ports). None now: the features the tree ports in part are
+/// [`FRAMEWORK_FEATURES_IN_PART`].
+const FRAMEWORK_FEATURES_NOT_PORTED: &[(&str, &str)] = &[];
+
+/// Hash#to_xml and Hash.from_xml / from_trusted_xml (8.2.0.alpha
+/// core_ext/hash/conversions.rb, over ActiveSupport::XmlMini), which the
+/// tree does not port.
+const HASH_CONVERSIONS_NOT_PORTED: &[(&str, &str)] = &[
+    ("Hash#to_xml", "active_support/core_ext/hash/conversions"),
+    ("Hash.from_xml", "active_support/core_ext/hash/conversions"),
+    ("Hash.from_trusted_xml", "active_support/core_ext/hash/conversions"),
 ];
 
-/// runtime/features/<feature>.rb for [`FRAMEWORK_FEATURE_PORTS`] and
-/// [`FRAMEWORK_FEATURES_NOT_PORTED`]; a feature that already has a file
-/// (the Inflector's, i18n's) keeps it.
+/// A Rails feature the tree ports in part ([`FRAMEWORK_FEATURES_IN_PART`]).
+struct FeatureInPart {
+    feature: &'static str,
+    /// The runtime ports answering its ported part, in load order; a port
+    /// the tree does not carry is left out.
+    ports: &'static [&'static str],
+    /// The methods the native feature defines that no port does
+    /// (`Owner#name` or `Owner.name`), with the native file of each.
+    refused: &'static [(&'static str, &'static str)],
+}
+
+/// Rails features a native gem requires that the tree ports in part.
+/// The feature file loads the ports, then defines each method of
+/// `refused` the tree does not define to raise a NotImplementedError
+/// naming it and its native file (runtime/active_support_not_ported.rb):
+/// `respond_to?` answers as natively and a call refuses by name. A
+/// method a port or Ruby itself defines is left as it is.
+///
+/// active_support/core_ext/hash (8.2.0.alpha) is conversions,
+/// deep_merge, deep_transform_values, except, indifferent_access, keys,
+/// reverse_merge and slice: runtime/active_support_core_ext.rb ports all
+/// but conversions (Hash#deep_merge, #deep_transform_values, #except!,
+/// #with_indifferent_access, #reverse_merge, #slice!, #extract!) and
+/// active_support_hash_keys.rb keys.rb. Core's gems require it (19
+/// sites), as polaris and measured do active_support/all; that one is
+/// written by [`active_support_all_feature`].
+const FRAMEWORK_FEATURES_IN_PART: &[FeatureInPart] = &[FeatureInPart {
+    feature: "active_support/core_ext/hash",
+    ports: &["active_support_core_ext", "active_support_hash_keys"],
+    refused: HASH_CONVERSIONS_NOT_PORTED,
+}];
+
+/// runtime/features/<feature>.rb for [`FRAMEWORK_FEATURE_PORTS`],
+/// [`FRAMEWORK_FEATURES_IN_PART`], active_support/all
+/// ([`active_support_all_feature`]) and [`FRAMEWORK_FEATURES_NOT_PORTED`];
+/// a feature that already has a file (the Inflector's, i18n's) keeps it.
 fn framework_feature_files(files: &mut Vec<(String, String)>) {
     let carried = |files: &[(String, String)], port: &str| files.iter().any(|(p, _)| *p == format!("runtime/{port}.rb"));
     let exists = |files: &[(String, String)], feature: &str| files.iter().any(|(p, _)| *p == format!("runtime/features/{feature}.rb"));
@@ -5473,6 +5518,37 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
         }
         files.push((format!("runtime/features/{feature}.rb"), text));
     }
+    let mut refusals = false;
+    for part in FRAMEWORK_FEATURES_IN_PART {
+        if exists(files, part.feature) {
+            continue;
+        }
+        let up = "../".repeat(part.feature.matches('/').count() + 1);
+        let feature = part.feature;
+        let mut text = format!(
+            "# `require {feature:?}` on this tree, from a gem's own code: the\n\
+             # tree's ports of it, and each method of it they do not port refused\n\
+             # by name (project.rs::FRAMEWORK_FEATURES_IN_PART). runtime/gem_facades.rb\n\
+             # puts this directory first on the load path.\n"
+        );
+        for port in part.ports.iter().filter(|port| carried(files, port)) {
+            text.push_str(&format!("require_relative \"{up}{port}\"\n"));
+        }
+        text.push_str(&format!("require_relative \"{up}active_support_not_ported\"\n"));
+        for (method, native) in part.refused {
+            text.push_str(&format!("RoundhouseActiveSupportNotPorted.refuse({method:?}, {native:?})\n"));
+        }
+        files.push((format!("runtime/features/{feature}.rb"), text));
+        refusals = true;
+    }
+    if !exists(files, "active_support/all") {
+        let text = active_support_all_feature(files);
+        files.push(("runtime/features/active_support/all.rb".into(), text));
+        refusals = true;
+    }
+    if refusals && !carried(files, "active_support_not_ported") {
+        files.push(("runtime/active_support_not_ported.rb".into(), active_support_not_ported_file()));
+    }
     for (feature, why) in FRAMEWORK_FEATURES_NOT_PORTED {
         if exists(files, feature) {
             continue;
@@ -5489,6 +5565,218 @@ fn framework_feature_files(files: &mut Vec<(String, String)>) {
             ),
         ));
     }
+}
+
+/// runtime/features/active_support/all.rb: 8.2.0.alpha all.rb requires
+/// active_support, active_support/time and active_support/core_ext
+/// (every core_ext/*.rb, each of which requires its own directory), as
+/// Rails' :load_active_support initializer does at boot. measured 3.2.1
+/// (base.rb:4) and Core's own component gems require it as they load.
+/// On the tree it loads the feature files of those the tree ports, the
+/// ones [`framework_feature_files`] has written by now: `active_support`
+/// and each under active_support/core_ext (Numeric's Duration builders
+/// are core_ext/numeric/time; the tree has no active_support/time, whose
+/// Time zone and calendar methods stay undefined, as before the gem
+/// required it: the tree's own ports ask `respond_to?(:zone_default)`).
+/// Then Array#to_xml (core_ext/array/conversions) is refused by name,
+/// as Hash's conversions are by core_ext/hash, and every other method
+/// Rails' all.rb defines that the tree does not (Integer#months,
+/// Time#beginning_of_day, Object#as_json, ...: [`ACTIVE_SUPPORT_ALL_METHODS`])
+/// is named in the NameError a call raises, which stays a NameError.
+/// A require of one of those features after it (core_ext/integer/time)
+/// is still refused as not ported ([`framework_feature_refusal`]).
+fn active_support_all_feature(files: &[(String, String)]) -> String {
+    const DIR: &str = "runtime/features/active_support/";
+    let mut text = String::from(
+        "# `require \"active_support/all\"` on this tree, from a gem's own code:\n\
+         # active_support, active_support/time and active_support/core_ext, which\n\
+         # Rails' :load_active_support initializer loads at boot natively. Here,\n\
+         # the tree's file for each Active Support feature it ports, and what\n\
+         # they do not port refused by name: Array#to_xml, and the NameError of a\n\
+         # call to any other method of Rails' all.rb names it (runtime/\n\
+         # active_support_not_ported.rb; project.rs::active_support_all_feature).\n\
+         # runtime/gem_facades.rb puts this directory first on the load path.\n",
+    );
+    if files.iter().any(|(p, _)| p == "runtime/features/active_support.rb") {
+        text.push_str("require_relative \"../active_support\"\n");
+    }
+    for (path, _) in files {
+        let Some(feature) = path.strip_prefix(DIR).and_then(|p| p.strip_suffix(".rb")) else {
+            continue;
+        };
+        if feature.starts_with("core_ext/") {
+            text.push_str(&format!("require_relative {feature:?}\n"));
+        }
+    }
+    text.push_str("require_relative \"../../active_support_not_ported\"\n");
+    text.push_str("RoundhouseActiveSupportNotPorted.refuse(\"Array#to_xml\", \"active_support/core_ext/array/conversions\")\n");
+    text.push_str("RoundhouseActiveSupportNotPorted.name_missing_methods\n");
+    text
+}
+
+/// runtime/active_support_not_ported.rb ([`active_support_not_ported_file`]),
+/// which the features the tree ports in part ([`FRAMEWORK_FEATURES_IN_PART`],
+/// [`active_support_all_feature`]) refuse their unported methods with.
+const ACTIVE_SUPPORT_NOT_PORTED: &str = r##"# frozen_string_literal: true
+
+# The Active Support methods a feature the tree ports in part defines
+# natively and no port does (project.rs::FRAMEWORK_FEATURES_IN_PART):
+# `refuse` defines one to raise a NotImplementedError naming it and its
+# native file, so `respond_to?` answers as natively and a call refuses by
+# name. A method the tree (or Ruby) already defines is left as it is.
+#
+# `name_missing_methods` (active_support/all) names the rest: a NameError
+# for a method Rails' active_support/all defines on that receiver (ALL)
+# and this tree does not carries a line saying so. The error stays what
+# it is, so `respond_to?` and a `rescue` answer as before the gem
+# required it. Generated.
+module RoundhouseActiveSupportNotPorted
+  # "Hash#to_xml" (an instance method) or "Hash.from_xml" (a singleton one).
+  def self.refuse(label, feature)
+    owner_name, separator, name = label.partition(/[#.]/)
+    owner = Object.const_get(owner_name)
+    owner = owner.singleton_class if separator == "."
+    return if owner.method_defined?(name) || owner.private_method_defined?(name)
+    message = "roundhouse: error[framework_feature_not_ported]: Active Support's `#{label}` (#{feature}) is not ported; not run"
+    owner.define_method(name) { |*_args, **_options, &_block| raise NotImplementedError, message }
+  end
+
+  # name => [[owner, "#" or ".", feature], ...], from ALL.
+  def self.index
+    @index ||= ALL.each_with_object({}) do |(feature, owners), index|
+      owners.each do |owner, labels|
+        labels.split.each { |label| (index[label[1..].to_sym] ||= []) << [owner, label[0], feature] }
+      end
+    end
+  end
+
+  # The line naming the Active Support method `error` (a NameError) found
+  # missing, or nil.
+  def self.note(error)
+    entries = index[error.name] or return
+    receiver = error.receiver
+    found = entries.find do |owner_name, kind, _|
+      next false unless Object.const_defined?(owner_name)
+      owner = Object.const_get(owner_name)
+      if kind == "."
+        receiver.equal?(owner) || (receiver.is_a?(Class) && owner.is_a?(Class) && receiver < owner)
+      else
+        owner === receiver
+      end
+    end or return
+    owner, kind, feature = found
+    "roundhouse: error[framework_feature_not_ported]: Active Support's `#{owner}#{kind}#{error.name}` " \
+      "(#{feature}, which `require \"active_support/all\"` loads natively) is not ported on this tree"
+  rescue StandardError
+    nil
+  end
+
+  module NamedMessage
+    def message
+      text = super
+      note = RoundhouseActiveSupportNotPorted.note(self)
+      note && !text.include?(note) ? "#{text}\n#{note}" : text
+    end
+  end
+
+  def self.name_missing_methods
+    NameError.prepend(NamedMessage) unless NameError <= NamedMessage
+  end
+end
+"##;
+
+/// What Rails' `require "active_support/all"` adds to Ruby's own classes
+/// and modules, by the feature that defines each (Shopify/rails
+/// 5813559f4aed, 8.2.0.alpha; `ruby tests/active_support_all_methods.rb
+/// literal` writes it, and tests/active_support_all_feature.rs checks it
+/// against that Rails): `feature => { owner => "#instance .singleton" }`.
+const ACTIVE_SUPPORT_ALL_METHODS: &str = r##"    "active_support/core_ext/array/access" => { "Array" => "#excluding #fifth #forty_two #fourth #from #including #second #second_to_last #third #third_to_last #to #without" },
+    "active_support/core_ext/array/conversions" => { "Array" => "#to_formatted_s #to_fs #to_sentence #to_xml" },
+    "active_support/core_ext/array/extract_options" => { "Array" => "#extract_options!", "Hash" => "#extractable_options?" },
+    "active_support/core_ext/array/grouping" => { "Array" => "#in_groups #in_groups_of #split" },
+    "active_support/core_ext/array/inquiry" => { "Array" => "#inquiry" },
+    "active_support/core_ext/array/wrap" => { "Array" => ".wrap" },
+    "active_support/core_ext/class/attribute" => { "Class" => "#class_attribute" },
+    "active_support/core_ext/date/acts_like" => { "Date" => "#acts_like_date?" },
+    "active_support/core_ext/date/blank" => { "Date" => "#blank? #present?" },
+    "active_support/core_ext/date/calculations" => { "Date" => "#advance #ago #at_beginning_of_day #at_end_of_day #at_midday #at_middle_of_day #at_midnight #at_noon #beginning_of_day #change #compare_with_coercion #compare_without_coercion #end_of_day #in #midday #middle_of_day #midnight #minus_with_duration #minus_without_duration #noon #plus_with_duration #plus_without_duration #since .beginning_of_week .beginning_of_week= .beginning_of_week_default .beginning_of_week_default= .current .find_beginning_of_week! .tomorrow .yesterday" },
+    "active_support/core_ext/date/conversions" => { "Date" => "#default_inspect #readable_inspect #to_formatted_s #to_fs" },
+    "active_support/core_ext/date_time/acts_like" => { "DateTime" => "#acts_like_date? #acts_like_time?" },
+    "active_support/core_ext/date_time/blank" => { "DateTime" => "#blank? #present?" },
+    "active_support/core_ext/date_time/calculations" => { "DateTime" => "#<=> #advance #ago #at_beginning_of_day #at_beginning_of_hour #at_beginning_of_minute #at_end_of_day #at_end_of_hour #at_end_of_minute #at_midday #at_middle_of_day #at_midnight #at_noon #beginning_of_day #beginning_of_hour #beginning_of_minute #change #end_of_day #end_of_hour #end_of_minute #getgm #getlocal #getutc #gmtime #in #localtime #midday #middle_of_day #midnight #noon #seconds_since_midnight #seconds_until_end_of_day #since #subsec #utc #utc? #utc_offset .current" },
+    "active_support/core_ext/date_time/conversions" => { "DateTime" => "#default_inspect #formatted_offset #inspect #nsec #offset_in_seconds #readable_inspect #seconds_since_unix_epoch #to_f #to_formatted_s #to_fs #to_i #usec .civil_from_format" },
+    "active_support/core_ext/digest/uuid" => { "Digest::UUID" => ".nil_uuid .uuid_from_hash .uuid_v3 .uuid_v4 .uuid_v5" },
+    "active_support/core_ext/enumerable" => { "Array" => "#compact_blank!", "Enumerable" => "#compact_blank #exclude? #excluding #in_order_of #including #index_by #index_with #many? #maximum #minimum #pick #pluck #sole #without", "Hash" => "#compact_blank #compact_blank!", "Range" => "#sum" },
+    "active_support/core_ext/file/atomic" => { "File" => ".atomic_write" },
+    "active_support/core_ext/hash/conversions" => { "Hash" => "#to_xml .from_trusted_xml .from_xml" },
+    "active_support/core_ext/hash/deep_transform_values" => { "Hash" => "#_deep_transform_values_in_object #_deep_transform_values_in_object! #deep_transform_values #deep_transform_values!" },
+    "active_support/core_ext/hash/indifferent_access" => { "Hash" => "#nested_under_indifferent_access #with_indifferent_access" },
+    "active_support/core_ext/hash/keys" => { "Hash" => "#_deep_transform_keys_in_object #_deep_transform_keys_in_object! #assert_valid_keys #deep_stringify_keys #deep_stringify_keys! #deep_symbolize_keys #deep_symbolize_keys! #deep_transform_keys #deep_transform_keys! #stringify_keys #stringify_keys! #symbolize_keys #symbolize_keys! #to_options #to_options!" },
+    "active_support/core_ext/hash/reverse_merge" => { "Hash" => "#reverse_merge #reverse_merge! #reverse_update #with_defaults #with_defaults!" },
+    "active_support/core_ext/integer/inflections" => { "Integer" => "#ordinal #ordinalize" },
+    "active_support/core_ext/integer/multiple" => { "Integer" => "#multiple_of?" },
+    "active_support/core_ext/integer/time" => { "Integer" => "#month #months #year #years" },
+    "active_support/core_ext/kernel/concern" => { "Kernel" => "#concern .concern" },
+    "active_support/core_ext/kernel/reporting" => { "Kernel" => "#enable_warnings #silence_warnings #suppress #with_warnings .enable_warnings .silence_warnings .suppress .with_warnings" },
+    "active_support/core_ext/kernel/singleton_class" => { "Kernel" => "#class_eval" },
+    "active_support/core_ext/load_error" => { "LoadError" => "#is_missing?" },
+    "active_support/core_ext/module/aliasing" => { "Module" => "#alias_attribute" },
+    "active_support/core_ext/module/anonymous" => { "Module" => "#anonymous?" },
+    "active_support/core_ext/module/attr_internal" => { "Module" => "#attr_internal #attr_internal_accessor #attr_internal_define #attr_internal_reader #attr_internal_writer .attr_internal_naming_format .attr_internal_naming_format=" },
+    "active_support/core_ext/module/attribute_accessors_per_thread" => { "Module" => "#thread_cattr_accessor #thread_cattr_reader #thread_cattr_writer #thread_mattr_accessor #thread_mattr_reader #thread_mattr_writer" },
+    "active_support/core_ext/module/deprecation" => { "Module" => "#deprecate" },
+    "active_support/core_ext/module/introspection" => { "Module" => "#module_parent #module_parent_name #module_parents" },
+    "active_support/core_ext/module/redefine_method" => { "Module" => "#method_visibility #redefine_method #redefine_singleton_method #silence_redefinition_of_method" },
+    "active_support/core_ext/module/remove_method" => { "Module" => "#remove_possible_method #remove_possible_singleton_method" },
+    "active_support/core_ext/name_error" => { "NameError" => "#missing_name #missing_name? #real_mod_name" },
+    "active_support/core_ext/numeric/bytes" => { "Numeric" => "#byte #bytes #exabyte #exabytes #gigabyte #gigabytes #kilobyte #kilobytes #megabyte #megabytes #petabyte #petabytes #terabyte #terabytes #zettabyte #zettabytes" },
+    "active_support/core_ext/numeric/time" => { "Numeric" => "#day #days #fortnight #fortnights #hour #hours #in_milliseconds #minute #minutes #second #seconds #week #weeks" },
+    "active_support/core_ext/object/acts_like" => { "Object" => "#acts_like?" },
+    "active_support/core_ext/object/blank" => { "Array" => "#blank? #present?", "FalseClass" => "#blank? #present?", "Hash" => "#blank? #present?", "NilClass" => "#blank? #present?", "Numeric" => "#blank? #present?", "Object" => "#blank? #presence #present?", "String" => "#blank? #present?", "Symbol" => "#blank? #present?", "Time" => "#blank? #present?", "TrueClass" => "#blank? #present?" },
+    "active_support/core_ext/object/inclusion" => { "Object" => "#in? #presence_in" },
+    "active_support/core_ext/object/instance_variables" => { "Object" => "#instance_values #instance_variable_names" },
+    "active_support/core_ext/object/json" => { "Array" => "#as_json", "BigDecimal" => "#as_json", "Date" => "#as_json", "DateTime" => "#as_json", "Enumerable" => "#as_json", "Exception" => "#as_json", "FalseClass" => "#as_json", "Float" => "#as_json", "Hash" => "#as_json", "IO" => "#as_json", "Module" => "#as_json", "NilClass" => "#as_json", "Numeric" => "#as_json", "Object" => "#as_json", "Pathname" => "#as_json", "Range" => "#as_json", "Regexp" => "#as_json", "String" => "#as_json", "Struct" => "#as_json", "Symbol" => "#as_json", "Time" => "#as_json", "TrueClass" => "#as_json" },
+    "active_support/core_ext/object/to_query" => { "Array" => "#to_param #to_query", "FalseClass" => "#to_param", "Hash" => "#to_param #to_query", "NilClass" => "#to_param #to_query", "Object" => "#to_param #to_query", "TrueClass" => "#to_param" },
+    "active_support/core_ext/object/try" => { "NilClass" => "#try #try!" },
+    "active_support/core_ext/object/with" => { "Object" => "#with" },
+    "active_support/core_ext/object/with_options" => { "Object" => "#with_options" },
+    "active_support/core_ext/pathname/blank" => { "Pathname" => "#blank? #present?" },
+    "active_support/core_ext/pathname/existence" => { "Pathname" => "#existence" },
+    "active_support/core_ext/range/overlap" => { "Range" => "#overlaps?" },
+    "active_support/core_ext/range/sole" => { "Range" => "#sole" },
+    "active_support/core_ext/regexp" => { "Regexp" => "#multiline?" },
+    "active_support/core_ext/securerandom" => { "SecureRandom" => ".base32 .base36 .base58" },
+    "active_support/core_ext/string/access" => { "String" => "#at #first #from #last #to" },
+    "active_support/core_ext/string/behavior" => { "String" => "#acts_like_string?" },
+    "active_support/core_ext/string/conversions" => { "String" => "#to_date #to_datetime #to_time" },
+    "active_support/core_ext/string/exclude" => { "String" => "#exclude?" },
+    "active_support/core_ext/string/filters" => { "String" => "#remove #remove! #squish #squish! #truncate #truncate_bytes #truncate_words" },
+    "active_support/core_ext/string/indent" => { "String" => "#indent #indent!" },
+    "active_support/core_ext/string/inflections" => { "String" => "#camelcase #camelize #classify #constantize #dasherize #deconstantize #demodulize #downcase_first #foreign_key #humanize #parameterize #pluralize #safe_constantize #singularize #tableize #titlecase #titleize #underscore #upcase_first" },
+    "active_support/core_ext/string/inquiry" => { "String" => "#inquiry" },
+    "active_support/core_ext/string/multibyte" => { "String" => "#is_utf8?" },
+    "active_support/core_ext/string/output_safety" => { "Numeric" => "#html_safe?", "Object" => "#html_safe?", "String" => "#html_safe" },
+    "active_support/core_ext/string/starts_ends_with" => { "String" => "#ends_with? #starts_with?" },
+    "active_support/core_ext/string/strip" => { "String" => "#strip_heredoc" },
+    "active_support/core_ext/string/zones" => { "String" => "#in_time_zone" },
+    "active_support/core_ext/symbol/starts_ends_with" => { "Symbol" => "#ends_with? #starts_with?" },
+    "active_support/core_ext/time/acts_like" => { "Time" => "#acts_like_time?" },
+    "active_support/core_ext/time/calculations" => { "Time" => "#advance #ago #at_beginning_of_day #at_beginning_of_hour #at_beginning_of_minute #at_end_of_day #at_end_of_hour #at_end_of_minute #at_midday #at_middle_of_day #at_midnight #at_noon #beginning_of_day #beginning_of_hour #beginning_of_minute #change #compare_with_coercion #compare_without_coercion #end_of_day #end_of_hour #end_of_minute #eql_with_coercion #eql_without_coercion #in #midday #middle_of_day #midnight #minus_with_coercion #minus_with_duration #minus_without_coercion #minus_without_duration #next_day #next_month #next_year #noon #plus_with_duration #plus_without_duration #prev_day #prev_month #prev_year #sec_fraction #seconds_since_midnight #seconds_until_end_of_day #since .=== .at_with_coercion .at_without_coercion .current .days_in_month .days_in_year .rfc3339" },
+    "active_support/core_ext/time/conversions" => { "Time" => "#formatted_offset #rfc2822 #rfc3339 #rfc822 #to_formatted_s #to_fs .iso8601 .rfc2822 .rfc822 .xmlschema" },
+    "active_support/core_ext/time/zones" => { "Time" => ".find_zone .find_zone! .use_zone .zone .zone= .zone_default .zone_default=" },
+    "active_support/descendants_tracker" => { "Class" => "#descendants" },
+"##;
+
+/// runtime/active_support_not_ported.rb: [`ACTIVE_SUPPORT_NOT_PORTED`]
+/// with its table of Rails' active_support/all methods
+/// ([`ACTIVE_SUPPORT_ALL_METHODS`]).
+fn active_support_not_ported_file() -> String {
+    format!(
+        "{ACTIVE_SUPPORT_NOT_PORTED}\n\
+         # Rails' active_support/all additions to Ruby's classes and modules,\n\
+         # by feature (project.rs::ACTIVE_SUPPORT_ALL_METHODS).\n\
+         module RoundhouseActiveSupportNotPorted\n  ALL = {{\n{ACTIVE_SUPPORT_ALL_METHODS}  }}.freeze\nend\n"
+    )
 }
 
 /// The Rails frameworks' root features ([`is_framework_feature`]).
@@ -7841,6 +8129,123 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                 && (parent.is_empty() || opens(text))
         })
     };
+    // The constant a gem's own `autoload` makes `source` the file of, if
+    // any: the path under the gem's lib/ the autoload names. Active
+    // Support's `autoload :Track` in hedwig 1.68.0's `Hedwig::Status`
+    // (extended with ActiveSupport::Autoload) names
+    // "hedwig/status/track", the underscored constant path; a plain
+    // `autoload :Credentials, "antom_ruby/credentials"` names its string.
+    // The parent is a module the tree declares whose underscored path is
+    // the file's directory, and the name one the gem writes an
+    // `autoload :Name` for in a file that opens that parent
+    // (`gem_autoloads`).
+    let declared_cpaths: std::collections::BTreeSet<&str> = app
+        .library_classes
+        .iter()
+        .map(|c| c.name.0.as_str())
+        .chain(app.models.iter().map(|m| m.name.0.as_str()))
+        .flat_map(|name| name.match_indices("::").map(move |(at, _)| &name[..at]).chain(std::iter::once(name)))
+        .collect();
+    let mut cpaths_by_fold: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for cpath in &declared_cpaths {
+        cpaths_by_fold.entry(fold_stem(&crate::naming::underscore(cpath))).or_default().push(cpath);
+    }
+    let mut autoload_names_by_fold: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for name in autoload_writers.keys() {
+        if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+            autoload_names_by_fold.entry(fold_stem(&crate::naming::underscore(name))).or_default().push(name);
+        }
+    }
+    for names in autoload_names_by_fold.values_mut() {
+        names.sort_unstable();
+    }
+    // The path an `autoload :name` statement in `text` names: Some(None)
+    // for none written (Active Support's, from the module's name), or for
+    // one that is no plain string literal.
+    let autoload_path = |text: &str, name: &str| -> Option<Option<String>> {
+        let mut found = None;
+        for pattern in [format!("autoload :{name}"), format!("autoload(:{name}")] {
+            for (at, _) in text.match_indices(&pattern) {
+                let rest = &text[at + pattern.len()..];
+                if rest.starts_with(|c: char| word(c)) {
+                    continue;
+                }
+                let rest = rest.trim_start_matches([' ', '\t']);
+                let Some(rest) = rest.strip_prefix(',') else {
+                    found.get_or_insert(None);
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let literal = rest.chars().next().filter(|q| *q == '"' || *q == '\'').and_then(|q| {
+                    let body = &rest[1..];
+                    body.find(q).map(|end| body[..end].to_string()).filter(|path| !path.contains("#{"))
+                });
+                if let Some(path) = literal {
+                    return Some(Some(path));
+                }
+                found.get_or_insert(None);
+            }
+        }
+        found
+    };
+    let autoload_target = |source: &str| -> Option<String> {
+        if !required_gem_file(source) {
+            return None;
+        }
+        let lib = gem_lib(source)?;
+        let rel = rel_of(source);
+        let stem = rel.strip_prefix(&format!("{lib}/"))?.strip_suffix(".rb")?;
+        let (parent_stem, leaf) = stem.rsplit_once('/').unwrap_or(("", stem));
+        let parents: Vec<&str> =
+            if parent_stem.is_empty() { vec![""] } else { cpaths_by_fold.get(&fold_stem(parent_stem))?.clone() };
+        let names = autoload_names_by_fold.get(&fold_stem(leaf))?;
+        let mut found: Vec<String> = Vec::new();
+        for parent in &parents {
+            for name in names {
+                let full = if parent.is_empty() { name.to_string() } else { format!("{parent}::{name}") };
+                if !gem_autoloads(&full) {
+                    continue;
+                }
+                let paths: Vec<Option<String>> = autoload_writers
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&i| autoload_path(&required_files[i].text, name))
+                    .collect();
+                let names_this_file = paths.iter().any(|path| match path {
+                    Some(path) => path.strip_suffix(".rb").unwrap_or(path) == stem,
+                    None => fold_stem(&crate::naming::underscore(&full)) == fold_stem(stem),
+                });
+                if names_this_file && !found.contains(&full) {
+                    found.push(full);
+                }
+            }
+        }
+        // Two constants the same file would be the autoload of: neither.
+        match found.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    };
+    let autoload_targets: crate::det::HashMap<&str, String> = required_files
+        .iter()
+        .filter_map(|source| autoload_target(&source.path).map(|full| (source.path.as_str(), full)))
+        .collect();
+    // A gem's declarations nested in a constant whose autoloaded file
+    // declares them, where that file has no program and its constant no
+    // declarations file of its own (hedwig's command_table/router.rb:
+    // `autoload :Router` names it, and its `module Router` holds only
+    // KeyspaceRouting, Queuing, Metadata, ...). Natively Router's
+    // autoload loads them all; here Router is the implicit module and
+    // each its own autoload, as Zeitwerk registers a directory's files.
+    let in_autoloaded_file = |anchor: &str, full: &str| -> bool {
+        declaring.get(anchor).is_some_and(|sources| {
+            sources.iter().any(|source| {
+                !program_by_source.contains_key(source)
+                    && autoload_targets.get(source).is_some_and(|target| full.starts_with(&format!("{target}::")))
+            })
+        })
+    };
     let mut namespaces: BTreeMap<String, BTreeMap<String, Child>> = BTreeMap::new();
     let mut boot_files: Vec<&str> = Vec::new();
     let mut claimed: BTreeMap<String, String> = BTreeMap::new();
@@ -7866,7 +8271,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             continue;
         };
         let full = chain.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("::");
-        if gem_file && !gem_autoloads(&full) {
+        if gem_file && !gem_autoloads(&full) && !in_autoloaded_file(anchor, &full) {
             continue;
         }
         // Two files that both define the same constant cannot both be its
@@ -7893,6 +8298,34 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             }
             parent = if parent == "Object" { segment.clone() } else { format!("{parent}::{segment}") };
         }
+    }
+    // A gem's autoloaded file that declares nothing of its own, only
+    // requires its children: hedwig 1.68.0's status/track.rb (three
+    // require_relatives) for status.rb's `eager_autoload { autoload
+    // :Track }`, Core's podding/sorting_hat.rb for `autoload
+    // :SortingHat`. Its program is the file, and no declarations file
+    // carried the autoload: `Hedwig::Status::Track` raised NameError
+    // (FetchShippingRatesJob's `track_status`). The constant's autoload
+    // loads the program, as Ruby's loads the file; its children's
+    // `module Track` define it there.
+    for program in &app.file_programs {
+        let Some(full) = autoload_targets.get(program.source.as_str()) else { continue };
+        let anchor = emit::ruby::file_program_anchor(app, program);
+        if !program_anchors.contains(&anchor) || claimed.contains_key(full) {
+            continue;
+        }
+        let (parent, name) = full.rsplit_once("::").unwrap_or(("Object", full.as_str()));
+        let child = namespaces.entry(parent.to_string()).or_default().entry(name.to_string()).or_default();
+        if child.file.is_some() {
+            continue;
+        }
+        if !child.seen {
+            child.seen = true;
+            child.all_module = false;
+        }
+        child.file = Some(anchor.clone());
+        child.path_named = true;
+        claimed.insert(full.clone(), anchor);
     }
 
     // A namespace no carried file defines whose registered constants are
@@ -8147,7 +8580,7 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
             let Some(file) = child.file.as_ref() else { continue };
             if let Some(program) = program_of_file.get(file) {
                 program_constants.entry(program.clone()).or_default().push((namespace, name));
-            } else if requires_first(file) {
+            } else if program_anchors.contains(file) || requires_first(file) {
                 program_constants.entry(file.clone()).or_default().push((namespace, name));
             }
         }
@@ -8403,6 +8836,217 @@ fn apply_models_autoload(files: &mut Vec<(String, String)>, app: &App) {
                  RoundhouseAutoload.autoloaded({cpath:?}, __FILE__) if defined?(RoundhouseAutoload)"
             )
             .unwrap();
+        }
+    }
+}
+
+/// A class body's `require_relative` loop over a literal list the same
+/// body assigns, kept as written in a declarations file: job-iteration
+/// 1.15.1's interruption_adapters.rb
+///
+/// ```ruby
+/// BUNDLED_ADAPTERS = [:delayed_job, :good_job, :resque, :sidekiq, :solid_queue, :sqs].freeze
+/// BUNDLED_ADAPTERS.each do |name|
+///   require_relative "interruption_adapters/#{name}_adapter"
+/// end
+/// ```
+///
+/// Its path was read relative to the emitted file (models/job_iteration/
+/// interruption_adapters/sidekiq_adapter.rb, which does not exist), where
+/// the files it names are file programs under models/roundhouse_files,
+/// which nothing then reached (UNREACHED_PROGRAMS). Each element names
+/// one source, relative to the declaring source's directory, as Ruby
+/// reads it: the loop becomes one require per element, in order, of what
+/// the tree carries for that source (its program, else the files of its
+/// declarations), as a file program's `require_relative` is resolved. A
+/// source the tree carries nothing of is named
+/// (`file_require_not_carried`); a list or path that is not a literal
+/// stays as written.
+fn unroll_literal_require_loops(files: &mut [(String, String)], app: &App) {
+    use std::collections::BTreeMap;
+    let rel_of = |path: &str| -> String {
+        path.strip_prefix(app.root.as_str()).map(|p| p.trim_start_matches('/')).unwrap_or(path).to_string()
+    };
+    let candidates: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (p, c))| {
+            p.starts_with("app/models/") && !p.starts_with("app/models/roundhouse_files/") && c.contains(".each") && c.contains("require_relative \"")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut sources_of: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (source, names) in &app.library_class_files {
+        for name in names {
+            let anchor = format!("app/models/{}.rb", emit::ruby::library_file_stem(name.0.as_str(), app));
+            let sources = sources_of.entry(anchor).or_default();
+            if !sources.contains(&source.as_str()) {
+                sources.push(source.as_str());
+            }
+        }
+    }
+    let texts: BTreeMap<String, &str> = app.sources.iter().map(|s| (rel_of(&s.path), s.text.as_str())).collect();
+    let emitted_paths: std::collections::BTreeSet<String> = files.iter().map(|(path, _)| path.clone()).collect();
+    let emitted = |anchor: &str| emitted_paths.contains(&format!("app/{anchor}.rb"));
+    let programs: BTreeMap<String, String> = app
+        .file_programs
+        .iter()
+        .map(|p| (rel_of(&p.source), emit::ruby::file_program_anchor(app, p)))
+        .filter(|(_, anchor)| emitted(anchor))
+        .collect();
+    let declarations = emit::ruby::declarations_by_source(app);
+    let normalize = |path: &str| -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        parts.join("/")
+    };
+    // `NAME = [:a, "b"].freeze`, `NAME = %w[a b]`, `NAME = %i[a b].freeze`
+    // in `content`: its elements' text.
+    let literal_list = |content: &str, name: &str| -> Option<Vec<String>> {
+        let assign = format!("{name} = ");
+        let mut found: Option<Vec<String>> = None;
+        for line in content.lines() {
+            let Some(value) = line.trim_start().strip_prefix(&assign) else { continue };
+            let value = value.trim_end();
+            let value = value.strip_suffix(".freeze").unwrap_or(value);
+            let items: Option<Vec<String>> = if let Some(words) =
+                value.strip_prefix("%w[").or_else(|| value.strip_prefix("%i[")).and_then(|v| v.strip_suffix(']'))
+            {
+                Some(words.split_whitespace().map(str::to_string).collect())
+            } else if let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+                inner
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| {
+                        let word = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                        if let Some(sym) = item.strip_prefix(':').filter(|s| word(s)) {
+                            return Some(sym.to_string());
+                        }
+                        ['"', '\''].iter().find_map(|q| {
+                            item.strip_prefix(*q).and_then(|s| s.strip_suffix(*q)).filter(|s| !s.contains(['"', '\'', '#', '\\']))
+                        }).map(str::to_string)
+                    })
+                    .collect()
+            } else {
+                None
+            };
+            // Assigned twice: not one literal.
+            if found.is_some() {
+                return None;
+            }
+            found = Some(items?);
+        }
+        found
+    };
+    for i in candidates {
+        let path = files[i].0.clone();
+        let Some(sources) = sources_of.get(&path) else { continue };
+        let content = files[i].1.clone();
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        let mut out = String::with_capacity(content.len());
+        let mut changed = false;
+        let mut at = 0;
+        while at < lines.len() {
+            let line = lines[at];
+            let text = line.trim();
+            let indent = &line[..line.len() - line.trim_start().len()];
+            // `LIST.each do |v| require_relative "..." end` (one line, or
+            // three), or `LIST.each { |v| require_relative "..." }`.
+            let parsed = (|| -> Option<(String, String, String, usize)> {
+                let (list, rest) = text.split_once(".each")?;
+                if list.is_empty() || !list.starts_with(|c: char| c.is_ascii_uppercase()) || !list.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return None;
+                }
+                let rest = rest.trim_start();
+                let (rest, close) = if let Some(r) = rest.strip_prefix("do") {
+                    (r.trim_start(), "end")
+                } else {
+                    (rest.strip_prefix('{')?.trim_start(), "}")
+                };
+                let rest = rest.strip_prefix('|')?;
+                let (var, rest) = rest.split_once('|')?;
+                let var = var.trim();
+                if var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return None;
+                }
+                let (body, used) = if rest.trim().is_empty() && close == "end" {
+                    let body = lines.get(at + 1)?.trim();
+                    (lines.get(at + 2)?.trim() == "end").then_some(())?;
+                    (body.to_string(), 3)
+                } else {
+                    (rest.trim().strip_suffix(close)?.trim().to_string(), 1)
+                };
+                let literal = body.strip_prefix("require_relative \"")?.strip_suffix('"')?;
+                let hole = format!("#{{{var}}}");
+                let (prefix, suffix) = literal.split_once(&hole)?;
+                if prefix.contains(['#', '"', '\\']) || suffix.contains(['#', '"', '\\']) {
+                    return None;
+                }
+                Some((list.to_string(), prefix.to_string(), suffix.to_string(), used))
+            })();
+            let Some((list, prefix, suffix, used)) = parsed else {
+                out.push_str(line);
+                at += 1;
+                continue;
+            };
+            let Some(items) = literal_list(&content, &list) else {
+                out.push_str(line);
+                at += 1;
+                continue;
+            };
+            let loop_head = format!("{list}.each");
+            let Some(source) = sources.iter().find(|s| texts.get(&rel_of(s)).is_some_and(|t| t.contains(&loop_head))) else {
+                out.push_str(line);
+                at += 1;
+                continue;
+            };
+            let source = rel_of(source);
+            let dir = source.rsplit_once('/').map_or("", |(d, _)| d);
+            let site = texts
+                .get(&source)
+                .and_then(|t| t.lines().position(|l| l.contains(&loop_head)))
+                .map_or(source.clone(), |n| format!("{source}:{}", n + 1));
+            out.push_str(&format!(
+                "{indent}# {site}: `{list}.each {{ |…| require_relative \"{prefix}#{{…}}{suffix}\" }}` over the literal\n\
+                 {indent}# {list}: each file it names, in order (project.rs::unroll_literal_require_loops).\n"
+            ));
+            for item in &items {
+                let feature = format!("{prefix}{item}{suffix}");
+                let rb = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+                let target = normalize(&format!("{dir}/{rb}"));
+                if let Some(program) = programs.get(&target) {
+                    out.push_str(&format!("{indent}require RoundhouseAutoload.path({program:?})\n"));
+                    continue;
+                }
+                let anchors: Vec<&String> = declarations.get(&target).into_iter().flatten().filter(|a| emitted(a)).collect();
+                if !anchors.is_empty() {
+                    for anchor in anchors {
+                        out.push_str(&format!("{indent}require RoundhouseAutoload.path({anchor:?})\n"));
+                    }
+                    continue;
+                }
+                let message = format!(
+                    "roundhouse: error[file_require_not_carried]: {site}: `require_relative {feature:?}` names an app file the tree does not carry; it was not loaded"
+                );
+                out.push_str(&format!("{indent}warn({message:?})\n"));
+            }
+            at += used;
+            changed = true;
+        }
+        if changed {
+            files[i].1 = out;
         }
     }
 }

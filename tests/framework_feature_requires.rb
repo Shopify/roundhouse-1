@@ -16,8 +16,8 @@
 # requires, `emitted` the tree's boot.rb; each then requires GEM_LIB's
 # probe_gem.rb (not compiled: a gem from the gem home) and prints what it
 # observes, which must be equal. `refusals` prints what the tree answers
-# for each feature it does not port (FRAMEWORK_FEATURES_NOT_PORTED, and
-# any other Rails feature: project.rs::framework_feature_refusal).
+# for each feature it does not port (project.rs::framework_feature_refusal),
+# and for active_support/all and core_ext/hash, which it ports in part.
 require_relative "support/rails_oracle"
 require "fileutils"
 require "stringio"
