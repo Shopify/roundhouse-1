@@ -839,6 +839,8 @@ pub(super) fn declare_hidden<'pr>(
                 Err(why) => Err(not_modeled(format!("a `test` whose {}", why.0), why.1)),
             },
         }
+    } else if stmt.as_call_node().is_some_and(|c| super::is_generate_test(&c)) {
+        Err(not_modeled("TestGenerator's `generate_test`", first_line(stmt)))
     } else if let Some(call) = stmt.as_call_node() {
         let mut out = Vec::new();
         unroll.unroll_loop(&call, &[], &mut out)?.map(|()| out)

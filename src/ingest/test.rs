@@ -325,7 +325,15 @@ pub(super) fn is_test_declaration_shape(stmt: &Node<'_>) -> bool {
     })
 }
 
-/// The first test declaration (`test "…"`, `def test_…`) inside `stmt`,
+/// Core's `TestGenerator#generate_test(name, location = nil, tags: nil,
+/// &block)` (components/platform/essentials/lib/platform/testing/
+/// test_generator.rb): it declares the test with `test(name, tags,
+/// &block)`, then redefines it to call the original as `real_<name>`.
+pub(super) fn is_generate_test(call: &ruby_prism::CallNode<'_>) -> bool {
+    call.receiver().is_none() && call.name().as_slice() == b"generate_test" && call.arguments().is_some()
+}
+
+/// The first test declaration (`test "…"`, `def test_…`, `generate_test`) inside `stmt`,
 /// a class-body statement ingest does not model (`%w[a b].each do |x|
 /// test "#{x}" do … end end`, or a `test` whose name is not a string
 /// literal), as its offset. Nested classes and method bodies are not
@@ -343,7 +351,7 @@ pub(super) fn hidden_test_declaration(stmt: &Node<'_>) -> Option<usize> {
     }
     impl<'pr> Visit<'pr> for Find {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
-            if self.found.is_none() && is_test_declaration_shape(&node.as_node()) {
+            if self.found.is_none() && (is_test_declaration_shape(&node.as_node()) || is_generate_test(node)) {
                 self.found = Some(node.location().start_offset());
                 return;
             }
@@ -2083,6 +2091,18 @@ end
         assert_eq!(tms[0].tests.iter().map(|t| t.method_name.as_str()).collect::<Vec<_>>(), ["test_kept"]);
         assert_eq!(gaps.len(), 1, "{gaps:#?}");
         assert!(gaps[0].contains("(`NamesTest` line 2: test \"from a proc\""), "{}", gaps[0]);
+    }
+
+    // TestGenerator's `generate_test` declares a test (by `test`), in the
+    // class body or in a `class << self` macro: a named gap, not lost.
+    #[test]
+    fn a_generate_test_is_a_named_gap() {
+        let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  generate_test(\"made\") do\n    assert true\n  end\n  test \"kept\" do\n  end\nend\n";
+        let err = ingest_test_files(src.as_bytes(), "gen_test.rb").unwrap_err().to_string();
+        assert!(err.contains("tests declared by TestGenerator's `generate_test` are not modeled"), "{err}");
+        let src = "class GenTest < ActiveSupport::TestCase\n  extend TestGenerator\n  class << self\n    def checks(k)\n      generate_test(\"checks #{k}\") do\n      end\n    end\n  end\n  checks :a\n  test \"kept\" do\n  end\nend\n";
+        let err = ingest_test_files(src.as_bytes(), "gen_test.rb").unwrap_err().to_string();
+        assert!(err.contains("a `class << self` method that declares tests when called") && err.contains("`checks`"), "{err}");
     }
 
     // TestTags' persistent rename aliases `test_x` onto the name the

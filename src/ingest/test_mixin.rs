@@ -111,6 +111,10 @@ struct Decl {
     declares: bool,
     /// Core's `SharedTests` concern itself.
     provider: bool,
+    /// The methods its `module ClassMethods` / `class_methods do` gives
+    /// an includer's class body that declare tests when called
+    /// (`test_macros`).
+    macros: Vec<String>,
 }
 
 /// A class (with a superclass) whose body includes a module: a test class
@@ -219,6 +223,9 @@ pub(super) struct TestMixins {
     by_name: Map<String, usize>,
     tables: Vec<Option<Result<Table, String>>>,
     reported: std::cell::RefCell<Set<usize>>,
+    /// Each module whose includers get a test-declaring class method
+    /// (its own `macros` or an included module's), as (method, module).
+    macro_modules: Map<String, Vec<(String, String)>>,
 }
 
 impl TestMixins {
@@ -298,6 +305,99 @@ impl TestMixins {
             self.build(i, &mut tables, &mut stack);
         }
         self.tables = tables;
+
+        // ActiveSupport::Concern extends an includer with the class
+        // methods of the module and of the concerns it includes.
+        if self.decls.iter().any(|d| !d.macros.is_empty()) {
+            let mut by_name: Map<&str, Vec<usize>> = Map::default();
+            for (i, d) in self.decls.iter().enumerate() {
+                by_name.entry(d.name.as_str()).or_default().push(i);
+            }
+            let mut macro_modules: Map<String, Vec<(String, String)>> = Map::default();
+            for (i, d) in self.decls.iter().enumerate() {
+                let (mut seen, mut stack, mut got) = (Set::default(), vec![i], Vec::new());
+                while let Some(j) = stack.pop() {
+                    if !seen.insert(j) {
+                        continue;
+                    }
+                    let e = &self.decls[j];
+                    got.extend(e.macros.iter().map(|m| (m.clone(), e.name.clone())));
+                    for r in &e.includes {
+                        if let Some(found) = candidates(r, &e.nesting).iter().find_map(|c| by_name.get(c.as_str())) {
+                            stack.extend(found.iter().copied());
+                        }
+                    }
+                }
+                if !got.is_empty() {
+                    let entry = macro_modules.entry(d.name.clone()).or_default();
+                    for m in got {
+                        if !entry.contains(&m) {
+                            entry.push(m);
+                        }
+                    }
+                }
+            }
+            self.macro_modules = macro_modules;
+        }
+    }
+
+    /// The test-declaring class methods the modules `tm` includes give
+    /// it, as (method, module).
+    fn included_test_macros(&self, tm: &TestModule) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for inc in &tm.includes {
+            let written = inc.0.as_str();
+            for (name, macros) in &self.macro_modules {
+                if name == written || name.ends_with(&format!("::{written}")) {
+                    out.extend(macros.iter().filter(|m| !out.contains(m)).cloned().collect::<Vec<_>>());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Whether a module `tm` includes gives it a class method that
+    /// declares tests (`refuse_test_macro_calls`).
+    pub(super) fn gives_test_macros(&self, tm: &TestModule) -> bool {
+        !self.macro_modules.is_empty() && !self.included_test_macros(tm).is_empty()
+    }
+
+    /// Each statement of `tm`'s class body that calls a test-declaring
+    /// class method an included module gives it (`test_input_field_
+    /// authorization(ProductInput, :vendor, …)`, whose `ClassMethods`
+    /// body runs `generate_test`) declares tests ingest does not see: a
+    /// named gap, so they are not lost without a word. Strict ingest fails.
+    pub(super) fn refuse_test_macro_calls(&self, tm: &TestModule, source: &[u8], file: &str) -> IngestResult<()> {
+        let macros = self.included_test_macros(tm);
+        if macros.is_empty() {
+            return Ok(());
+        }
+        let result = super::prism::parse_silent(source);
+        let root = result.node();
+        let Some((class, _)) = find_class(&root, &[], tm.name.0.as_str()) else { return Ok(()) };
+        for stmt in class.body().map(flatten_statements).unwrap_or_default() {
+            if stmt.as_def_node().is_some()
+                || stmt.as_class_node().is_some()
+                || stmt.as_module_node().is_some()
+                || stmt.as_singleton_class_node().is_some()
+            {
+                continue;
+            }
+            let hit = self_calls(&stmt)
+                .into_iter()
+                .find_map(|(called, at)| macros.iter().find(|(m, _)| *m == called).map(|(m, owner)| (m.clone(), owner.clone(), at)));
+            let Some((method, owner, at)) = hit else { continue };
+            let line = super::sources::line_at(file, at).map(|l| l.to_string()).unwrap_or_else(|| "?".into());
+            super::survey::continue_or_fail(IngestError::Unsupported {
+                file: file.into(),
+                message: format!(
+                    "tests declared by a class method an included module gives the class are not modeled; they will not run (`{}` line {line}: `{method}` of `{owner}`)",
+                    tm.name.0
+                ),
+            })?;
+        }
+        Ok(())
     }
 
     /// Test classes `ingest_test_files` did not reach that include shared
@@ -1224,9 +1324,18 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
         content: false,
         declares: false,
         provider: name == "SharedTests" && is_shared_tests_provider(&stmts),
+        macros: Vec::new(),
     };
+    let mut class_defs: Vec<ruby_prism::DefNode<'_>> = Vec::new();
+    // A `def test_…` after a bare `private`/`protected`, or written as
+    // `private def test_…`, is a helper: Minitest runs public methods only
+    // (`public_instance_methods` in Core's `methods_matching`).
+    let mut hidden = false;
     for stmt in &stmts {
-        if stmt.as_module_node().is_some() {
+        if let Some(inner) = stmt.as_module_node() {
+            if module_name_path(&inner).as_deref() == Some(&["ClassMethods".to_string()][..]) {
+                class_defs.extend(inner.body().map(flatten_statements).unwrap_or_default().iter().filter_map(|n| n.as_def_node()));
+            }
             scan_node(stmt, &nesting, file, out, classes, known);
             continue;
         }
@@ -1235,7 +1344,10 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
             continue;
         }
         decl.content = true;
-        if is_test_declaration_shape(stmt) || hidden_test_declaration(stmt).is_some() {
+        if let Some(level) = bare_visibility(stmt) {
+            hidden = level != MethodVisibility::Public;
+        }
+        if !non_public_def(stmt, hidden) && (is_test_declaration_shape(stmt) || hidden_test_declaration(stmt).is_some()) {
             decl.declares = true;
         }
         if let Some(call) = stmt.as_call_node() {
@@ -1245,6 +1357,10 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
                         if let Some(args) = call.arguments() {
                             decl.includes.extend(args.arguments().iter().filter_map(|n| IncludeRef::of(&n)));
                         }
+                    }
+                    "class_methods" => {
+                        let body = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body());
+                        class_defs.extend(body.map(flatten_statements).unwrap_or_default().iter().filter_map(|n| n.as_def_node()));
                     }
                     "included" | "tag" | "setup" | "teardown" | "generate_tests" if call.block().is_some() => {
                         if constant_id_str(&call.name()) != "included" || included_block_declares(&call) {
@@ -1256,7 +1372,97 @@ fn scan_node(node: &Node<'_>, outer: &[String], file: &str, out: &mut Vec<Decl>,
             }
         }
     }
+    decl.macros = test_macros(&class_defs);
     out.push(decl);
+}
+
+/// The methods of `defs` (a module's class methods for its includers)
+/// that declare tests when called: a `test`, `generate_test` or
+/// `define_method("test_…")` in the body, or a call to another of them.
+fn test_macros(defs: &[ruby_prism::DefNode<'_>]) -> Vec<String> {
+    let calls: Vec<(String, Vec<String>)> = defs
+        .iter()
+        .filter(|d| d.receiver().is_none())
+        .map(|d| {
+            let called = d.body().map(|b| self_calls(&b).into_iter().map(|(n, _)| n).collect()).unwrap_or_default();
+            (constant_id_str(&d.name()).to_string(), called)
+        })
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    loop {
+        let before = found.len();
+        for (name, called) in &calls {
+            if !found.contains(name) && called.iter().any(|c| matches!(c.as_str(), "test" | "generate_test") || found.contains(c)) {
+                found.push(name.clone());
+            }
+        }
+        if found.len() == before {
+            return found;
+        }
+    }
+}
+
+/// The calls `node` makes on `self` (receiverless or `self.`), as (name,
+/// offset), outside the bodies of nested methods, classes and modules. A
+/// `define_method` whose name starts `test_` is listed as `test`.
+fn self_calls(node: &Node<'_>) -> Vec<(String, usize)> {
+    use ruby_prism::Visit;
+    struct Calls(Vec<(String, usize)>);
+    impl<'pr> Visit<'pr> for Calls {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+                let mut name = constant_id_str(&node.name()).to_string();
+                if name == "define_method" {
+                    let first = node.arguments().and_then(|a| a.arguments().iter().next());
+                    let text = first.map(|n| String::from_utf8_lossy(n.location().as_slice()).into_owned()).unwrap_or_default();
+                    if text.trim_start_matches([':', '"', '\'']).starts_with("test_") {
+                        name = "test".into();
+                    }
+                }
+                self.0.push((name, node.location().start_offset()));
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_class_node(&mut self, _: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(&mut self, _: &ruby_prism::SingletonClassNode<'pr>) {}
+    }
+    let mut calls = Calls(Vec::new());
+    calls.visit(node);
+    calls.0
+}
+
+/// The level a bare `private` / `protected` / `public` sets for the defs
+/// after it.
+fn bare_visibility(stmt: &Node<'_>) -> Option<MethodVisibility> {
+    let call = stmt.as_call_node()?;
+    if call.receiver().is_some() || call.arguments().is_some() || call.block().is_some() {
+        return None;
+    }
+    match constant_id_str(&call.name()) {
+        "private" => Some(MethodVisibility::Private),
+        "protected" => Some(MethodVisibility::Protected),
+        "public" => Some(MethodVisibility::Public),
+        _ => None,
+    }
+}
+
+/// A def Minitest does not collect: one under a bare `private` or
+/// `protected` (`hidden`), or `private def …` / `protected def …`.
+fn non_public_def(stmt: &Node<'_>, hidden: bool) -> bool {
+    if stmt.as_def_node().is_some() {
+        return hidden;
+    }
+    stmt.as_call_node().is_some_and(|call| {
+        call.receiver().is_none()
+            && call.block().is_none()
+            && matches!(constant_id_str(&call.name()), "private" | "protected")
+            && call.arguments().is_some_and(|a| {
+                let args: Vec<Node<'_>> = a.arguments().iter().collect();
+                matches!(args.as_slice(), [arg] if arg.as_def_node().is_some())
+            })
+    })
 }
 
 /// An `included do` block that declares tests, tags or setup for the class.
@@ -1863,6 +2069,47 @@ end
         let defined: Vec<&str> = tms[0].defined_tests.iter().map(|(n, _)| n.as_str()).collect();
         assert!(defined.contains(&"test_one") && defined.contains(&"test_two_tag:slow:true"), "{defined:?}");
         assert!(tms[0].defined_tests.iter().all(|(_, declared)| !declared), "{:?}", tms[0].defined_tests);
+    }
+
+    #[test]
+    fn a_helper_modules_private_test_named_def_declares_no_tests() {
+        // StripePaymentsExtensions::StripeHelper: a nested class, then a
+        // private `def test_handler`, which Minitest does not run.
+        let helper = "module StripeHelper\n  private\n  def stub_it; end\n  class TestHandler\n  end\n  def test_handler\n    TestHandler\n  end\nend\n";
+        let inline = "module InlineHelper\n  private def test_double\n    1\n  end\nend\n";
+        let class = "class PayTest < ActiveSupport::TestCase\n  include StripeHelper\n  include InlineHelper\n  test \"pays\" do\n    assert true\n  end\nend\n";
+        let tms = run(&[("stripe_helper.rb", helper), ("inline_helper.rb", inline), ("pay_test.rb", class)], "pay_test.rb").unwrap();
+        assert_eq!(names(&tms[0]), ["test_pays"]);
+        let public = "module PublicHelper\n  class TestHandler\n  end\n  def test_handler\n    TestHandler\n  end\nend\n";
+        let class = "class PubTest < ActiveSupport::TestCase\n  include PublicHelper\nend\n";
+        let err = run(&[("public_helper.rb", public), ("pub_test.rb", class)], "pub_test.rb").unwrap_err();
+        assert!(err.contains("test class `PubTest` refused") && err.contains("TestHandler"), "{err}");
+    }
+
+    #[test]
+    fn a_call_to_an_included_test_macro_is_a_named_gap() {
+        // AccessAndAuth::InputFieldsAuthorizationHelper: a concern whose
+        // `ClassMethods#test_input_field_authorization` runs
+        // `generate_test`, called in the includer's class body.
+        let helper = "module AuthHelper\n  extend ActiveSupport::Concern\n  module ClassMethods\n    include TestGenerator\n    def test_field(key)\n      generate_test(\"checks #{key}\") do\n        assert true\n      end\n    end\n    def test_fields(*keys)\n      keys.each { |k| test_field(k) }\n    end\n    def label(x) = x.to_s\n  end\nend\n";
+        let outer = "module OuterHelper\n  extend ActiveSupport::Concern\n  include AuthHelper\nend\n";
+        let class = "class InputTest < ActiveSupport::TestCase\n  include OuterHelper\n  test \"own\" do\n    assert true\n  end\n  label(:x)\n  test_field(:vendor)\n  [:a].each do |k|\n    test_fields(k)\n  end\nend\n";
+        let files = [("auth_helper.rb", helper), ("outer_helper.rb", outer), ("input_test.rb", class)];
+        let mut mixins = TestMixins::default();
+        for (file, source) in &files {
+            mixins.scan(source.as_bytes(), file);
+        }
+        mixins.finish();
+        let tms = crate::ingest::test::ingest_test_files(class.as_bytes(), "input_test.rb").unwrap();
+        assert!(mixins.gives_test_macros(&tms[0]));
+        let err = mixins.refuse_test_macro_calls(&tms[0], class.as_bytes(), "input_test.rb").unwrap_err().to_string();
+        assert!(err.contains("tests declared by a class method an included module gives the class are not modeled") && err.contains("`test_field` of `AuthHelper`"), "{err}");
+        crate::ingest::survey::activate();
+        mixins.refuse_test_macro_calls(&tms[0], class.as_bytes(), "input_test.rb").unwrap();
+        let gaps: Vec<String> = crate::ingest::survey::drain().iter().map(|e| e.to_string()).collect();
+        assert_eq!(gaps.len(), 2, "{gaps:#?}");
+        assert!(gaps[1].contains("`test_fields` of `AuthHelper`"), "{}", gaps[1]);
+        assert_eq!(names(&tms[0]), ["test_own"]);
     }
 
     #[test]
