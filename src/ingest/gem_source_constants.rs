@@ -90,7 +90,7 @@ pub fn scan<V: Vfs + ?Sized>(vfs: &V, home: &Path, lock: &Lockfile, gems: &BTree
     for gem in gems {
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, extensions) = gemspec(vfs, home, gem, version);
+        let (require_paths, extensions) = gemspec(vfs, home, &dir, gem, version);
         let key = (dir.clone(), require_paths.clone());
         let cached = cache().lock().ok().and_then(|c| c.get(&key).cloned());
         let read = match cached {
@@ -163,7 +163,7 @@ pub fn engine_isolated_prefixes<V: Vfs + ?Sized>(
         }
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let (require_paths, _) = gemspec(vfs, home, &dir, gem, version);
         let mut engines = Vec::new();
         for path in &require_paths {
             engine_files(vfs, &dir.join(path), 0, &mut engines);
@@ -271,7 +271,7 @@ pub fn scan_gem_source_requires<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Pat
         }
         let Some(version) = lock.version_of(gem) else { continue };
         let Some(dir) = gem_dir(vfs, home, lock, gem, version, &mut installed) else { continue };
-        let (require_paths, _) = gemspec(vfs, home, gem, version);
+        let (require_paths, _) = gemspec(vfs, home, &dir, gem, version);
         let owns = |feature: &str| {
             let rb = if feature.ends_with(".rb") { feature.to_string() } else { format!("{feature}.rb") };
             require_paths.iter().any(|path| vfs.exists(&dir.join(path).join(&rb)))
@@ -486,10 +486,17 @@ fn gem_dir<V: Vfs + ?Sized>(
 
 /// The gemspec's `require_paths` (`<home>/specifications/<gem>-<version>.gemspec`,
 /// as RubyGems writes it: `s.require_paths = ["lib".freeze]`), `lib`
-/// when it names none, and whether it builds `extensions`.
-fn gemspec<V: Vfs + ?Sized>(vfs: &V, home: &Path, gem: &str, version: &str) -> (Vec<String>, bool) {
+/// when it names none, and whether it builds `extensions`. A gem the lock
+/// takes from git has no specification there: Bundler loads the
+/// checkout's own `<gem>.gemspec` (`dir`, [`gem_dir`]), as the gem home
+/// installs it in the same form (grpc's
+/// `s.require_paths = ["src/ruby/lib".freeze, ...]`).
+fn gemspec<V: Vfs + ?Sized>(vfs: &V, home: &Path, dir: &Path, gem: &str, version: &str) -> (Vec<String>, bool) {
     let spec = home.join("specifications").join(format!("{gem}-{version}.gemspec"));
-    let text = vfs.read_to_string(&spec).ok();
+    let text = vfs
+        .read_to_string(&spec)
+        .ok()
+        .or_else(|| vfs.read(&dir.join(format!("{gem}.gemspec"))).ok().map(|b| String::from_utf8_lossy(&b).into_owned()));
     let extensions = text.as_deref().is_some_and(|t| t.lines().any(|l| l.trim_start().starts_with("s.extensions")));
     let paths: Vec<String> = text
         .and_then(|text| {

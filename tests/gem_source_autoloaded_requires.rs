@@ -15,6 +15,12 @@
 //! so the gem is loaded before the file's own code reads its constants.
 //! A require under a condition, or of a gem whose lock closure reaches
 //! Rails, still leaves the gem unloaded.
+//!
+//! A lock dependency from a GIT section is Bundler's checkout, whose own
+//! gemspec names its require paths: grpc's `src/ruby/lib`, which
+//! shopify_spanner 4.9.0's defaults.rb (`require "grpc"`) reaches, so
+//! panama_client's and shopify_spanner's `GRPC::*` reads were refused
+//! while the gem home had no `specifications/grpc-*.gemspec` to read.
 #[path = "support/emit_and_run.rs"]
 mod emit_and_run;
 
@@ -156,4 +162,29 @@ fn a_conditional_or_rails_reaching_require_leaves_the_gem_unloaded() {
             assert!(!constants.iter().any(|e| e.contains(&format!("{kept} ")) || e.ends_with(kept)), "{kept}: {errors:#?}");
         }
     }
+}
+
+/// gitlog is grpc's shape: a GIT-section lock dependency of the gem
+/// source whose checkout's gemspec puts its files under src/ruby/lib.
+const GIT_LOCK: &str = "GIT\n  remote: https://github.com/example/gitlog.git\n  revision: 0123456789abcdef0123456789abcdef01234567\n  specs:\n    gitlog (2.0.0.dev)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    activesupport (8.0.2)\n    hedgy (1.0.0)\n      activesupport (>= 7.2)\n      gitlog\n\nDEPENDENCIES\n  activesupport\n  gitlog!\n  hedgy\n";
+
+const GIT_CONFIGURATION: &str = "require \"gitlog\"\n\nmodule Hedgy\n  class Configuration\n    attr_reader :logger\n\n    def initialize\n      @logger = GitLog::Channel.new\n    end\n  end\nend\n";
+
+#[test]
+fn a_git_gem_s_checkout_gemspec_names_its_require_paths() {
+    let home = fake_gem_home();
+    let checkout = home.join("bundler/gems/gitlog-0123456789ab");
+    std::fs::create_dir_all(checkout.join("src/ruby/lib")).unwrap();
+    std::fs::write(
+        checkout.join("gitlog.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"gitlog\".freeze\n  s.version = \"2.0.0.dev\".freeze\n  s.summary = \"fixture\"\n  s.authors = [\"x\"]\n  s.require_paths = [\"src/ruby/lib\".freeze]\nend\n",
+    )
+    .unwrap();
+    std::fs::write(checkout.join("src/ruby/lib/gitlog.rb"), "module GitLog\n  class Channel; end\nend\n").unwrap();
+    let (_, errors) = app(&home, GIT_CONFIGURATION)
+        .write("Gemfile.lock", GIT_LOCK)
+        .write("sorbet/rbi/gems/gitlog@2.0.0.dev-0123456789abcdef0123456789abcdef01234567.rbi", "# typed: true\n\nmodule GitLog; end\nclass GitLog::Channel; end\n")
+        .emit(BuildTarget::Ruby);
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(constant_errors(&errors).is_empty(), "{errors:#?}");
 }
