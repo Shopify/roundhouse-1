@@ -28,20 +28,60 @@
 //!   `config/contexts.yml`, as `ingest::initializers` reads it.
 //! * A require inside an `if`/`unless` (or a modifier) runs only when
 //!   its condition holds; it is recorded as conditional
-//!   ([`App::boot_conditional_loads`]) and not loaded by the emitted
-//!   boot, which cannot evaluate the boot file's condition. Those are
-//!   named in the emitted `app/models.rb`.
+//!   ([`App::boot_conditional_loads`]). In config/boot.rb,
+//!   config/application.rb and config/environment.rb the statement is
+//!   the boot program's (below), which runs the condition; elsewhere (an
+//!   environment file without a program) the emitted boot does not load
+//!   it and names it in the emitted `app/models.rb`.
 //!
 //! NOT MODELED: a computed require (`ENV["BOOT_PRELOAD"]`'s paths),
 //! `$LOAD_PATH` changes the boot files make, Bundler's `:debug` group
 //! argument to `Rails.groups`.
+//!
+//! THE BOOT PROGRAMS ([`boot_programs`]). Native boot runs more of these
+//! files than their requires: Core's config/boot.rb writes ENV
+//! (`ENV["DISABLE_DATABASE_ENVIRONMENT_CHECK"] = "1"`, the OTEL_* keys),
+//! sets the encodings and `Warning[:deprecated]`, and its
+//! config/application.rb writes `ENV["POD_IDS"] ||= "0;1" unless
+//! Rails.env.production?`, which the shard registry reads when it builds
+//! the pods. When a boot file has such a statement, each of
+//! config/boot.rb, config/application.rb and config/environment.rb is
+//! carried as a file program (`App::file_programs`), loaded first at
+//! boot ([`BootLoad`]s ahead of the walk's), its items in source order:
+//! * each require the walk follows, as a `ProgramItem::Require` of the
+//!   file it resolves to (so the program loads it where native boot
+//!   does); `Bundler.require`'s carried gem entries and
+//!   `Rails.load_embedded_engines`' engines likewise, a grouped gem
+//!   under its environments' condition; a require in a class or module
+//!   body at that declaration (the body itself is the application
+//!   reopen's: `ingest::app`);
+//! * every other statement as Ruby runs it (`ProgramItem::Statement`,
+//!   which names one that raises and goes on), conditionals on
+//!   `Rails.env` included;
+//! * by name, what cannot run (`ProgramItem::NotCarried`, reported as
+//!   `file_statement_unsupported` and named again at boot): a computed
+//!   require, a `$LOAD_PATH` change, a statement the expression ingest
+//!   refuses.
+//!
+//! Consumed, not carried, because the emitted tree stands in for them:
+//! Bundler's process setup (`gem "bundler"`, `require "bundler/setup"`,
+//! `require "bootsnap/setup"`, `ENV["BUNDLE_GEMFILE"]`; the tree activates
+//! its locked gems itself, runtime/bundled_gems.rb and gem_facades.rb, as
+//! `project::boot_require_is_process_machinery` skips them there) and
+//! config/environment.rb's `Rails.application.initialize!` (the emitted
+//! app/models.rb is that initialization: the environment program, the
+//! railties' initializers and config/initializers). A boot file whose
+//! statements are only requires and these has no program: the walk's
+//! boot loads already load it in its order.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use ruby_prism::Node;
 
-use crate::app::BootLoad;
+use crate::app::{BootLoad, FileProgram, ProgramItem};
+use crate::expr::Expr;
+use crate::span::Span;
 use crate::vfs::Vfs;
 
 use super::util::{constant_id_str, flatten_statements};
@@ -85,6 +125,402 @@ pub(super) fn boot_loads<V: Vfs + ?Sized>(
         walk.file(&file, None);
     }
     (walk.loads, walk.conditional_loads)
+}
+
+/// The native boot files, in the order a test's `require
+/// "config/environment"` runs them.
+const BOOT_SEEDS: [&str; 3] = ["config/boot.rb", "config/application.rb", "config/environment.rb"];
+
+/// The boot files' own programs and the [`BootLoad`]s that load them
+/// ahead of the walk's (module doc, THE BOOT PROGRAMS): empty when no
+/// boot file has a statement beyond its requires. Each program comes
+/// with its source, registered for spans.
+pub(super) fn boot_programs<V: Vfs + ?Sized>(
+    vfs: &V,
+    dir: &Path,
+    path_gems: &[PathBuf],
+    gem_sources: &[(String, PathBuf)],
+) -> (Vec<BootLoad>, Vec<(FileProgram, Vec<u8>)>) {
+    let mut load_path: Vec<PathBuf> =
+        path_gems.iter().map(|gem| gem.join("lib")).filter(|lib| vfs.is_dir(lib)).collect();
+    load_path.push(dir.join("lib"));
+    let walk = Walk {
+        vfs,
+        dir,
+        load_path,
+        gems: bundler_entries(vfs, dir, path_gems, gem_sources),
+        visited: BTreeSet::new(),
+        envs: Vec::new(),
+        conditional: false,
+        loads: Vec::new(),
+        conditional_loads: Vec::new(),
+        bundler_require: false,
+    };
+    let mut programs = Vec::new();
+    for seed in BOOT_SEEDS {
+        let path = dir.join(seed);
+        let Ok(source) = vfs.read(&path) else { continue };
+        let file = path.display().to_string();
+        super::sources::register(&file, &String::from_utf8_lossy(&source));
+        let result = super::prism::parse(&source, &file);
+        let root = result.node();
+        let Some(program) = root.as_program_node() else { continue };
+        let program_walk = BootProgram { walk: &walk, path: normalize(&path), file: file.clone(), source: &source };
+        let mut items = Vec::new();
+        program_walk.items(&program.statements().body().iter().collect::<Vec<_>>(), &mut items);
+        programs.push((FileProgram { source: file, items }, source.to_vec()));
+    }
+    fn runs(items: &[ProgramItem]) -> bool {
+        items.iter().any(|item| match item {
+            ProgramItem::Statement(_) | ProgramItem::NotCarried { .. } => true,
+            ProgramItem::Branch { then_items, else_items, .. } => runs(then_items) || runs(else_items),
+            _ => false,
+        })
+    }
+    if !programs.iter().any(|(program, _)| runs(&program.items)) {
+        return (Vec::new(), Vec::new());
+    }
+    let loads = programs
+        .iter()
+        .map(|(program, _)| {
+            let rel = walk.rel(Path::new(&program.source));
+            BootLoad { source: rel.clone(), envs: Vec::new(), site: format!("{rel} (native boot)") }
+        })
+        .collect();
+    (loads, programs)
+}
+
+/// One boot file's program items (module doc, THE BOOT PROGRAMS).
+struct BootProgram<'w, 'a, V: Vfs + ?Sized> {
+    walk: &'w Walk<'a, V>,
+    /// The boot file, normalized as the walk's targets are.
+    path: PathBuf,
+    /// The boot file as registered (`sources::register`).
+    file: String,
+    source: &'w [u8],
+}
+
+impl<V: Vfs + ?Sized> BootProgram<'_, '_, V> {
+    fn span(&self, node: &Node<'_>) -> Span {
+        let loc = node.location();
+        Span { file: super::sources::file_id(&self.file), start: loc.start_offset() as u32, end: loc.end_offset() as u32 }
+    }
+
+    fn not_carried(&self, node: &Node<'_>, message: impl Into<String>) -> ProgramItem {
+        ProgramItem::NotCarried {
+            span: self.span(node),
+            construct: super::initializers::construct_of(node, &String::from_utf8_lossy(self.source)),
+            message: message.into(),
+        }
+    }
+
+    /// A `ProgramItem::Require` of `target`, a file of the tree, from
+    /// this boot file: relative to it, so the emit resolves it to that
+    /// file and no other (`program_require_source`).
+    fn require_of(&self, node: &Node<'_>, target: &Path) -> ProgramItem {
+        let dir = normalize(self.walk.dir);
+        let target = normalize(target);
+        let base = self.path.parent().unwrap_or(Path::new(""));
+        match (target.strip_prefix(&dir), base.strip_prefix(&dir)) {
+            (Ok(rel_target), Ok(rel_base)) => {
+                let up = rel_base.components().count();
+                let mut feature = "../".repeat(up);
+                feature.push_str(&rel_target.display().to_string());
+                let feature = feature.strip_suffix(".rb").unwrap_or(&feature).to_string();
+                ProgramItem::Require { span: self.span(node), feature, relative: true }
+            }
+            // Outside the app root: the feature under its `lib/`.
+            _ => {
+                let text = target.display().to_string();
+                let feature = text.rsplit_once("/lib/").map(|(_, f)| f).unwrap_or(&text);
+                let feature = feature.strip_suffix(".rb").unwrap_or(feature).to_string();
+                ProgramItem::Require { span: self.span(node), feature, relative: false }
+            }
+        }
+    }
+
+    /// `require "lit"` / `require_relative "lit"` with no receiver:
+    /// `Some(item)` (or `Some(None)`, consumed), `None` for any other
+    /// statement.
+    fn literal_require(&self, stmt: &Node<'_>) -> Option<Option<ProgramItem>> {
+        let call = stmt.as_call_node()?;
+        let name = constant_id_str(&call.name());
+        if call.receiver().is_some() || !matches!(name, "require" | "require_relative") || call.block().is_some() {
+            return None;
+        }
+        let args: Vec<Node<'_>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let [one] = args.as_slice() else { return None };
+        let feature = String::from_utf8_lossy(one.as_string_node()?.unescaped()).into_owned();
+        if name == "require" && process_machinery_feature(&feature) {
+            return Some(None);
+        }
+        let target = if name == "require" {
+            self.walk.resolve(&feature)
+        } else {
+            self.path.parent().map(|p| normalize(&p.join(with_rb(&feature)))).filter(|p| self.walk.vfs.exists(p))
+        };
+        Some(Some(match target {
+            Some(target) => self.require_of(stmt, &target),
+            None => ProgramItem::Require { span: self.span(stmt), feature, relative: name == "require_relative" },
+        }))
+    }
+
+    fn items(&self, stmts: &[Node<'_>], out: &mut Vec<ProgramItem>) {
+        for stmt in stmts {
+            if let Some(item) = self.literal_require(stmt) {
+                out.extend(item);
+                continue;
+            }
+            if let Some(call) = stmt.as_call_node() {
+                let name = constant_id_str(&call.name());
+                let on = |constant: &str| receiver_is_constant(&call, constant);
+                if name == "require" && on("Bundler") {
+                    self.bundler_require(stmt, out);
+                    continue;
+                }
+                if name == "load_embedded_engines" && on("Rails") {
+                    for engine in embedded_engine_names(self.walk.vfs, self.walk.dir) {
+                        if let Some(target) = self.walk.resolve(&engine) {
+                            out.push(self.require_of(stmt, &target));
+                        }
+                    }
+                    continue;
+                }
+                // Bundler's own activation (`gem "bundler", ">= 0.a"`).
+                if name == "gem" && call.receiver().is_none() {
+                    continue;
+                }
+                // config/environment.rb: the emitted boot is Rails'
+                // initialization (module doc).
+                if name == "initialize!" && call.receiver().is_some_and(|r| is_application(&r)) {
+                    continue;
+                }
+                // `Rails.application.configure do … end` in a boot file:
+                // its config writes are the application's (`ingest::app`);
+                // its requires load here.
+                if name == "configure" && call.receiver().is_some_and(|r| is_application(&r)) {
+                    if let Some(body) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+                        self.body_requires(&flatten_statements(body), out);
+                    }
+                    continue;
+                }
+                if load_path_change(&call) {
+                    out.push(ProgramItem::NotCarried {
+                        span: self.span(stmt),
+                        construct: format!("$LOAD_PATH.{name}"),
+                        message: "a `$LOAD_PATH` change is not carried: the emitted tree resolves the app's requires when it is emitted (`boot_requires`), and its load path is the runtime's".into(),
+                    });
+                    continue;
+                }
+            }
+            if let Some(class) = stmt.as_class_node() {
+                if let Some(body) = class.body() {
+                    self.body_requires(&flatten_statements(body), out);
+                }
+                continue;
+            }
+            if let Some(module) = stmt.as_module_node() {
+                if let Some(body) = module.body() {
+                    self.body_requires(&flatten_statements(body), out);
+                }
+                continue;
+            }
+            if writes_bundle_gemfile(stmt) {
+                continue;
+            }
+            out.push(self.statement(stmt));
+        }
+    }
+
+    /// A class or module body (or a `configure` block) of a boot file:
+    /// its requires, as the walk follows them; the rest is the
+    /// application's (`ingest::app`).
+    fn body_requires(&self, stmts: &[Node<'_>], out: &mut Vec<ProgramItem>) {
+        for stmt in stmts {
+            if let Some(item) = self.literal_require(stmt) {
+                out.extend(item);
+            } else if let Some(class) = stmt.as_class_node() {
+                if let Some(body) = class.body() {
+                    self.body_requires(&flatten_statements(body), out);
+                }
+            } else if let Some(module) = stmt.as_module_node() {
+                if let Some(body) = module.body() {
+                    self.body_requires(&flatten_statements(body), out);
+                }
+            }
+        }
+    }
+
+    /// `Bundler.require(...)`: each carried gem entry, in Gemfile order,
+    /// a grouped one under `envs.include?(Rails.env.to_s)` (module doc).
+    fn bundler_require(&self, stmt: &Node<'_>, out: &mut Vec<ProgramItem>) {
+        for gem in &self.walk.gems {
+            let require = self.require_of(stmt, &gem.entry);
+            if gem.envs.is_empty() {
+                out.push(require);
+                continue;
+            }
+            if let Some(ProgramItem::Branch { cond, then_items, .. }) = out.last_mut() {
+                if branch_envs(cond).as_deref() == Some(gem.envs.as_slice()) {
+                    then_items.push(require);
+                    continue;
+                }
+            }
+            match envs_condition(&gem.envs, self.span(stmt)) {
+                Some(cond) => out.push(ProgramItem::Branch { cond, negate: false, then_items: vec![require], else_items: Vec::new() }),
+                None => out.push(self.not_carried(stmt, format!("the environments condition of {} is not carried", gem.site))),
+            }
+        }
+    }
+
+    /// Any other statement, as Ruby runs it.
+    fn statement(&self, stmt: &Node<'_>) -> ProgramItem {
+        if let Some(why) = computed_require(stmt) {
+            return self.not_carried(
+                stmt,
+                format!("a computed require is not carried ({why}): the emitted tree loads the files it resolves when it is emitted, and this one names its file only at boot"),
+            );
+        }
+        if defines_method(stmt) {
+            return self.not_carried(stmt, "a method this boot-file statement defines is not carried; Ruby defines it when the file loads");
+        }
+        // `$VERBOSE = true`: the expression ingest reads a global and
+        // writes none (as `library_class::program_items` carries it).
+        if let Some(write) = stmt.as_global_variable_write_node() {
+            return match super::expr::ingest_expr(&write.value(), &self.file) {
+                Ok(value) => ProgramItem::Statement(Expr::new(
+                    self.span(stmt),
+                    crate::expr::ExprNode::Assign {
+                        target: crate::expr::LValue::Var {
+                            id: crate::ident::VarId(0),
+                            name: crate::ident::Symbol::from(constant_id_str(&write.name())),
+                        },
+                        value,
+                    },
+                )),
+                Err(err) => self.not_carried(stmt, format!("the ingest cannot carry this global variable's value: {err}")),
+            };
+        }
+        match super::expr::ingest_expr(stmt, &self.file) {
+            Ok(expr) => ProgramItem::Statement(expr),
+            Err(err) => self.not_carried(stmt, format!("the ingest cannot carry this boot-file statement: {err}")),
+        }
+    }
+}
+
+/// The receiver of `call` is the top-level constant `constant`.
+fn receiver_is_constant(call: &ruby_prism::CallNode<'_>, constant: &str) -> bool {
+    call.receiver().is_some_and(|r| {
+        r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == constant)
+            || r.as_constant_path_node().is_some_and(|p| {
+                p.parent().is_none() && p.name().is_some_and(|n| constant_id_str(&n) == constant)
+            })
+    })
+}
+
+/// `<Const>.application` (`Rails.application`, `Shopify::Application`'s
+/// `Rails.application`).
+fn is_application(node: &Node<'_>) -> bool {
+    node.as_call_node()
+        .is_some_and(|c| constant_id_str(&c.name()) == "application" && c.arguments().is_none() && c.receiver().is_some())
+}
+
+/// Bundler's and Bootsnap's own setup, which the emitted tree's gem
+/// activation stands in for (module doc;
+/// `project::boot_require_is_process_machinery`).
+fn process_machinery_feature(feature: &str) -> bool {
+    ["bundler", "bootsnap"].iter().any(|gem| feature == *gem || feature.starts_with(&format!("{gem}/")))
+}
+
+/// `ENV["BUNDLE_GEMFILE"] = …` / `||= …`: Bundler's configuration.
+fn writes_bundle_gemfile(stmt: &Node<'_>) -> bool {
+    let env_key = |receiver: Option<Node<'_>>, arguments: Option<ruby_prism::ArgumentsNode<'_>>| {
+        receiver.is_some_and(|r| r.as_constant_read_node().is_some_and(|c| constant_id_str(&c.name()) == "ENV"))
+            && arguments.is_some_and(|a| {
+                a.arguments().iter().next().and_then(|k| k.as_string_node()).is_some_and(|k| k.unescaped() == b"BUNDLE_GEMFILE")
+            })
+    };
+    if let Some(write) = stmt.as_index_or_write_node() {
+        return env_key(write.receiver(), write.arguments());
+    }
+    if let Some(write) = stmt.as_index_operator_write_node() {
+        return env_key(write.receiver(), write.arguments());
+    }
+    stmt.as_call_node()
+        .is_some_and(|c| constant_id_str(&c.name()) == "[]=" && env_key(c.receiver(), c.arguments()))
+}
+
+/// `$LOAD_PATH.unshift(…)` and kin (`$:`).
+fn load_path_change(call: &ruby_prism::CallNode<'_>) -> bool {
+    call.receiver().is_some_and(|r| {
+        r.as_global_variable_read_node().is_some_and(|g| matches!(constant_id_str(&g.name()), "$LOAD_PATH" | "$:"))
+    }) && matches!(constant_id_str(&call.name()), "unshift" | "push" | "<<" | "prepend" | "concat" | "insert" | "append")
+}
+
+/// A `require`/`require_relative`/`load` anywhere in `stmt` whose
+/// argument is not a literal: the call as written.
+fn computed_require(stmt: &Node<'_>) -> Option<String> {
+    use ruby_prism::Visit;
+    struct Finds(Option<String>);
+    impl<'pr> Visit<'pr> for Finds {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let name = constant_id_str(&node.name());
+            if self.0.is_none() && node.receiver().is_none() && matches!(name, "require" | "require_relative" | "load") {
+                let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+                if !matches!(args.as_slice(), [one] if one.as_string_node().is_some()) {
+                    self.0 = Some(format!("`{name}` of a computed path"));
+                }
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut finds = Finds(None);
+    finds.visit(stmt);
+    finds.0
+}
+
+/// Whether `node` holds a `def`.
+fn defines_method(node: &Node<'_>) -> bool {
+    use ruby_prism::Visit;
+    struct Finds(bool);
+    impl<'pr> Visit<'pr> for Finds {
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {
+            self.0 = true;
+        }
+    }
+    let mut finds = Finds(false);
+    finds.visit(node);
+    finds.0
+}
+
+/// `["test", "development"].include?(Rails.env.to_s)`, at `span`: the
+/// condition `Bundler.require(*Rails.groups)` loads a grouped gem under.
+fn envs_condition(envs: &[String], span: Span) -> Option<Expr> {
+    let list = envs.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join(", ");
+    let text = format!("[{list}].include?(Rails.env.to_s)\n");
+    let result = ruby_prism::parse(text.as_bytes());
+    let root = result.node();
+    let stmt = root.as_program_node()?.statements().body().iter().next()?;
+    let mut expr = super::expr::ingest_expr(&stmt, "<bundler_groups>").ok()?;
+    expr.span = span;
+    Some(expr)
+}
+
+/// The environments an [`envs_condition`] names.
+fn branch_envs(cond: &Expr) -> Option<Vec<String>> {
+    use crate::expr::{ExprNode, Literal};
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*cond.node else { return None };
+    if method.as_str() != "include?" {
+        return None;
+    }
+    let ExprNode::Array { elements, .. } = &*recv.node else { return None };
+    elements
+        .iter()
+        .map(|e| match &*e.node {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// config/boot.rb's top-level, unconditional `require "lit"` calls that

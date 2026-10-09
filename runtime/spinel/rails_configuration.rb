@@ -37,8 +37,15 @@
 require_relative "rails"
 
 module Rails
+  # One configuration for the process, as natively (railties rails.rb:
+  # `application.config`, the Application's one
+  # Application::Configuration). Its state lives on the application's
+  # class-level slots and this object's class, so building it once is
+  # also what lets a test stub a key on it (Core:
+  # `Rails.application.config.stubs(consider_all_requests_local: false)`)
+  # and have the next `Rails.application.config` see the stub.
   def self.configuration
-    Configuration.new(application)
+    @configuration ||= Configuration.new(application)
   end
 
   Application.class_eval do
@@ -195,6 +202,100 @@ module Rails
         ::Rails::Railtie::Configuration.new.public_send(name, *args, &block)
       else
         super
+      end
+    end
+
+    # `config.x`, Application::Configuration's `@x = Custom.new`
+    # (railties 8.2.0.alpha application/configuration.rb): the app's own
+    # namespace, where an assignment is the definition and every unset
+    # name reads as a fresh ActiveSupport::OrderedOptions. Ingest lifts
+    # each `config.x.a.b = v` the tree writes to `x_a_b` on the
+    # application reopen (`config_receiver_path`), so the Custom here
+    # answers those through the same readers and writers, and stores any
+    # other name the way Rails' does.
+    def x
+      @x ||= Custom.new(@application, "x")
+    end
+
+    # Application::Configuration's `attr_accessor
+    # :consider_all_requests_local`, `false` until written
+    # (configuration.rb:56). Environments write it (Core's test.rb:
+    # true); the environment program carries the write as written
+    # (`initializers::RUNTIME_FRAMEWORK_CONFIG_KEYS`), and app code reads
+    # it to decide whether to raise or report (Core's
+    # QueryCapture::Capture, PlatformComponent's test slices).
+    def consider_all_requests_local
+      Configuration.settings.fetch(:consider_all_requests_local, false)
+    end
+
+    def consider_all_requests_local=(value)
+      Configuration.settings[:consider_all_requests_local] = value
+    end
+
+    # The Application::Configuration accessors this class answers
+    # itself (above), one store for the process like the native
+    # singleton's instance variables.
+    def self.settings # :nodoc:
+      @settings ||= {}
+    end
+
+    # Application::Configuration::Custom. A name the tree's lifted keys
+    # cover reads and writes through the application reopen (`x_<name>`,
+    # or a deeper Custom when lifted keys extend `x_<name>_`); any other
+    # name is Rails' own store: a write sets it, a read of an unset name
+    # creates and keeps an empty ActiveSupport::OrderedOptions.
+    class Custom
+      def initialize(application, prefix)
+        @application = application
+        @prefix = prefix
+      end
+
+      def method_missing(method, *args)
+        name = method.to_s
+        if name.end_with?("=")
+          key = "#{@prefix}_#{name.delete_suffix("=")}"
+          return @application.public_send("#{key}=", args.first) if lifted?(key)
+
+          Custom.store[key] = args.first
+        else
+          key = "#{@prefix}_#{name}"
+          return @application.public_send(key) if lifted?(key)
+          return Custom.store[key] if Custom.store.key?(key)
+          return Custom.nested[key] ||= Custom.new(@application, key) if lifted_below?(key)
+
+          Custom.store[key] = Custom.empty_options
+        end
+      end
+
+      def respond_to_missing?(_symbol, _include_private = false)
+        true
+      end
+
+      def self.store # :nodoc:
+        @store ||= {}
+      end
+
+      def self.nested # :nodoc:
+        @nested ||= {}
+      end
+
+      # The OrderedOptions port rails_railtie.rb requires; loaded here
+      # when this tree carries no railtie (a missing file is a LoadError
+      # naming it, not a stand-in).
+      def self.empty_options # :nodoc:
+        require_relative "active_support_ordered_options" unless defined?(::ActiveSupport::OrderedOptions)
+        ::ActiveSupport::OrderedOptions.new
+      end
+
+      private
+
+      def lifted?(key)
+        @application.respond_to?("#{key}__build")
+      end
+
+      def lifted_below?(key)
+        prefix = "#{key}_"
+        @application.class.instance_methods.any? { |m| (s = m.to_s).start_with?(prefix) && s.end_with?("__build") }
       end
     end
 

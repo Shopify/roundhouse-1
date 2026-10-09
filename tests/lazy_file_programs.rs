@@ -96,10 +96,14 @@ fn a_program_the_native_boot_files_require_loads_at_boot_in_their_order() {
     let models = std::fs::read_to_string(run.emitted.join("app/models.rb")).expect("app/models.rb");
     assert!(models.contains("  [\"models/roundhouse_files/lib/boot_flag\", nil], # config/boot.rb:1\n"), "{models}");
     assert!(models.contains("  [\"models/roundhouse_files/lib/prod_only\", [\"production\"]], # config/environments/production.rb:1\n"), "{models}");
-    assert!(
-        models.contains("    \"models/roundhouse_files/lib/maybe\" => \"config/boot.rb:2\",\n"),
-        "a conditional boot require is named: {models}"
-    );
+    // config/boot.rb's conditional require is a statement of its boot
+    // program (`ingest::boot_requires`, THE BOOT PROGRAMS), which runs
+    // the condition as native boot does: not loaded here, since
+    // RH_NEVER_SET is unset, and not named as unevaluated either.
+    assert!(!models.contains("    \"models/roundhouse_files/lib/maybe\" => \"config/boot.rb:2\",\n"), "{models}");
+    let boot = std::fs::read_to_string(run.emitted.join("app/models/roundhouse_files/config/boot.rb")).expect("boot program");
+    assert!(boot.contains("RoundhouseAutoload.file_statement(\"config/boot.rb:2\") do\n"), "{boot}");
+    assert!(boot.contains("require RoundhouseAutoload.path(\"models/roundhouse_files/lib/maybe\") if ENV[\"RH_NEVER_SET\"]"), "{boot}");
 }
 
 #[test]
