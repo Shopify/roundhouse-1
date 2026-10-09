@@ -109,6 +109,10 @@ fn read_rows(text: &str) -> Vec<Value> {
 }
 
 fn native_rows(source: &str) -> Vec<Value> {
+    native_rows_with(source, "")
+}
+
+fn native_rows_with(source: &str, helper: &str) -> Vec<Value> {
     let version = minitest_version();
     let rails = if source.contains("ActiveSupport::TestCase") {
         "require 'active_support'; require 'active_support/test_case'"
@@ -120,6 +124,7 @@ require "json"
 Minitest.seed = 4242
 {rails}
 {LIFECYCLE_HELPER}
+{helper}
 {source}
 AssertionContractTest.runnable_methods.each do |name|
   result = AssertionContractTest.new(name).run
@@ -181,8 +186,17 @@ end
 }
 
 fn compare(source: &str) -> Vec<Value> {
-    let native = native_rows(source);
-    let (emitted, errors) = app(source).emit(BuildTarget::Ruby);
+    compare_with(source, None)
+}
+
+/// [`compare`], with one more lib file (`(path, source)`) that both runs load.
+fn compare_with(source: &str, helper: Option<(&str, &str)>) -> Vec<Value> {
+    let native = native_rows_with(source, helper.map_or("", |(_, text)| text));
+    let overlay = match helper {
+        Some((path, text)) => app(source).write(path, text),
+        None => app(source),
+    };
+    let (emitted, errors) = overlay.emit(BuildTarget::Ruby);
     assert!(errors.is_empty(), "{errors:#?}");
     let results = emitted.join("results.jsonl");
     let output = ruby()
@@ -330,4 +344,85 @@ end
         ("AssertionContractTest#test_each_test_starts_clean", "pass", 2),
     ], "{log}");
     assert!(output.status.success(), "{log}");
+}
+
+/// ActiveSupport::Testing::SetupAndTeardown's `setup` / `teardown` class
+/// macros, called by app code as it runs (a helper's `included` hook, as
+/// Core's test helpers do): registration order, `prepend: true`, `if:`,
+/// a method name, `throw :abort` ending the setup chain, and teardown
+/// callbacks in reverse after `teardown`, with their assertions counted.
+#[test]
+fn runtime_setup_and_teardown_callbacks_match_native() {
+    const HELPER: &str = r#"
+module CallbackOrderHelper
+  def self.included(base)
+    base.setup do
+      @trace = @prepended ? "first" : "prepend missing"
+      assert true
+    end
+    base.setup :second
+    base.setup(if: :never?) { @trace = @trace + " skipped" }
+    base.setup { throw :abort }
+    base.setup { @trace = @trace + " after abort" }
+    base.setup(prepend: true) { @prepended = true }
+    base.teardown { assert_equal "first second test teardown inner", @trace }
+    base.teardown { @trace = @trace + " inner" }
+  end
+
+  def second
+    @trace = @trace + " second"
+  end
+
+  def never?
+    false
+  end
+end
+"#;
+    let rows = compare_with(r#"
+class AssertionContractTest < ActiveSupport::TestCase
+  include CallbackOrderHelper
+  def test_order
+    assert_equal "first second", @trace
+    @trace = @trace + " test"
+  end
+  def teardown
+    @trace = @trace + " teardown"
+    super
+  end
+end
+"#, Some(("lib/callback_order_helper.rb", HELPER)));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], "pass", "{:#?}", rows[0]);
+    assert_eq!(rows[0]["assertions"], 3, "{:#?}", rows[0]);
+}
+
+/// Rails' test base classes exist before the app's files reopen them:
+/// `ActiveSupport::TestCase` is the emitted `TestBase`, and a
+/// `class ActionController::TestCase` reopening keeps it a TestBase, with
+/// Minitest's assertions (Core's app/models/action_controller/test_case.rb
+/// had made it a bare Object subclass, whose tests had no `assertions`).
+#[test]
+fn rails_test_base_classes_are_declared_before_boot() {
+    let source = "class AssertionContractTest < Minitest::Test\n  def test_one\n    assert_equal 1, 1\n  end\nend\n";
+    let (emitted, errors) = app(source).emit(BuildTarget::Ruby);
+    assert!(errors.is_empty(), "{errors:#?}");
+    let probe = r#"
+require "test_helper"
+module ActionController
+  class TestCase
+  end
+end
+test = ActionController::TestCase.new
+test.assert_equal 1, 1
+puts [ActiveSupport::TestCase.equal?(TestBase), ActionController::TestCase.superclass == TestBase, test.assertions].inspect
+"#;
+    std::fs::write(emitted.join("test/base_classes_probe.rb"), probe).unwrap();
+    let output = ruby()
+        .args(["-Itest", "-e", &format!("gem 'minitest', '={}'; load ARGV.fetch(0)", minitest_version()), "test/base_classes_probe.rb"])
+        .current_dir(&emitted)
+        .env("BLOG_DB", ":memory:")
+        .output().expect("emitted CRuby");
+    let log = format!("stdout={}\nstderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{log}");
+    assert!(String::from_utf8_lossy(&output.stdout).lines().any(|line| line == "[true, true, 1]"), "{log}");
 }

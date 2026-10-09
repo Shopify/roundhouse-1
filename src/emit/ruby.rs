@@ -1158,6 +1158,22 @@ pub fn emit_with_assertions(
             truncate_lines.push(format!("Db.exec(\"DELETE FROM {}\")", name.as_str()));
         }
     }
+    // The PostgreSQL CRuby tree isolates tests as Rails does instead:
+    // ActiveRecord::TestFixtures (runtime/active_record_test_fixtures.rb)
+    // loads the fixture sets once per process, deleting only the fixture
+    // tables, each through its model's writing pool, and every test runs
+    // in a transaction that rolls back. Truncating all of the app's
+    // tables before each test touched every model (Core: 1,421 of them,
+    // an autoload each) and ran an unmodelled table's DELETE on
+    // ActiveRecord::Base's pool, which Core points at a replica.
+    let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
+    let test_reset = if minitest
+        && app.primary_database_adapter() == Some(&crate::database::DatabaseAdapter::Postgresql)
+    {
+        TestReset::FixtureSets(fixture_set_rows(app, &fixture_lcs))
+    } else {
+        TestReset::Truncate(truncate_lines.clone())
+    };
 
     // Test bootstrap. The canonical content (LOAD_PATH wiring,
     // SqliteAdapter setup, RequestDispatch + ActionResponse +
@@ -1169,7 +1185,7 @@ pub fn emit_with_assertions(
     // even when no test files are produced yet.
     files.push(EmittedFile {
         path: PathBuf::from("test/test_helper.rb"),
-        content: render_test_helper(&fixture_lcs, &truncate_lines),
+        content: render_test_helper(&fixture_lcs, &test_reset, minitest),
     });
 
     // Test fixtures — one `<Plural>Fixtures` LibraryClass per YAML file
@@ -1300,7 +1316,9 @@ pub fn emit_with_assertions(
             })
             .collect();
         // Explicit reset+fixture-load sequence used by the autorun
-        // shim. Mirrors Crystal's `test_setup.cr` (which emits a static
+        // shim. The Minitest driver has none: TestBase#setup's
+        // `SchemaSetup.reset!` is its reset, which a copy in the driver
+        // only ran a second time, before it. Mirrors Crystal's `test_setup.cr` (which emits a static
         // `RoundhouseTest.fixture_loaders = [-> { ArticlesFixtures.
         // _fixtures_load!; nil }, …]`). The dynamic `Object.constants`
         // walk that `FixtureLoader.load_all!` uses under CRuby is not
@@ -1571,9 +1589,8 @@ pub fn emit_with_assertions(
             // files; a driver there would report on it once per require.
             let test_names = test_names_of(lc);
             let is_bare_base = test_parents.contains(class_name) && test_names.is_empty();
-            let minitest = assertion_mode == crate::lower::test_module_to_library::inline_assertions::AssertionMode::Minitest;
             if !is_bare_base && minitest {
-                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &test_names, &reset_lines));
+                emitted.content.push_str(&render_minitest_shim(&lc_for_emit, &test_names));
             } else if !is_bare_base {
                 emitted.content.push_str(&render_autorun_shim(&lc_for_emit, &test_names, &reset_lines));
             }
@@ -1714,16 +1731,21 @@ fn rbs_only_from_funcs(
 /// parent's, and the parent's tests are not the subclass file's to run
 /// (Minitest runs them once under the parent, and again, inherited,
 /// under the subclass, which `test_names` lists).
-fn render_minitest_shim(lc: &LibraryClass, test_names: &[String], reset_lines: &[String]) -> String {
+///
+/// It carries no reset of its own. The test's fixture phase is the
+/// runner's (`RoundhouseTestRunner.run_one`): TestBase#setup's
+/// `SchemaSetup.reset!`, and on the PostgreSQL tree
+/// ActiveRecord::TestFixtures' load-once and transaction. A copy of the
+/// reset here ran every truncate and fixture load a second time per test
+/// (on Core, 1,421 model truncates, each naming and so autoloading its
+/// model).
+fn render_minitest_shim(lc: &LibraryClass, test_names: &[String]) -> String {
     // A native name is any text (`test_#call_ok?`, `test_x_#@y`): a
     // literal that does not interpolate.
     let methods: Vec<String> = test_names.iter().map(|name| expr::ruby_str_literal(name)).collect();
     let mut s = String::from("\nif RoundhouseTestRunner.drive?(__FILE__)\n");
-    writeln!(s, "  RoundhouseTestRunner.run({}, [{}]) do", lc.name.0, methods.join(", ")).unwrap();
-    for line in reset_lines {
-        writeln!(s, "    {line}").unwrap();
-    }
-    s.push_str("  end\nend\n");
+    writeln!(s, "  RoundhouseTestRunner.run({}, [{}])", lc.name.0, methods.join(", ")).unwrap();
+    s.push_str("end\n");
     s
 }
 
@@ -2062,7 +2084,11 @@ fn fixture_file_stem(class_name: &str) -> String {
 ///   1. the runtime require chain → `require_relative "../main"`
 ///   2. `SchemaSetup.reset!`'s truncate list → the app's own models
 ///   3. `FixtureLoader.load_all!`'s constant scan → explicit calls
-fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -> String {
+///
+/// On the CRuby (Minitest) tree the require chain is preceded by Rails'
+/// test base classes, and on the PostgreSQL one (2) is the fixture sets
+/// ActiveRecord::TestFixtures loads (`TestReset::FixtureSets`).
+fn render_test_helper(fixture_lcs: &[LibraryClass], reset: &TestReset, minitest: bool) -> String {
     // (1) The require chain. The source list is a hand-maintained
     // SUBSET that stopped tracking the runtime as it grew: by
     // 2026-08-16 `boot.rb` required 23 files this did not, so a
@@ -2117,8 +2143,11 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
         );
         return out;
     };
-    out.replace_range(
-        start..end + REQUIRE_BLOCK_END.len(),
+    let mut boot = String::new();
+    if minitest {
+        boot.push_str(MINITEST_TEST_CASES);
+    }
+    boot.push_str(
         "# The app's whole boot chain, in its curated order: the runtime,\n\
          # config/schema, config/routes, app/models, app/views. boot.rb\n\
          # starts nothing — main.rb requires it too, then adds the server.\n\
@@ -2137,18 +2166,39 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
          # without a token, as Rails' own integration tests do.\n\
          ActionController::Base.allow_forgery_protection = false",
     );
+    out.replace_range(start..end + REQUIRE_BLOCK_END.len(), &boot);
 
     // (2)
-    let truncate = if truncate_lines.is_empty() {
-        String::from("    # no table-backed models")
-    } else {
-        truncate_lines
-            .iter()
-            .map(|line| format!("    {line}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    out = out.replace(TRUNCATE_BLOCK, &truncate);
+    match reset {
+        TestReset::Truncate(truncate_lines) => {
+            let truncate = if truncate_lines.is_empty() {
+                String::from("    # no table-backed models")
+            } else {
+                truncate_lines
+                    .iter()
+                    .map(|line| format!("    {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            out = out.replace(TRUNCATE_BLOCK, &truncate);
+        }
+        TestReset::FixtureSets(_) => {
+            let reset_body = format!("{TRUNCATE_BLOCK}\n    FixtureLoader.load_all!\n");
+            debug_assert!(
+                out.contains(&reset_body),
+                "runtime/spinel/test/test_helper.rb SchemaSetup.reset! body \
+                 changed; update the FixtureSets reset in render_test_helper"
+            );
+            out = out.replace(
+                &reset_body,
+                "    # The PostgreSQL tree truncates and reloads nothing per test:\n\
+                 \x20   # ActiveRecord::TestFixtures#setup_fixtures (runtime/\n\
+                 \x20   # active_record_test_fixtures.rb) loads FixtureLoader.fixture_sets\n\
+                 \x20   # once per process, before the test's transaction, which rolls\n\
+                 \x20   # back after it.\n",
+            );
+        }
+    }
 
     // (3)
     // `fixture_lcs` ORDER, not sorted. The lowerer topologically sorts
@@ -2170,8 +2220,124 @@ fn render_test_helper(fixture_lcs: &[LibraryClass], truncate_lines: &[String]) -
             .collect::<Vec<_>>()
             .join("\n")
     };
-    out.replace(SCAN_BLOCK, &explicit)
+    let TestReset::FixtureSets(rows) = reset else {
+        return out.replace(SCAN_BLOCK, &explicit);
+    };
+    // The fixture sets ActiveRecord::TestFixtures loads, in the same
+    // order, beside `load_all!` (which nothing calls on this tree).
+    let scan_end = format!("{SCAN_BLOCK}\n  end\n");
+    debug_assert!(
+        out.contains(&scan_end),
+        "runtime/spinel/test/test_helper.rb FixtureLoader.load_all! end \
+         changed; update the FixtureSets render in render_test_helper"
+    );
+    let mut sets = format!(
+        "{explicit}\n  end\n\n\
+         \x20 # ActiveRecord::TestFixtures' fixture sets (runtime/\n\
+         \x20 # active_record_test_fixtures.rb), parents first: the set's name,\n\
+         \x20 # its fixture module, the model class its rows load and the table\n\
+         \x20 # they go to. Named, not referenced: a model is resolved (and so\n\
+         \x20 # autoloaded) only when its set loads.\n\
+         \x20 def self.fixture_sets\n\
+         \x20   [\n"
+    );
+    for row in rows {
+        writeln!(
+            sets,
+            "      [{}, {}, {}, {}],",
+            expr::ruby_str_literal(&row.set),
+            expr::ruby_str_literal(&row.module),
+            expr::ruby_str_literal(&row.model),
+            expr::ruby_str_literal(&row.table),
+        )
+        .unwrap();
+    }
+    sets.push_str("    ]\n  end\n");
+    out.replace(&scan_end, &sets)
 }
+
+/// How the emitted test helper isolates one test from the last.
+enum TestReset {
+    /// `SchemaSetup.reset!` truncates every table-backed model (and
+    /// deletes every unmodelled table) and reloads every fixture before
+    /// each test: the SQLite and spinel trees.
+    Truncate(Vec<String>),
+    /// Rails' transactional tests: the PostgreSQL CRuby tree's
+    /// ActiveRecord::TestFixtures loads these sets once and rolls each
+    /// test back.
+    FixtureSets(Vec<FixtureSetRow>),
+}
+
+/// One fixture set as ActiveRecord::TestFixtures loads it.
+struct FixtureSetRow {
+    /// Rails' fixture set name: the fixture's path under test/fixtures
+    /// without its extension (`customers/customer_active_records`).
+    set: String,
+    /// The emitted `<Camel>Fixtures` module with `_fixtures_load!`.
+    module: String,
+    /// The model class its rows load (`Fixture::class_id`).
+    model: String,
+    /// The model's table, or the set's name when the app has no such
+    /// model (Rails' default table for a set).
+    table: String,
+}
+
+/// The fixture sets of `fixture_lcs` (load order), each with the model
+/// and table its `_fixtures_load!` writes.
+fn fixture_set_rows(app: &App, fixture_lcs: &[LibraryClass]) -> Vec<FixtureSetRow> {
+    let by_module: crate::det::HashMap<String, &crate::dialect::Fixture> = app
+        .fixtures
+        .iter()
+        .map(|f| (format!("{}Fixtures", crate::naming::camelize(f.name.as_str())), f))
+        .collect();
+    fixture_lcs
+        .iter()
+        .filter_map(|lc| {
+            let module = lc.name.0.as_str();
+            let fixture = by_module.get(module);
+            debug_assert!(fixture.is_some(), "fixture module {module} has no fixture");
+            let fixture = fixture?;
+            let class = fixture.class_id();
+            let table = app
+                .models
+                .iter()
+                .find(|m| m.name == class)
+                .map(|m| m.table.0.as_str().to_string())
+                .unwrap_or_else(|| fixture.name.as_str().to_string());
+            Some(FixtureSetRow {
+                set: fixture.path.as_str().to_string(),
+                module: module.to_string(),
+                model: class.0.as_str().to_string(),
+                table,
+            })
+        })
+        .collect()
+}
+
+/// Rails' test base classes, declared ahead of boot on the CRuby tree.
+/// The app's own files reopen them as they load (Core's
+/// app/models/action_controller/test_case.rb includes a module into
+/// `ActionController::TestCase` at boot; a support file's
+/// `ActiveSupport::TestCase.class_eval { setup do … end }` loads with a
+/// test file), and Rails defines both before any of that runs. Without
+/// them the first reopening made a bare `Object` subclass, whose tests
+/// had no `assertions`, and the second raised NameError.
+/// `ActiveSupport::TestCase` is `TestBase` itself, the class emitted
+/// test classes descend from for it (`emitted_test_parent`).
+const MINITEST_TEST_CASES: &str = "\
+# Rails' test base classes, before the app's files reopen them: TestBase
+# (defined below) is ActiveSupport::TestCase, and ActionController::
+# TestCase descends from it.
+class TestBase
+end
+module ActiveSupport
+  TestCase = ::TestBase
+end
+module ActionController
+  class TestCase < TestBase
+  end
+end
+";
 
 /// The superclass an emitted test class declares: `ActiveSupport::
 /// TestCase` and `Minitest::Test` become the harness's `TestBase`, any

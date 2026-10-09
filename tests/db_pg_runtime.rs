@@ -628,6 +628,132 @@ fn postgres_test_bootstrap_loads_log_subscriber_test_helper_when_a_test_names_it
     assert!(source.find(REQUIRE).expect("helper required") > configured, "{source}");
 }
 
+/// The PostgreSQL CRuby tree isolates tests as Rails' transactional
+/// fixtures do: no per-test truncate of every model (on Core, 1,421
+/// `<Model>._adapter_truncate` lines, each autoloading its model, and an
+/// unmodelled table's DELETE on ActiveRecord::Base's replica pool), and
+/// no second reset in the test file's driver. The helper names the
+/// fixture sets for ActiveRecord::TestFixtures, which loads them once per
+/// process through each model's own pool, and declares Rails' test base
+/// classes before the app's files reopen them.
+#[test]
+fn postgres_test_helper_names_fixture_sets_for_load_once_instead_of_truncating() {
+    use roundhouse::project::{target_files, BuildTarget};
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let mut app = postgres_model_app();
+    app.fixtures.push(roundhouse::ingest::ingest_fixture_file(
+        b"first:\n  Title: One\n  enabled: true\n",
+        std::path::Path::new("test/fixtures/entries.yml"),
+        std::path::Path::new("test/fixtures"),
+    ).expect("ingest fixture"));
+    app.test_modules.push(roundhouse::ingest::test::ingest_test_file(
+        b"class EntryTest < ActiveSupport::TestCase\n  test \"first\" do\n    assert_equal \"One\", entries(:first).Title\n  end\nend\n",
+        "test/models/entry_test.rb",
+    ).expect("ingest test").expect("test module"));
+    let files = target_files(&app, &fixture_root, BuildTarget::Ruby).unwrap();
+    let source = |path: &str| files.iter().find(|(p, _)| p == path).unwrap_or_else(|| panic!("no {path}")).1.as_str();
+    let helper = source("test/test_helper.rb");
+
+    let reset = &helper[helper.find("  def self.reset!\n").expect("SchemaSetup.reset!")..];
+    let reset = &reset[..reset.find("\n  end\n").unwrap()];
+    assert!(!reset.contains("FixtureLoader.load_all!"), "{reset}");
+    let code: Vec<&str> = helper.lines().filter(|line| !line.trim_start().starts_with('#')).collect();
+    assert!(!code.iter().any(|line| line.contains("_adapter_truncate") || line.contains("DELETE FROM")), "{helper}");
+    assert!(helper.contains(
+        "  def self.fixture_sets\n    [\n      [\"entries\", \"EntriesFixtures\", \"Entry\", \"entries\"],\n    ]\n  end\n"),
+        "{helper}");
+    // Rails' base classes exist before boot loads any app file.
+    let bases = helper.find("module ActiveSupport\n  TestCase = ::TestBase\nend\n").expect("ActiveSupport::TestCase");
+    assert!(helper.contains("module ActionController\n  class TestCase < TestBase\n  end\nend\n"), "{helper}");
+    assert!(bases < helper.find("require_relative \"../boot\"").expect("boot"), "{helper}");
+    assert!(helper.trim_end().ends_with("TestBase.include(ActiveRecord::TestFixtures)"), "{helper}");
+
+    // The driver runs the tests and nothing else: the runner owns setup.
+    let test = source("test/models/entry_test.rb");
+    assert!(test.contains("\nif RoundhouseTestRunner.drive?(__FILE__)\n  RoundhouseTestRunner.run(EntryTest, [\"test_first\"])\nend\n"), "{test}");
+
+    let fixtures = source("runtime/active_record_test_fixtures.rb");
+    assert!(fixtures.contains("pool.with_connection do |conn|"), "{fixtures}");
+    assert!(fixtures.contains("@@already_loaded_fixtures[@fixture_cache_key]"), "{fixtures}");
+}
+
+/// The emitted PostgreSQL test run, end to end, as Rails' transactional
+/// fixtures behave: the first test's setup DELETEs the fixture table once
+/// (one statement, which removes a stale row) and inserts the set; each
+/// test then runs in a transaction rolled back at teardown, so the second
+/// test sees the fixtures and not the first test's row; and Rails'
+/// accessors answer where the compiler did not lower them (`fixture(...)`,
+/// and `entries(:second)` in a `setup do` block).
+#[test]
+#[ignore = "requires pg gem and ROUNDHOUSE_PG_TEST_URL for a disposable local PostgreSQL server"]
+fn postgres_fixture_sets_load_once_and_each_test_rolls_back() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/tiny-blog");
+    let mut app = postgres_model_app();
+    app.fixtures.push(roundhouse::ingest::ingest_fixture_file(
+        b"first:\n  id: 1\n  Title: One\n  enabled: true\nsecond:\n  id: 2\n  Title: Two\n  enabled: false\n",
+        std::path::Path::new("test/fixtures/entries.yml"),
+        std::path::Path::new("test/fixtures"),
+    ).expect("ingest fixture"));
+    app.test_modules.push(roundhouse::ingest::test::ingest_test_file(
+        b"class EntryTest < ActiveSupport::TestCase\n  setup do\n    @second = entries(:second)\n  end\n\n  test \"first\" do\n    assert_equal \"One\", fixture(:entries, :first).Title\n    assert_equal \"Two\", @second.Title\n    Entry.create!(Title: \"added\", enabled: true)\n    assert_equal 3, Entry.count\n  end\n\n  test \"second\" do\n    assert_equal 2, Entry.count\n    assert_equal \"Two\", @second.Title\n  end\nend\n",
+        "test/models/entry_test.rb",
+    ).expect("ingest test").expect("test module"));
+    let files = roundhouse::project::target_files(&app, &fixture_root, roundhouse::project::BuildTarget::Ruby)
+        .expect("package PostgreSQL Ruby project");
+    struct ProjectDir(std::path::PathBuf);
+    impl Drop for ProjectDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let project = ProjectDir(std::env::temp_dir().join(format!("roundhouse-pg-fixtures-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&project.0);
+    for (path, content) in &files {
+        let path = project.0.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let path = |rel: &str| serde_json::to_string(&project.0.join(rel)).unwrap();
+    let results = path("results.jsonl");
+    let script = format!(r##"
+require "json"
+require {runtime}
+require {support}
+require {schema}
+require {model}
+ENV["ROUNDHOUSE_DATABASE_URL"] = DB_OPTIONS.merge(dbname: DATABASE_NAMES[0]).compact.map {{ |k,v| "#{{k}}=#{{v}}" }}.join(" ")
+ENV["ROUNDHOUSE_TEST_RESULTS"] = {results}
+class PostgreSQLRuntimeTest
+  def test_fixture_sets_load_once
+    Db.close
+    require {helper}
+    connection = ActiveRecord::Base.connection
+    connection.execute(%q(INSERT INTO entries (id, "Title", enabled) VALUES (99, 'stale', true)))
+    connection.execute("CREATE TABLE entries_deletes (n serial)")
+    connection.execute("CREATE FUNCTION runtime_test.count_entries_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO runtime_test.entries_deletes DEFAULT VALUES; RETURN NULL; END $$")
+    connection.execute("CREATE TRIGGER count_entries_delete AFTER DELETE ON entries FOR EACH STATEMENT EXECUTE FUNCTION runtime_test.count_entries_delete()")
+    require {entry_test}
+    rows = File.readlines({results}).map {{ |line| JSON.parse(line) }}
+    assert_equal [["EntryTest#test_first", "pass", 3], ["EntryTest#test_second", "pass", 2]],
+      rows.map {{ |row| [row["id"], row["status"], row["assertions"]] }}.sort, rows.inspect
+    connection = ActiveRecord::Base.connection
+    assert_equal [1], connection.execute("SELECT count(*) AS n FROM entries_deletes").to_a.map {{ |row| row["n"].to_i }}
+    assert_equal [[1, "One"], [2, "Two"]], connection.execute(%q(SELECT id, "Title" FROM entries ORDER BY id)).to_a.map {{ |row| [row["id"].to_i, row["Title"]] }}
+    assert_empty ActiveRecord::TestFixtures.fixture_sets_not_loaded
+  end
+end
+"##,
+        runtime = path("runtime/db.rb"), support = path("runtime/active_support_ext.rb"),
+        schema = path("config/schema.rb"), model = path("app/models/entry.rb"),
+        helper = path("test/test_helper.rb"), entry_test = path("test/models/entry_test.rb"));
+    let result = std::process::Command::new("ruby")
+        .args(["-r", "./tests/db_pg_runtime.rb", "-e", &script, "--", "--name", "test_fixture_sets_load_once"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("DB_ADAPTER").env_remove("ROUNDHOUSE_TEST_RESULTS")
+        .output().expect("ruby");
+    assert!(result.status.success(), "emitted code={script}\nentry_test={}\nstdout={}\nstderr={}",
+        files.iter().find(|(p, _)| p == "test/models/entry_test.rb").map(|(_, c)| c.as_str()).unwrap_or(""),
+        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+}
+
 #[test]
 fn postgres_schema_error_is_not_replaced_by_sqlite_or_empty_ddl() {
     let mut app = postgres_model_app();
